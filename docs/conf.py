@@ -1,11 +1,15 @@
 # Configuration file for the Sphinx documentation builder.
 
+import sys
+import os
 
 # -- Project information -----------------------------------------------------
 
 project = "Lance"
 copyright = "%Y, Lance Developer"
 author = "Lance Developer"
+
+sys.path.insert(0, os.path.abspath("../python"))
 
 
 # -- General configuration ---------------------------------------------------

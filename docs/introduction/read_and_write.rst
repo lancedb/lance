@@ -170,23 +170,37 @@ Bulk Update
 ^^^^^^^^^^^
 
 The :py:meth:`lance.LanceDataset.update` method is useful for updating rows based on
-a filter.  However, if we want to replace existing rows with new rows then a merge
-insert operation would be more efficient:
+a filter.  However, if we want to replace existing rows with new rows then a :py:meth:`lance.LanceDataset.merge_insert`
+operation would be more efficient:
 
-.. code-block:: python
+.. testsetup:: bulk_update
 
-  import lance
+    tbl = pa.Table.from_pylist([{"name": "Alice", "age": 20},
+                          {"name": "Bob", "age": 30}])
+    lance.write_dataset(tbl, "./alice_and_bob.lance", mode="overwrite")
 
-  # Change the ages of both Alice and Bob
-  new_table = pa.Table.from_pylist([{"name": "Alice", "age": 30},
-                                    {"name": "Bob", "age": 20}])
-  dataset = lance.dataset("./alice_and_bob.lance")
-  # This will use `name` as the key for matching rows.  Merge insert
-  # uses a JOIN internally and so you typically want this column to
-  # be a unique key or id of some kind.
-  dataset.merge_insert("name") \
-         .when_matched_update_all() \
-         .execute(new_table)
+.. doctest:: bulk_update
+
+  >>> import lance
+
+  >>> dataset = lance.dataset("./alice_and_bob.lance")
+  >>> dataset.to_table().to_pandas()
+      name  age
+  0  Alice   20
+  1    Bob   30
+  >>> # Change the ages of both Alice and Bob
+  >>> new_table = pa.Table.from_pylist([{"name": "Alice", "age": 2},
+  ...                                   {"name": "Bob", "age": 3}])
+  >>> # This will use `name` as the key for matching rows.  Merge insert
+  >>> # uses a JOIN internally and so you typically want this column to
+  >>> # be a unique key or id of some kind.
+  >>> rst = dataset.merge_insert("name") \
+  ...        .when_matched_update_all() \
+  ...        .execute(new_table)
+  >>> dataset.to_table().to_pandas()
+      name  age
+  0  Alice    2
+  1    Bob    3
 
 Note that, similar to the update operation, rows that are modified will
 be removed and inserted back into the table, changing their position to
@@ -202,20 +216,34 @@ we don't know which rows we've added previously and we don't want to
 create duplicate rows.  We can use the merge insert operation to achieve
 this:
 
-.. code-block:: python
+.. testsetup:: insert_if_not_exists
 
   import lance
+  import pyarrow as pa
 
-  # Bob is already in the table, but Carla is new
-  new_table = pa.Table.from_pylist([{"name": "Bob", "age": 30},
-                                    {"name": "Carla", "age": 37}])
+  # Create a fresh dataset
+  tbl = pa.Table.from_pylist([{"name": "Alice", "age": 20},
+                              {"name": "Bob", "age": 30}])
+  lance.write_dataset(tbl, "./alice_and_bob.lance", mode="overwrite")
 
-  dataset = lance.dataset("./alice_and_bob.lance")
+.. doctest:: insert_if_not_exists
 
-  # This will insert Carla but leave Bob unchanged
-  dataset.merge_insert("name") \
-         .when_not_matched_insert_all() \
-         .execute(new_table)
+  >>> # Bob is already in the table, but Carla is new
+  >>> new_table = pa.Table.from_pylist([{"name": "Bob", "age": 30},
+  ...                                   {"name": "Carla", "age": 37}])
+  >>>
+  >>> dataset = lance.dataset("./alice_and_bob.lance")
+  >>>
+  >>> # This will insert Carla but leave Bob unchanged
+  >>> _ = dataset.merge_insert("name") \
+  ...        .when_not_matched_insert_all() \
+  ...        .execute(new_table)
+  >>> # Verify that Carla was added but Bob remains unchanged
+  >>> dataset.to_table().to_pandas()
+      name  age
+  0  Alice   20
+  1    Bob   30
+  2  Carla   37
 
 Update or Insert (Upsert)
 ^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -225,21 +253,37 @@ already exists we want to update it.  If the row does not exist we want
 to add it.  This operation is sometimes called "upsert".  We can use
 the merge insert operation to do this as well:
 
-.. code-block:: python
+.. testsetup:: upsert
 
-  import lance
+  # Create a fresh dataset
+  tbl = pa.Table.from_pylist([{"name": "Alice", "age": 20},
+                              {"name": "Bob", "age": 30},
+                              {"name": "Carla", "age": 37}])
+  lance.write_dataset(tbl, "./alice_and_bob.lance", mode="overwrite")
 
-  # Change Carla's age and insert David
-  new_table = pa.Table.from_pylist([{"name": "Carla", "age": 27},
-                                    {"name": "David", "age": 42}])
+.. doctest:: upsert
 
-  dataset = lance.dataset("./alice_and_bob.lance")
-
-  # This will update Carla and insert David
-  dataset.merge_insert("name") \
-         .when_matched_update_all() \
-         .when_not_matched_insert_all() \
-         .execute(new_table)
+  >>> import lance
+  >>> import pyarrow as pa
+  >>>
+  >>> # Change Carla's age and insert David
+  >>> new_table = pa.Table.from_pylist([{"name": "Carla", "age": 27},
+  ...                                   {"name": "David", "age": 42}])
+  >>>
+  >>> dataset = lance.dataset("./alice_and_bob.lance")
+  >>>
+  >>> # This will update Carla and insert David
+  >>> _ = dataset.merge_insert("name") \
+  ...        .when_matched_update_all() \
+  ...        .when_not_matched_insert_all() \
+  ...        .execute(new_table)
+  >>> # Verify the results
+  >>> dataset.to_table().to_pandas()
+      name  age
+  0  Alice   20
+  1    Bob   30
+  2  Carla   27
+  3  David   42
 
 Replace a Portion of Data
 ^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -249,22 +293,46 @@ of existing rows (defined by a filter) with new data.  This is similar
 to performing both a delete and an insert in a single transaction.  For
 example:
 
-.. code-block:: python
+.. testsetup:: replace_portion
 
   import lance
+  import pyarrow as pa
 
-  new_table = pa.Table.from_pylist([{"name": "Edgar", "age": 46},
-                                    {"name": "Francene", "age": 44}])
+  # Create a dataset with a mix of ages including some over 40
+  tbl = pa.Table.from_pylist([{"name": "Alice", "age": 20},
+                              {"name": "Bob", "age": 30},
+                              {"name": "Charlie", "age": 45},
+                              {"name": "Donna", "age": 50}])
+  lance.write_dataset(tbl, "./alice_and_bob.lance", mode="overwrite")
 
-  dataset = lance.dataset("./alice_and_bob.lance")
+.. doctest:: replace_portion
 
-  # This will remove anyone above 40 and insert our new data
-  dataset.merge_insert("name") \
-         .when_not_matched_insert_all() \
-         .when_not_matched_by_source_delete("age >= 40") \
-         .execute(new_table)
-
-
+  >>> import lance
+  >>> import pyarrow as pa
+  >>>
+  >>> new_table = pa.Table.from_pylist([{"name": "Edgar", "age": 46},
+  ...                                   {"name": "Francene", "age": 44}])
+  >>>
+  >>> dataset = lance.dataset("./alice_and_bob.lance")
+  >>> dataset.to_table().to_pandas()
+        name  age
+  0    Alice   20
+  1      Bob   30
+  2  Charlie   45
+  3    Donna   50
+  >>>
+  >>> # This will remove anyone above 40 and insert our new data
+  >>> _ = dataset.merge_insert("name") \
+  ...        .when_not_matched_insert_all() \
+  ...        .when_not_matched_by_source_delete("age >= 40") \
+  ...        .execute(new_table)
+  >>> # Verify the results - people over 40 replaced with new data
+  >>> dataset.to_table().to_pandas()
+         name  age
+  0     Alice   20
+  1       Bob   30
+  2     Edgar   46
+  3  Francene   44
 
 Reading Lance Dataset
 ---------------------

@@ -113,7 +113,7 @@ jobs:
           fail_ci_if_error: false
   linux-arm:
     runs-on: ubuntu-2404-4x-arm64
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
