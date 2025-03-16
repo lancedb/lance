@@ -32,5 +32,3 @@ Lance format is one of the official `Ray data sources <https://docs.ray.io/en/la
 
     # Or via Ray.data.read_lance
     pd_df = ray.data.read_lance("./alice_bob_and_charlie.lance").to_pandas()
-
-    assert pd.DataFrame(data).sort_index(axis=0).equals(pd_df.sort_index(axis=0))
