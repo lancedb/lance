@@ -34,6 +34,7 @@ use snafu::location;
 
 use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use super::ProductQuantizer;
+use crate::vector::graph::OrderedNode;
 use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     pb,
@@ -678,13 +679,14 @@ impl DistCalculator for PQDistCalculator {
         }
     }
 
-    fn distance_all(&self) -> Vec<f32> {
+    fn distance_all(&self, k_hint: usize) -> Vec<f32> {
         match self.distance_type {
             DistanceType::L2 => compute_pq_distance(
                 &self.distance_table,
                 self.num_bits,
                 self.num_sub_vectors,
                 self.pq_code.values(),
+                k_hint,
             ),
             DistanceType::Cosine => {
                 // it seems we implemented cosine distance at some version,
@@ -701,6 +703,7 @@ impl DistCalculator for PQDistCalculator {
                     self.num_bits,
                     self.num_sub_vectors,
                     self.pq_code.values(),
+                    k_hint,
                 );
                 l2_dists.into_iter().map(|v| v / 2.0).collect()
             }
@@ -709,6 +712,7 @@ impl DistCalculator for PQDistCalculator {
                 self.num_bits,
                 self.num_sub_vectors,
                 self.pq_code.values(),
+                k_hint,
             ),
             _ => unimplemented!("distance type is not supported: {:?}", self.distance_type),
         }
@@ -869,7 +873,7 @@ mod tests {
         let expected = (0..storage.len())
             .map(|id| dist_calc.distance(id as u32))
             .collect::<Vec<_>>();
-        let distances = dist_calc.distance_all();
+        let distances = dist_calc.distance_all(100);
         assert_eq!(distances, expected);
     }
 }

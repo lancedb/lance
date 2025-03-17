@@ -275,6 +275,7 @@ impl ProductQuantizer {
             self.num_bits,
             self.num_sub_vectors,
             code.values(),
+            0,
         );
         Ok(distances.into())
     }
@@ -335,6 +336,7 @@ impl ProductQuantizer {
             self.num_bits,
             self.num_sub_vectors,
             code,
+            100,
         ))
     }
 
