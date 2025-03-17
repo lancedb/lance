@@ -38,6 +38,7 @@ use dataset::cleanup::CleanupStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
+use dataset::ColumnOrdering;
 use dataset::MergeInsertBuilder;
 use env_logger::Env;
 use file::{
@@ -118,6 +119,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_class::<FileFragment>()?;
+    m.add_class::<ColumnOrdering>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
