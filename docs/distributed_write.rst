@@ -13,10 +13,10 @@ Overview
 --------
 
 The :doc:`Lance format <format>` is designed to support parallel writing across multiple distributed workers.
-A distributed write operation can be performed by two phrases:
+A distributed write operation can be performed by two phases:
 
-#. Generate new :py:class:`~lance.LanceFragment` in parallel across multiple workers.
-#. Collecting all the :class:`~lance.FragmentMetadata` and commit into a single dataset in
+#. **Parallel Writes**: Generate new :py:class:`~lance.LanceFragment` in parallel across multiple workers.
+#. **Commit**: Collect all the :class:`~lance.FragmentMetadata` and commit into a single dataset in
    a single :py:class:`~lance.LanceOperation`.
 
 .. image:: ./_static/distributed_append.png
@@ -154,7 +154,7 @@ Add New Columns
 Thanks to its two-dimensional layout
 (`see this blog post <https://blog.lancedb.com/designing-a-table-format-for-ml-workloads/>`_),
 adding new columns is highly efficient since it avoids copying the existing data files.
-Instead, the process involves simply create new data files and linking it to the existing dataset
+Instead, the process simply creates new data files and links them to the existing dataset
 using metadata-only operations.
 
 .. testsetup:: add_columns
