@@ -189,6 +189,10 @@ pub struct ManifestLocation {
     pub size: Option<u64>,
     /// Naming scheme of the manifest file.
     pub naming_scheme: ManifestNamingScheme,
+    /// Optional e-tag, used for integrity checks. Manifests should be immutable, so
+    /// if we detect a change in the e-tag, it means the manifest was tampered with.
+    /// This might happen if the dataset was deleted and then re-created.
+    pub e_tag: Option<String>,
 }
 
 /// Get the latest manifest path
@@ -251,6 +255,7 @@ async fn current_manifest_path(
                 path: meta.location,
                 size: Some(meta.size as u64),
                 naming_scheme: scheme,
+                e_tag: meta.e_tag,
             })
         }
         // If the first valid manifest we see if V1, assume for now that we are
@@ -282,6 +287,7 @@ async fn current_manifest_path(
                 path: current_meta.location,
                 size: Some(current_meta.size as u64),
                 naming_scheme: scheme,
+                e_tag: current_meta.e_tag,
             })
         }
         (None, _) => Err(Error::NotFound {
@@ -343,15 +349,47 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
     if let Some((version, entry)) = latest_entry {
         let path = Path::from_filesystem_path(entry.path())
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        let metadata = entry.metadata()?;
         Ok(Some(ManifestLocation {
             version,
             path,
-            size: Some(entry.metadata()?.len()),
+            size: Some(metadata.len()),
             naming_scheme: scheme.unwrap(),
+            e_tag: Some(get_etag(&metadata)),
         }))
     } else {
         Ok(None)
     }
+}
+
+// Based on object store's implementation.
+fn get_etag(metadata: &std::fs::Metadata) -> String {
+    let inode = get_inode(metadata);
+    let size = metadata.len();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .unwrap_or_default()
+        .as_micros();
+
+    // Use an ETag scheme based on that used by many popular HTTP servers
+    // <https://httpd.apache.org/docs/2.2/mod/core.html#fileetag>
+    // <https://stackoverflow.com/questions/47512043/how-etags-are-generated-and-configured>
+    format!("{inode:x}-{mtime:x}-{size:x}")
+}
+
+#[cfg(unix)]
+/// We include the inode when available to yield an ETag more resistant to collisions
+/// and as used by popular web servers such as [Apache](https://httpd.apache.org/docs/2.2/mod/core.html#fileetag)
+fn get_inode(metadata: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(metadata)
+}
+
+#[cfg(not(unix))]
+/// On platforms where an inode isn't available, fallback to just relying on size and mtime
+fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
+    0
 }
 
 async fn list_manifests<'a>(
@@ -498,6 +536,7 @@ async fn default_resolve_version(
             // Both V1 and V2 should give the same path for detached versions
             path: ManifestNamingScheme::V2.manifest_path(base_path, version),
             size: None,
+            e_tag: None,
         });
     }
 
@@ -510,6 +549,7 @@ async fn default_resolve_version(
             path,
             size: Some(meta.size as u64),
             naming_scheme: scheme,
+            e_tag: meta.e_tag,
         }),
         Err(ObjectStoreError::NotFound { .. }) => {
             // fallback to V1
@@ -519,6 +559,7 @@ async fn default_resolve_version(
                 path: scheme.manifest_path(base_path, version),
                 size: None,
                 naming_scheme: scheme,
+                e_tag: None,
             })
         }
         Err(e) => Err(e.into()),

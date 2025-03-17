@@ -344,6 +344,7 @@ impl<'a> CommitBuilder<'a> {
                 commit_handler,
                 tags,
                 manifest_naming_scheme,
+                todo!(),
             }),
         }
     }

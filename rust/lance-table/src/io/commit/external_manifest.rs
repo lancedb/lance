@@ -52,6 +52,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             path,
             size: None,
             naming_scheme,
+            e_tag: None,
         })
     }
 
@@ -78,6 +79,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
                     path,
                     size: None,
                     naming_scheme,
+                    e_tag: None,
                 })
             })
             .transpose()
@@ -91,6 +93,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         version: u64,
         path: &str,
         size: u64,
+        e_tag: Option<String>,
     ) -> Result<()>;
 
     /// Put the manifest path for a given base_uri and version, should fail if the version **does not** already exist
@@ -100,6 +103,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         version: u64,
         path: &str,
         size: u64,
+        e_tag: Option<String>,
     ) -> Result<()>;
 
     /// Delete the manifest information for given base_uri from the store
@@ -141,12 +145,14 @@ impl ExternalManifestCommitHandler {
     /// by any number of readers or writers, so care should be taken to ensure
     /// that the manifest is not lost nor any errors occur due to duplicate
     /// operations.
+    #[allow(clippy::too_many_arguments)]
     async fn finalize_manifest(
         &self,
         base_path: &Path,
         staging_manifest_path: &Path,
         version: u64,
         size: u64,
+        e_tag: Option<String>,
         store: &dyn OSObjectStore,
         naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<Path, Error> {
@@ -168,6 +174,7 @@ impl ExternalManifestCommitHandler {
                 version,
                 final_manifest_path.as_ref(),
                 size,
+                e_tag,
             )
             .await?;
 
@@ -200,6 +207,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 path,
                 size,
                 naming_scheme,
+                e_tag,
             }) => {
                 // The path is finalized, no need to check object store
                 if path.extension() == Some(MANIFEST_EXTENSION) {
@@ -208,13 +216,15 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         path,
                         size,
                         naming_scheme,
+                        e_tag,
                     });
                 }
 
-                let size = if let Some(size) = size {
-                    size
+                let (size, e_tag) = if let Some(size) = size {
+                    (size, e_tag)
                 } else {
-                    object_store.size(&path).await? as u64
+                    let meta = object_store.inner.head(&path).await?;
+                    (meta.size as u64, meta.e_tag)
                 };
 
                 let final_path = self
@@ -223,6 +233,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         &path,
                         version,
                         size,
+                        e_tag.clone(),
                         &object_store.inner,
                         naming_scheme,
                     )
@@ -233,6 +244,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     path: final_path,
                     size: Some(size),
                     naming_scheme,
+                    e_tag,
                 })
             }
             // Dataset not found in the external store, this could be because the dataset did not
@@ -305,7 +317,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     })?
                     .path;
                 match object_store.head(&path).await {
-                    Ok(ObjectMeta { size, .. }) => {
+                    Ok(ObjectMeta { size, e_tag, .. }) => {
                         let res = self
                             .external_manifest_store
                             .put_if_not_exists(
@@ -313,6 +325,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                                 version,
                                 path.as_ref(),
                                 size as u64,
+                                e_tag.clone(),
                             )
                             .await;
                         if let Err(e) = res {
@@ -328,6 +341,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                             path,
                             size: Some(size as u64),
                             naming_scheme,
+                            e_tag,
                         });
                     }
                     Err(ObjectStoreError::NotFound { .. }) => {
@@ -350,10 +364,11 @@ impl CommitHandler for ExternalManifestCommitHandler {
         let naming_scheme =
             ManifestNamingScheme::detect_scheme_staging(location.path.filename().unwrap());
 
-        let size = if let Some(size) = location.size {
-            size
+        let (size, e_tag) = if let Some(size) = location.size {
+            (size, location.e_tag.clone())
         } else {
-            object_store.head(&location.path).await?.size as u64
+            let meta = object_store.head(&location.path).await?;
+            (meta.size as u64, meta.e_tag)
         };
 
         let new_path = self
@@ -362,6 +377,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 &location.path,
                 version,
                 size,
+                e_tag,
                 object_store,
                 naming_scheme,
             )
@@ -398,6 +414,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 manifest.version,
                 staging_path.as_ref(),
                 size,
+                None, // e_tag is not available at this point
             )
             .await
             .map_err(|_| CommitError::CommitConflict {});
@@ -418,6 +435,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 &staging_path,
                 manifest.version,
                 size,
+                None, // e_tag
                 &object_store.inner,
                 naming_scheme,
             )

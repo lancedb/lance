@@ -124,6 +124,7 @@ pub struct Dataset {
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
     pub manifest_naming_scheme: ManifestNamingScheme,
+    pub manifest_e_tag: Option<String>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -341,12 +342,28 @@ impl Dataset {
         Ok(())
     }
 
+    fn already_checked_out(&self, location: &ManifestLocation) -> bool {
+        // We check the e_tag here just in case it has been overwritten. This can
+        // happen if the table has been dropped then re-created recently.
+        self.manifest.version == location.version
+            && location.e_tag.as_ref().map_or(false, |e_tag| {
+                self.manifest_e_tag
+                    .as_ref()
+                    .map_or(false, |current_e_tag| e_tag != current_e_tag)
+            })
+    }
+
     async fn checkout_by_version_number(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
         let manifest_location = self
             .commit_handler
             .resolve_version_location(&base_path, version, &self.object_store.inner)
             .await?;
+
+        if self.already_checked_out(&manifest_location) {
+            return Ok(self.clone());
+        }
+
         let manifest = Self::load_manifest(self.object_store.as_ref(), &manifest_location).await?;
         Self::checkout_manifest(
             self.object_store.clone(),
@@ -357,6 +374,7 @@ impl Dataset {
             self.session.clone(),
             self.commit_handler.clone(),
             manifest_location.naming_scheme,
+            manifest_location.e_tag,
         )
         .await
     }
@@ -442,6 +460,7 @@ impl Dataset {
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
         manifest_naming_scheme: ManifestNamingScheme,
+        e_tag: Option<String>,
     ) -> Result<Self> {
         let tags = Tags::new(
             object_store.clone(),
@@ -458,6 +477,7 @@ impl Dataset {
             session,
             tags,
             manifest_naming_scheme,
+            manifest_e_tag: e_tag,
         })
     }
 
@@ -538,6 +558,7 @@ impl Dataset {
                 self.session.clone(),
                 self.commit_handler.clone(),
                 ManifestNamingScheme::V2,
+                blob_manifest_location.e_tag,
             )
             .await?;
             Ok(Some(Arc::new(blobs_dataset)))
@@ -559,7 +580,8 @@ impl Dataset {
             .commit_handler
             .resolve_latest_location(&self.base, &self.object_store)
             .await?;
-        if location.version == self.manifest.version {
+
+        if self.already_checked_out(&location) {
             return Ok((self.manifest.as_ref().clone(), self.manifest_file.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
