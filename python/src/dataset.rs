@@ -292,19 +292,21 @@ pub fn transforms_from_python(transforms: &Bound<'_, PyAny>) -> PyResult<NewColu
 #[pyclass(name = "_ColumnOrdering", module = "_lib", subclass)]
 #[derive(Clone)]
 pub struct ColumnOrdering {
-    column_ordering: LanceColumnOrdering
+    column_ordering: LanceColumnOrdering,
 }
 
 #[pymethods]
 impl ColumnOrdering {
     #[new]
     #[pyo3(signature=(ascending, nulls_first, column_name))]
-    fn new(
-        ascending: bool,
-        nulls_first: bool,
-        column_name: String,
-    ) -> Self {
-        Self { column_ordering: LanceColumnOrdering {ascending, nulls_first, column_name}}
+    fn new(ascending: bool, nulls_first: bool, column_name: String) -> Self {
+        Self {
+            column_ordering: LanceColumnOrdering {
+                ascending,
+                nulls_first,
+                column_name,
+            },
+        }
     }
 }
 
@@ -779,7 +781,9 @@ impl Dataset {
         }
         if let Some(orderings) = orderings {
             scanner
-                .order_by(Some(orderings.into_iter().map(|o|o.column_ordering).collect()))
+                .order_by(Some(
+                    orderings.into_iter().map(|o| o.column_ordering).collect(),
+                ))
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         let scan = Arc::new(scanner);

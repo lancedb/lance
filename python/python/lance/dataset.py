@@ -505,7 +505,6 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.use_scalar_index, use_scalar_index)
         setopt(builder.fast_search, fast_search)
         setopt(builder.include_deleted_rows, include_deleted_rows)
-        setopt(builder.include_deleted_rows, include_deleted_rows)
         setopt(builder.order_by, orderings)
 
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
