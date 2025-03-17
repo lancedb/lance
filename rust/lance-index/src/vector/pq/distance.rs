@@ -157,13 +157,12 @@ pub(super) fn compute_pq_distance_4bit(
         flat_num,
         &mut distances,
     );
-    let qmax = distances
+    let qmax = *distances
         .iter()
         .take(flat_num)
         .sorted_unstable_by(|a, b| a.total_cmp(b))
         .nth(k_hint - 1)
-        .unwrap()
-        .clone();
+        .unwrap();
 
     let (qmin, quantized_dists_table) = quantize_distance_table(distance_table, qmax);
     const NUM_CENTROIDS: usize = 2_usize.pow(4);
@@ -243,7 +242,7 @@ fn compute_pq_distance_4bit_flat(
     code: &[u8],
     offset: usize,
     length: usize,
-    dists: &mut Vec<f32>,
+    dists: &mut [f32],
 ) {
     const NUM_CENTROIDS: usize = 2_usize.pow(4);
 
@@ -255,8 +254,8 @@ fn compute_pq_distance_4bit_flat(
         for (i, &centroid_idx) in vec_indices.iter().enumerate() {
             let current_idx = centroid_idx & 0xF;
             let next_idx = centroid_idx >> 4;
-            distances[i] += dist_table[current_idx as usize] as f32;
-            distances[i] += next_dist_table[next_idx as usize] as f32;
+            distances[i] += dist_table[current_idx as usize];
+            distances[i] += next_dist_table[next_idx as usize];
         }
     }
 }
