@@ -5,9 +5,10 @@
 """Tests for sort by"""
 
 from pathlib import Path
+
 import lance
-from lance.dataset import ColumnOrdering
 import pyarrow as pa
+from lance.dataset import ColumnOrdering
 
 
 def test_one_column_order_by(tmp_path: Path):
