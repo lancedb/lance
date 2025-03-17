@@ -450,7 +450,8 @@ class LanceDataset(pa.dataset.Dataset):
             Note: if this is a search operation, or a take operation (including scalar
             indexed scans) then deleted rows cannot be returned.
         orderings: list of ColumnOrdering, default None
-            If not specified, the rows will be returned as the file order if scan_in_order is true. Otherwise it will fellow as a random order.
+            If not specified, the rows will be returned as the file order
+            if scan_in_order is true. Otherwise it will fellow as a random order.
             If specified, the return rows will follow the orderings.
 
 
@@ -666,7 +667,8 @@ class LanceDataset(pa.dataset.Dataset):
             Note: if this is a search operation, or a take operation (including scalar
             indexed scans) then deleted rows cannot be returned.
         orderings: list of ColumnOrdering, default None
-            If not specified, the rows will be returned as the file order if scan_in_order is true. Otherwise it will fellow as a random order.
+            If not specified, the rows will be returned as the file order
+            if scan_in_order is true. Otherwise it will fellow as a random order.
             If specified, the return rows will follow the orderings.
 
         Notes
@@ -3060,7 +3062,8 @@ class LanceOperation:
 class ColumnOrdering:
     """
     This class is used to define the column ordering rules for the `sort` operator.
-    It allows users to specify the sorting order (ascending or descending) and the position of null values (first or last).
+    It allows users to specify the sorting order (ascending or descending)
+    and the position of null values (first or last).
     """
 
     def __init__(self, ascending: bool, nulls_first: bool, column_name: str):
