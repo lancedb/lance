@@ -16,6 +16,7 @@ Lance format is one of the official `Ray data sources <https://docs.ray.io/en/la
 .. testcode::
 
     import ray
+    import pandas as pd
 
     ray.init()
 
@@ -27,9 +28,19 @@ Lance format is one of the official `Ray data sources <https://docs.ray.io/en/la
     ray.data.from_items(data).write_lance("./alice_bob_and_charlie.lance")
 
     # It can be read via lance directly
-    tbl = lance.dataset("./alice_bob_and_charlie.lance").to_table().combine_chunks()
-    assert tbl == pa.Table.from_pylist(data), "{} != {}".format(tbl, pa.Table.from_pylist(data))
+    df = (
+        lance.
+        dataset("./alice_bob_and_charlie.lance")
+        .to_table()
+        .to_pandas()
+        .sort_values(by=["id"])
+    )
+    assert df.equals(pd.DataFrame(data))
 
     # Or via Ray.data.read_lance
-    pd_df = ray.data.read_lance("./alice_bob_and_charlie.lance").to_pandas()
-    assert tbl == pa.Table.from_pandas(pd_df), "{} != {}".format(tbl, pa.Table.from_pandas(pd_df))
+    ray_df = (
+        ray.data.read_lance("./alice_bob_and_charlie.lance")
+        .to_pandas()
+        .sort_values(by=["id"])
+    )
+    assert df.equals(ray_df)
