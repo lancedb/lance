@@ -36,6 +36,7 @@ use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
+    scanner::ColumnOrdering as LanceColumnOrdering,
     scanner::Scanner as LanceScanner,
     transaction::{Operation, Transaction},
     Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
@@ -288,6 +289,24 @@ pub fn transforms_from_python(transforms: &Bound<'_, PyAny>) -> PyResult<NewColu
         }))
     }
 }
+#[pyclass(name = "_ColumnOrdering", module = "_lib", subclass)]
+#[derive(Clone)]
+pub struct ColumnOrdering {
+    column_ordering: LanceColumnOrdering
+}
+
+#[pymethods]
+impl ColumnOrdering {
+    #[new]
+    #[pyo3(signature=(ascending, nulls_first, column_name))]
+    fn new(
+        ascending: bool,
+        nulls_first: bool,
+        column_name: String,
+    ) -> Self {
+        Self { column_ordering: LanceColumnOrdering {ascending, nulls_first, column_name}}
+    }
+}
 
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
@@ -491,7 +510,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, orderings=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -516,6 +535,7 @@ impl Dataset {
         late_materialization: Option<PyObject>,
         use_scalar_index: Option<bool>,
         include_deleted_rows: Option<bool>,
+        orderings: Option<Vec<ColumnOrdering>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -757,7 +777,11 @@ impl Dataset {
                 })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
-
+        if let Some(orderings) = orderings {
+            scanner
+                .order_by(Some(orderings.into_iter().map(|o|o.column_ordering).collect()))
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
         let scan = Arc::new(scanner);
         Ok(Scanner::new(scan))
     }

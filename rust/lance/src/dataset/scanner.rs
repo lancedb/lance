@@ -107,6 +107,7 @@ lazy_static::lazy_static! {
 ///
 /// Floats are sorted using the IEEE 754 total ordering
 /// Strings are sorted using UTF-8 lexicographic order (i.e. we sort the binary)
+#[derive(Debug, Clone)]
 pub struct ColumnOrdering {
     pub ascending: bool,
     pub nulls_first: bool,
