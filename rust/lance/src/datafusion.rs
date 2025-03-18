@@ -15,18 +15,16 @@ pub trait MetricsExt {
 
 impl MetricsExt for MetricsSet {
     fn find_count(&self, metric_name: &str) -> Option<Count> {
-        self.iter()
-            .filter_map(|m| match m.value() {
-                MetricValue::Count { name, count } => {
-                    if name == metric_name {
-                        Some(count.clone())
-                    } else {
-                        None
-                    }
+        self.iter().find_map(|m| match m.value() {
+            MetricValue::Count { name, count } => {
+                if name == metric_name {
+                    Some(count.clone())
+                } else {
+                    None
                 }
-                _ => None,
-            })
-            .next()
+            }
+            _ => None,
+        })
     }
 }
 
