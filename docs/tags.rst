@@ -42,7 +42,7 @@ and :meth:`delete <lance.dataset.Tags.delete>` or :py:meth:`list <lance.dataset.
 
 
 
-.. warning::
+.. note::
 
     Tagged versions are exempted from the :py:meth:`LanceDataset.cleanup_old_versions() <lance.LanceDataset.cleanup_old_versions>`
     process.
