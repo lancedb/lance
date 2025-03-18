@@ -323,18 +323,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         // If metric type is cosine, normalize the training data, and after this point,
         // treat the metric type as L2.
-        let (training_data, dt) = if self.distance_type == DistanceType::Cosine {
+        let training_data = if self.distance_type == DistanceType::Cosine {
             let training_data = lance_linalg::kernels::normalize_fsl(&training_data)?;
-            (training_data, DistanceType::L2)
+            training_data
         } else {
-            (training_data, self.distance_type)
+            training_data
         };
 
         let training_data = match (self.ivf.as_ref(), Q::use_residual(self.distance_type)) {
             (Some(ivf), true) => {
                 let ivf_transformer = lance_index::vector::ivf::new_ivf_transformer(
                     ivf.centroids.clone().unwrap(),
-                    dt,
+                    DistanceType::L2,
                     vec![],
                 );
                 span!(Level::INFO, "compute residual for PQ training")

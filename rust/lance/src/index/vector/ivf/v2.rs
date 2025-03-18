@@ -1011,9 +1011,7 @@ mod tests {
     ) {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::new(32, 4);
-        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
-            .version(crate::index::vector::IndexFileVersion::V3)
-            .clone();
+        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
@@ -1049,7 +1047,7 @@ mod tests {
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
-    // #[case(4, DistanceType::Dot, 0.85)]
+    #[case(4, DistanceType::Dot, 0.85)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq(
         #[case] nlist: usize,
