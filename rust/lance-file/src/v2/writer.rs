@@ -115,7 +115,7 @@ fn initial_column_metadata() -> pbfile::ColumnMetadata {
     }
 }
 
-const WARNED_ON_UNSTABLE_API: AtomicBool = AtomicBool::new(false);
+static WARNED_ON_UNSTABLE_API: AtomicBool = AtomicBool::new(false);
 
 impl FileWriter {
     /// Create a new FileWriter with a desired output schema
