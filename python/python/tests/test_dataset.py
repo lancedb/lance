@@ -3118,3 +3118,13 @@ def test_create_table_from_pydict(tmp_path):
     }
     ds = lance.write_dataset(dat, tmp_path)
     assert ds.to_table() == pa.Table.from_pydict(dat)
+
+
+def test_write_dataset_with_file_writer_options(tmp_path):
+    dat = {
+        "foo": [1, 3],
+        "bar": ["one", "three"],
+    }
+    file_writer_options = {"data_cache_bytes": 4096, "max_page_bytes": 4096}
+    ds = lance.write_dataset(dat, tmp_path, file_writer_options)
+    assert ds.to_table() == pa.Table.from_pydict(dat)

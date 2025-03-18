@@ -306,8 +306,12 @@ class LanceFragment(pa.dataset.Fragment):
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
         file_writer_options : optional, dict
-            Extra file write options that make sense to control lance data file. This is
-            used to set page size for file in disk.
+            Extra file write options that make sense to control lance data file.
+            These options can be set in dict:
+            `data_cache_bytes`: how many bytes to use for buffering column data,
+                the default value is 8 * 1024 * 1024
+            `max_page_bytes`: A hint to indicate the max size of a page,
+                the default value is 32 * 1024 * 1024
         See Also
         --------
         lance.dataset.LanceOperation.Overwrite :
