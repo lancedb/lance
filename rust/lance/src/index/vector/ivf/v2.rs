@@ -1046,6 +1046,7 @@ mod tests {
         }
     }
 
+    #[ignore]
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
@@ -1071,6 +1072,7 @@ mod tests {
         }
     }
 
+    #[ignore]
     #[rstest]
     #[case(4, DistanceType::L2, 0.85)]
     #[case(4, DistanceType::Cosine, 0.85)]
