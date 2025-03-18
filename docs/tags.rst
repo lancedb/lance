@@ -9,14 +9,10 @@ especially in machine learning workflows where datasets are frequently updated.
 For example, you can :py:meth:`create <lance.dataset.Tags.create>`, :meth:`update <lance.dataset.Tags.update>`,
 and :meth:`delete <lance.dataset.Tags.delete>` or :py:meth:`list <lance.dataset.Tags.list>` tags.
 
+.. note::
 
-.. warning::
-
-    Tagged versions are exempted from the :py:meth:`LanceDataset.cleanup_old_versions() <lance.LanceDataset.cleanup_old_versions>`
-    process.
-
-    To remove a version that has been tagged, you must first :py:meth:`LanceDataset.tags.delete() <lance.dataset.Tags.delete>`
-    the associated tag.
+    Creating or deleting a tag does not create a new version of the dataset. Tags are stored as auxiliary metadata
+    in a separate directory.
 
 .. testsetup::
 
@@ -43,3 +39,13 @@ and :meth:`delete <lance.dataset.Tags.delete>` or :py:meth:`list <lance.dataset.
     >>> ds.tags.delete("v1-prod")
     >>> ds.tags.list()
     {}
+
+
+
+.. warning::
+
+    Tagged versions are exempted from the :py:meth:`LanceDataset.cleanup_old_versions() <lance.LanceDataset.cleanup_old_versions>`
+    process.
+
+    To remove a version that has been tagged, you must first :py:meth:`LanceDataset.tags.delete() <lance.dataset.Tags.delete>`
+    the associated tag.
