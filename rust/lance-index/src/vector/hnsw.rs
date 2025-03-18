@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use self::builder::HnswBuildParams;
 use super::graph::{OrderedFloat, OrderedNode};
-use super::storage::{DistCalculator, VectorStore};
+use super::storage::VectorStore;
 
 pub mod builder;
 pub mod index;
