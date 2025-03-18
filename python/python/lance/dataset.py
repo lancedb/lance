@@ -278,6 +278,30 @@ class LanceDataset(pa.dataset.Dataset):
 
     @property
     def tags(self) -> Tags:
+        """Tag management for the dataset.
+
+        Similar to Git, tags are a way to add metadata to a specific version of the
+        dataset.
+
+        .. warning::
+
+            Tagged versions are exempted from the :py:meth:`cleanup_old_versions()`
+            process.
+
+            To remove a version that has been tagged, you must first
+            :py:meth:`~Tags.delete` the associated tag.
+
+        Examples
+        --------
+
+        .. code-block:: python
+
+            ds = lance.open("dataset.lance")
+            ds.tags.create("v2-prod-20250203", 10)
+
+            tags = ds.tags.list()
+
+        """
         return Tags(self._ds)
 
     def list_indices(self) -> List[Index]:
