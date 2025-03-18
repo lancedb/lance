@@ -35,7 +35,9 @@ Lance format is one of the official `Ray data sources <https://docs.ray.io/en/la
         .to_pandas()
         .sort_values(by=["id"])
     )
-    assert df.equals(pd.DataFrame(data))
+    assert df.equals(pd.DataFrame(data)), "{} != {}".format(
+        df, pd.DataFrame(data)
+    )
 
     # Or via Ray.data.read_lance
     ray_df = (
