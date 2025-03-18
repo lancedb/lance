@@ -139,6 +139,11 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_>;
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
+
+    fn dist_between(&self, u: u32, v: u32) -> f32 {
+        let dist_cal_u = self.dist_calculator_from_id(u);
+        dist_cal_u.distance(v)
+    }
 }
 
 pub struct StorageBuilder<Q: Quantization> {

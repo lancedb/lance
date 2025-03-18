@@ -602,6 +602,91 @@ impl VectorStore for ProductQuantizationStorage {
             _ => unimplemented!("Unsupported data type: {:?}", self.codebook.value_type()),
         }
     }
+
+    fn dist_between(&self, u: u32, v: u32) -> f32 {
+        // this is a fast way to compute distance between two vectors in the same storage.
+        // it doesn't construct the distance table.
+
+        let u_codes = get_pq_code(
+            self.pq_code.values(),
+            self.num_bits,
+            self.num_sub_vectors,
+            u,
+        );
+        let v_codes = get_pq_code(
+            self.pq_code.values(),
+            self.num_bits,
+            self.num_sub_vectors,
+            v,
+        );
+
+        match self.codebook.value_type() {
+            DataType::Float16 => {
+                let qu = get_centroids(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float16Type>()
+                        .values(),
+                    self.num_bits,
+                    self.dimension,
+                    &u_codes,
+                );
+                let qv = get_centroids(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float16Type>()
+                        .values(),
+                    self.num_bits,
+                    self.dimension,
+                    &v_codes,
+                );
+                self.distance_type.func()(&qu, &qv)
+            }
+            DataType::Float32 => {
+                let qu = get_centroids(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float32Type>()
+                        .values(),
+                    self.num_bits,
+                    self.dimension,
+                    &u_codes,
+                );
+                let qv = get_centroids(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float32Type>()
+                        .values(),
+                    self.num_bits,
+                    self.dimension,
+                    &v_codes,
+                );
+                self.distance_type.func()(&qu, &qv)
+            }
+            DataType::Float64 => {
+                let qu = get_centroids(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float64Type>()
+                        .values(),
+                    self.num_bits,
+                    self.dimension,
+                    &u_codes,
+                );
+                let qv = get_centroids(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float64Type>()
+                        .values(),
+                    self.num_bits,
+                    self.dimension,
+                    &v_codes,
+                );
+                self.distance_type.func()(&qu, &qv)
+            }
+            _ => unimplemented!("Unsupported data type: {:?}", self.codebook.value_type()),
+        }
+    }
 }
 
 /// Distance calculator backed by PQ code.
