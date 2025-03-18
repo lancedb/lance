@@ -1132,9 +1132,18 @@ def test_retrain_indices(indexed_dataset):
     indices = indexed_dataset.list_indices()
     assert len(indices) == 2
 
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    centroids = stats["indices"][0]["centroids"]
+    delta_centroids = stats["indices"][1]["centroids"]
+    assert centroids == delta_centroids
+
     indexed_dataset.optimize.optimize_indices(retrain=True)
+    new_centroids = indexed_dataset.stats.index_stats("vector_idx")["indices"][0][
+        "centroids"
+    ]
     indices = indexed_dataset.list_indices()
     assert len(indices) == 1
+    assert centroids != new_centroids
 
 
 def test_no_include_deleted_rows(indexed_dataset):

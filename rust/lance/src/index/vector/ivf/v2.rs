@@ -1018,6 +1018,8 @@ mod tests {
         let original_avg_loss = get_avg_loss(&dataset).await;
         let original_ivf = &original_ivfs[0];
         let mut count = 0;
+        #[allow(unused_assignments)]
+        let mut last_avg_loss = original_avg_loss;
         // append more rows and make delta index until hitting the retrain threshold
         loop {
             let range = match count {
@@ -1031,8 +1033,8 @@ mod tests {
                 .unwrap();
             count += 1;
 
-            let new_avg_loss = get_avg_loss(&dataset).await;
-            if new_avg_loss / original_avg_loss >= AVG_LOSS_RETRAIN_THRESHOLD {
+            last_avg_loss = get_avg_loss(&dataset).await;
+            if last_avg_loss / original_avg_loss >= AVG_LOSS_RETRAIN_THRESHOLD {
                 if count <= 1 {
                     // the first append is with the same data distribution, so the loss should be
                     // very close to the original loss, then it shouldn't hit the retrain threshold
@@ -1071,6 +1073,7 @@ mod tests {
         let ivf_models = get_ivf_models(&dataset).await;
         let ivf = &ivf_models[0];
         assert_ne!(original_ivf.centroids, ivf.centroids);
+        assert_lt!(get_avg_loss(&dataset).await, last_avg_loss);
     }
 
     #[tokio::test]

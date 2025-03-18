@@ -16,6 +16,18 @@ use lance_linalg::{
 };
 
 /// Train KMeans model and returns the centroids of each cluster.
+///
+/// Parameters
+/// ----------
+/// - *centroids*: initial centroids, use the random initialization if None
+/// - *array*: a flatten floating number array of vectors
+/// - *dimension*: dimension of the vector
+/// - *k*: number of clusters
+/// - *max_iterations*: maximum number of iterations
+/// - *redos*: number of times to redo the k-means clustering
+/// - *rng*: random number generator
+/// - *distance_type*: distance type to compute pair-wise vector distance
+/// - *sample_rate*: sample rate to select the data for training
 #[allow(clippy::too_many_arguments)]
 pub fn train_kmeans<T: ArrowPrimitiveType>(
     centroids: Option<Arc<FixedSizeListArray>>,
