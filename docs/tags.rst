@@ -11,8 +11,8 @@ and :meth:`delete <lance.dataset.Tags.delete>` or :py:meth:`list <lance.dataset.
 
 .. note::
 
-    Creating or deleting a tag does not create a new version of the dataset. Tags are stored as auxiliary metadata
-    in a separate directory.
+    Creating or deleting tags does not generate new dataset versions.
+    Tags exist as auxiliary metadata stored in a separate directory.
 
 .. testsetup::
 
