@@ -10,6 +10,14 @@ For example, you can :py:meth:`create <lance.dataset.Tags.create>`, :meth:`updat
 and :meth:`delete <lance.dataset.Tags.delete>` or :py:meth:`list <lance.dataset.Tags.list>` tags.
 
 
+.. warning::
+
+    Tagged versions are exempted from the :py:meth:`LanceDataset.cleanup_old_versions() <lance.LanceDataset.cleanup_old_versions>`
+    process.
+
+    To remove a version that has been tagged, you must first :py:meth:`LanceDataset.tags.delete() <lance.dataset.Tags.delete>`
+    the associated tag.
+
 .. testsetup::
 
     shutil.rmtree("./tags.lance", ignore_errors=True)
@@ -35,4 +43,3 @@ and :meth:`delete <lance.dataset.Tags.delete>` or :py:meth:`list <lance.dataset.
     >>> ds.tags.delete("v1-prod")
     >>> ds.tags.list()
     {}
-

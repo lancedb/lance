@@ -285,8 +285,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         .. warning::
 
-            Once a dataset version is tagged, it will be excluded from
-            :py:meth:`cleanup_old_versions()` process.
+            Tagged versions are exempted from the :py:meth:`cleanup_old_versions()` process.
+
+            To remove a version that has been tagged, you must first :py:meth:`~Tags.delete`
+            the associated tag.
 
         Examples
         --------
