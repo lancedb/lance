@@ -463,7 +463,7 @@ def test_fragment_metadata_pickle(tmp_path: Path, enable_move_stable_row_ids: bo
 
 def test_write_fragment_with_file_writer_option(tmp_path: Path):
     df = pd.DataFrame({"a": [1, 2, 3, 4, 5]})
-    file_writer_options = {"data_cache_bytes": 4096, "max_page_bytes": 4096}
+    file_writer_options = {"data_cache_bytes": "4096", "max_page_bytes": "4096"}
     frag = LanceFragment.create(tmp_path, df, file_writer_options=file_writer_options)
 
     assert len(frag.files) == 1
