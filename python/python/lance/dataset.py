@@ -838,7 +838,7 @@ class LanceDataset(pa.dataset.Dataset):
             [self._ds.take(indices, columns, columns_with_transform)]
         )
 
-    def _take_rows(
+    def take_rows(
         self,
         row_ids: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
