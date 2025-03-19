@@ -4,11 +4,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow::array::AsArray;
+use arrow::datatypes;
+use arrow_array::{FixedSizeListArray, RecordBatch, UInt64Array};
 use futures::prelude::stream::{StreamExt, TryStreamExt};
 use futures::{stream, FutureExt};
 use itertools::Itertools;
-use lance_arrow::RecordBatchExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, ROW_ID_FIELD};
@@ -16,13 +18,14 @@ use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::FileReaderOptions;
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
 };
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::v3::shuffler::IvfShufflerReader;
 use lance_index::vector::v3::subindex::SubIndexType;
-use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY};
+use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY, PQ_CODE_COLUMN};
 use lance_index::{
     pb,
     vector::{
@@ -352,18 +355,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         // If metric type is cosine, normalize the training data, and after this point,
         // treat the metric type as L2.
-        let (training_data, dt) = if self.distance_type == DistanceType::Cosine {
-            let training_data = lance_linalg::kernels::normalize_fsl(&training_data)?;
-            (training_data, DistanceType::L2)
+        let training_data = if self.distance_type == DistanceType::Cosine {
+            lance_linalg::kernels::normalize_fsl(&training_data)?
         } else {
-            (training_data, self.distance_type)
+            training_data
         };
 
         let training_data = match (self.ivf.as_ref(), Q::use_residual(self.distance_type)) {
             (Some(ivf), true) => {
                 let ivf_transformer = lance_index::vector::ivf::new_ivf_transformer(
                     ivf.centroids.clone().unwrap(),
-                    dt,
+                    DistanceType::L2,
                     vec![],
                 );
                 span!(Level::INFO, "compute residual for PQ training")
@@ -529,6 +531,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     sub_index_params,
                     batches,
                     partition,
+                    column,
                 )
                 .await
                 .map(|res| (res, loss))
@@ -563,10 +566,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         sub_index_params: S::BuildParams,
         batches: Vec<RecordBatch>,
         part_id: usize,
+        column: String,
     ) -> Result<(usize, usize)> {
         let local_store = ObjectStore::local();
         // build quantized vector storage
-        let storage = StorageBuilder::new(distance_type, quantizer)?.build(batches)?;
+        let storage = StorageBuilder::new(column, distance_type, quantizer)?.build(batches)?;
 
         let path = temp_dir.child(format!("storage_part{}", part_id));
         let batches = storage.to_batches()?;
@@ -611,7 +615,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 ))?;
 
             let part_storage = existing_index.load_partition_storage(part_id).await?;
-            let part_batches = part_storage.to_batches()?;
+            let mut part_batches = part_storage.to_batches()?.collect::<Vec<_>>();
+            // for PQ, the PQ codes are transposed, so we need to transpose them back
+            if matches!(Q::quantization_type(), QuantizationType::Product) {
+                for batch in part_batches.iter_mut() {
+                    let codes = batch[PQ_CODE_COLUMN]
+                        .as_fixed_size_list()
+                        .values()
+                        .as_primitive::<datatypes::UInt8Type>();
+                    let codes_num_bytes = codes.len() / batch.num_rows();
+                    let original_codes = transpose(codes, codes_num_bytes, batch.num_rows());
+                    let original_codes = FixedSizeListArray::try_new_from_values(
+                        original_codes,
+                        codes_num_bytes as i32,
+                    )?;
+                    *batch =
+                        batch.replace_column_by_name(PQ_CODE_COLUMN, Arc::new(original_codes))?;
+                }
+            }
             batches.extend(part_batches);
         }
 
