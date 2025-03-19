@@ -78,7 +78,11 @@ pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
         .flat_map(|(i, sub_vec)| {
             let subvec_centroids =
                 get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
-            dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length)
+            // we define dot distance as `1.0 - dot(a, b)`,
+            // this would cause the total distance to be `num_sub_vectors - dot(a, b)`.
+            // So here we convert it to `-dot(a, b)`,
+            // and add 1.0 to the total distance later.
+            dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length).map(|dist| dist - 1.0)
         })
         .exact_size(num_sub_vectors * num_centroids)
         .collect()
@@ -116,7 +120,7 @@ pub(super) fn compute_pq_distance(
     // and `code` is a flatten array of [num_sub_vectors, num_vectors] u8,
     // so code[i * num_vectors + j] is the code of i-th sub-vector of the j-th vector.
     let num_vectors = code.len() / num_sub_vectors;
-    let mut distances = vec![1.0 - num_sub_vectors as f32; num_vectors];
+    let mut distances = vec![0.0; num_vectors];
     // it must be 8
     const NUM_CENTROIDS: usize = 2_usize.pow(8);
     for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
@@ -143,7 +147,7 @@ pub(super) fn compute_pq_distance_4bit(
     let (qmin, qmax, distance_table) = quantize_distance_table(distance_table);
     let num_vectors = code.len() * 2 / num_sub_vectors;
     // store the distances in f32 to avoid overflow
-    let mut distances = vec![1.0 - num_sub_vectors as f32; num_vectors];
+    let mut distances = vec![0.0; num_vectors];
     const NUM_CENTROIDS: usize = 2_usize.pow(4);
     for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
         debug_assert_eq!(vec_indices.len(), distances.len());

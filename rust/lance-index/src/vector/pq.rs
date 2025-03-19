@@ -276,6 +276,8 @@ impl ProductQuantizer {
             self.num_sub_vectors,
             code.values(),
         );
+
+        let distances = distances.into_iter().map(|d| d + 1.0).collect::<Vec<_>>();
         Ok(distances.into())
     }
 

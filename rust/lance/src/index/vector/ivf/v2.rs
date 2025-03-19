@@ -1072,7 +1072,7 @@ mod tests {
     #[rstest]
     #[case(4, DistanceType::L2, 0.85)]
     #[case(4, DistanceType::Cosine, 0.85)]
-    // #[case(4, DistanceType::Dot, 0.8)]
+    #[case(4, DistanceType::Dot, 0.8)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq_4bit(
         #[case] nlist: usize,
