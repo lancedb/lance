@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::datatypes;
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow_array::{FixedSizeListArray, RecordBatch, UInt64Array};
 use futures::prelude::stream::{StreamExt, TryStreamExt};
 use futures::{stream, FutureExt};
 use itertools::Itertools;
-use lance_arrow::RecordBatchExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, ROW_ID_FIELD};
@@ -601,9 +601,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         .as_fixed_size_list()
                         .values()
                         .as_primitive::<datatypes::UInt8Type>();
-
-                    let original_codes =
-                        transpose(codes, codes.len() / batch.num_rows(), batch.num_rows());
+                    let codes_num_bytes = codes.len() / batch.num_rows();
+                    let original_codes = transpose(codes, codes_num_bytes, batch.num_rows());
+                    let original_codes = FixedSizeListArray::try_new_from_values(
+                        original_codes,
+                        codes_num_bytes as i32,
+                    )?;
                     *batch =
                         batch.replace_column_by_name(PQ_CODE_COLUMN, Arc::new(original_codes))?;
                 }
