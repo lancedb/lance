@@ -1637,20 +1637,24 @@ impl Scanner {
                 .collect();
 
             let index_uuids = match &self.fragments {
-                Some(fragments) => index_uuids.into_iter().filter(|f|  {
-                    match &f.fragment_bitmap {
+                Some(fragments) => index_uuids
+                    .into_iter()
+                    .filter(|f| match &f.fragment_bitmap {
                         Some(bitmap) => fragments.iter().any(|f| bitmap.contains(f.id as u32)),
-                        None => true
-                    }
-                }).collect(),
-                None => index_uuids
+                        None => true,
+                    })
+                    .collect(),
+                None => index_uuids,
             };
 
             let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
 
             let unindexed_fragments = match &self.fragments {
-                Some(fragments) => unindexed_fragments.into_iter().filter(|f| fragments.contains(f)).collect(),
-                None => unindexed_fragments
+                Some(fragments) => unindexed_fragments
+                    .into_iter()
+                    .filter(|f| fragments.contains(f))
+                    .collect(),
+                None => unindexed_fragments,
             };
 
             let unindexed_scan_node = if unindexed_fragments.is_empty() {
