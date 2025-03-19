@@ -4603,6 +4603,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fts_fuzzy_query() {
+        let tempdir = tempfile::tempdir().unwrap();
+
+        let params = InvertedIndexParams::default();
+        let text_col = GenericStringArray::<i32>::from(vec![
+            "fa", "fo", "fob", "focus", "foo", "food", "foul",
+        ]);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "text",
+                text_col.data_type().to_owned(),
+                false,
+            )])
+            .into(),
+            vec![Arc::new(text_col) as ArrayRef],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(batches, tempdir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new_fuzzy("foo".to_owned(), 1))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 4);
+        let texts = results["text"]
+            .as_string::<i32>()
+            .iter()
+            .map(|s| s.unwrap().to_owned())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            texts,
+            vec![
+                "fo".to_owned(),   // 1 deletion
+                "fob".to_owned(),  // 1 substitution
+                "foo".to_owned(),  // 0 edits
+                "food".to_owned(), // 1 insertion
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[tokio::test]
     async fn test_fts_on_multiple_columns() {
         let tempdir = tempfile::tempdir().unwrap();
 

@@ -256,10 +256,18 @@ pub struct FullTextSearchQuery {
     /// The columns to search,
     /// if empty, search all indexed columns
     pub columns: Vec<String>,
+
     /// The full text search query
     pub query: String,
+
     /// The maximum number of results to return
     pub limit: Option<i64>,
+
+    /// fuzzy query max distance
+    /// if None, then it is not used (not a fuzzy query),
+    /// if Some(n), then it is a fuzzy query with max distance n
+    pub max_distance: Option<u32>,
+
     /// The wand factor to use for ranking
     /// if None, use the default value of 1.0
     /// Increasing this value will reduce the recall and improve the performance
@@ -273,6 +281,17 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             columns: vec![],
+            max_distance: None,
+            wand_factor: None,
+        }
+    }
+
+    pub fn new_fuzzy(query: String, max_distance: u32) -> Self {
+        Self {
+            query,
+            limit: None,
+            columns: vec![],
+            max_distance: Some(max_distance),
             wand_factor: None,
         }
     }
@@ -286,6 +305,11 @@ impl FullTextSearchQuery {
 
     pub fn limit(mut self, limit: Option<i64>) -> Self {
         self.limit = limit;
+        self
+    }
+
+    pub fn max_distance(mut self, max_distance: Option<u32>) -> Self {
+        self.max_distance = max_distance;
         self
     }
 

@@ -20,6 +20,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
+use fst::{IntoStreamer, Streamer};
 use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
@@ -115,20 +116,57 @@ impl InvertedIndex {
     ) -> Result<Vec<(u64, f32)>> {
         let mut tokenizer = self.tokenizer.clone();
         let tokens = collect_tokens(&query.query, &mut tokenizer, None);
-        let token_ids = self.map(&tokens).into_iter();
-        let token_ids = if !is_phrase_query(&query.query) {
-            token_ids.sorted_unstable().dedup().collect()
-        } else {
-            if !self.inverted_list.has_positions() {
-                return Err(Error::Index { message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), location: location!() });
+        let token_ids = match query.max_distance {
+            Some(max_dist) => {
+                if tokens.len() != 1 {
+                    return Err(Error::Index {
+                        message: format!(
+                            "the number of tokens must be 1 for fuzzy search but got {}",
+                            tokens.len()
+                        ),
+                        location: location!(),
+                    });
+                }
+                let token = &tokens[0];
+                let lev = fst::automaton::Levenshtein::new(&token, max_dist).map_err(|e| {
+                    Error::Index {
+                        message: format!("failed to construct the fuzzy query: {}", e),
+                        location: location!(),
+                    }
+                })?;
+                if let TokenMap::Fst(ref map) = self.tokens.tokens {
+                    let mut stream = map.search(lev).into_stream();
+                    let mut token_ids = Vec::new();
+                    while let Some((_, token_id)) = stream.next() {
+                        token_ids.push(token_id as u32);
+                    }
+                    token_ids
+                } else {
+                    return Err(Error::Index {
+                        message: "tokens is not fst, which is not expected".to_owned(),
+                        location: location!(),
+                    });
+                }
             }
-            let token_ids = token_ids.collect::<Vec<_>>();
-            // for phrase query, all tokens must be present
-            if token_ids.len() != tokens.len() {
-                return Ok(Vec::new());
+            None => {
+                let mut token_ids = self.map(&tokens);
+                if is_phrase_query(&query.query) {
+                    if !self.inverted_list.has_positions() {
+                        return Err(Error::Index { message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), location: location!() });
+                    }
+                    // some tokens are missed,
+                    // so the phrase query will not match any documents
+                    if token_ids.len() != tokens.len() {
+                        return Ok(Vec::new());
+                    }
+                } else {
+                    token_ids.sort_unstable();
+                    token_ids.dedup();
+                }
+                token_ids
             }
-            token_ids
         };
+
         self.bm25_search(token_ids, query, prefilter).await
     }
 
@@ -180,7 +218,7 @@ impl InvertedIndex {
     }
 
     fn to_builder(&self) -> InvertedIndexBuilder {
-        let tokens = self.tokens.clone();
+        let tokens = self.tokens.clone().into_mut();
         let inverted_list = self.inverted_list.clone();
         let docs = self.docs.clone();
         InvertedIndexBuilder::from_existing_index(self.params.clone(), tokens, inverted_list, docs)
@@ -318,17 +356,69 @@ impl ScalarIndex for InvertedIndex {
     }
 }
 
+// at indexing, we use HashMap because we need it to be mutable,
+// at searching, we use fst::Map because it's more efficient
+#[derive(Debug, Clone)]
+pub(crate) enum TokenMap {
+    HashMap(HashMap<String, u32>),
+    Fst(fst::Map<Vec<u8>>),
+}
+
+impl Default for TokenMap {
+    fn default() -> Self {
+        Self::HashMap(HashMap::new())
+    }
+}
+
+impl DeepSizeOf for TokenMap {
+    fn deep_size_of_children(&self, ctx: &mut deepsize::Context) -> usize {
+        match self {
+            TokenMap::HashMap(map) => map.deep_size_of_children(ctx),
+            TokenMap::Fst(map) => map.as_fst().size(),
+        }
+    }
+}
+
+impl TokenMap {
+    pub fn len(&self) -> usize {
+        match self {
+            TokenMap::HashMap(map) => map.len(),
+            TokenMap::Fst(map) => map.len(),
+        }
+    }
+}
+
 // TokenSet is a mapping from tokens to token ids
-// it also records the frequency of each token
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct TokenSet {
-    // token -> (token_id, frequency)
-    pub(crate) tokens: HashMap<String, u32>,
+    // token -> token_id
+    pub(crate) tokens: TokenMap,
     pub(crate) next_id: u32,
     total_length: usize,
 }
 
 impl TokenSet {
+    pub fn into_mut(self) -> Self {
+        let tokens = match self.tokens {
+            TokenMap::HashMap(map) => map,
+            TokenMap::Fst(map) => {
+                let mut new_map = HashMap::with_capacity(map.len());
+                let mut stream = map.into_stream();
+                while let Some((token, token_id)) = stream.next() {
+                    new_map.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
+                }
+
+                new_map
+            }
+        };
+
+        Self {
+            tokens: TokenMap::HashMap(tokens),
+            next_id: self.next_id,
+            total_length: self.total_length,
+        }
+    }
+
     pub fn num_tokens(&self) -> usize {
         self.tokens.len()
     }
@@ -336,10 +426,19 @@ impl TokenSet {
     pub fn to_batch(self) -> Result<RecordBatch> {
         let mut token_builder = StringBuilder::with_capacity(self.tokens.len(), self.total_length);
         let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
-        for (token, token_id) in self.tokens.into_iter().sorted_unstable() {
-            token_builder.append_value(token);
-            token_id_builder.append_value(token_id);
+
+        if let TokenMap::HashMap(map) = self.tokens {
+            for (token, token_id) in map.into_iter().sorted_unstable() {
+                token_builder.append_value(&token);
+                token_id_builder.append_value(token_id);
+            }
+        } else {
+            return Err(Error::Index {
+                message: "tokens is not a HashMap".to_owned(),
+                location: location!(),
+            });
         }
+
         let token_col = token_builder.finish();
         let token_id_col = token_id_builder.finish();
 
@@ -361,21 +460,29 @@ impl TokenSet {
     pub async fn load(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let mut next_id = 0;
         let mut total_length = 0;
-        let mut tokens = HashMap::new();
+        let mut tokens = fst::MapBuilder::memory();
 
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let token_col = batch[TOKEN_COL].as_string::<i32>();
         let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
 
         for (token, &token_id) in token_col.iter().zip(token_id_col.values().iter()) {
-            let token = token.unwrap();
+            let token = token.ok_or(Error::Index {
+                message: "found null token in token set".to_owned(),
+                location: location!(),
+            })?;
             next_id = next_id.max(token_id + 1);
             total_length += token.len();
-            tokens.insert(token.to_owned(), token_id);
+            tokens
+                .insert(token, token_id as u64)
+                .map_err(|e| Error::Index {
+                    message: format!("failed to insert token {}: {}", token, e),
+                    location: location!(),
+                })?;
         }
 
         Ok(Self {
-            tokens,
+            tokens: TokenMap::Fst(tokens.into_map()),
             next_id,
             total_length,
         })
@@ -384,7 +491,10 @@ impl TokenSet {
     pub fn add(&mut self, token: String) -> u32 {
         let next_id = self.next_id();
         let len = token.len();
-        let token_id = *self.tokens.entry(token).or_insert(next_id);
+        let token_id = match self.tokens {
+            TokenMap::HashMap(ref mut map) => *map.entry(token).or_insert(next_id),
+            _ => unreachable!("tokens must be HashMap while indexing"),
+        };
 
         // add token if it doesn't exist
         if token_id == next_id {
@@ -396,11 +506,10 @@ impl TokenSet {
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
-        self.tokens.get(token).copied()
-    }
-
-    pub fn all_tokens(&self) -> impl Iterator<Item = u32> + '_ {
-        self.tokens.values().copied()
+        match self.tokens {
+            TokenMap::HashMap(ref map) => map.get(token).copied(),
+            TokenMap::Fst(ref map) => map.get(token).map(|id| id as u32),
+        }
     }
 
     pub fn next_id(&self) -> u32 {

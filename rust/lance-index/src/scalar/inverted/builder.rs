@@ -112,11 +112,17 @@ impl InvertedIndexBuilder {
 
         // init the token maps
         let mut token_maps = vec![HashMap::new(); num_shards];
-        for (token, token_id) in self.tokens.tokens.iter() {
-            let mut hasher = DefaultHasher::new();
-            hasher.write(token.as_bytes());
-            let shard = hasher.finish() as usize % num_shards;
-            token_maps[shard].insert(token.clone(), *token_id);
+
+        match self.tokens.tokens {
+            TokenMap::HashMap(ref tokens) => {
+                for (token, token_id) in tokens.iter() {
+                    let mut hasher = DefaultHasher::new();
+                    hasher.write(token.as_bytes());
+                    let shard = hasher.finish() as usize % num_shards;
+                    token_maps[shard].insert(token.clone(), *token_id);
+                }
+            }
+            _ => unreachable!("tokens must be HashMap at indexing"),
         }
 
         // spawn `num_shards` workers to build the index,
