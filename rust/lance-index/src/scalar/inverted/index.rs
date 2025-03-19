@@ -386,6 +386,10 @@ impl TokenMap {
             Self::Fst(map) => map.len(),
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 // TokenSet is a mapping from tokens to token ids
