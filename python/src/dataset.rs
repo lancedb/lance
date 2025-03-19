@@ -561,7 +561,19 @@ impl Dataset {
             } else {
                 None
             };
-            let full_text_query = FullTextSearchQuery::new(query).columns(columns);
+            let max_distance =
+                if let Some(max_distance) = full_text_query.get_item("max_distance")? {
+                    if max_distance.is_none() {
+                        None
+                    } else {
+                        Some(max_distance.extract::<u32>()?)
+                    }
+                } else {
+                    None
+                };
+            let full_text_query = FullTextSearchQuery::new(query)
+                .columns(columns)
+                .max_distance(max_distance);
             scanner
                 .full_text_search(full_text_query)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;

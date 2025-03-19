@@ -3358,14 +3358,32 @@ class ScannerBuilder:
         self,
         query: str,
         columns: Optional[List[str]] = None,
+        max_distance: Optional[int] = None,
     ) -> ScannerBuilder:
         """
         Filter rows by full text searching. *Experimental API*,
         may remove it after we support to do this within `filter` SQL-like expression
 
         Must create inverted index on the given column before searching,
+
+        Parameters
+        ----------
+        query : str
+            The query string to search for.
+        columns : list of str, optional
+            The columns to search in. If None, search in all indexed columns.
+        max_distance : int, optional
+            The maximum distance between words to consider a match.
+            If None, then it is not used in the search.
+            Otherwise, it must be a positive integer, and the query is fuzzy query.
+            Any token within the max_distance will be considered a match,
+            the distance is edit distance (insertions, deletions, substitutions).
         """
-        self._full_text_query = {"query": query, "columns": columns}
+        self._full_text_query = {
+            "query": query,
+            "columns": columns,
+            "max_distance": max_distance,
+        }
         return self
 
     def to_scanner(self) -> LanceScanner:
