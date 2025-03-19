@@ -150,7 +150,7 @@ async fn do_take_rows(
         })?;
 
         let reader = fragment
-            .open(&projection.physical_schema, FragReadConfig::default(), None)
+            .open(&projection.physical_schema, FragReadConfig::default())
             .await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_addr_stats.sorted {

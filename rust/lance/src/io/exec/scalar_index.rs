@@ -10,7 +10,7 @@ use datafusion::{
     common::{stats::Precision, Statistics},
     physical_plan::{
         execution_plan::{Boundedness, EmissionType},
-        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
+        metrics::{ExecutionPlanMetricsSet, MetricsSet},
         stream::RecordBatchStreamAdapter,
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     },
@@ -154,7 +154,6 @@ impl ExecutionPlan for ScalarIndexExec {
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
         let batch_fut = Self::do_execute(self.expr.clone(), self.dataset.clone());
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
@@ -162,7 +161,8 @@ impl ExecutionPlan for ScalarIndexExec {
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             SCALAR_INDEX_SCHEMA.clone(),
             stream,
-            baseline_metrics,
+            partition,
+            &self.metrics,
         )))
     }
 
@@ -340,7 +340,6 @@ impl ExecutionPlan for MapIndexExec {
         context: Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
         let index_vals = self.input.execute(partition, context)?;
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let stream_fut =
             Self::do_execute(index_vals, self.dataset.clone(), self.column_name.clone());
         let stream = futures::stream::iter(vec![stream_fut])
@@ -350,7 +349,8 @@ impl ExecutionPlan for MapIndexExec {
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             INDEX_LOOKUP_SCHEMA.clone(),
             stream,
-            baseline_metrics,
+            partition,
+            &self.metrics,
         )))
     }
 
@@ -630,9 +630,8 @@ impl ExecutionPlan for MaterializeIndexExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<datafusion::execution::context::TaskContext>,
+        context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let batch_fut = Self::do_execute(
             self.expr.clone(),
             self.dataset.clone(),
@@ -646,11 +645,12 @@ impl ExecutionPlan for MaterializeIndexExec {
             MATERIALIZE_INDEX_SCHEMA.clone(),
             stream,
         ));
-        let stream = break_stream(stream, 64 * 1024);
+        let stream = break_stream(stream, context.session_config().batch_size());
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             MATERIALIZE_INDEX_SCHEMA.clone(),
             stream.map_err(|err| err.into()),
-            baseline_metrics,
+            partition,
+            &self.metrics,
         )))
     }
 
@@ -664,5 +664,100 @@ impl ExecutionPlan for MaterializeIndexExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{ops::Bound, sync::Arc};
+
+    use arrow::datatypes::UInt64Type;
+    use datafusion::{
+        execution::TaskContext, physical_plan::ExecutionPlan, prelude::SessionConfig,
+        scalar::ScalarValue,
+    };
+    use futures::TryStreamExt;
+    use lance_datagen::gen;
+    use lance_index::{
+        scalar::{expression::ScalarIndexExpr, SargableQuery, ScalarIndexParams},
+        DatasetIndexExt, IndexType,
+    };
+    use tempfile::{tempdir, TempDir};
+
+    use crate::{
+        io::exec::scalar_index::MaterializeIndexExec,
+        utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
+        Dataset,
+    };
+
+    struct TestFixture {
+        dataset: Arc<Dataset>,
+        _tmp_dir_guard: TempDir,
+    }
+
+    async fn test_fixture() -> TestFixture {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = gen()
+            .col("ordered", lance_datagen::array::step::<UInt64Type>())
+            .into_dataset(
+                test_uri,
+                FragmentCount::from(10),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["ordered"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        TestFixture {
+            dataset: Arc::new(dataset),
+            _tmp_dir_guard: test_dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_materialize_index_exec() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+
+        let query = ScalarIndexExpr::Query(
+            "ordered".to_string(),
+            Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::UInt64(Some(47))),
+            )),
+        );
+
+        let fragments = dataset.fragments().clone();
+
+        let plan = MaterializeIndexExec::new(dataset, query, fragments);
+
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 47);
+
+        let context =
+            TaskContext::default().with_session_config(SessionConfig::default().with_batch_size(5));
+        let stream = plan.execute(0, Arc::new(context)).unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches.len(), 10);
+        assert_eq!(batches[0].num_rows(), 5);
     }
 }

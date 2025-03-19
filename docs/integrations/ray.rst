@@ -34,13 +34,17 @@ Lance format is one of the official `Ray data sources <https://docs.ray.io/en/la
         .to_table()
         .to_pandas()
         .sort_values(by=["id"])
+        .reset_index(drop=True)
     )
-    assert df.equals(pd.DataFrame(data))
+    assert df.equals(pd.DataFrame(data)), "{} != {}".format(
+        df, pd.DataFrame(data)
+    )
 
     # Or via Ray.data.read_lance
     ray_df = (
         ray.data.read_lance("./alice_bob_and_charlie.lance")
         .to_pandas()
         .sort_values(by=["id"])
+        .reset_index(drop=True)
     )
     assert df.equals(ray_df)

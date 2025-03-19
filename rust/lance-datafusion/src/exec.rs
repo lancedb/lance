@@ -18,6 +18,7 @@ use datafusion::{
         TaskContext,
     },
     physical_plan::{
+        analyze::AnalyzeExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
@@ -29,10 +30,11 @@ use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use lazy_static::lazy_static;
 
-use futures::stream;
+use futures::{stream, StreamExt};
 use lance_arrow::SchemaExt;
-use lance_core::Result;
+use lance_core::{Error, Result};
 use log::{debug, info, warn};
+use snafu::location;
 
 /// An source execution node created from an existing stream
 ///
@@ -168,6 +170,7 @@ impl ExecutionPlan for OneShotExec {
 pub struct LanceExecutionOptions {
     pub use_spilling: bool,
     pub mem_pool_size: Option<u64>,
+    pub batch_size: Option<usize>,
 }
 
 const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
@@ -200,7 +203,7 @@ impl LanceExecutionOptions {
     }
 }
 
-pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
+pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     let session_config = SessionConfig::new();
     let mut runtime_env_builder = RuntimeEnvBuilder::new();
     if options.use_spilling() {
@@ -216,16 +219,16 @@ pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
 
 lazy_static! {
     static ref DEFAULT_SESSION_CONTEXT: SessionContext =
-        new_session_context(LanceExecutionOptions::default());
+        new_session_context(&LanceExecutionOptions::default());
     static ref DEFAULT_SESSION_CONTEXT_WITH_SPILLING: SessionContext = {
-        new_session_context(LanceExecutionOptions {
+        new_session_context(&LanceExecutionOptions {
             use_spilling: true,
             ..Default::default()
         })
     };
 }
 
-pub fn get_session_context(options: LanceExecutionOptions) -> SessionContext {
+pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     let session_ctx: SessionContext;
     if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE {
         if options.use_spilling() {
@@ -237,6 +240,18 @@ pub fn get_session_context(options: LanceExecutionOptions) -> SessionContext {
         session_ctx = new_session_context(options)
     }
     session_ctx
+}
+
+fn get_task_context(
+    session_ctx: &SessionContext,
+    options: &LanceExecutionOptions,
+) -> Arc<TaskContext> {
+    let mut state = session_ctx.state();
+    if let Some(batch_size) = options.batch_size.as_ref() {
+        state.config_mut().options_mut().execution.batch_size = *batch_size;
+    }
+
+    state.task_ctx()
 }
 
 /// Executes a plan using default session & runtime configuration
@@ -251,12 +266,37 @@ pub fn execute_plan(
         DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
     );
 
-    let session_ctx = get_session_context(options);
+    let session_ctx = get_session_context(&options);
 
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
     assert_eq!(plan.properties().partitioning.partition_count(), 1);
-    Ok(plan.execute(0, session_ctx.task_ctx())?)
+    Ok(plan.execute(0, get_task_context(&session_ctx, &options))?)
+}
+
+pub async fn analyze_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+) -> Result<String> {
+    let schema = plan.schema();
+    let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
+
+    let session_ctx = get_session_context(&options);
+    assert_eq!(analyze.properties().partitioning.partition_count(), 1);
+    let mut stream = analyze
+        .execute(0, get_task_context(&session_ctx, &options))
+        .map_err(|err| {
+            Error::io(
+                format!("Failed to execute analyze plan: {}", err),
+                location!(),
+            )
+        })?;
+
+    // fully execute the plan
+    while (stream.next().await).is_some() {}
+
+    let display = DisplayableExecutionPlan::with_metrics(analyze.as_ref());
+    Ok(format!("{}", display.indent(true)))
 }
 
 pub trait SessionContextExt {

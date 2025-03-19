@@ -91,6 +91,7 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
         indices: &[u32],
         batch_size: u32,
         projection: Arc<lance_core::datatypes::Schema>,
+        take_priority: Option<u32>,
     ) -> Result<ReadBatchTaskStream>;
 
     /// Return the number of rows in the file
@@ -223,6 +224,7 @@ impl GenericFileReader for V1Reader {
         indices: &[u32],
         _batch_size: u32,
         projection: Arc<Schema>,
+        _take_priority: Option<u32>,
     ) -> Result<ReadBatchTaskStream> {
         let indices_vec = indices.to_vec();
         let reader = self.reader.clone();
@@ -276,6 +278,8 @@ mod v2_adapter {
         reader: Arc<v2::reader::FileReader>,
         projection: Arc<Schema>,
         field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
+        default_priority: u32,
+        file_scheduler: FileScheduler,
     }
 
     impl Reader {
@@ -283,11 +287,15 @@ mod v2_adapter {
             reader: Arc<v2::reader::FileReader>,
             projection: Arc<Schema>,
             field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
+            default_priority: u32,
+            file_scheduler: FileScheduler,
         ) -> Self {
             Self {
                 reader,
                 projection,
                 field_id_to_column_idx,
+                default_priority,
+                file_scheduler,
             }
         }
     }
@@ -351,6 +359,7 @@ mod v2_adapter {
             indices: &[u32],
             batch_size: u32,
             projection: Arc<Schema>,
+            take_priority: Option<u32>,
         ) -> Result<ReadBatchTaskStream> {
             let indices = UInt32Array::from(indices.to_vec());
             let projection = ReaderProjection::from_field_ids(
@@ -358,8 +367,19 @@ mod v2_adapter {
                 projection.as_ref(),
                 self.field_id_to_column_idx.as_ref(),
             )?;
-            Ok(self
-                .reader
+
+            let reader = if let Some(take_priority) = take_priority {
+                let op_priority = ((take_priority as u64) << 32) | self.default_priority as u64;
+                let scheduler = self.file_scheduler.with_priority(op_priority);
+                Arc::new(
+                    self.reader
+                        .with_scheduler(Arc::new(LanceEncodingsIo(scheduler))),
+                )
+            } else {
+                self.reader.clone()
+            };
+
+            Ok(reader
                 .read_tasks(
                     ReadBatchParams::Indices(indices),
                     batch_size,
@@ -488,6 +508,7 @@ impl GenericFileReader for NullReader {
         indices: &[u32],
         batch_size: u32,
         projection: Arc<Schema>,
+        _take_priority: Option<u32>,
     ) -> Result<ReadBatchTaskStream> {
         let num_rows = indices.len() as u64;
         self.read_range_tasks(0..num_rows, batch_size, projection)
@@ -528,6 +549,19 @@ pub struct FragReadConfig {
     pub with_row_id: bool,
     // Add the row address column
     pub with_row_address: bool,
+    /// The scan scheduler to use for reading data files.
+    ///
+    /// This should be specified if multiple readers are being used in
+    /// an operation
+    pub scan_scheduler: Option<Arc<ScanScheduler>>,
+    /// The default scan priority to use for reading data files
+    ///
+    /// Only used if `scan_scheduler` is provided
+    ///
+    /// The overall priority for reads will be
+    ///
+    /// operation_priority: u32 | reader_priority: u32 | file_position: u64
+    pub reader_priority: Option<u32>,
 }
 
 impl FragReadConfig {
@@ -538,6 +572,16 @@ impl FragReadConfig {
 
     pub fn with_row_address(mut self, value: bool) -> Self {
         self.with_row_address = value;
+        self
+    }
+
+    pub fn with_scan_scheduler(mut self, value: Arc<ScanScheduler>) -> Self {
+        self.scan_scheduler = Some(value);
+        self
+    }
+
+    pub fn with_reader_priority(mut self, value: u32) -> Self {
+        self.reader_priority = Some(value);
         self
     }
 }
@@ -665,7 +709,10 @@ impl FileFragment {
         scan_scheduler: Arc<ScanScheduler>,
     ) -> Result<()> {
         for reader in self
-            .open_readers(dataset_schema, Some((scan_scheduler, 0)))
+            .open_readers(
+                dataset_schema,
+                &FragReadConfig::default().with_scan_scheduler(scan_scheduler),
+            )
             .await?
         {
             reader.update_storage_stats(field_stats);
@@ -722,9 +769,8 @@ impl FileFragment {
         &self,
         projection: &Schema,
         read_config: FragReadConfig,
-        scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
     ) -> Result<FragmentReader> {
-        let open_files = self.open_readers(projection, scan_scheduler);
+        let open_files = self.open_readers(projection, &read_config);
         let deletion_vec_load =
             self.load_deletion_vector(&self.dataset.object_store, &self.metadata);
 
@@ -783,7 +829,7 @@ impl FileFragment {
         &self,
         data_file: &DataFile,
         projection: Option<&Schema>,
-        scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
+        read_config: &FragReadConfig,
     ) -> Result<Option<Box<dyn GenericFileReader>>> {
         let full_schema = self.dataset.schema();
         // The data file may contain fields that are not part of the dataset any longer, remove those
@@ -821,23 +867,29 @@ impl FileFragment {
             Ok(None)
         } else {
             let path = self.dataset.data_dir().child(data_file.path.as_str());
-            let (store_scheduler, priority_offset) = scan_scheduler.unwrap_or_else(|| {
-                (
-                    ScanScheduler::new(
-                        self.dataset.object_store.clone(),
-                        SchedulerConfig::max_bandwidth(&self.dataset.object_store),
-                    ),
-                    0,
-                )
-            });
+            let (store_scheduler, reader_priority) =
+                if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
+                    (
+                        scan_scheduler.clone(),
+                        read_config.reader_priority.unwrap_or(0),
+                    )
+                } else {
+                    (
+                        ScanScheduler::new(
+                            self.dataset.object_store.clone(),
+                            SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                        ),
+                        0,
+                    )
+                };
             let file_scheduler = store_scheduler
-                .open_file_with_priority(&path, priority_offset)
+                .open_file_with_priority(&path, reader_priority as u64)
                 .await?;
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let path = file_scheduler.reader().path().clone();
             let reader = Arc::new(
                 v2::reader::FileReader::try_open_with_file_metadata(
-                    Arc::new(LanceEncodingsIo(file_scheduler)),
+                    Arc::new(LanceEncodingsIo(file_scheduler.clone())),
                     path,
                     None,
                     Arc::<DecoderPlugins>::default(),
@@ -861,7 +913,13 @@ impl FileFragment {
                         }
                     }),
             ));
-            let reader = v2_adapter::Reader::new(reader, schema_per_file, field_id_to_column_idx);
+            let reader = v2_adapter::Reader::new(
+                reader,
+                schema_per_file,
+                field_id_to_column_idx,
+                reader_priority,
+                file_scheduler,
+            );
             Ok(Some(Box::new(reader)))
         }
     }
@@ -869,12 +927,12 @@ impl FileFragment {
     async fn open_readers(
         &self,
         projection: &Schema,
-        scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
+        read_config: &FragReadConfig,
     ) -> Result<Vec<Box<dyn GenericFileReader>>> {
         let mut opened_files = vec![];
         for data_file in &self.metadata.files {
             if let Some(reader) = self
-                .open_reader(data_file, Some(projection), scan_scheduler.clone())
+                .open_reader(data_file, Some(projection), read_config)
                 .await?
             {
                 opened_files.push(reader);
@@ -998,7 +1056,7 @@ impl FileFragment {
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
         let reader = self
-            .open_reader(some_file, None, None)
+            .open_reader(some_file, None, &FragReadConfig::default())
             .await?
             .ok_or_else(|| Error::Internal {
                 message: format!(
@@ -1074,7 +1132,7 @@ impl FileFragment {
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
             let reader = self
-                .open_reader(data_file, None, None)
+                .open_reader(data_file, None, &FragReadConfig::default())
                 .await?
                 .ok_or_else(|| {
                     Error::corrupt_file(
@@ -1292,7 +1350,6 @@ impl FileFragment {
             .open(
                 projection,
                 FragReadConfig::default().with_row_address(with_row_address),
-                None,
             )
             .await?;
 
@@ -1302,7 +1359,7 @@ impl FileFragment {
             reader.legacy_read_range_as_batch(range).await
         } else {
             // FIXME, change this method to streams
-            reader.take_as_batch(row_offsets).await
+            reader.take_as_batch(row_offsets, None).await
         }
     }
 
@@ -1384,7 +1441,6 @@ impl FileFragment {
             FragReadConfig::default()
                 .with_row_address(with_row_addr)
                 .with_row_id(with_row_id),
-            None,
         );
         let deletion_vector = read_deletion_file(
             &self.dataset.base,
@@ -2130,20 +2186,36 @@ impl FragmentReader {
     }
 
     /// Take rows from this fragment.
-    pub async fn take(&self, indices: &[u32], batch_size: u32) -> Result<ReadBatchFutStream> {
+    pub async fn take(
+        &self,
+        indices: &[u32],
+        batch_size: u32,
+        take_priority: Option<u32>,
+    ) -> Result<ReadBatchFutStream> {
         let indices_arr = UInt32Array::from(indices.to_vec());
         self.new_read_impl(
             ReadBatchParams::Indices(indices_arr),
             batch_size,
-            move |reader| reader.take_all_tasks(indices, batch_size, reader.projection().clone()),
+            move |reader| {
+                reader.take_all_tasks(
+                    indices,
+                    batch_size,
+                    reader.projection().clone(),
+                    take_priority,
+                )
+            },
         )
     }
 
     /// Take rows from this fragment, will perform a copy if the underlying reader returns multiple
     /// batches.  May return an error if the taken rows do not fit into a single batch.
-    pub async fn take_as_batch(&self, indices: &[u32]) -> Result<RecordBatch> {
+    pub async fn take_as_batch(
+        &self,
+        indices: &[u32],
+        take_priority: Option<u32>,
+    ) -> Result<RecordBatch> {
         let batches = self
-            .take(indices, u32::MAX)
+            .take(indices, u32::MAX, take_priority)
             .await?
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
@@ -2347,7 +2419,6 @@ mod tests {
                 .open(
                     fragment.schema(),
                     FragReadConfig::default().with_row_id(with_row_id),
-                    None,
                 )
                 .await
                 .unwrap();
@@ -2371,7 +2442,6 @@ mod tests {
                 .open(
                     fragment.schema(),
                     FragReadConfig::default().with_row_id(with_row_id),
-                    None,
                 )
                 .await
                 .unwrap();
@@ -2410,7 +2480,6 @@ mod tests {
                     FragReadConfig::default()
                         .with_row_id(with_row_id)
                         .with_row_address(with_row_address),
-                    None,
                 )
                 .await
                 .unwrap();
@@ -2436,7 +2505,6 @@ mod tests {
                     FragReadConfig::default()
                         .with_row_id(with_row_id)
                         .with_row_address(with_row_address),
-                    None,
                 )
                 .await
                 .unwrap();
@@ -2471,7 +2539,6 @@ mod tests {
             .open(
                 dataset.schema(),
                 FragReadConfig::default().with_row_id(true),
-                None,
             )
             .await
             .unwrap();
@@ -2563,7 +2630,6 @@ mod tests {
                 .open(
                     dataset.schema(),
                     FragReadConfig::default().with_row_id(true),
-                    None,
                 )
                 .await
                 .unwrap();
@@ -3111,9 +3177,9 @@ mod tests {
             .get_fragments()
             .first()
             .unwrap()
-            .open(dataset.schema(), FragReadConfig::default(), None)
+            .open(dataset.schema(), FragReadConfig::default())
             .await?;
-        let actual_data = reader.take_as_batch(&[0, 1, 2]).await?;
+        let actual_data = reader.take_as_batch(&[0, 1, 2], None).await?;
         assert_eq!(expected_data.slice(0, 3), actual_data);
 
         let actual_data = reader
@@ -3165,7 +3231,6 @@ mod tests {
             .open(
                 &dataset.schema().project::<&str>(&[])?,
                 FragReadConfig::default().with_row_id(true),
-                None,
             )
             .await?;
         let batch = reader.legacy_read_range_as_batch(0..20).await?;
@@ -3181,7 +3246,6 @@ mod tests {
             .open(
                 &dataset.schema().project::<&str>(&[])?,
                 FragReadConfig::default(),
-                None,
             )
             .await;
         assert!(matches!(res, Err(Error::IO { .. })));
