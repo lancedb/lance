@@ -191,8 +191,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     // build the index with the all data in the dataset,
     pub async fn build(&mut self) -> Result<()> {
         if self.retrain {
-            // TODO: train the quantizer based on the existing one
-            self.quantizer = None;
             self.shuffle_reader = None;
             self.existing_indices = Vec::new();
         }
@@ -200,9 +198,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // step 1. train IVF & quantizer
         self.with_ivf(self.load_or_build_ivf().await?);
 
-        if self.quantizer.is_none() {
-            self.with_quantizer(self.load_or_build_quantizer().await?);
-        }
+        self.with_quantizer(self.load_or_build_quantizer().await?);
 
         // step 2. shuffle the dataset
         if self.shuffle_reader.is_none() {
@@ -338,15 +334,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     #[instrument(name = "load_or_build_quantizer", level = "debug", skip_all)]
     async fn load_or_build_quantizer(&self) -> Result<Q> {
+        if self.quantizer.is_some() && !self.retrain {
+            return Ok(self.quantizer.clone().unwrap());
+        }
+
         let dataset = self.dataset.as_ref().ok_or(Error::invalid_input(
             "dataset not set before loading or building quantizer",
             location!(),
         ))?;
-        let quantizer_params = self.quantizer_params.as_ref().ok_or(Error::invalid_input(
-            "quantizer build params not set",
-            location!(),
-        ))?;
-        let sample_size_hint = quantizer_params.sample_size();
+        let sample_size_hint = match &self.quantizer_params {
+            Some(params) => params.sample_size(),
+            None => 256 * 256, // here it must be retrain, let's just set sample size to the default value
+        };
 
         let start = std::time::Instant::now();
         info!(
@@ -383,7 +382,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         info!("Start to train quantizer");
         let start = std::time::Instant::now();
-        let quantizer = Q::build(&training_data, DistanceType::L2, quantizer_params)?;
+        let quantizer = match &self.quantizer {
+            Some(q) => {
+                let mut q = q.clone();
+                if self.retrain {
+                    q.retrain(&training_data)?;
+                }
+                q
+            }
+            None => {
+                let quantizer_params = self.quantizer_params.as_ref().ok_or(
+                    Error::invalid_input("quantizer build params not set", location!()),
+                )?;
+                Q::build(&training_data, DistanceType::L2, quantizer_params)?
+            }
+        };
         info!(
             "Trained quantizer in {:02} seconds",
             start.elapsed().as_secs_f32()
