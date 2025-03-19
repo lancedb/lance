@@ -753,8 +753,8 @@ impl DistCalculator for PQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
         let num_centroids = 2_usize.pow(self.num_bits);
         let pq_code = self.get_pq_code(id);
-
-        if self.num_bits == 4 {
+        let diff = self.num_sub_vectors as f32 - 1.0;
+        let dist = if self.num_bits == 4 {
             pq_code
                 .enumerate()
                 .map(|(i, c)| {
@@ -764,12 +764,18 @@ impl DistCalculator for PQDistCalculator {
                     self.distance_table[2 * i * num_centroids + current_idx]
                         + self.distance_table[(2 * i + 1) * num_centroids + next_idx]
                 })
-                .sum::<f32>()
+                .sum()
         } else {
             pq_code
                 .enumerate()
                 .map(|(i, c)| self.distance_table[i * num_centroids + c])
-                .sum::<f32>()
+                .sum()
+        };
+
+        if self.distance_type == DistanceType::Dot {
+            dist - diff
+        } else {
+            dist
         }
     }
 
@@ -806,7 +812,8 @@ impl DistCalculator for PQDistCalculator {
                     self.num_sub_vectors,
                     self.pq_code.values(),
                 );
-                dot_dists.into_iter().map(|v| v + 1.0).collect()
+                let diff = self.num_sub_vectors as f32 - 1.0;
+                dot_dists.into_iter().map(|v| v - diff).collect()
             }
             _ => unimplemented!("distance type is not supported: {:?}", self.distance_type),
         }

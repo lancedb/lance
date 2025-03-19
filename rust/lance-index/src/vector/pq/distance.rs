@@ -78,11 +78,7 @@ pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
         .flat_map(|(i, sub_vec)| {
             let subvec_centroids =
                 get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
-            // we define dot distance as `1.0 - dot(a, b)`,
-            // this would cause the total distance to be `num_sub_vectors - dot(a, b)`.
-            // So here we convert it to `-dot(a, b)`,
-            // and add 1.0 to the total distance later.
-            dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length).map(|dist| dist - 1.0)
+            dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length)
         })
         .exact_size(num_sub_vectors * num_centroids)
         .collect()
