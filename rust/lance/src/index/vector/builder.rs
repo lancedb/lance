@@ -327,8 +327,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // If metric type is cosine, normalize the training data, and after this point,
         // treat the metric type as L2.
         let training_data = if self.distance_type == DistanceType::Cosine {
-            let training_data = lance_linalg::kernels::normalize_fsl(&training_data)?;
-            training_data
+            lance_linalg::kernels::normalize_fsl(&training_data)?
         } else {
             training_data
         };

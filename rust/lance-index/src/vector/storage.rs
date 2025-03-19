@@ -162,7 +162,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
     pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
         let mut batch = concat_batches(batches[0].schema_ref(), batches.iter())?;
 
-        if batch.column_by_name(&self.quantizer.column()).is_none() {
+        if batch.column_by_name(self.quantizer.column()).is_none() {
             let vectors = batch
                 .column_by_name(&self.vector_column)
                 .ok_or(Error::Index {

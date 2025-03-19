@@ -738,7 +738,7 @@ impl PQDistCalculator {
         }
     }
 
-    fn get_pq_code<'a>(&'a self, id: u32) -> impl Iterator<Item = usize> + 'a {
+    fn get_pq_code(&self, id: u32) -> impl Iterator<Item = usize> + '_ {
         get_pq_code(
             self.pq_code.values(),
             self.num_bits,
@@ -813,12 +813,12 @@ impl DistCalculator for PQDistCalculator {
     }
 }
 
-fn get_pq_code<'a>(
-    pq_code: &'a [u8],
+fn get_pq_code(
+    pq_code: &[u8],
     num_bits: u32,
     num_sub_vectors: usize,
     id: u32,
-) -> impl Iterator<Item = u8> + 'a {
+) -> impl Iterator<Item = u8> + '_ {
     let num_bytes = if num_bits == 4 {
         num_sub_vectors / 2
     } else {
