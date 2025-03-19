@@ -17,18 +17,138 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 
-use pyo3::exceptions::PyAssertionError;
 use pyo3::exceptions::PyValueError;
 use pyo3::pyclass;
 use pyo3::pyfunction;
 use pyo3::pymethods;
 use pyo3::PyResult;
+use tracing::field::Visit;
+use tracing::span;
 use tracing::subscriber;
+use tracing::Level;
+use tracing::Subscriber;
+use tracing_chrome::ChromeLayer;
 use tracing_chrome::{ChromeLayerBuilder, TraceStyle};
 use tracing_subscriber::filter;
+use tracing_subscriber::filter::Filtered;
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::layer::Layered;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::Registry;
+
+pub type TracingSubscriber = Layered<Filtered<ChromeLayer<Registry>, Targets, Registry>, Registry>;
+
+lazy_static::lazy_static! {
+    static ref SUBSCRIBER: LoggingSubscriberRef = LoggingPassthrough::init();
+}
+
+struct LoggingPassthroughState {
+    inner: Option<TracingSubscriber>,
+    level: Level,
+}
+
+impl Default for LoggingPassthroughState {
+    fn default() -> Self {
+        Self {
+            inner: None,
+            // This value doesn't matter, we'll override it in `initialize_tracing`
+            level: Level::INFO,
+        }
+    }
+}
+
+#[derive(Default)]
+struct LoggingPassthrough {
+    state: RwLock<LoggingPassthroughState>,
+}
+
+impl LoggingPassthrough {
+    fn init() -> LoggingSubscriberRef {
+        let subscriber = LoggingSubscriberRef(Arc::new(LoggingPassthrough::default()));
+        subscriber::set_global_default(subscriber.clone()).unwrap();
+        subscriber
+    }
+}
+
+#[derive(Default)]
+struct EventToStr {
+    str: String,
+}
+
+impl Visit for EventToStr {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.str += &format!("{}={:?} ", field.name(), value);
+    }
+}
+
+#[derive(Clone)]
+pub struct LoggingSubscriberRef(Arc<LoggingPassthrough>);
+
+impl Subscriber for LoggingSubscriberRef {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.is_event() || self.0.state.read().unwrap().inner.is_some()
+    }
+
+    fn new_span(&self, span: &span::Attributes<'_>) -> span::Id {
+        let state = self.0.state.read().unwrap();
+        if let Some(inner) = &state.inner {
+            inner.new_span(span)
+        } else {
+            span::Id::from_u64(0)
+        }
+    }
+
+    fn record(&self, span: &span::Id, values: &span::Record<'_>) {
+        let state = self.0.state.read().unwrap();
+        if let Some(inner) = &state.inner {
+            inner.record(span, values);
+        }
+    }
+
+    fn record_follows_from(&self, span: &span::Id, follows: &span::Id) {
+        let state = self.0.state.read().unwrap();
+        if let Some(inner) = &state.inner {
+            inner.record_follows_from(span, follows);
+        }
+    }
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let state = self.0.state.read().unwrap();
+
+        if event.metadata().level() <= &state.level {
+            let log_level = match *event.metadata().level() {
+                Level::TRACE => log::Level::Trace,
+                Level::DEBUG => log::Level::Debug,
+                Level::INFO => log::Level::Info,
+                Level::WARN => log::Level::Warn,
+                Level::ERROR => log::Level::Error,
+            };
+            let mut fields = EventToStr::default();
+            event.record(&mut fields);
+            log::log!(target: "lance::events", log_level, "target=\"{}\" {}", event.metadata().target(), fields.str);
+        }
+
+        if let Some(inner) = &state.inner {
+            inner.event(event);
+        }
+    }
+
+    fn enter(&self, span: &span::Id) {
+        let state = self.0.state.read().unwrap();
+        if let Some(inner) = &state.inner {
+            inner.enter(span);
+        }
+    }
+
+    fn exit(&self, span: &span::Id) {
+        let state = self.0.state.read().unwrap();
+        if let Some(inner) = &state.inner {
+            inner.exit(span);
+        }
+    }
+}
 
 #[pyclass]
 pub struct TraceGuard {
@@ -76,11 +196,24 @@ pub fn trace_to_chrome(path: Option<&str>, level: Option<&str>) -> PyResult<Trac
         .with_target("lance", level_filter)
         .with_target("pylance", level_filter);
     let subscriber = Registry::default().with(chrome_layer.with_filter(filter));
-    subscriber::set_global_default(subscriber)
-        .map(move |_| TraceGuard {
-            guard: Arc::new(Mutex::new(Some(guard))),
-        })
-        .map_err(|_| {
-            PyAssertionError::new_err("Attempt to configure tracing when it is already configured")
-        })
+
+    let mut state = SUBSCRIBER.0.state.write().unwrap();
+    state.inner.replace(subscriber);
+
+    Ok(TraceGuard {
+        guard: Arc::new(Mutex::new(Some(guard))),
+    })
+}
+
+pub fn initialize_tracing(level: log::Level) {
+    let tracing_level = match level {
+        log::Level::Trace => Level::TRACE,
+        log::Level::Debug => Level::DEBUG,
+        log::Level::Info => Level::INFO,
+        log::Level::Warn => Level::WARN,
+        log::Level::Error => Level::ERROR,
+    };
+
+    let mut state = SUBSCRIBER.0.state.write().unwrap();
+    state.level = tracing_level;
 }

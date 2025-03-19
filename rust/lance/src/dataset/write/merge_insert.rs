@@ -58,7 +58,7 @@ use futures::{
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::futures::Capacity,
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -461,15 +461,9 @@ impl MergeInsertJob {
             .dataset
             .empty_projection()
             .union_arrow_schema(schema.as_ref(), OnMissing::Error)?;
-        let mut target = Arc::new(
-            TakeExec::try_new(
-                self.dataset.clone(),
-                index_mapper,
-                projection,
-                get_num_compute_intensive_cpus(),
-            )?
-            .unwrap(),
-        ) as Arc<dyn ExecutionPlan>;
+        let mut target =
+            Arc::new(TakeExec::try_new(self.dataset.clone(), index_mapper, projection)?.unwrap())
+                as Arc<dyn ExecutionPlan>;
 
         // 5 - Take puts the row id and row addr at the beginning.  A full scan (used when there is
         //     no scalar index) puts the row id and addr at the end.  We need to match these up so
@@ -669,7 +663,7 @@ impl MergeInsertJob {
     ) -> Result<(Vec<Fragment>, Vec<Fragment>)> {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
-        let session_ctx = get_session_context(LanceExecutionOptions {
+        let session_ctx = get_session_context(&LanceExecutionOptions {
             use_spilling: true,
             ..Default::default()
         });
@@ -743,7 +737,6 @@ impl MergeInsertJob {
                             .open(
                                 dataset.schema(),
                                 FragReadConfig::default().with_row_address(true),
-                                None,
                             )
                             .await?;
                         let batch_size = reader.legacy_num_rows_in_batch(0).unwrap();
