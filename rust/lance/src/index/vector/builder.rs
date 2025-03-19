@@ -190,6 +190,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     // build the index with the all data in the dataset,
     pub async fn build(&mut self) -> Result<()> {
+        if self.retrain {
+            // TODO: train the quantizer based on the existing one
+            self.quantizer = None;
+            self.shuffle_reader = None;
+            self.existing_indices = Vec::new();
+        }
+
         // step 1. train IVF & quantizer
         self.with_ivf(self.load_or_build_ivf().await?);
 
@@ -511,6 +518,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let temp_dir = self.temp_dir.clone();
             let quantizer = quantizer.clone();
             let sub_index_params = sub_index_params.clone();
+            let column = self.column.clone();
             async move {
                 let (batches, loss) = Self::take_partition_batches(
                     partition,
