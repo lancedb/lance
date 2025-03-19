@@ -278,3 +278,100 @@ def test_dfs_query_then_fetch(tmp_tables, tmp_path):
         with_row_id=True,
     )
     assert sorted(table_to_tuple(text_neutral)) == sorted(table_to_tuple(text3_neutral))
+
+
+def test_fragment_fts(tmp_tables, tmp_path):
+    ds = lance.write_dataset(tmp_tables[0], tmp_path, mode="overwrite")
+    ds = lance.write_dataset(tmp_tables[1], tmp_path, mode="append")
+    ds = lance.write_dataset(tmp_tables[2], tmp_path, mode="append")
+    indices = []
+    frags = list(ds.get_fragments())
+    for f in frags:
+        # we can create an inverted index distributely
+        index = ds.create_scalar_index("text", "INVERTED", fragment_ids=[f.fragment_id])
+        assert isinstance(index, dict)
+        indices.append(index)
+
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=indices,
+        removed_indices=[],
+    )
+    ds = lance.LanceDataset.commit(
+        ds.uri,
+        create_index_op,
+        read_version=ds.version,
+    )
+
+    # test fragment level full text search
+    scanner = ds.scanner(
+        full_text_query={"columns": ["text"], "query": "several"},
+        prefilter=True,
+        with_row_id=True,
+        fragments=[frags[0]],
+    )
+    assert scanner.to_table()["_rowid"].to_pylist() == [1]
+
+    # test fragment level full text search with filter
+    scanner = ds.scanner(
+        full_text_query={"columns": ["text"], "query": "several"},
+        prefilter=True,
+        with_row_id=True,
+        fragments=[frags[0]],
+        filter="sentiment='neutral'",
+    )
+    assert scanner.to_table()["_rowid"].to_pylist() == [1]
+
+    # test fragment level full text search with filter
+    scanner = ds.scanner(
+        full_text_query={"columns": ["text"], "query": "puppy"},
+        prefilter=True,
+        with_row_id=True,
+        fragments=[frags[0]],
+        filter="sentiment='positive'",
+    )
+    assert scanner.to_table()["_rowid"].to_pylist() == []
+
+    # test second fragment
+    # test fragment level full text search
+    scanner = ds.scanner(
+        full_text_query={"columns": ["text"], "query": "very"},
+        prefilter=True,
+        with_row_id=True,
+        fragments=[frags[1]],
+    )
+    assert scanner.to_table()["_rowid"].to_pylist() == [(1 << 32) + 1]
+
+    # test fragment level full text search with filter
+    scanner = ds.scanner(
+        full_text_query={"columns": ["text"], "query": "very"},
+        prefilter=True,
+        with_row_id=True,
+        fragments=[frags[1]],
+        filter="sentiment='neutral'",
+    )
+    assert scanner.to_table()["_rowid"].to_pylist() == []
+
+    # test fragment level full text search with filter
+    scanner = ds.scanner(
+        full_text_query={"columns": ["text"], "query": "very"},
+        prefilter=True,
+        with_row_id=True,
+        fragments=[frags[1]],
+        filter="sentiment='positive'",
+    )
+    assert scanner.to_table()["_rowid"].to_pylist() == [(1 << 32) + 1]
+
+    with pytest.raises(ValueError):
+        # DfsQueryThenFetch is not supported for fragment level full text search,
+        # because it requires a new api to expose distributed frequency information.
+        scanner = ds.scanner(
+            full_text_query={
+                "columns": ["text"],
+                "query": "very",
+                "search_type": "DfsQueryThenFetch",
+            },
+            prefilter=True,
+            with_row_id=True,
+            fragments=[frags[1]],
+        )
+        assert scanner.to_table()["_rowid"].to_pylist() == [(1 << 32) + 1]

@@ -50,7 +50,7 @@ use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::inverted::{FTS_SCHEMA, SCORE_COL};
-use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
+use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType, SearchType};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -1611,6 +1611,13 @@ impl Scanner {
             .columns(Some(columns.clone()))
             .limit(self.limit);
 
+        if let (Some(_), SearchType::DfsQueryThenFetch) = (&self.fragments, &query.search_type) {
+            return Err(Error::NotSupported{
+                source: "Distributed frequency full text search at the fragment level is not currently supported".to_string().into(),
+                location: location!(),
+            });
+        }
+
         // load indices
         let mut column_inputs = Vec::with_capacity(columns.len());
         for column in columns {
@@ -1629,7 +1636,23 @@ impl Scanner {
                 .into_iter()
                 .collect();
 
+            let index_uuids = match &self.fragments {
+                Some(fragments) => index_uuids.into_iter().filter(|f|  {
+                    match &f.fragment_bitmap {
+                        Some(bitmap) => fragments.iter().any(|f| bitmap.contains(f.id as u32)),
+                        None => true
+                    }
+                }).collect(),
+                None => index_uuids
+            };
+
             let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+
+            let unindexed_fragments = match &self.fragments {
+                Some(fragments) => unindexed_fragments.into_iter().filter(|f| fragments.contains(f)).collect(),
+                None => unindexed_fragments
+            };
+
             let unindexed_scan_node = if unindexed_fragments.is_empty() {
                 Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
             } else {
