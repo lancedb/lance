@@ -1013,7 +1013,7 @@ mod tests {
             total_loss / num_rows as f64
         }
 
-        const AVG_LOSS_RETRAIN_THRESHOLD: f64 = 1.2;
+        const AVG_LOSS_RETRAIN_THRESHOLD: f64 = 1.1;
         let original_ivfs = get_ivf_models(&dataset).await;
         let original_avg_loss = get_avg_loss(&dataset).await;
         let original_ivf = &original_ivfs[0];
@@ -1024,7 +1024,10 @@ mod tests {
         loop {
             let range = match count {
                 0 => range.clone(),
-                _ => range.end.neg_wrapping().sub_wrapping(range.end)..range.end.neg_wrapping(),
+                _ => match params.metric_type {
+                    DistanceType::Hamming => range.end..range.end.mul_wrapping(range.end),
+                    _ => range.end.neg_wrapping()..range.start,
+                },
             };
             append_dataset::<T>(&mut dataset, 500, range).await;
             dataset
