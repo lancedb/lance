@@ -4608,7 +4608,7 @@ mod tests {
 
         let params = InvertedIndexParams::default();
         let text_col = GenericStringArray::<i32>::from(vec![
-            "fa", "fo", "fob", "focus", "foo", "food", "foul",
+            "fa", "fo", "fob", "focus", "foo", "food", "foul", // # spellchecker:disable-line
         ]);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![arrow_schema::Field::new(
@@ -4645,10 +4645,10 @@ mod tests {
         assert_eq!(
             texts,
             vec![
-                "fo".to_owned(),   // 1 deletion
-                "fob".to_owned(),  // 1 substitution
-                "foo".to_owned(),  // 0 edits
-                "food".to_owned(), // 1 insertion
+                "fo".to_owned(),   // 1 deletion        # spellchecker:disable-line
+                "fob".to_owned(),  // 1 substitution    # spellchecker:disable-line
+                "foo".to_owned(),  // 0 edits           # spellchecker:disable-line
+                "food".to_owned(), // 1 insertion       # spellchecker:disable-line
             ]
             .into_iter()
             .collect()

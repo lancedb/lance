@@ -128,7 +128,7 @@ impl InvertedIndex {
                     });
                 }
                 let token = &tokens[0];
-                let lev = fst::automaton::Levenshtein::new(&token, max_dist).map_err(|e| {
+                let lev = fst::automaton::Levenshtein::new(token, max_dist).map_err(|e| {
                     Error::Index {
                         message: format!("failed to construct the fuzzy query: {}", e),
                         location: location!(),
@@ -359,7 +359,7 @@ impl ScalarIndex for InvertedIndex {
 // at indexing, we use HashMap because we need it to be mutable,
 // at searching, we use fst::Map because it's more efficient
 #[derive(Debug, Clone)]
-pub(crate) enum TokenMap {
+pub enum TokenMap {
     HashMap(HashMap<String, u32>),
     Fst(fst::Map<Vec<u8>>),
 }
@@ -373,8 +373,8 @@ impl Default for TokenMap {
 impl DeepSizeOf for TokenMap {
     fn deep_size_of_children(&self, ctx: &mut deepsize::Context) -> usize {
         match self {
-            TokenMap::HashMap(map) => map.deep_size_of_children(ctx),
-            TokenMap::Fst(map) => map.as_fst().size(),
+            Self::HashMap(map) => map.deep_size_of_children(ctx),
+            Self::Fst(map) => map.as_fst().size(),
         }
     }
 }
@@ -382,8 +382,8 @@ impl DeepSizeOf for TokenMap {
 impl TokenMap {
     pub fn len(&self) -> usize {
         match self {
-            TokenMap::HashMap(map) => map.len(),
-            TokenMap::Fst(map) => map.len(),
+            Self::HashMap(map) => map.len(),
+            Self::Fst(map) => map.len(),
         }
     }
 }
