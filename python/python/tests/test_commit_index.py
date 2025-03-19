@@ -59,7 +59,7 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
     field_idx = dataset_without_index.schema.get_field_index("meta")
     create_index_op = lance.LanceOperation.CreateIndex(
         new_indices=[
-            lance.Index(
+            lance.IndexInfo(
                 uuid=index_id,
                 name="meta_idx",
                 fields=[field_idx],

@@ -1529,7 +1529,7 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_ids: List[int],
             replace: bool = True,
             **kwargs,
-        ) -> Index: ...
+        ) -> IndexInfo: ...
 
         @overload
         def create_scalar_index(
@@ -1552,7 +1552,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_ids: Optional[List[int]] = None,
         replace: bool = True,
         **kwargs,
-    ) -> Index | LanceDataset:
+    ) -> IndexInfo | LanceDataset:
         """Create a scalar index on a column.
 
         Scalar indices, like vector indices, can be used to speed up scans.  A scalar
@@ -1665,8 +1665,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        index : Index | LanceDataset
-            Returns Index object if the fragment_ids is provided. Commit the index
+        index : IndexInfo | LanceDataset
+            Returns IndexInfo object if the fragment_ids is provided. Commit the index
             to the dataset later with commit() method.
             Returns LanceDataset if the fragment_ids is not provided.
 
@@ -2747,6 +2747,15 @@ class ExecuteResult(TypedDict):
 
 class Index(TypedDict):
     name: str
+    type: str
+    uuid: str
+    fields: List[str]
+    version: int
+    fragment_ids: Set[int]
+
+
+class IndexInfo(TypedDict):
+    name: str
     uuid: str
     fields: List[int]
     version: int
@@ -3090,8 +3099,8 @@ class LanceOperation:
         Operation that creates an index on the dataset.
         """
 
-        new_indices: List[Index]
-        removed_indices: List[Index]
+        new_indices: List[IndexInfo]
+        removed_indices: List[IndexInfo]
 
     @dataclass
     class DataReplacementGroup:
