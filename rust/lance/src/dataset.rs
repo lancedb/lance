@@ -4645,9 +4645,9 @@ mod tests {
         assert_eq!(
             texts,
             vec![
+                "foo".to_owned(),  // 0 edits
                 "fo".to_owned(),   // 1 deletion        # spellchecker:disable-line
                 "fob".to_owned(),  // 1 substitution    # spellchecker:disable-line
-                "foo".to_owned(),  // 0 edits
                 "food".to_owned(), // 1 insertion       # spellchecker:disable-line
             ]
             .into_iter()
