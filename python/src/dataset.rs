@@ -791,10 +791,10 @@ impl Dataset {
         batch.to_pyarrow(self_.py())
     }
 
-    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None))]
+    #[pyo3(signature=(row_ids, columns = None, columns_with_transform = None))]
     fn take_rows(
         self_: PyRef<'_, Self>,
-        row_indices: Vec<u64>,
+        row_ids: Vec<u64>,
         columns: Option<Vec<String>>,
         columns_with_transform: Option<Vec<(String, String)>>,
     ) -> PyResult<PyObject> {
@@ -813,10 +813,7 @@ impl Dataset {
         .infer_error()?;
 
         let batch = RT
-            .block_on(
-                Some(self_.py()),
-                self_.ds.take_rows(&row_indices, projection),
-            )?
+            .block_on(Some(self_.py()), self_.ds.take_rows(&row_ids, projection))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         batch.to_pyarrow(self_.py())

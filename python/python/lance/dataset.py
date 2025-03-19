@@ -844,7 +844,10 @@ class LanceDataset(pa.dataset.Dataset):
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         **kargs,
     ) -> pa.Table:
-        """Select rows by row_ids.
+        """
+        Deprecated interface: will use primary key,
+        more details: https://github.com/lancedb/lance/issues/2454
+        Select rows by row_ids.
 
         **Unstable API**. Internal use only
 
@@ -867,9 +870,7 @@ class LanceDataset(pa.dataset.Dataset):
         if isinstance(columns, dict):
             columns_with_transform = list(columns.items())
             columns = None
-        return pa.Table.from_batches(
-            [self._ds.take_rows(row_ids, columns, columns_with_transform)]
-        )
+        return [self._ds.take_rows(row_ids, columns, columns_with_transform)]
 
     def take_blobs(
         self,
