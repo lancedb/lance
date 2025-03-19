@@ -30,3 +30,33 @@ def test_lance_schema(tmp_path: Path):
 
     assert schema.to_pyarrow() == data.schema
     assert LanceSchema.from_pyarrow(data.schema) == schema
+
+    fields = schema.fields()
+    assert len(fields) == 3
+    assert fields[0].name() == "x"
+    assert fields[0].id() == 0
+    assert fields[1].name() == "s"
+    assert fields[1].id() == 1
+
+    s_children = fields[1].children()
+    assert len(s_children) == 2
+    assert s_children[0].name() == "a"
+    assert s_children[0].id() == 2
+    assert s_children[1].name() == "b"
+    assert s_children[1].id() == 3
+
+    assert fields[2].name() == "y"
+    assert fields[2].id() == 4
+
+    l_children = fields[2].children()
+    assert len(l_children) == 1
+    assert l_children[0].name() == "item"
+    assert l_children[0].id() == 5
+
+    # Changing column name does not change the id
+    dataset.alter_columns({"path": "s.a", "name": "new_name"})
+    schema = dataset.lance_schema
+    fields = schema.fields()
+    s_fields = fields[1].children()
+    assert s_fields[0].name() == "new_name"
+    assert s_fields[0].id() == 2
