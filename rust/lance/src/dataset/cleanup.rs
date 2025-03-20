@@ -468,7 +468,7 @@ pub async fn cleanup_old_versions(
     cleanup.run().await
 }
 
-pub async fn auto_clean_hook(
+pub async fn auto_cleanup_hook(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<Result<RemovalStats>>> {

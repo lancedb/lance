@@ -41,7 +41,7 @@ use object_store::path::Path;
 use prost::Message;
 
 use super::ObjectStore;
-use crate::dataset::cleanup::auto_clean_hook;
+use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig, BLOB_DIR};
@@ -631,8 +631,10 @@ pub(crate) async fn do_commit_detached_transaction(
 
         match result {
             Ok(location) => {
-                if let Some(auto_clean_carried_out) = auto_clean_hook(&dataset, &manifest).await? {
-                    auto_clean_carried_out?;
+                if let Some(auto_cleanup_carried_out) =
+                    auto_cleanup_hook(&dataset, &manifest).await?
+                {
+                    auto_cleanup_carried_out?;
                 }
 
                 return Ok((manifest, location.path, location.e_tag));
@@ -838,8 +840,10 @@ pub(crate) async fn commit_transaction(
                     .file_metadata_cache
                     .insert(cache_path, Arc::new(transaction.clone()));
 
-                if let Some(auto_clean_carried_out) = auto_clean_hook(&dataset, &manifest).await? {
-                    auto_clean_carried_out?;
+                if let Some(auto_cleanup_carried_out) =
+                    auto_cleanup_hook(&dataset, &manifest).await?
+                {
+                    auto_cleanup_carried_out?;
                 }
 
                 return Ok((manifest, manifest_location.path, manifest_location.e_tag));
