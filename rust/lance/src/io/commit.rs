@@ -1265,6 +1265,7 @@ mod tests {
     #[tokio::test]
     async fn test_good_concurrent_config_writes() {
         let (_tmpdir, dataset) = get_empty_dataset().await;
+        let original_num_config_keys = dataset.manifest.config.len();
 
         // Test successful concurrent insert config operations
         let futures: Vec<_> = ["key1", "key2", "key3", "key4", "key5"]
@@ -1286,7 +1287,7 @@ mod tests {
         }
 
         let dataset = dataset.checkout_version(6).await.unwrap();
-        assert_eq!(dataset.manifest.config.len(), 5);
+        assert_eq!(dataset.manifest.config.len(), 5 + original_num_config_keys);
 
         dataset.validate().await.unwrap();
 
@@ -1309,7 +1310,7 @@ mod tests {
         let dataset = dataset.checkout_version(11).await.unwrap();
 
         // There are now two fewer keys
-        assert_eq!(dataset.manifest.config.len(), 3);
+        assert_eq!(dataset.manifest.config.len(), 3 + original_num_config_keys);
 
         dataset.validate().await.unwrap()
     }
