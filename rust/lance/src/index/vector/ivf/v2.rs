@@ -632,7 +632,6 @@ mod tests {
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::DIST_COL;
     use lance_index::{DatasetIndexExt, IndexType};
-    use lance_linalg::distance::hamming::hamming;
     use lance_linalg::distance::{multivec_distance, DistanceType};
     use lance_linalg::kernels::normalize_fsl;
     use lance_testing::datagen::generate_random_array_with_range;
@@ -756,29 +755,29 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    fn ground_truth(
-        vectors: &FixedSizeListArray,
+    async fn ground_truth(
+        dataset: &Dataset,
+        column: &str,
         query: &dyn Array,
         k: usize,
         distance_type: DistanceType,
-    ) -> Vec<(f32, u64)> {
-        let mut dists = vec![];
-        for i in 0..vectors.len() {
-            let dist = match distance_type {
-                DistanceType::Hamming => hamming(
-                    query.as_primitive::<UInt8Type>().values(),
-                    vectors.value(i).as_primitive::<UInt8Type>().values(),
-                ),
-                _ => distance_type.func()(
-                    query.as_primitive::<Float32Type>().values(),
-                    vectors.value(i).as_primitive::<Float32Type>().values(),
-                ),
-            };
-            dists.push((dist, i as u64));
-        }
-        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        dists.truncate(k);
-        dists
+    ) -> HashSet<u64> {
+        let batch = dataset
+            .scan()
+            .with_row_id()
+            .nearest(column, query, k)
+            .unwrap()
+            .distance_metric(distance_type)
+            .use_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -876,10 +875,9 @@ mod tests {
         let row_ids = results.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
         assert!(row_ids.len() == k);
 
-        let gt = ground_truth(&vectors, query.as_ref(), k, params.metric_type);
-        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
+        let gt = ground_truth(&dataset, vector_column, &query, k, params.metric_type).await;
 
-        let recall = row_ids.intersection(&gt_set).count() as f32 / k as f32;
+        let recall = row_ids.intersection(&gt).count() as f32 / k as f32;
         assert!(
             recall >= recall_requirement,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
@@ -919,12 +917,16 @@ mod tests {
 
         let query = vectors.value(0);
         // delete half rows to trigger compact
-        dataset.delete("id < 250").await.unwrap();
+        let half_rows = NUM_ROWS / 2;
+        dataset
+            .delete(&format!("id < {}", half_rows))
+            .await
+            .unwrap();
         // update the other half rows
         let update_result = UpdateBuilder::new(Arc::new(dataset))
-            .update_where("id >= 250 and id<300")
+            .update_where(&format!("id >= {} and id<{}", half_rows, half_rows + 50))
             .unwrap()
-            .set("id", "500+id")
+            .set("id", &format!("{}+id", NUM_ROWS))
             .unwrap()
             .build()
             .unwrap()
@@ -935,14 +937,14 @@ mod tests {
             .await
             .unwrap();
         let num_rows = dataset.count_rows(None).await.unwrap();
-        assert_eq!(num_rows, 250);
+        assert_eq!(num_rows, half_rows);
         compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
         // query again, the result should not include the deleted row
         let result = dataset
             .scan()
-            .nearest(vector_column, query.as_primitive::<T>(), 250)
+            .nearest(vector_column, query.as_primitive::<T>(), half_rows)
             .unwrap()
             .nprobs(nlist)
             .with_row_id()
@@ -950,10 +952,30 @@ mod tests {
             .await
             .unwrap();
         let row_ids = result["id"].as_primitive::<UInt64Type>();
-        assert_eq!(row_ids.len(), 250);
+        assert_eq!(row_ids.len(), half_rows);
         row_ids.values().iter().for_each(|id| {
-            assert!(*id >= 300);
+            assert!(*id >= half_rows as u64 + 50);
         });
+
+        // make sure we can still hit the recall
+        let gt = ground_truth(&dataset, vector_column, &query, 100, params.metric_type).await;
+        let results = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), 100)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = results[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let recall = row_ids.intersection(&gt).count() as f32 / 100.0;
+        assert_ge!(recall, 0.8, "{}", recall);
     }
 
     async fn test_optimize_strategy(params: VectorIndexParams) {

@@ -475,6 +475,60 @@ impl VectorStore for ProductQuantizationStorage {
         Ok([self.batch.with_metadata(metadata)?].into_iter())
     }
 
+    // we can't use the default implementation of remap,
+    // because PQ Storage transposed the PQ codes
+    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+        let transposed_codes = self.pq_code.values();
+        let mut new_row_ids = Vec::with_capacity(self.len());
+        let mut new_codes = Vec::with_capacity(self.len() * self.num_sub_vectors);
+
+        let row_ids = self.row_ids.values();
+        for (i, row_id) in row_ids.iter().enumerate() {
+            match mapping.get(row_id) {
+                Some(Some(new_id)) => {
+                    new_row_ids.push(*new_id);
+                    new_codes.extend(get_pq_code(
+                        transposed_codes,
+                        self.num_bits,
+                        self.num_sub_vectors,
+                        i as u32,
+                    ));
+                }
+                Some(None) => {}
+                None => {
+                    new_row_ids.push(*row_id);
+                    new_codes.extend(get_pq_code(
+                        transposed_codes,
+                        self.num_bits,
+                        self.num_sub_vectors,
+                        i as u32,
+                    ));
+                }
+            }
+        }
+
+        let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
+        let new_codes = UInt8Array::from(new_codes);
+        let num_bytes_in_code = new_codes.len() / new_row_ids.len();
+        let new_transposed_codes = transpose(&new_codes, new_row_ids.len(), num_bytes_in_code);
+        let codes_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
+            new_transposed_codes.clone(),
+            num_bytes_in_code as i32,
+        )?);
+        let batch = RecordBatch::try_new(self.schema(), vec![new_row_ids.clone(), codes_fsl])?;
+
+        Ok(Self {
+            codebook: self.codebook.clone(),
+            batch,
+            pq_code: Arc::new(new_transposed_codes),
+            row_ids: new_row_ids,
+            num_sub_vectors: self.num_sub_vectors,
+            num_bits: self.num_bits,
+            dimension: self.dimension,
+            distance_type: self.distance_type,
+        })
+    }
+
     fn append_batch(&self, _batch: RecordBatch, _vector_column: &str) -> Result<Self> {
         unimplemented!()
     }
