@@ -632,7 +632,6 @@ mod tests {
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::DIST_COL;
     use lance_index::{DatasetIndexExt, IndexType};
-    use lance_linalg::distance::hamming::hamming;
     use lance_linalg::distance::{multivec_distance, DistanceType};
     use lance_linalg::kernels::normalize_fsl;
     use lance_testing::datagen::generate_random_array_with_range;
@@ -973,7 +972,7 @@ mod tests {
             .as_primitive::<UInt64Type>()
             .values()
             .iter()
-            .map(|r| *r)
+            .copied()
             .collect::<HashSet<_>>();
         let recall = row_ids.intersection(&gt).count() as f32 / 100.0;
         assert_ge!(recall, 0.8, "{}", recall);
