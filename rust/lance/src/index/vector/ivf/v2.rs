@@ -810,7 +810,7 @@ mod tests {
     ) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_index_impl::<UInt8Type>(params, nlist, recall_requirement, 0..255, dataset)
+                test_index_impl::<UInt8Type>(params, nlist, recall_requirement, 0..4, dataset)
                     .await;
             }
             _ => {
@@ -891,7 +891,7 @@ mod tests {
     async fn test_remap(params: VectorIndexParams, nlist: usize) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_remap_impl::<UInt8Type>(params, nlist, 0..2).await;
+                test_remap_impl::<UInt8Type>(params, nlist, 0..4).await;
             }
             _ => {
                 test_remap_impl::<Float32Type>(params, nlist, 0.0..1.0).await;
@@ -958,7 +958,7 @@ mod tests {
     async fn test_optimize_strategy(params: VectorIndexParams) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_optimize_strategy_impl::<UInt8Type>(params, 0..2).await;
+                test_optimize_strategy_impl::<UInt8Type>(params, 0..4).await;
             }
             _ => {
                 test_optimize_strategy_impl::<Float32Type>(params, 0.0..1.0).await;
@@ -1025,7 +1025,9 @@ mod tests {
             let range = match count {
                 0 => range.clone(),
                 _ => match params.metric_type {
-                    DistanceType::Hamming => range.end..range.end.mul_wrapping(range.end),
+                    DistanceType::Hamming => {
+                        range.end..range.end.mul_wrapping(range.end).mul_wrapping(range.end)
+                    }
                     _ => range.end.neg_wrapping()..range.start,
                 },
             };
@@ -1254,7 +1256,7 @@ mod tests {
         let recall_requirement = recall_requirement * 0.9;
         match params.metric_type {
             DistanceType::Hamming => {
-                test_index_multivec_impl::<UInt8Type>(params, nlist, recall_requirement, 0..2)
+                test_index_multivec_impl::<UInt8Type>(params, nlist, recall_requirement, 0..4)
                     .await;
             }
             _ => {
