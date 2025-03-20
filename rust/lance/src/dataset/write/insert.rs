@@ -203,25 +203,32 @@ impl<'a> InsertBuilder<'a> {
         context: &WriteContext<'_>,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
-            WriteMode::Create => Operation::Overwrite {
-                // Use the full schema, not the written schema
-                schema,
-                fragments: written_frags.default.0,
-                config_upsert_values: Some(
-                    [
-                        (
-                            String::from("lance.auto_cleanup.interval"),
-                            String::from("20"), // TODO: make configurable?
-                        ),
-                        (
-                            String::from("lance.auto_cleanup.older_than"),
-                            String::from("14"),
-                        ),
-                    ]
-                    .into_iter()
-                    .collect(),
-                ),
-            },
+            WriteMode::Create => {
+                // Fetch auto_cleanup params from context
+                let config_upsert_values = match &context.params.auto_cleanup {
+                    Some(auto_cleanup_params) => Some(
+                        [
+                            (
+                                String::from("lance.auto_cleanup.interval"),
+                                auto_cleanup_params.interval.to_string(),
+                            ),
+                            (
+                                String::from("lance.auto_cleanup.older_than"),
+                                auto_cleanup_params.older_than.to_string(),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    None => None,
+                };
+                Operation::Overwrite {
+                    // Use the full schema, not the written schema
+                    schema,
+                    fragments: written_frags.default.0,
+                    config_upsert_values,
+                }
+            }
             WriteMode::Overwrite => Operation::Overwrite {
                 // Use the full schema, not the written schema
                 schema,
