@@ -190,12 +190,12 @@ pub struct WriteParams {
 
     pub session: Option<Arc<Session>>,
 
-    /// If Some, and this is a new dataset, set auto cleanup parameters.
-    /// This allows for old dataset versions to be automatically cleaned up, as
-    /// according to the parameters set out in `AutoCleanupParams`.
-    /// This parameter has no effect on existing datasets. To add autocleanup to
-    /// an existing /// dataset, use XXXXXXX method.
-    /// Default is Some({"interval": 20, "older_than": 14}).
+    /// If Some, and this is a new dataset, old dataset versions will be
+    /// automatically cleaned up as according to the parameters set out in
+    /// `AutoCleanupParams`. This parameter has no effect on existing datasets.
+    /// To add autocleaning to an existing dataset, use Dataset::update_config
+    /// to set lance.auto_cleanup.interval and lance.auto_cleanup.older_than.
+    /// Both parameters must be set to invoke autocleaning.
     pub auto_cleanup: Option<AutoCleanupParams>,
 }
 
