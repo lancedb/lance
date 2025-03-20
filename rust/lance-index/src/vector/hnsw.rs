@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use self::builder::HnswBuildParams;
 use super::graph::{OrderedFloat, OrderedNode};
-use super::storage::{DistCalculator, VectorStore};
+use super::storage::VectorStore;
 
 pub mod builder;
 pub mod index;
@@ -73,12 +73,11 @@ fn select_neighbors_heuristic(
         if results.len() >= k {
             break;
         }
-        let dist_cal = storage.dist_calculator_from_id(u.id);
 
         if results.is_empty()
             || results
                 .iter()
-                .all(|v| u.dist < OrderedFloat(dist_cal.distance(v.id)))
+                .all(|v| u.dist < OrderedFloat(storage.dist_between(u.id, v.id)))
         {
             results.push(u.clone());
         }
