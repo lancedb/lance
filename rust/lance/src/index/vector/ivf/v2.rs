@@ -919,12 +919,16 @@ mod tests {
 
         let query = vectors.value(0);
         // delete half rows to trigger compact
-        dataset.delete("id < 250").await.unwrap();
+        let half_rows = NUM_ROWS / 2;
+        dataset
+            .delete(&format!("id < {}", half_rows))
+            .await
+            .unwrap();
         // update the other half rows
         let update_result = UpdateBuilder::new(Arc::new(dataset))
-            .update_where("id >= 250 and id<300")
+            .update_where(&format!("id >= {} and id<{}", half_rows, half_rows + 50))
             .unwrap()
-            .set("id", "500+id")
+            .set("id", &format!("{}+id", NUM_ROWS))
             .unwrap()
             .build()
             .unwrap()
@@ -935,14 +939,14 @@ mod tests {
             .await
             .unwrap();
         let num_rows = dataset.count_rows(None).await.unwrap();
-        assert_eq!(num_rows, 250);
+        assert_eq!(num_rows, half_rows);
         compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
         // query again, the result should not include the deleted row
         let result = dataset
             .scan()
-            .nearest(vector_column, query.as_primitive::<T>(), 250)
+            .nearest(vector_column, query.as_primitive::<T>(), half_rows)
             .unwrap()
             .nprobs(nlist)
             .with_row_id()
@@ -950,10 +954,44 @@ mod tests {
             .await
             .unwrap();
         let row_ids = result["id"].as_primitive::<UInt64Type>();
-        assert_eq!(row_ids.len(), 250);
+        assert_eq!(row_ids.len(), half_rows);
         row_ids.values().iter().for_each(|id| {
-            assert!(*id >= 300);
+            assert!(*id >= half_rows as u64 + 50);
         });
+
+        // make sure we can still hit the recall
+        let gt = dataset
+            .scan()
+            .with_row_id()
+            .nearest(vector_column, query.as_primitive::<T>(), 100)
+            .unwrap()
+            .use_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let gt_set = gt[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .map(|r| *r)
+            .collect::<HashSet<_>>();
+        let results = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), 100)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = results[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .map(|r| *r)
+            .collect::<HashSet<_>>();
+        let recall = row_ids.intersection(&gt_set).count() as f32 / 100.0;
+        assert_ge!(recall, 0.8, "{}", recall);
     }
 
     async fn test_optimize_strategy(params: VectorIndexParams) {
