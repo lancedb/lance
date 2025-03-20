@@ -468,6 +468,12 @@ pub async fn cleanup_old_versions(
     cleanup.run().await
 }
 
+/// If the dataset config has `lance.auto_cleanup` parameters set,
+/// this function automatically calls `dataset.cleanup_old_versions`
+/// every `lance.auto_cleanup.interval` versions. This function calls
+/// `dataset.cleanup_old_versions` with `lance.auto_cleanup.older_than`
+/// for `older_than` and `Some(false)` for both `delete_unverified` and
+/// `error_if_tagged_old_versions`.
 pub async fn auto_cleanup_hook(
     dataset: &Dataset,
     manifest: &Manifest,
