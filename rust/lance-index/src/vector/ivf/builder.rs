@@ -28,6 +28,10 @@ pub struct IvfBuildParams {
     /// Use provided IVF centroids.
     pub centroids: Option<Arc<FixedSizeListArray>>,
 
+    /// Retrain centroids.
+    /// If true, the centroids will be retrained based on provided `centroids`.
+    pub retrain: bool,
+
     pub sample_rate: usize,
 
     /// Precomputed partitions file (row_id -> partition_id)
@@ -45,9 +49,6 @@ pub struct IvfBuildParams {
 
     pub shuffle_partition_concurrency: usize,
 
-    /// Use residual vectors to build sub-vector.
-    pub use_residual: bool,
-
     /// Storage options used to load precomputed partitions.
     pub storage_options: Option<HashMap<String, String>>,
 }
@@ -58,12 +59,12 @@ impl Default for IvfBuildParams {
             num_partitions: 32,
             max_iters: 50,
             centroids: None,
+            retrain: false,
             sample_rate: 256, // See faiss
             precomputed_partitions_file: None,
             precomputed_shuffle_buffers: None,
             shuffle_partition_batches: 1024 * 10,
             shuffle_partition_concurrency: 2,
-            use_residual: true,
             storage_options: None,
         }
     }

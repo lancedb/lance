@@ -187,6 +187,35 @@ impl Quantization for ScalarQuantizer {
         Ok(quantizer)
     }
 
+    fn retrain(&mut self, data: &dyn Array) -> Result<()> {
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "SQ retrain: input is not a FixedSizeList: {}",
+                data.data_type()
+            ),
+            location: location!(),
+        })?;
+
+        match fsl.value_type() {
+            DataType::Float16 => {
+                self.update_bounds::<Float16Type>(fsl)?;
+            }
+            DataType::Float32 => {
+                self.update_bounds::<Float32Type>(fsl)?;
+            }
+            DataType::Float64 => {
+                self.update_bounds::<Float64Type>(fsl)?;
+            }
+            value_type => {
+                return Err(Error::invalid_input(
+                    format!("unsupported data type {} for scalar quantizer", value_type),
+                    location!(),
+                ))
+            }
+        }
+        Ok(())
+    }
+
     fn code_dim(&self) -> usize {
         self.dim
     }
