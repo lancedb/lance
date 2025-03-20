@@ -39,6 +39,7 @@ pub mod utils;
 pub mod v3;
 
 use super::pb;
+use crate::metrics::MetricsCollector;
 use crate::{prefilter::PreFilter, Index};
 pub use residual::RESIDUAL_COLUMN;
 
@@ -49,6 +50,7 @@ pub const INDEX_UUID_COLUMN: &str = "__index_uuid";
 pub const PART_ID_COLUMN: &str = "__ivf_part_id";
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
 pub const SQ_CODE_COLUMN: &str = "__sq_code";
+pub const LOSS_METADATA_KEY: &str = "_loss";
 
 lazy_static! {
     pub static ref VECTOR_RESULT_SCHEMA: arrow_schema::SchemaRef =
@@ -141,7 +143,12 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
-    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch>;
+    async fn search(
+        &self,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch>;
 
     fn find_partitions(&self, query: &Query) -> Result<UInt32Array>;
 
@@ -150,6 +157,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         partition_id: usize,
         query: &Query,
         pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch>;
 
     /// If the index is loadable by IVF, so it can be a sub-index that
@@ -190,12 +198,15 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         &self,
         _partition_id: usize,
         _with_vector: bool,
+        _metrics: &dyn MetricsCollector,
     ) -> Result<SendableRecordBatchStream> {
         unimplemented!("only for IVF")
     }
 
     // for SubIndex only
     async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream>;
+
+    fn num_rows(&self) -> u64;
 
     /// Return the IDs of rows in the index.
     fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_>;
@@ -227,7 +238,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;
 
-    fn ivf_model(&self) -> IvfModel;
+    fn ivf_model(&self) -> &IvfModel;
     fn quantizer(&self) -> Quantizer;
 
     /// the index type of this vector index.

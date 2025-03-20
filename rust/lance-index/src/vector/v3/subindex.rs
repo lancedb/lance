@@ -10,6 +10,7 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use snafu::location;
 
+use crate::metrics::MetricsCollector;
 use crate::vector::storage::VectorStore;
 use crate::vector::{flat, hnsw};
 use crate::{prefilter::PreFilter, vector::Query};
@@ -43,6 +44,7 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         params: Self::QueryParams,
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch>;
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.

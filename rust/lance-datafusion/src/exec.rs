@@ -32,9 +32,20 @@ use lazy_static::lazy_static;
 
 use futures::{stream, StreamExt};
 use lance_arrow::SchemaExt;
-use lance_core::{Error, Result};
+use lance_core::{
+    utils::{
+        futures::FinallyStreamExt,
+        tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION},
+    },
+    Error, Result,
+};
 use log::{debug, info, warn};
 use snafu::location;
+
+use crate::utils::{
+    MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
+    PARTS_LOADED_METRIC, REQUESTS_METRIC,
+};
 
 /// An source execution node created from an existing stream
 ///
@@ -254,6 +265,68 @@ fn get_task_context(
     state.task_ctx()
 }
 
+#[derive(Default)]
+struct SummaryCounts {
+    iops: usize,
+    requests: usize,
+    bytes_read: usize,
+    indices_loaded: usize,
+    parts_loaded: usize,
+    index_comparisons: usize,
+}
+
+fn visit_node(node: &dyn ExecutionPlan, counts: &mut SummaryCounts) {
+    if let Some(metrics) = node.metrics() {
+        counts.iops += metrics
+            .find_count(IOPS_METRIC)
+            .map(|c| c.value())
+            .unwrap_or(0);
+        counts.requests += metrics
+            .find_count(REQUESTS_METRIC)
+            .map(|c| c.value())
+            .unwrap_or(0);
+        counts.bytes_read += metrics
+            .find_count(BYTES_READ_METRIC)
+            .map(|c| c.value())
+            .unwrap_or(0);
+        counts.indices_loaded += metrics
+            .find_count(INDICES_LOADED_METRIC)
+            .map(|c| c.value())
+            .unwrap_or(0);
+        counts.parts_loaded += metrics
+            .find_count(PARTS_LOADED_METRIC)
+            .map(|c| c.value())
+            .unwrap_or(0);
+        counts.index_comparisons += metrics
+            .find_count(INDEX_COMPARISONS_METRIC)
+            .map(|c| c.value())
+            .unwrap_or(0);
+    }
+    for child in node.children() {
+        visit_node(child.as_ref(), counts);
+    }
+}
+
+fn report_plan_summary_metrics(plan: &dyn ExecutionPlan) {
+    let output_rows = plan
+        .metrics()
+        .map(|m| m.output_rows().unwrap_or(0))
+        .unwrap_or(0);
+    let mut counts = SummaryCounts::default();
+    visit_node(plan, &mut counts);
+    tracing::info!(
+        target: TRACE_EXECUTION,
+        type = EXECUTION_PLAN_RUN,
+        output_rows,
+        iops = counts.iops,
+        requests = counts.requests,
+        bytes_read = counts.bytes_read,
+        indices_loaded = counts.indices_loaded,
+        parts_loaded = counts.parts_loaded,
+        index_comparisons = counts.index_comparisons,
+    );
+}
+
 /// Executes a plan using default session & runtime configuration
 ///
 /// Only executes a single partition.  Panics if the plan has more than one partition.
@@ -271,7 +344,13 @@ pub fn execute_plan(
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
     assert_eq!(plan.properties().partitioning.partition_count(), 1);
-    Ok(plan.execute(0, get_task_context(&session_ctx, &options))?)
+    let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
+
+    let schema = stream.schema();
+    let stream = stream.finally(move || {
+        report_plan_summary_metrics(plan.as_ref());
+    });
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }
 
 pub async fn analyze_plan(

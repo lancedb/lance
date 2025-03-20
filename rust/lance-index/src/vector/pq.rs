@@ -276,6 +276,9 @@ impl ProductQuantizer {
             self.num_sub_vectors,
             code.values(),
         );
+
+        let diff = self.num_sub_vectors as f32 - 1.0;
+        let distances = distances.into_iter().map(|d| d - diff).collect::<Vec<_>>();
         Ok(distances.into())
     }
 
@@ -393,6 +396,18 @@ impl Quantization for ProductQuantizer {
         }
 
         params.build(data, distance_type)
+    }
+
+    fn retrain(&mut self, data: &dyn Array) -> Result<()> {
+        assert_eq!(data.null_count(), 0);
+        let params = PQBuildParams::with_codebook(
+            self.num_sub_vectors,
+            self.num_bits as usize,
+            Arc::new(self.codebook.clone()),
+        );
+
+        *self = params.build(data, self.distance_type)?;
+        Ok(())
     }
 
     fn code_dim(&self) -> usize {

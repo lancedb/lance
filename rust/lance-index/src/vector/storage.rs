@@ -22,7 +22,6 @@ use lance_linalg::distance::DistanceType;
 use prost::Message;
 use snafu::location;
 
-use crate::vector::pq::transform::TransposeTransformer;
 use crate::{
     pb,
     vector::{
@@ -31,8 +30,7 @@ use crate::{
     },
 };
 
-use super::quantizer::{QuantizationType, Quantizer};
-use super::transform::Transformer;
+use super::quantizer::Quantizer;
 use super::DISTANCE_TYPE_KEY;
 
 /// <section class="warning">
@@ -139,37 +137,45 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_>;
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
+
+    fn dist_between(&self, u: u32, v: u32) -> f32 {
+        let dist_cal_u = self.dist_calculator_from_id(u);
+        dist_cal_u.distance(v)
+    }
 }
 
 pub struct StorageBuilder<Q: Quantization> {
+    vector_column: String,
     distance_type: DistanceType,
     quantizer: Q,
-    transformers: Vec<Arc<dyn Transformer>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
-    pub fn new(distance_type: DistanceType, quantizer: Q) -> Result<Self> {
-        let transformers = if matches!(Q::quantization_type(), QuantizationType::Product) {
-            let metadata = quantizer.metadata(None)?;
-            vec![Arc::new(TransposeTransformer::new(metadata.to_string())?) as _]
-        } else {
-            Vec::new()
-        };
+    pub fn new(vector_column: String, distance_type: DistanceType, quantizer: Q) -> Result<Self> {
         Ok(Self {
+            vector_column,
             distance_type,
             quantizer,
-            transformers,
         })
     }
 
-    pub fn build(&self, mut batches: Vec<RecordBatch>) -> Result<Q::Storage> {
-        for batch in batches.iter_mut() {
-            for transformer in &self.transformers {
-                *batch = transformer.transform(batch)?;
-            }
+    pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
+        let mut batch = concat_batches(batches[0].schema_ref(), batches.iter())?;
+
+        if batch.column_by_name(self.quantizer.column()).is_none() {
+            let vectors = batch
+                .column_by_name(&self.vector_column)
+                .ok_or(Error::Index {
+                    message: format!("Vector column {} not found in batch", self.vector_column),
+                    location: location!(),
+                })?;
+            let codes = self.quantizer.quantize(vectors)?;
+            batch = batch.drop_column(&self.vector_column)?.try_with_column(
+                arrow_schema::Field::new(self.quantizer.column(), codes.data_type().clone(), true),
+                codes,
+            )?;
         }
 
-        let batch = concat_batches(batches[0].schema_ref(), batches.iter())?;
         let batch = batch.add_metadata(
             STORAGE_METADATA_KEY.to_owned(),
             self.quantizer.metadata(None)?.to_string(),
@@ -245,6 +251,10 @@ impl IvfQuantizationStorage {
             metadata,
             ivf,
         })
+    }
+
+    pub fn num_rows(&self) -> u64 {
+        self.reader.num_rows()
     }
 
     pub fn quantizer<Q: Quantization>(&self) -> Result<Quantizer> {

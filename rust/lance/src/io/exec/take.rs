@@ -27,6 +27,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -36,9 +37,13 @@ use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
+use super::utils::IoMetrics;
+
+#[derive(Debug, Clone)]
 struct TakeStreamMetrics {
     baseline_metrics: BaselineMetrics,
     batches_processed: Count,
+    io_metrics: IoMetrics,
 }
 
 impl TakeStreamMetrics {
@@ -53,6 +58,7 @@ impl TakeStreamMetrics {
         Self {
             baseline_metrics: BaselineMetrics::new(metrics, partition),
             batches_processed,
+            io_metrics: IoMetrics::new(metrics, partition),
         }
     }
 }
@@ -247,6 +253,8 @@ impl TakeStream {
         self: Arc<Self>,
         input: S,
     ) -> impl Stream<Item = Result<RecordBatch>> {
+        let scan_scheduler = self.scan_scheduler.clone();
+        let metrics = self.metrics.clone();
         let batches = input
             .enumerate()
             .map(move |(batch_index, batch)| {
@@ -258,7 +266,11 @@ impl TakeStream {
                 )
             })
             .boxed();
-        batches.try_buffered(get_num_compute_intensive_cpus())
+        batches
+            .try_buffered(get_num_compute_intensive_cpus())
+            .finally(move || {
+                metrics.io_metrics.record_final(scan_scheduler.as_ref());
+            })
     }
 }
 
@@ -427,6 +439,13 @@ impl TakeExec {
             metadata: dataset_schema.metadata.clone(),
         }
     }
+
+    /// Get the dataset.
+    ///
+    /// WARNING: Internal API with no stability guarantees.
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
 }
 
 impl ExecutionPlan for TakeExec {
@@ -518,12 +537,11 @@ mod tests {
     use datafusion::execution::TaskContext;
     use lance_arrow::SchemaExt;
     use lance_core::{datatypes::OnMissing, ROW_ID};
-    use lance_datafusion::exec::OneShotExec;
+    use lance_datafusion::{exec::OneShotExec, utils::MetricsExt};
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
 
     use crate::{
-        datafusion::MetricsExt,
         dataset::WriteParams,
         io::exec::{LanceScanConfig, LanceScanExec},
     };

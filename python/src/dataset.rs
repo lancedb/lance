@@ -50,6 +50,7 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::{
     optimize::OptimizeOptions,
@@ -452,7 +453,11 @@ impl Dataset {
                 let idx_type = RT
                     .block_on(Some(self_.py()), async {
                         let idx = ds
-                            .open_generic_index(&idx_schema.fields[0].name, &idx.uuid.to_string())
+                            .open_generic_index(
+                                &idx_schema.fields[0].name,
+                                &idx.uuid.to_string(),
+                                &NoOpMetricsCollector,
+                            )
                             .await?;
                         Ok::<_, lance::Error>(idx.index_type())
                     })?
@@ -1163,6 +1168,9 @@ impl Dataset {
                         .extract::<Vec<String>>()
                         .map_err(|err| PyValueError::new_err(err.to_string()))?,
                 );
+            }
+            if let Some(retrain) = kwargs.get_item("retrain")? {
+                options.retrain = retrain.extract()?;
             }
         }
         RT.block_on(

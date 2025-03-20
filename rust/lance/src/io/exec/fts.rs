@@ -25,7 +25,8 @@ use crate::index::prefilter::DatasetPreFilter;
 use crate::{index::DatasetIndexInternalExt, Dataset};
 
 use super::utils::{
-    FilteredRowIdsToPrefilter, InstrumentedRecordBatchStreamAdapter, SelectionVectorToPrefilter,
+    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter,
+    SelectionVectorToPrefilter,
 };
 use super::PreFilterSource;
 
@@ -157,7 +158,7 @@ impl ExecutionPlan for FtsExec {
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
-
+        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
         let indices = self.indices.clone();
         let stream = stream::iter(indices)
             .map(move |(column, indices)| {
@@ -167,6 +168,7 @@ impl ExecutionPlan for FtsExec {
                 let ds = ds.clone();
                 let context = context.clone();
                 let prefilter_source = prefilter_source.clone();
+                let metrics = metrics.clone();
 
                 async move {
                     let prefilter_loader = match &prefilter_source {
@@ -188,7 +190,9 @@ impl ExecutionPlan for FtsExec {
                         prefilter_loader,
                     ));
 
-                    let index = ds.open_generic_index(&column, &uuid).await?;
+                    let index = ds
+                        .open_generic_index(&column, &uuid, metrics.as_ref())
+                        .await?;
                     let index =
                         index
                             .as_any()
@@ -200,7 +204,9 @@ impl ExecutionPlan for FtsExec {
                                 ))
                             })?;
                     pre_filter.wait_for_ready().await?;
-                    let results = index.full_text_search(&query, pre_filter).await?;
+                    let results = index
+                        .full_text_search(&query, pre_filter, metrics.as_ref())
+                        .await?;
 
                     let (row_ids, scores): (Vec<u64>, Vec<f32>) = results.into_iter().unzip();
                     let batch = RecordBatch::try_new(
@@ -337,6 +343,7 @@ impl ExecutionPlan for FlatFtsExec {
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let column_inputs = self.column_inputs.clone();
+        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::iter(column_inputs)
             .map(move |(column, indices, input)| {
@@ -345,9 +352,12 @@ impl ExecutionPlan for FlatFtsExec {
                 let query = query.clone();
                 let ds = ds.clone();
                 let context = context.clone();
+                let metrics = metrics.clone();
 
                 async move {
-                    let index = ds.open_generic_index(&column, &uuid).await?;
+                    let index = ds
+                        .open_generic_index(&column, &uuid, metrics.as_ref())
+                        .await?;
                     let index =
                         index
                             .as_any()

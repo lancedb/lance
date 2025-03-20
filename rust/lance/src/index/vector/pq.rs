@@ -20,6 +20,7 @@ use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
+use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::{transpose, ProductQuantizationStorage};
 use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
@@ -201,7 +202,12 @@ impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
     #[instrument(level = "debug", skip_all, name = "PQIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
+    async fn search(
+        &self,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
         if self.code.is_none() || self.row_ids.is_none() {
             return Err(Error::Index {
                 message: "PQIndex::search: PQ is not initialized".to_string(),
@@ -212,6 +218,8 @@ impl VectorIndex for PQIndex {
 
         let code = self.code.as_ref().unwrap().clone();
         let row_ids = self.row_ids.as_ref().unwrap().clone();
+
+        metrics.record_comparisons(row_ids.len());
 
         let pq = self.pq.clone();
         let query = query.clone();
@@ -278,6 +286,7 @@ impl VectorIndex for PQIndex {
         _: usize,
         _: &Query,
         _: Arc<dyn PreFilter>,
+        _: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         unimplemented!("only for IVF")
     }
@@ -368,6 +377,12 @@ impl VectorIndex for PQIndex {
         Ok(Box::pin(stream))
     }
 
+    fn num_rows(&self) -> u64 {
+        self.row_ids
+            .as_ref()
+            .map_or(0, |row_ids| row_ids.len() as u64)
+    }
+
     fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
     }
@@ -410,7 +425,7 @@ impl VectorIndex for PQIndex {
         Ok(())
     }
 
-    fn ivf_model(&self) -> IvfModel {
+    fn ivf_model(&self) -> &IvfModel {
         unimplemented!("only for IVF")
     }
     fn quantizer(&self) -> Quantizer {
@@ -610,7 +625,7 @@ mod tests {
 
         let centroids = generate_random_array_with_range::<Float32Type>(4 * DIM, -1.0..1.0);
         let fsl = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf = IvfModel::new(fsl);
+        let ivf = IvfModel::new(fsl, None);
         let params = PQBuildParams::new(16, 8);
         let pq = build_pq_model(&dataset, "vector", DIM, MetricType::L2, &params, Some(&ivf))
             .await

@@ -14,9 +14,11 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::parse::str_is_truthy;
+use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS};
 use lance_file::reader::FileReader;
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
+use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
@@ -49,7 +51,7 @@ use roaring::RoaringBitmap;
 use scalar::{build_inverted_index, detect_scalar_index_type, inverted_index_details};
 use serde_json::json;
 use snafu::location;
-use tracing::instrument;
+use tracing::{info, instrument};
 use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;
 use vector::utils::get_vector_type;
@@ -122,7 +124,7 @@ pub(crate) async fn remap_index(
     let new_id = Uuid::new_v4();
 
     let generic = dataset
-        .open_generic_index(&field.name, &index_id.to_string())
+        .open_generic_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
         .await?;
 
     match generic.index_type() {
@@ -130,7 +132,7 @@ pub(crate) async fn remap_index(
             let new_store = LanceIndexStore::from_dataset(dataset, &new_id.to_string());
 
             let scalar_index = dataset
-                .open_scalar_index(&field.name, &index_id.to_string())
+                .open_scalar_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
                 .await?;
             scalar_index.remap(row_id_map, &new_store).await?;
         }
@@ -596,7 +598,10 @@ impl DatasetIndexExt for Dataset {
 
         // Open all delta indices
         let indices = stream::iter(metadatas.iter())
-            .then(|m| async move { self.open_generic_index(column, &m.uuid.to_string()).await })
+            .then(|m| async move {
+                self.open_generic_index(column, &m.uuid.to_string(), &NoOpMetricsCollector)
+                    .await
+            })
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -713,10 +718,12 @@ impl DatasetIndexExt for Dataset {
         let mut partition_streams = Vec::with_capacity(indices.len());
         for index in indices {
             let index = self
-                .open_vector_index(&column.name, &index.uuid.to_string())
+                .open_vector_index(&column.name, &index.uuid.to_string(), &NoOpMetricsCollector)
                 .await?;
 
-            let stream = index.partition_reader(partition_id, with_vector).await?;
+            let stream = index
+                .partition_reader(partition_id, with_vector, &NoOpMetricsCollector)
+                .await?;
             if schema.is_none() {
                 schema = Some(stream.schema());
             }
@@ -743,11 +750,26 @@ impl DatasetIndexExt for Dataset {
 #[async_trait]
 pub trait DatasetIndexInternalExt: DatasetIndexExt {
     /// Opens an index (scalar or vector) as a generic index
-    async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>>;
+    async fn open_generic_index(
+        &self,
+        column: &str,
+        uuid: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn Index>>;
     /// Opens the requested scalar index
-    async fn open_scalar_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn ScalarIndex>>;
+    async fn open_scalar_index(
+        &self,
+        column: &str,
+        uuid: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>>;
     /// Opens the requested vector index
-    async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>>;
+    async fn open_vector_index(
+        &self,
+        column: &str,
+        uuid: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn VectorIndex>>;
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
 
@@ -760,7 +782,12 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
 
 #[async_trait]
 impl DatasetIndexInternalExt for Dataset {
-    async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>> {
+    async fn open_generic_index(
+        &self,
+        column: &str,
+        uuid: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn Index>> {
         // Checking for cache existence is cheap so we just check both scalar and vector caches
         if let Some(index) = self.session.index_cache.get_scalar(uuid) {
             return Ok(index.as_index());
@@ -780,15 +807,20 @@ impl DatasetIndexInternalExt for Dataset {
         let index_dir = self.indices_dir().child(uuid);
         let index_file = index_dir.child(INDEX_FILE_NAME);
         if self.object_store.exists(&index_file).await? {
-            let index = self.open_vector_index(column, uuid).await?;
+            let index = self.open_vector_index(column, uuid, metrics).await?;
             Ok(index.as_index())
         } else {
-            let index = self.open_scalar_index(column, uuid).await?;
+            let index = self.open_scalar_index(column, uuid, metrics).await?;
             Ok(index.as_index())
         }
     }
 
-    async fn open_scalar_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn ScalarIndex>> {
+    async fn open_scalar_index(
+        &self,
+        column: &str,
+        uuid: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
         if let Some(index) = self.session.index_cache.get_scalar(uuid) {
             return Ok(index);
         }
@@ -799,11 +831,20 @@ impl DatasetIndexInternalExt for Dataset {
         })?;
 
         let index = crate::index::scalar::open_scalar_index(self, column, &index_meta).await?;
+
+        info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_SCALAR, index_type=index.index_type().to_string());
+        metrics.record_index_load();
+
         self.session.index_cache.insert_scalar(uuid, index.clone());
         Ok(index)
     }
 
-    async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>> {
+    async fn open_vector_index(
+        &self,
+        column: &str,
+        uuid: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn VectorIndex>> {
         if let Some(index) = self.session.index_cache.get_vector(uuid) {
             log::debug!("Found vector index in cache uuid: {}", uuid);
             return Ok(index);
@@ -820,6 +861,7 @@ impl DatasetIndexInternalExt for Dataset {
         // TODO: we need to change the legacy IVF_PQ to be in lance format
         let index = match (major_version, minor_version) {
             (0, 1) | (0, 0) => {
+                info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
@@ -835,6 +877,7 @@ impl DatasetIndexInternalExt for Dataset {
             }
 
             (0, 2) => {
+                info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
                 let reader = FileReader::try_new_self_described_from_reader(
                     reader.clone(),
                     Some(&self.session.file_metadata_cache),
@@ -879,6 +922,9 @@ impl DatasetIndexInternalExt for Dataset {
                 })?;
 
                 let (_, element_type) = get_vector_type(self.schema(), column)?;
+
+                info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
+
                 match index_metadata.index_type.as_str() {
                     "IVF_FLAT" => match element_type {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
@@ -957,6 +1003,7 @@ impl DatasetIndexInternalExt for Dataset {
             }),
         };
         let index = index?;
+        metrics.record_index_load();
         self.session.index_cache.insert_vector(uuid, index.clone());
         Ok(index)
     }
@@ -1359,10 +1406,7 @@ mod tests {
         assert_eq!(get_bitmap(&meta[0]), vec![0]);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0,   // Just create index for delta
-                index_names: Some(vec![]), // Optimize nothing
-            })
+            .optimize_indices(&OptimizeOptions::append().index_names(vec![])) // Does nothing because no index name is passed
             .await
             .unwrap();
         let stats = get_stats(&dataset, "vec_idx").await;
@@ -1377,10 +1421,9 @@ mod tests {
 
         // optimize the other index
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0, // Just create index for delta
-                index_names: Some(vec!["other_vec_idx".to_string()]),
-            })
+            .optimize_indices(
+                &OptimizeOptions::append().index_names(vec!["other_vec_idx".to_owned()]),
+            )
             .await
             .unwrap();
         let stats = get_stats(&dataset, "vec_idx").await;
@@ -1586,10 +1629,7 @@ mod tests {
         assert_indexed_rows(&dataset, num_rows).await;
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0,
-                index_names: None,
-            })
+            .optimize_indices(&OptimizeOptions::append())
             .await
             .unwrap();
         let num_rows = dataset.count_all_rows().await.unwrap();
@@ -1680,10 +1720,7 @@ mod tests {
         }
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0,
-                index_names: None,
-            })
+            .optimize_indices(&OptimizeOptions::append())
             .await
             .unwrap();
         let num_rows = dataset.count_all_rows().await.unwrap();
@@ -1812,7 +1849,7 @@ mod tests {
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
         let index = dataset
-            .open_generic_index("tag", &indices[0].uuid.to_string())
+            .open_generic_index("tag", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
             .await
             .unwrap();
         assert_eq!(index.index_type(), IndexType::Bitmap);

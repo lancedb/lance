@@ -7,7 +7,8 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 
 @pytest.mark.parametrize("accelerator", [None, "cuda"])

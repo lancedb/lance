@@ -24,6 +24,7 @@ use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use snafu::location;
 
+use crate::metrics::MetricsCollector;
 use crate::{Index, IndexParams, IndexType};
 
 pub mod bitmap;
@@ -595,7 +596,11 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Search the scalar index
     ///
     /// Returns all row ids that satisfy the query, these row ids are not necessarily ordered
-    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult>;
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult>;
 
     /// Returns true if the query can be answered exactly
     ///

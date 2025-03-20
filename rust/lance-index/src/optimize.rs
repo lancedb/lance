@@ -20,6 +20,19 @@ pub struct OptimizeOptions {
 
     /// the index names to optimize. If None, all indices will be optimized.
     pub index_names: Option<Vec<String>>,
+
+    /// whether to retrain the whole index. Default: false.
+    ///
+    /// If true, the index will be retrained based on the current data,
+    /// `num_indices_to_merge` will be ignored, and all indices will be merged into one.
+    /// If false, the index will be optimized by merging `num_indices_to_merge` indices.
+    ///
+    /// This is useful when the data distribution has changed significantly,
+    /// and we want to retrain the index to improve the search quality.
+    /// This would be faster than re-create the index from scratch.
+    ///
+    /// NOTE: this option is only supported for v3 vector indices.
+    pub retrain: bool,
 }
 
 impl Default for OptimizeOptions {
@@ -27,6 +40,43 @@ impl Default for OptimizeOptions {
         Self {
             num_indices_to_merge: 1,
             index_names: None,
+            retrain: false,
         }
+    }
+}
+
+impl OptimizeOptions {
+    pub fn new() -> Self {
+        Self {
+            num_indices_to_merge: 1,
+            index_names: None,
+            retrain: false,
+        }
+    }
+
+    pub fn append() -> Self {
+        Self {
+            num_indices_to_merge: 0,
+            index_names: None,
+            retrain: false,
+        }
+    }
+
+    pub fn retrain() -> Self {
+        Self {
+            num_indices_to_merge: 0,
+            index_names: None,
+            retrain: true,
+        }
+    }
+
+    pub fn num_indices_to_merge(mut self, num: usize) -> Self {
+        self.num_indices_to_merge = num;
+        self
+    }
+
+    pub fn index_names(mut self, names: Vec<String>) -> Self {
+        self.index_names = Some(names);
+        self
     }
 }
