@@ -122,6 +122,13 @@ impl FileMetadataCache {
         }
     }
 
+    pub fn approx_size(&self) -> usize {
+        if let Some(cache) = self.cache.as_ref() {
+            cache.entry_count() as usize
+        } else {
+            0
+        }
+    }
     /// Fetch an item from the cache, using a str as the key
     pub fn get_by_str<T: Send + Sync + 'static>(&self, path: &str) -> Option<Arc<T>> {
         self.get(&Path::parse(path).unwrap())

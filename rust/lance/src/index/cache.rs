@@ -105,6 +105,13 @@ impl IndexCache {
             + self.metadata_cache.entry_count()) as usize
     }
 
+    pub(crate) fn approx_size(&self) -> usize {
+        (self.scalar_cache.entry_count()
+            + self.vector_cache.entry_count()
+            + self.vector_partition_cache.entry_count()
+            + self.metadata_cache.entry_count()) as usize
+    }
+
     pub(crate) fn get_type(&self, key: &str) -> Option<ScalarIndexType> {
         if let Some(index) = self.type_cache.get(key) {
             self.cache_stats.record_hit();
