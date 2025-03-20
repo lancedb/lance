@@ -106,7 +106,7 @@ pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 
 /// Lance Dataset
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Dataset {
     pub object_store: Arc<ObjectStore>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
@@ -123,6 +123,17 @@ pub struct Dataset {
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
     pub manifest_naming_scheme: ManifestNamingScheme,
+}
+
+impl std::fmt::Debug for Dataset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dataset")
+            .field("uri", &self.uri)
+            .field("base", &self.base)
+            .field("version", &self.manifest.version)
+            .field("cache_num_items", &self.session.approx_num_items())
+            .finish()
+    }
 }
 
 /// Dataset Version
