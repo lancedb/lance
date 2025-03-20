@@ -1,11 +1,15 @@
 # Configuration file for the Sphinx documentation builder.
 
+import sys
+import os
 
 # -- Project information -----------------------------------------------------
 
 project = "Lance"
 copyright = "%Y, Lance Developer"
 author = "Lance Developer"
+
+sys.path.insert(0, os.path.abspath("../python"))
 
 
 # -- General configuration ---------------------------------------------------
@@ -85,15 +89,20 @@ html_theme_options = {
         "content.tabs.link",
         "content.code.copy",
     ],
+    "navigation_depth": 4,
     "social": [
         {
             "icon": "fontawesome/brands/github",
-            "link": "https://github.com/jbms/sphinx-immaterial",
+            "link": "https://github.com/lancedb/lance",
             "name": "Source on github.com",
         },
         {
             "icon": "fontawesome/brands/python",
             "link": "https://pypi.org/project/pylance/",
+        },
+        {
+            "icon": "fontawesome/brands/discord",
+            "link": "https://discord.gg/zMM32dvNtd",
         },
     ],
 }

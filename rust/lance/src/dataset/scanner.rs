@@ -13,12 +13,10 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use datafusion::common::SchemaExt;
-use datafusion::execution::TaskContext;
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
-use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
@@ -47,7 +45,7 @@ use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
-use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
+use lance_datafusion::exec::{analyze_plan, execute_plan, LanceExecutionOptions};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::inverted::{FTS_SCHEMA, SCORE_COL};
@@ -1033,7 +1031,10 @@ impl Scanner {
 
             Ok(DatasetRecordBatchStream::new(execute_plan(
                 plan,
-                LanceExecutionOptions::default(),
+                LanceExecutionOptions {
+                    batch_size: self.batch_size,
+                    ..Default::default()
+                },
             )?))
         }
         .boxed()
@@ -1494,7 +1495,7 @@ impl Scanner {
             )?;
         }
 
-        plan = self.take(plan, pre_filter_projection, self.batch_readahead)?;
+        plan = self.take(plan, pre_filter_projection)?;
 
         // Stage 2: filter
         if let Some(refine_expr) = filter_plan.refine_expr {
@@ -1514,7 +1515,7 @@ impl Scanner {
                 .empty_projection()
                 .union_columns(ordering_columns, OnMissing::Error)?;
             // We haven't loaded the sort column yet so take it now
-            plan = self.take(plan, projection_with_ordering, self.batch_readahead)?;
+            plan = self.take(plan, projection_with_ordering)?;
             let col_exprs = ordering
                 .iter()
                 .map(|col| {
@@ -1552,7 +1553,7 @@ impl Scanner {
             .dataset
             .empty_projection()
             .union_schema(&physical_schema);
-        plan = self.take(plan, physical_projection, self.batch_readahead)?;
+        plan = self.take(plan, physical_projection)?;
         // Stage 6: physical projection -- reorder physical columns needed before final projection
         let output_arrow_schema = physical_schema.as_ref().into();
 
@@ -1768,8 +1769,7 @@ impl Scanner {
                     .empty_projection()
                     .union_column(&q.column, OnMissing::Error)
                     .unwrap();
-                let knn_node_with_vector =
-                    self.take(ann_node, vector_projection, self.batch_readahead)?;
+                let knn_node_with_vector = self.take(ann_node, vector_projection)?;
                 // TODO: now we just open an index to get its metric type.
                 let idx = self
                     .dataset
@@ -1847,7 +1847,7 @@ impl Scanner {
                     .empty_projection()
                     .union_column(&q.column, OnMissing::Error)
                     .unwrap();
-                knn_node = self.take(knn_node, vector_projection, self.batch_readahead)?;
+                knn_node = self.take(knn_node, vector_projection)?;
             }
 
             let mut columns = vec![q.column.clone()];
@@ -1986,7 +1986,7 @@ impl Scanner {
                 let refine_cols = Planner::column_names_in_expr(refine_expr);
                 take_projection = take_projection.union_columns(refine_cols, OnMissing::Error)?;
             }
-            plan = self.take(plan, take_projection, self.batch_readahead)?;
+            plan = self.take(plan, take_projection)?;
         }
 
         let post_take_filter = match (needs_recheck, refine_expr) {
@@ -2381,18 +2381,14 @@ impl Scanner {
         &self,
         input: Arc<dyn ExecutionPlan>,
         output_projection: Projection,
-        batch_readahead: usize,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let coalesced = Arc::new(CoalesceBatchesExec::new(
             input.clone(),
             self.get_batch_size(),
         ));
-        if let Some(take_plan) = TakeExec::try_new(
-            self.dataset.clone(),
-            coalesced,
-            output_projection,
-            batch_readahead,
-        )? {
+        if let Some(take_plan) =
+            TakeExec::try_new(self.dataset.clone(), coalesced, output_projection)?
+        {
             Ok(Arc::new(take_plan))
         } else {
             // No new columns needed
@@ -2412,21 +2408,15 @@ impl Scanner {
     #[instrument(level = "info", skip(self))]
     pub async fn analyze_plan(&self) -> Result<String> {
         let plan = self.create_plan().await?;
-        let schema = plan.schema();
-        let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
-        let ctx = Arc::new(TaskContext::default());
-        let mut stream = analyze.execute(0, ctx).map_err(|err| {
-            Error::io(
-                format!("Failed to execute analyze plan: {}", err),
-                location!(),
-            )
-        })?;
 
-        // fully execute the plan
-        while (stream.next().await).is_some() {}
-
-        let display = DisplayableExecutionPlan::with_metrics(analyze.as_ref());
-        Ok(format!("{}", display.indent(true)))
+        analyze_plan(
+            plan,
+            LanceExecutionOptions {
+                batch_size: self.batch_size,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     #[instrument(level = "info", skip(self))]
@@ -4647,6 +4637,23 @@ mod test {
                 }
             }
         }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_index_take_batch_size() {
+        let fixture = ScalarIndexTestFixture::new(LanceFileVersion::Stable, false).await;
+        let stream = fixture
+            .dataset
+            .scan()
+            .filter("indexed > 0")
+            .unwrap()
+            .batch_size(16)
+            .try_into_stream()
+            .await
+            .unwrap();
+        let batches = stream.collect::<Vec<_>>().await;
+        assert_eq!(batches.len(), 1000_usize.div_ceil(16));
     }
 
     async fn assert_plan_node_equals(

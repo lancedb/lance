@@ -42,13 +42,17 @@ use crate::datatypes::Schema;
 async fn open_file(
     file_fragment: FileFragment,
     projection: Arc<Schema>,
-    read_config: FragReadConfig,
+    mut read_config: FragReadConfig,
     with_make_deletions_null: bool,
-    scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
+    scan_scheduler: Option<(Arc<ScanScheduler>, u32)>,
 ) -> Result<FragmentReader> {
-    let mut reader = file_fragment
-        .open(projection.as_ref(), read_config, scan_scheduler)
-        .await?;
+    if let Some((scan_scheduler, reader_priority)) = scan_scheduler {
+        read_config = read_config
+            .with_scan_scheduler(scan_scheduler)
+            .with_reader_priority(reader_priority);
+    }
+
+    let mut reader = file_fragment.open(projection.as_ref(), read_config).await?;
 
     if with_make_deletions_null {
         reader.with_make_deletions_null();
@@ -228,7 +232,7 @@ impl LanceStream {
                             .with_row_id(config.with_row_id)
                             .with_row_address(config.with_row_address),
                         config.with_make_deletions_null,
-                        Some((scan_scheduler, priority as u64)),
+                        Some((scan_scheduler, priority as u32)),
                     )
                     .await?;
                     let batch_stream = if let Some(range) = file_fragment.range {

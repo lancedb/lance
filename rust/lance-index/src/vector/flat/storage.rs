@@ -14,7 +14,7 @@ use arrow_array::{
     types::{Float32Type, UInt64Type},
     Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array,
 };
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
@@ -160,21 +160,6 @@ impl VectorStore for FlatFloatStorage {
             self.distance_type,
         )
     }
-
-    /// Distance between two vectors.
-    fn distance_between(&self, a: u32, b: u32) -> f32 {
-        match self.vectors.value_type() {
-            DataType::Float32 => {
-                let vector1 = self.vectors.value(a as usize);
-                let vector2 = self.vectors.value(b as usize);
-                self.distance_type.func()(
-                    vector1.as_primitive::<Float32Type>().values(),
-                    vector2.as_primitive::<Float32Type>().values(),
-                )
-            }
-            _ => unimplemented!(),
-        }
-    }
 }
 
 /// All data are stored in memory
@@ -291,21 +276,6 @@ impl VectorStore for FlatBinStorage {
             self.vectors.value(id as usize),
             self.distance_type,
         )
-    }
-
-    /// Distance between two vectors.
-    fn distance_between(&self, a: u32, b: u32) -> f32 {
-        match self.vectors.value_type() {
-            DataType::Float32 => {
-                let vector1 = self.vectors.value(a as usize);
-                let vector2 = self.vectors.value(b as usize);
-                self.distance_type.func()(
-                    vector1.as_primitive::<Float32Type>().values(),
-                    vector2.as_primitive::<Float32Type>().values(),
-                )
-            }
-            _ => unimplemented!(),
-        }
     }
 }
 

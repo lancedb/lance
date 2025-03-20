@@ -26,6 +26,7 @@ use lance_io::{
     utils::read_message,
 };
 use lance_linalg::distance::{DistanceType, Dot, L2};
+use lance_table::utils::LanceIteratorExtension;
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
 use prost::Message;
@@ -104,8 +105,6 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
 /// It stores PQ code, as well as the row ID to the original vectors.
 ///
 /// It is possible to store additional metadata to accelerate filtering later.
-///
-/// TODO: support f16/f64 later.
 #[derive(Clone, Debug)]
 pub struct ProductQuantizationStorage {
     codebook: FixedSizeListArray,
@@ -436,7 +435,6 @@ impl VectorStore for ProductQuantizationStorage {
             _ => distance_type,
         };
         let metadata_json = batch
-            .schema_ref()
             .metadata()
             .get(STORAGE_METADATA_KEY)
             .ok_or(Error::Index {
@@ -544,12 +542,163 @@ impl VectorStore for ProductQuantizationStorage {
         }
     }
 
-    fn dist_calculator_from_id(&self, _: u32) -> Self::DistanceCalculator<'_> {
-        todo!("distance_between not implemented for PQ storage")
+    fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+        let codes = get_pq_code(
+            self.pq_code.values(),
+            self.num_bits,
+            self.num_sub_vectors,
+            id,
+        );
+        match self.codebook.value_type() {
+            DataType::Float16 => {
+                let codebook = self
+                    .codebook
+                    .values()
+                    .as_primitive::<datatypes::Float16Type>()
+                    .values();
+                let query = get_centroids(
+                    codebook,
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.dimension,
+                    codes,
+                );
+                PQDistCalculator::new(
+                    codebook,
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.pq_code.clone(),
+                    &query,
+                    self.distance_type,
+                )
+            }
+            DataType::Float32 => {
+                let codebook = self
+                    .codebook
+                    .values()
+                    .as_primitive::<datatypes::Float32Type>()
+                    .values();
+                let query = get_centroids(
+                    codebook,
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.dimension,
+                    codes,
+                );
+                PQDistCalculator::new(
+                    codebook,
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.pq_code.clone(),
+                    &query,
+                    self.distance_type,
+                )
+            }
+            DataType::Float64 => {
+                let codebook = self
+                    .codebook
+                    .values()
+                    .as_primitive::<datatypes::Float64Type>()
+                    .values();
+                let query = get_centroids(
+                    codebook,
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.dimension,
+                    codes,
+                );
+                PQDistCalculator::new(
+                    codebook,
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.pq_code.clone(),
+                    &query,
+                    self.distance_type,
+                )
+            }
+            _ => unimplemented!("Unsupported data type: {:?}", self.codebook.value_type()),
+        }
     }
 
-    fn distance_between(&self, _: u32, _: u32) -> f32 {
-        todo!("distance_between not implemented for PQ storage")
+    fn dist_between(&self, u: u32, v: u32) -> f32 {
+        // this is a fast way to compute distance between two vectors in the same storage.
+        // it doesn't construct the distance table.
+        let pq_codes = self.pq_code.values();
+        let u_codes = get_pq_code(pq_codes, self.num_bits, self.num_sub_vectors, u);
+        let v_codes = get_pq_code(pq_codes, self.num_bits, self.num_sub_vectors, v);
+
+        match self.codebook.value_type() {
+            DataType::Float16 => {
+                let qu = get_centroids(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float16Type>()
+                        .values(),
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.dimension,
+                    u_codes,
+                );
+                let qv = get_centroids(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float16Type>()
+                        .values(),
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.dimension,
+                    v_codes,
+                );
+                self.distance_type.func()(&qu, &qv)
+            }
+            DataType::Float32 => {
+                let qu = get_centroids(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float32Type>()
+                        .values(),
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.dimension,
+                    u_codes,
+                );
+                let qv = get_centroids(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float32Type>()
+                        .values(),
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.dimension,
+                    v_codes,
+                );
+                self.distance_type.func()(&qu, &qv)
+            }
+            DataType::Float64 => {
+                let qu = get_centroids(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float64Type>()
+                        .values(),
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.dimension,
+                    u_codes,
+                );
+                let qv = get_centroids(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float64Type>()
+                        .values(),
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.dimension,
+                    v_codes,
+                );
+                self.distance_type.func()(&qu, &qv)
+            }
+            _ => unimplemented!("Unsupported data type: {:?}", self.codebook.value_type()),
+        }
     }
 }
 
@@ -589,20 +738,14 @@ impl PQDistCalculator {
         }
     }
 
-    fn get_pq_code(&self, id: u32) -> Vec<usize> {
-        let num_sub_vectors_in_byte = if self.num_bits == 4 {
-            self.num_sub_vectors / 2
-        } else {
-            self.num_sub_vectors
-        };
-        let num_vectors = self.pq_code.len() / num_sub_vectors_in_byte;
-        self.pq_code
-            .values()
-            .iter()
-            .skip(id as usize)
-            .step_by(num_vectors)
-            .map(|&c| c as usize)
-            .collect()
+    fn get_pq_code(&self, id: u32) -> impl Iterator<Item = usize> + '_ {
+        get_pq_code(
+            self.pq_code.values(),
+            self.num_bits,
+            self.num_sub_vectors,
+            id,
+        )
+        .map(|v| v as usize)
     }
 }
 
@@ -610,24 +753,29 @@ impl DistCalculator for PQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
         let num_centroids = 2_usize.pow(self.num_bits);
         let pq_code = self.get_pq_code(id);
-
-        if self.num_bits == 4 {
+        let diff = self.num_sub_vectors as f32 - 1.0;
+        let dist = if self.num_bits == 4 {
             pq_code
-                .into_iter()
                 .enumerate()
                 .map(|(i, c)| {
                     let current_idx = c & 0x0F;
                     let next_idx = c >> 4;
+
                     self.distance_table[2 * i * num_centroids + current_idx]
                         + self.distance_table[(2 * i + 1) * num_centroids + next_idx]
                 })
                 .sum()
         } else {
             pq_code
-                .into_iter()
                 .enumerate()
                 .map(|(i, c)| self.distance_table[i * num_centroids + c])
                 .sum()
+        };
+
+        if self.distance_type == DistanceType::Dot {
+            dist - diff
+        } else {
+            dist
         }
     }
 
@@ -657,20 +805,97 @@ impl DistCalculator for PQDistCalculator {
                 );
                 l2_dists.into_iter().map(|v| v / 2.0).collect()
             }
-            DistanceType::Dot => compute_pq_distance(
-                &self.distance_table,
-                self.num_bits,
-                self.num_sub_vectors,
-                self.pq_code.values(),
-            ),
+            DistanceType::Dot => {
+                let dot_dists = compute_pq_distance(
+                    &self.distance_table,
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.pq_code.values(),
+                );
+                let diff = self.num_sub_vectors as f32 - 1.0;
+                dot_dists.into_iter().map(|v| v - diff).collect()
+            }
             _ => unimplemented!("distance type is not supported: {:?}", self.distance_type),
         }
     }
 }
 
+fn get_pq_code(
+    pq_code: &[u8],
+    num_bits: u32,
+    num_sub_vectors: usize,
+    id: u32,
+) -> impl Iterator<Item = u8> + '_ {
+    let num_bytes = if num_bits == 4 {
+        num_sub_vectors / 2
+    } else {
+        num_sub_vectors
+    };
+
+    let num_vectors = pq_code.len() / num_bytes;
+    pq_code
+        .iter()
+        .skip(id as usize)
+        .step_by(num_vectors)
+        .copied()
+        .exact_size(num_bytes)
+}
+
+fn get_centroids<T: Clone>(
+    codebook: &[T],
+    num_bits: u32,
+    num_sub_vectors: usize,
+    dimension: usize,
+    codes: impl Iterator<Item = u8>,
+) -> Vec<T> {
+    // codebook[i][j] is the j-th centroid of the i-th sub-vector.
+    // the codebook is stored as a flat array, codebook[i * num_centroids + j] = codebook[i][j]
+
+    if num_bits == 4 {
+        return get_centroids_4bit(codebook, num_sub_vectors, dimension, codes);
+    }
+
+    let num_centroids: usize = 2_usize.pow(8);
+    let sub_vector_width = dimension / num_sub_vectors;
+    let mut centroids = Vec::with_capacity(dimension);
+    for (sub_vec_idx, centroid_idx) in codes.enumerate() {
+        let centroid_idx = centroid_idx as usize;
+        let centroid = &codebook[sub_vec_idx * num_centroids * sub_vector_width
+            + centroid_idx * sub_vector_width
+            ..sub_vec_idx * num_centroids * sub_vector_width
+                + (centroid_idx + 1) * sub_vector_width];
+        centroids.extend_from_slice(centroid);
+    }
+    centroids
+}
+
+fn get_centroids_4bit<T: Clone>(
+    codebook: &[T],
+    num_sub_vectors: usize,
+    dimension: usize,
+    codes: impl Iterator<Item = u8>,
+) -> Vec<T> {
+    let num_centroids: usize = 16;
+    let sub_vector_width = dimension / num_sub_vectors;
+    let mut centroids = Vec::with_capacity(dimension);
+    for (sub_vec_idx, centroid_idx) in codes.into_iter().enumerate() {
+        let current_idx = (centroid_idx & 0x0F) as usize;
+        let offset = 2 * sub_vec_idx * num_centroids * sub_vector_width;
+        let current_centroid = &codebook[offset + current_idx * sub_vector_width
+            ..offset + (current_idx + 1) * sub_vector_width];
+        centroids.extend_from_slice(current_centroid);
+
+        let next_idx = (centroid_idx >> 4) as usize;
+        let offset = (2 * sub_vec_idx + 1) * num_centroids * sub_vector_width;
+        let next_centroid = &codebook
+            [offset + next_idx * sub_vector_width..offset + (next_idx + 1) * sub_vector_width];
+        centroids.extend_from_slice(next_centroid);
+    }
+    centroids
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::vector::ivf::storage::IvfModel;
     use crate::vector::storage::StorageBuilder;
 
     use super::*;
@@ -680,19 +905,20 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::Schema;
     use lance_core::ROW_ID_FIELD;
+    use rand::Rng;
 
     const DIM: usize = 32;
     const TOTAL: usize = 512;
     const NUM_SUB_VECTORS: usize = 16;
 
     async fn create_pq_storage() -> ProductQuantizationStorage {
-        let codebook = Float32Array::from_iter_values((0..256 * DIM).map(|v| v as f32));
+        let codebook = Float32Array::from_iter_values((0..256 * DIM).map(|_| rand::random()));
         let codebook = FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap();
-        let pq = ProductQuantizer::new(NUM_SUB_VECTORS, 8, DIM, codebook, DistanceType::L2);
+        let pq = ProductQuantizer::new(NUM_SUB_VECTORS, 8, DIM, codebook, DistanceType::Dot);
 
         let schema = ArrowSchema::new(vec![
             Field::new(
-                "vectors",
+                "vec",
                 DataType::FixedSizeList(
                     Field::new_list_field(DataType::Float32, true).into(),
                     DIM as i32,
@@ -701,20 +927,16 @@ mod tests {
             ),
             ROW_ID_FIELD.clone(),
         ]);
-        let vectors = Float32Array::from_iter_values((0..TOTAL * DIM).map(|v| v as f32));
+        let vectors = Float32Array::from_iter_values((0..TOTAL * DIM).map(|_| rand::random()));
         let row_ids = UInt64Array::from_iter_values((0..TOTAL).map(|v| v as u64));
         let fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
 
-        StorageBuilder::new(
-            &IvfModel::empty(),
-            "vectors".to_owned(),
-            pq.distance_type,
-            pq,
-        )
-        .build(&batch)
-        .unwrap()
+        StorageBuilder::new("vec".to_owned(), pq.distance_type, pq)
+            .unwrap()
+            .build(vec![batch])
+            .unwrap()
     }
 
     #[tokio::test]
@@ -762,5 +984,16 @@ mod tests {
             .collect::<Vec<_>>();
         let distances = dist_calc.distance_all();
         assert_eq!(distances, expected);
+    }
+
+    #[tokio::test]
+    async fn test_dist_between() {
+        let mut rng = rand::thread_rng();
+        let storage = create_pq_storage().await;
+        let u = rng.gen_range(0..storage.len() as u32);
+        let v = rng.gen_range(0..storage.len() as u32);
+        let dist1 = storage.dist_between(u, v);
+        let dist2 = storage.dist_between(v, u);
+        assert_eq!(dist1, dist2);
     }
 }

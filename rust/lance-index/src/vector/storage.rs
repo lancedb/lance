@@ -10,7 +10,7 @@ use arrow::array::AsArray;
 use arrow::compute::concat_batches;
 use arrow::datatypes::UInt64Type;
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{Field, SchemaRef};
+use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
@@ -30,11 +30,8 @@ use crate::{
     },
 };
 
-use super::pq::ProductQuantizer;
-use super::quantizer::{QuantizationType, Quantizer};
-use super::residual::ResidualTransform;
-use super::transform::Transformer;
-use super::{DISTANCE_TYPE_KEY, PART_ID_COLUMN};
+use super::quantizer::Quantizer;
+use super::DISTANCE_TYPE_KEY;
 
 /// <section class="warning">
 ///  Internal API
@@ -141,63 +138,44 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
 
-    fn distance_between(&self, a: u32, b: u32) -> f32;
-
-    fn dist_calculator_from_native(&self, _query: ArrayRef) -> Self::DistanceCalculator<'_> {
-        todo!("Implement this")
+    fn dist_between(&self, u: u32, v: u32) -> f32 {
+        let dist_cal_u = self.dist_calculator_from_id(u);
+        dist_cal_u.distance(v)
     }
 }
 
 pub struct StorageBuilder<Q: Quantization> {
-    column: String,
+    vector_column: String,
     distance_type: DistanceType,
     quantizer: Q,
-    transformers: Vec<Arc<dyn Transformer>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
-    pub fn new(ivf: &IvfModel, column: String, distance_type: DistanceType, quantizer: Q) -> Self {
-        let mut transformers = vec![];
-        if matches!(Q::quantization_type(), QuantizationType::Product)
-            && ProductQuantizer::use_residual(distance_type)
-            && ivf.centroids.is_some()
-        {
-            transformers.push(Arc::new(ResidualTransform::new(
-                ivf.centroids.clone().unwrap(),
-                PART_ID_COLUMN,
-                &column,
-            )) as _);
-        }
-        Self {
-            column,
+    pub fn new(vector_column: String, distance_type: DistanceType, quantizer: Q) -> Result<Self> {
+        Ok(Self {
+            vector_column,
             distance_type,
             quantizer,
-            transformers,
-        }
+        })
     }
 
-    pub fn build(&self, batch: &RecordBatch) -> Result<Q::Storage> {
-        let mut batch = batch.clone();
-        for transformer in &self.transformers {
-            batch = transformer.transform(&batch)?;
+    pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
+        let mut batch = concat_batches(batches[0].schema_ref(), batches.iter())?;
+
+        if batch.column_by_name(self.quantizer.column()).is_none() {
+            let vectors = batch
+                .column_by_name(&self.vector_column)
+                .ok_or(Error::Index {
+                    message: format!("Vector column {} not found in batch", self.vector_column),
+                    location: location!(),
+                })?;
+            let codes = self.quantizer.quantize(vectors)?;
+            batch = batch.drop_column(&self.vector_column)?.try_with_column(
+                arrow_schema::Field::new(self.quantizer.column(), codes.data_type().clone(), true),
+                codes,
+            )?;
         }
 
-        let vectors = batch.column_by_name(&self.column).ok_or(Error::Schema {
-            message: format!("column {} not found", self.column),
-            location: location!(),
-        })?;
-        let code_array = self.quantizer.quantize(vectors.as_ref())?;
-        let batch = batch
-            .try_with_column(
-                Field::new(
-                    self.quantizer.column(),
-                    code_array.data_type().clone(),
-                    true,
-                ),
-                code_array,
-            )?
-            .drop_column(&self.column)?
-            .drop_column(PART_ID_COLUMN)?;
         let batch = batch.add_metadata(
             STORAGE_METADATA_KEY.to_owned(),
             self.quantizer.metadata(None)?.to_string(),
