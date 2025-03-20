@@ -626,7 +626,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
         match result {
             Ok(path) => {
-                if let Some(auto_clean_carried_out) = auto_clean_hook(&dataset, &manifest).await {
+                if let Some(auto_clean_carried_out) = auto_clean_hook(&dataset, &manifest).await? {
                     auto_clean_carried_out?;
                 }
 
@@ -833,7 +833,7 @@ pub(crate) async fn commit_transaction(
                     .file_metadata_cache
                     .insert(cache_path, Arc::new(transaction.clone()));
 
-                if let Some(auto_clean_carried_out) = auto_clean_hook(&dataset, &manifest).await {
+                if let Some(auto_clean_carried_out) = auto_clean_hook(&dataset, &manifest).await? {
                     auto_clean_carried_out?;
                 }
 
