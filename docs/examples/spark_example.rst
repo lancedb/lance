@@ -96,8 +96,8 @@ Running the Spark Application
 
 To execute the application, download these dependencies:
 
-* lance-core JAR: Core Rust Spark binding exposing Lance features to Java (available `here <https://mvnrepository.com/artifact/com.lancedb/lance-core>`_)
-* lance-spark JAR: Spark connector for reading/writing Lance format (available `here <https://mvnrepository.com/artifact/com.lancedb/lance-spark>`_)
+* lance-core JAR: Core Rust Spark binding exposing Lance features to Java (available `here <https://repo1.maven.org/maven2/com/lancedb/lance-core/0.23.0/lance-core-0.23.0.jar>`_)
+* lance-spark JAR: Spark connector for reading/writing Lance format (available `here <https://repo1.maven.org/maven2/com/lancedb/lance-spark/0.23.0/lance-spark-0.23.0.jar>`_)
 
 Place these JARs in the ``${SPARK_HOME}/jars`` directory, then run:
 
