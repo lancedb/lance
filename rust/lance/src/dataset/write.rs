@@ -111,6 +111,22 @@ impl TryFrom<&str> for WriteMode {
     }
 }
 
+/// Autoclean Parameters
+#[derive(Debug, Clone)]
+pub struct AutoCleanupParams {
+    pub interval: usize,
+    pub older_than: usize,
+}
+
+impl Default for AutoCleanupParams {
+    fn default() -> Self {
+        Self {
+            interval: 20,
+            older_than: 14,
+        }
+    }
+}
+
 /// Dataset Write Parameters
 #[derive(Debug, Clone)]
 pub struct WriteParams {
@@ -173,6 +189,14 @@ pub struct WriteParams {
     pub object_store_registry: Arc<ObjectStoreRegistry>,
 
     pub session: Option<Arc<Session>>,
+
+    /// If Some, and this is a new dataset, set auto cleanup parameters.
+    /// This allows for old dataset versions to be automatically cleaned up, as
+    /// according to the parameters set out in `AutoCleanupParams`.
+    /// This parameter has no effect on existing datasets. To add autocleanup to
+    /// an existing /// dataset, use XXXXXXX method.
+    /// Default is Some({"interval": 20, "older_than": 14}).
+    pub auto_cleanup: Option<AutoCleanupParams>,
 }
 
 impl Default for WriteParams {
@@ -192,6 +216,7 @@ impl Default for WriteParams {
             enable_v2_manifest_paths: false,
             object_store_registry: Arc::new(ObjectStoreRegistry::default()),
             session: None,
+            auto_cleanup: Some(AutoCleanupParams::default()),
         }
     }
 }
