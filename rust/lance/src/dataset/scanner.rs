@@ -46,6 +46,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{analyze_plan, execute_plan, LanceExecutionOptions};
 use lance_datafusion::projection::ProjectionPlan;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::inverted::{FTS_SCHEMA, SCORE_COL};
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
@@ -1762,7 +1763,11 @@ impl Scanner {
                 // TODO: now we just open an index to get its metric type.
                 let idx = self
                     .dataset
-                    .open_vector_index(q.column.as_str(), &index.uuid.to_string())
+                    .open_vector_index(
+                        q.column.as_str(),
+                        &index.uuid.to_string(),
+                        &NoOpMetricsCollector,
+                    )
                     .await?;
                 let mut q = q.clone();
                 q.metric_type = idx.metric_type();
@@ -1823,7 +1828,11 @@ impl Scanner {
             // to make sure the distance is comparable.
             let idx = self
                 .dataset
-                .open_vector_index(q.column.as_str(), &index.uuid.to_string())
+                .open_vector_index(
+                    q.column.as_str(),
+                    &index.uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
                 .await?;
             let mut q = q.clone();
             q.metric_type = idx.metric_type();

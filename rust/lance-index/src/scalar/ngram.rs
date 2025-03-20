@@ -19,6 +19,7 @@ use lance_core::cache::FileMetadataCache;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::Result;
 use lance_core::{utils::mask::RowIdTreeMap, Error};
 use lance_io::object_store::ObjectStore;
@@ -32,13 +33,17 @@ use tantivy::tokenizer::TextAnalyzer;
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
+use crate::metrics::NoOpMetricsCollector;
 use crate::scalar::inverted::CACHE_SIZE;
 use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 
 use super::btree::TrainingSource;
 use super::lance_format::LanceIndexStore;
-use super::{AnyQuery, IndexReader, IndexStore, IndexWriter, ScalarIndex, SearchResult, TextQuery};
+use super::{
+    AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector, ScalarIndex, SearchResult,
+    TextQuery,
+};
 
 const TOKENS_COL: &str = "tokens";
 const POSTING_LIST_COL: &str = "posting_list";
@@ -185,10 +190,16 @@ impl std::fmt::Debug for NGramPostingListReader {
 }
 
 impl NGramPostingListReader {
-    #[instrument(level = "debug", skip(self))]
-    pub async fn ngram_list(&self, row_offset: u32) -> Result<Arc<NGramPostingList>> {
+    #[instrument(level = "debug", skip(self, metrics))]
+    pub async fn ngram_list(
+        &self,
+        row_offset: u32,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<NGramPostingList>> {
         self.cache
             .try_get_with(row_offset, async move {
+                metrics.record_part_load();
+                tracing::info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="ngram", part_id=row_offset);
                 let batch = self
                     .reader
                     .read_range(
@@ -357,7 +368,10 @@ impl Index for NGramIndex {
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
         let mut frag_ids = RoaringBitmap::new();
         for row_offset in self.tokens.values() {
-            let list = self.list_reader.ngram_list(*row_offset).await?;
+            let list = self
+                .list_reader
+                .ngram_list(*row_offset, &NoOpMetricsCollector)
+                .await?;
             frag_ids.extend(
                 list.bitmap
                     .iter()
@@ -370,7 +384,11 @@ impl Index for NGramIndex {
 
 #[async_trait]
 impl ScalarIndex for NGramIndex {
-    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query =
             query
                 .as_any()
@@ -403,11 +421,12 @@ impl ScalarIndex for NGramIndex {
                 let posting_lists = futures::stream::iter(
                     row_offsets
                         .into_iter()
-                        .map(|row_offset| self.list_reader.ngram_list(row_offset)),
+                        .map(|row_offset| self.list_reader.ngram_list(row_offset, metrics)),
                 )
                 .buffer_unordered(self.io_parallelism)
                 .try_collect::<Vec<_>>()
                 .await?;
+                metrics.record_comparisons(posting_lists.len());
                 let list_refs = posting_lists.iter().map(|list| list.as_ref());
                 let row_ids = NGramPostingList::intersect(list_refs);
                 Ok(SearchResult::AtMost(RowIdTreeMap::from(row_ids)))
@@ -1154,6 +1173,7 @@ mod tests {
     use tantivy::tokenizer::TextAnalyzer;
     use tempfile::{tempdir, TempDir};
 
+    use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::{
         lance_format::LanceIndexStore,
         ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions},
@@ -1233,13 +1253,21 @@ mod tests {
     async fn get_posting_list_for_trigram(index: &NGramIndex, trigram: &str) -> Vec<u64> {
         let token = ngram_to_token(trigram, 3);
         let row_offset = index.tokens[&token];
-        let list = index.list_reader.ngram_list(row_offset).await.unwrap();
+        let list = index
+            .list_reader
+            .ngram_list(row_offset, &NoOpMetricsCollector)
+            .await
+            .unwrap();
         list.bitmap.iter().sorted().collect()
     }
 
     async fn get_null_posting_list(index: &NGramIndex) -> Vec<u64> {
         let row_offset = index.tokens[&0];
-        let list = index.list_reader.ngram_list(row_offset).await.unwrap();
+        let list = index
+            .list_reader
+            .ngram_list(row_offset, &NoOpMetricsCollector)
+            .await
+            .unwrap();
         list.bitmap.iter().sorted().collect()
     }
 
@@ -1275,7 +1303,10 @@ mod tests {
 
         // Basic search
         let res = index
-            .search(&TextQuery::StringContains("cat".to_string()))
+            .search(
+                &TextQuery::StringContains("cat".to_string()),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -1285,7 +1316,10 @@ mod tests {
 
         // Whitespace in query
         let res = index
-            .search(&TextQuery::StringContains("nos nos".to_string()))
+            .search(
+                &TextQuery::StringContains("nos nos".to_string()),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         let expected = SearchResult::AtMost(RowIdTreeMap::from_iter([8]));
@@ -1293,7 +1327,10 @@ mod tests {
 
         // No matches
         let res = index
-            .search(&TextQuery::StringContains("tdo".to_string()))
+            .search(
+                &TextQuery::StringContains("tdo".to_string()),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         let expected = SearchResult::Exact(RowIdTreeMap::new());
@@ -1301,7 +1338,10 @@ mod tests {
 
         // False positive
         let res = index
-            .search(&TextQuery::StringContains("inose".to_string()))
+            .search(
+                &TextQuery::StringContains("inose".to_string()),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         let expected = SearchResult::AtMost(RowIdTreeMap::from_iter([8]));
@@ -1309,7 +1349,10 @@ mod tests {
 
         // Too short, don't know anything
         let res = index
-            .search(&TextQuery::StringContains("ab".to_string()))
+            .search(
+                &TextQuery::StringContains("ab".to_string()),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         let expected = SearchResult::AtLeast(RowIdTreeMap::new());
@@ -1317,7 +1360,10 @@ mod tests {
 
         // One short string but we still get at least one trigram, this is ok
         let res = index
-            .search(&TextQuery::StringContains("no nos".to_string()))
+            .search(
+                &TextQuery::StringContains("no nos".to_string()),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         let expected = SearchResult::AtMost(RowIdTreeMap::from_iter([8]));
@@ -1353,7 +1399,10 @@ mod tests {
         assert_eq!(index.tokens.len(), 3);
 
         let res = index
-            .search(&TextQuery::StringContains("cat".to_string()))
+            .search(
+                &TextQuery::StringContains("cat".to_string()),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         let expected = SearchResult::AtMost(RowIdTreeMap::from_iter([0, 4]));
@@ -1403,7 +1452,11 @@ mod tests {
     async fn row_ids_in_index(index: &NGramIndex) -> Vec<u64> {
         let mut row_ids = HashSet::new();
         for row_offset in index.tokens.values() {
-            let list = index.list_reader.ngram_list(*row_offset).await.unwrap();
+            let list = index
+                .list_reader
+                .ngram_list(*row_offset, &NoOpMetricsCollector)
+                .await
+                .unwrap();
             row_ids.extend(list.bitmap.iter());
         }
         row_ids.into_iter().sorted().collect()

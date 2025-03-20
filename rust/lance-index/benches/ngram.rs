@@ -11,6 +11,7 @@ use futures::stream;
 use itertools::Itertools;
 use lance_core::cache::FileMetadataCache;
 use lance_core::ROW_ID;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions};
 use lance_index::scalar::{ScalarIndex, TextQuery};
@@ -101,7 +102,7 @@ fn bench_ngram(c: &mut Criterion) {
                 .to_string();
             black_box(
                 index
-                    .search(&TextQuery::StringContains(sample))
+                    .search(&TextQuery::StringContains(sample), &NoOpMetricsCollector)
                     .await
                     .unwrap(),
             );

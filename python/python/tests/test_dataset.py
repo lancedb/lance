@@ -807,6 +807,23 @@ def test_analyze_index_scan(tmp_path: Path):
     assert "MaterializeIndex: query=filter = 10, metrics=[output_rows=1" in plan
 
 
+def test_analyze_scan(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(table, tmp_path)
+    plan = dataset.scanner().analyze_plan()
+    # The bytes_read part might get brittle if we change file versions a lot
+    # future us are free to ignore that part.
+    assert "bytes_read=3643, iops=3, requests=3" in plan
+
+
+def test_analyze_take(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("a", "BTREE")
+    plan = dataset.scanner(filter="a = 50").analyze_plan()
+    assert "bytes_read=16, iops=2, requests=2" in plan
+
+
 def test_analyze_vector_search(tmp_path: Path):
     table = pa.Table.from_pydict(
         {

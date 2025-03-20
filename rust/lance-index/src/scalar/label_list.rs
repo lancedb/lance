@@ -19,18 +19,22 @@ use tracing::instrument;
 
 use crate::{Index, IndexType};
 
-use super::SearchResult;
 use super::{bitmap::train_bitmap_index, SargableQuery};
 use super::{
     bitmap::BitmapIndex, btree::TrainingSource, AnyQuery, IndexStore, LabelListQuery, ScalarIndex,
 };
+use super::{MetricsCollector, SearchResult};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
 #[async_trait]
 trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
-    async fn search_exact(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
-        let result = self.search(query).await?;
+    async fn search_exact(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RowIdTreeMap> {
+        let result = self.search(query, metrics).await?;
         match result {
             SearchResult::Exact(row_ids) => Ok(row_ids),
             _ => Err(Error::Internal {
@@ -91,11 +95,12 @@ impl LabelListIndex {
     fn search_values<'a>(
         &'a self,
         values: &'a Vec<ScalarValue>,
+        metrics: &'a dyn MetricsCollector,
     ) -> BoxStream<'a, Result<RowIdTreeMap>> {
         futures::stream::iter(values)
             .then(move |value| {
                 let value_query = SargableQuery::Equals(value.clone());
-                async move { self.values_index.search_exact(&value_query).await }
+                async move { self.values_index.search_exact(&value_query, metrics).await }
             })
             .boxed()
     }
@@ -133,18 +138,22 @@ impl LabelListIndex {
 
 #[async_trait]
 impl ScalarIndex for LabelListIndex {
-    #[instrument(skip(self), level = "debug")]
-    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
+    #[instrument(skip_all, level = "debug")]
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<LabelListQuery>().unwrap();
 
         let row_ids = match query {
             LabelListQuery::HasAllLabels(labels) => {
-                let values_results = self.search_values(labels);
+                let values_results = self.search_values(labels, metrics);
                 self.set_intersection(values_results, labels.len() == 1)
                     .await
             }
             LabelListQuery::HasAnyLabel(labels) => {
-                let values_results = self.search_values(labels);
+                let values_results = self.search_values(labels, metrics);
                 self.set_union(values_results, labels.len() == 1).await
             }
         }?;

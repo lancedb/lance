@@ -18,7 +18,9 @@ use lance_core::{utils::mask::RowIdMask, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use tracing::instrument;
 
-use super::{AnyQuery, LabelListQuery, SargableQuery, ScalarIndex, SearchResult, TextQuery};
+use super::{
+    AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult, TextQuery,
+};
 
 /// An indexed expression consists of a scalar index query with a post-scan filter
 ///
@@ -392,7 +394,11 @@ impl IndexedExpression {
 #[async_trait]
 pub trait ScalarIndexLoader: Send + Sync {
     /// Load the index with the given name
-    async fn load_index(&self, name: &str) -> Result<Arc<dyn ScalarIndex>>;
+    async fn load_index(
+        &self,
+        name: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>>;
 }
 
 /// This represents a lookup into one or more scalar indices
@@ -452,10 +458,14 @@ impl ScalarIndexExpr {
     /// any situations where the session cache has been disabled.
     #[async_recursion]
     #[instrument(level = "debug", skip_all)]
-    pub async fn evaluate(&self, index_loader: &dyn ScalarIndexLoader) -> Result<IndexExprResult> {
+    pub async fn evaluate(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<IndexExprResult> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate(index_loader).await?;
+                let result = inner.evaluate(index_loader, metrics).await?;
                 match result {
                     IndexExprResult::Exact(mask) => Ok(IndexExprResult::Exact(!mask)),
                     IndexExprResult::AtMost(mask) => Ok(IndexExprResult::AtLeast(!mask)),
@@ -463,8 +473,8 @@ impl ScalarIndexExpr {
                 }
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate(index_loader);
-                let rhs_result = rhs.evaluate(index_loader);
+                let lhs_result = lhs.evaluate(index_loader, metrics);
+                let rhs_result = rhs.evaluate(index_loader, metrics);
                 let (lhs_result, rhs_result) = join!(lhs_result, rhs_result);
                 match (lhs_result?, rhs_result?) {
                     (IndexExprResult::Exact(lhs), IndexExprResult::Exact(rhs)) => {
@@ -499,8 +509,8 @@ impl ScalarIndexExpr {
                 }
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate(index_loader);
-                let rhs_result = rhs.evaluate(index_loader);
+                let lhs_result = lhs.evaluate(index_loader, metrics);
+                let rhs_result = rhs.evaluate(index_loader, metrics);
                 let (lhs_result, rhs_result) = join!(lhs_result, rhs_result);
                 match (lhs_result?, rhs_result?) {
                     (IndexExprResult::Exact(lhs), IndexExprResult::Exact(rhs)) => {
@@ -534,8 +544,8 @@ impl ScalarIndexExpr {
                 }
             }
             Self::Query(column, query) => {
-                let index = index_loader.load_index(column).await?;
-                let search_result = index.search(query.as_ref()).await?;
+                let index = index_loader.load_index(column, metrics).await?;
+                let search_result = index.search(query.as_ref(), metrics).await?;
                 match search_result {
                     SearchResult::Exact(matching_row_ids) => {
                         Ok(IndexExprResult::Exact(RowIdMask {

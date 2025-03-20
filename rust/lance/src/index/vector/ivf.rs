@@ -29,13 +29,19 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::{
-    traits::DatasetTakeRows, utils::tokio::get_num_compute_intensive_cpus, Error, Result,
-    ROW_ID_FIELD,
+    traits::DatasetTakeRows,
+    utils::{
+        tokio::get_num_compute_intensive_cpus,
+        tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
+    },
+    Error, Result, ROW_ID_FIELD,
 };
 use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
+use lance_index::metrics::MetricsCollector;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::transpose;
@@ -165,11 +171,12 @@ impl IVFIndex {
     /// Parameters
     /// ----------
     ///  - partition_id: partition ID.
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, metrics))]
     pub async fn load_partition(
         &self,
         partition_id: usize,
         write_cache: bool,
+        metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
         let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
         let session = self.session.upgrade().ok_or(Error::Internal {
@@ -179,6 +186,9 @@ impl IVFIndex {
         let part_index = if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
             part_idx
         } else {
+            metrics.record_part_load();
+            tracing::info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key);
+
             let mtx = self.partition_locks.get_partition_mutex(partition_id);
             let _guard = mtx.lock().await;
             // check the cache again, as the partition may have been loaded by another
@@ -849,7 +859,9 @@ impl Index for IVFIndex {
         let mut frag_ids = RoaringBitmap::default();
         let part_ids = 0..self.ivf.num_partitions();
         for part_id in part_ids {
-            let part = self.load_partition(part_id, false).await?;
+            let part = self
+                .load_partition(part_id, false, &NoOpMetricsCollector)
+                .await?;
             frag_ids |= part.calculate_included_frags().await?;
         }
         Ok(frag_ids)
@@ -859,7 +871,12 @@ impl Index for IVFIndex {
 #[async_trait]
 impl VectorIndex for IVFIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
+    async fn search(
+        &self,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
         let mut query = query.clone();
         if self.metric_type == MetricType::Cosine {
             let key = normalize_arrow(&query.key)?;
@@ -870,7 +887,9 @@ impl VectorIndex for IVFIndex {
         assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
-            .map(|part_id| self.search_in_partition(part_id as usize, &query, pre_filter.clone()))
+            .map(|part_id| {
+                self.search_in_partition(part_id as usize, &query, pre_filter.clone(), metrics)
+            })
             .buffer_unordered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
@@ -914,11 +933,12 @@ impl VectorIndex for IVFIndex {
         partition_id: usize,
         query: &Query,
         pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        let part_index = self.load_partition(partition_id, true).await?;
+        let part_index = self.load_partition(partition_id, true, metrics).await?;
 
         let query = self.preprocess_query(partition_id, query)?;
-        let batch = part_index.search(&query, pre_filter).await?;
+        let batch = part_index.search(&query, pre_filter, metrics).await?;
         Ok(batch)
     }
 
@@ -950,8 +970,9 @@ impl VectorIndex for IVFIndex {
         &self,
         partition_id: usize,
         with_vector: bool,
+        metrics: &dyn MetricsCollector,
     ) -> Result<SendableRecordBatchStream> {
-        let partition = self.load_partition(partition_id, false).await?;
+        let partition = self.load_partition(partition_id, false, metrics).await?;
         partition.to_batch_stream(with_vector).await
     }
 
@@ -1814,6 +1835,7 @@ mod tests {
     use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen, ArrayGeneratorExt, Dimension, RowCount};
+    use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
@@ -2019,7 +2041,10 @@ mod tests {
                     metric_type: MetricType::L2,
                     use_index: true,
                 };
-                let search_result = index.search(&query, prefilter.clone()).await.unwrap();
+                let search_result = index
+                    .search(&query, prefilter.clone(), &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
 
                 let found_ids = search_result.column(1);
                 let found_ids = found_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
@@ -2196,7 +2221,7 @@ mod tests {
         .unwrap();
 
         let index = dataset
-            .open_vector_index(WellKnownIvfPqData::COLUMN, &uuid_str)
+            .open_vector_index(WellKnownIvfPqData::COLUMN, &uuid_str, &NoOpMetricsCollector)
             .await
             .unwrap();
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
@@ -2252,7 +2277,11 @@ mod tests {
         .unwrap();
 
         let remapped = dataset
-            .open_vector_index(WellKnownIvfPqData::COLUMN, &new_uuid.to_string())
+            .open_vector_index(
+                WellKnownIvfPqData::COLUMN,
+                &new_uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         let ivf_remapped = remapped.as_any().downcast_ref::<IVFIndex>().unwrap();
@@ -3039,7 +3068,11 @@ mod tests {
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
         let idx = dataset
-            .open_generic_index("vector", indices[0].uuid.to_string().as_str())
+            .open_generic_index(
+                "vector",
+                indices[0].uuid.to_string().as_str(),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         let ivf_idx = idx.as_any().downcast_ref::<v2::IvfPq>().unwrap();

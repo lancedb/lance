@@ -20,9 +20,12 @@ mod test {
     use datafusion::execution::SendableRecordBatchStream;
     use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_index::vector::ivf::storage::IvfModel;
-    use lance_index::vector::quantizer::{QuantizationType, Quantizer};
     use lance_index::vector::v3::subindex::SubIndexType;
+    use lance_index::{metrics::MetricsCollector, vector::ivf::storage::IvfModel};
+    use lance_index::{
+        metrics::NoOpMetricsCollector,
+        vector::quantizer::{QuantizationType, Quantizer},
+    };
     use lance_index::{vector::Query, Index, IndexType};
     use lance_io::{local::LocalObjectReader, traits::Reader};
     use lance_linalg::distance::MetricType;
@@ -92,6 +95,7 @@ mod test {
             &self,
             query: &Query,
             _pre_filter: Arc<dyn PreFilter>,
+            _metrics: &dyn MetricsCollector,
         ) -> Result<RecordBatch> {
             let key: &Float32Array = query.key.as_primitive();
             assert_eq!(key.len(), self.assert_query_value.len());
@@ -110,6 +114,7 @@ mod test {
             _: usize,
             _: &Query,
             _: Arc<dyn PreFilter>,
+            _: &dyn MetricsCollector,
         ) -> Result<RecordBatch> {
             unimplemented!("only for IVF")
         }
@@ -258,6 +263,7 @@ mod test {
                     filtered_ids: None,
                     final_mask: Mutex::new(OnceCell::new()),
                 }),
+                &NoOpMetricsCollector,
             )
             .await
             .unwrap();

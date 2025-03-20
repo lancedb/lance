@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
+
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     execution::RecordBatchStream,
-    physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
+    physical_plan::{
+        metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet},
+        stream::RecordBatchStreamAdapter,
+        SendableRecordBatchStream,
+    },
 };
 use datafusion_common::DataFusionError;
 use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
@@ -149,3 +155,47 @@ pub fn reader_to_stream(batches: Box<dyn RecordBatchReader + Send>) -> SendableR
     );
     Box::pin(stream)
 }
+
+pub trait MetricsExt {
+    fn find_count(&self, name: &str) -> Option<Count>;
+}
+
+impl MetricsExt for MetricsSet {
+    fn find_count(&self, metric_name: &str) -> Option<Count> {
+        self.iter().find_map(|m| match m.value() {
+            MetricValue::Count { name, count } => {
+                if name == metric_name {
+                    Some(count.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+    }
+}
+
+pub trait ExecutionPlanMetricsSetExt {
+    fn new_count(&self, name: &'static str, partition: usize) -> Count;
+}
+
+impl ExecutionPlanMetricsSetExt for ExecutionPlanMetricsSet {
+    fn new_count(&self, name: &'static str, partition: usize) -> Count {
+        let count = Count::new();
+        MetricBuilder::new(self)
+            .with_partition(partition)
+            .build(MetricValue::Count {
+                name: Cow::Borrowed(name),
+                count: count.clone(),
+            });
+        count
+    }
+}
+
+// Common metrics
+pub const IOPS_METRIC: &str = "iops";
+pub const REQUESTS_METRIC: &str = "requests";
+pub const BYTES_READ_METRIC: &str = "bytes_read";
+pub const INDICES_LOADED_METRIC: &str = "indices_loaded";
+pub const PARTS_LOADED_METRIC: &str = "parts_loaded";
+pub const INDEX_COMPARISONS_METRIC: &str = "index_comparisons";
