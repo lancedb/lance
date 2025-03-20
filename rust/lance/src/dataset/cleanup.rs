@@ -471,21 +471,41 @@ pub async fn cleanup_old_versions(
 pub async fn auto_clean_hook(
     dataset: &Dataset,
     manifest: &Manifest,
-) -> Option<Result<RemovalStats>> {
+) -> Result<Option<Result<RemovalStats>>> {
     if let Some(older_than) = manifest.config.get("lance.auto_cleanup.older_than") {
-        if let Some(cleanup_interval) = manifest.config.get("lance.auto_cleanup.interval") {
-            let older_than: i64 = older_than.parse().unwrap(); // TODO: add proper error handling
-            let cleanup_interval: u64 = cleanup_interval.parse().unwrap(); // TODO: add proper error handling
-            if manifest.version % cleanup_interval == 0 {
-                return Some(
+        if let Some(interval) = manifest.config.get("lance.auto_cleanup.interval") {
+            let older_than: i64 = match older_than.parse() {
+                Ok(t) => t,
+                Err(e) => {
+                    return Err(Error::Cleanup {
+                        message: format!(
+                        "Error encountered while parsing lance.auto_cleanup.older_than as i64: {}",
+                        e
+                    ),
+                    })
+                }
+            };
+            let interval: u64 = match interval.parse() {
+                Ok(i) => i,
+                Err(e) => {
+                    return Err(Error::Cleanup {
+                        message: format!(
+                        "Error encountered while parsing lance.auto_cleanup.interval as u64: {}",
+                        e
+                    ),
+                    })
+                }
+            };
+            if manifest.version % interval == 0 {
+                return Ok(Some(
                     dataset
                         .cleanup_old_versions(TimeDelta::days(older_than), Some(false), Some(false))
                         .await,
-                );
+                ));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 fn tagged_old_versions_cleanup_error(
