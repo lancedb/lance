@@ -34,6 +34,9 @@ pub struct IvfModel {
 
     /// Number of vectors in each partition.
     pub lengths: Vec<u32>,
+
+    /// Kmeans loss
+    pub loss: Option<f64>,
 }
 
 impl DeepSizeOf for IvfModel {
@@ -53,14 +56,16 @@ impl IvfModel {
             centroids: None,
             offsets: vec![],
             lengths: vec![],
+            loss: None,
         }
     }
 
-    pub fn new(centroids: FixedSizeListArray) -> Self {
+    pub fn new(centroids: FixedSizeListArray, loss: Option<f64>) -> Self {
         Self {
             centroids: Some(centroids),
             offsets: vec![],
             lengths: vec![],
+            loss,
         }
     }
 
@@ -86,6 +91,14 @@ impl IvfModel {
 
     pub fn partition_size(&self, part: usize) -> usize {
         self.lengths[part] as usize
+    }
+
+    pub fn num_rows(&self) -> u64 {
+        self.lengths.iter().map(|x| *x as u64).sum()
+    }
+
+    pub fn loss(&self) -> Option<f64> {
+        self.loss
     }
 
     /// Use the query vector to find `nprobes` closest partitions.
@@ -167,6 +180,7 @@ impl TryFrom<&IvfModel> for PbIvf {
             lengths,
             offsets: ivf.offsets.iter().map(|x| *x as u64).collect(),
             centroids_tensor: ivf.centroids.as_ref().map(|c| c.try_into()).transpose()?,
+            loss: ivf.loss,
         })
     }
 }
@@ -215,6 +229,7 @@ impl TryFrom<PbIvf> for IvfModel {
             centroids,
             offsets,
             lengths: proto.lengths,
+            loss: proto.loss,
         })
     }
 }
@@ -296,6 +311,7 @@ mod tests {
             lengths: vec![2, 2],
             offsets: vec![0, 2],
             centroids_tensor: None,
+            loss: None,
         };
 
         let ivf = IvfModel::try_from(pb_ivf).unwrap();

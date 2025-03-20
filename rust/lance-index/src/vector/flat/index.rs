@@ -186,6 +186,10 @@ impl Quantization for FlatQuantizer {
         Ok(Self::new(dim as usize, distance_type))
     }
 
+    fn retrain(&mut self, _: &dyn Array) -> Result<()> {
+        Ok(())
+    }
+
     fn code_dim(&self) -> usize {
         self.dim
     }
@@ -262,6 +266,10 @@ impl Quantization for FlatBinQuantizer {
     fn build(data: &dyn Array, distance_type: DistanceType, _: &Self::BuildParams) -> Result<Self> {
         let dim = data.as_fixed_size_list().value_length();
         Ok(Self::new(dim as usize, distance_type))
+    }
+
+    fn retrain(&mut self, _: &dyn Array) -> Result<()> {
+        Ok(())
     }
 
     fn code_dim(&self) -> usize {

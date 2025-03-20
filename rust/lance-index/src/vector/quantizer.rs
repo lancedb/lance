@@ -41,6 +41,7 @@ pub trait Quantization:
         distance_type: DistanceType,
         params: &Self::BuildParams,
     ) -> Result<Self>;
+    fn retrain(&mut self, data: &dyn Array) -> Result<()>;
     fn code_dim(&self) -> usize;
     fn column(&self) -> &'static str;
     fn use_residual(_: DistanceType) -> bool {

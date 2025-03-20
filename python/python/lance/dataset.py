@@ -278,6 +278,30 @@ class LanceDataset(pa.dataset.Dataset):
 
     @property
     def tags(self) -> Tags:
+        """Tag management for the dataset.
+
+        Similar to Git, tags are a way to add metadata to a specific version of the
+        dataset.
+
+        .. warning::
+
+            Tagged versions are exempted from the :py:meth:`cleanup_old_versions()`
+            process.
+
+            To remove a version that has been tagged, you must first
+            :py:meth:`~Tags.delete` the associated tag.
+
+        Examples
+        --------
+
+        .. code-block:: python
+
+            ds = lance.open("dataset.lance")
+            ds.tags.create("v2-prod-20250203", 10)
+
+            tags = ds.tags.list()
+
+        """
         return Tags(self._ds)
 
     def list_indices(self) -> List[Index]:
@@ -3602,6 +3626,15 @@ class DatasetOptimizer:
         index_names: List[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
+        retrain: bool, default False
+            Whether to retrain the whole index.
+            If true, the index will be retrained based on the current data,
+            `num_indices_to_merge` will be ignored,
+            and all indices will be merged into one.
+
+            This is useful when the data distribution has changed significantly,
+            and we want to retrain the index to improve the search quality.
+            This would be faster than re-create the index from scratch.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

@@ -214,6 +214,32 @@ def test_indexed_vector_scan_postfilter(
     assert scanner.to_table().num_rows == 0
 
 
+def test_index_take_batch_size(tmp_path):
+    dataset = lance.write_dataset(
+        pa.table({"ints": range(1024)}), tmp_path, max_rows_per_file=100
+    )
+    dataset.create_scalar_index("ints", index_type="BTREE")
+    batches = dataset.scanner(
+        with_row_id=True, filter="ints > 0", batch_size=50
+    ).to_batches()
+    batches = list(batches)
+    assert len(batches) == 21
+
+    dataset = lance.write_dataset(
+        pa.table({"strings": [f"string-{i}" for i in range(1024)]}),
+        tmp_path,
+        max_rows_per_file=100,
+        mode="overwrite",
+    )
+    dataset.create_scalar_index("strings", index_type="NGRAM")
+    filter = "contains(strings, 'ing')"
+    batches = dataset.scanner(
+        with_row_id=True, filter=filter, batch_size=50, limit=1024
+    ).to_batches()
+    batches = list(batches)
+    assert len(batches) == 21
+
+
 def test_all_null_chunk(tmp_path):
     def gen_string(idx: int):
         if idx % 2 == 0:
