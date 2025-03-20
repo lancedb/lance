@@ -756,29 +756,29 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    fn ground_truth(
-        vectors: &FixedSizeListArray,
+    async fn ground_truth(
+        dataset: &Dataset,
+        column: &str,
         query: &dyn Array,
         k: usize,
         distance_type: DistanceType,
-    ) -> Vec<(f32, u64)> {
-        let mut dists = vec![];
-        for i in 0..vectors.len() {
-            let dist = match distance_type {
-                DistanceType::Hamming => hamming(
-                    query.as_primitive::<UInt8Type>().values(),
-                    vectors.value(i).as_primitive::<UInt8Type>().values(),
-                ),
-                _ => distance_type.func()(
-                    query.as_primitive::<Float32Type>().values(),
-                    vectors.value(i).as_primitive::<Float32Type>().values(),
-                ),
-            };
-            dists.push((dist, i as u64));
-        }
-        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        dists.truncate(k);
-        dists
+    ) -> HashSet<u64> {
+        let batch = dataset
+            .scan()
+            .with_row_id()
+            .nearest(column, query, k)
+            .unwrap()
+            .distance_metric(distance_type)
+            .use_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -876,10 +876,9 @@ mod tests {
         let row_ids = results.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
         assert!(row_ids.len() == k);
 
-        let gt = ground_truth(&vectors, query.as_ref(), k, params.metric_type);
-        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
+        let gt = ground_truth(&dataset, vector_column, &query, k, params.metric_type).await;
 
-        let recall = row_ids.intersection(&gt_set).count() as f32 / k as f32;
+        let recall = row_ids.intersection(&gt).count() as f32 / k as f32;
         assert!(
             recall >= recall_requirement,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
@@ -960,21 +959,7 @@ mod tests {
         });
 
         // make sure we can still hit the recall
-        let gt = dataset
-            .scan()
-            .with_row_id()
-            .nearest(vector_column, query.as_primitive::<T>(), 100)
-            .unwrap()
-            .use_index(false)
-            .try_into_batch()
-            .await
-            .unwrap();
-        let gt_set = gt[ROW_ID]
-            .as_primitive::<UInt64Type>()
-            .values()
-            .iter()
-            .map(|r| *r)
-            .collect::<HashSet<_>>();
+        let gt = ground_truth(&dataset, vector_column, &query, 100, params.metric_type).await;
         let results = dataset
             .scan()
             .nearest(vector_column, query.as_primitive::<T>(), 100)
@@ -990,7 +975,7 @@ mod tests {
             .iter()
             .map(|r| *r)
             .collect::<HashSet<_>>();
-        let recall = row_ids.intersection(&gt_set).count() as f32 / 100.0;
+        let recall = row_ids.intersection(&gt).count() as f32 / 100.0;
         assert_ge!(recall, 0.8, "{}", recall);
     }
 
