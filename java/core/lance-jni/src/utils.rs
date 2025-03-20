@@ -189,7 +189,6 @@ pub fn get_index_params(
             env.get_int_as_usize_from_method(&ivf_params_obj, "getShufflePartitionBatches")?;
         let shuffle_partition_concurrency =
             env.get_int_as_usize_from_method(&ivf_params_obj, "getShufflePartitionConcurrency")?;
-        let use_residual = env.get_boolean_from_method(&ivf_params_obj, "useResidual")?;
 
         let ivf_params = IvfBuildParams {
             num_partitions,
@@ -197,7 +196,6 @@ pub fn get_index_params(
             sample_rate,
             shuffle_partition_batches,
             shuffle_partition_concurrency,
-            use_residual,
             ..Default::default()
         };
         stages.push(StageParams::Ivf(ivf_params));

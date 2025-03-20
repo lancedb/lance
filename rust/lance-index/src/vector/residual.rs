@@ -77,6 +77,7 @@ where
             dimension,
             distance_type.expect("provide either partitions or distance type"),
         )
+        .0
         .into()
     });
     let part_ids = part_ids.values();

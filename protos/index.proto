@@ -66,6 +66,9 @@ message IVF {
 
   // Tensor of centroids. `num_partitions * dimension` of float32s.
   Tensor centroids_tensor = 4;
+
+  // KMeans loss.
+  optional double loss = 5;
 }
 
 // Product Quantization.
