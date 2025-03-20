@@ -110,7 +110,7 @@ impl TryFrom<&str> for WriteMode {
     }
 }
 
-/// Autoclean Parameters
+/// Auto cleanup parameters
 #[derive(Debug, Clone)]
 pub struct AutoCleanupParams {
     pub interval: usize,
@@ -189,8 +189,8 @@ pub struct WriteParams {
 
     pub session: Option<Arc<Session>>,
 
-    /// If Some, and this is a new dataset, old dataset versions will be
-    /// automatically cleaned up as according to the parameters set out in
+    /// If Some and this is a new dataset, old dataset versions will be
+    /// automatically cleaned up according to the parameters set out in
     /// `AutoCleanupParams`. This parameter has no effect on existing datasets.
     /// To add autocleaning to an existing dataset, use Dataset::update_config
     /// to set lance.auto_cleanup.interval and lance.auto_cleanup.older_than.
