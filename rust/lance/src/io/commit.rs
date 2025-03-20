@@ -631,12 +631,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
         match result {
             Ok(location) => {
-                if let Some(auto_cleanup_carried_out) =
-                    auto_cleanup_hook(dataset, &manifest).await?
-                {
-                    auto_cleanup_carried_out?;
-                }
-
+                auto_cleanup_hook(dataset, &manifest).await?;
                 return Ok((manifest, location.path, location.e_tag));
             }
             Err(CommitError::CommitConflict) => {
@@ -840,12 +835,7 @@ pub(crate) async fn commit_transaction(
                     .file_metadata_cache
                     .insert(cache_path, Arc::new(transaction.clone()));
 
-                if let Some(auto_cleanup_carried_out) =
-                    auto_cleanup_hook(&dataset, &manifest).await?
-                {
-                    auto_cleanup_carried_out?;
-                }
-
+                auto_cleanup_hook(&dataset, &manifest).await?;
                 return Ok((manifest, manifest_location.path, manifest_location.e_tag));
             }
             Err(CommitError::CommitConflict) => {

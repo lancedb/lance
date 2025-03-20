@@ -471,7 +471,7 @@ pub async fn cleanup_old_versions(
 pub async fn auto_cleanup_hook(
     dataset: &Dataset,
     manifest: &Manifest,
-) -> Result<Option<Result<RemovalStats>>> {
+) -> Result<Option<RemovalStats>> {
     if let Some(older_than) = manifest.config.get("lance.auto_cleanup.older_than") {
         if let Some(interval) = manifest.config.get("lance.auto_cleanup.interval") {
             let older_than: i64 = match older_than.parse() {
@@ -500,7 +500,7 @@ pub async fn auto_cleanup_hook(
                 return Ok(Some(
                     dataset
                         .cleanup_old_versions(TimeDelta::days(older_than), Some(false), Some(false))
-                        .await,
+                        .await?,
                 ));
             }
         }
