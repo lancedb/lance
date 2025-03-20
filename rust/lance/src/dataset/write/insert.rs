@@ -205,9 +205,7 @@ impl<'a> InsertBuilder<'a> {
         let operation = match context.params.mode {
             WriteMode::Create => {
                 // Fetch auto_cleanup params from context
-                let config_upsert_values = match &context.params.auto_cleanup {
-                    Some(auto_cleanup_params) => Some(
-                        [
+                let config_upsert_values = context.params.auto_cleanup.as_ref().map(|auto_cleanup_params| [
                             (
                                 String::from("lance.auto_cleanup.interval"),
                                 auto_cleanup_params.interval.to_string(),
@@ -218,10 +216,7 @@ impl<'a> InsertBuilder<'a> {
                             ),
                         ]
                         .into_iter()
-                        .collect(),
-                    ),
-                    None => None,
-                };
+                        .collect());
                 Operation::Overwrite {
                     // Use the full schema, not the written schema
                     schema,

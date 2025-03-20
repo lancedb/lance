@@ -632,7 +632,7 @@ pub(crate) async fn do_commit_detached_transaction(
         match result {
             Ok(location) => {
                 if let Some(auto_cleanup_carried_out) =
-                    auto_cleanup_hook(&dataset, &manifest).await?
+                    auto_cleanup_hook(dataset, &manifest).await?
                 {
                     auto_cleanup_carried_out?;
                 }

@@ -1015,7 +1015,7 @@ mod tests {
 
         fixture.create_some_data().await.unwrap();
 
-        let dataset_config = &(*fixture.open().await.unwrap()).manifest.config;
+        let dataset_config = &fixture.open().await.unwrap().manifest.config;
         let cleanup_interval: usize = dataset_config
             .get("lance.auto_cleanup.interval")
             .unwrap()
