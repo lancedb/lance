@@ -37,6 +37,7 @@ from pyarrow import RecordBatch, Schema
 
 from lance.log import LOGGER
 
+from ._dataset.iter_batches import PrefetchIterator
 from .blob import BlobFile
 from .dependencies import (
     _check_for_hugging_face,
@@ -769,6 +770,7 @@ class LanceDataset(pa.dataset.Dataset):
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
+        prefetch_batches: Optional[int] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -782,7 +784,7 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         record_batches : Iterator of :py:class:`~pyarrow.RecordBatch`
         """
-        return self.scanner(
+        base_iterator = self.scanner(
             columns=columns,
             filter=filter,
             limit=limit,
@@ -801,6 +803,15 @@ class LanceDataset(pa.dataset.Dataset):
             use_stats=use_stats,
             full_text_query=full_text_query,
         ).to_batches()
+
+        if prefetch_batches is not None and prefetch_batches > 0:
+            return PrefetchIterator(
+                iterator=base_iterator,
+                prefetch_window=prefetch_batches,
+                batch_size=batch_size,
+            )
+
+        return base_iterator
 
     def sample(
         self,
