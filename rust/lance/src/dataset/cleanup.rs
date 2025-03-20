@@ -983,39 +983,60 @@ mod tests {
 
     #[tokio::test]
     async fn auto_cleanup_old_versions() {
-        // Every n commits, all versions older than T should be deleted This
-        // test assumes the default case of n = 20, T = 2 weeks.
+        // Every n commits, all versions older than T should be deleted.
         //
-        // This test first makes 15 commits and check that all of the versions are
-        // present. It then wait 20 days and make 5 more commits. We check that,
-        // without explicitly calling `fixture.run_cleanup`, the 15 old versions
-        // are automatically cleaned up and only 5 remain.
+        // We first make many commits and check that all of the versions are
+        // present. We then wait until the "older_than" period has elapsed and
+        // make many more commits. We check that, without explicitly calling
+        // `fixture.run_cleanup`, the old versions are automatically cleaned
+        // up and only the new ones remain. File counts are made after every
+        // commit.
         let fixture = MockDatasetFixture::try_new().unwrap();
+
         fixture.create_some_data().await.unwrap();
 
-        for _ in 0..14 {
-            fixture.overwrite_some_data().await.unwrap();
+        let dataset_config = &(*fixture.open().await.unwrap()).manifest.config;
+        let cleanup_interval: usize = dataset_config
+            .get("lance.auto_cleanup.interval")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let cleanup_older_than: i64 = dataset_config
+            .get("lance.auto_cleanup.older_than")
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        // Helper function to check that the number of files is correct.
+        async fn check_num_files<'a>(
+            fixture: &'a MockDatasetFixture<'a>,
+            num_expected_files: usize,
+        ) {
+            let file_count = fixture.count_files().await.unwrap();
+
+            assert_eq!(file_count.num_data_files, num_expected_files);
+            assert_eq!(file_count.num_manifest_files, num_expected_files);
+            assert_eq!(file_count.num_tx_files, num_expected_files);
         }
 
+        // First, write many files within the "older_than" window. Check that
+        // no files are automatically cleaned up.
+        for num_expected_files in 2..2 * cleanup_interval {
+            fixture.overwrite_some_data().await.unwrap();
+            check_num_files(&fixture, num_expected_files).await;
+        }
+
+        // Fast forward so we are outside of the "older_than" window.
         fixture
             .clock
-            .set_system_time(TimeDelta::try_days(20).unwrap());
+            .set_system_time(TimeDelta::try_days(cleanup_older_than + 1).unwrap());
 
-        let before_auto_clean_count = fixture.count_files().await.unwrap();
-
-        assert_eq!(before_auto_clean_count.num_data_files, 15);
-        assert_eq!(before_auto_clean_count.num_manifest_files, 15);
-        assert_eq!(before_auto_clean_count.num_tx_files, 15);
-
-        for _ in 0..5 {
+        // Write more files and check that those outside of the "older_than" window
+        // are cleaned up.
+        for num_expected_files in 2..cleanup_interval {
             fixture.overwrite_some_data().await.unwrap();
+            check_num_files(&fixture, num_expected_files).await;
         }
-
-        let after_auto_clean_count = fixture.count_files().await.unwrap();
-
-        assert_eq!(after_auto_clean_count.num_data_files, 5);
-        assert_eq!(after_auto_clean_count.num_manifest_files, 5);
-        assert_eq!(after_auto_clean_count.num_tx_files, 5);
     }
 
     #[tokio::test]
