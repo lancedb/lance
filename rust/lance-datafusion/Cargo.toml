@@ -30,6 +30,7 @@ log.workspace = true
 prost.workspace = true
 snafu.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 substrait-expr = { version = "0.2.3" }

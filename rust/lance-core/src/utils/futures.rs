@@ -8,6 +8,7 @@ use std::{
 };
 
 use futures::{stream::BoxStream, Stream, StreamExt};
+use pin_project::pin_project;
 use tokio::sync::Semaphore;
 use tokio_util::sync::PollSemaphore;
 
@@ -213,6 +214,53 @@ where
 impl<'a, T: Clone> SharedStreamExt<'a> for BoxStream<'a, T> {
     fn share(self, capacity: Capacity) -> (SharedStream<'a, T>, SharedStream<'a, T>) {
         SharedStream::new(self, capacity)
+    }
+}
+
+#[pin_project]
+pub struct FinallyStream<S: Stream, F: FnOnce()> {
+    #[pin]
+    stream: S,
+    f: Option<F>,
+}
+
+impl<S: Stream, F: FnOnce()> FinallyStream<S, F> {
+    pub fn new(stream: S, f: F) -> Self {
+        Self { stream, f: Some(f) }
+    }
+}
+
+impl<S: Stream, F: FnOnce()> Stream for FinallyStream<S, F> {
+    type Item = S::Item;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.project();
+        let res = this.stream.poll_next(cx);
+        if matches!(res, std::task::Poll::Ready(None)) {
+            // It's possible that None is polled multiple times, but we only call the function once
+            if let Some(f) = this.f.take() {
+                f();
+            }
+        }
+        res
+    }
+}
+
+pub trait FinallyStreamExt<S: Stream>: Stream + Sized {
+    fn finally<F: FnOnce()>(self, f: F) -> FinallyStream<Self, F> {
+        FinallyStream {
+            stream: self,
+            f: Some(f),
+        }
+    }
+}
+
+impl<S: Stream> FinallyStreamExt<S> for S {
+    fn finally<F: FnOnce()>(self, f: F) -> FinallyStream<Self, F> {
+        FinallyStream::new(self, f)
     }
 }
 

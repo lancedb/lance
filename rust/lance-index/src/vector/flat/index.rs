@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use snafu::location;
 
 use crate::{
+    metrics::MetricsCollector,
     prefilter::PreFilter,
     vector::{
         graph::{OrderedFloat, OrderedNode},
@@ -80,8 +81,10 @@ impl IvfSubIndex for FlatIndex {
         params: Self::QueryParams,
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         let dist_calc = storage.dist_calculator(query);
+        metrics.record_comparisons(storage.len());
 
         let mut res: Vec<_> = match prefilter.is_empty() {
             true => {

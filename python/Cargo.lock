@@ -3261,6 +3261,7 @@ dependencies = [
  "prost 0.13.5",
  "snafu",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

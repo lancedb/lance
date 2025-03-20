@@ -26,19 +26,20 @@ use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
 use moka::future::Cache;
 use roaring::RoaringBitmap;
 use snafu::location;
-use tracing::instrument;
+use tracing::{info, instrument};
 
 use super::builder::inverted_list_schema;
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::{NoFilter, PreFilter};
 use crate::scalar::{
-    AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, InvertedIndexParams, SargableQuery,
-    ScalarIndex, SearchResult,
+    AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, InvertedIndexParams, MetricsCollector,
+    SargableQuery, ScalarIndex, SearchResult,
 };
 use crate::Index;
 
@@ -112,9 +113,11 @@ impl InvertedIndex {
         &self,
         query: &FullTextSearchQuery,
         prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, f32)>> {
         let mut tokenizer = self.tokenizer.clone();
         let tokens = collect_tokens(&query.query, &mut tokenizer, None);
+        metrics.record_comparisons(tokens.len());
         let token_ids = self.map(&tokens).into_iter();
         let token_ids = if !is_phrase_query(&query.query) {
             token_ids.sorted_unstable().dedup().collect()
@@ -129,7 +132,7 @@ impl InvertedIndex {
             }
             token_ids
         };
-        self.bm25_search(token_ids, query, prefilter).await
+        self.bm25_search(token_ids, query, prefilter, metrics).await
     }
 
     // search the documents that contain the query
@@ -141,6 +144,7 @@ impl InvertedIndex {
         token_ids: Vec<u32>,
         query: &FullTextSearchQuery,
         prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, f32)>> {
         let limit = query
             .limit
@@ -155,7 +159,7 @@ impl InvertedIndex {
             .zip(repeat_with(|| (self.inverted_list.clone(), mask.clone())))
             .map(|((position, token_id), (inverted_list, mask))| async move {
                 let posting = inverted_list
-                    .posting_list(token_id, is_phrase_query)
+                    .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
                 Result::Ok(PostingIterator::new(
                     token_id,
@@ -224,11 +228,15 @@ impl Index for InvertedIndex {
 impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
     #[instrument(level = "debug", skip_all)]
-    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let row_ids = match query {
             SargableQuery::FullTextSearch(query) => self
-                .full_text_search(query, Arc::new(NoFilter))
+                .full_text_search(query, Arc::new(NoFilter), metrics)
                 .await?
                 .into_iter()
                 .map(|(row_id, _)| row_id),
@@ -505,15 +513,18 @@ impl InvertedListReader {
         Ok(batch)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, metrics))]
     pub(crate) async fn posting_list(
         &self,
         token_id: u32,
         is_phrase_query: bool,
+        metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
         let mut posting = self
             .posting_cache
             .try_get_with(token_id, async move {
+                metrics.record_part_load();
+                info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
                 let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();

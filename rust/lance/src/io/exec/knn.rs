@@ -50,9 +50,21 @@ use crate::{Error, Result};
 use lance_arrow::*;
 
 use super::utils::{
-    FilteredRowIdsToPrefilter, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
+    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
     SelectionVectorToPrefilter,
 };
+
+pub struct AnnMetrics {
+    index_metrics: IndexMetrics,
+}
+
+impl AnnMetrics {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            index_metrics: IndexMetrics::new(metrics, partition),
+        }
+    }
+}
 
 /// [ExecutionPlan] compute vector distance from a query vector.
 ///
@@ -391,13 +403,17 @@ impl ExecutionPlan for ANNIvfPartitionExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
         let ds = self.dataset.clone();
+        let metrics = Arc::new(AnnMetrics::new(&self.metrics, partition));
         let stream = stream::iter(self.index_uuids.clone())
             .map(move |uuid| {
                 let query = query.clone();
                 let ds = ds.clone();
+                let metrics = metrics.clone();
 
                 async move {
-                    let index = ds.open_vector_index(&query.column, &uuid).await?;
+                    let index = ds
+                        .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
+                        .await?;
 
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
@@ -571,7 +587,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let column = self.query.column.clone();
         let indices = self.indices.clone();
         let prefilter_source = self.prefilter_source.clone();
-
+        let metrics = Arc::new(AnnMetrics::new(&self.metrics, partition));
+        let metrics_clone = metrics.clone();
         // Per-delta-index stream:
         //   Stream<(parttitions, index uuid)>
         let per_index_stream = input_stream
@@ -612,7 +629,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let indices = indices.clone();
                     let context = context.clone();
                     let prefilter_source = prefilter_source.clone();
-
+                    let metrics = metrics.clone();
                     let index_meta = indices
                         .iter()
                         .find(|idx| idx.uuid.to_string() == index_uuid)
@@ -639,7 +656,9 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             prefilter_loader,
                         ));
 
-                        let raw_index = ds.open_vector_index(&column, &index_uuid).await?;
+                        let raw_index = ds
+                            .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
+                            .await?;
 
                         Ok::<_, DataFusionError>(
                             stream::iter(part_ids)
@@ -651,6 +670,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 .try_flatten()
                 .map(move |result| {
                     let query = query.clone();
+                    let metrics = metrics_clone.clone();
                     async move {
                         let (part_id, (index, pre_filter)) = result?;
 
@@ -661,7 +681,12 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         };
 
                         index
-                            .search_in_partition(part_id as usize, &query, pre_filter)
+                            .search_in_partition(
+                                part_id as usize,
+                                &query,
+                                pre_filter,
+                                &metrics.index_metrics,
+                            )
                             .map_err(|e| {
                                 DataFusionError::Execution(format!(
                                     "Failed to calculate KNN: {}",

@@ -11,6 +11,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Buf;
 use lance_core::error::{box_error, CorruptFileSnafu};
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DELETION, TRACE_FILE_AUDIT};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
@@ -90,7 +91,7 @@ pub async fn write_deletion_file(
 
             object_store.put(&path, &out).await?;
 
-            info!(target: "file_audit", mode="create", type="deletion", path = path.to_string());
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_DELETION, path = path.to_string());
 
             Some(deletion_file)
         }
@@ -109,7 +110,7 @@ pub async fn write_deletion_file(
 
             object_store.put(&path, &out).await?;
 
-            info!(target: "file_audit", mode="create", type="deletion", path = path.to_string());
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_DELETION, path = path.to_string());
 
             Some(deletion_file)
         }

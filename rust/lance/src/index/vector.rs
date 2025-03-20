@@ -18,6 +18,7 @@ mod fixture_test;
 use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -406,7 +407,7 @@ pub(crate) async fn remap_vector_index(
     mapping: &HashMap<u64, Option<u64>>,
 ) -> Result<()> {
     let old_index = dataset
-        .open_vector_index(column, &old_uuid.to_string())
+        .open_vector_index(column, &old_uuid.to_string(), &NoOpMetricsCollector)
         .await?;
     old_index.check_can_remap()?;
 

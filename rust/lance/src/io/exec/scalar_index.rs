@@ -27,6 +27,7 @@ use lance_core::{
 };
 use lance_datafusion::chunker::break_stream;
 use lance_index::{
+    metrics::MetricsCollector,
     scalar::{
         expression::{IndexExprResult, ScalarIndexExpr, ScalarIndexLoader},
         SargableQuery, ScalarIndex,
@@ -44,7 +45,7 @@ use crate::{
     Dataset,
 };
 
-use super::utils::InstrumentedRecordBatchStreamAdapter;
+use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 
 lazy_static::lazy_static! {
     pub static ref SCALAR_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![Field::new("result".to_string(), DataType::Binary, true)]));
@@ -52,7 +53,11 @@ lazy_static::lazy_static! {
 
 #[async_trait]
 impl ScalarIndexLoader for Dataset {
-    async fn load_index(&self, name: &str) -> Result<Arc<dyn ScalarIndex>> {
+    async fn load_index(
+        &self,
+        name: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
         let idx = self
             .load_scalar_index_for_column(name)
             .await?
@@ -60,7 +65,8 @@ impl ScalarIndexLoader for Dataset {
                 message: format!("Scanner created plan for index query on {} but no index on dataset for that column", name),
                 location: location!()
             })?;
-        self.open_scalar_index(name, &idx.uuid.to_string()).await
+        self.open_scalar_index(name, &idx.uuid.to_string(), metrics)
+            .await
     }
 }
 
@@ -105,8 +111,12 @@ impl ScalarIndexExec {
         }
     }
 
-    async fn do_execute(expr: ScalarIndexExpr, dataset: Arc<Dataset>) -> Result<RecordBatch> {
-        let query_result = expr.evaluate(dataset.as_ref()).await?;
+    async fn do_execute(
+        expr: ScalarIndexExpr,
+        dataset: Arc<Dataset>,
+        metrics: IndexMetrics,
+    ) -> Result<RecordBatch> {
+        let query_result = expr.evaluate(dataset.as_ref(), &metrics).await?;
         let IndexExprResult::Exact(row_id_mask) = query_result else {
             todo!("Support for non-exact query results as pre-filter for vector search")
         };
@@ -153,7 +163,8 @@ impl ExecutionPlan for ScalarIndexExec {
         partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        let batch_fut = Self::do_execute(self.expr.clone(), self.dataset.clone());
+        let metrics = IndexMetrics::new(&self.metrics, partition);
+        let batch_fut = Self::do_execute(self.expr.clone(), self.dataset.clone(), metrics);
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
@@ -230,6 +241,7 @@ impl MapIndexExec {
         dataset: Arc<Dataset>,
         deletion_mask: Option<Arc<RowIdMask>>,
         batch: RecordBatch,
+        metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<RecordBatch> {
         let index_vals = batch.column(0);
         let index_vals = (0..index_vals.len())
@@ -239,7 +251,7 @@ impl MapIndexExec {
             column_name.clone(),
             Arc::new(SargableQuery::IsIn(index_vals)),
         );
-        let query_result = query.evaluate(dataset.as_ref()).await?;
+        let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
         let IndexExprResult::Exact(mut row_id_mask) = query_result else {
             todo!("Support for non-exact query results as input for merge_insert")
         };
@@ -277,6 +289,7 @@ impl MapIndexExec {
         input: datafusion::physical_plan::SendableRecordBatchStream,
         dataset: Arc<Dataset>,
         column_name: String,
+        metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<
         impl Stream<Item = datafusion::error::Result<RecordBatch>> + Send + 'static,
     > {
@@ -295,7 +308,8 @@ impl MapIndexExec {
             let column_name = column_name.clone();
             let dataset = dataset.clone();
             let deletion_mask = deletion_mask.clone();
-            Self::map_batch(column_name, dataset, deletion_mask, res)
+            let metrics = metrics.clone();
+            Self::map_batch(column_name, dataset, deletion_mask, res, metrics)
         }))
     }
 }
@@ -340,8 +354,13 @@ impl ExecutionPlan for MapIndexExec {
         context: Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
         let index_vals = self.input.execute(partition, context)?;
-        let stream_fut =
-            Self::do_execute(index_vals, self.dataset.clone(), self.column_name.clone());
+        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
+        let stream_fut = Self::do_execute(
+            index_vals,
+            self.dataset.clone(),
+            self.column_name.clone(),
+            metrics,
+        );
         let stream = futures::stream::iter(vec![stream_fut])
             .then(|stream_fut| stream_fut)
             .try_flatten()
@@ -452,8 +471,9 @@ impl MaterializeIndexExec {
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        metrics: Arc<IndexMetrics>,
     ) -> Result<RecordBatch> {
-        let expr_result = expr.evaluate(dataset.as_ref());
+        let expr_result = expr.evaluate(dataset.as_ref(), metrics.as_ref());
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
             let fragment_bitmap =
@@ -632,10 +652,12 @@ impl ExecutionPlan for MaterializeIndexExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
         let batch_fut = Self::do_execute(
             self.expr.clone(),
             self.dataset.clone(),
             self.fragments.clone(),
+            metrics,
         );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))

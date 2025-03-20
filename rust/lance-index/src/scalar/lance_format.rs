@@ -298,6 +298,7 @@ mod tests {
 
     use std::{collections::HashMap, ops::Bound, path::Path};
 
+    use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::{
         bitmap::{train_bitmap_index, BitmapIndex},
         btree::{train_btree_index, BTreeIndex, TrainingSource, DEFAULT_BTREE_BATCH_SIZE},
@@ -391,7 +392,10 @@ mod tests {
         let index = BTreeIndex::load(index_store).await.unwrap();
 
         let result = index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))))
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(10000))),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -401,10 +405,13 @@ mod tests {
         assert!(row_ids.contains(10000));
 
         let result = index
-            .search(&SargableQuery::Range(
-                Bound::Unbounded,
-                Bound::Excluded(ScalarValue::Int32(Some(-100))),
-            ))
+            .search(
+                &SargableQuery::Range(
+                    Bound::Unbounded,
+                    Bound::Excluded(ScalarValue::Int32(Some(-100))),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -414,10 +421,13 @@ mod tests {
         assert_eq!(Some(0), row_ids.len());
 
         let result = index
-            .search(&SargableQuery::Range(
-                Bound::Unbounded,
-                Bound::Excluded(ScalarValue::Int32(Some(100))),
-            ))
+            .search(
+                &SargableQuery::Range(
+                    Bound::Unbounded,
+                    Bound::Excluded(ScalarValue::Int32(Some(100))),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -455,7 +465,10 @@ mod tests {
         let updated_index = BTreeIndex::load(updated_index_store).await.unwrap();
 
         let result = updated_index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))))
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(10000))),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -466,7 +479,10 @@ mod tests {
         assert!(row_ids.contains(10000));
 
         let result = updated_index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(500_000))))
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(500_000))),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -478,7 +494,7 @@ mod tests {
     }
 
     async fn check(index: &BTreeIndex, query: SargableQuery, expected: &[u64]) {
-        let results = index.search(&query).await.unwrap();
+        let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert!(results.is_exact());
         let expected_arr = RowIdTreeMap::from_iter(expected);
         assert_eq!(results.row_ids(), &expected_arr);
@@ -755,7 +771,7 @@ mod tests {
             let index = BTreeIndex::load(index_store).await.unwrap();
 
             let result = index
-                .search(&SargableQuery::Equals(sample_value))
+                .search(&SargableQuery::Equals(sample_value), &NoOpMetricsCollector)
                 .await
                 .unwrap();
 
@@ -832,9 +848,10 @@ mod tests {
         let index = BTreeIndex::load(index_store).await.unwrap();
 
         let result = index
-            .search(&SargableQuery::Equals(ScalarValue::Utf8(Some(
-                "foo".to_string(),
-            ))))
+            .search(
+                &SargableQuery::Equals(ScalarValue::Utf8(Some("foo".to_string()))),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -843,7 +860,10 @@ mod tests {
 
         assert!(row_ids.is_empty());
 
-        let result = index.search(&SargableQuery::IsNull()).await.unwrap();
+        let result = index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
         assert!(result.is_exact());
         let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(4096));
@@ -898,7 +918,10 @@ mod tests {
         let index = BitmapIndex::load(index_store).await.unwrap();
 
         let result = index
-            .search(&SargableQuery::Equals(ScalarValue::Utf8(None)))
+            .search(
+                &SargableQuery::Equals(ScalarValue::Utf8(None)),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -908,9 +931,10 @@ mod tests {
         assert!(row_ids.contains(2));
 
         let result = index
-            .search(&SargableQuery::Equals(ScalarValue::Utf8(Some(
-                "abcd".to_string(),
-            ))))
+            .search(
+                &SargableQuery::Equals(ScalarValue::Utf8(Some("abcd".to_string()))),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -934,7 +958,10 @@ mod tests {
         let index = BitmapIndex::load(index_store).await.unwrap();
 
         let result = index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))))
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(10000))),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -944,10 +971,13 @@ mod tests {
         assert!(row_ids.contains(10000));
 
         let result = index
-            .search(&SargableQuery::Range(
-                Bound::Unbounded,
-                Bound::Excluded(ScalarValue::Int32(Some(-100))),
-            ))
+            .search(
+                &SargableQuery::Range(
+                    Bound::Unbounded,
+                    Bound::Excluded(ScalarValue::Int32(Some(-100))),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -956,10 +986,13 @@ mod tests {
         assert!(row_ids.is_empty());
 
         let result = index
-            .search(&SargableQuery::Range(
-                Bound::Unbounded,
-                Bound::Excluded(ScalarValue::Int32(Some(100))),
-            ))
+            .search(
+                &SargableQuery::Range(
+                    Bound::Unbounded,
+                    Bound::Excluded(ScalarValue::Int32(Some(100))),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -969,7 +1002,7 @@ mod tests {
     }
 
     async fn check_bitmap(index: &BitmapIndex, query: SargableQuery, expected: &[u64]) {
-        let results = index.search(&query).await.unwrap();
+        let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert!(results.is_exact());
         let expected_arr = RowIdTreeMap::from_iter(expected);
         assert_eq!(results.row_ids(), &expected_arr);
@@ -1213,7 +1246,10 @@ mod tests {
         let updated_index = BitmapIndex::load(updated_index_store).await.unwrap();
 
         let result = updated_index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(5000))))
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(5000))),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -1257,21 +1293,30 @@ mod tests {
 
         // Remapped to new value
         assert!(remapped_index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(5))))
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(5))),
+                &NoOpMetricsCollector
+            )
             .await
             .unwrap()
             .row_ids()
             .contains(65));
         // Deleted
         assert!(remapped_index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(7))))
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(7))),
+                &NoOpMetricsCollector
+            )
             .await
             .unwrap()
             .row_ids()
             .is_empty());
         // Not remapped
         assert!(remapped_index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(3))))
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(3))),
+                &NoOpMetricsCollector
+            )
             .await
             .unwrap()
             .row_ids()
@@ -1319,7 +1364,7 @@ mod tests {
             let data = data.clone();
             async move {
                 let index = LabelListIndex::load(index_store).await.unwrap();
-                let result = index.search(&query).await.unwrap();
+                let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
                 assert!(result.is_exact());
                 let row_ids = result.row_ids();
 

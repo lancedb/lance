@@ -25,10 +25,10 @@ use serde_json::json;
 use snafu::location;
 use tracing::instrument;
 
-use crate::prefilter::PreFilter;
 use crate::vector::ivf::storage::IvfModel;
 use crate::vector::quantizer::QuantizationType;
 use crate::vector::v3::subindex::{IvfSubIndex, SubIndexType};
+use crate::{metrics::MetricsCollector, prefilter::PreFilter};
 use crate::{
     vector::{
         graph::NEIGHBORS_FIELD,
@@ -152,7 +152,12 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
 #[async_trait]
 impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
+    async fn search(
+        &self,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
         let hnsw = self.hnsw.as_ref().ok_or(Error::Index {
             message: "HNSW index not loaded".to_string(),
             location: location!(),
@@ -172,6 +177,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             query.into(),
             storage.as_ref(),
             pre_filter,
+            metrics,
         )
     }
 
@@ -184,6 +190,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         _: usize,
         _: &Query,
         _: Arc<dyn PreFilter>,
+        _: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         unimplemented!("only for IVF")
     }

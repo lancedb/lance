@@ -23,7 +23,7 @@ use serde::Serialize;
 use snafu::location;
 use tracing::instrument;
 
-use crate::{Index, IndexType};
+use crate::{metrics::MetricsCollector, Index, IndexType};
 
 use super::{btree::OrderableScalarValue, SargableQuery, SearchResult};
 use super::{btree::TrainingSource, AnyQuery, IndexStore, ScalarIndex};
@@ -171,11 +171,16 @@ impl Index for BitmapIndex {
 #[async_trait]
 impl ScalarIndex for BitmapIndex {
     #[instrument(name = "bitmap_search", level = "debug", skip_all)]
-    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
 
         let row_ids = match query {
             SargableQuery::Equals(val) => {
+                metrics.record_comparisons(1);
                 if val.is_null() {
                     self.null_map.clone()
                 } else {
@@ -202,10 +207,12 @@ impl ScalarIndex for BitmapIndex {
                     .map(|(_, v)| v)
                     .collect::<Vec<_>>();
 
+                metrics.record_comparisons(maps.len());
                 RowIdTreeMap::union_all(&maps)
             }
             SargableQuery::IsIn(values) => {
                 let mut union_bitmap = RowIdTreeMap::default();
+                metrics.record_comparisons(values.len());
                 for val in values {
                     if val.is_null() {
                         union_bitmap |= self.null_map.clone();
@@ -219,7 +226,10 @@ impl ScalarIndex for BitmapIndex {
 
                 union_bitmap
             }
-            SargableQuery::IsNull() => self.null_map.clone(),
+            SargableQuery::IsNull() => {
+                metrics.record_comparisons(1);
+                self.null_map.clone()
+            }
             SargableQuery::FullTextSearch(_) => {
                 return Err(Error::NotSupported {
                     source: "full text search is not supported for bitmap indexes".into(),
