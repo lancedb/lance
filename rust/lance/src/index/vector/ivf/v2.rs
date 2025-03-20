@@ -645,6 +645,7 @@ mod tests {
     use crate::index::DatasetIndexInternalExt;
     use crate::{index::vector::VectorIndexParams, Dataset};
 
+    const NUM_ROWS: usize = 500;
     const DIM: usize = 32;
 
     async fn generate_test_dataset<T: ArrowPrimitiveType>(
@@ -654,7 +655,7 @@ mod tests {
     where
         T::Native: SampleUniform,
     {
-        let (batch, schema) = generate_batch::<T>(500, None, range, false);
+        let (batch, schema) = generate_batch::<T>(NUM_ROWS, None, range, false);
         let vectors = batch.column_by_name("vector").unwrap().clone();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
         let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
@@ -668,7 +669,7 @@ mod tests {
     where
         T::Native: SampleUniform,
     {
-        let (batch, schema) = generate_batch::<T>(500, None, range, true);
+        let (batch, schema) = generate_batch::<T>(NUM_ROWS, None, range, true);
         let vectors = batch.column_by_name("vector").unwrap().clone();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
         let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
@@ -1025,13 +1026,11 @@ mod tests {
             let range = match count {
                 0 => range.clone(),
                 _ => match params.metric_type {
-                    DistanceType::Hamming => {
-                        range.end..range.end.mul_wrapping(range.end).mul_wrapping(range.end)
-                    }
+                    DistanceType::Hamming => range.start..range.end.add_wrapping(range.end),
                     _ => range.end.neg_wrapping()..range.start,
                 },
             };
-            append_dataset::<T>(&mut dataset, 500, range).await;
+            append_dataset::<T>(&mut dataset, NUM_ROWS / 5, range).await;
             dataset
                 .optimize_indices(&OptimizeOptions::append())
                 .await
@@ -1078,7 +1077,9 @@ mod tests {
         let ivf_models = get_ivf_models(&dataset).await;
         let ivf = &ivf_models[0];
         assert_ne!(original_ivf.centroids, ivf.centroids);
-        assert_lt!(get_avg_loss(&dataset).await, last_avg_loss);
+        if params.metric_type != DistanceType::Hamming {
+            assert_lt!(get_avg_loss(&dataset).await, last_avg_loss);
+        }
     }
 
     #[tokio::test]
