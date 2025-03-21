@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import logging
+import warnings
+from os import register_at_fork
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
 from . import log
@@ -153,3 +155,13 @@ def set_logger(
     log_handler=None,
 ):
     log.set_logger(file_path, name, level, format_string, log_handler)
+
+
+def __warn_on_fork():
+    warnings.warn(
+        "lance is not fork-safe. If you are using multiprocessing, "
+        "use spawn instead."
+    )
+
+
+register_at_fork(before=__warn_on_fork)
