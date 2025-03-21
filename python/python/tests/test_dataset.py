@@ -3544,23 +3544,44 @@ def test_empty_structs(tmp_path):
     assert res == table.take([2, 0, 1])
 
 
-def test_create_table_from_pylist(tmp_path):
-    data = [
-        {"foo": 1, "bar": "one"},
-        {"foo": 3, "bar": "three"},
-    ]
-    ds = lance.write_dataset(data, tmp_path)
+def test_batch_merge_with_delayed_commit(tmp_path: Path):
+    data_path = tmp_path / "data"
+    base_data = pa.table({"id": [0, 1, 2], "val": ["a", "b", "c"]})
+    lance.write_dataset(base_data, data_path, mode="create", max_rows_per_file=1)
 
-    assert ds.to_table() == pa.Table.from_pylist(data)
+    ds = lance.dataset(data_path)
+    original_version = ds.version
+    fragments = ds.get_fragments()
 
-
-def test_create_table_from_pydict(tmp_path):
-    dat = {
-        "foo": [1, 3],
-        "bar": ["one", "three"],
+    # Prepare merge operations
+    updates = {
+        f.fragment_id: pa.table(
+            {"id": [f.fragment_id], "new_col": [100 * (f.fragment_id + 1)]}
+        )
+        for f in fragments
     }
-    ds = lance.write_dataset(dat, tmp_path)
-    assert ds.to_table() == pa.Table.from_pydict(dat)
+
+    merged_data = []
+    for frag in fragments:
+        new_frags, schema = ds.merge(
+            updates[frag.fragment_id],
+            left_on="id",
+            fragment_ids=[frag.fragment_id],
+            commit=False,
+        )
+        merged_data.extend(new_frags)
+        ds = lance.dataset(data_path)  # Refresh reference
+
+    # Commit combined changes
+    op = lance.LanceOperation.Merge(merged_data, schema)
+    ds.commit(data_path, operation=op, read_version=original_version)
+
+    # Verify results
+    final_ds = lance.dataset(data_path)
+    assert final_ds.version == original_version + 1
+    assert final_ds.to_table().equals(
+        pa.table({"id": [0, 1, 2], "val": ["a", "b", "c"], "new_col": [100, 200, 300]})
+    )
 
 
 def test_metadata_cache_size(tmp_path):
