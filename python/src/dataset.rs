@@ -27,6 +27,14 @@ use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::Duration;
 
+use crate::error::PythonErrorExt;
+use crate::file::object_store_from_uri_or_path;
+use crate::fragment::FileFragment;
+use crate::schema::LanceSchema;
+use crate::session::Session;
+use crate::utils::PyLance;
+use crate::RT;
+use crate::{LanceReader, Scanner};
 use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
@@ -50,6 +58,7 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
+use lance_file::v2::writer::FileWriterOptions;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::{
@@ -77,15 +86,6 @@ use pyo3::{
 };
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
-
-use crate::error::PythonErrorExt;
-use crate::file::object_store_from_uri_or_path;
-use crate::fragment::FileFragment;
-use crate::schema::LanceSchema;
-use crate::session::Session;
-use crate::utils::PyLance;
-use crate::RT;
-use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
@@ -1736,6 +1736,25 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                 storage_options: Some(storage_options),
                 ..Default::default()
             });
+        }
+
+        if let Some(writer_options) =
+            get_dict_opt::<HashMap<String, String>>(options, "file_writer_options")?
+        {
+            let mut file_writer_options = FileWriterOptions::default();
+            if let Some(max_page_bytes) = writer_options.get("max_page_bytes") {
+                file_writer_options.max_page_bytes = match max_page_bytes.parse::<u64>() {
+                    Ok(n) => Some(n),
+                    Err(_e) => None,
+                }
+            }
+            if let Some(data_cache_bytes) = writer_options.get("data_cache_bytes") {
+                file_writer_options.data_cache_bytes = match data_cache_bytes.parse::<u64>() {
+                    Ok(n) => Some(n),
+                    Err(_e) => None,
+                }
+            }
+            p.file_writer_options = Some(file_writer_options);
         }
 
         if let Some(enable_move_stable_row_ids) =
