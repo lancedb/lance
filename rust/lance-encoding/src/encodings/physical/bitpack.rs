@@ -30,6 +30,7 @@ pub struct BitpackParams {
     pub num_bits: u64,
 
     pub signed: bool,
+    pub all_negative: bool,
 }
 
 // Compute the number of bits to use for each item, if this array can be encoded using
@@ -66,6 +67,7 @@ where
         .map(|bits| BitpackParams {
             num_bits: bits,
             signed: false,
+            all_negative: false,
         })
 }
 
@@ -79,6 +81,8 @@ where
     T::Native: PrimInt + AsPrimitive<i64>,
 {
     let mut add_signed_bit = false;
+    let mut has_negative_number = false;
+    let mut all_negative_number = true;
     let mut min_leading_bits: Option<u64> = None;
     for val in arr.iter() {
         if val.is_none() {
@@ -91,35 +95,45 @@ where
 
         if val.to_i64().unwrap() < 0i64 {
             min_leading_bits = min_leading_bits.map(|bits| bits.min(val.leading_ones() as u64));
-            add_signed_bit = true;
+            has_negative_number = true;
         } else {
             min_leading_bits = min_leading_bits.map(|bits| bits.min(val.leading_zeros() as u64));
+            all_negative_number = false;
         }
     }
 
     let mut min_leading_bits = arr.data_type().byte_width() as u64 * 8 - min_leading_bits?;
+
+    if !all_negative_number && has_negative_number {
+        add_signed_bit = true;
+    }
+
     if add_signed_bit {
         // Need extra sign bit
         min_leading_bits += 1;
     }
+
     // cannot bitpack into <1 bit
     let num_bits = min_leading_bits.max(1);
     Some(BitpackParams {
         num_bits,
         signed: add_signed_bit,
+        all_negative: all_negative_number,
     })
 }
 #[derive(Debug)]
 pub struct BitpackedArrayEncoder {
     num_bits: u64,
     signed_type: bool,
+    all_negative: bool,
 }
 
 impl BitpackedArrayEncoder {
-    pub fn new(num_bits: u64, signed_type: bool) -> Self {
+    pub fn new(num_bits: u64, signed_type: bool, all_negative: bool) -> Self {
         Self {
             num_bits,
             signed_type,
+            all_negative,
         }
     }
 }
@@ -169,6 +183,7 @@ impl ArrayEncoder for BitpackedArrayEncoder {
             unpacked.bits_per_value,
             bitpacked_buffer_index,
             self.signed_type,
+            self.all_negative,
         );
 
         Ok(EncodedArray {
@@ -246,6 +261,7 @@ pub struct BitpackedScheduler {
     uncompressed_bits_per_value: u64,
     buffer_offset: u64,
     signed: bool,
+    all_negative: bool,
 }
 
 impl BitpackedScheduler {
@@ -254,12 +270,14 @@ impl BitpackedScheduler {
         uncompressed_bits_per_value: u64,
         buffer_offset: u64,
         signed: bool,
+        all_negative: bool,
     ) -> Self {
         Self {
             bits_per_value,
             uncompressed_bits_per_value,
             buffer_offset,
             signed,
+            all_negative,
         }
     }
 }
@@ -315,6 +333,7 @@ impl PageScheduler for BitpackedScheduler {
         let bits_per_value = self.bits_per_value;
         let uncompressed_bits_per_value = self.uncompressed_bits_per_value;
         let signed = self.signed;
+        let all_negative = self.all_negative;
         async move {
             let bytes = bytes.await?;
             Ok(Box::new(BitpackedPageDecoder {
@@ -324,6 +343,7 @@ impl PageScheduler for BitpackedScheduler {
                 uncompressed_bits_per_value,
                 signed,
                 data: bytes,
+                all_negative,
             }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
@@ -351,6 +371,8 @@ struct BitpackedPageDecoder {
     signed: bool,
 
     data: Vec<Bytes>,
+
+    all_negative: bool,
 }
 
 impl PrimitivePageDecoder for BitpackedPageDecoder {
@@ -401,12 +423,8 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                 // the offset within the current destination byte to write to
                 let mut dst_offset = 0;
 
-                let is_negative = is_encoded_item_negative(
-                    src,
-                    src_idx,
-                    src_offset,
-                    self.bits_per_value as usize,
-                );
+                let is_negative = 
+                    is_encoded_item_negative(src, src_idx, src_offset, self.bits_per_value as usize);
 
                 while src_bits_written < self.bits_per_value {
                     // write bits from current source byte into destination
@@ -436,7 +454,7 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
 
                 // if the type is signed, need to pad out the rest of the byte with 1s
                 let mut negative_padded_current_byte = false;
-                if self.signed && is_negative && dst_offset > 0 {
+                if ((self.signed && is_negative) || self.all_negative) && dst_offset > 0 {
                     negative_padded_current_byte = true;
                     while dst_offset < 8 {
                         dest[dst_idx] |= 1 << dst_offset;
@@ -461,7 +479,7 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                         dst_idx + byte_len as usize - partial_bytes_written + to_next_byte;
 
                     // pad remaining bytes with 1 for negative signed numbers
-                    if self.signed && is_negative {
+                    if (self.signed && is_negative) || self.all_negative {
                         if !negative_padded_current_byte {
                             dest[dst_idx] = 0xFF;
                         }
@@ -702,6 +720,14 @@ pub mod test {
         let result = result.unwrap();
         assert_eq!(3, result.num_bits);
         assert!(!result.signed);
+
+        let values = Int32Array::from(vec![-1, -2, -7]);
+        let arr = values;
+        let result = bitpack_params(&arr);
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert_eq!(3, result.num_bits);
+        assert!(!result.signed);
     }
 
     #[test]
@@ -801,6 +827,11 @@ pub mod test {
                 ])),
                 36,
             ),
+            (
+                DataType::Int64,
+                Arc::new(Int64Array::from_iter_values(vec![-1, -2, -3, -4, -5])),
+                3,
+            ),
         ];
 
         for (data_type, arr, bits_per_value) in test_cases {
@@ -809,6 +840,7 @@ pub mod test {
             let encoder = BitpackedArrayEncoder {
                 num_bits: params.num_bits,
                 signed_type: params.signed,
+                all_negative: params.all_negative,
             };
             let data = DataBlock::from_array(arr);
             let result = encoder.encode(data, &data_type, &mut buffed_index).unwrap();
@@ -870,22 +902,6 @@ pub mod test {
                     4,
                     250 << 56,
                 ])),
-            ),
-            (
-                DataType::Int8,
-                Arc::new(Int8Array::from_iter_values(vec![-100])),
-            ),
-            (
-                DataType::Int16,
-                Arc::new(Int16Array::from_iter_values(vec![-100 << 8])),
-            ),
-            (
-                DataType::Int32,
-                Arc::new(Int32Array::from_iter_values(vec![-100 << 24])),
-            ),
-            (
-                DataType::Int64,
-                Arc::new(Int64Array::from_iter_values(vec![-100 << 56])),
             ),
         ];
 
@@ -1107,6 +1123,15 @@ pub mod test {
                 Box::new(
                     DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
                         Uniform::new(0, 1),
+                    ),
+                ),
+            ),
+            // check that it works for all negative integeres case
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        Uniform::new(-20, -1),
                     ),
                 ),
             ),
