@@ -55,7 +55,7 @@ use std::{
     future,
     sync::{Mutex, MutexGuard},
 };
-use tracing::{info, instrument};
+use tracing::{info, instrument, Span};
 
 use crate::{utils::temporal::utc_now, Dataset};
 
@@ -247,7 +247,7 @@ impl<'a> CleanupTask<'a> {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip_all)]
+    #[instrument(level = "debug", skip_all, fields(old_versions = inspection.old_manifests.len(), bytes_deleted = tracing::field::Empty))]
     async fn delete_unreferenced_files(
         &self,
         inspection: CleanupInspection,
@@ -308,6 +308,10 @@ impl<'a> CleanupTask<'a> {
         let mut removal_stats = removal_stats.into_inner().unwrap();
         removal_stats.old_versions = num_old_manifests as u64;
         removal_stats.bytes_removed += manifest_bytes_removed?;
+
+        let span = Span::current();
+        span.record("bytes_deleted", removal_stats.bytes_removed);
+
         Ok(removal_stats)
     }
 
