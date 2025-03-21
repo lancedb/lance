@@ -55,7 +55,7 @@ use std::{
     future,
     sync::{Mutex, MutexGuard},
 };
-use tracing::info;
+use tracing::{info, instrument};
 
 use crate::{utils::temporal::utc_now, Dataset};
 
@@ -150,6 +150,7 @@ impl<'a> CleanupTask<'a> {
         self.delete_unreferenced_files(inspection).await
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn process_manifests(
         &'a self,
         tagged_versions: &HashSet<u64>,
@@ -246,6 +247,7 @@ impl<'a> CleanupTask<'a> {
         Ok(())
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn delete_unreferenced_files(
         &self,
         inspection: CleanupInspection,
