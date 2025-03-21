@@ -629,8 +629,8 @@ pub(crate) async fn do_commit_detached_transaction(
         .await;
 
         match result {
-            Ok(path) => {
-                return Ok((manifest, path));
+            Ok(location) => {
+                return Ok((manifest, location));
             }
             Err(CommitError::CommitConflict) => {
                 // We pick a random u64 for the version, so it's possible (though extremely unlikely)
