@@ -34,18 +34,13 @@ impl std::fmt::Debug for Session {
         f.debug_struct("Session")
             .field(
                 "index_cache",
-                &format!(
-                    "IndexCache(items={}, size_bytes={})",
-                    self.index_cache.get_size(),
-                    self.index_cache.deep_size_of()
-                ),
+                &format!("IndexCache(items={})", self.index_cache.approx_size(),),
             )
             .field(
                 "file_metadata_cache",
                 &format!(
-                    "FileMetadataCache(items={}, size_bytes={})",
-                    self.file_metadata_cache.size(),
-                    self.file_metadata_cache.deep_size_of()
+                    "FileMetadataCache(items={})",
+                    self.file_metadata_cache.approx_size(),
                 ),
             )
             .field(
@@ -124,6 +119,12 @@ impl Session {
         // We re-expose deep_size_of here so that users don't
         // need the deepsize crate themselves (e.g. to use deep_size_of)
         self.deep_size_of() as u64
+    }
+
+    pub fn approx_num_items(&self) -> usize {
+        self.index_cache.approx_size()
+            + self.file_metadata_cache.approx_size()
+            + self.index_extensions.len()
     }
 }
 

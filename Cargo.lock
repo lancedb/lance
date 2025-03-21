@@ -3819,6 +3819,7 @@ dependencies = [
  "snafu",
  "substrait-expr",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

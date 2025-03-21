@@ -30,7 +30,11 @@ use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
-    utils::{mask::RowIdTreeMap, tokio::get_num_compute_intensive_cpus},
+    utils::{
+        mask::RowIdTreeMap,
+        tokio::get_num_compute_intensive_cpus,
+        tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
+    },
     Error, Result,
 };
 use lance_datafusion::{
@@ -42,12 +46,13 @@ use moka::sync::Cache;
 use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
 use snafu::location;
+use tracing::info;
 
 use crate::{Index, IndexType};
 
 use super::{
-    flat::FlatIndexMetadata, AnyQuery, IndexReader, IndexStore, IndexWriter, SargableQuery,
-    ScalarIndex, SearchResult,
+    flat::FlatIndexMetadata, AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector,
+    SargableQuery, ScalarIndex, SearchResult,
 };
 
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
@@ -757,10 +762,13 @@ impl BTreeIndex {
         &self,
         page_number: u32,
         index_reader: LazyIndexReader,
+        metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
         if let Some(cached) = self.page_cache.0.get(&page_number) {
             return Ok(cached);
         }
+        metrics.record_part_load();
+        info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
         let serialized_page = index_reader
             .read_record_batch(page_number as u64, self.batch_size)
@@ -775,13 +783,14 @@ impl BTreeIndex {
         query: &SargableQuery,
         page_number: u32,
         index_reader: LazyIndexReader,
+        metrics: &dyn MetricsCollector,
     ) -> Result<RowIdTreeMap> {
-        let subindex = self.lookup_page(page_number, index_reader).await?;
+        let subindex = self.lookup_page(page_number, index_reader, metrics).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
         // 1 and 2 and three is in page 2 and seven is in pages 8 and 9 then when we search page 2 we only need
         // to search for X IN [5, 3]
-        match subindex.search(query).await? {
+        match subindex.search(query, metrics).await? {
             SearchResult::Exact(map) => Ok(map),
             _ => Err(Error::Internal {
                 message: "BTree sub-indices need to return exact results".to_string(),
@@ -949,7 +958,11 @@ impl Index for BTreeIndex {
 
 #[async_trait]
 impl ScalarIndex for BTreeIndex {
-    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let pages = match query {
             SargableQuery::Equals(val) => self
@@ -971,7 +984,7 @@ impl ScalarIndex for BTreeIndex {
         let page_tasks = pages
             .into_iter()
             .map(|page_index| {
-                self.search_page(query, page_index, lazy_index_reader.clone())
+                self.search_page(query, page_index, lazy_index_reader.clone(), metrics)
                     .boxed()
             })
             .collect::<Vec<_>>();

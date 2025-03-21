@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use lance_file::version::LanceFileVersion;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::{
     is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, Index, Manifest,
     WriterVersion, DETACHED_VERSION_MASK,
@@ -510,7 +511,11 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
             // We need to calculate the fragments covered by the index
             let idx = dataset
-                .open_generic_index(&idx_field.name, &index.uuid.to_string())
+                .open_generic_index(
+                    &idx_field.name,
+                    &index.uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
                 .await?;
             index.fragment_bitmap = Some(idx.calculate_included_frags().await?);
         }

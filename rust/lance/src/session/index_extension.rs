@@ -71,9 +71,12 @@ mod test {
     use deepsize::DeepSizeOf;
     use lance_file::version::LanceFileVersion;
     use lance_file::writer::{FileWriter, FileWriterOptions};
-    use lance_index::vector::ivf::storage::IvfModel;
-    use lance_index::vector::quantizer::{QuantizationType, Quantizer};
     use lance_index::vector::v3::subindex::SubIndexType;
+    use lance_index::{
+        metrics::MetricsCollector,
+        vector::quantizer::{QuantizationType, Quantizer},
+    };
+    use lance_index::{metrics::NoOpMetricsCollector, vector::ivf::storage::IvfModel};
     use lance_index::{
         vector::{hnsw::VECTOR_ID_FIELD, Query},
         DatasetIndexExt, Index, IndexMetadata, IndexType, INDEX_FILE_NAME,
@@ -124,7 +127,12 @@ mod test {
 
     #[async_trait::async_trait]
     impl VectorIndex for MockIndex {
-        async fn search(&self, _: &Query, _: Arc<dyn PreFilter>) -> Result<RecordBatch> {
+        async fn search(
+            &self,
+            _: &Query,
+            _: Arc<dyn PreFilter>,
+            _: &dyn MetricsCollector,
+        ) -> Result<RecordBatch> {
             unimplemented!()
         }
 
@@ -137,6 +145,7 @@ mod test {
             _: usize,
             _: &Query,
             _: Arc<dyn PreFilter>,
+            _: &dyn MetricsCollector,
         ) -> Result<RecordBatch> {
             unimplemented!()
         }
@@ -369,7 +378,7 @@ mod test {
 
         // trying to open the index should fail as there is no extension loader
         assert!(ds_without_extension
-            .open_vector_index("vec", &index_uuid)
+            .open_vector_index("vec", &index_uuid, &NoOpMetricsCollector)
             .await
             .unwrap_err()
             .to_string()
@@ -377,7 +386,7 @@ mod test {
 
         // trying to open the index should succeed with the extension loader
         let vector_index = ds_with_extension
-            .open_vector_index("vec", &index_uuid)
+            .open_vector_index("vec", &index_uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 

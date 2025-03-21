@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::IndexType;
@@ -54,7 +55,7 @@ pub async fn merge_indices<'a>(
     let mut indices = Vec::with_capacity(old_indices.len());
     for idx in old_indices {
         let index = dataset
-            .open_generic_index(&column.name, &idx.uuid.to_string())
+            .open_generic_index(&column.name, &idx.uuid.to_string(), &NoOpMetricsCollector)
             .await?;
         indices.push(index);
     }
@@ -84,7 +85,11 @@ pub async fn merge_indices<'a>(
             });
 
             let index = dataset
-                .open_scalar_index(&column.name, &old_indices[0].uuid.to_string())
+                .open_scalar_index(
+                    &column.name,
+                    &old_indices[0].uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
                 .await?;
 
             let mut scanner = dataset.scan();
@@ -281,7 +286,11 @@ mod tests {
 
         // Check that the index has all 2000 rows.
         let binding = dataset
-            .open_vector_index("vector", index.uuid.to_string().as_str())
+            .open_vector_index(
+                "vector",
+                index.uuid.to_string().as_str(),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         let ivf_index = binding.as_any().downcast_ref::<v2::IvfPq>().unwrap();

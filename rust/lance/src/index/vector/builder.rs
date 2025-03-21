@@ -17,6 +17,7 @@ use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::FileReaderOptions;
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -227,7 +228,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let model = ivf_index.ivf_model();
         let mapped = stream::iter(0..model.num_partitions())
             .map(|part_id| async move {
-                let part = ivf_index.load_partition(part_id, false).await?;
+                let part = ivf_index
+                    .load_partition(part_id, false, &NoOpMetricsCollector)
+                    .await?;
                 let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
                     Error::Internal {
                         message: "failed to downcast partition entry".to_string(),

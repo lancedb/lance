@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::convert::TryFrom;
 
+pub mod metrics;
 pub mod optimize;
 pub mod prefilter;
 pub mod scalar;
