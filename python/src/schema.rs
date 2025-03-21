@@ -3,7 +3,7 @@
 
 use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
-use lance::datatypes::Schema;
+use lance::datatypes::{Field, Schema};
 use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_file::format::pb;
 use prost::Message;
@@ -14,6 +14,42 @@ use pyo3::{
     types::PyTuple,
     IntoPyObjectExt,
 };
+
+#[pyclass(name = "LanceField", module = "lance.schema")]
+#[derive(Clone)]
+pub struct LanceField(pub Field);
+
+/// A field in a Lance schema
+///
+/// Unlike a PyArrow field, a Lance field has an id in addition to the name.
+#[pymethods]
+impl LanceField {
+    pub fn __repr__(&self) -> PyResult<String> {
+        Ok(format!("{:?}", self.0))
+    }
+
+    pub fn __richcmp__(&self, other: Self, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Eq => Ok(self.0 == other.0),
+            CompareOp::Ne => Ok(self.0 != other.0),
+            _ => Err(PyNotImplementedError::new_err(
+                "Only == and != are supported",
+            )),
+        }
+    }
+
+    pub fn children(&self) -> PyResult<Vec<LanceField>> {
+        Ok(self.0.children.iter().cloned().map(LanceField).collect())
+    }
+
+    pub fn name(&self) -> PyResult<String> {
+        Ok(self.0.name.clone())
+    }
+
+    pub fn id(&self) -> PyResult<i32> {
+        Ok(self.0.id)
+    }
+}
 
 /// A Lance Schema.
 ///
@@ -104,5 +140,9 @@ impl LanceSchema {
         };
         let schema = Schema::from(fields_with_meta);
         Ok(Self(schema))
+    }
+
+    pub fn fields(&self) -> PyResult<Vec<LanceField>> {
+        Ok(self.0.fields.iter().cloned().map(LanceField).collect())
     }
 }
