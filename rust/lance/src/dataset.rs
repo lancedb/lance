@@ -1446,6 +1446,7 @@ impl Dataset {
 
     async fn merge_impl(
         &mut self,
+        fragment_ids: Vec<String>,
         stream: Box<dyn RecordBatchReader + Send>,
         left_on: &str,
         right_on: &str,
@@ -1493,13 +1494,8 @@ impl Dataset {
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
-        let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
-            .then(|f| {
-                let joiner = joiner.clone();
-                async move { f.merge(left_on, &joiner).await.map(|f| f.metadata) }
-            })
-            .try_collect::<Vec<_>>()
-            .await?;
+        // Process all fragments using default parallel strategy
+        let updated_fragments = self.process_fragments(fragment_ids, left_on, joiner).await?;
 
         let transaction = Transaction::new(
             self.manifest.version,
@@ -1530,6 +1526,42 @@ impl Dataset {
         Ok(())
     }
 
+    /// Fragment-level processing interface for distributed execution
+    /// Enables external frameworks like Ray to parallelize fragment processing
+    pub async fn process_fragments(
+        &self,
+        fragment_ids: Vec<String>,
+        left_on: &str,
+        joiner: Arc<HashJoiner>,
+    ) -> Result<Vec<FragmentMetadata>> {
+        // Process fragments in parallel using Tokio work stealing
+        stream::iter(fragment_ids)
+            .then(|fragment_id| async {
+                // Get fragment with error conversion
+                let fragment = self._ds.get_fragment(&fragment_id).map_err(|e| {
+                    Error::new(
+                        ErrorKind::DatasetError,
+                        format!("Failed to get fragment {}: {}", fragment_id, e),
+                    )
+                })?;
+
+                // Execute merge operation
+                fragment.merge(left_on, &joiner)
+                    .await
+                    .map(|f| f.metadata)
+                    .map_err(|e| {
+                        Error::new(
+                            ErrorKind::ExecutionError,
+                            format!("Fragment {} merge failed: {}", fragment_id, e),
+                        )
+                    })
+            })
+            .buffered(num_cpus::get())  // Ordered processing (use buffer_unordered for unordered)
+            .try_collect()
+            .await
+    }
+
+
     /// Merge this dataset with another arrow Table / Dataset, and returns a new version of dataset.
     ///
     /// Parameters:
@@ -1547,8 +1579,19 @@ impl Dataset {
         left_on: &str,
         right_on: &str,
     ) -> Result<()> {
+        let fragment_ids = self.get_fragments().iter().map(|f| f.id()).collect();
+        self.merge_based_fragments(stream, fragment_ids, left_on, right_on).await
+    }
+
+    pub async fn merge_based_fragments(
+        &mut self,
+        stream: impl RecordBatchReader + Send + 'static,
+        left_on: &str,
+        right_on: &str,
+        fragment_ids: Vec<String>,
+    ) -> Result<()> {
         let stream = Box::new(stream);
-        self.merge_impl(stream, left_on, right_on).await
+        self.merge_impl(stream, fragment_ids, left_on, right_on).await
     }
 
     async fn update_op(&mut self, op: Operation) -> Result<()> {
