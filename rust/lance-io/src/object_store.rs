@@ -750,16 +750,24 @@ impl StorageOptions {
     pub fn with_env_gcs(&mut self) {
         for (os_key, os_value) in std::env::vars_os() {
             if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
-                if let Ok(config_key) = GoogleConfigKey::from_str(&key.to_ascii_lowercase()) {
+                let lowercase_key = key.to_ascii_lowercase();
+
+                if let Ok(config_key) = GoogleConfigKey::from_str(&lowercase_key) {
                     if !self.0.contains_key(config_key.as_ref()) {
                         self.0
                             .insert(config_key.as_ref().to_string(), value.to_string());
                     }
                 }
+                // Special case for GOOGLE_STORAGE_TOKEN
+                else if lowercase_key == "google_storage_token" {
+                    if !self.0.contains_key("google_storage_token") {
+                        self.0.insert("google_storage_token".to_string(), value.to_string());
+                    }
+                }
             }
         }
     }
-
+    
     /// Add values from the environment to storage options
     pub fn with_env_s3(&mut self) {
         for (os_key, os_value) in std::env::vars_os() {
