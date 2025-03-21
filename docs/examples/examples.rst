@@ -10,4 +10,4 @@ Examples
    Creating Multi-Modal datasets using Lance <./flickr8k_dataset_creation.rst>
    Training Multi-Modal models using a Lance dataset <./clip_training.rst>
    Deep Learning Artefact Management using Lance <./artefact_management.rst>
-   Reading and writing a Lance dataset in Spark <./spark_example.rst>
+   Reading and writing a Lance dataset via Spark DataSource <./spark_datasource_example.rst>

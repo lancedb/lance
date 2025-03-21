@@ -98,11 +98,14 @@ To execute the application, download these dependencies:
 
 * lance-core JAR: Core Rust Spark binding exposing Lance features to Java (available `here <https://repo1.maven.org/maven2/com/lancedb/lance-core/0.23.0/lance-core-0.23.0.jar>`_)
 * lance-spark JAR: Spark connector for reading/writing Lance format (available `here <https://repo1.maven.org/maven2/com/lancedb/lance-spark/0.23.0/lance-spark-0.23.0.jar>`_)
+* jar-jni JAR: Load JNI dependencies embedded within a JAR file (available `here <https://repo1.maven.org/maven2/org/questdb/jar-jni/1.1.1/jar-jni-1.1.1.jar>`_)
+* arrow-c-data JAR: Java implementation of C Data Interface (available `here <https://repo1.maven.org/maven2/org/apache/arrow/arrow-c-data/12.0.1/arrow-c-data-12.0.1.jar>`_)
+* arrow-dataset JAR: Java implementation of Arrow Dataset API/Framework (available `here <https://repo1.maven.org/maven2/org/apache/arrow/arrow-dataset/12.0.1/arrow-dataset-12.0.1.jar>`_)
 
 Place these JARs in the ``${SPARK_HOME}/jars`` directory, then run:
 
 .. code-block:: bash
 
-   ./bin/spark-shell --jars ./jars/lance-core-0.23.0.jar,./jars/lance-spark-0.23.0.jar -i ./iris_to_lance_via_spark_shell.scala
+   ./bin/spark-shell --jars ./jars/lance-core-0.23.0.jar,./jars/lance-spark-0.23.0.jar,./jars/jar-jni-1.1.1.jar,./jars/arrow-c-data-12.0.1.jar,./jars/arrow-dataset-12.0.1.jar -i ./iris_to_lance_via_spark_shell.scala
 
 It should be work! Have fun!
