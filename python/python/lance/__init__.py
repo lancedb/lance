@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import logging
+import os
 import warnings
-from os import register_at_fork
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
 from . import log
@@ -164,4 +164,5 @@ def __warn_on_fork():
     )
 
 
-register_at_fork(before=__warn_on_fork)
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=__warn_on_fork)
