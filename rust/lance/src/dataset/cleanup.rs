@@ -247,7 +247,7 @@ impl<'a> CleanupTask<'a> {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip_all, fields(old_versions = inspection.old_manifests.len(), bytes_deleted = tracing::field::Empty))]
+    #[instrument(level = "debug", skip_all, fields(old_versions = inspection.old_manifests.len(), bytes_removed = tracing::field::Empty))]
     async fn delete_unreferenced_files(
         &self,
         inspection: CleanupInspection,
@@ -310,7 +310,7 @@ impl<'a> CleanupTask<'a> {
         removal_stats.bytes_removed += manifest_bytes_removed?;
 
         let span = Span::current();
-        span.record("bytes_deleted", removal_stats.bytes_removed);
+        span.record("bytes_removed", removal_stats.bytes_removed);
 
         Ok(removal_stats)
     }
