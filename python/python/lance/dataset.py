@@ -1099,6 +1099,65 @@ class LanceDataset(pa.dataset.Dataset):
 
         self._ds.merge(reader, left_on, right_on)
 
+    def merge_based_fragments(
+        self,
+        data_obj: ReaderLike,
+        left_on: str,
+        right_on: Optional[str] = None,
+        schema=None,
+    ):
+        """
+        Merge another dataset into this one.
+
+        Performs a left join, where the dataset is the left side and data_obj
+        is the right side. Rows existing in the dataset but not on the left will
+        be filled with null values, unless Lance doesn't support null values for
+        some types, in which case an error will be raised.
+
+        Parameters
+        ----------
+        data_obj: Reader-like
+            The data to be merged. Acceptable types are:
+            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner,
+            Iterator[RecordBatch], or RecordBatchReader
+        left_on: str
+            The name of the column in the dataset to join on.
+        right_on: str or None
+            The name of the column in data_obj to join on. If None, defaults to
+            left_on.
+
+        Examples
+        --------
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> df = pa.table({'x': [1, 2, 3], 'y': ['a', 'b', 'c']})
+        >>> dataset = lance.write_dataset(df, "dataset")
+        >>> dataset.to_table().to_pandas()
+           x  y
+        0  1  a
+        1  2  b
+        2  3  c
+        >>> new_df = pa.table({'x': [1, 2, 3], 'z': ['d', 'e', 'f']})
+        >>> dataset.merge(new_df, 'x')
+        >>> dataset.to_table().to_pandas()
+           x  y  z
+        0  1  a  d
+        1  2  b  e
+        2  3  c  f
+
+        See Also
+        --------
+        LanceDataset.add_columns :
+            Add new columns by computing batch-by-batch.
+        """
+        if right_on is None:
+            right_on = left_on
+
+        reader = _coerce_reader(data_obj, schema)
+
+        self._ds.merge(reader, left_on, right_on)
+
     def add_columns(
         self,
         transforms: Dict[str, str] | BatchUDF | ReaderLike,
