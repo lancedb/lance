@@ -590,9 +590,7 @@ fn maybe_column(expr: &Expr) -> Option<String> {
             if func.inner().name() == "get_field" && args.len() == 2 {
                 if let Expr::Literal(field) = &args[1] {
                     match maybe_column(&args[0]) {
-                        Some(col) => {
-                            Some(format!("{col}.{field}"))
-                        },
+                        Some(col) => Some(format!("{col}.{field}")),
                         None => None,
                     }
                 } else {
