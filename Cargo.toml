@@ -118,6 +118,7 @@ deepsize = "0.2.0"
 dirs = "5.0.0"
 either = "1.0"
 fsst = { version = "=0.25.0", path = "./rust/lance-encoding/src/compression_algo/fsst" }
+fst = { version = "0.4.7", features = ["levenshtein"] }
 futures = "0.3"
 http = "1.1.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }

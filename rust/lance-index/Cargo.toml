@@ -27,6 +27,7 @@ datafusion-sql.workspace = true
 datafusion.workspace = true
 deepsize.workspace = true
 dirs.workspace = true
+fst.workspace = true
 futures.workspace = true
 half.workspace = true
 itertools.workspace = true

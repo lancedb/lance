@@ -353,6 +353,38 @@ def test_indexed_filter_with_fts_index(tmp_path):
     assert results["_rowid"].to_pylist() == [2, 3]
 
 
+def test_fts_fuzzy_query(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "fa",
+                "fo",  # spellchecker:disable-line
+                "fob",
+                "focus",
+                "foo",
+                "food",
+                "foul",
+            ]
+        }
+    )
+    # spellchecker:<on>
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+    results = ds.to_table(
+        full_text_query={
+            "query": "foo",
+            "max_distance": 1,
+        }
+    )
+    assert results.num_rows == 4
+    assert set(results["text"].to_pylist()) == {
+        "foo",
+        "fo",  # 1 deletion # spellchecker:disable-line
+        "fob",  # 1 substitution
+        "food",  # 1 insertion
+    }
+
+
 def test_fts_with_postfilter(tmp_path):
     tab = pa.table({"text": ["Frodo the puppy"] * 100, "id": range(100)})
     dataset = lance.write_dataset(tab, tmp_path)
