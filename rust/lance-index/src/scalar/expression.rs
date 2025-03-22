@@ -589,10 +589,7 @@ fn maybe_column(expr: &Expr) -> Option<String> {
         Expr::ScalarFunction(ScalarFunction { func, args }) => {
             if func.inner().name() == "get_field" && args.len() == 2 {
                 if let Expr::Literal(field) = &args[1] {
-                    match maybe_column(&args[0]) {
-                        Some(col) => Some(format!("{col}.{field}")),
-                        None => None,
-                    }
+                    maybe_column(&args[0]).map(|col| format!("{col}.{field}"))
                 } else {
                     None
                 }
@@ -605,10 +602,10 @@ fn maybe_column(expr: &Expr) -> Option<String> {
 }
 
 // Extract a column from the expression, if it is a column, and we have an index for that column, or None
-fn maybe_indexed_column<'a, 'b>(
-    expr: &'a Expr,
-    index_info: &'b dyn IndexInformationProvider,
-) -> Option<(String, &'b DataType, &'b dyn ScalarQueryParser)> {
+fn maybe_indexed_column<'a>(
+    expr: &Expr,
+    index_info: &'a dyn IndexInformationProvider,
+) -> Option<(String, &'a DataType, &'a dyn ScalarQueryParser)> {
     let col = maybe_column(expr)?;
     let data_type = index_info.get_index(&col);
     data_type.map(|(ty, parser)| (col, ty, parser))
