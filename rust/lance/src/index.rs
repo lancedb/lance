@@ -1007,7 +1007,19 @@ impl DatasetIndexInternalExt for Dataset {
                 _ => Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>,
             };
 
-            indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
+            // Get the full path of the field
+            let mut fields = vec![field];
+            while fields.last().unwrap().parent_id >= 0 {
+                match schema.field_by_id(fields.last().unwrap().parent_id) {
+                    Some(f) => {
+                        fields.push(f);
+                    }
+                    None => break,
+                }
+            }
+            fields.reverse();
+            let idents = fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+            indexed_fields.push((idents.join("."), (field.data_type(), query_parser)));
         }
         let index_info_map = HashMap::from_iter(indexed_fields);
         Ok(ScalarIndexInfo {
