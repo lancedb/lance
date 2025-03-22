@@ -294,7 +294,7 @@ impl IndexStore for LanceIndexStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
 
     use std::{collections::HashMap, ops::Bound, path::Path};
 
@@ -331,15 +331,21 @@ mod tests {
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
-    struct MockTrainingSource {
+    pub struct MockTrainingSource {
         data: SendableRecordBatchStream,
     }
 
     impl MockTrainingSource {
-        async fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
+        pub async fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
             Self {
                 data: lance_datafusion::utils::reader_to_stream(Box::new(data)),
             }
+        }
+    }
+
+    impl From<SendableRecordBatchStream> for MockTrainingSource {
+        fn from(data: SendableRecordBatchStream) -> Self {
+            Self { data }
         }
     }
 
