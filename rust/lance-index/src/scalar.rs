@@ -4,7 +4,7 @@
 //! Scalar indices for metadata search & filtering
 
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::{any::Any, ops::Bound, sync::Arc};
 
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -251,6 +251,21 @@ impl PartialEq for dyn AnyQuery {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SearchType {
+    QueryThenFetch,
+    DfsQueryThenFetch,
+}
+
+impl Display for SearchType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueryThenFetch => write!(f, "QueryThenFetch"),
+            Self::DfsQueryThenFetch => write!(f, "DfsQueryThenFetch"),
+        }
+    }
+}
+
 /// A full text search query
 #[derive(Debug, Clone, PartialEq)]
 pub struct FullTextSearchQuery {
@@ -266,6 +281,8 @@ pub struct FullTextSearchQuery {
     /// Increasing this value will reduce the recall and improve the performance
     /// 1.0 is the value that would give the best performance without recall loss
     pub wand_factor: Option<f32>,
+
+    pub search_type: SearchType,
 }
 
 impl FullTextSearchQuery {
@@ -275,6 +292,7 @@ impl FullTextSearchQuery {
             limit: None,
             columns: vec![],
             wand_factor: None,
+            search_type: SearchType::QueryThenFetch,
         }
     }
 
@@ -282,6 +300,11 @@ impl FullTextSearchQuery {
         if let Some(columns) = columns {
             self.columns = columns;
         }
+        self
+    }
+
+    pub fn search_type(mut self, search_type: SearchType) -> Self {
+        self.search_type = search_type;
         self
     }
 

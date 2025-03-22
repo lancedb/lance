@@ -15,9 +15,12 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::stream::{self};
 use futures::{StreamExt, TryStreamExt};
+use lance_index::as_inverted_index;
 use lance_index::prefilter::{FilterLoader, PreFilter};
-use lance_index::scalar::inverted::{flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA};
-use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::inverted::{
+    flat_bm25_search_stream, InvertedIndex, ParsedQuery, FTS_SCHEMA,
+};
+use lance_index::scalar::{FullTextSearchQuery, SearchType};
 use lance_table::format::Index;
 use tracing::instrument;
 
@@ -29,6 +32,31 @@ use super::utils::{
     SelectionVectorToPrefilter,
 };
 use super::PreFilterSource;
+
+async fn parse_query(
+    query: &FullTextSearchQuery,
+    column: &str,
+    indices: &[Index],
+    ds: &Arc<Dataset>,
+    metrics: &IndexMetrics,
+) -> DataFusionResult<ParsedQuery> {
+    let mut parsed = None;
+    for index in indices {
+        let uuid = index.uuid.to_string();
+        let index = ds.open_generic_index(column, &uuid, metrics).await?;
+        let index = as_inverted_index!(index, uuid)?;
+        match &mut parsed {
+            None => parsed = Some(index.parse(query)?),
+            Some(parsed) => parsed.count(index),
+        }
+    }
+    match parsed {
+        Some(parsed) => Ok(parsed),
+        None => Err(DataFusionError::Execution(
+            "Unable to parse query".to_string(),
+        )),
+    }
+}
 
 /// An execution node that performs full text search
 ///
@@ -159,65 +187,96 @@ impl ExecutionPlan for FtsExec {
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
         let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
-        let indices = self.indices.clone();
-        let stream = stream::iter(indices)
-            .map(move |(column, indices)| {
-                let index_meta = indices[0].clone();
-                let uuid = index_meta.uuid.to_string();
-                let query = query.clone();
+
+        let stream = stream::iter(self.indices.clone());
+
+        let stream = match query.search_type {
+            SearchType::QueryThenFetch => stream
+                .map(|(column, indices)| (column, indices, Option::<ParsedQuery>::None))
+                .boxed(),
+            SearchType::DfsQueryThenFetch => {
                 let ds = ds.clone();
-                let context = context.clone();
-                let prefilter_source = prefilter_source.clone();
+                let query = query.clone();
                 let metrics = metrics.clone();
-
-                async move {
-                    let prefilter_loader = match &prefilter_source {
-                        PreFilterSource::FilteredRowIds(src_node) => {
-                            let stream = src_node.execute(partition, context.clone())?;
-                            Some(Box::new(FilteredRowIdsToPrefilter(stream))
-                                as Box<dyn FilterLoader>)
+                stream
+                    .then(move |(column, indices)| {
+                        let ds = ds.clone();
+                        let query = query.clone();
+                        let metrics = metrics.clone();
+                        async move {
+                            match parse_query(&query, &column, &indices, &ds, metrics.as_ref())
+                                .await
+                            {
+                                Ok(parsed) => (column, indices, Some(parsed)),
+                                // use query then fetch if distributed frequency collection failed
+                                Err(_) => (column, indices, Option::<ParsedQuery>::None),
+                            }
                         }
-                        PreFilterSource::ScalarIndexQuery(src_node) => {
-                            let stream = src_node.execute(partition, context.clone())?;
-                            Some(Box::new(SelectionVectorToPrefilter(stream))
-                                as Box<dyn FilterLoader>)
-                        }
-                        PreFilterSource::None => None,
-                    };
-                    let pre_filter = Arc::new(DatasetPreFilter::new(
-                        ds.clone(),
-                        &[index_meta],
-                        prefilter_loader,
-                    ));
+                    })
+                    .boxed()
+            }
+        };
 
-                    let index = ds
-                        .open_generic_index(&column, &uuid, metrics.as_ref())
-                        .await?;
-                    let index =
-                        index
-                            .as_any()
-                            .downcast_ref::<InvertedIndex>()
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(format!(
-                                    "Index {} is not an inverted index",
-                                    uuid,
-                                ))
-                            })?;
-                    pre_filter.wait_for_ready().await?;
-                    let results = index
-                        .full_text_search(&query, pre_filter, metrics.as_ref())
-                        .await?;
+        let stream = stream
+            .flat_map(move |(column, indices, parsed)| {
+                let mut all_batches = Vec::with_capacity(indices.len());
 
-                    let (row_ids, scores): (Vec<u64>, Vec<f32>) = results.into_iter().unzip();
-                    let batch = RecordBatch::try_new(
-                        FTS_SCHEMA.clone(),
-                        vec![
-                            Arc::new(UInt64Array::from(row_ids)),
-                            Arc::new(Float32Array::from(scores)),
-                        ],
-                    )?;
-                    Ok::<_, DataFusionError>(batch)
+                for index_meta in indices {
+                    let parsed = parsed.clone();
+                    let query = query.clone();
+                    let ds = ds.clone();
+                    let context = context.clone();
+                    let prefilter_source = prefilter_source.clone();
+                    let metrics = metrics.clone();
+                    let column = column.clone();
+                    all_batches.push(async move {
+                        let uuid = index_meta.uuid.to_string();
+                        let prefilter_loader = match &prefilter_source {
+                            PreFilterSource::FilteredRowIds(src_node) => {
+                                let stream = src_node.execute(partition, context.clone())?;
+                                Some(Box::new(FilteredRowIdsToPrefilter(stream))
+                                    as Box<dyn FilterLoader>)
+                            }
+                            PreFilterSource::ScalarIndexQuery(src_node) => {
+                                let stream = src_node.execute(partition, context.clone())?;
+                                Some(Box::new(SelectionVectorToPrefilter(stream))
+                                    as Box<dyn FilterLoader>)
+                            }
+                            PreFilterSource::None => None,
+                        };
+                        let pre_filter = Arc::new(DatasetPreFilter::new(
+                            ds.clone(),
+                            &[index_meta],
+                            prefilter_loader,
+                        ));
+
+                        let index = ds
+                            .open_generic_index(&column, &uuid, metrics.as_ref())
+                            .await?;
+                        let index = as_inverted_index!(index, uuid)?;
+                        pre_filter.wait_for_ready().await?;
+
+                        let parsed = match parsed {
+                            Some(parsed) => parsed,
+                            None => index.parse(&query)?,
+                        };
+
+                        let results = index
+                            .parsed_search(&parsed, pre_filter, metrics.as_ref())
+                            .await?;
+
+                        let (row_ids, scores): (Vec<u64>, Vec<f32>) = results.into_iter().unzip();
+                        let batch = RecordBatch::try_new(
+                            FTS_SCHEMA.clone(),
+                            vec![
+                                Arc::new(UInt64Array::from(row_ids)),
+                                Arc::new(Float32Array::from(scores)),
+                            ],
+                        )?;
+                        Ok::<_, DataFusionError>(batch)
+                    });
                 }
+                stream::iter(all_batches)
             })
             .buffered(self.indices.len());
         let schema = self.schema();
@@ -353,26 +412,20 @@ impl ExecutionPlan for FlatFtsExec {
                 let ds = ds.clone();
                 let context = context.clone();
                 let metrics = metrics.clone();
-
                 async move {
+                    let unindexed_stream = input.execute(partition, context)?;
                     let index = ds
                         .open_generic_index(&column, &uuid, metrics.as_ref())
                         .await?;
-                    let index =
-                        index
-                            .as_any()
-                            .downcast_ref::<InvertedIndex>()
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(format!(
-                                    "Index {} is not an inverted index",
-                                    uuid,
-                                ))
-                            })?;
-
-                    let unindexed_stream = input.execute(partition, context)?;
+                    let index = as_inverted_index!(index, uuid)?;
+                    let parsed = match query.search_type {
+                        SearchType::DfsQueryThenFetch => {
+                            parse_query(&query, &column, &indices, &ds, metrics.as_ref()).await?
+                        }
+                        SearchType::QueryThenFetch => index.parse(&query)?,
+                    };
                     let unindexed_result_stream =
-                        flat_bm25_search_stream(unindexed_stream, column, query, index);
-
+                        flat_bm25_search_stream(unindexed_stream, column, parsed, index);
                     Ok::<_, DataFusionError>(unindexed_result_stream)
                 }
             })
