@@ -1378,12 +1378,15 @@ impl BatchGeneratorBuilder {
         self,
         batch_size: RowCount,
         num_batches: BatchCount,
-    ) -> BoxStream<'static, Result<RecordBatch, ArrowError>> {
+    ) -> (
+        BoxStream<'static, Result<RecordBatch, ArrowError>>,
+        Arc<Schema>,
+    ) {
         // TODO: this is pretty lazy and could be optimized
-        let batches = self
-            .into_reader_rows(batch_size, num_batches)
-            .collect::<Vec<_>>();
-        futures::stream::iter(batches).boxed()
+        let reader = self.into_reader_rows(batch_size, num_batches);
+        let schema = reader.schema();
+        let batches = reader.collect::<Vec<_>>();
+        (futures::stream::iter(batches).boxed(), schema)
     }
 
     /// Create a RecordBatchReader that generates batches of the given size (in bytes)

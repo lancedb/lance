@@ -633,6 +633,39 @@ def test_null_handling(tmp_path: Path):
     check(True)
 
 
+def test_nan_handling(tmp_path: Path):
+    tbl = pa.table(
+        {
+            "x": [
+                1.0,
+                float("-nan"),
+                float("infinity"),
+                float("-infinity"),
+                2.0,
+                float("nan"),
+                3.0,
+            ],
+        }
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    def check(has_index: bool):
+        assert dataset.to_table(filter="x IS NULL").num_rows == 0
+        assert dataset.to_table(filter="x IS NOT NULL").num_rows == 7
+        assert dataset.to_table(filter="x > 0").num_rows == 5
+        assert dataset.to_table(filter="x < 5").num_rows == 5
+        assert dataset.to_table(filter="x = 'Inf'").num_rows == 1
+        assert dataset.to_table(filter="x = '-Inf'").num_rows == 1
+        assert dataset.to_table(filter="x = 'nan'").num_rows == 1
+        assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
+
+    check(False)
+    dataset.create_scalar_index("x", index_type="BITMAP")
+    check(True)
+    dataset.create_scalar_index("x", index_type="BTREE")
+    check(True)
+
+
 def test_scalar_index_with_nulls(tmp_path):
     # Create a test dataframe with 50% null values.
     test_table_size = 10_000
