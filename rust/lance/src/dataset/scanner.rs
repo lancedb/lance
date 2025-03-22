@@ -19,7 +19,6 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
@@ -33,9 +32,11 @@ use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
-use datafusion_expr::Operator;
+use datafusion_expr::{Operator, ScalarUDF};
+use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::aggregate::AggregateExprBuilder;
-use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{expressions, PhysicalExpr, ScalarFunctionExpr};
+use datafusion_physical_expr::{LexOrdering, Partitioning};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
 use futures::{FutureExt, TryStreamExt};
@@ -1519,8 +1520,18 @@ impl Scanner {
             let col_exprs = ordering
                 .iter()
                 .map(|col| {
+                    let split = col.column_name.split(".").collect::<Vec<_>>();
+                    let schema = plan.schema();
+                    let mut expr = expressions::col(split[0], &schema)?;
+                    for part in split[1..].iter() {
+                        expr = Arc::new(ScalarFunctionExpr::try_new(
+                            Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
+                            vec![expr, expressions::lit(part.to_string())],
+                            &schema,
+                        )?);
+                    }
                     Ok(PhysicalSortExpr {
-                        expr: expressions::col(&col.column_name, plan.schema().as_ref())?,
+                        expr,
                         options: SortOptions {
                             descending: !col.ascending,
                             nulls_first: col.nulls_first,

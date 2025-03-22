@@ -481,19 +481,19 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<IndexMetadata>> {
+        let field = self.schema().field(col);
+        let Some(field) = field else {
+            return Err(Error::Index {
+                message: format!("Column {} does not exist", col),
+                location: location!(),
+            });
+        };
         Ok(self
             .load_indices()
             .await?
             .iter()
             .filter(|idx| idx.fields.len() == 1)
-            .find(|idx| {
-                let field = self.schema().field_by_id(idx.fields[0]);
-                if let Some(field) = field {
-                    field.name == col
-                } else {
-                    false
-                }
-            })
+            .find(|idx| idx.fields[0] == field.id)
             .cloned())
     }
 
@@ -1054,7 +1054,19 @@ impl DatasetIndexInternalExt for Dataset {
                 _ => Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>,
             };
 
-            indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
+            // Get the full path of the field
+            let mut fields = vec![field];
+            while fields.last().unwrap().parent_id >= 0 {
+                match schema.field_by_id(fields.last().unwrap().parent_id) {
+                    Some(f) => {
+                        fields.push(f);
+                    }
+                    None => break,
+                }
+            }
+            fields.reverse();
+            let idents = fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+            indexed_fields.push((idents.join("."), (field.data_type(), query_parser)));
         }
         let index_info_map = HashMap::from_iter(indexed_fields);
         Ok(ScalarIndexInfo {

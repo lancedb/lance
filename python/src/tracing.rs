@@ -66,7 +66,7 @@ struct LoggingPassthrough {
 
 impl LoggingPassthrough {
     fn init() -> LoggingSubscriberRef {
-        let subscriber = LoggingSubscriberRef(Arc::new(LoggingPassthrough::default()));
+        let subscriber = LoggingSubscriberRef(Arc::new(Self::default()));
         subscriber::set_global_default(subscriber.clone()).unwrap();
         subscriber
     }
