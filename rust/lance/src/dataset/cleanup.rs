@@ -35,7 +35,13 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::{Error, Result};
+use lance_core::{
+    utils::tracing::{
+        AUDIT_MODE_DELETE, AUDIT_MODE_DELETE_UNVERIFIED, AUDIT_TYPE_DATA, AUDIT_TYPE_DELETION,
+        AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
+    },
+    Error, Result,
+};
 use lance_table::{
     format::{Index, Manifest},
     io::{
@@ -282,7 +288,7 @@ impl<'a> CleanupTask<'a> {
 
         let old_manifests_stream = stream::iter(old_manifests)
             .map(|path| {
-                info!(target: "file_audit", mode="delete", type="manifest", path = path.to_string());
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, type=AUDIT_TYPE_MANIFEST, path = path.to_string());
                 Ok(path)
             })
             .boxed();
@@ -332,14 +338,14 @@ impl<'a> CleanupTask<'a> {
                 {
                     return Ok(None);
                 } else if !maybe_in_progress {
-                    info!(target: "file_audit", mode="delete_unverified", type="index", path = path.to_string());
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, type=AUDIT_TYPE_INDEX, path = path.to_string());
                     return Ok(Some(path));
                 } else if inspection
                     .verified_files
                     .index_uuids
                     .contains(uuid.as_ref())
                 {
-                    info!(target: "file_audit", mode="delete", type="index", path = path.to_string());
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, type=AUDIT_TYPE_INDEX, path = path.to_string());
                     return Ok(Some(path));
                 }
             } else {
@@ -356,14 +362,14 @@ impl<'a> CleanupTask<'a> {
                     {
                         Ok(None)
                     } else if !maybe_in_progress {
-                        info!(target: "file_audit", mode="delete_unverified", type="data", path = path.to_string());
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, type=AUDIT_TYPE_DATA, path = path.to_string());
                         Ok(Some(path))
                     } else if inspection
                         .verified_files
                         .data_paths
                         .contains(&relative_path)
                     {
-                        info!(target: "file_audit", mode="delete", type="data", path = path.to_string());
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, type=AUDIT_TYPE_DATA, path = path.to_string());
                         Ok(Some(path))
                     } else {
                         Ok(None)
@@ -386,14 +392,14 @@ impl<'a> CleanupTask<'a> {
                     {
                         Ok(None)
                     } else if !maybe_in_progress {
-                        info!(target: "file_audit", mode="delete_unverified", type="deletion", path = path.to_string());
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, type=AUDIT_TYPE_DELETION, path = path.to_string());
                         Ok(Some(path))
                     } else if inspection
                         .verified_files
                         .delete_paths
                         .contains(&relative_path)
                     {
-                        info!(target: "file_audit", mode="delete", type="deletion", path = path.to_string());
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, type=AUDIT_TYPE_DELETION, path = path.to_string());
                         Ok(Some(path))
                     } else {
                         Ok(None)

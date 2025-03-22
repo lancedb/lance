@@ -10,7 +10,7 @@ use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::stream::{self};
@@ -28,7 +28,8 @@ use crate::index::prefilter::DatasetPreFilter;
 use crate::{index::DatasetIndexInternalExt, Dataset};
 
 use super::utils::{
-    FilteredRowIdsToPrefilter, InstrumentedRecordBatchStreamAdapter, SelectionVectorToPrefilter,
+    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter,
+    SelectionVectorToPrefilter,
 };
 use super::PreFilterSource;
 
@@ -37,11 +38,12 @@ async fn parse_query(
     column: &str,
     indices: &[Index],
     ds: &Arc<Dataset>,
+    metrics: &IndexMetrics,
 ) -> DataFusionResult<ParsedQuery> {
     let mut parsed = None;
     for index in indices {
         let uuid = index.uuid.to_string();
-        let index = ds.open_generic_index(column, &uuid).await?;
+        let index = ds.open_generic_index(column, &uuid, metrics).await?;
         let index = as_inverted_index!(index, uuid)?;
         match &mut parsed {
             None => parsed = Some(index.parse(query)?),
@@ -184,7 +186,7 @@ impl ExecutionPlan for FtsExec {
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::iter(self.indices.clone());
 
@@ -195,12 +197,16 @@ impl ExecutionPlan for FtsExec {
             SearchType::DfsQueryThenFetch => {
                 let ds = ds.clone();
                 let query = query.clone();
+                let metrics = metrics.clone();
                 stream
                     .then(move |(column, indices)| {
                         let ds = ds.clone();
                         let query = query.clone();
+                        let metrics = metrics.clone();
                         async move {
-                            match parse_query(&query, &column, &indices, &ds).await {
+                            match parse_query(&query, &column, &indices, &ds, metrics.as_ref())
+                                .await
+                            {
                                 Ok(parsed) => (column, indices, Some(parsed)),
                                 // use query then fetch if distributed frequency collection failed
                                 Err(_) => (column, indices, Option::<ParsedQuery>::None),
@@ -221,6 +227,7 @@ impl ExecutionPlan for FtsExec {
                     let ds = ds.clone();
                     let context = context.clone();
                     let prefilter_source = prefilter_source.clone();
+                    let metrics = metrics.clone();
                     let column = column.clone();
                     all_batches.push(async move {
                         let uuid = index_meta.uuid.to_string();
@@ -243,7 +250,9 @@ impl ExecutionPlan for FtsExec {
                             prefilter_loader,
                         ));
 
-                        let index = ds.open_generic_index(&column, &uuid).await?;
+                        let index = ds
+                            .open_generic_index(&column, &uuid, metrics.as_ref())
+                            .await?;
                         let index = as_inverted_index!(index, uuid)?;
                         pre_filter.wait_for_ready().await?;
 
@@ -252,7 +261,9 @@ impl ExecutionPlan for FtsExec {
                             None => index.parse(&query)?,
                         };
 
-                        let results = index.parsed_search(&parsed, pre_filter).await?;
+                        let results = index
+                            .parsed_search(&parsed, pre_filter, metrics.as_ref())
+                            .await?;
 
                         let (row_ids, scores): (Vec<u64>, Vec<f32>) = results.into_iter().unzip();
                         let batch = RecordBatch::try_new(
@@ -272,7 +283,8 @@ impl ExecutionPlan for FtsExec {
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             schema,
             stream.boxed(),
-            baseline_metrics,
+            partition,
+            &self.metrics,
         )) as SendableRecordBatchStream)
     }
 
@@ -390,7 +402,7 @@ impl ExecutionPlan for FlatFtsExec {
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let column_inputs = self.column_inputs.clone();
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::iter(column_inputs)
             .map(move |(column, indices, input)| {
@@ -399,13 +411,16 @@ impl ExecutionPlan for FlatFtsExec {
                 let query = query.clone();
                 let ds = ds.clone();
                 let context = context.clone();
+                let metrics = metrics.clone();
                 async move {
                     let unindexed_stream = input.execute(partition, context)?;
-                    let index = ds.open_generic_index(&column, &uuid).await?;
+                    let index = ds
+                        .open_generic_index(&column, &uuid, metrics.as_ref())
+                        .await?;
                     let index = as_inverted_index!(index, uuid)?;
                     let parsed = match query.search_type {
                         SearchType::DfsQueryThenFetch => {
-                            parse_query(&query, &column, &indices, &ds).await?
+                            parse_query(&query, &column, &indices, &ds, metrics.as_ref()).await?
                         }
                         SearchType::QueryThenFetch => index.parse(&query)?,
                     };
@@ -420,7 +435,8 @@ impl ExecutionPlan for FlatFtsExec {
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             schema,
             stream.boxed(),
-            baseline_metrics,
+            partition,
+            &self.metrics,
         )) as SendableRecordBatchStream)
     }
 

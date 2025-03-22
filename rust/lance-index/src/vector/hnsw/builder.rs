@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
 use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, VECTOR_ID_FIELD};
+use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
 use crate::vector::flat::storage::FlatFloatStorage;
 use crate::vector::graph::builder::GraphBuilderNode;
@@ -393,9 +394,10 @@ impl HnswBuilder {
     ) {
         let nodes = &self.nodes;
         let target_level = nodes[node as usize].read().unwrap().level_neighbors.len() as u16 - 1;
+        let dist_calc = storage.dist_calculator_from_id(node);
         let mut ep = OrderedNode::new(
             self.entry_point,
-            storage.distance_between(node, self.entry_point).into(),
+            dist_calc.distance(self.entry_point).into(),
         );
 
         //
@@ -406,7 +408,6 @@ impl HnswBuilder {
         //    ep = Select-Neighbors(W, 1)
         //  }
         // ```
-        let dist_calc = storage.dist_calculator_from_id(node);
         for level in (target_level + 1..self.params.max_level).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
             ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
@@ -655,7 +656,7 @@ impl IvfSubIndex for HNSW {
         .into()
     }
 
-    #[instrument(level = "debug", skip(self, query, storage, prefilter))]
+    #[instrument(level = "debug", skip(self, query, storage, prefilter, _metrics))]
     fn search(
         &self,
         query: ArrayRef,
@@ -663,6 +664,7 @@ impl IvfSubIndex for HNSW {
         params: Self::QueryParams,
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         if params.ef < k {
             return Err(Error::Index {

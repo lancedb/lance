@@ -16,6 +16,7 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
@@ -106,7 +107,7 @@ pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 
 /// Lance Dataset
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Dataset {
     pub object_store: Arc<ObjectStore>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
@@ -123,6 +124,17 @@ pub struct Dataset {
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
     pub manifest_naming_scheme: ManifestNamingScheme,
+}
+
+impl std::fmt::Debug for Dataset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dataset")
+            .field("uri", &self.uri)
+            .field("base", &self.base)
+            .field("version", &self.manifest.version)
+            .field("cache_num_items", &self.session.approx_num_items())
+            .finish()
+    }
 }
 
 /// Dataset Version
@@ -1703,7 +1715,7 @@ fn write_manifest_file_to_path<'a>(
             .await?;
         let size = object_writer.tell().await? as u64;
         object_writer.shutdown().await?;
-        info!(target: "file_audit", mode="create", type="manifest", path = path.to_string());
+        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_MANIFEST, path = path.to_string());
         Ok(size)
     })
 }
@@ -2088,7 +2100,7 @@ mod tests {
         for fragment in &fragments {
             assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
             let reader = fragment
-                .open(dataset.schema(), FragReadConfig::default(), None)
+                .open(dataset.schema(), FragReadConfig::default())
                 .await
                 .unwrap();
             // No group / batch concept in v2

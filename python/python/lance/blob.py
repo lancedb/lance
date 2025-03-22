@@ -28,7 +28,7 @@ class BlobColumn:
     This can be useful for working with medium-to-small binary objects that need
     to interface with APIs that expect file-like objects.  For very large binary
     objects (4-8MB or more per value) you might be better off creating a blob column
-    and using :ref:`lance.Dataset.take_blobs` to access the blob data.
+    and using :py:meth:`lance.Dataset.take_blobs` to access the blob data.
     """
 
     def __init__(self, blob_column: Union[pa.Array, pa.ChunkedArray]):
@@ -50,13 +50,12 @@ class BlobColumn:
 
 
 class BlobFile(io.RawIOBase):
-    """
-    Represents a blob in a Lance dataset as a file-like object.
-    """
+    """Represents a blob in a Lance dataset as a file-like object."""
 
     def __init__(self, inner: LanceBlobFile):
         """
-        Internal only:  To obtain a BlobFile use :ref:`lance.Dataset.take_blobs`.
+        Internal only:  To obtain a BlobFile use
+        :py:meth:`lance.dataset.Dataset.take_blobs`.
         """
         self.inner = inner
 

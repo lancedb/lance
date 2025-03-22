@@ -1,14 +1,24 @@
+use lance_datafusion::utils::{
+    ExecutionPlanMetricsSetExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
+    IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+};
+use lance_index::metrics::MetricsCollector;
+use lance_io::scheduler::ScanScheduler;
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use pin_project::pin_project;
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::physical_plan::metrics::BaselineMetrics;
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
@@ -207,14 +217,28 @@ pub struct InstrumentedRecordBatchStreamAdapter<S> {
     #[pin]
     stream: S,
     baseline_metrics: BaselineMetrics,
+    batch_count: Count,
 }
 
 impl<S> InstrumentedRecordBatchStreamAdapter<S> {
-    pub fn new(schema: SchemaRef, stream: S, baseline_metrics: BaselineMetrics) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        stream: S,
+        partition: usize,
+        metrics: &ExecutionPlanMetricsSet,
+    ) -> Self {
+        let batch_count = Count::new();
+        MetricBuilder::new(metrics)
+            .with_partition(partition)
+            .build(MetricValue::Count {
+                name: Cow::Borrowed("output_batches"),
+                count: batch_count.clone(),
+            });
         Self {
             schema,
             stream,
-            baseline_metrics,
+            baseline_metrics: BaselineMetrics::new(metrics, partition),
+            batch_count,
         }
     }
 }
@@ -233,6 +257,9 @@ where
         let timer = this.baseline_metrics.elapsed_compute().timer();
         let poll = this.stream.poll_next(cx);
         timer.done();
+        if let Poll::Ready(Some(Ok(_))) = &poll {
+            this.batch_count.add(1);
+        }
         this.baseline_metrics.record_poll(poll)
     }
 }
@@ -300,6 +327,61 @@ impl ExecutionPlan for ReplayExec {
 
     fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
         self.input.properties()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IoMetrics {
+    iops: Count,
+    requests: Count,
+    bytes_read: Count,
+}
+
+impl IoMetrics {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        let iops = metrics.new_count(IOPS_METRIC, partition);
+        let requests = metrics.new_count(REQUESTS_METRIC, partition);
+        let bytes_read = metrics.new_count(BYTES_READ_METRIC, partition);
+        Self {
+            iops,
+            requests,
+            bytes_read,
+        }
+    }
+
+    pub fn record_final(&self, scan_scheduler: &ScanScheduler) {
+        let stats = scan_scheduler.stats();
+        self.iops.add(stats.iops as usize);
+        self.requests.add(stats.requests as usize);
+        self.bytes_read.add(stats.bytes_read as usize);
+    }
+}
+
+pub struct IndexMetrics {
+    indices_loaded: Count,
+    parts_loaded: Count,
+    index_comparisons: Count,
+}
+
+impl IndexMetrics {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            indices_loaded: metrics.new_count(INDICES_LOADED_METRIC, partition),
+            parts_loaded: metrics.new_count(PARTS_LOADED_METRIC, partition),
+            index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
+        }
+    }
+}
+
+impl MetricsCollector for IndexMetrics {
+    fn record_parts_loaded(&self, num_shards: usize) {
+        self.parts_loaded.add(num_shards);
+    }
+    fn record_index_loads(&self, num_indexes: usize) {
+        self.indices_loaded.add(num_indexes);
+    }
+    fn record_comparisons(&self, num_comparisons: usize) {
+        self.index_comparisons.add(num_comparisons);
     }
 }
 

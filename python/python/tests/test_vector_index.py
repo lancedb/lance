@@ -643,6 +643,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     idx_stats = actual_statistics["indices"][0]
     partitions = idx_stats.pop("partitions")
     idx_stats.pop("centroids")
+    idx_stats.pop("loss")
     assert idx_stats == expected_statistics
     assert len(partitions) == 5
     partition_keys = {"size"}
@@ -802,8 +803,8 @@ def test_optimize_index_recall(tmp_path: Path):
 
     def check_index(has_knn_combined, delete_has_happened):
         for query in sample_queries:
-            results = dataset.to_table(nearest=query).column("vector")
-            assert has_target(query["q"], results)
+            results = dataset.to_table(nearest=query)
+            assert has_target(query["q"], results["vector"])
             plan = dataset.scanner(nearest=query).explain_plan(verbose=True)
             assert ("KNNVectorDistance" in plan) == has_knn_combined
         for query in sample_delete_queries:
@@ -1119,6 +1120,30 @@ def test_optimize_indices(indexed_dataset):
     indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
     indices = indexed_dataset.list_indices()
     assert len(indices) == 2
+
+
+def test_retrain_indices(indexed_dataset):
+    data = create_table()
+    indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 1
+
+    indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 2
+
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    centroids = stats["indices"][0]["centroids"]
+    delta_centroids = stats["indices"][1]["centroids"]
+    assert centroids == delta_centroids
+
+    indexed_dataset.optimize.optimize_indices(retrain=True)
+    new_centroids = indexed_dataset.stats.index_stats("vector_idx")["indices"][0][
+        "centroids"
+    ]
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 1
+    assert centroids != new_centroids
 
 
 def test_no_include_deleted_rows(indexed_dataset):

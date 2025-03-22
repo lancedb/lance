@@ -16,7 +16,7 @@ use datafusion::logical_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{ColumnarValue, PlanProperties};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
@@ -198,7 +198,6 @@ impl ExecutionPlan for LancePushdownScanExec {
         // To get a stream with a static lifetime, we clone self put it into
         // a stream.
         let state = (self.clone(), 0);
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let fragment_stream = futures::stream::unfold(state, |(exec, fragment_i)| async move {
             if fragment_i == exec.fragments.len() {
                 None
@@ -232,7 +231,8 @@ impl ExecutionPlan for LancePushdownScanExec {
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
             batch_stream,
-            baseline_metrics,
+            partition,
+            &self.metrics,
         )))
     }
 
@@ -292,7 +292,7 @@ impl FragmentScanner {
         // We will call the reader with projections. In order for this to work
         // we must ensure that we open the fragment with the maximal schema.
         let mut reader = fragment
-            .open(dataset.schema(), FragReadConfig::default(), None)
+            .open(dataset.schema(), FragReadConfig::default())
             .await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();

@@ -31,7 +31,7 @@ use object_store::path::Path;
 use snafu::location;
 use tokio::sync::Mutex;
 
-use crate::vector::PART_ID_COLUMN;
+use crate::vector::{LOSS_METADATA_KEY, PART_ID_COLUMN};
 
 #[async_trait::async_trait]
 /// A reader that can read the shuffled partitions.
@@ -46,6 +46,12 @@ pub trait ShuffleReader: Send + Sync {
 
     /// Get the size of the partition by partition_id
     fn partition_size(&self, partition_id: usize) -> Result<usize>;
+
+    /// Get the total loss,
+    /// if the loss is not available, return None,
+    /// in such case, the caller should sum up the losses from each batch's metadata.
+    /// Must be called after all partitions are read.
+    fn total_loss(&self) -> Option<f64>;
 }
 
 #[async_trait::async_trait]
@@ -105,6 +111,12 @@ impl Shuffler for IvfShuffler {
                 spawn_cpu(move || {
                     let batch = batch?;
 
+                    let loss = batch
+                        .metadata()
+                        .get(LOSS_METADATA_KEY)
+                        .map(|s| s.parse::<f64>().unwrap_or_default())
+                        .unwrap_or_default();
+
                     let part_ids: &UInt32Array = batch
                         .column_by_name(PART_ID_COLUMN)
                         .expect("Partition ID column not found")
@@ -117,6 +129,7 @@ impl Shuffler for IvfShuffler {
                         .column_by_name(PART_ID_COLUMN)
                         .expect("Partition ID column not found")
                         .as_primitive();
+                    let batch = batch.drop_column(PART_ID_COLUMN)?;
 
                     let mut partition_buffers =
                         (0..num_partitions).map(|_| Vec::new()).collect::<Vec<_>>();
@@ -134,7 +147,7 @@ impl Shuffler for IvfShuffler {
                         start = end;
                     }
 
-                    Ok::<Vec<Vec<RecordBatch>>, Error>(partition_buffers)
+                    Ok::<(Vec<Vec<RecordBatch>>, f64), Error>((partition_buffers, loss))
                 })
             })
             .buffered(get_num_compute_intensive_cpus());
@@ -146,8 +159,10 @@ impl Shuffler for IvfShuffler {
             .collect::<Vec<_>>();
 
         let mut counter = 0;
+        let mut total_loss = 0.0;
         while let Some(shuffled) = parallel_sort_stream.next().await {
-            let shuffled = shuffled?;
+            let (shuffled, loss) = shuffled?;
+            total_loss += loss;
 
             for (part_id, batches) in shuffled.into_iter().enumerate() {
                 let part_batches = &mut partition_buffers[part_id];
@@ -218,6 +233,7 @@ impl Shuffler for IvfShuffler {
             self.object_store.clone(),
             self.output_dir.clone(),
             partition_sizes,
+            total_loss,
         )))
     }
 }
@@ -226,6 +242,7 @@ pub struct IvfShufflerReader {
     scheduler: Arc<ScanScheduler>,
     output_dir: Path,
     partition_sizes: Vec<usize>,
+    loss: f64,
 }
 
 impl IvfShufflerReader {
@@ -233,6 +250,7 @@ impl IvfShufflerReader {
         object_store: Arc<ObjectStore>,
         output_dir: Path,
         partition_sizes: Vec<usize>,
+        loss: f64,
     ) -> Self {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
@@ -240,6 +258,7 @@ impl IvfShufflerReader {
             scheduler,
             output_dir,
             partition_sizes,
+            loss,
         }
     }
 }
@@ -265,7 +284,7 @@ impl ShuffleReader for IvfShufflerReader {
             Arc::new(schema),
             reader.read_stream(
                 lance_io::ReadBatchParams::RangeFull,
-                4096,
+                u32::MAX,
                 16,
                 FilterExpression::no_filter(),
             )?,
@@ -274,6 +293,10 @@ impl ShuffleReader for IvfShufflerReader {
 
     fn partition_size(&self, partition_id: usize) -> Result<usize> {
         Ok(self.partition_sizes[partition_id])
+    }
+
+    fn total_loss(&self) -> Option<f64> {
+        Some(self.loss)
     }
 }
 
@@ -310,5 +333,9 @@ impl ShuffleReader for SinglePartitionReader {
         // it's used for determining the order of building the index and skipping empty partitions
         // so we just return 1 here
         Ok(1)
+    }
+
+    fn total_loss(&self) -> Option<f64> {
+        None
     }
 }

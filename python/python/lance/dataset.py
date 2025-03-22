@@ -283,6 +283,30 @@ class LanceDataset(pa.dataset.Dataset):
 
     @property
     def tags(self) -> Tags:
+        """Tag management for the dataset.
+
+        Similar to Git, tags are a way to add metadata to a specific version of the
+        dataset.
+
+        .. warning::
+
+            Tagged versions are exempted from the :py:meth:`cleanup_old_versions()`
+            process.
+
+            To remove a version that has been tagged, you must first
+            :py:meth:`~Tags.delete` the associated tag.
+
+        Examples
+        --------
+
+        .. code-block:: python
+
+            ds = lance.open("dataset.lance")
+            ds.tags.create("v2-prod-20250203", 10)
+
+            tags = ds.tags.list()
+
+        """
         return Tags(self._ds)
 
     def list_indices(self) -> List[Index]:
@@ -434,17 +458,19 @@ class LanceDataset(pa.dataset.Dataset):
             Note: if this is a search operation, or a take operation (including scalar
             indexed scans) then deleted rows cannot be returned.
 
-        Notes
-        -----
 
-        For now, if BOTH filter and nearest is specified, then:
+        .. note::
 
-        1. nearest is executed first.
-        2. The results are filtered afterwards.
+            For now, if BOTH filter and nearest is specified, then:
+
+            1. nearest is executed first.
+            2. The results are filtered afterwards.
+
 
         For debugging ANN results, you can choose to not use the index
         even if present by specifying ``use_index=False``. For example,
         the following will always return exact KNN results:
+
 
         .. code-block:: python
 
@@ -765,11 +791,11 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         **kwargs : dict, optional
-            Arguments for ``Scanner.from_dataset``.
+            Arguments for :py:meth:`~LanceDataset.scanner`.
 
         Returns
         -------
-        record_batches : Iterator of RecordBatch
+        record_batches : Iterator of :py:class:`~pyarrow.RecordBatch`
         """
         return self.scanner(
             columns=columns,
@@ -3119,6 +3145,45 @@ class LanceOperation:
 
         replacements: List[LanceOperation.DataReplacementGroup]
 
+    @dataclass
+    class Project(BaseOperation):
+        """
+        Operation that project columns.
+        Use this operator for drop column or rename/swap column.
+
+        Attributes
+        ----------
+        schema: LanceSchema
+            The lance schema of the new dataset.
+
+        Examples
+        --------
+        Use the projece operator to swap column:
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> import pyarrow.compute as pc
+        >>> from lance.schema import LanceSchema
+        >>> table = pa.table({"a": [1, 2], "b": ["a", "b"], "b1": ["c", "d"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.to_table().to_pandas()
+           a  b b1
+        0  1  a  c
+        1  2  b  d
+        >>>
+        >>> ## rename column `b` into `b0` and rename b1 into `b`
+        >>> table = pa.table({"a": [3, 4], "b0": ["a", "b"], "b": ["c", "d"]})
+        >>> lance_schema = LanceSchema.from_pyarrow(table.schema)
+        >>> operation = lance.LanceOperation.Project(lance_schema)
+        >>> dataset = lance.LanceDataset.commit("example", operation, read_version=1)
+        >>> dataset.to_table().to_pandas()
+           a b0  b
+        0  1  a  c
+        1  2  b  d
+        """
+
+        schema: LanceSchema
+
 
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
@@ -3708,6 +3773,15 @@ class DatasetOptimizer:
         index_names: List[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
+        retrain: bool, default False
+            Whether to retrain the whole index.
+            If true, the index will be retrained based on the current data,
+            `num_indices_to_merge` will be ignored,
+            and all indices will be merged into one.
+
+            This is useful when the data distribution has changed significantly,
+            and we want to retrain the index to improve the search quality.
+            This would be faster than re-create the index from scratch.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

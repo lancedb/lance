@@ -14,7 +14,7 @@ use arrow_array::{
 use arrow_array::{Array, Float32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{metrics::BaselineMetrics, PlanProperties};
+use datafusion::physical_plan::PlanProperties;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
     Statistics,
@@ -50,9 +50,21 @@ use crate::{Error, Result};
 use lance_arrow::*;
 
 use super::utils::{
-    FilteredRowIdsToPrefilter, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
+    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
     SelectionVectorToPrefilter,
 };
+
+pub struct AnnMetrics {
+    index_metrics: IndexMetrics,
+}
+
+impl AnnMetrics {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            index_metrics: IndexMetrics::new(metrics, partition),
+        }
+    }
+}
 
 /// [ExecutionPlan] compute vector distance from a query vector.
 ///
@@ -173,7 +185,6 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let key = self.query.clone();
         let column = self.column.clone();
         let dt = self.distance_type;
@@ -193,7 +204,8 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             schema,
             stream.boxed(),
-            baseline_metrics,
+            partition,
+            &self.metrics,
         )) as SendableRecordBatchStream)
     }
 
@@ -390,15 +402,18 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let ds = self.dataset.clone();
+        let metrics = Arc::new(AnnMetrics::new(&self.metrics, partition));
         let stream = stream::iter(self.index_uuids.clone())
             .map(move |uuid| {
                 let query = query.clone();
                 let ds = ds.clone();
+                let metrics = metrics.clone();
 
                 async move {
-                    let index = ds.open_vector_index(&query.column, &uuid).await?;
+                    let index = ds
+                        .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
+                        .await?;
 
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
@@ -427,7 +442,8 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             schema,
             stream.boxed(),
-            baseline_metrics,
+            partition,
+            &self.metrics,
         )) as SendableRecordBatchStream)
     }
 }
@@ -565,14 +581,14 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context.clone())?;
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let schema = self.schema();
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let column = self.query.column.clone();
         let indices = self.indices.clone();
         let prefilter_source = self.prefilter_source.clone();
-
+        let metrics = Arc::new(AnnMetrics::new(&self.metrics, partition));
+        let metrics_clone = metrics.clone();
         // Per-delta-index stream:
         //   Stream<(parttitions, index uuid)>
         let per_index_stream = input_stream
@@ -613,7 +629,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let indices = indices.clone();
                     let context = context.clone();
                     let prefilter_source = prefilter_source.clone();
-
+                    let metrics = metrics.clone();
                     let index_meta = indices
                         .iter()
                         .find(|idx| idx.uuid.to_string() == index_uuid)
@@ -640,7 +656,9 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             prefilter_loader,
                         ));
 
-                        let raw_index = ds.open_vector_index(&column, &index_uuid).await?;
+                        let raw_index = ds
+                            .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
+                            .await?;
 
                         Ok::<_, DataFusionError>(
                             stream::iter(part_ids)
@@ -652,6 +670,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 .try_flatten()
                 .map(move |result| {
                     let query = query.clone();
+                    let metrics = metrics_clone.clone();
                     async move {
                         let (part_id, (index, pre_filter)) = result?;
 
@@ -662,7 +681,12 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         };
 
                         index
-                            .search_in_partition(part_id as usize, &query, pre_filter)
+                            .search_in_partition(
+                                part_id as usize,
+                                &query,
+                                pre_filter,
+                                &metrics.index_metrics,
+                            )
                             .map_err(|e| {
                                 DataFusionError::Execution(format!(
                                     "Failed to calculate KNN: {}",
@@ -674,7 +698,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 })
                 .buffered(get_num_compute_intensive_cpus())
                 .boxed(),
-            baseline_metrics,
+            partition,
+            &self.metrics,
         )))
     }
 

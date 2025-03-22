@@ -728,6 +728,7 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
 
+    use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::inverted::TokenizerConfig;
     use crate::scalar::lance_format::LanceIndexStore;
     use crate::scalar::{FullTextSearchQuery, SargableQuery, ScalarIndex, SearchResult};
@@ -782,9 +783,12 @@ mod tests {
     async fn test_inverted_index<Offset: arrow::array::OffsetSizeTrait>() {
         let invert_index = create_index::<Offset>(false, TokenizerConfig::default()).await;
         let search_result = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("lance".to_owned()).limit(Some(3)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("lance".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         let SearchResult::Exact(row_ids) = search_result else {
@@ -796,9 +800,12 @@ mod tests {
         assert!(row_ids.contains(2));
 
         let result = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("database".to_owned()).limit(Some(3)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("database".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         assert!(result.is_exact());
@@ -809,9 +816,12 @@ mod tests {
         assert!(row_ids.contains(3));
 
         let result = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("unknown null".to_owned()).limit(Some(3)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("unknown null".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         assert!(result.is_exact());
@@ -824,24 +834,33 @@ mod tests {
 
         // we built the index without position, so the phrase query will not work
         let results = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await;
         assert!(results.unwrap_err().to_string().contains("position is not found but required for phrase queries, try recreating the index with position"));
         let results = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await;
         assert!(results.unwrap_err().to_string().contains("position is not found but required for phrase queries, try recreating the index with position"));
 
         // recreate the index with position
         let invert_index = create_index::<Offset>(true, TokenizerConfig::default()).await;
         let result = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("lance database".to_owned()).limit(Some(10)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("lance database".to_owned()).limit(Some(10)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         assert!(result.is_exact());
@@ -853,9 +872,12 @@ mod tests {
         assert!(row_ids.contains(3));
 
         let result = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         assert!(result.is_exact());
@@ -865,9 +887,12 @@ mod tests {
         assert!(row_ids.contains(1));
 
         let result = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"database lance\"".to_owned()).limit(Some(10)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("\"database lance\"".to_owned()).limit(Some(10)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         assert!(result.is_exact());
@@ -875,9 +900,12 @@ mod tests {
         assert_eq!(row_ids.len(), Some(0));
 
         let result = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"lance unknown\"".to_owned()).limit(Some(10)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("\"lance unknown\"".to_owned()).limit(Some(10)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         assert!(result.is_exact());
@@ -885,9 +913,12 @@ mod tests {
         assert_eq!(row_ids.len(), Some(0));
 
         let result = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         assert!(result.is_exact());
@@ -909,9 +940,12 @@ mod tests {
     async fn test_accented_chars() {
         let invert_index = create_index::<i32>(false, TokenizerConfig::default()).await;
         let result = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         assert!(result.is_exact());
@@ -919,9 +953,12 @@ mod tests {
         assert_eq!(row_ids.len(), Some(1));
 
         let result = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         assert!(result.is_exact());
@@ -932,9 +969,12 @@ mod tests {
         let invert_index =
             create_index::<i32>(true, TokenizerConfig::default().ascii_folding(true)).await;
         let result = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         assert!(result.is_exact());
@@ -942,9 +982,12 @@ mod tests {
         assert_eq!(row_ids.len(), Some(1));
 
         let result = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         assert!(result.is_exact());
