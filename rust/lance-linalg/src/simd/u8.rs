@@ -283,7 +283,7 @@ impl Add for u8x16 {
     fn add(self, rhs: Self) -> Self::Output {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm_add_epi8(self.0, rhs.0))
+            Self(_mm_adds_epu8(self.0, rhs.0))
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -305,11 +305,11 @@ impl AddAssign for u8x16 {
     fn add_assign(&mut self, rhs: Self) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            self.0 = _mm_add_epi8(self.0, rhs.0)
+            self.0 = _mm_adds_epu8(self.0, rhs.0)
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            self.0 = vaddq_u8(self.0, rhs.0)
+            self.0 = vqaddq_u8(self.0, rhs.0)
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
@@ -423,5 +423,18 @@ mod tests {
             #[cfg(target_arch = "aarch64")]
             assert_eq!((x * (x + 16_i32)) as u8, y);
         });
+    }
+
+    #[test]
+    fn test_saturating_add() {
+        let a = u8x16::splat(200);
+        let b = u8x16::splat(100);
+        let mut result = a + b;
+
+        let expected = (0..16).map(|_| 255).collect::<Vec<_>>();
+        assert_eq!(result.as_array(), expected.as_slice());
+
+        result += b;
+        assert_eq!(result.as_array(), expected.as_slice());
     }
 }
