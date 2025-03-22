@@ -59,7 +59,7 @@ def balanced_dataset(tmp_path, big_val):
 
 
 def test_write_fragments(balanced_dataset, tmp_path):
-    tbl = balanced_dataset._take_rows(range(10))
+    tbl = balanced_dataset.take_rows(range(10))
     transaction = lance.fragment.write_fragments(
         tbl,
         tmp_path / "ds",
@@ -81,7 +81,7 @@ def test_write_fragments(balanced_dataset, tmp_path):
     )
     dataset = lance.LanceDataset(tmp_path / "ds")
 
-    assert dataset._take_rows(range(10)) == balanced_dataset._take_rows(range(10))
+    assert dataset.take_rows(range(10)) == balanced_dataset.take_rows(range(10))
 
 
 def test_append_then_take(balanced_dataset, tmp_path, big_val):
@@ -117,7 +117,7 @@ def test_append_then_take(balanced_dataset, tmp_path, big_val):
     # Verify we can take blob values
     row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid")
 
-    take_tbl = ds._take_rows(row_ids.to_pylist(), columns=["idx", "blobs"])
+    take_tbl = ds.take_rows(row_ids.to_pylist(), columns=["idx", "blobs"])
 
     blobs = take_tbl.column("blobs")
     for val in blobs:
@@ -133,23 +133,19 @@ def test_delete(balanced_dataset):
 
     assert len(row_ids) == 40
 
-    assert balanced_dataset._take_rows(
-        row_ids.to_pylist(), columns=["idx"]
-    ) == pa.table(
+    assert balanced_dataset.take_rows(row_ids.to_pylist(), columns=["idx"]) == pa.table(
         {
             "idx": pa.array(list(range(40)), pa.uint64()),
         }
     )
 
-    assert (
-        len(balanced_dataset._take_rows(row_ids.to_pylist(), columns=["blobs"])) == 40
-    )
+    assert len(balanced_dataset.take_rows(row_ids.to_pylist(), columns=["blobs"])) == 40
 
-    assert len(balanced_dataset._take_rows([100], columns=["idx"])) == 0
-    assert len(balanced_dataset._take_rows([100], columns=["blobs"])) == 0
+    assert len(balanced_dataset.take_rows([100], columns=["idx"])) == 0
+    assert len(balanced_dataset.take_rows([100], columns=["blobs"])) == 0
 
-    assert len(balanced_dataset._take_rows(range(20, 80), columns=["idx"])) == 20
-    assert len(balanced_dataset._take_rows(range(20, 80), columns=["blobs"])) == 20
+    assert len(balanced_dataset.take_rows(range(20, 80), columns=["idx"])) == 20
+    assert len(balanced_dataset.take_rows(range(20, 80), columns=["blobs"])) == 20
 
 
 def test_scan(balanced_dataset):
@@ -213,12 +209,12 @@ def test_compaction(tmp_path, big_val):
     row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid")
     assert row_ids.to_pylist() == list(range(40))
 
-    assert ds._take_rows(row_ids.to_pylist(), columns=["idx"]) == pa.table(
+    assert ds.take_rows(row_ids.to_pylist(), columns=["idx"]) == pa.table(
         {
             "idx": pa.array(range(40), pa.uint64()),
         }
     )
-    assert ds._take_rows(row_ids.to_pylist(), columns=["blobs"]) == pa.table(
+    assert ds.take_rows(row_ids.to_pylist(), columns=["blobs"]) == pa.table(
         {
             "blobs": pa.array([big_val for _ in range(40)], pa.large_binary()),
         }

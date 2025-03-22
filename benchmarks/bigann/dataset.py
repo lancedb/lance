@@ -52,7 +52,7 @@ def create_text2image_10m(args):
 
     ids = []
     for row_id in gt_row_ids.cpu().numpy():
-        ids.append(ds._take_rows(row_id, columns=["id"]))
+        ids.append(ds.take_rows(row_id, columns=["id"]))
 
     shutil.rmtree(query_path, ignore_errors=True)
     arr = pa.array(queries.reshape(-1))
