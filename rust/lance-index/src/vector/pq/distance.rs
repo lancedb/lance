@@ -4,13 +4,19 @@
 use core::panic;
 use std::cmp::{max, min};
 
-use itertools::Itertools;
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
 use lance_linalg::simd::u8::u8x16;
 use lance_linalg::simd::{Shuffle, SIMD};
 use lance_table::utils::LanceIteratorExtension;
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
+
+// for quantizing the distance table, we need to know the max possible distance,
+// so we perform a flat search on the first `FLAT_NUM_4BIT_PQ` rows.
+// increasing this number will increase the accuracy of the quantization,
+// but also increase the computation time.
+// 200 is a good trade-off according to the original paper.
+const FLAT_NUM_4BIT_PQ: usize = 200;
 
 /// Build a Distance Table from the query to each PQ centroid
 /// using L2 distance.
@@ -148,7 +154,7 @@ pub(super) fn compute_pq_distance_4bit(
     // compute the distances for first k_hint rows
     // then use the max distance as qmax to quantize the distance table
     let k_hint = min(k_hint, num_vectors);
-    let flat_num = max(200, k_hint).min(num_vectors);
+    let flat_num = max(FLAT_NUM_4BIT_PQ, k_hint).min(num_vectors);
     compute_pq_distance_4bit_flat(
         distance_table,
         num_vectors,
@@ -160,8 +166,7 @@ pub(super) fn compute_pq_distance_4bit(
     let qmax = *distances
         .iter()
         .take(flat_num)
-        .sorted_unstable_by(|a, b| a.total_cmp(b))
-        .nth(k_hint - 1)
+        .max_by(|a, b| a.total_cmp(b))
         .unwrap();
 
     let (qmin, quantized_dists_table) = quantize_distance_table(distance_table, qmax);
