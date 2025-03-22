@@ -1446,7 +1446,7 @@ impl Dataset {
 
     async fn merge_impl(
         &mut self,
-        fragment_ids: Vec<String>,
+        fragment_ids: Set<int>,
         stream: Box<dyn RecordBatchReader + Send>,
         left_on: &str,
         right_on: &str,
@@ -1495,7 +1495,9 @@ impl Dataset {
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
         // Process all fragments using default parallel strategy
-        let updated_fragments = self.process_fragments(fragment_ids, left_on, joiner).await?;
+        let updated_fragments = self
+            .process_fragments(fragment_ids, left_on, joiner)
+            .await?;
 
         let transaction = Transaction::new(
             self.manifest.version,
@@ -1530,7 +1532,7 @@ impl Dataset {
     /// Enables external frameworks like Ray to parallelize fragment processing
     pub async fn process_fragments(
         &self,
-        fragment_ids: Vec<String>,
+        fragment_ids: Set<int>,
         left_on: &str,
         joiner: Arc<HashJoiner>,
     ) -> Result<Vec<FragmentMetadata>> {
@@ -1546,7 +1548,8 @@ impl Dataset {
                 })?;
 
                 // Execute merge operation
-                fragment.merge(left_on, &joiner)
+                fragment
+                    .merge(left_on, &joiner)
                     .await
                     .map(|f| f.metadata)
                     .map_err(|e| {
@@ -1556,11 +1559,10 @@ impl Dataset {
                         )
                     })
             })
-            .buffered(num_cpus::get())  // Ordered processing (use buffer_unordered for unordered)
+            .buffered(num_cpus::get()) // Ordered processing (use buffer_unordered for unordered)
             .try_collect()
             .await
     }
-
 
     /// Merge this dataset with another arrow Table / Dataset, and returns a new version of dataset.
     ///
@@ -1580,7 +1582,8 @@ impl Dataset {
         right_on: &str,
     ) -> Result<()> {
         let fragment_ids = self.get_fragments().iter().map(|f| f.id()).collect();
-        self.merge_based_fragments(stream, fragment_ids, left_on, right_on).await
+        self.merge_based_fragments(stream, fragment_ids, left_on, right_on)
+            .await
     }
 
     pub async fn merge_based_fragments(
@@ -1591,7 +1594,8 @@ impl Dataset {
         fragment_ids: Vec<String>,
     ) -> Result<()> {
         let stream = Box::new(stream);
-        self.merge_impl(stream, fragment_ids, left_on, right_on).await
+        self.merge_impl(stream, fragment_ids, left_on, right_on)
+            .await
     }
 
     async fn update_op(&mut self, op: Operation) -> Result<()> {
