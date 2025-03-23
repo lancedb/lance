@@ -631,7 +631,6 @@ pub(crate) async fn do_commit_detached_transaction(
 
         match result {
             Ok(location) => {
-                auto_cleanup_hook(dataset, &manifest).await?;
                 return Ok((manifest, location.path, location.e_tag));
             }
             Err(CommitError::CommitConflict) => {
