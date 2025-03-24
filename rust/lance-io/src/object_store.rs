@@ -39,6 +39,7 @@ use url::Url;
 use super::local::LocalObjectReader;
 mod tracing;
 use self::tracing::ObjectStoreTracingExt;
+use crate::object_writer::WriteResult;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
 
@@ -591,7 +592,7 @@ impl ObjectStore {
     }
 
     /// A helper function to create a file and write content to it.
-    pub async fn put(&self, path: &Path, content: &[u8]) -> Result<()> {
+    pub async fn put(&self, path: &Path, content: &[u8]) -> Result<WriteResult> {
         let mut writer = self.create(path).await?;
         writer.write_all(content).await?;
         writer.shutdown().await

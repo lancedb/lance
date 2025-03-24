@@ -165,10 +165,7 @@ impl ExternalManifestCommitHandler {
             naming_scheme,
             e_tag,
         };
-        match store
-            .copy(staging_manifest_path, &location.path)
-            .await
-        {
+        match store.copy(staging_manifest_path, &location.path).await {
             Ok(_) => {}
             Err(ObjectStoreError::NotFound { .. }) => return Ok(location), // Another writer beat us to it.
             Err(e) => return Err(e.into()),
@@ -254,47 +251,6 @@ impl CommitHandler for ExternalManifestCommitHandler {
         }
     }
 
-    /// Get the latest version of a dataset at the path
-    async fn resolve_latest_version(
-        &self,
-        base_path: &Path,
-        object_store: &ObjectStore,
-    ) -> std::result::Result<Path, Error> {
-        self.resolve_latest_location(base_path, object_store)
-            .await
-            .map(|l| l.path)
-    }
-
-    async fn resolve_latest_version_id(
-        &self,
-        base_path: &Path,
-        object_store: &ObjectStore,
-    ) -> std::result::Result<u64, Error> {
-        let version = self
-            .external_manifest_store
-            .get_latest_version(base_path.as_ref())
-            .await?;
-
-        match version {
-            Some((version, _)) => Ok(version),
-            None => Ok(current_manifest_path(object_store, base_path)
-                .await?
-                .version),
-        }
-    }
-
-    async fn resolve_version(
-        &self,
-        base_path: &Path,
-        version: u64,
-        object_store: &dyn OSObjectStore,
-    ) -> std::result::Result<Path, Error> {
-        Ok(self
-            .resolve_version_location(base_path, version, object_store)
-            .await?
-            .path)
-    }
-
     async fn resolve_version_location(
         &self,
         base_path: &Path,
@@ -372,17 +328,16 @@ impl CommitHandler for ExternalManifestCommitHandler {
             (meta.size as u64, meta.e_tag)
         };
 
-        self
-            .finalize_manifest(
-                base_path,
-                &location.path,
-                version,
-                size,
-                e_tag,
-                object_store,
-                naming_scheme,
-            )
-            .await
+        self.finalize_manifest(
+            base_path,
+            &location.path,
+            version,
+            size,
+            e_tag,
+            object_store,
+            naming_scheme,
+        )
+        .await
     }
 
     async fn commit(
@@ -400,7 +355,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         // step 1: Write the manifest we want to commit to object store with a temporary name
         let path = naming_scheme.manifest_path(base_path, manifest.version);
         let staging_path = make_staging_manifest_path(&path)?;
-        let size = manifest_writer(object_store, manifest, indices, &staging_path).await?;
+        let write_res = manifest_writer(object_store, manifest, indices, &staging_path).await?;
 
         // step 2 & 3: Try to commit this version to external store, return err on failure
         let res = self
@@ -409,8 +364,8 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 base_path.as_ref(),
                 manifest.version,
                 staging_path.as_ref(),
-                size,
-                None, // e_tag is not available at this point
+                write_res.size as u64,
+                write_res.e_tag,
             )
             .await
             .map_err(|_| CommitError::CommitConflict {});
@@ -430,7 +385,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 base_path,
                 &staging_path,
                 manifest.version,
-                size,
+                write_res.size as u64,
                 None, // e_tag
                 &object_store.inner,
                 naming_scheme,

@@ -23,7 +23,7 @@ use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
-use lance_io::object_writer::ObjectWriter;
+use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::{WriteExt, Writer};
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
 use lance_table::format::{
@@ -626,7 +626,7 @@ impl Dataset {
             None,
         );
 
-        let (restored_manifest, path) = commit_transaction(
+        let (restored_manifest, path, manifest_e_tag) = commit_transaction(
             self,
             &self.object_store,
             self.commit_handler.as_ref(),
@@ -639,6 +639,7 @@ impl Dataset {
 
         self.manifest = Arc::new(restored_manifest);
         self.manifest_file = path;
+        self.manifest_e_tag = manifest_e_tag;
 
         Ok(())
     }
@@ -975,7 +976,7 @@ impl Dataset {
             None,
         );
 
-        let (manifest, path) = commit_transaction(
+        let (manifest, path, manifest_e_tag) = commit_transaction(
             self,
             &self.object_store,
             self.commit_handler.as_ref(),
@@ -988,6 +989,7 @@ impl Dataset {
 
         self.manifest = Arc::new(manifest);
         self.manifest_file = path;
+        self.manifest_e_tag = manifest_e_tag;
 
         Ok(())
     }
@@ -1042,10 +1044,10 @@ impl Dataset {
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let mut versions: Vec<Version> = self
             .commit_handler
-            .list_manifests(&self.base, &self.object_store.inner)
+            .list_manifest_locations(&self.base, &self.object_store.inner)
             .await?
-            .try_filter_map(|path| async move {
-                match read_manifest(&self.object_store, &path, None).await {
+            .try_filter_map(|location| async move {
+                match read_manifest(&self.object_store, &location.path, location.size).await {
                     Ok(manifest) => Ok(Some(Version::from(&manifest))),
                     Err(e) => Err(e),
                 }
@@ -1063,9 +1065,11 @@ impl Dataset {
     /// This is meant to be a fast path for checking if a dataset has changed. This is why
     /// we don't return the full version struct.
     pub async fn latest_version_id(&self) -> Result<u64> {
-        self.commit_handler
-            .resolve_latest_version_id(&self.base, &self.object_store)
-            .await
+        Ok(self
+            .commit_handler
+            .resolve_latest_location(&self.base, &self.object_store)
+            .await?
+            .version)
     }
 
     pub fn count_fragments(&self) -> usize {
@@ -1548,7 +1552,7 @@ impl Dataset {
             None,
         );
 
-        let (manifest, manifest_path) = commit_transaction(
+        let (manifest, manifest_path, manifest_e_tag) = commit_transaction(
             self,
             &self.object_store,
             self.commit_handler.as_ref(),
@@ -1561,6 +1565,7 @@ impl Dataset {
 
         self.manifest = Arc::new(manifest);
         self.manifest_file = manifest_path;
+        self.manifest_e_tag = manifest_e_tag;
 
         Ok(())
     }
@@ -1590,7 +1595,7 @@ impl Dataset {
         let transaction =
             Transaction::new(self.manifest.version, op, /*blobs_op=*/ None, None);
 
-        let (manifest, manifest_path) = commit_transaction(
+        let (manifest, manifest_path, manifest_e_tag) = commit_transaction(
             self,
             &self.object_store,
             self.commit_handler.as_ref(),
@@ -1603,6 +1608,7 @@ impl Dataset {
 
         self.manifest = Arc::new(manifest);
         self.manifest_file = manifest_path;
+        self.manifest_e_tag = manifest_e_tag;
 
         Ok(())
     }
@@ -1729,17 +1735,16 @@ fn write_manifest_file_to_path<'a>(
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
-) -> BoxFuture<'a, Result<u64>> {
+) -> BoxFuture<'a, Result<WriteResult>> {
     Box::pin(async {
         let mut object_writer = ObjectWriter::new(object_store, path).await?;
         let pos = write_manifest(&mut object_writer, manifest, indices).await?;
         object_writer
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
-        let size = object_writer.tell().await? as u64;
-        object_writer.shutdown().await?;
+        let res = object_writer.shutdown().await?;
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_MANIFEST, path = path.to_string());
-        Ok(size)
+        Ok(res)
     })
 }
 
@@ -2175,9 +2180,10 @@ mod tests {
             dataset.object_store(),
             &dataset
                 .commit_handler
-                .resolve_latest_version(&dataset.base, dataset.object_store())
+                .resolve_latest_location(&dataset.base, dataset.object_store())
                 .await
-                .unwrap(),
+                .unwrap()
+                .path,
             None,
         )
         .await
@@ -2198,9 +2204,10 @@ mod tests {
             dataset.object_store(),
             &dataset
                 .commit_handler
-                .resolve_latest_version(&dataset.base, dataset.object_store())
+                .resolve_latest_location(&dataset.base, dataset.object_store())
                 .await
-                .unwrap(),
+                .unwrap()
+                .path,
             None,
         )
         .await

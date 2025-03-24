@@ -81,6 +81,12 @@ pub struct ObjectWriter {
     use_constant_size_upload_parts: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct WriteResult {
+    pub size: usize,
+    pub e_tag: Option<String>,
+}
+
 enum UploadState {
     /// The writer has been opened but no data has been written yet. Will be in
     /// this state until the buffer is full or the writer is shut down.
@@ -95,23 +101,27 @@ enum UploadState {
     },
     /// The writer is in the process of uploading data in a single PUT request.
     /// This happens when shutdown is called before the buffer is full.
-    PuttingSingle(BoxFuture<'static, OSResult<()>>),
+    PuttingSingle(BoxFuture<'static, OSResult<WriteResult>>),
     /// The writer is in the process of completing the multipart upload.
-    Completing(BoxFuture<'static, OSResult<()>>),
+    Completing(BoxFuture<'static, OSResult<WriteResult>>),
     /// The writer has been shut down and all data has been written.
-    Done,
+    Done(WriteResult),
 }
 
 /// Methods for state transitions.
 impl UploadState {
     fn started_to_completing(&mut self, path: Arc<Path>, buffer: Vec<u8>) {
         // To get owned self, we temporarily swap with Done.
-        let this = std::mem::replace(self, Self::Done);
+        let this = std::mem::replace(self, Self::Done(WriteResult::default()));
         *self = match this {
             Self::Started(store) => {
                 let fut = async move {
-                    store.put(&path, buffer.into()).await?;
-                    Ok(())
+                    let size = buffer.len();
+                    let res = store.put(&path, buffer.into()).await?;
+                    Ok(WriteResult {
+                        size,
+                        e_tag: res.e_tag,
+                    })
                 };
                 Self::PuttingSingle(Box::pin(fut))
             }
@@ -121,7 +131,7 @@ impl UploadState {
 
     fn in_progress_to_completing(&mut self) {
         // To get owned self, we temporarily swap with Done.
-        let this = std::mem::replace(self, Self::Done);
+        let this = std::mem::replace(self, Self::Done(WriteResult::default()));
         *self = match this {
             Self::InProgress {
                 mut upload,
@@ -130,8 +140,11 @@ impl UploadState {
             } => {
                 debug_assert!(futures.is_empty());
                 let fut = async move {
-                    upload.complete().await?;
-                    Ok(())
+                    let res = upload.complete().await?;
+                    Ok(WriteResult {
+                        size: 0, // This will be set properly later.
+                        e_tag: res.e_tag,
+                    })
                 };
                 Self::Completing(Box::pin(fut))
             }
@@ -198,7 +211,7 @@ impl ObjectWriter {
         let mut_self = &mut *self;
         loop {
             match &mut mut_self.state {
-                UploadState::Started(_) | UploadState::Done => break,
+                UploadState::Started(_) | UploadState::Done(_) => break,
                 UploadState::CreatingUpload(ref mut fut) => match fut.poll_unpin(cx) {
                     Poll::Ready(Ok(mut upload)) => {
                         let mut futures = JoinSet::new();
@@ -274,7 +287,10 @@ impl ObjectWriter {
                 }
                 UploadState::PuttingSingle(ref mut fut) | UploadState::Completing(ref mut fut) => {
                     match fut.poll_unpin(cx) {
-                        Poll::Ready(Ok(())) => mut_self.state = UploadState::Done,
+                        Poll::Ready(Ok(mut res)) => {
+                            res.size = mut_self.cursor;
+                            mut_self.state = UploadState::Done(res)
+                        }
                         Poll::Ready(Err(e)) => {
                             return Err(std::io::Error::new(std::io::ErrorKind::Other, e))
                         }
@@ -286,14 +302,19 @@ impl ObjectWriter {
         Ok(())
     }
 
-    pub async fn shutdown(&mut self) -> Result<()> {
+    pub async fn shutdown(&mut self) -> Result<WriteResult> {
         AsyncWriteExt::shutdown(self).await.map_err(|e| {
             Error::io(
                 format!("failed to shutdown object writer for {}: {}", self.path, e),
                 // and wrap it in here.
                 location!(),
             )
-        })
+        })?;
+        if let UploadState::Done(result) = &self.state {
+            Ok(result.clone())
+        } else {
+            unreachable!()
+        }
     }
 }
 
@@ -302,7 +323,8 @@ impl Drop for ObjectWriter {
         // If there is a multipart upload started but not finished, we should abort it.
         if matches!(self.state, UploadState::InProgress { .. }) {
             // Take ownership of the state.
-            let state = std::mem::replace(&mut self.state, UploadState::Done);
+            let state =
+                std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
             if let UploadState::InProgress { mut upload, .. } = state {
                 tokio::task::spawn(async move {
                     let _ = upload.abort().await;
@@ -398,7 +420,7 @@ impl AsyncWrite for ObjectWriter {
         self.as_mut().poll_tasks(cx)?;
 
         match &self.state {
-            UploadState::Started(_) | UploadState::Done => Poll::Ready(Ok(())),
+            UploadState::Started(_) | UploadState::Done(_) => Poll::Ready(Ok(())),
             UploadState::CreatingUpload(_)
             | UploadState::Completing(_)
             | UploadState::PuttingSingle(_) => Poll::Pending,
@@ -423,7 +445,7 @@ impl AsyncWrite for ObjectWriter {
             // through a Pin.
             let mut_self = &mut *self;
             match &mut mut_self.state {
-                UploadState::Done => return Poll::Ready(Ok(())),
+                UploadState::Done(_) => return Poll::Ready(Ok(())),
                 UploadState::CreatingUpload(_)
                 | UploadState::PuttingSingle(_)
                 | UploadState::Completing(_) => return Poll::Pending,
@@ -492,6 +514,7 @@ mod tests {
         assert_eq!(object_writer.write(buf.as_slice()).await.unwrap(), 256);
         assert_eq!(object_writer.tell().await.unwrap(), 256 * 3);
 
-        object_writer.shutdown().await.unwrap();
+        let res = object_writer.shutdown().await.unwrap();
+        assert_eq!(res.size, 256 * 3);
     }
 }

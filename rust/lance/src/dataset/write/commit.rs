@@ -273,7 +273,7 @@ impl<'a> CommitBuilder<'a> {
             ..Default::default()
         };
 
-        let (manifest, manifest_file) = if let Some(dataset) = dest.dataset() {
+        let (manifest, manifest_file, manifest_e_tag) = if let Some(dataset) = dest.dataset() {
             if self.detached {
                 if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
                     return Err(Error::NotSupported {
@@ -332,6 +332,7 @@ impl<'a> CommitBuilder<'a> {
                 manifest: Arc::new(manifest),
                 manifest_file,
                 session,
+                manifest_e_tag,
                 ..dataset.as_ref().clone()
             }),
             WriteDestination::Uri(uri) => Ok(Dataset {
@@ -344,7 +345,7 @@ impl<'a> CommitBuilder<'a> {
                 commit_handler,
                 tags,
                 manifest_naming_scheme,
-                todo!(),
+                manifest_e_tag,
             }),
         }
     }
