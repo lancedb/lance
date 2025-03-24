@@ -1923,7 +1923,7 @@ pub fn create_decode_iterator(
     should_validate: bool,
     is_structural: bool,
     messages: VecDeque<Result<DecoderMessage>>,
-) -> Box<dyn RecordBatchReader> {
+) -> Box<dyn RecordBatchReader + Send + 'static> {
     let arrow_schema = Arc::new(ArrowSchema::from(schema));
     let root_fields = arrow_schema.fields.clone();
     if is_structural {
@@ -2069,7 +2069,7 @@ pub fn schedule_and_decode_blocking(
     column_indices: Vec<u32>,
     target_schema: Arc<Schema>,
     config: SchedulerDecoderConfig,
-) -> Result<Box<dyn RecordBatchReader>> {
+) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     if requested_rows.num_rows() == 0 {
         let arrow_schema = Arc::new(ArrowSchema::from(target_schema.as_ref()));
         return Ok(Box::new(RecordBatchIterator::new(vec![], arrow_schema)));

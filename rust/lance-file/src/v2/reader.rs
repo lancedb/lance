@@ -1055,7 +1055,7 @@ impl FileReader {
         batch_size: u32,
         projection: ReaderProjection,
         filter: FilterExpression,
-    ) -> Result<Box<dyn RecordBatchReader>> {
+    ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let column_infos = self.collect_columns_from_projection(&projection)?;
         debug!(
             "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
@@ -1086,6 +1086,45 @@ impl FileReader {
         )
     }
 
+    fn read_range_blocking(
+        &self,
+        range: Range<u64>,
+        batch_size: u32,
+        projection: ReaderProjection,
+        filter: FilterExpression,
+    ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        let column_infos = self.collect_columns_from_projection(&projection)?;
+        let num_rows = self.num_rows;
+
+        debug!(
+            "Reading range {:?} with batch_size {} from file with {} rows and {} columns into schema with {} columns",
+            range,
+            batch_size,
+            num_rows,
+            column_infos.len(),
+            projection.schema.fields.len(),
+        );
+
+        let config = SchedulerDecoderConfig {
+            batch_size,
+            cache: self.cache.clone(),
+            decoder_plugins: self.decoder_plugins.clone(),
+            io: self.scheduler.clone(),
+            should_validate: self.options.validate_on_decode,
+        };
+
+        let requested_rows = RequestedRows::Ranges(vec![range]);
+
+        schedule_and_decode_blocking(
+            column_infos,
+            requested_rows,
+            filter,
+            projection.column_indices,
+            projection.schema,
+            config,
+        )
+    }
+
     /// Read data from the file as an iterator of record batches
     ///
     /// This is a blocking variant of [`Self::read_stream_projected`] that runs entirely in the
@@ -1103,7 +1142,7 @@ impl FileReader {
         batch_size: u32,
         projection: Option<ReaderProjection>,
         filter: FilterExpression,
-    ) -> Result<Box<dyn RecordBatchReader>> {
+    ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let projection = projection.unwrap_or_else(|| self.base_projection.clone());
         Self::validate_projection(&projection, &self.metadata)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
@@ -1137,7 +1176,31 @@ impl FileReader {
                 let indices = indices.iter().map(|idx| idx.unwrap() as u64).collect();
                 self.take_rows_blocking(indices, batch_size, projection, filter)
             }
-            _ => todo!(),
+            ReadBatchParams::Range(range) => {
+                verify_bound(&params, range.end as u64, false)?;
+                self.read_range_blocking(
+                    range.start as u64..range.end as u64,
+                    batch_size,
+                    projection,
+                    filter,
+                )
+            }
+            ReadBatchParams::RangeFrom(range) => {
+                verify_bound(&params, range.start as u64, true)?;
+                self.read_range_blocking(
+                    range.start as u64..self.num_rows,
+                    batch_size,
+                    projection,
+                    filter,
+                )
+            }
+            ReadBatchParams::RangeTo(range) => {
+                verify_bound(&params, range.end as u64, false)?;
+                self.read_range_blocking(0..range.end as u64, batch_size, projection, filter)
+            }
+            ReadBatchParams::RangeFull => {
+                self.read_range_blocking(0..self.num_rows, batch_size, projection, filter)
+            }
         }
     }
 
