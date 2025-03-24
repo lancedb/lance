@@ -15,7 +15,7 @@ Build from source code
     cd lance/java
     mvn clean package -DskipTests -Drust.release.build=true
 
-After building the code, the spark related jars are under path :py:meth:`lance/java/spark/target/jars/`
+After building the code, the spark related jars are under path :class:`lance/java/spark/target/jars/`
 
 .. code-block:: shell
 
@@ -41,7 +41,7 @@ If you did not want to get jars from source, you can download these five jars fr
 
 Configurations for Lance Spark Connector
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-There are some configurations you have to set in `spark-defaults.conf` to enable lance datasource.
+There are some configurations you have to set in :class:`spark-defaults.conf` to enable lance datasource.
 
 .. code-block:: text
 
@@ -55,7 +55,7 @@ If dealing with lance dataset stored in object store, these configurations shoul
 
 	spark.sql.catalog.lance.access_key_id {your object store ak}
 	spark.sql.catalog.lance.secret_access_key {your object store sk}
-	spark.sql.catalog.lance.aws_region {your object store region}
+	spark.sql.catalog.lance.aws_region {your object store region(optional)}
 	spark.sql.catalog.lance.aws_endpoint {your object store aws_endpoint which should be in virtual host style}
 	spark.sql.catalog.lance.virtual_hosted_style_request true
 
@@ -65,16 +65,18 @@ Startup the Spark Shell
 
 .. code-block:: shell
 
-	bin/spark-shell --master "local[56]"  --jars /path_of_code/lance/java/spark/target/jars/*.jar
+	bin/spark-shell --master "local[56]"  --jars "/path_of_code/lance/java/spark/target/jars/*.jar"
 
 
-Use :py:meth:`--jars` to involve the related jars we build or downloaded.
+Use :class:`--jars` to involve the related jars we build or downloaded.
 
+.. note::
+    Spark shell console use :class:`scala` language not :class:`python`
 
 Using Spark Shell to manipulate lance dataset
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-* Write a new dataset named `test.lance`
+* Write a new dataset named :class:`test.lance`
 
 .. code-block:: scala
 
@@ -84,7 +86,7 @@ Using Spark Shell to manipulate lance dataset
     ).toDF("name", "id")
     df.write.format("lance").option("path","./test.lance").save()
 
-* Overwrite the `test.lance` dataset
+* Overwrite the :class:`test.lance` dataset
 
 .. code-block:: scala
 
@@ -94,7 +96,7 @@ Using Spark Shell to manipulate lance dataset
     ).toDF("name", "id")
     df.write.format("lance").option("path","./test.lance").mode("overwrite").save()
 
-* Append Data into the `test.lance` dataset
+* Append Data into the :class:`test.lance` dataset
 
 .. code-block:: scala
 
@@ -104,14 +106,14 @@ Using Spark Shell to manipulate lance dataset
     ).toDF("name", "id")
     df.write.format("lance").option("path","./test.lance").mode("append").save()
 
-* Use spark data frame to read the `test.lance` dataset
+* Use spark data frame to read the :class:`test.lance` dataset
 
 .. code-block:: scala
 
     val data = spark.read.format("lance").option("path", "./test.lance").load();
     data.show()
 
-* Register data frame as table and use sql to query `test.lance` dataset
+* Register data frame as table and use sql to query :class:`test.lance` dataset
 
 .. code-block:: scala
 
