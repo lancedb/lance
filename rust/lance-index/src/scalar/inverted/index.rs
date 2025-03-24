@@ -116,12 +116,14 @@ impl InvertedIndex {
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, f32)>> {
-        let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_tokens(&query.query, &mut tokenizer, None);
-        metrics.record_comparisons(tokens.len());
-
         let token_ids = match query.max_distance {
             Some(max_dist) => {
+                let mut tokenizer = tantivy::tokenizer::TextAnalyzer::from(
+                    tantivy::tokenizer::SimpleTokenizer::default(),
+                );
+                let tokens = collect_tokens(&query.query, &mut tokenizer, None);
+                metrics.record_comparisons(tokens.len());
+
                 if tokens.len() != 1 {
                     return Err(Error::Index {
                         message: format!(
@@ -153,6 +155,10 @@ impl InvertedIndex {
                 }
             }
             None => {
+                let mut tokenizer = self.tokenizer.clone();
+                let tokens = collect_tokens(&query.query, &mut tokenizer, None);
+                metrics.record_comparisons(tokens.len());
+
                 let mut token_ids = self.map(&tokens);
                 if is_phrase_query(&query.query) {
                     if !self.inverted_list.has_positions() {
