@@ -3064,26 +3064,8 @@ class ColumnOrdering:
     It allows users to specify the sorting order (ascending or descending)
     and the position of null values (first or last).
     """
-
-    def __init__(self, ascending: bool, nulls_first: bool, column_name: str):
-        self.inner_ordering = _ColumnOrdering(ascending, nulls_first, column_name)
-
-    @staticmethod
-    def asc_nulls_first(column_name: str) -> ColumnOrdering:
-        return ColumnOrdering(True, True, column_name)
-
-    @staticmethod
-    def asc_nulls_last(column_name: str) -> ColumnOrdering:
-        return ColumnOrdering(True, False, column_name)
-
-    @staticmethod
-    def desc_nulls_first(column_name: str) -> ColumnOrdering:
-        return ColumnOrdering(False, True, column_name)
-
-    @staticmethod
-    def desc_nulls_last(column_name: str) -> ColumnOrdering:
-        return ColumnOrdering(False, False, column_name)
-
+    def __init__(self, column_name: str, ascending: bool = True, nulls_first: bool = False):
+        self.inner_ordering = _ColumnOrdering(column_name, ascending, nulls_first)
 
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):

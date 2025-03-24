@@ -19,14 +19,14 @@ def test_one_column_order_by(tmp_path: Path):
     dataset = lance.write_dataset(data, base_dir)
 
     ## asc null_last
-    ordering = ColumnOrdering.asc_nulls_last("int_col")
+    ordering = ColumnOrdering("int_col")
     true_value = pa.table(
         {"int_col": [1, 2, 3, 4, None], "str_col": [None, "a", "d", "c", "b"]}
     )
     assert dataset.scanner(orderings=[ordering]).to_table() == true_value
 
     ## asc null_first
-    ordering = ColumnOrdering.asc_nulls_first("int_col")
+    ordering = ColumnOrdering("int_col", nulls_first=True)
     true_value = pa.table(
         {
             "int_col": [None, 1, 2, 3, 4],
@@ -36,7 +36,7 @@ def test_one_column_order_by(tmp_path: Path):
     assert dataset.scanner(orderings=[ordering]).to_table() == true_value
 
     ## desc null_last
-    ordering = ColumnOrdering.desc_nulls_last("int_col")
+    ordering = ColumnOrdering("int_col", ascending=False)
     true_value = pa.table(
         {
             "int_col": [4, 3, 2, 1, None],
@@ -46,7 +46,7 @@ def test_one_column_order_by(tmp_path: Path):
     assert dataset.scanner(orderings=[ordering]).to_table() == true_value
 
     ## desc null_first
-    ordering = ColumnOrdering.desc_nulls_first("int_col")
+    ordering = ColumnOrdering("int_col", ascending=False, nulls_first=True)
     true_value = pa.table(
         {
             "int_col": [None, 4, 3, 2, 1],
@@ -67,8 +67,8 @@ def test_two_column_order_by(tmp_path: Path):
     dataset = lance.write_dataset(data, base_dir)
 
     ## int column asc null_last and str col desc null
-    ordering1 = ColumnOrdering.asc_nulls_last("int_col")
-    ordering2 = ColumnOrdering.desc_nulls_first("str_col")
+    ordering1 = ColumnOrdering("int_col")
+    ordering2 = ColumnOrdering("str_col", ascending=False, nulls_first=True)
 
     true_value = pa.table(
         {
@@ -87,7 +87,7 @@ def test_all_order_by_support_functions(tmp_path: Path):
     dataset = lance.write_dataset(data, base_dir)
 
     ## asc null_last
-    ordering = ColumnOrdering.asc_nulls_last("int_col")
+    ordering = ColumnOrdering("int_col")
     true_value = pa.table(
         {"int_col": [1, 2, 3, 4, None], "str_col": [None, "a", "d", "c", "b"]}
     )
