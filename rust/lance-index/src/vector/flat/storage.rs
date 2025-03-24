@@ -331,7 +331,7 @@ impl<T: ArrowPrimitiveType> DistCalculator for FlatDistanceCal<'_, T> {
         (self.distance_fn)(&self.query, vector)
     }
 
-    fn distance_all(&self) -> Vec<f32> {
+    fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
         let query = &self.query;
         self.vectors
             .chunks_exact(self.dimension)

@@ -40,7 +40,11 @@ use super::DISTANCE_TYPE_KEY;
 /// </section>
 pub trait DistCalculator {
     fn distance(&self, id: u32) -> f32;
-    fn distance_all(&self) -> Vec<f32>;
+
+    // return the distances of all rows
+    // k_hint is a hint that can be used for optimization
+    fn distance_all(&self, k_hint: usize) -> Vec<f32>;
+
     fn prefetch(&self, _id: u32) {}
 }
 
