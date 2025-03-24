@@ -15,7 +15,7 @@ Build from source code
     cd lance/java
     mvn clean package -DskipTests -Drust.release.build=true
 
-After building the code, the spark related jars are under path :meth:`lance/java/spark/target/jars/`
+After building the code, the spark related jars are under path :py:meth:`lance/java/spark/target/jars/`
 
 .. code-block:: shell
 
@@ -68,7 +68,7 @@ Startup the Spark Shell
 	bin/spark-shell --master "local[56]"  --jars /path_of_code/lance/java/spark/target/jars/*.jar
 
 
-Use :meth:`--jars` to involve the related jars we build or downloaded.
+Use :py:meth:`--jars` to involve the related jars we build or downloaded.
 
 
 Using Spark Shell to manipulate lance dataset
