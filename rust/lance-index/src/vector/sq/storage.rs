@@ -416,7 +416,7 @@ impl DistCalculator for SQDistCalculator<'_> {
         inverse_scalar_dist(std::iter::once(dist), &self.bounds)[0]
     }
 
-    fn distance_all(&self) -> Vec<f32> {
+    fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
         match self.storage.distance_type {
             DistanceType::L2 | DistanceType::Cosine => inverse_scalar_dist(
                 self.storage.chunks.iter().flat_map(|c| {

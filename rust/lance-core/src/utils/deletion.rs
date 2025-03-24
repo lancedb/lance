@@ -105,15 +105,15 @@ impl DeletionVector {
     // Note: deletion vectors are based on 32-bit offsets.  However, this function works
     // even when given 64-bit row addresses.  That is because `id as u32` returns the lower
     // 32 bits (the row offset) and the upper 32 bits are ignored.
-    pub fn build_predicate(&self, row_ids: std::slice::Iter<u64>) -> Option<BooleanArray> {
+    pub fn build_predicate(&self, row_addrs: std::slice::Iter<u64>) -> Option<BooleanArray> {
         match self {
             Self::Bitmap(bitmap) => Some(
-                row_ids
+                row_addrs
                     .map(|&id| !bitmap.contains(id as u32))
                     .collect::<Vec<_>>(),
             ),
             Self::Set(set) => Some(
-                row_ids
+                row_addrs
                     .map(|&id| !set.contains(&(id as u32)))
                     .collect::<Vec<_>>(),
             ),
