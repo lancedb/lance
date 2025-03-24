@@ -641,6 +641,7 @@ impl Dataset {
     /// # Returns
     ///
     /// * `RemovalStats` - Statistics about the removal operation
+    #[instrument(level = "debug", skip(self))]
     pub fn cleanup_old_versions(
         &self,
         older_than: Duration,
