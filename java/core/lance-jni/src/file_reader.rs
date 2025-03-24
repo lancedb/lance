@@ -126,8 +126,8 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_closeNative<'
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_numRowsNative<'local>(
-    mut env: JNIEnv<'local>,
+pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_numRowsNative(
+    mut env: JNIEnv<'_>,
     reader: JObject,
 ) -> jlong {
     match inner_num_rows(&mut env, reader) {
@@ -151,7 +151,7 @@ fn unwrap_reader<T>(val: std::result::Result<T, jni::errors::Error>) -> Result<T
     }
 }
 
-fn inner_num_rows<'local>(env: &mut JNIEnv<'local>, reader: JObject) -> Result<jlong> {
+fn inner_num_rows(env: &mut JNIEnv<'_>, reader: JObject) -> Result<jlong> {
     let reader = unsafe { env.get_rust_field::<_, _, BlockingFileReader>(reader, NATIVE_READER) };
     let reader = unwrap_reader(reader)?;
     Ok(reader.num_rows() as i64)
@@ -176,8 +176,8 @@ fn inner_populate_schema(env: &mut JNIEnv, reader: JObject, schema_addr: jlong) 
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative<'local>(
-    mut env: JNIEnv<'local>,
+pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative(
+    mut env: JNIEnv<'_>,
     reader: JObject,
     batch_size: jint,
     stream_addr: jlong,
@@ -187,8 +187,8 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
     }
 }
 
-fn inner_read_all<'local>(
-    env: &mut JNIEnv<'local>,
+fn inner_read_all(
+    env: &mut JNIEnv<'_>,
     reader: JObject,
     batch_size: jint,
     stream_addr: jlong,

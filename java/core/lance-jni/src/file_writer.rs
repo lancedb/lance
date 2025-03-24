@@ -128,8 +128,8 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_writeNative<'
     JObject::null()
 }
 
-fn inner_write_batch<'local>(
-    env: &mut JNIEnv<'local>,
+fn inner_write_batch(
+    env: &mut JNIEnv<'_>,
     writer: JObject,
     batch_address: jlong,
     schema_address: jlong,
