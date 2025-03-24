@@ -21,7 +21,7 @@ exclude = ["python"]
 resolver = "2"
 
 [workspace.package]
-version = "0.25.0"
+version = "0.25.1"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -44,21 +44,21 @@ categories = [
 rust-version = "1.81.0"
 
 [workspace.dependencies]
-lance = { version = "=0.25.0", path = "./rust/lance" }
-lance-arrow = { version = "=0.25.0", path = "./rust/lance-arrow" }
-lance-core = { version = "=0.25.0", path = "./rust/lance-core" }
-lance-datafusion = { version = "=0.25.0", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=0.25.0", path = "./rust/lance-datagen" }
-lance-encoding = { version = "=0.25.0", path = "./rust/lance-encoding" }
-lance-encoding-datafusion = { version = "=0.25.0", path = "./rust/lance-encoding-datafusion" }
-lance-file = { version = "=0.25.0", path = "./rust/lance-file" }
-lance-index = { version = "=0.25.0", path = "./rust/lance-index" }
-lance-io = { version = "=0.25.0", path = "./rust/lance-io" }
-lance-jni = { version = "=0.25.0", path = "./java/core/lance-jni" }
-lance-linalg = { version = "=0.25.0", path = "./rust/lance-linalg" }
-lance-table = { version = "=0.25.0", path = "./rust/lance-table" }
-lance-test-macros = { version = "=0.25.0", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=0.25.0", path = "./rust/lance-testing" }
+lance = { version = "=0.25.1", path = "./rust/lance" }
+lance-arrow = { version = "=0.25.1", path = "./rust/lance-arrow" }
+lance-core = { version = "=0.25.1", path = "./rust/lance-core" }
+lance-datafusion = { version = "=0.25.1", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=0.25.1", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=0.25.1", path = "./rust/lance-encoding" }
+lance-encoding-datafusion = { version = "=0.25.1", path = "./rust/lance-encoding-datafusion" }
+lance-file = { version = "=0.25.1", path = "./rust/lance-file" }
+lance-index = { version = "=0.25.1", path = "./rust/lance-index" }
+lance-io = { version = "=0.25.1", path = "./rust/lance-io" }
+lance-jni = { version = "=0.25.1", path = "./java/core/lance-jni" }
+lance-linalg = { version = "=0.25.1", path = "./rust/lance-linalg" }
+lance-table = { version = "=0.25.1", path = "./rust/lance-table" }
+lance-test-macros = { version = "=0.25.1", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=0.25.1", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "54.1", optional = false, features = ["prettyprint"] }
@@ -117,7 +117,7 @@ datafusion-physical-expr = { version = "45.0" }
 deepsize = "0.2.0"
 dirs = "5.0.0"
 either = "1.0"
-fsst = { version = "=0.25.0", path = "./rust/lance-encoding/src/compression_algo/fsst" }
+fsst = { version = "=0.25.1", path = "./rust/lance-encoding/src/compression_algo/fsst" }
 futures = "0.3"
 http = "1.1.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
