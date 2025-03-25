@@ -430,7 +430,11 @@ async fn list_manifests<'a>(
         .read_dir_all(&base_path.child(VERSIONS_DIR), None)
         .await?
         .filter_map(|obj_meta| {
-            futures::future::ready(obj_meta.map(ManifestLocation::try_from).ok())
+            futures::future::ready(
+                obj_meta
+                    .map(|m| ManifestLocation::try_from(m).ok())
+                    .transpose(),
+            )
         })
         .boxed())
 }
