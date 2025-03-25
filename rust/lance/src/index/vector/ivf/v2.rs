@@ -969,16 +969,13 @@ mod tests {
         compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
-        // query again, the result should not include the deleted row
-        let result = dataset
-            .scan()
-            .nearest(vector_column, query.as_primitive::<T>(), half_rows)
-            .unwrap()
-            .nprobs(nlist)
-            .with_row_id()
-            .try_into_batch()
+        // index the updated data
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
             .await
             .unwrap();
+        // query again, the result should not include the deleted row
+        let result = dataset.scan().try_into_batch().await.unwrap();
         let ids = result["id"].as_primitive::<UInt64Type>();
         assert_eq!(ids.len(), half_rows);
         ids.values().iter().for_each(|id| {
@@ -1009,6 +1006,8 @@ mod tests {
         // delete so that only one row left, to trigger remap and there must be some empty partitions
         assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
         dataset.delete(&format!("id < {}", max_id)).await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
         compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
