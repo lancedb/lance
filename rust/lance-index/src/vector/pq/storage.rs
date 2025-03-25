@@ -515,7 +515,7 @@ impl VectorStore for ProductQuantizationStorage {
             let num_bytes_in_code = new_codes.len() / new_row_ids.len();
             let new_transposed_codes = transpose(&new_codes, new_row_ids.len(), num_bytes_in_code);
             let codes_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
-                new_transposed_codes.clone(),
+                new_transposed_codes,
                 num_bytes_in_code as i32,
             )?);
             RecordBatch::try_new(self.schema(), vec![new_row_ids.clone(), codes_fsl])?
