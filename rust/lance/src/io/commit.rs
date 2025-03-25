@@ -37,6 +37,7 @@ use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::DatasetIndexExt;
+use log;
 use object_store::path::Path;
 use prost::Message;
 
@@ -834,7 +835,11 @@ pub(crate) async fn commit_transaction(
                     .file_metadata_cache
                     .insert(cache_path, Arc::new(transaction.clone()));
 
-                auto_cleanup_hook(&dataset, &manifest).await?;
+                match auto_cleanup_hook(&dataset, &manifest).await {
+                    Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
+                    Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
+                    _ => {}
+                };
                 return Ok((manifest, manifest_location.path, manifest_location.e_tag));
             }
             Err(CommitError::CommitConflict) => {
