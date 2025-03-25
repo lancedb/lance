@@ -760,15 +760,13 @@ impl StorageOptions {
                     }
                 }
                 // Check for GOOGLE_STORAGE_TOKEN until GoogleConfigKey supports storage token
-                else if lowercase_key == token_key {
-                    if !self.0.contains_key(token_key) {
-                        self.0.insert(token_key.to_string(), value.to_string());
-                    }
+                else if lowercase_key == token_key && !self.0.contains_key(token_key) {
+                    self.0.insert(token_key.to_string(), value.to_string());
                 }
             }
         }
     }
-    
+
     /// Add values from the environment to storage options
     pub fn with_env_s3(&mut self) {
         for (os_key, os_value) in std::env::vars_os() {
