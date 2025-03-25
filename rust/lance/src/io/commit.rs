@@ -216,7 +216,7 @@ pub(crate) async fn commit_new_dataset(
     let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blob_path = base_path.child(BLOB_DIR);
         let blob_tx = Transaction::new(0, blob_op.clone(), None, None);
-        let (blob_manifest, _) = do_commit_new_dataset(
+        let (blob_manifest, _, _) = do_commit_new_dataset(
             object_store,
             commit_handler,
             &blob_path,
@@ -666,12 +666,12 @@ pub(crate) async fn commit_detached_transaction(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
-) -> Result<(Manifest, Path)> {
+) -> Result<(Manifest, Path, Option<String>)> {
     let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
         let blobs_tx =
             Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
-        let (blobs_manifest, _) = do_commit_detached_transaction(
+        let (blobs_manifest, _, _) = do_commit_detached_transaction(
             blobs_dataset.as_ref(),
             object_store,
             commit_handler,
@@ -712,7 +712,7 @@ pub(crate) async fn commit_transaction(
         let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
         let blobs_tx =
             Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
-        let (blobs_manifest, _) = do_commit_detached_transaction(
+        let (blobs_manifest, _, _) = do_commit_detached_transaction(
             blobs_dataset.as_ref(),
             object_store,
             commit_handler,

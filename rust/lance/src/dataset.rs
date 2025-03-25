@@ -24,13 +24,13 @@ use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::object_writer::{ObjectWriter, WriteResult};
-use lance_io::traits::{WriteExt, Writer};
+use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
 use lance_table::format::{
     DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
 };
 use lance_table::io::commit::{
-    migrate_scheme_to_v2, CommitError, CommitHandler, CommitLock, ManifestLocation,
+    migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
     ManifestNamingScheme,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
@@ -346,10 +346,10 @@ impl Dataset {
         // We check the e_tag here just in case it has been overwritten. This can
         // happen if the table has been dropped then re-created recently.
         self.manifest.version == location.version
-            && location.e_tag.as_ref().map_or(false, |e_tag| {
+            && location.e_tag.as_ref().is_some_and(|e_tag| {
                 self.manifest_e_tag
                     .as_ref()
-                    .map_or(false, |current_e_tag| e_tag != current_e_tag)
+                    .is_some_and(|current_e_tag| e_tag != current_e_tag)
             })
     }
 
@@ -626,20 +626,8 @@ impl Dataset {
             None,
         );
 
-        let (restored_manifest, path, manifest_e_tag) = commit_transaction(
-            self,
-            &self.object_store,
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
-
-        self.manifest = Arc::new(restored_manifest);
-        self.manifest_file = path;
-        self.manifest_e_tag = manifest_e_tag;
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
         Ok(())
     }
@@ -814,6 +802,30 @@ impl Dataset {
         .await
     }
 
+    pub(crate) async fn apply_commit(
+        &mut self,
+        transaction: Transaction,
+        write_config: &ManifestWriteConfig,
+        commit_config: &CommitConfig,
+    ) -> Result<()> {
+        let (manifest, manifest_path, manifest_e_tag) = commit_transaction(
+            self,
+            self.object_store(),
+            self.commit_handler.as_ref(),
+            &transaction,
+            write_config,
+            commit_config,
+            self.manifest_naming_scheme,
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+        self.manifest_file = manifest_path;
+        self.manifest_e_tag = manifest_e_tag;
+
+        Ok(())
+    }
+
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(Arc::new(self.clone()))
@@ -976,20 +988,8 @@ impl Dataset {
             None,
         );
 
-        let (manifest, path, manifest_e_tag) = commit_transaction(
-            self,
-            &self.object_store,
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
-
-        self.manifest = Arc::new(manifest);
-        self.manifest_file = path;
-        self.manifest_e_tag = manifest_e_tag;
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
         Ok(())
     }
@@ -1552,20 +1552,8 @@ impl Dataset {
             None,
         );
 
-        let (manifest, manifest_path, manifest_e_tag) = commit_transaction(
-            self,
-            &self.object_store,
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
-
-        self.manifest = Arc::new(manifest);
-        self.manifest_file = manifest_path;
-        self.manifest_e_tag = manifest_e_tag;
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
         Ok(())
     }
@@ -1595,20 +1583,8 @@ impl Dataset {
         let transaction =
             Transaction::new(self.manifest.version, op, /*blobs_op=*/ None, None);
 
-        let (manifest, manifest_path, manifest_e_tag) = commit_transaction(
-            self,
-            &self.object_store,
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
-
-        self.manifest = Arc::new(manifest);
-        self.manifest_file = manifest_path;
-        self.manifest_e_tag = manifest_e_tag;
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
         Ok(())
     }
