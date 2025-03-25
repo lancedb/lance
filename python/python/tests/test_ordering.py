@@ -96,6 +96,9 @@ def test_all_order_by_support_functions(tmp_path: Path):
     assert pa.Table.from_batches(dataset.to_batches(orderings=[ordering])) == true_value
     assert dataset.scanner(orderings=[ordering]).to_table() == true_value
 
+    fragment = dataset.get_fragment(0)
+    assert fragment.to_table(orderings=[ordering]) == true_value
     assert (
-        dataset.get_fragment(0).scanner(orderings=[ordering]).to_table() == true_value
+        pa.Table.from_batches(fragment.to_batches(orderings=[ordering])) == true_value
     )
+    assert fragment.scanner(orderings=[ordering]).to_table() == true_value
