@@ -51,6 +51,16 @@ jobs:
 
         if [ "$RELEASE_TYPE" == "stable" ]; then
           echo "Creating stable release for version $CURRENT_VERSION"
+
+          cd ../java
+
+          mvn versions:set versions:commit -DnewVersion=$CURRENT_VERSION
+
+          git add pom.xml */pom.xml
+          git commit -m "Release $CURRENT_VERSION: Update Java module versions"
+
+          cd ../rust
+
           TAG="v${CURRENT_VERSION}"
         else
           # Get a list of all tags, filter for current version beta tags, sort them and get the last one
