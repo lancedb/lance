@@ -23,6 +23,9 @@ import com.lancedb.lance.spark.LanceConstant;
 import com.lancedb.lance.spark.SparkOptions;
 import com.lancedb.lance.spark.read.LanceInputPartition;
 
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.sql.types.StructField;
@@ -31,33 +34,36 @@ import org.apache.spark.sql.types.StructType;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 public class LanceFragmentScanner implements AutoCloseable {
-  private Dataset dataset;
-  private Fragment fragment;
+  private static LoadingCache<LanceConfig, List<Fragment>> LOADING_CACHE =
+      CacheBuilder.newBuilder()
+          .maximumSize(100)
+          .expireAfterAccess(1, TimeUnit.HOURS)
+          .build(
+              new CacheLoader<LanceConfig, List<Fragment>>() {
+                @Override
+                public List<Fragment> load(LanceConfig config) throws Exception {
+                  BufferAllocator allocator = LanceDatasetAdapter.allocator;
+                  ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
+                  Dataset dataset = Dataset.open(allocator, config.getDatasetUri(), options);
+                  return dataset.getFragments();
+                }
+              });
   private LanceScanner scanner;
 
-  private LanceFragmentScanner(Dataset dataset, Fragment fragment, LanceScanner scanner) {
-    this.dataset = dataset;
-    this.fragment = fragment;
+  private LanceFragmentScanner(LanceScanner scanner) {
     this.scanner = scanner;
   }
 
-  public static LanceFragmentScanner create(
-      int fragmentId, LanceInputPartition inputPartition, BufferAllocator allocator) {
-    Dataset dataset = null;
-    Fragment fragment = null;
+  public static LanceFragmentScanner create(int fragmentId, LanceInputPartition inputPartition) {
     LanceScanner scanner = null;
     try {
       LanceConfig config = inputPartition.getConfig();
-      ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
-      dataset = Dataset.open(allocator, config.getDatasetUri(), options);
-      fragment =
-          dataset.getFragments().stream()
-              .filter(f -> f.getId() == fragmentId)
-              .findAny()
-              .orElseThrow(() -> new RuntimeException("no fragment found for " + fragmentId));
+      List<Fragment> cachedFragments = LOADING_CACHE.get(config);
+      Fragment fragment = cachedFragments.get(fragmentId);
       ScanOptions.Builder scanOptions = new ScanOptions.Builder();
       scanOptions.columns(getColumnNames(inputPartition.getSchema()));
       if (inputPartition.getWhereCondition().isPresent()) {
@@ -84,16 +90,9 @@ public class LanceFragmentScanner implements AutoCloseable {
           t.addSuppressed(it);
         }
       }
-      if (dataset != null) {
-        try {
-          dataset.close();
-        } catch (Throwable it) {
-          t.addSuppressed(it);
-        }
-      }
-      throw t;
+      throw new RuntimeException(t);
     }
-    return new LanceFragmentScanner(dataset, fragment, scanner);
+    return new LanceFragmentScanner(scanner);
   }
 
   /** @return the arrow reader. The caller is responsible for closing the reader */
@@ -109,9 +108,6 @@ public class LanceFragmentScanner implements AutoCloseable {
       } catch (Exception e) {
         throw new IOException(e);
       }
-    }
-    if (dataset != null) {
-      dataset.close();
     }
   }
 
