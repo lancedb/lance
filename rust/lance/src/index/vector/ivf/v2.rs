@@ -668,7 +668,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::dataset::optimize::{compact_files, CompactionOptions};
-    use crate::dataset::UpdateBuilder;
+    use crate::dataset::{UpdateBuilder, WriteParams};
     use crate::index::DatasetIndexInternalExt;
     use crate::{index::vector::VectorIndexParams, Dataset};
 
@@ -685,7 +685,16 @@ mod tests {
         let (batch, schema) = generate_batch::<T>(NUM_ROWS, None, range, false);
         let vectors = batch.column_by_name("vector").unwrap().clone();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                mode: crate::dataset::WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
         (dataset, Arc::new(vectors.as_fixed_size_list().clone()))
     }
 
@@ -969,11 +978,6 @@ mod tests {
         compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
-        // index the updated data
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
         // query again, the result should not include the deleted row
         let result = dataset.scan().try_into_batch().await.unwrap();
         let ids = result["id"].as_primitive::<UInt64Type>();
@@ -981,7 +985,6 @@ mod tests {
         ids.values().iter().for_each(|id| {
             assert!(*id >= half_rows as u64 + 50);
         });
-        let max_id = ids.values().iter().copied().max().unwrap();
 
         // make sure we can still hit the recall
         let gt = ground_truth(&dataset, vector_column, &query, 100, params.metric_type).await;
@@ -1004,8 +1007,13 @@ mod tests {
         assert_ge!(recall, 0.8, "{}", recall);
 
         // delete so that only one row left, to trigger remap and there must be some empty partitions
+        let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
+        dataset
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
         assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
-        dataset.delete(&format!("id < {}", max_id)).await.unwrap();
+        dataset.delete("id > 0").await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
         assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
         compact_files(&mut dataset, CompactionOptions::default(), None)
