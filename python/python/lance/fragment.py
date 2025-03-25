@@ -36,7 +36,13 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
-    from .dataset import LanceDataset, LanceScanner, ReaderLike, Transaction
+    from .dataset import (
+        ColumnOrdering,
+        LanceDataset,
+        LanceScanner,
+        ReaderLike,
+        Transaction,
+    )
     from .lance import LanceSchema
 
 
@@ -399,6 +405,7 @@ class LanceFragment(pa.dataset.Fragment):
         with_row_id: bool = False,
         with_row_address: bool = False,
         batch_readahead: int = 16,
+        orderings: Optional[List[ColumnOrdering]] = None,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
         filter_str = str(filter) if filter is not None else None
@@ -418,6 +425,7 @@ class LanceFragment(pa.dataset.Fragment):
             with_row_id=with_row_id,
             with_row_address=with_row_address,
             batch_readahead=batch_readahead,
+            orderings=orderings,
             **columns_arg,
         )
         from .dataset import LanceScanner
