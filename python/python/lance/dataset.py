@@ -51,7 +51,6 @@ from .lance import (
     Compaction,
     CompactionMetrics,
     LanceSchema,
-    _ColumnOrdering,
     _Dataset,
     _MergeInsertBuilder,
     _Scanner,
@@ -3058,14 +3057,18 @@ class LanceOperation:
         schema: LanceSchema
 
 
+@dataclass
 class ColumnOrdering:
     """
     This class is used to define the column ordering rules for the `sort` operator.
     It allows users to specify the sorting order (ascending or descending)
     and the position of null values (first or last).
     """
-    def __init__(self, column_name: str, ascending: bool = True, nulls_first: bool = False):
-        self.inner_ordering = _ColumnOrdering(column_name, ascending, nulls_first)
+
+    column_name: str
+    ascending: bool = True
+    nulls_first: bool = False
+
 
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
@@ -3398,7 +3401,7 @@ class ScannerBuilder:
             inner_orderings = []
             for order in orderings:
                 if isinstance(order, ColumnOrdering):
-                    inner_orderings.append(order.inner_ordering)
+                    inner_orderings.append(order)
                 else:
                     raise TypeError(
                         f"orderings must be a list of ColumnOrdering. "

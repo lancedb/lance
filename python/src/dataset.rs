@@ -36,7 +36,7 @@ use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
-    scanner::ColumnOrdering as LanceColumnOrdering,
+    scanner::ColumnOrdering,
     scanner::Scanner as LanceScanner,
     transaction::{Operation, Transaction},
     Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
@@ -71,6 +71,7 @@ use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
+    intern,
     pybacked::PyBackedStr,
     pyclass,
     types::{IntoPyDict, PyDict},
@@ -289,24 +290,35 @@ pub fn transforms_from_python(transforms: &Bound<'_, PyAny>) -> PyResult<NewColu
         }))
     }
 }
-#[pyclass(name = "_ColumnOrdering", module = "_lib", subclass)]
-#[derive(Clone)]
-pub struct ColumnOrdering {
-    column_ordering: LanceColumnOrdering,
+impl FromPyObject<'_> for PyLance<ColumnOrdering> {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let ascending: bool = ob.getattr("ascending")?.extract()?;
+        let nulls_first: bool = ob.getattr("nulls_first")?.extract()?;
+        let column_name: String = ob.getattr("column_name")?.extract()?;
+        Ok(Self(ColumnOrdering {
+            ascending,
+            nulls_first,
+            column_name,
+        }))
+    }
 }
 
-#[pymethods]
-impl ColumnOrdering {
-    #[new]
-    #[pyo3(signature=(ascending, nulls_first, column_name))]
-    fn new(ascending: bool, nulls_first: bool, column_name: String) -> Self {
-        Self {
-            column_ordering: LanceColumnOrdering {
-                ascending,
-                nulls_first,
-                column_name,
-            },
-        }
+impl<'py> IntoPyObject<'py> for PyLance<&ColumnOrdering> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let cls = py
+            .import(intern!(py, "lance"))
+            .and_then(|module| module.getattr(intern!(py, "LanceScanner")))
+            .and_then(|cls| cls.getattr(intern!(py, "ColumnOrdering")))
+            .expect("Failed to get RewrittenIndex class");
+
+        let column_name = self.0.column_name.to_string();
+        let ascending = self.0.ascending;
+        let nulls_first = self.0.nulls_first;
+        cls.call1((column_name, ascending, nulls_first))
     }
 }
 
@@ -537,7 +549,7 @@ impl Dataset {
         late_materialization: Option<PyObject>,
         use_scalar_index: Option<bool>,
         include_deleted_rows: Option<bool>,
-        orderings: Option<Vec<ColumnOrdering>>,
+        orderings: Option<Vec<PyLance<ColumnOrdering>>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -781,9 +793,7 @@ impl Dataset {
         }
         if let Some(orderings) = orderings {
             scanner
-                .order_by(Some(
-                    orderings.into_iter().map(|o| o.column_ordering).collect(),
-                ))
+                .order_by(Some(orderings.into_iter().map(|o| o.0).collect()))
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         let scan = Arc::new(scanner);
