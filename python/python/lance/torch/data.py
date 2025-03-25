@@ -111,7 +111,29 @@ def _to_tensor(
     return ret
 
 
-class TensorDataset(torch.utils.data.Dataset):
+logger = logging.getLogger(__name__)
+
+try:
+    # When available, subclass from the newer torchdata DataPipes
+    # instead of torch Datasets.
+    import torchdata
+
+    MAP_DATASET_CLASS = torchdata.datapipes.map.MapDataPipe
+    ITER_DATASET_CLASS = torchdata.datapipes.iter.IterDataPipe
+except ImportError:
+    try:
+        import torch
+
+        MAP_DATASET_CLASS = torch.utils.data.Dataset
+        ITER_DATASET_CLASS = torch.utils.data.IterableDataset
+    except ImportError:
+        logger.error(
+            "Error when importing Torch. To use PyTorch features, please install torch."
+        )
+        raise
+
+
+class TensorDataset(MAP_DATASET_CLASS):
     """A PyTorch Dataset that wraps over a tensor, returns in batches.
 
     Unlike `torch.utils.data.TensorDataset`, this has the same behavior as LanceDataset
@@ -174,7 +196,7 @@ def _buffer_arrow_batches(
         yield concat_batches(buffer)
 
 
-class LanceDataset(torch.utils.data.IterableDataset):
+class LanceDataset(ITER_DATASET_CLASS):
     """PyTorch :class:`torch.utils.data.IterableDataset` over lance dataset."""
 
     def __init__(
