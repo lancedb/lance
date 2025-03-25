@@ -158,6 +158,27 @@ impl ExternalManifestCommitHandler {
     ) -> std::result::Result<ManifestLocation, Error> {
         // step 1: copy the manifest to the final location
         let final_manifest_path = naming_scheme.manifest_path(base_path, version);
+
+        let copied = match store
+            .copy(staging_manifest_path, &final_manifest_path)
+            .await
+        {
+            Ok(_) => true,
+            Err(ObjectStoreError::NotFound { .. }) => false, // Another writer beat us to it.
+            Err(e) => return Err(e.into()),
+        };
+
+        // On S3, the etag can change if originally was MultipartUpload and later was Copy
+        // https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html#AmazonS3-Type-Object-ETag
+        // We generally only do MultipartUpload for > 5MB files, so we can skip this check
+        // if size < 5MB
+        let e_tag = if size < 5 * 1024 * 1024 {
+            e_tag
+        } else {
+            let meta = store.head(&final_manifest_path).await?;
+            meta.e_tag
+        };
+
         let location = ManifestLocation {
             version,
             path: final_manifest_path,
@@ -165,11 +186,10 @@ impl ExternalManifestCommitHandler {
             naming_scheme,
             e_tag,
         };
-        match store.copy(staging_manifest_path, &location.path).await {
-            Ok(_) => {}
-            Err(ObjectStoreError::NotFound { .. }) => return Ok(location), // Another writer beat us to it.
-            Err(e) => return Err(e.into()),
-        };
+
+        if !copied {
+            return Ok(location);
+        }
 
         // step 2: flip the external store to point to the final location
         self.external_manifest_store
@@ -365,7 +385,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 manifest.version,
                 staging_path.as_ref(),
                 write_res.size as u64,
-                write_res.e_tag,
+                write_res.e_tag.clone(),
             )
             .await
             .map_err(|_| CommitError::CommitConflict {});
@@ -386,7 +406,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 &staging_path,
                 manifest.version,
                 write_res.size as u64,
-                None, // e_tag
+                write_res.e_tag,
                 &object_store.inner,
                 naming_scheme,
             )

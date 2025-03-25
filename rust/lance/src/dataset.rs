@@ -349,7 +349,7 @@ impl Dataset {
             && location.e_tag.as_ref().is_some_and(|e_tag| {
                 self.manifest_e_tag
                     .as_ref()
-                    .is_some_and(|current_e_tag| e_tag != current_e_tag)
+                    .is_some_and(|current_e_tag| e_tag == current_e_tag)
             })
     }
 
