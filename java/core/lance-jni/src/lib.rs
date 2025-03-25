@@ -54,6 +54,8 @@ mod blocking_dataset;
 mod blocking_scanner;
 pub mod error;
 pub mod ffi;
+mod file_reader;
+mod file_writer;
 mod fragment;
 pub mod traits;
 pub mod utils;

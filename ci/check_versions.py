@@ -11,7 +11,12 @@ def get_versions():
     """
     Gets the current version in both python/Cargo.toml and Cargo.toml files.
     """
-    import tomllib
+    try:
+        # Python 3.11+ 
+        import tomllib
+    except ImportError:
+        # Python 3.6-3.10 use tomli
+        import tomli as tomllib
 
     with open("python/Cargo.toml", "rb") as file:
         pylance_version = tomllib.load(file)["package"]["version"]
