@@ -3772,6 +3772,7 @@ def write_dataset(
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
     enable_move_stable_row_ids: bool = False,
+    file_writer_options: Optional[Dict[str, str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -3830,6 +3831,13 @@ def write_dataset(
         These row ids are stable after compaction operations, but not after updates.
         This makes compaction more efficient, since with stable row ids no
         secondary indices need to be updated to point to new row ids.
+    file_writer_options : optional, dict
+        Extra file write options that make sense to control lance data file.
+        These options can be set in dict:
+        `data_cache_bytes`: how many bytes to use for buffering column data,
+            the default value is 8 * 1024 * 1024
+        `max_page_bytes`: A hint to indicate the max size of a page,
+            the default value is 32 * 1024 * 1024
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -3864,6 +3872,7 @@ def write_dataset(
         "data_storage_version": data_storage_version,
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
         "enable_move_stable_row_ids": enable_move_stable_row_ids,
+        "file_writer_options": file_writer_options,
     }
 
     if commit_lock:
