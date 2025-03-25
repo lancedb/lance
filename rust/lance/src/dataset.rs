@@ -5554,4 +5554,37 @@ mod tests {
             .to_string()
             .contains("Expected to modify the fragment but no changes were made"));
     }
+
+    #[tokio::test]
+    async fn test_replace_dataset() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = gen()
+            .col("int", array::step::<Int32Type>())
+            .into_batch_rows(RowCount::from(20))
+            .unwrap();
+        let data1 = data.slice(0, 10);
+        let data2 = data.slice(10, 10);
+        let mut ds = InsertBuilder::new(test_uri)
+            .execute(vec![data1])
+            .await
+            .unwrap();
+
+        ds.object_store().remove_dir_all(test_uri).await.unwrap();
+
+        let ds2 = InsertBuilder::new(test_uri)
+            .execute(vec![data2.clone()])
+            .await
+            .unwrap();
+
+        ds.checkout_latest().await.unwrap();
+        let roundtripped = ds.scan().try_into_batch().await.unwrap();
+        assert_eq!(roundtripped, data2);
+
+        ds.validate().await.unwrap();
+        ds2.validate().await.unwrap();
+        assert_eq!(ds.manifest.version, 1);
+        assert_eq!(ds2.manifest.version, 1);
+    }
 }
