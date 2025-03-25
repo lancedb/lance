@@ -935,7 +935,7 @@ mod tests {
     {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
 
         let vector_column = "vector";
         dataset
@@ -979,11 +979,12 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let row_ids = result["id"].as_primitive::<UInt64Type>();
-        assert_eq!(row_ids.len(), half_rows);
-        row_ids.values().iter().for_each(|id| {
+        let ids = result["id"].as_primitive::<UInt64Type>();
+        assert_eq!(ids.len(), half_rows);
+        ids.values().iter().for_each(|id| {
             assert!(*id >= half_rows as u64 + 50);
         });
+        let max_id = ids.values().iter().copied().max().unwrap();
 
         // make sure we can still hit the recall
         let gt = ground_truth(&dataset, vector_column, &query, 100, params.metric_type).await;
@@ -1004,6 +1005,23 @@ mod tests {
             .collect::<HashSet<_>>();
         let recall = row_ids.intersection(&gt).count() as f32 / 100.0;
         assert_ge!(recall, 0.8, "{}", recall);
+
+        // delete so that only one row left, to trigger remap and there must be some empty partitions
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+        dataset.delete(&format!("id < {}", max_id)).await.unwrap();
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        let results = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), 100)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 1);
     }
 
     async fn test_optimize_strategy(params: VectorIndexParams) {
