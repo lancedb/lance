@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow::array::AsArray;
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, Float32Array, Int64Array, Int8Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
@@ -730,6 +730,10 @@ impl Scanner {
 
         let key = match element_type {
             dt if dt == *q.data_type() => q,
+            dt if dt.is_integer() => coerce_float_vector(
+                q.as_any().downcast_ref::<Float32Array>().unwrap(),
+                FloatType::try_from(&dt)?,
+            )?,
             dt if dt.is_floating() => coerce_float_vector(
                 q.as_any().downcast_ref::<Float32Array>().unwrap(),
                 FloatType::try_from(&dt)?,
