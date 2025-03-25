@@ -278,6 +278,7 @@ pub fn dot_distance_arrow_batch(
         DataType::Float16 => do_dot_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
         DataType::Float32 => do_dot_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_dot_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
+        DataType::Int8 => do_dot_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         _ => Err(Error::InvalidArgumentError(format!(
             "Unsupported data type: {:?}",
             from.data_type()
