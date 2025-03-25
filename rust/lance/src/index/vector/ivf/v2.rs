@@ -668,7 +668,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::dataset::optimize::{compact_files, CompactionOptions};
-    use crate::dataset::UpdateBuilder;
+    use crate::dataset::{UpdateBuilder, WriteParams};
     use crate::index::DatasetIndexInternalExt;
     use crate::{index::vector::VectorIndexParams, Dataset};
 
@@ -685,7 +685,16 @@ mod tests {
         let (batch, schema) = generate_batch::<T>(NUM_ROWS, None, range, false);
         let vectors = batch.column_by_name("vector").unwrap().clone();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                mode: crate::dataset::WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
         (dataset, Arc::new(vectors.as_fixed_size_list().clone()))
     }
 
@@ -935,7 +944,7 @@ mod tests {
     {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
 
         let vector_column = "vector";
         dataset
@@ -970,18 +979,10 @@ mod tests {
             .await
             .unwrap();
         // query again, the result should not include the deleted row
-        let result = dataset
-            .scan()
-            .nearest(vector_column, query.as_primitive::<T>(), half_rows)
-            .unwrap()
-            .nprobs(nlist)
-            .with_row_id()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids = result["id"].as_primitive::<UInt64Type>();
-        assert_eq!(row_ids.len(), half_rows);
-        row_ids.values().iter().for_each(|id| {
+        let result = dataset.scan().try_into_batch().await.unwrap();
+        let ids = result["id"].as_primitive::<UInt64Type>();
+        assert_eq!(ids.len(), half_rows);
+        ids.values().iter().for_each(|id| {
             assert!(*id >= half_rows as u64 + 50);
         });
 
@@ -1004,6 +1005,30 @@ mod tests {
             .collect::<HashSet<_>>();
         let recall = row_ids.intersection(&gt).count() as f32 / 100.0;
         assert_ge!(recall, 0.8, "{}", recall);
+
+        // delete so that only one row left, to trigger remap and there must be some empty partitions
+        let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
+        dataset
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+        dataset.delete("id > 0").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        let results = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), 100)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 1);
     }
 
     async fn test_optimize_strategy(params: VectorIndexParams) {

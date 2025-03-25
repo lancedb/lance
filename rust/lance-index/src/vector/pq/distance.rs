@@ -174,7 +174,7 @@ pub(super) fn compute_pq_distance_4bit(
     let mut quantized_dists = vec![0_u8; num_vectors];
 
     let remainder = num_vectors % NUM_CENTROIDS;
-    for i in (0..num_vectors - NUM_CENTROIDS + 1).step_by(NUM_CENTROIDS) {
+    for i in (0..num_vectors - remainder).step_by(NUM_CENTROIDS) {
         let mut block_distances = u8x16::zeros();
 
         for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
