@@ -1080,7 +1080,92 @@ pub fn idf(nq: usize, num_docs: usize) -> f32 {
     ((num_docs - nq as f32 + 0.5) / (nq as f32 + 0.5) + 1.0).ln()
 }
 
-struct 
+struct FlatIndex<'a> {
+    doc_col: &'a str,
+    existing_index: &'a InvertedIndex,
+    batch: &'a RecordBatch,
+}
+
+impl<'a> FlatIndex<'a> {
+    pub fn new(
+        doc_col: &'a str,
+        existing_index: &'a InvertedIndex,
+        batch: &'a RecordBatch,
+    ) -> Self {
+        Self {
+            doc_col,
+            existing_index,
+            batch,
+        }
+    }
+}
+
+impl<'a> Searcher for FlatIndex<'a> {
+    fn tokenizer(&self) -> tantivy::tokenizer::TextAnalyzer {
+        self.existing_index.tokenizer()
+    }
+
+    fn expand_fuzzy(&self, tokens: Vec<String>, max_distance: Option<u32>) -> Result<Vec<String>> {
+        self.existing_index.expand_fuzzy(tokens, max_distance)
+    }
+
+    async fn bm25_search(
+        &self,
+        tokens: Vec<String>,
+        params: &FtsSearchParams,
+        is_phrase_query: bool,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<(u64, f32)>> {
+        let avgdl = self.existing_index.docs.average_length();
+        let num_docs = self.existing_index.docs.len();
+
+        let row_ids = self.batch[ROW_ID].as_primitive::<UInt64Type>().values();
+        let doc_iter = iter_str_array(&self.batch[self.doc_col]);
+        let mut res = Vec::with_capacity(self.batch.num_rows());
+        for (doc_id, doc) in std::iter::zip(row_ids, doc_iter) {
+            let Some(doc) = doc else {
+                continue;
+            };
+
+            let query_tokens = tokens.iter().cloned().collect();
+            let mut tokenizer = self.tokenizer();
+            let doc_tokens = collect_tokens(doc, &mut tokenizer, Some(&query_tokens));
+            let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / avgdl);
+            let mut doc_token_count = HashMap::new();
+            for token in doc_tokens {
+                doc_token_count
+                    .entry(token)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+            }
+            let mut score = 0.0;
+            for token in tokens.iter() {
+                let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
+
+                let idf = if let Some(token_id) = self.existing_index.tokens.get(token) {
+                    // for known token, we just use the index's metadata to calculate the score
+                    // it's not accurate but it's good enough for ranking
+                    idf(
+                        self.existing_index.inverted_list.posting_len(token_id),
+                        num_docs,
+                    )
+                } else {
+                    // for unknown token, we set the idf to a very high value
+                    // so that the new token will significantly effect the score
+                    idf(1, num_docs)
+                };
+                score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
+            }
+
+            if score > 0.0 {
+                res.push((*doc_id, score));
+            }
+        }
+
+        Ok(res)
+    }
+}
 
 pub fn flat_full_text_search(
     batches: &[&RecordBatch],
@@ -1137,104 +1222,103 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     Ok(results)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn flat_bm25_search(
-    batch: RecordBatch,
-    doc_col: &str,
-    inverted_list: &InvertedListReader,
-    query_tokens: &HashSet<String>,
-    query_token_ids: &HashMap<String, Option<u32>>,
-    tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
-    avgdl: f32,
-    num_docs: usize,
-) -> std::result::Result<RecordBatch, DataFusionError> {
-    let doc_iter = iter_str_array(&batch[doc_col]);
-    let mut scores = Vec::with_capacity(batch.num_rows());
-    for doc in doc_iter {
-        let Some(doc) = doc else {
-            scores.push(0.0);
-            continue;
-        };
+// #[allow(clippy::too_many_arguments)]
+// pub fn flat_bm25_search(
+//     batch: RecordBatch,
+//     doc_col: &str,
+//     inverted_list: &InvertedListReader,
+//     query_tokens: &Vec<String>,
+//     query_token_ids: &HashMap<String, Option<u32>>,
+//     tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
+//     avgdl: f32,
+//     num_docs: usize,
+// ) -> std::result::Result<RecordBatch, DataFusionError> {
+//     let doc_iter = iter_str_array(&batch[doc_col]);
+//     let mut scores = Vec::with_capacity(batch.num_rows());
+//     for doc in doc_iter {
+//         let Some(doc) = doc else {
+//             scores.push(0.0);
+//             continue;
+//         };
 
-        let doc_tokens = collect_tokens(doc, tokenizer, Some(query_tokens));
-        let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / avgdl);
-        let mut doc_token_count = HashMap::new();
-        for token in doc_tokens {
-            doc_token_count
-                .entry(token)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-        }
-        let mut score = 0.0;
-        for (token, token_id) in query_token_ids.iter() {
-            let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
+//         let doc_tokens = collect_tokens(doc, tokenizer, Some(query_tokens));
+//         let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / avgdl);
+//         let mut doc_token_count = HashMap::new();
+//         for token in doc_tokens {
+//             doc_token_count
+//                 .entry(token)
+//                 .and_modify(|count| *count += 1)
+//                 .or_insert(1);
+//         }
+//         let mut score = 0.0;
+//         for (token, token_id) in query_token_ids.iter() {
+//             let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
 
-            let idf = if let Some(token_id) = token_id {
-                // for known token, we just use the index's metadata to calculate the score
-                // it's not accurate but it's good enough for ranking
-                idf(inverted_list.posting_len(*token_id), num_docs)
-            } else {
-                // for unknown token, we set the idf to a very high value
-                // so that the new token will significantly effect the score
-                idf(1, num_docs)
-            };
-            score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
-        }
-        scores.push(score);
-    }
+//             let idf = if let Some(token_id) = token_id {
+//                 // for known token, we just use the index's metadata to calculate the score
+//                 // it's not accurate but it's good enough for ranking
+//                 idf(inverted_list.posting_len(*token_id), num_docs)
+//             } else {
+//                 // for unknown token, we set the idf to a very high value
+//                 // so that the new token will significantly effect the score
+//                 idf(1, num_docs)
+//             };
+//             score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
+//         }
+//         scores.push(score);
+//     }
 
-    let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
-    let batch = batch
-        .try_with_column(SCORE_FIELD.clone(), score_col)?
-        .project_by_schema(&FTS_SCHEMA)?; // the scan node would probably scan some extra columns for prefilter, drop them here
-    Ok(batch)
-}
+//     let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
+//     let batch = batch
+//         .try_with_column(SCORE_FIELD.clone(), score_col)?
+//         .project_by_schema(&FTS_SCHEMA)?; // the scan node would probably scan some extra columns for prefilter, drop them here
+//     Ok(batch)
+// }
 
 pub fn flat_bm25_search_stream(
     input: SendableRecordBatchStream,
     doc_col: String,
     query: FullTextSearchQuery,
     index: &InvertedIndex,
+    metrics: &dyn MetricsCollector,
 ) -> SendableRecordBatchStream {
-    let mut tokenizer = index.tokenizer.clone();
-    let query_token_ids = collect_tokens(&query.query, &mut tokenizer, None)
-        .into_iter()
-        .dedup()
-        .map(|token| {
-            let token_id = index.tokens.get(&token);
-            (token, token_id)
+    let stream = input
+        .map(move |batch| {
+            let doc_col = doc_col.clone();
+            let params = (&query).into();
+            let query = query.query.clone();
+            async move {
+                let batch = batch?;
+                let flat_index = FlatIndex::new(&doc_col, index, &batch);
+                let res = process_compound_query(
+                    &query,
+                    &flat_index,
+                    &params,
+                    Arc::new(NoFilter),
+                    metrics,
+                )
+                .await?;
+
+                let batch = RecordBatch::try_new(
+                    FTS_SCHEMA.clone(),
+                    vec![
+                        Arc::new(UInt64Array::from_iter_values(
+                            res.iter().map(|(row_id, _)| *row_id),
+                        )) as ArrayRef,
+                        Arc::new(Float32Array::from_iter_values(
+                            res.iter().map(|(_, score)| *score),
+                        )) as ArrayRef,
+                    ],
+                )?;
+                Ok(batch)
+            }
         })
-        .collect::<HashMap<_, _>>();
-    let query_tokens = query_token_ids.keys().cloned().collect::<HashSet<_>>();
-    let inverted_list = index.inverted_list.clone();
-    let num_docs = index.docs.len();
-    let avgdl = index.docs.average_length();
+        .buffer_unordered(get_num_compute_intensive_cpus());
 
-    let stream = input.map(move |batch| {
-        let batch = batch?;
-        let scored_batch = flat_bm25_search(
-            batch,
-            &doc_col,
-            inverted_list.as_ref(),
-            &query_tokens,
-            &query_token_ids,
-            &mut tokenizer,
-            avgdl,
-            num_docs,
-        )?;
-
-        // filter out rows with score 0
-        let score_col = scored_batch[SCORE_COL].as_primitive::<Float32Type>();
-        let mask = score_col
-            .iter()
-            .map(|score| score.is_some_and(|score| score > 0.0))
-            .collect::<Vec<_>>();
-        let mask = BooleanArray::from(mask);
-        let batch = arrow::compute::filter_record_batch(&scored_batch, &mask)?;
-        Ok(batch)
-    });
-
-    Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
+    Box::pin(RecordBatchStreamAdapter::new(
+        FTS_SCHEMA.clone(),
+        stream.boxed(),
+    )) as SendableRecordBatchStream
 }
 
 pub fn is_phrase_query(query: &str) -> bool {

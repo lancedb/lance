@@ -255,7 +255,7 @@ impl PartialEq for dyn AnyQuery {
 /// A full text search query
 #[derive(Debug, Clone, PartialEq)]
 pub struct FullTextSearchQuery {
-    query: inverted::query::CompoundQuery,
+    pub query: inverted::query::CompoundQuery,
 
     /// The maximum number of results to return
     pub limit: Option<i64>,
