@@ -3,7 +3,7 @@
 
 //! Scalar indices for metadata search & filtering
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::{any::Any, ops::Bound, sync::Arc};
 
@@ -19,7 +19,7 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
-use inverted::query::FtsSearchParams;
+use inverted::query::{FtsQueryNode, FtsSearchParams};
 use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
@@ -304,10 +304,12 @@ impl FullTextSearchQuery {
         self.wand_factor = wand_factor;
         self
     }
-}
 
-impl Into<FtsSearchParams> for &FullTextSearchQuery {
-    fn into(self) -> FtsSearchParams {
+    pub fn fields(&self) -> HashSet<String> {
+        self.query.fields()
+    }
+
+    pub fn params(&self) -> FtsSearchParams {
         FtsSearchParams {
             limit: self.limit.map(|limit| limit as usize).unwrap_or(usize::MAX),
             wand_factor: self.wand_factor.unwrap_or(1.0),

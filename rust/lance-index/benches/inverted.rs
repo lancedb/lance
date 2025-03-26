@@ -16,6 +16,7 @@ use lance_core::cache::FileMetadataCache;
 use lance_core::ROW_ID;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::NoFilter;
+use lance_index::scalar::inverted::query::{FtsSearchParams, Searcher};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndex};
@@ -70,16 +71,16 @@ fn bench_inverted(c: &mut Criterion) {
     rt.block_on(async { builder.update(stream, store.as_ref()).await.unwrap() });
     let invert_index = rt.block_on(InvertedIndex::load(store)).unwrap();
 
+    let params = FtsSearchParams::new().with_limit(10);
     let no_filter = Arc::new(NoFilter);
     c.bench_function(format!("invert({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             black_box(
                 invert_index
-                    .full_text_search(
-                        &FullTextSearchQuery::new(
-                            tokens[rand::random::<usize>() % tokens.len()].to_owned(),
-                        )
-                        .limit(Some(10)),
+                    .bm25_search(
+                        vec![tokens[rand::random::<usize>() % tokens.len()].to_owned()],
+                        &params,
+                        false,
                         no_filter.clone(),
                         &NoOpMetricsCollector,
                     )

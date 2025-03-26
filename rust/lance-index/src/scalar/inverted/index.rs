@@ -39,6 +39,7 @@ use tracing::{info, instrument};
 use super::builder::inverted_list_schema;
 use super::query::*;
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
+use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::{NoFilter, PreFilter};
 use crate::scalar::{
     AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, InvertedIndexParams, MetricsCollector,
@@ -111,17 +112,6 @@ impl InvertedIndex {
             .collect()
     }
 
-    #[instrument(level = "debug", skip_all)]
-    pub async fn full_text_search(
-        &self,
-        query: &FullTextSearchQuery,
-        prefilter: Arc<dyn PreFilter>,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<(u64, f32)>> {
-        let params = query.into();
-        process_compound_query(&query.query, self, &params, prefilter, metrics).await
-    }
-
     fn to_builder(&self) -> InvertedIndexBuilder {
         let tokens = self.tokens.clone().into_mut();
         let inverted_list = self.inverted_list.clone();
@@ -173,7 +163,7 @@ impl Searcher for InvertedIndex {
         is_phrase_query: bool,
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<(u64, f32)>> {
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
         metrics.record_comparisons(tokens.len());
 
         let mask = prefilter.mask();
@@ -257,11 +247,6 @@ impl ScalarIndex for InvertedIndex {
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let row_ids = match query {
-            SargableQuery::FullTextSearch(query) => self
-                .full_text_search(query, Arc::new(NoFilter), metrics)
-                .await?
-                .into_iter()
-                .map(|(row_id, _)| row_id),
             query => {
                 return Err(Error::invalid_input(
                     format!("unsupported query {:?} for inverted index", query),
@@ -270,7 +255,7 @@ impl ScalarIndex for InvertedIndex {
             }
         };
 
-        Ok(SearchResult::Exact(RowIdTreeMap::from_iter(row_ids)))
+        // Ok(SearchResult::Exact(RowIdTreeMap::from_iter(row_ids)))
     }
 
     fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
@@ -1112,17 +1097,18 @@ impl<'a> Searcher for FlatIndex<'a> {
     async fn bm25_search(
         &self,
         tokens: Vec<String>,
-        params: &FtsSearchParams,
-        is_phrase_query: bool,
-        prefilter: Arc<dyn PreFilter>,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<(u64, f32)>> {
+        _params: &FtsSearchParams,
+        _is_phrase_query: bool,
+        _prefilter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
         let avgdl = self.existing_index.docs.average_length();
         let num_docs = self.existing_index.docs.len();
 
         let row_ids = self.batch[ROW_ID].as_primitive::<UInt64Type>().values();
         let doc_iter = iter_str_array(&self.batch[self.doc_col]);
-        let mut res = Vec::with_capacity(self.batch.num_rows());
+        let mut doc_ids = Vec::with_capacity(row_ids.len());
+        let mut scores = Vec::with_capacity(row_ids.len());
         for (doc_id, doc) in std::iter::zip(row_ids, doc_iter) {
             let Some(doc) = doc else {
                 continue;
@@ -1159,11 +1145,12 @@ impl<'a> Searcher for FlatIndex<'a> {
             }
 
             if score > 0.0 {
-                res.push((*doc_id, score));
+                doc_ids.push(*doc_id);
+                scores.push(score);
             }
         }
 
-        Ok(res)
+        Ok((doc_ids, scores))
     }
 }
 
@@ -1275,51 +1262,53 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
 //     Ok(batch)
 // }
 
-pub fn flat_bm25_search_stream(
-    input: SendableRecordBatchStream,
-    doc_col: String,
-    query: FullTextSearchQuery,
-    index: &InvertedIndex,
-    metrics: &dyn MetricsCollector,
-) -> SendableRecordBatchStream {
-    let stream = input
-        .map(move |batch| {
-            let doc_col = doc_col.clone();
-            let params = (&query).into();
-            let query = query.query.clone();
-            async move {
-                let batch = batch?;
-                let flat_index = FlatIndex::new(&doc_col, index, &batch);
-                let res = process_compound_query(
-                    &query,
-                    &flat_index,
-                    &params,
-                    Arc::new(NoFilter),
-                    metrics,
-                )
-                .await?;
+// pub fn flat_bm25_search_stream(
+//     input: SendableRecordBatchStream,
+//     doc_col: String,
+//     query: FullTextSearchQuery,
+//     index: Arc<dyn Index>,
+// ) -> SendableRecordBatchStream {
+//     let stream = input
+//         .map(move |batch| {
+//             let doc_col = doc_col.clone();
+//             let params = (&query).into();
+//             let query = query.query.clone();
+//             let index = index.clone();
+//             async move {
+//                 let batch = batch?;
+//                 let index = index
+//                     .as_any()
+//                     .downcast_ref::<InvertedIndex>()
+//                     .ok_or_else(|| {
+//                         DataFusionError::Execution("index is not an inverted index".to_owned())
+//                     })?;
+//                 let flat_index = FlatIndex::new(&doc_col, index, &batch);
+//                 let (doc_ids, scores) = process_compound_query(
+//                     &query,
+//                     &flat_index,
+//                     &params,
+//                     Arc::new(NoFilter),
+//                     &NoOpMetricsCollector,
+//                 )
+//                 .await?;
 
-                let batch = RecordBatch::try_new(
-                    FTS_SCHEMA.clone(),
-                    vec![
-                        Arc::new(UInt64Array::from_iter_values(
-                            res.iter().map(|(row_id, _)| *row_id),
-                        )) as ArrayRef,
-                        Arc::new(Float32Array::from_iter_values(
-                            res.iter().map(|(_, score)| *score),
-                        )) as ArrayRef,
-                    ],
-                )?;
-                Ok(batch)
-            }
-        })
-        .buffer_unordered(get_num_compute_intensive_cpus());
+//                 let batch = RecordBatch::try_new(
+//                     FTS_SCHEMA.clone(),
+//                     vec![
+//                         Arc::new(UInt64Array::from(doc_ids)) as ArrayRef,
+//                         Arc::new(Float32Array::from(scores)) as ArrayRef,
+//                     ],
+//                 )?;
+//                 Ok(batch)
+//             }
+//         })
+//         .buffer_unordered(get_num_compute_intensive_cpus());
 
-    Box::pin(RecordBatchStreamAdapter::new(
-        FTS_SCHEMA.clone(),
-        stream.boxed(),
-    )) as SendableRecordBatchStream
-}
+//     Box::pin(RecordBatchStreamAdapter::new(
+//         FTS_SCHEMA.clone(),
+//         stream.boxed(),
+//     )) as SendableRecordBatchStream
+// }
 
 pub fn is_phrase_query(query: &str) -> bool {
     query.starts_with('\"') && query.ends_with('\"')

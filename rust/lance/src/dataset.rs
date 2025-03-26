@@ -4644,7 +4644,7 @@ mod tests {
             .unwrap();
         let results = dataset
             .scan()
-            .full_text_search(FullTextSearchQuery::new_fuzzy("foo".to_owned(), 1))
+            .full_text_search(FullTextSearchQuery::new_fuzzy("foo".to_owned(), Some(1)))
             .unwrap()
             .try_into_batch()
             .await

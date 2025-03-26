@@ -18,7 +18,6 @@ use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
-use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -48,7 +47,10 @@ use lance_datafusion::exec::{analyze_plan, execute_plan, LanceExecutionOptions};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::expression::PlannerIndexExt;
-use lance_index::scalar::inverted::{FTS_SCHEMA, SCORE_COL};
+use lance_index::scalar::inverted::query::{
+    CompoundQuery, FtsQuery, FtsSearchParams, MultiMatchQuery,
+};
+use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
@@ -63,7 +65,7 @@ use crate::datatypes::Schema;
 use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
-use crate::io::exec::fts::{FlatFtsExec, FtsExec};
+use crate::io::exec::fts::{BoostQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{get_physical_optimizer, LanceScanConfig};
@@ -519,11 +521,12 @@ impl Scanner {
     ///    .into_stream();
     /// ```
     pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
-        if !query.columns.is_empty() {
-            for column in &query.columns {
-                if self.dataset.schema().field(column).is_none() {
+        let fields = query.fields();
+        if !fields.is_empty() {
+            for field in fields.iter() {
+                if self.dataset.schema().field(field).is_none() {
                     return Err(Error::invalid_input(
-                        format!("Column {} not found", column),
+                        format!("Column {} not found", field),
                         location!(),
                     ));
                 }
@@ -1569,7 +1572,11 @@ impl Scanner {
         filter_plan: &FilterPlan,
         query: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let columns = if query.columns.is_empty() {
+        let fields = query.fields();
+        let params = query.params();
+        let query = if fields.is_empty() {
+            // the field is not specified,
+            // try to search over all indexed fields
             let string_columns = self.dataset.schema().fields.iter().filter_map(|f| {
                 if f.data_type() == DataType::Utf8 || f.data_type() == DataType::LargeUtf8 {
                     Some(&f.name)
@@ -1595,125 +1602,221 @@ impl Scanner {
                 }
             }
 
-            indexed_columns
+            Self::fill_fts_query_field(&query.query, &indexed_columns)?
         } else {
-            query.columns.clone()
+            // check whether all specified columns are indexed
+            for field in &fields {
+                self.dataset
+                    .load_scalar_index_for_column(field)
+                    .await?
+                    .ok_or(Error::invalid_input(
+                        format!("Column {} has no inverted index", field),
+                        location!(),
+                    ))?;
+            }
+            query.query.clone()
         };
 
-        if columns.is_empty() {
-            return Err(Error::invalid_input(
-                "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
-                location!(),
-            ));
-        }
-
-        // rewrite the query to be with the columns and limit
-        let query = query
-            .clone()
-            .columns(Some(columns.clone()))
-            .limit(self.limit);
-
-        // load indices
-        let mut column_inputs = Vec::with_capacity(columns.len());
-        for column in columns {
-            let index = self
-                .dataset
-                .load_scalar_index_for_column(&column)
-                .await?
-                .ok_or(Error::invalid_input(
-                    format!("Column {} has no inverted index", column),
-                    location!(),
-                ))?;
-            let index_uuids: Vec<_> = self
-                .dataset
-                .load_indices_by_name(&index.name)
-                .await?
-                .into_iter()
-                .collect();
-
-            let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
-            let unindexed_scan_node = if unindexed_fragments.is_empty() {
-                Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
-            } else {
-                let mut columns = vec![column.clone()];
-                if let Some(expr) = filter_plan.full_expr.as_ref() {
-                    let filter_columns = Planner::column_names_in_expr(expr);
-                    columns.extend(filter_columns);
-                }
-                let flat_fts_scan_schema =
-                    Arc::new(self.dataset.schema().project(&columns).unwrap());
-                let mut scan_node = self.scan_fragments(
-                    true,
-                    false,
-                    true,
-                    flat_fts_scan_schema,
-                    Arc::new(unindexed_fragments),
-                    None,
-                    false,
-                );
-
-                if let Some(expr) = filter_plan.full_expr.as_ref() {
-                    // If there is a prefilter we need to manually apply it to the new data
-                    let planner = Planner::new(scan_node.schema());
-                    let physical_refine_expr = planner.create_physical_expr(expr)?;
-                    scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
-                }
-
-                scan_node
-            };
-
-            column_inputs.push((column.clone(), index_uuids, unindexed_scan_node));
-        }
-
-        let indices = column_inputs
-            .iter()
-            .map(|(col, idx, _)| (col.clone(), idx.clone()))
-            .collect();
         let prefilter_source = self.prefilter_source(filter_plan).await?;
-        let fts_plan = Arc::new(FtsExec::new(
-            self.dataset.clone(),
-            indices,
-            query.clone(),
-            prefilter_source,
-        )) as Arc<dyn ExecutionPlan>;
-        let flat_fts_plan = Arc::new(FlatFtsExec::new(self.dataset.clone(), column_inputs, query));
-        let fts_node = Arc::new(UnionExec::new(vec![fts_plan, flat_fts_plan]));
-        let fts_node = Arc::new(RepartitionExec::try_new(
-            fts_node,
-            Partitioning::RoundRobinBatch(1),
-        )?);
+        let fts_exec = self.plan_fts(&query, &params, &prefilter_source)?;
+        // let mut column_inputs = Vec::with_capacity(columns.len());
+        // for column in columns {
+        //     let index = self
+        //         .dataset
+        //         .load_scalar_index_for_column(&column)
+        //         .await?
+        //         .ok_or(Error::invalid_input(
+        //             format!("Column {} has no inverted index", column),
+        //             location!(),
+        //         ))?;
+        //     let index_uuids: Vec<_> = self
+        //         .dataset
+        //         .load_indices_by_name(&index.name)
+        //         .await?
+        //         .into_iter()
+        //         .collect();
+
+        //     let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+        //     let unindexed_scan_node = if unindexed_fragments.is_empty() {
+        //         Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
+        //     } else {
+        //         let mut columns = vec![column.clone()];
+        //         if let Some(expr) = filter_plan.full_expr.as_ref() {
+        //             let filter_columns = Planner::column_names_in_expr(expr);
+        //             columns.extend(filter_columns);
+        //         }
+        //         let flat_fts_scan_schema =
+        //             Arc::new(self.dataset.schema().project(&columns).unwrap());
+        //         let mut scan_node = self.scan_fragments(
+        //             true,
+        //             false,
+        //             true,
+        //             flat_fts_scan_schema,
+        //             Arc::new(unindexed_fragments),
+        //             None,
+        //             false,
+        //         );
+
+        //         if let Some(expr) = filter_plan.full_expr.as_ref() {
+        //             // If there is a prefilter we need to manually apply it to the new data
+        //             let planner = Planner::new(scan_node.schema());
+        //             let physical_refine_expr = planner.create_physical_expr(expr)?;
+        //             scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
+        //         }
+
+        //         scan_node
+        //     };
+
+        //     column_inputs.push((column.clone(), index_uuids, unindexed_scan_node));
+        // }
+
+        // let indices = column_inputs
+        //     .iter()
+        //     .map(|(col, idx, _)| (col.clone(), idx.clone()))
+        //     .collect();
+
+        // let fts_plan = Arc::new(FtsExec::new(
+        //     self.dataset.clone(),
+        //     indices,
+        //     query.clone(),
+        //     prefilter_source,
+        // )) as Arc<dyn ExecutionPlan>;
+        // let flat_fts_plan = Arc::new(FlatFtsExec::new(self.dataset.clone(), column_inputs, query));
 
         // group by rowid to dedup results from multiple indices
-        let schema = fts_node.schema();
-        let group_expr = vec![(expressions::col(ROW_ID, &schema)?, ROW_ID.to_string())];
-        let fts_node = Arc::new(AggregateExec::try_new(
-            AggregateMode::Single,
-            PhysicalGroupBy::new_single(group_expr),
-            vec![Arc::new(
-                AggregateExprBuilder::new(
-                    functions_aggregate::min_max::max_udaf(),
-                    vec![expressions::col(SCORE_COL, &schema)?],
-                )
-                .schema(schema.clone())
-                .alias(SCORE_COL)
-                .build()?,
-            )],
-            vec![None],
-            fts_node,
-            schema,
-        )?);
-        let sort_expr = PhysicalSortExpr {
-            expr: expressions::col(SCORE_COL, fts_node.schema().as_ref())?,
-            options: SortOptions {
-                descending: true,
-                nulls_first: false,
+        Ok(fts_exec)
+    }
+
+    fn plan_fts(
+        &self,
+        query: &CompoundQuery,
+        params: &FtsSearchParams,
+        prefilter_source: &PreFilterSource,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let plan: Arc<dyn ExecutionPlan> = match query {
+            CompoundQuery::Leaf(leaf) => match leaf {
+                FtsQuery::Match(query) => Arc::new(MatchQueryExec::new(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    prefilter_source.clone(),
+                )),
+                FtsQuery::Phrase(query) => Arc::new(PhraseQueryExec::new(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    prefilter_source.clone(),
+                )),
             },
+
+            CompoundQuery::Boost(query) => {
+                let positive_exec = self.plan_fts(&query.positive, params, prefilter_source)?;
+                let negative_exec = self.plan_fts(&query.negative, params, prefilter_source)?;
+                Arc::new(BoostQueryExec::new(
+                    query.clone(),
+                    params.clone(),
+                    positive_exec,
+                    negative_exec,
+                ))
+            }
+
+            CompoundQuery::MultiMatch(query) => {
+                let children = query
+                    .match_queries
+                    .iter()
+                    .map(|q| self.plan_fts(q, params, prefilter_source))
+                    .collect::<Result<Vec<_>>>()?;
+
+                let schema = children[0].schema();
+                let group_expr = vec![(
+                    expressions::col(ROW_ID, schema.as_ref())?,
+                    ROW_ID.to_string(),
+                )];
+
+                let fts_node = Arc::new(UnionExec::new(children));
+                let fts_node = Arc::new(RepartitionExec::try_new(
+                    fts_node,
+                    Partitioning::RoundRobinBatch(1),
+                )?);
+                // dedup by row_id and return the max score as final score
+                let fts_node = Arc::new(AggregateExec::try_new(
+                    AggregateMode::Single,
+                    PhysicalGroupBy::new_single(group_expr),
+                    vec![Arc::new(
+                        AggregateExprBuilder::new(
+                            functions_aggregate::min_max::max_udaf(),
+                            vec![expressions::col(SCORE_COL, &schema)?],
+                        )
+                        .schema(schema.clone())
+                        .alias(SCORE_COL)
+                        .build()?,
+                    )],
+                    vec![None],
+                    fts_node,
+                    schema,
+                )?);
+                let sort_expr = PhysicalSortExpr {
+                    expr: expressions::col(SCORE_COL, fts_node.schema().as_ref())?,
+                    options: SortOptions {
+                        descending: true,
+                        nulls_first: false,
+                    },
+                };
+
+                Arc::new(
+                    SortExec::new(LexOrdering::new(vec![sort_expr]), fts_node)
+                        .with_fetch(self.limit.map(|l| l as usize)),
+                )
+            }
         };
 
-        Ok(Arc::new(
-            SortExec::new(LexOrdering::new(vec![sort_expr]), fts_node)
-                .with_fetch(self.limit.map(|l| l as usize)),
-        ))
+        Ok(plan)
+    }
+
+    fn fill_fts_query_field(
+        query: &CompoundQuery,
+        indexed_columns: &[String],
+    ) -> Result<CompoundQuery> {
+        match query {
+            CompoundQuery::Leaf(leaf) => {
+                if !leaf.is_missing_field() {
+                    return Ok(query.clone());
+                }
+
+                if !matches!(leaf, FtsQuery::Match(_)) {
+                    return Err(Error::invalid_input(
+                        "the field must be specified in the query".to_string(),
+                        location!(),
+                    ));
+                }
+
+                match indexed_columns.len() {
+                    0 => {
+                        return Err(Error::invalid_input(
+                            "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
+                            location!(),
+                        ));
+                    }
+                    1 => {
+                        let field = indexed_columns[0].clone();
+                        let query = leaf.clone().with_field(field);
+                        Ok(CompoundQuery::Leaf(query))
+                    }
+                    _ => {
+                        let multi_match_query =
+                            MultiMatchQuery::new(leaf.query().to_owned(), indexed_columns.to_vec());
+                        Ok(CompoundQuery::MultiMatch(multi_match_query))
+                    }
+                }
+            }
+            // if there is a compound query, we need to check if the field is
+            _ => {
+                return Err(Error::invalid_input(
+                    "the field must be specified in the query".to_string(),
+                    location!(),
+                ));
+            }
+        }
     }
 
     // ANN/KNN search execution node with optional prefilter

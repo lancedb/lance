@@ -139,9 +139,9 @@ impl Wand {
         limit: usize,
         factor: f32,
         scorer: impl Fn(u64, f32) -> f32,
-    ) -> Result<Vec<(u64, f32)>> {
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
         if limit == 0 {
-            return Ok(vec![]);
+            return Ok((vec![], vec![]));
         }
 
         let num_query_tokens = self.postings.len();
@@ -178,7 +178,7 @@ impl Wand {
             .map(|doc| (doc.0.row_id, doc.0.score))
             .sorted_unstable()
             .map(|(row_id, score)| (row_id, score.0))
-            .collect())
+            .unzip())
     }
 
     // calculate the score of the document
