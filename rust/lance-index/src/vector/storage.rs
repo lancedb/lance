@@ -152,6 +152,9 @@ pub struct StorageBuilder<Q: Quantization> {
     vector_column: String,
     distance_type: DistanceType,
     quantizer: Q,
+
+    // this is for testing purpose
+    assert_num_columns: bool,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
@@ -160,7 +163,14 @@ impl<Q: Quantization> StorageBuilder<Q> {
             vector_column,
             distance_type,
             quantizer,
+            assert_num_columns: true,
         })
+    }
+
+    // this is for testing purpose
+    pub fn assert_num_columns(mut self, assert_num_columns: bool) -> Self {
+        self.assert_num_columns = assert_num_columns;
+        self
     }
 
     pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
@@ -180,7 +190,9 @@ impl<Q: Quantization> StorageBuilder<Q> {
             )?;
         }
 
-        debug_assert_eq!(batch.num_columns(), 2);
+        if self.assert_num_columns {
+            debug_assert_eq!(batch.num_columns(), 2);
+        }
         debug_assert!(batch.column_by_name(ROW_ID).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
