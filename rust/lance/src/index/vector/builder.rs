@@ -26,7 +26,7 @@ use lance_index::vector::quantizer::{
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::v3::shuffler::IvfShufflerReader;
 use lance_index::vector::v3::subindex::SubIndexType;
-use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY, PQ_CODE_COLUMN};
+use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_index::{
     pb,
     vector::{
@@ -653,8 +653,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         original_codes,
                         codes_num_bytes as i32,
                     )?;
-                    *batch =
-                        batch.replace_column_by_name(PQ_CODE_COLUMN, Arc::new(original_codes))?;
+                    *batch = batch
+                        .replace_column_by_name(PQ_CODE_COLUMN, Arc::new(original_codes))?
+                        .drop_column(PART_ID_COLUMN)?;
                 }
             }
             batches.extend(part_batches);
@@ -672,6 +673,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .get(LOSS_METADATA_KEY)
                     .map(|s| s.parse::<f64>().unwrap_or(0.0))
                     .unwrap_or(0.0);
+                let batch = batch.drop_column(PART_ID_COLUMN)?;
                 batches.push(batch);
             }
         }
