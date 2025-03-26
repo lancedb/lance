@@ -73,14 +73,6 @@ impl Transformer for PartitionTransformer {
             return Ok(batch.clone());
         }
 
-        if self.centroids.len() == 1 {
-            // If there is only one centroid, we can skip the computation.
-            // Just add a column with all zeros.
-            let part_ids = UInt32Array::from(vec![0; batch.num_rows()]);
-            let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true);
-            return Ok(batch.try_with_column(field, Arc::new(part_ids))?);
-        }
-
         let arr =
             batch
                 .column_by_name(&self.input_column)

@@ -1131,7 +1131,8 @@ mod tests {
             }
             if count >= 10 {
                 panic!(
-                    "failed to hit the retrain threshold {}",
+                    "failed to hit the retrain threshold {} < {}",
+                    last_avg_loss / original_avg_loss,
                     AVG_LOSS_RETRAIN_THRESHOLD
                 );
             }
