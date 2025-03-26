@@ -22,7 +22,6 @@ use lance_linalg::distance::DistanceType;
 use prost::Message;
 use snafu::location;
 
-use crate::vector::PART_ID_COLUMN;
 use crate::{
     pb,
     vector::{
