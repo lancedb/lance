@@ -14,7 +14,7 @@ use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, ROW_ID};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::v2::reader::FileReader;
 use lance_io::ReadBatchParams;
@@ -179,6 +179,10 @@ impl<Q: Quantization> StorageBuilder<Q> {
                 codes,
             )?;
         }
+
+        debug_assert_eq!(batch.num_columns(), 2);
+        debug_assert!(batch.column_by_name(ROW_ID).is_some());
+        debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
         let batch = batch.add_metadata(
             STORAGE_METADATA_KEY.to_owned(),

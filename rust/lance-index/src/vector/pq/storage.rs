@@ -152,6 +152,20 @@ impl ProductQuantizationStorage {
         distance_type: DistanceType,
         transposed: bool,
     ) -> Result<Self> {
+        debug_assert_eq!(batch.num_columns(), 2);
+
+        if batch.num_columns() != 2 {
+            log::warn!(
+                "PQ storage should have 2 columns, but got {} columns: {}",
+                batch.num_columns(),
+                batch.schema(),
+            );
+            batch = batch.project(&[
+                batch.schema().index_of(ROW_ID)?,
+                batch.schema().index_of(PQ_CODE_COLUMN)?,
+            ])?;
+        }
+
         let Some(row_ids) = batch.column_by_name(ROW_ID) else {
             return Err(Error::Index {
                 message: "Row ID column not found from PQ storage".to_string(),
