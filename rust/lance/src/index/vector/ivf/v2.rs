@@ -1211,6 +1211,9 @@ mod tests {
     }
 
     #[rstest]
+    #[case(1, DistanceType::L2, 0.9)]
+    #[case(1, DistanceType::Cosine, 0.9)]
+    #[case(1, DistanceType::Dot, 0.85)]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
     #[case(4, DistanceType::Dot, 0.85)]

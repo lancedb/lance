@@ -22,6 +22,7 @@ use lance_linalg::distance::DistanceType;
 use prost::Message;
 use snafu::location;
 
+use crate::vector::PART_ID_COLUMN;
 use crate::{
     pb,
     vector::{
@@ -191,7 +192,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
         }
 
         if self.assert_num_columns {
-            debug_assert_eq!(batch.num_columns(), 2);
+            debug_assert_eq!(batch.num_columns(), 2, "{}", batch.schema());
         }
         debug_assert!(batch.column_by_name(ROW_ID).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
