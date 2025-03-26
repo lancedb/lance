@@ -1101,7 +1101,12 @@ class LanceDataset(pa.dataset.Dataset):
 
     def add_columns(
         self,
-        transforms: Dict[str, str] | BatchUDF | ReaderLike,
+        transforms: Dict[str, str]
+        | BatchUDF
+        | ReaderLike
+        | pyarrow.Field
+        | List[pyarrow.Field]
+        | pyarrow.Schema,
         read_columns: List[str] | None = None,
         reader_schema: Optional[pa.Schema] = None,
         batch_size: Optional[int] = None,
@@ -1129,6 +1134,8 @@ class LanceDataset(pa.dataset.Dataset):
             reference existing columns in the dataset.
             If this is a AddColumnsUDF, then it is a UDF that takes a batch of
             existing data and returns a new batch with the new columns.
+            If this is :class:`pyarrow.Field` or :class:`pyarrow.Schema`, it adds
+            all NULL columns with the given schema, in a metadata-only operation.
         read_columns : list of str, optional
             The names of the columns that the UDF will read. If None, then the
             UDF will read all columns. This is only used when transforms is a
@@ -1168,6 +1175,18 @@ class LanceDataset(pa.dataset.Dataset):
         LanceDataset.merge :
             Merge a pre-computed set of columns into the dataset.
         """
+        if isinstance(transforms, pa.Field):
+            transforms = [transforms]
+        if (
+            isinstance(transforms, list)
+            and len(transforms) > 0
+            and isinstance(transforms[0], pa.Field)
+        ):
+            transforms = pa.schema(transforms)
+        if isinstance(transforms, pa.Schema):
+            self._ds.add_columns_with_schema(transforms)
+            return
+
         transforms = normalize_transform(transforms, self, read_columns, reader_schema)
         if isinstance(transforms, pa.RecordBatchReader):
             self._ds.add_columns_from_reader(transforms, batch_size)
