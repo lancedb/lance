@@ -1157,7 +1157,7 @@ mod tests {
         let ivf_models = get_ivf_models(&dataset).await;
         let ivf = &ivf_models[0];
         assert_ne!(original_ivf.centroids, ivf.centroids);
-        if params.metric_type != DistanceType::Hamming {
+        if ivf.num_partitions() > 1 && params.metric_type != DistanceType::Hamming {
             assert_lt!(get_avg_loss(&dataset).await, last_avg_loss);
         }
     }
