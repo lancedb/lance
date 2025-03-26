@@ -9,13 +9,13 @@ use arrow::array::AsArray;
 use arrow::datatypes::UInt8Type;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
+use arrow_array::Array;
 use arrow_array::{make_array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::Duration;
-use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 
 use lance::dataset::builder::DatasetBuilder;
@@ -1566,9 +1566,7 @@ impl Dataset {
         let mut new_self = self.ds.as_ref().clone();
         let new_self = RT
             .spawn(None, async move {
-                new_self
-                    .add_columns(transform, None, None)
-                    .await?;
+                new_self.add_columns(transform, None, None).await?;
                 Ok(new_self)
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
