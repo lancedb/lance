@@ -8,7 +8,8 @@ use std::ops::AddAssign;
 use std::sync::Arc;
 
 use crate::Error;
-use arrow_array::types::{Float16Type, Float64Type};
+use arrow_array::types::{Float16Type, Float64Type, Int8Type};
+use arrow_array::Int8Array;
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
 use half::{bf16, f16};
@@ -278,7 +279,22 @@ pub fn dot_distance_arrow_batch(
         DataType::Float16 => do_dot_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
         DataType::Float32 => do_dot_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_dot_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
-        DataType::Int8 => do_dot_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
+        DataType::Int8 => do_dot_distance_arrow_batch::<Float32Type>(
+            &from.as_primitive::<Int8Type>()
+                .into_iter()
+                .map(|x| x.unwrap() as f32)
+                .collect(), 
+            &FixedSizeListArray::from_iter_primitive::<Float32Type,_,_>(
+                to
+                .values()
+                .as_any()
+                .downcast_ref::<Vec<Int8Array>>()
+                .ok_or(arrow_schema::ArrowError::ParseError(format!("Fail to cast primitive array to Int8Type")))?
+                .into_iter()
+                .map(|arr| Some(arr.into_iter().map(|opt| opt.map(|v| v as f32)).collect::<Vec<_>>()))
+                .collect::<Vec<_>>(),
+                to.value_length())
+        ),
         _ => Err(Error::InvalidArgumentError(format!(
             "Unsupported data type: {:?}",
             from.data_type()
