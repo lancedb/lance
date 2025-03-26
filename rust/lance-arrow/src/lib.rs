@@ -8,12 +8,12 @@
 use std::sync::Arc;
 use std::{collections::HashMap, ptr::NonNull};
 
-use arrow_array::{Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array};
 use arrow_array::{
     cast::AsArray, Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray,
     GenericListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt32Array,
     UInt8Array,
 };
+use arrow_array::{Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array};
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema};
@@ -237,9 +237,9 @@ pub trait FixedSizeListArrayExt {
     /// ```
     fn sample(&self, n: usize) -> Result<FixedSizeListArray>;
 
-    /// Ensure the [FixedSizeListArray] of Float16, Float32, Float64 and 
+    /// Ensure the [FixedSizeListArray] of Float16, Float32, Float64 and
     /// Int8, Int16, Int32, Int64, UInt8, UInt32 type to floating point type.
-    fn convert_to_floating_point (&self) -> Result<FixedSizeListArray>;
+    fn convert_to_floating_point(&self) -> Result<FixedSizeListArray>;
 }
 
 impl FixedSizeListArrayExt for FixedSizeListArray {
@@ -259,129 +259,133 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
         take(self, &UInt32Array::from(chosen), None).map(|arr| arr.as_fixed_size_list().clone())
     }
 
-    fn convert_to_floating_point (&self) -> Result<FixedSizeListArray> {
+    fn convert_to_floating_point(&self) -> Result<FixedSizeListArray> {
         match self.data_type() {
-            DataType::FixedSizeList(field, size) => {
-                match field.data_type() {
-                    DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(self.clone()),
-                    DataType::Int8 => Ok(
-                        FixedSizeListArray::new(
-                            Arc::new(arrow_schema::Field::new(
-                                field.name(), 
-                                DataType::Float32, 
-                                field.is_nullable())),
-                            *size, 
-                            Arc::new(Float32Array::from_iter_values(
-                                self
-                                .values()
-                                .as_any()
-                                .downcast_ref::<Int8Array>()
-                                .ok_or(ArrowError::ParseError(format!("Fail to cast primitive array to Int8Type")))?
-                                .into_iter()
-                                .filter_map(|x| x.map(|y| y as f32)))), 
-                            self
-                            .nulls()
-                            .map(|x| x.clone()))
-                    ),
-                    DataType::Int16 => Ok(
-                        FixedSizeListArray::new(
-                            Arc::new(arrow_schema::Field::new(
-                                field.name(), 
-                                DataType::Float32, 
-                                field.is_nullable())),
-                            *size, 
-                            Arc::new(Float32Array::from_iter_values(
-                                self
-                                .values()
-                                .as_any()
-                                .downcast_ref::<Int16Array>()
-                                .ok_or(ArrowError::ParseError(format!("Fail to cast primitive array to Int8Type")))?
-                                .into_iter()
-                                .filter_map(|x| x.map(|y| y as f32)))), 
-                            self
-                            .nulls()
-                            .map(|x| x.clone()))
-                    ),
-                    DataType::Int32 => Ok(
-                        FixedSizeListArray::new(
-                            Arc::new(arrow_schema::Field::new(
-                                field.name(), 
-                                DataType::Float32, 
-                                field.is_nullable())),
-                            *size, 
-                            Arc::new(Float32Array::from_iter_values(
-                                self
-                                .values()
-                                .as_any()
-                                .downcast_ref::<Int32Array>()
-                                .ok_or(ArrowError::ParseError(format!("Fail to cast primitive array to Int8Type")))?
-                                .into_iter()
-                                .filter_map(|x| x.map(|y| y as f32)))), 
-                            self
-                            .nulls()
-                            .map(|x| x.clone()))
-                    ),
-                    DataType::Int64 => Ok(
-                        FixedSizeListArray::new(
-                            Arc::new(arrow_schema::Field::new(
-                                field.name(), 
-                                DataType::Float64, 
-                                field.is_nullable())),
-                            *size, 
-                            Arc::new(Float64Array::from_iter_values(
-                                self
-                                .values()
-                                .as_any()
-                                .downcast_ref::<Int64Array>()
-                                .ok_or(ArrowError::ParseError(format!("Fail to cast primitive array to Int8Type")))?
-                                .into_iter()
-                                .filter_map(|x| x.map(|y| y as f64)))), 
-                            self
-                            .nulls()
-                            .map(|x| x.clone()))
-                    ),
-                    DataType::UInt8 => Ok(
-                        FixedSizeListArray::new(
-                            Arc::new(arrow_schema::Field::new(
-                                field.name(), 
-                                DataType::Float64, 
-                                field.is_nullable())),
-                            *size, 
-                            Arc::new(Float64Array::from_iter_values(
-                                self
-                                .values()
-                                .as_any()
-                                .downcast_ref::<UInt8Array>()
-                                .ok_or(ArrowError::ParseError(format!("Fail to cast primitive array to Int8Type")))?
-                                .into_iter()
-                                .filter_map(|x| x.map(|y| y as f64)))), 
-                            self
-                            .nulls()
-                            .map(|x| x.clone()))
-                    ),
-                    DataType::UInt32 => Ok(
-                        FixedSizeListArray::new(
-                            Arc::new(arrow_schema::Field::new(
-                                field.name(), 
-                                DataType::Float64, 
-                                field.is_nullable())),
-                            *size, 
-                            Arc::new(Float64Array::from_iter_values(
-                                self
-                                .values()
-                                .as_any()
-                                .downcast_ref::<UInt32Array>()
-                                .ok_or(ArrowError::ParseError(format!("Fail to cast primitive array to Int8Type")))?
-                                .into_iter()
-                                .filter_map(|x| x.map(|y| y as f64)))), 
-                            self
-                            .nulls()
-                            .map(|x| x.clone()))
-                    ),
-                    data_type => Err(ArrowError::ParseError(format!("Expect either floating type or integer got {:?}", data_type)))
-                }
-            }
-            data_type => Err(ArrowError::ParseError(format!("Expect either FixedSizeList got {:?}", data_type)))
+            DataType::FixedSizeList(field, size) => match field.data_type() {
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(self.clone()),
+                DataType::Int8 => Ok(FixedSizeListArray::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float32,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float32Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<Int8Array>()
+                            .ok_or(ArrowError::ParseError(format!(
+                                "Fail to cast primitive array to Int8Type"
+                            )))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f32)),
+                    )),
+                    self.nulls().map(|x| x.clone()),
+                )),
+                DataType::Int16 => Ok(FixedSizeListArray::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float32,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float32Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<Int16Array>()
+                            .ok_or(ArrowError::ParseError(format!(
+                                "Fail to cast primitive array to Int8Type"
+                            )))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f32)),
+                    )),
+                    self.nulls().map(|x| x.clone()),
+                )),
+                DataType::Int32 => Ok(FixedSizeListArray::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float32,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float32Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .ok_or(ArrowError::ParseError(format!(
+                                "Fail to cast primitive array to Int8Type"
+                            )))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f32)),
+                    )),
+                    self.nulls().map(|x| x.clone()),
+                )),
+                DataType::Int64 => Ok(FixedSizeListArray::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float64,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float64Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or(ArrowError::ParseError(format!(
+                                "Fail to cast primitive array to Int8Type"
+                            )))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f64)),
+                    )),
+                    self.nulls().map(|x| x.clone()),
+                )),
+                DataType::UInt8 => Ok(FixedSizeListArray::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float64,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float64Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<UInt8Array>()
+                            .ok_or(ArrowError::ParseError(format!(
+                                "Fail to cast primitive array to Int8Type"
+                            )))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f64)),
+                    )),
+                    self.nulls().map(|x| x.clone()),
+                )),
+                DataType::UInt32 => Ok(FixedSizeListArray::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float64,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float64Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<UInt32Array>()
+                            .ok_or(ArrowError::ParseError(format!(
+                                "Fail to cast primitive array to Int8Type"
+                            )))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f64)),
+                    )),
+                    self.nulls().map(|x| x.clone()),
+                )),
+                data_type => Err(ArrowError::ParseError(format!(
+                    "Expect either floating type or integer got {:?}",
+                    data_type
+                ))),
+            },
+            data_type => Err(ArrowError::ParseError(format!(
+                "Expect either FixedSizeList got {:?}",
+                data_type
+            ))),
         }
     }
 }

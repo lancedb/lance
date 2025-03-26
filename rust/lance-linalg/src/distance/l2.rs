@@ -294,11 +294,12 @@ pub fn l2_distance_arrow_batch(
         DataType::Float32 => do_l2_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_l2_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
         DataType::Int8 => do_l2_distance_arrow_batch::<Float32Type>(
-            &from.as_primitive::<Int8Type>()
+            &from
+                .as_primitive::<Int8Type>()
                 .into_iter()
                 .map(|x| x.unwrap() as f32)
-                .collect(), 
-            &to.convert_to_floating_point()?
+                .collect(),
+            &to.convert_to_floating_point()?,
         ),
         _ => Err(Error::ComputeError(format!(
             "Unsupported data type: {}",
