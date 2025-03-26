@@ -176,9 +176,27 @@ add columns with :py:class:`pyarrow.Field` or :py:class:`pyarrow.Schema`.
 
     table = pa.table({"id": pa.array([1, 2, 3])})
     dataset = lance.write_dataset(table, "null_columns")
-    dataset.add_columns(pa.field("embedding", pa.list_(pa.float32(), 128)))
-    print(dataset.schema)
 
+    # With pyarrow Field
+    dataset.add_columns(pa.field("embedding", pa.list_(pa.float32(), 128)))
+    assert dataset.schema == pa.schema([
+        ("id", pa.int64()),
+        ("embedding", pa.list_(pa.float32(), 128)),
+    ])
+
+    # With pyarrow Schema
+    dataset.add_columns(pa.schema([
+        ("label", pa.string()),
+        ("score", pa.float32()),
+    ]))
+    assert dataset.schema == pa.schema([
+        ("id", pa.int64()),
+        ("embedding", pa.list_(pa.float32(), 128)),
+        ("label", pa.string()),
+        ("score", pa.float32()),
+    ])
+
+This operation is very fast, as it only updates the metadata of the dataset.
 
 
 Adding new columns using merge
