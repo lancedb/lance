@@ -79,7 +79,8 @@ fn infer_vector_element_type_impl(
                 arrow::datatypes::DataType::Float16
                 | arrow::datatypes::DataType::Float32
                 | arrow::datatypes::DataType::Float64
-                | arrow::datatypes::DataType::UInt8 => Ok(element_field.data_type().clone()),
+                | arrow::datatypes::DataType::UInt8 
+                | arrow::datatypes::DataType::Int8 => Ok(element_field.data_type().clone()),
                 _ => Err(Error::Index {
                     message: format!(
                         "vector element is not expected type (Float16/Float32/Float64 or UInt8): {:?}",

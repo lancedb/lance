@@ -8,11 +8,11 @@ use std::ops::AddAssign;
 use std::sync::Arc;
 
 use crate::Error;
-use arrow_array::types::{Float16Type, Float64Type};
+use arrow_array::types::{Float16Type, Float64Type, Int8Type};
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
 use half::{bf16, f16};
-use lance_arrow::{ArrowFloatType, FloatArray};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
@@ -278,6 +278,13 @@ pub fn dot_distance_arrow_batch(
         DataType::Float16 => do_dot_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
         DataType::Float32 => do_dot_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_dot_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
+        DataType::Int8 => do_dot_distance_arrow_batch::<Float32Type>(
+            &from.as_primitive::<Int8Type>()
+                .into_iter()
+                .map(|x| x.unwrap() as f32)
+                .collect(), 
+            &to.convert_to_floating_point()?
+        ),
         _ => Err(Error::InvalidArgumentError(format!(
             "Unsupported data type: {:?}",
             from.data_type()
