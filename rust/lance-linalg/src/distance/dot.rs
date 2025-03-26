@@ -13,7 +13,7 @@ use arrow_array::Int8Array;
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
 use half::{bf16, f16};
-use lance_arrow::{ArrowFloatType, FloatArray};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
@@ -284,16 +284,7 @@ pub fn dot_distance_arrow_batch(
                 .into_iter()
                 .map(|x| x.unwrap() as f32)
                 .collect(), 
-            &FixedSizeListArray::from_iter_primitive::<Float32Type,_,_>(
-                to
-                .values()
-                .as_any()
-                .downcast_ref::<Vec<Int8Array>>()
-                .ok_or(arrow_schema::ArrowError::ParseError(format!("Fail to cast primitive array to Int8Type")))?
-                .into_iter()
-                .map(|arr| Some(arr.into_iter().map(|opt| opt.map(|v| v as f32)).collect::<Vec<_>>()))
-                .collect::<Vec<_>>(),
-                to.value_length())
+            &to.convert_to_floating_point()?
         ),
         _ => Err(Error::InvalidArgumentError(format!(
             "Unsupported data type: {:?}",
