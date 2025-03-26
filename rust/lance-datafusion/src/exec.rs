@@ -244,10 +244,8 @@ lazy_static! {
 }
 
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
-    if options.target_partition.is_some() {
-        return new_session_context(options);
-    }
-    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE {
+    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE && options.target_partition.is_none()
+    {
         return if options.use_spilling() {
             DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone()
         } else {
