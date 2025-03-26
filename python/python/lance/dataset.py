@@ -1712,8 +1712,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         column = column[0]
-        if column not in self.schema.names:
-            raise KeyError(f"{column} not found in schema")
+        field = self._get_field(column)
 
         index_type = index_type.upper()
         if index_type not in ["BTREE", "BITMAP", "NGRAM", "LABEL_LIST", "INVERTED"]:
@@ -1725,7 +1724,6 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             )
 
-        field = self.schema.field(column)
         if index_type in ["BTREE", "BITMAP"]:
             if (
                 not pa.types.is_integer(field.type)
@@ -1758,6 +1756,39 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         self._ds.create_index([column], index_type, name, replace, None, kwargs)
+
+    def _get_field(self, name: str) -> pa.Field:
+        """
+        Get the field from the schema.
+
+        Parameters
+        ----------
+        name : str
+            The name of the field to get. Can be a column name or a nested field name.
+
+        Returns
+        -------
+        field : pa.Field
+            The field from the schema.
+
+        Raises
+        ------
+        KeyError
+            If the field is not found in the schema.
+        """
+
+        idents = name.split(".")
+        schema = self.schema
+        field = None
+        for idx, ident in enumerate(idents):
+            if ident not in schema.names:
+                raise KeyError(f"column {ident} not found in schema")
+            field = schema.field(ident)
+            if idx != len(idents) - 1:
+                if not pa.types.is_struct(field.type):
+                    raise TypeError(f"column {ident} must be a schema")
+                schema = field.type
+        return field
 
     def create_index(
         self,

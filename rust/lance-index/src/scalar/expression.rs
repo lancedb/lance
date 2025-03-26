@@ -593,20 +593,31 @@ impl ScalarIndexExpr {
 }
 
 // Extract a column from the expression, if it is a column, or None
-fn maybe_column(expr: &Expr) -> Option<&str> {
+fn maybe_column(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Column(col) => Some(&col.name),
+        Expr::Column(col) => Some(col.name.clone()),
+        Expr::ScalarFunction(ScalarFunction { func, args }) => {
+            if func.inner().name() == "get_field" && args.len() == 2 {
+                if let Expr::Literal(field) = &args[1] {
+                    maybe_column(&args[0]).map(|col| format!("{col}.{field}"))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
 
 // Extract a column from the expression, if it is a column, and we have an index for that column, or None
-fn maybe_indexed_column<'a, 'b>(
-    expr: &'a Expr,
-    index_info: &'b dyn IndexInformationProvider,
-) -> Option<(&'a str, &'b DataType, &'b dyn ScalarQueryParser)> {
+fn maybe_indexed_column<'a>(
+    expr: &Expr,
+    index_info: &'a dyn IndexInformationProvider,
+) -> Option<(String, &'a DataType, &'a dyn ScalarQueryParser)> {
     let col = maybe_column(expr)?;
-    let data_type = index_info.get_index(col);
+    let data_type = index_info.get_index(&col);
     data_type.map(|(ty, parser)| (col, ty, parser))
 }
 
@@ -642,7 +653,7 @@ fn visit_between(
     let low = maybe_scalar(&between.low, col_type)?;
     let high = maybe_scalar(&between.high, col_type)?;
 
-    let indexed_expr = query_parser.visit_between(column, low, high)?;
+    let indexed_expr = query_parser.visit_between(&column, low, high)?;
 
     if between.negated {
         indexed_expr.maybe_not()
@@ -658,7 +669,7 @@ fn visit_in_list(
     let (column, col_type, query_parser) = maybe_indexed_column(&in_list.expr, index_info)?;
     let values = maybe_scalar_list(&in_list.list, col_type)?;
 
-    let indexed_expr = query_parser.visit_in_list(column, values)?;
+    let indexed_expr = query_parser.visit_in_list(&column, values)?;
 
     if in_list.negated {
         indexed_expr.maybe_not()
@@ -676,7 +687,7 @@ fn visit_is_bool(
     if *col_type != DataType::Boolean {
         None
     } else {
-        query_parser.visit_is_bool(column, value)
+        query_parser.visit_is_bool(&column, value)
     }
 }
 
@@ -689,7 +700,7 @@ fn visit_column(
     if *col_type != DataType::Boolean {
         None
     } else {
-        query_parser.visit_is_bool(column, true)
+        query_parser.visit_is_bool(&column, true)
     }
 }
 
@@ -699,7 +710,7 @@ fn visit_is_null(
     negated: bool,
 ) -> Option<IndexedExpression> {
     let (column, _, query_parser) = maybe_indexed_column(expr, index_info)?;
-    let indexed_expr = query_parser.visit_is_null(column)?;
+    let indexed_expr = query_parser.visit_is_null(&column)?;
     if negated {
         indexed_expr.maybe_not()
     } else {
@@ -719,7 +730,7 @@ fn visit_comparison(
     let left_col = maybe_indexed_column(&expr.left, index_info);
     if let Some((column, col_type, query_parser)) = left_col {
         let scalar = maybe_scalar(&expr.right, col_type)?;
-        query_parser.visit_comparison(column, scalar, &expr.op)
+        query_parser.visit_comparison(&column, scalar, &expr.op)
     } else {
         // Datafusion's query simplifier will canonicalize expressions and so we shouldn't reach this case.  If, for some reason, we
         // do reach this case we can handle it in the future by inverting expr.op and swapping the left and right sides
@@ -852,7 +863,7 @@ fn visit_scalar_fn(
         return None;
     }
     let (col, data_type, query_parser) = maybe_indexed_column(&scalar_fn.args[0], index_info)?;
-    query_parser.visit_scalar_function(col, data_type, &scalar_fn.func, &scalar_fn.args)
+    query_parser.visit_scalar_function(&col, data_type, &scalar_fn.func, &scalar_fn.args)
 }
 
 fn visit_node(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<IndexedExpression> {

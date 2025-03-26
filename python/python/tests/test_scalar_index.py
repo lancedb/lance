@@ -818,3 +818,30 @@ def test_drop_index(tmp_path):
     assert ds.to_table(filter="bitmap = 1").num_rows == 1
     assert ds.to_table(filter="fts = 'a'").num_rows == test_table_size
     assert ds.to_table(filter="contains(ngram, 'a')").num_rows == test_table_size
+
+
+def test_nested_scalar_index(tmp_path):
+    tbl = pa.table(
+        {
+            "outer": [
+                {"inner": "a", "text": "Frodo was a puppy"},
+                {"inner": "b", "text": "There were several kittens playing"},
+            ],
+            "value": [1, 2],
+        }
+    )
+    ds = lance.write_dataset(tbl, tmp_path)
+    ds.create_scalar_index("outer.inner", index_type="BTREE")
+    ds.create_scalar_index("outer.text", index_type="INVERTED")
+
+    scanner = ds.scanner(filter="outer.inner = 'a'")
+    assert scanner.to_table().num_rows == 1
+    assert "MaterializeIndex: query=outer.inner = a" in scanner.explain_plan()
+
+    scanner = ds.scanner(full_text_query={"columns": ["outer.text"], "query": "foo"})
+    assert scanner.to_table().num_rows == 0
+    assert "Fts: query=foo" in scanner.explain_plan()
+    assert "FlatFts: query=foo" in scanner.explain_plan()
+
+    scanner = ds.scanner(full_text_query={"columns": ["outer.text"], "query": "puppy"})
+    assert scanner.to_table().num_rows == 1
