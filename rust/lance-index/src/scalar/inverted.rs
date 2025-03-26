@@ -5,6 +5,7 @@ pub mod builder;
 mod index;
 mod tokenizer;
 mod wand;
+pub mod query;
 
 pub use builder::InvertedIndexBuilder;
 pub use index::*;

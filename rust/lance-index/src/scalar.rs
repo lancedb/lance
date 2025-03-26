@@ -19,9 +19,11 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
+use inverted::query::FtsSearchParams;
 use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
+use lazy_static::lazy_static;
 use snafu::location;
 
 use crate::metrics::MetricsCollector;
@@ -250,24 +252,13 @@ impl PartialEq for dyn AnyQuery {
         self.dyn_eq(other)
     }
 }
-
 /// A full text search query
 #[derive(Debug, Clone, PartialEq)]
 pub struct FullTextSearchQuery {
-    /// The columns to search,
-    /// if empty, search all indexed columns
-    pub columns: Vec<String>,
-
-    /// The full text search query
-    pub query: String,
+    query: inverted::query::CompoundQuery,
 
     /// The maximum number of results to return
     pub limit: Option<i64>,
-
-    /// fuzzy query max distance
-    /// if None, then it is not used (not a fuzzy query),
-    /// if Some(n), then it is a fuzzy query with max distance n
-    pub max_distance: Option<u32>,
 
     /// The wand factor to use for ranking
     /// if None, use the default value of 1.0
@@ -277,46 +268,50 @@ pub struct FullTextSearchQuery {
 }
 
 impl FullTextSearchQuery {
+    /// Create a new terms query
     pub fn new(query: String) -> Self {
+        let query =
+            inverted::query::FtsQuery::Match(inverted::query::MatchQuery::new(query)).into();
         Self {
             query,
             limit: None,
-            columns: vec![],
-            max_distance: None,
             wand_factor: None,
         }
     }
 
-    pub fn new_fuzzy(query: String, max_distance: u32) -> Self {
+    /// Create a new fuzzy query
+    pub fn new_fuzzy(term: String, max_distance: Option<u32>) -> Self {
+        let query = inverted::query::FtsQuery::Match(inverted::query::MatchQuery::new_fuzzy(
+            term,
+            max_distance,
+        ))
+        .into();
         Self {
             query,
             limit: None,
-            columns: vec![],
-            max_distance: Some(max_distance),
             wand_factor: None,
         }
     }
 
-    pub fn columns(mut self, columns: Option<Vec<String>>) -> Self {
-        if let Some(columns) = columns {
-            self.columns = columns;
-        }
-        self
-    }
-
+    /// limit the number of results to return
+    /// if None, return all results
     pub fn limit(mut self, limit: Option<i64>) -> Self {
         self.limit = limit;
-        self
-    }
-
-    pub fn max_distance(mut self, max_distance: Option<u32>) -> Self {
-        self.max_distance = max_distance;
         self
     }
 
     pub fn wand_factor(mut self, wand_factor: Option<f32>) -> Self {
         self.wand_factor = wand_factor;
         self
+    }
+}
+
+impl Into<FtsSearchParams> for &FullTextSearchQuery {
+    fn into(self) -> FtsSearchParams {
+        FtsSearchParams {
+            limit: self.limit.map(|limit| limit as usize).unwrap_or(usize::MAX),
+            wand_factor: self.wand_factor.unwrap_or(1.0),
+        }
     }
 }
 
@@ -430,9 +425,9 @@ impl AnyQuery for SargableQuery {
                     .collect::<Vec<_>>(),
                 false,
             ),
-            Self::FullTextSearch(query) => {
-                col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(query.query.clone()))))
-            }
+            Self::FullTextSearch(query) => col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(
+                query.query.to_string(),
+            )))),
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone())),
         }

@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::usize;
 
 use arrow::array::{
     AsArray, Float32Builder, Int32Builder, ListBuilder, StringBuilder, UInt32Builder, UInt64Builder,
@@ -36,6 +37,7 @@ use snafu::location;
 use tracing::{info, instrument};
 
 use super::builder::inverted_list_schema;
+use super::query::*;
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::{NoFilter, PreFilter};
 use crate::scalar::{
@@ -116,68 +118,48 @@ impl InvertedIndex {
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, f32)>> {
-        let token_ids = match query.max_distance {
-            Some(max_dist) => {
-                let mut tokenizer = tantivy::tokenizer::TextAnalyzer::from(
-                    tantivy::tokenizer::SimpleTokenizer::default(),
-                );
-                let tokens = collect_tokens(&query.query, &mut tokenizer, None);
-                metrics.record_comparisons(tokens.len());
+        let params = query.into();
+        process_compound_query(&query.query, self, &params, prefilter, metrics).await
+    }
 
-                if tokens.len() != 1 {
-                    return Err(Error::Index {
-                        message: format!(
-                            "the number of tokens must be 1 for fuzzy search but got {}",
-                            tokens.len()
-                        ),
-                        location: location!(),
-                    });
-                }
-                let token = &tokens[0];
-                let lev = fst::automaton::Levenshtein::new(token, max_dist).map_err(|e| {
-                    Error::Index {
-                        message: format!("failed to construct the fuzzy query: {}", e),
-                        location: location!(),
-                    }
+    fn to_builder(&self) -> InvertedIndexBuilder {
+        let tokens = self.tokens.clone().into_mut();
+        let inverted_list = self.inverted_list.clone();
+        let docs = self.docs.clone();
+        InvertedIndexBuilder::from_existing_index(self.params.clone(), tokens, inverted_list, docs)
+    }
+}
+
+impl Searcher for InvertedIndex {
+    fn tokenizer(&self) -> tantivy::tokenizer::TextAnalyzer {
+        self.tokenizer.clone()
+    }
+
+    fn expand_fuzzy(&self, tokens: Vec<String>, max_distance: Option<u32>) -> Result<Vec<String>> {
+        let mut new_tokens = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            let max_dist = match max_distance {
+                Some(max_dist) => max_dist,
+                None => MatchQuery::auto_dist(&token),
+            };
+            let lev =
+                fst::automaton::Levenshtein::new(&token, max_dist).map_err(|e| Error::Index {
+                    message: format!("failed to construct the fuzzy query: {}", e),
+                    location: location!(),
                 })?;
-                if let TokenMap::Fst(ref map) = self.tokens.tokens {
-                    let mut stream = map.search(lev).into_stream();
-                    let mut token_ids = Vec::new();
-                    while let Some((_, token_id)) = stream.next() {
-                        token_ids.push(token_id as u32);
-                    }
-                    token_ids
-                } else {
-                    return Err(Error::Index {
-                        message: "tokens is not fst, which is not expected".to_owned(),
-                        location: location!(),
-                    });
+            if let TokenMap::Fst(ref map) = self.tokens.tokens {
+                let mut stream = map.search(lev).into_stream();
+                while let Some((token, _)) = stream.next() {
+                    new_tokens.push(String::from_utf8_lossy(token).into_owned());
                 }
+            } else {
+                return Err(Error::Index {
+                    message: "tokens is not fst, which is not expected".to_owned(),
+                    location: location!(),
+                });
             }
-            None => {
-                let mut tokenizer = self.tokenizer.clone();
-                let tokens = collect_tokens(&query.query, &mut tokenizer, None);
-                metrics.record_comparisons(tokens.len());
-
-                let mut token_ids = self.map(&tokens);
-                if is_phrase_query(&query.query) {
-                    if !self.inverted_list.has_positions() {
-                        return Err(Error::Index { message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), location: location!() });
-                    }
-                    // some tokens are missed,
-                    // so the phrase query will not match any documents
-                    if token_ids.len() != tokens.len() {
-                        return Ok(Vec::new());
-                    }
-                } else {
-                    token_ids.sort_unstable();
-                    token_ids.dedup();
-                }
-                token_ids
-            }
-        };
-
-        self.bm25_search(token_ids, query, prefilter, metrics).await
+        }
+        Ok(new_tokens)
     }
 
     // search the documents that contain the query
@@ -186,19 +168,16 @@ impl InvertedIndex {
     #[instrument(level = "debug", skip_all)]
     async fn bm25_search(
         &self,
-        token_ids: Vec<u32>,
-        query: &FullTextSearchQuery,
+        tokens: Vec<String>,
+        params: &FtsSearchParams,
+        is_phrase_query: bool,
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, f32)>> {
-        let limit = query
-            .limit
-            .map(|limit| limit as usize)
-            .unwrap_or(usize::MAX);
-        let wand_factor = query.wand_factor.unwrap_or(1.0);
+        metrics.record_comparisons(tokens.len());
 
         let mask = prefilter.mask();
-        let is_phrase_query = is_phrase_query(&query.query);
+        let token_ids = self.map(&tokens);
         let postings = stream::iter(token_ids)
             .enumerate()
             .zip(repeat_with(|| (self.inverted_list.clone(), mask.clone())))
@@ -220,19 +199,17 @@ impl InvertedIndex {
             .await?;
 
         let mut wand = Wand::new(self.docs.len(), postings.into_iter());
-        wand.search(is_phrase_query, limit, wand_factor, |doc, freq| {
-            let doc_norm =
-                K1 * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / self.docs.average_length());
-            freq / (freq + doc_norm)
-        })
+        wand.search(
+            is_phrase_query,
+            params.limit,
+            params.wand_factor,
+            |doc, freq| {
+                let doc_norm = K1
+                    * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / self.docs.average_length());
+                freq / (freq + doc_norm)
+            },
+        )
         .await
-    }
-
-    fn to_builder(&self) -> InvertedIndexBuilder {
-        let tokens = self.tokens.clone().into_mut();
-        let inverted_list = self.inverted_list.clone();
-        let docs = self.docs.clone();
-        InvertedIndexBuilder::from_existing_index(self.params.clone(), tokens, inverted_list, docs)
     }
 }
 
@@ -1103,6 +1080,8 @@ pub fn idf(nq: usize, num_docs: usize) -> f32 {
     ((num_docs - nq as f32 + 0.5) / (nq as f32 + 0.5) + 1.0).ln()
 }
 
+struct 
+
 pub fn flat_full_text_search(
     batches: &[&RecordBatch],
     doc_col: &str,
@@ -1256,24 +1235,6 @@ pub fn flat_bm25_search_stream(
     });
 
     Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
-}
-
-pub fn collect_tokens(
-    text: &str,
-    tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
-    inclusive: Option<&HashSet<String>>,
-) -> Vec<String> {
-    let mut stream = tokenizer.token_stream(text);
-    let mut tokens = Vec::new();
-    while let Some(token) = stream.next() {
-        if let Some(inclusive) = inclusive {
-            if !inclusive.contains(&token.text) {
-                continue;
-            }
-        }
-        tokens.push(token.text.to_owned());
-    }
-    tokens
 }
 
 pub fn is_phrase_query(query: &str) -> bool {
