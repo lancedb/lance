@@ -1131,7 +1131,8 @@ mod tests {
             }
             if count >= 10 {
                 panic!(
-                    "failed to hit the retrain threshold {}",
+                    "failed to hit the retrain threshold {} < {}",
+                    last_avg_loss / original_avg_loss,
                     AVG_LOSS_RETRAIN_THRESHOLD
                 );
             }
@@ -1156,7 +1157,7 @@ mod tests {
         let ivf_models = get_ivf_models(&dataset).await;
         let ivf = &ivf_models[0];
         assert_ne!(original_ivf.centroids, ivf.centroids);
-        if params.metric_type != DistanceType::Hamming {
+        if ivf.num_partitions() > 1 && params.metric_type != DistanceType::Hamming {
             assert_lt!(get_avg_loss(&dataset).await, last_avg_loss);
         }
     }
@@ -1211,6 +1212,9 @@ mod tests {
     }
 
     #[rstest]
+    #[case(1, DistanceType::L2, 0.9)]
+    #[case(1, DistanceType::Cosine, 0.9)]
+    #[case(1, DistanceType::Dot, 0.85)]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
     #[case(4, DistanceType::Dot, 0.85)]
