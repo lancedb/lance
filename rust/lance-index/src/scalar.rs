@@ -280,10 +280,9 @@ impl FullTextSearchQuery {
 
     /// Create a new fuzzy query
     pub fn new_fuzzy(term: String, max_distance: Option<u32>) -> Self {
-        let query = inverted::query::FtsQuery::Match(inverted::query::MatchQuery::new_fuzzy(
-            term,
-            max_distance,
-        ))
+        let query = inverted::query::FtsQuery::Match(
+            inverted::query::MatchQuery::new(term).with_fuzziness(max_distance),
+        )
         .into();
         Self {
             query,

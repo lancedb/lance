@@ -88,6 +88,18 @@ impl FtsQuery {
     }
 }
 
+impl From<MatchQuery> for FtsQuery {
+    fn from(query: MatchQuery) -> Self {
+        Self::Match(query)
+    }
+}
+
+impl From<PhraseQuery> for FtsQuery {
+    fn from(query: PhraseQuery) -> Self {
+        Self::Phrase(query)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchQuery {
     // The field to search in.
@@ -96,14 +108,13 @@ pub struct MatchQuery {
     pub terms: String,
     pub boost: f32,
 
-    // fuzzy query
-    pub is_fuzzy: bool,
     // The max edit distance for fuzzy matching.
+    // If Some(0), it will be exact match.
     // If None, it will be determined automatically by the rules:
     // - 0 for terms with length <= 2
     // - 1 for terms with length <= 5
     // - 2 for terms with length > 5
-    pub max_distance: Option<u32>,
+    pub fuzziness: Option<u32>,
 }
 
 impl MatchQuery {
@@ -112,18 +123,7 @@ impl MatchQuery {
             field: None,
             terms,
             boost: 1.0,
-            is_fuzzy: false,
-            max_distance: None,
-        }
-    }
-
-    pub fn new_fuzzy(terms: String, max_distance: Option<u32>) -> Self {
-        Self {
-            field: None,
-            terms,
-            boost: 1.0,
-            is_fuzzy: true,
-            max_distance,
+            fuzziness: Some(0),
         }
     }
 
@@ -137,13 +137,12 @@ impl MatchQuery {
         self
     }
 
-    pub fn with_max_distance(mut self, max_distance: Option<u32>) -> Self {
-        self.is_fuzzy = true;
-        self.max_distance = max_distance;
+    pub fn with_fuzziness(mut self, fuzziness: Option<u32>) -> Self {
+        self.fuzziness = fuzziness;
         self
     }
 
-    pub fn auto_dist(token: &str) -> u32 {
+    pub fn auto_fuzziness(token: &str) -> u32 {
         match token.len() {
             0..=2 => 0,
             3..=5 => 1,
@@ -204,6 +203,18 @@ impl From<FtsQuery> for CompoundQuery {
     }
 }
 
+impl From<BoostQuery> for CompoundQuery {
+    fn from(query: BoostQuery) -> Self {
+        Self::Boost(query)
+    }
+}
+
+impl From<MultiMatchQuery> for CompoundQuery {
+    fn from(query: MultiMatchQuery) -> Self {
+        Self::MultiMatch(query)
+    }
+}
+
 impl std::fmt::Display for CompoundQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -247,13 +258,13 @@ pub struct BoostQuery {
 
 impl BoostQuery {
     pub fn new(
-        positive: Box<CompoundQuery>,
-        negative: Box<CompoundQuery>,
+        positive: CompoundQuery,
+        negative: CompoundQuery,
         negative_boost: Option<f32>,
     ) -> Self {
         Self {
-            positive,
-            negative,
+            positive: Box::new(positive),
+            negative: Box::new(negative),
             negative_boost: negative_boost.unwrap_or(0.5),
         }
     }
@@ -269,6 +280,7 @@ impl FtsQueryNode for BoostQuery {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultiMatchQuery {
+    // each query must be a match query with specified field
     pub match_queries: Vec<CompoundQuery>,
 }
 

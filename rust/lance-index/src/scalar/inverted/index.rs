@@ -129,7 +129,7 @@ impl InvertedIndex {
         for token in tokens {
             let max_dist = match max_distance {
                 Some(max_dist) => max_dist,
-                None => MatchQuery::auto_dist(&token),
+                None => MatchQuery::auto_fuzziness(&token),
             };
             let lev =
                 fst::automaton::Levenshtein::new(&token, max_dist).map_err(|e| Error::Index {

@@ -24,6 +24,7 @@ use lance::Result;
 use lance::{datatypes::Schema, io::ObjectStore};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
+use lance_index::scalar::inverted::query::CompoundQuery;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
 use lance_index::vector::v3::subindex::IvfSubIndex;
@@ -35,6 +36,7 @@ use lance_linalg::{
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use pyo3::intern;
+use pyo3::types::PyDict;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
@@ -281,5 +283,117 @@ pub fn class_name(ob: &Bound<'_, PyAny>) -> PyResult<String> {
     match full_name.rsplit_once('.') {
         Some((_, name)) => Ok(name.to_string()),
         None => Ok(full_name),
+    }
+}
+
+pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<CompoundQuery> {
+    let query_type = query.keys().get_item(0)?.extract::<String>()?;
+    let query_value = query
+        .get_item(&query_type)?
+        .ok_or(PyValueError::new_err(format!(
+            "Query type {} not found",
+            query_type
+        )))?;
+    let query_value = query_value.downcast::<PyDict>()?;
+
+    match query_type.as_str() {
+        "match" => {
+            let field = query_value.keys().get_item(0)?.extract::<String>()?;
+            let params = query_value
+                .get_item(&field)?
+                .ok_or(PyValueError::new_err(format!("field {} not found", field)))?;
+            let params = params.downcast::<PyDict>()?;
+
+            let query = params
+                .get_item("query")?
+                .ok_or(PyValueError::new_err("query not found"))?
+                .extract::<String>()?;
+            let boost = params
+                .get_item("boost")?
+                .ok_or(PyValueError::new_err("boost not found"))?
+                .extract::<f32>()?;
+            let fuzziness = params
+                .get_item("fuzziness")?
+                .ok_or(PyValueError::new_err("fuzziness not found"))?
+                .extract::<Option<u32>>()?;
+
+            let query = lance_index::scalar::inverted::query::MatchQuery::new(query)
+                .with_field(Some(field))
+                .with_boost(boost)
+                .with_fuzziness(fuzziness);
+            Ok(CompoundQuery::Leaf(query.into()))
+        }
+
+        "match_phrase" => {
+            let field = query_value.keys().get_item(0)?.extract::<String>()?;
+            let query = query_value
+                .get_item(&field)?
+                .ok_or(PyValueError::new_err(format!("field {} not found", field)))?
+                .extract::<String>()?;
+
+            let query = lance_index::scalar::inverted::query::PhraseQuery::new(query)
+                .with_field(Some(field));
+            Ok(CompoundQuery::Leaf(query.into()))
+        }
+
+        "boost" => {
+            let field = query_value.keys().get_item(0)?.extract::<String>()?;
+            let params = query_value
+                .get_item(&field)?
+                .ok_or(PyValueError::new_err(format!("field {} not found", field)))?;
+            let params = params.downcast::<PyDict>()?;
+
+            let positive = params
+                .get_item("positive")?
+                .ok_or(PyValueError::new_err("positive not found"))?;
+            let positive = positive.downcast::<PyDict>()?;
+
+            let negative = params
+                .get_item("negative")?
+                .ok_or(PyValueError::new_err("negative not found"))?;
+            let negative = negative.downcast::<PyDict>()?;
+
+            let negative_boost = params
+                .get_item("negative_boost")?
+                .ok_or(PyValueError::new_err("negative_boost not found"))?
+                .extract::<f32>()?;
+
+            let positive_query = parse_fts_query(positive)?;
+            let negative_query = parse_fts_query(negative)?;
+            let query = lance_index::scalar::inverted::query::BoostQuery::new(
+                positive_query,
+                negative_query,
+                Some(negative_boost),
+            );
+
+            Ok(query.into())
+        }
+
+        "multi_match" => {
+            let query = query_value
+                .get_item("query")?
+                .ok_or(PyValueError::new_err("query not found"))?
+                .extract::<String>()?;
+
+            let fields = query_value
+                .get_item("fields")?
+                .ok_or(PyValueError::new_err("fields not found"))?
+                .extract::<Vec<String>>()?;
+
+            let boost = query_value
+                .get_item("boost")?
+                .ok_or(PyValueError::new_err("boost not found"))?
+                .extract::<Vec<f32>>()?;
+
+            let query = lance_index::scalar::inverted::query::MultiMatchQuery::with_boosts(
+                query, fields, boost,
+            );
+            Ok(query.into())
+        }
+
+        _ => Err(PyValueError::new_err(format!(
+            "Unsupported query type: {}",
+            query_type
+        ))),
     }
 }

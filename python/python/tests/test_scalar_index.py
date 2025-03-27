@@ -13,6 +13,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from lance.query import Query
 from lance.vector import vec_to_table
 
 
@@ -371,10 +372,7 @@ def test_fts_fuzzy_query(tmp_path):
     ds = lance.write_dataset(data, tmp_path)
     ds.create_scalar_index("text", "INVERTED")
     results = ds.to_table(
-        full_text_query={
-            "query": "foo",
-            "max_distance": 1,
-        }
+        full_text_query=Query.match_query("foo", field="text", fuzziness=1),
     )
     assert results.num_rows == 4
     assert set(results["text"].to_pylist()) == {

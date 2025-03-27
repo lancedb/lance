@@ -260,15 +260,17 @@ impl ExecutionPlan for MatchQueryExec {
                                 column,
                             ))
                         })?;
-                let mut tokenizer = match query.is_fuzzy {
+
+                let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
+                let mut tokenizer = match is_fuzzy {
+                    false => inverted_idx.tokenizer(),
                     true => tantivy::tokenizer::TextAnalyzer::from(
                         tantivy::tokenizer::SimpleTokenizer::default(),
                     ),
-                    false => inverted_idx.tokenizer(),
                 };
                 let mut tokens = collect_tokens(&query.terms, &mut tokenizer, None);
-                if query.is_fuzzy {
-                    tokens = inverted_idx.expand_fuzzy(tokens, query.max_distance)?;
+                if is_fuzzy {
+                    tokens = inverted_idx.expand_fuzzy(tokens, query.fuzziness)?;
                 }
 
                 pre_filter.wait_for_ready().await?;

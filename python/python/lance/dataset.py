@@ -58,6 +58,7 @@ from .lance import (
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
+from .query import Query
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
@@ -336,7 +337,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
-        full_text_query: Optional[Union[str, dict]] = None,
+        full_text_query: Optional[Union[str, dict, Query]] = None,
         *,
         prefilter: Optional[bool] = None,
         with_row_id: Optional[bool] = None,
@@ -519,9 +520,9 @@ class LanceDataset(pa.dataset.Dataset):
                     builder = builder.columns(default_columns)
 
         if full_text_query is not None:
-            if isinstance(full_text_query, str):
+            if isinstance(full_text_query, (str, Query)):
                 builder = builder.full_text_search(full_text_query)
-            else:
+            elif isinstance(full_text_query, dict):
                 builder = builder.full_text_search(**full_text_query)
         if nearest is not None:
             builder = builder.nearest(**nearest)
@@ -575,7 +576,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict]] = None,
+        full_text_query: Optional[Union[str, dict, Query]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
@@ -3375,9 +3376,8 @@ class ScannerBuilder:
 
     def full_text_search(
         self,
-        query: str,
+        query: str | Query,
         columns: Optional[List[str]] = None,
-        max_distance: Optional[int] = None,
     ) -> ScannerBuilder:
         """
         Filter rows by full text searching. *Experimental API*,
@@ -3387,22 +3387,22 @@ class ScannerBuilder:
 
         Parameters
         ----------
-        query : str
-            The query string to search for.
+        query : str | Query
+            If str, the query string to search for.
+            If Query, the query object to search for,
+            and the `columns` parameter will be ignored.
         columns : list of str, optional
             The columns to search in. If None, search in all indexed columns.
-        max_distance : int, optional
-            The maximum distance between words to consider a match.
-            If None, then it is not used in the search.
-            Otherwise, it must be a positive integer, and the query is fuzzy query.
-            Any token within the max_distance will be considered a match,
-            the distance is edit distance (insertions, deletions, substitutions).
         """
-        self._full_text_query = {
-            "query": query,
-            "columns": columns,
-            "max_distance": max_distance,
-        }
+        if isinstance(query, Query):
+            self._full_text_query = {
+                "query": query._inner,
+            }
+        else:
+            self._full_text_query = {
+                "query": query,
+                "columns": columns,
+            }
         return self
 
     def to_scanner(self) -> LanceScanner:
