@@ -53,17 +53,17 @@ pub(crate) fn build_prefilter(
 ) -> Result<Arc<DatasetPreFilter>> {
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
-            let stream = src_node.execute(partition, context.clone())?;
+            let stream = src_node.execute(partition, context)?;
             Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
         }
         PreFilterSource::ScalarIndexQuery(src_node) => {
-            let stream = src_node.execute(partition, context.clone())?;
+            let stream = src_node.execute(partition, context)?;
             Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
         }
         PreFilterSource::None => None,
     };
     Ok(Arc::new(DatasetPreFilter::new(
-        ds.clone(),
+        ds,
         index_meta,
         prefilter_loader,
     )))

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
 
-use itertools::Itertools;
 use lance_core::{Error, Result};
 use snafu::location;
-
-use crate::metrics::MetricsCollector;
-use crate::prefilter::PreFilter;
 
 #[derive(Debug, Clone)]
 pub struct FtsSearchParams {
@@ -36,6 +31,12 @@ impl FtsSearchParams {
     }
 }
 
+impl Default for FtsSearchParams {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub trait FtsQueryNode {
     fn fields(&self) -> HashSet<String>;
 }
@@ -49,8 +50,8 @@ pub enum FtsQuery {
 impl std::fmt::Display for FtsQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            FtsQuery::Match(query) => write!(f, "Match({:?})", query),
-            FtsQuery::Phrase(query) => write!(f, "Phrase({:?})", query),
+            Self::Match(query) => write!(f, "Match({:?})", query),
+            Self::Phrase(query) => write!(f, "Phrase({:?})", query),
         }
     }
 }
@@ -58,8 +59,8 @@ impl std::fmt::Display for FtsQuery {
 impl FtsQueryNode for FtsQuery {
     fn fields(&self) -> HashSet<String> {
         match self {
-            FtsQuery::Match(query) => query.fields(),
-            FtsQuery::Phrase(query) => query.fields(),
+            Self::Match(query) => query.fields(),
+            Self::Phrase(query) => query.fields(),
         }
     }
 }
@@ -67,15 +68,15 @@ impl FtsQueryNode for FtsQuery {
 impl FtsQuery {
     pub fn query(&self) -> &str {
         match self {
-            FtsQuery::Match(query) => &query.terms,
-            FtsQuery::Phrase(query) => &query.terms,
+            Self::Match(query) => &query.terms,
+            Self::Phrase(query) => &query.terms,
         }
     }
 
     pub fn is_missing_field(&self) -> bool {
         match self {
-            FtsQuery::Match(query) => query.field.is_none(),
-            FtsQuery::Phrase(query) => query.field.is_none(),
+            Self::Match(query) => query.field.is_none(),
+            Self::Phrase(query) => query.field.is_none(),
         }
     }
 
@@ -122,7 +123,7 @@ impl MatchQuery {
             terms,
             boost: 1.0,
             is_fuzzy: true,
-            max_distance: max_distance,
+            max_distance,
         }
     }
 
@@ -199,20 +200,20 @@ pub enum CompoundQuery {
 
 impl From<FtsQuery> for CompoundQuery {
     fn from(query: FtsQuery) -> Self {
-        CompoundQuery::Leaf(query)
+        Self::Leaf(query)
     }
 }
 
 impl std::fmt::Display for CompoundQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            CompoundQuery::Leaf(query) => write!(f, "Leaf({})", query),
-            CompoundQuery::Boost(query) => write!(
+            Self::Leaf(query) => write!(f, "Leaf({})", query),
+            Self::Boost(query) => write!(
                 f,
                 "Boosting(positive={}, negative={}, negative_boost={})",
                 query.positive, query.negative, query.negative_boost
             ),
-            CompoundQuery::MultiMatch(query) => write!(f, "MultiMatch({:?})", query),
+            Self::MultiMatch(query) => write!(f, "MultiMatch({:?})", query),
         }
     }
 }
@@ -220,13 +221,13 @@ impl std::fmt::Display for CompoundQuery {
 impl FtsQueryNode for CompoundQuery {
     fn fields(&self) -> HashSet<String> {
         match self {
-            CompoundQuery::Leaf(query) => query.fields(),
-            CompoundQuery::Boost(query) => {
+            Self::Leaf(query) => query.fields(),
+            Self::Boost(query) => {
                 let mut fields = query.positive.fields();
                 fields.extend(query.negative.fields());
                 fields
             }
-            CompoundQuery::MultiMatch(query) => {
+            Self::MultiMatch(query) => {
                 let mut fields = HashSet::new();
                 for match_query in &query.match_queries {
                     fields.extend(match_query.fields());
@@ -285,7 +286,7 @@ impl MultiMatchQuery {
     pub fn with_boosts(query: String, fields: Vec<String>, boosts: Vec<f32>) -> Self {
         let match_queries = fields
             .into_iter()
-            .zip(boosts.into_iter())
+            .zip(boosts)
             .map(|(field, boost)| {
                 FtsQuery::Match(
                     MatchQuery::new(query.clone())
@@ -307,19 +308,6 @@ impl FtsQueryNode for MultiMatchQuery {
         }
         fields
     }
-}
-
-pub trait Searcher {
-    fn tokenizer(&self) -> tantivy::tokenizer::TextAnalyzer;
-    fn expand_fuzzy(&self, tokens: Vec<String>, max_distance: Option<u32>) -> Result<Vec<String>>;
-    async fn bm25_search(
-        &self,
-        tokens: &[String],
-        params: &FtsSearchParams,
-        is_phrase_query: bool,
-        prefilter: Arc<dyn PreFilter>,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<(Vec<u64>, Vec<f32>)>;
 }
 
 pub fn collect_tokens(
@@ -353,10 +341,10 @@ pub fn fill_fts_query_field(
 
             match columns.len() {
                 0 => {
-                    return Err(Error::invalid_input(
+                    Err(Error::invalid_input(
                         "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
                         location!(),
-                    ));
+                    ))
                 }
                 1 => {
                     let field = columns[0].clone();
@@ -372,11 +360,9 @@ pub fn fill_fts_query_field(
             }
         }
         // for compound queries, we require the users to specify the field
-        _ => {
-            return Err(Error::invalid_input(
-                "the field must be specified in the query".to_string(),
-                location!(),
-            ));
-        }
+        _ => Err(Error::invalid_input(
+            "the field must be specified in the query".to_string(),
+            location!(),
+        )),
     }
 }

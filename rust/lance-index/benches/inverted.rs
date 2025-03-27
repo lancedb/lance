@@ -16,7 +16,7 @@ use lance_core::cache::FileMetadataCache;
 use lance_core::ROW_ID;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::NoFilter;
-use lance_index::scalar::inverted::query::{FtsSearchParams, Searcher};
+use lance_index::scalar::inverted::query::FtsSearchParams;
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;

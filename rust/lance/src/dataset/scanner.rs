@@ -18,7 +18,6 @@ use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
-use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -49,9 +48,9 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::inverted::query::{
-    fill_fts_query_field, CompoundQuery, FtsQuery, FtsSearchParams, MultiMatchQuery,
+    fill_fts_query_field, CompoundQuery, FtsQuery, FtsSearchParams,
 };
-use lance_index::scalar::inverted::{FTS_SCHEMA, SCORE_COL};
+use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};

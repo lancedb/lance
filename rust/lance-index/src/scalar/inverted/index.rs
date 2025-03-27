@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::cell::Cell;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::usize;
 
 use arrow::array::{
     AsArray, Float32Builder, Int32Builder, ListBuilder, StringBuilder, UInt32Builder, UInt64Builder,
@@ -29,27 +25,23 @@ use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
-use lance_core::utils::mask::RowIdTreeMap;
-use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
 use moka::future::Cache;
 use roaring::RoaringBitmap;
 use snafu::location;
-use tokio::sync::Mutex;
 use tracing::{info, instrument};
 
 use super::builder::inverted_list_schema;
 use super::query::*;
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
-use crate::metrics::NoOpMetricsCollector;
-use crate::prefilter::{NoFilter, PreFilter};
+use crate::prefilter::PreFilter;
 use crate::scalar::{
-    AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, InvertedIndexParams, MetricsCollector,
-    SargableQuery, ScalarIndex, SearchResult,
+    AnyQuery, IndexReader, IndexStore, InvertedIndexParams, MetricsCollector, SargableQuery,
+    ScalarIndex, SearchResult,
 };
-use crate::vector::graph::OrderedFloat;
 use crate::Index;
 
 pub const TOKENS_FILE: &str = "tokens.lance";
@@ -123,14 +115,16 @@ impl InvertedIndex {
         let docs = self.docs.clone();
         InvertedIndexBuilder::from_existing_index(self.params.clone(), tokens, inverted_list, docs)
     }
-}
 
-impl Searcher for InvertedIndex {
-    fn tokenizer(&self) -> tantivy::tokenizer::TextAnalyzer {
+    pub fn tokenizer(&self) -> tantivy::tokenizer::TextAnalyzer {
         self.tokenizer.clone()
     }
 
-    fn expand_fuzzy(&self, tokens: Vec<String>, max_distance: Option<u32>) -> Result<Vec<String>> {
+    pub fn expand_fuzzy(
+        &self,
+        tokens: Vec<String>,
+        max_distance: Option<u32>,
+    ) -> Result<Vec<String>> {
         let mut new_tokens = Vec::with_capacity(tokens.len());
         for token in tokens {
             let max_dist = match max_distance {
@@ -161,7 +155,7 @@ impl Searcher for InvertedIndex {
     // return the row ids of the documents sorted by bm25 score
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     #[instrument(level = "debug", skip_all)]
-    async fn bm25_search(
+    pub async fn bm25_search(
         &self,
         tokens: &[String],
         params: &FtsSearchParams,
@@ -248,19 +242,13 @@ impl ScalarIndex for InvertedIndex {
     async fn search(
         &self,
         query: &dyn AnyQuery,
-        metrics: &dyn MetricsCollector,
+        _metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        let row_ids = match query {
-            query => {
-                return Err(Error::invalid_input(
-                    format!("unsupported query {:?} for inverted index", query),
-                    location!(),
-                ))
-            }
-        };
-
-        // Ok(SearchResult::Exact(RowIdTreeMap::from_iter(row_ids)))
+        return Err(Error::invalid_input(
+            format!("unsupported query {:?} for inverted index", query),
+            location!(),
+        ));
     }
 
     fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
