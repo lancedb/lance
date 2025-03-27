@@ -58,7 +58,7 @@ use futures::{
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::futures::Capacity,
+    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -665,6 +665,7 @@ impl MergeInsertJob {
         use datafusion::logical_expr::{col, lit};
         let session_ctx = get_session_context(&LanceExecutionOptions {
             use_spilling: true,
+            target_partition: Some(get_num_compute_intensive_cpus().min(8)),
             ..Default::default()
         });
         let mut group_stream = session_ctx
