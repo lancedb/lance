@@ -755,11 +755,18 @@ impl StorageOptions {
     pub fn with_env_gcs(&mut self) {
         for (os_key, os_value) in std::env::vars_os() {
             if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
-                if let Ok(config_key) = GoogleConfigKey::from_str(&key.to_ascii_lowercase()) {
+                let lowercase_key = key.to_ascii_lowercase();
+                let token_key = "google_storage_token";
+
+                if let Ok(config_key) = GoogleConfigKey::from_str(&lowercase_key) {
                     if !self.0.contains_key(config_key.as_ref()) {
                         self.0
                             .insert(config_key.as_ref().to_string(), value.to_string());
                     }
+                }
+                // Check for GOOGLE_STORAGE_TOKEN until GoogleConfigKey supports storage token
+                else if lowercase_key == token_key && !self.0.contains_key(token_key) {
+                    self.0.insert(token_key.to_string(), value.to_string());
                 }
             }
         }
