@@ -5,14 +5,17 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use chrono::TimeDelta;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions, StorageClass,
 };
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
+use lance_datafusion::spill::{create_spill, SpillReceiver, SpillSender};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
@@ -641,6 +644,102 @@ async fn resolve_commit_handler(
                 Ok(commit_handler)
             }
         }
+    }
+}
+
+/// Create an iterator of record batch streams from the given source.
+///
+/// If `enable_retries` is true, the source will be collected, and the
+/// resulting iterator will be an infinite iterator that returns the same
+/// batches over and over again. Otherwise, the source will be yielded by a
+/// one-item iterator.
+///
+/// This is used to support retries on write operations.
+async fn new_source_iter(
+    source: SendableRecordBatchStream,
+    enable_retries: bool,
+) -> Result<Box<dyn Iterator<Item = SendableRecordBatchStream> + Send + 'static>> {
+    if enable_retries {
+        let schema = source.schema();
+
+        // If size hint shows there is only one batch, spilling has no benefit, just keep that
+        // in memory. (This is a pretty common case.)
+        let size_hint = source.size_hint();
+        if size_hint.0 == 1 && size_hint.1 == Some(1) {
+            let batches: Vec<RecordBatch> = source.try_collect().await?;
+            Ok(Box::new(std::iter::repeat_with(move || {
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(batches.clone().into_iter().map(Ok)),
+                )) as SendableRecordBatchStream
+            })))
+        } else {
+            Ok(Box::new(SpillStreamIter::try_new(source).await?))
+        }
+    } else {
+        Ok(Box::new(std::iter::once(source)))
+    }
+}
+
+struct SpillStreamIter {
+    receiver: SpillReceiver,
+    #[allow(dead_code)] // Exists to keep the SpillSender alive
+    sender_handle: tokio::task::JoinHandle<SpillSender>,
+    #[allow(dead_code)] // Exists to keep the temp dir alive
+    tmp_dir: tempfile::TempDir,
+}
+
+impl SpillStreamIter {
+    pub async fn try_new(mut source: SendableRecordBatchStream) -> Result<Self> {
+        let tmp_dir = tokio::task::spawn_blocking(|| {
+            tempfile::tempdir().map_err(|e| Error::InvalidInput {
+                source: format!("Failed to create temp dir: {}", e).into(),
+                location: location!(),
+            })
+        })
+        .await
+        .ok()
+        .expect_ok()??;
+
+        let tmp_path = tmp_dir.path().join("spill.arrows");
+        let (mut sender, receiver) = create_spill(tmp_path, source.schema());
+
+        let sender_handle = tokio::task::spawn(async move {
+            while let Some(res) = source.next().await {
+                match res {
+                    Ok(batch) => match sender.write(batch).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            sender.send_error(e);
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        sender.send_error(e);
+                        break;
+                    }
+                }
+            }
+
+            if let Err(err) = sender.finish().await {
+                sender.send_error(err);
+            }
+            sender
+        });
+
+        Ok(Self {
+            receiver,
+            tmp_dir,
+            sender_handle,
+        })
+    }
+}
+
+impl Iterator for SpillStreamIter {
+    type Item = SendableRecordBatchStream;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.receiver.read())
     }
 }
 

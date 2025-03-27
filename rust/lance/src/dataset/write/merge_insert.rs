@@ -58,7 +58,7 @@ use futures::{
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::{backoff::Backoff, futures::Capacity, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -224,10 +224,12 @@ struct MergeInsertParams {
     insert_not_matched: bool,
     // Controls whether data that is not matched by the source is deleted or not
     delete_not_matched_by_source: WhenNotMatchedBySource,
+    conflict_retries: u32,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
 /// part of a single transaction.
+#[derive(Clone)]
 pub struct MergeInsertJob {
     // The column to merge the new data into
     dataset: Arc<Dataset>,
@@ -299,6 +301,7 @@ impl MergeInsertBuilder {
                 when_matched: WhenMatched::DoNothing,
                 insert_not_matched: true,
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
+                conflict_retries: 10,
             },
         })
     }
@@ -325,6 +328,17 @@ impl MergeInsertBuilder {
     /// These are typically "old rows"
     pub fn when_not_matched_by_source(&mut self, behavior: WhenNotMatchedBySource) -> &mut Self {
         self.params.delete_not_matched_by_source = behavior;
+        self
+    }
+
+    /// Set number of times to retry the operation if there is contention.
+    ///
+    /// values > 0 will collect all data into memory. If you want to stream out
+    /// the data, set this to 0.
+    ///
+    /// Default is 10.
+    pub fn conflict_retries(&mut self, retries: u32) -> &mut Self {
+        self.params.conflict_retries = retries;
         self
     }
 
@@ -993,13 +1007,41 @@ impl MergeInsertJob {
     /// This will take in the source, merge it with the existing target data, and insert new
     /// rows, update existing rows, and delete existing rows
     pub async fn execute(
-        self,
+        mut self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let ds = self.dataset.clone();
-        let (transaction, stats) = self.execute_uncommitted_impl(source).await?;
-        let dataset = CommitBuilder::new(ds).execute(transaction).await?;
-        Ok((Arc::new(dataset), stats))
+        let mut source_iter =
+            super::new_source_iter(source, self.params.conflict_retries > 0).await?;
+
+        let mut dataset_ref = self.dataset.clone();
+        let max_retries = self.params.conflict_retries;
+        let mut backoff = Backoff::default();
+        while backoff.attempt() <= max_retries {
+            let ds = dataset_ref.clone();
+            let (transaction, stats) = self
+                .clone()
+                .execute_uncommitted_impl(source_iter.next().unwrap())
+                .await?;
+            match CommitBuilder::new(ds).execute(transaction).await {
+                Ok(ds) => return Ok((Arc::new(ds), stats)),
+                Err(Error::RetryableCommitConflict { .. }) => {
+                    tokio::time::sleep(backoff.next_backoff()).await;
+                    let mut ds = dataset_ref.as_ref().clone();
+                    ds.checkout_latest().await?;
+                    dataset_ref = Arc::new(ds);
+                    self.dataset = dataset_ref.clone();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+        }
+        Err(Error::TooMuchContention {
+            message: format!(
+                "Attempted {} retries, but there is too much contention on the table.",
+                max_retries
+            ),
+            location: location!(),
+        })
     }
 
     /// Execute the merge insert job without committing the changes.
@@ -1442,12 +1484,14 @@ mod tests {
     };
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
+    use futures::future::try_join_all;
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use tempfile::tempdir;
+    use tokio::sync::{Barrier, Notify};
 
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{builder::DatasetBuilder, InsertBuilder, WriteMode, WriteParams};
 
     use super::*;
 
@@ -2086,5 +2130,184 @@ mod tests {
                 assert_eq!(values.value(1024), 1024 + new_data.num_rows() as u32 - 2);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_concurrency() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let num_rows = 10;
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..num_rows)),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(
+                    0,
+                    num_rows as usize,
+                ))),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = InsertBuilder::new(test_uri)
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+
+        // do 10 merge inserts in parallel. Each will open the dataset, signal
+        // they have opened, and then wait for a signal to proceed. Once the signal
+        // is received, they will do a merge insert and close the dataset.
+
+        let barrier = Arc::new(Barrier::new(10));
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let uri_ref = test_uri.to_string();
+            let schema_ref = schema.clone();
+            let barrier_ref = barrier.clone();
+            let handle = tokio::task::spawn(async move {
+                let dataset = DatasetBuilder::from_uri(&uri_ref).load().await.unwrap();
+                let dataset = Arc::new(dataset);
+
+                let new_data = RecordBatch::try_new(
+                    schema_ref.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(vec![i])),
+                        Arc::new(UInt32Array::from(vec![1])),
+                    ],
+                )
+                .unwrap();
+                let source = Box::new(RecordBatchIterator::new([Ok(new_data)], schema_ref.clone()));
+
+                let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap();
+                barrier_ref.wait().await;
+
+                job.execute_reader(source).await.unwrap();
+            });
+            handles.push(handle);
+        }
+
+        try_join_all(handles).await.unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+        let batches = dataset.scan().try_into_batch().await.unwrap();
+
+        let values = batches["value"].as_primitive::<UInt32Type>();
+        assert!(
+            values.values().iter().all(|&v| v == 1),
+            "All values should be 1 after merge insert. Got: {:?}",
+            values
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_large_concurrent() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let num_rows = 10;
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..num_rows)),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(
+                    0,
+                    num_rows as usize,
+                ))),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = InsertBuilder::new(test_uri)
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Start one merge insert, but don't commit it yet.
+        let new_data1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1])),
+                Arc::new(UInt32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let (transaction1, _stats) =
+            MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(RecordBatchIterator::new(
+                    vec![Ok(new_data1)],
+                    schema.clone(),
+                ))
+                .await
+                .unwrap();
+
+        // Setup a "large" merge insert, with many batches
+        let new_data2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..1000)),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(2, 1000))),
+            ],
+        )
+        .unwrap();
+        let notify = Arc::new(Notify::new());
+        let source = RecordBatchIterator::new(
+            (0..10)
+                .map(|i| {
+                    let batch = new_data2.slice(i * 100, 100);
+                    if i == 9 {
+                        notify.notify_one();
+                    }
+                    Ok(batch)
+                })
+                .collect::<Vec<_>>(),
+            schema.clone(),
+        );
+        let dataset2 = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset2), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(source);
+        let task = tokio::task::spawn(job);
+
+        // Right as the large merge insert has finished reading the last batch,
+        // we will commit the first merge insert. This should trigger a conflict,
+        // but we should resolve it automatically.
+        notify.notified().await;
+        let mut dataset = CommitBuilder::new(dataset)
+            .execute(transaction1)
+            .await
+            .unwrap();
+
+        task.await.unwrap().unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        let batches = dataset.scan().try_into_batch().await.unwrap();
+        let values = batches["value"].as_primitive::<UInt32Type>();
+        assert!(
+            values.values().iter().all(|&v| v == 2),
+            "All values should be 1 after merge insert. Got: {:?}",
+            values
+        );
     }
 }

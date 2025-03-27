@@ -3192,6 +3192,7 @@ dependencies = [
  "arrow-arith",
  "arrow-array",
  "arrow-buffer",
+ "arrow-ipc",
  "arrow-ord",
  "arrow-row",
  "arrow-schema",
@@ -3210,6 +3211,7 @@ dependencies = [
  "datafusion-functions",
  "datafusion-physical-expr",
  "deepsize",
+ "either",
  "futures",
  "half",
  "humantime",
@@ -3323,6 +3325,7 @@ dependencies = [
  "log",
  "prost 0.13.5",
  "snafu",
+ "tempfile",
  "tokio",
  "tracing",
 ]
