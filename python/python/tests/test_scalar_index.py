@@ -214,6 +214,25 @@ def test_indexed_vector_scan_postfilter(
     assert scanner.to_table().num_rows == 0
 
 
+def test_fixed_size_binary(tmp_path):
+    arr = pa.array([b"0123012301230123", b"2345234523452345"], pa.uuid())
+
+    ds = lance.write_dataset(pa.table({"uuid": arr}), tmp_path)
+
+    ds.create_scalar_index("uuid", "BTREE")
+
+    query = (
+        "uuid = arrow_cast("
+        "0x32333435323334353233343532333435, "
+        "'FixedSizeBinary(16)')"
+    )
+    assert "MaterializeIndex" in ds.scanner(filter=query).explain_plan()
+
+    table = ds.scanner(filter=query).to_table()
+    assert table.num_rows == 1
+    assert table.column("uuid").to_pylist() == arr.slice(1, 1).to_pylist()
+
+
 def test_index_take_batch_size(tmp_path):
     dataset = lance.write_dataset(
         pa.table({"ints": range(1024)}), tmp_path, max_rows_per_file=100
@@ -625,6 +644,39 @@ def test_null_handling(tmp_path: Path):
             assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 3
         else:
             assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 2
+
+    check(False)
+    dataset.create_scalar_index("x", index_type="BITMAP")
+    check(True)
+    dataset.create_scalar_index("x", index_type="BTREE")
+    check(True)
+
+
+def test_nan_handling(tmp_path: Path):
+    tbl = pa.table(
+        {
+            "x": [
+                1.0,
+                float("-nan"),
+                float("infinity"),
+                float("-infinity"),
+                2.0,
+                float("nan"),
+                3.0,
+            ],
+        }
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    # There is no way, in DF, to query for NAN / INF, that I'm aware of.
+    # So the best we can do here is make sure that the presence of NAN / INF
+    # doesn't interfere with normal operation of the btree.
+    def check(has_index: bool):
+        assert dataset.to_table(filter="x IS NULL").num_rows == 0
+        assert dataset.to_table(filter="x IS NOT NULL").num_rows == 7
+        assert dataset.to_table(filter="x > 0").num_rows == 5
+        assert dataset.to_table(filter="x < 5").num_rows == 5
+        assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
 
     check(False)
     dataset.create_scalar_index("x", index_type="BITMAP")
