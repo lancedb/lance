@@ -52,6 +52,7 @@ use lance_datafusion::{
 
 use datafusion_physical_expr::expressions::Column;
 use futures::{
+    future::Either,
     stream::{self},
     Stream, StreamExt, TryStreamExt,
 };
@@ -224,6 +225,7 @@ struct MergeInsertParams {
     insert_not_matched: bool,
     // Controls whether data that is not matched by the source is deleted or not
     delete_not_matched_by_source: WhenNotMatchedBySource,
+    conflict_retries: u8,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -299,6 +301,7 @@ impl MergeInsertBuilder {
                 when_matched: WhenMatched::DoNothing,
                 insert_not_matched: true,
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
+                conflict_retries: 10,
             },
         })
     }
@@ -325,6 +328,17 @@ impl MergeInsertBuilder {
     /// These are typically "old rows"
     pub fn when_not_matched_by_source(&mut self, behavior: WhenNotMatchedBySource) -> &mut Self {
         self.params.delete_not_matched_by_source = behavior;
+        self
+    }
+
+    /// Set number of times to retry the operation if there is contention.
+    ///
+    /// values > 0 will collect all data into memory. If you want to stream out
+    /// the data, set this to 0.
+    ///
+    /// Default is 10.
+    pub fn conflict_retries(&mut self, retries: u8) -> &mut Self {
+        self.params.conflict_retries = retries;
         self
     }
 
@@ -996,10 +1010,48 @@ impl MergeInsertJob {
         self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let ds = self.dataset.clone();
-        let (transaction, stats) = self.execute_uncommitted_impl(source).await?;
-        let dataset = CommitBuilder::new(ds).execute(transaction).await?;
-        Ok((Arc::new(dataset), stats))
+        let num_attempts = 0;
+        let mut source_iter: Box<dyn Iterator<Item = SendableRecordBatchStream>> =
+            if self.params.conflict_retries == 0 {
+                Box::new(std::iter::once(source))
+            } else {
+                // Collect the source data into memory
+                let schema = source.schema();
+                let batches: Vec<RecordBatch> = source.try_collect().await?;
+                Box::new(std::iter::repeat_with(move || {
+                    Box::pin(RecordBatchStreamAdapter::new(
+                        schema.clone(),
+                        futures::stream::iter(batches.clone().into_iter().map(Ok)),
+                    )) as SendableRecordBatchStream
+                }))
+            };
+
+        let dataset_ref = self.dataset.clone();
+        let max_retries = self.params.conflict_retries;
+        while num_attempts <= max_retries {
+            let ds = dataset_ref.clone();
+            let (transaction, stats) = self
+                .execute_uncommitted_impl(source_iter.next().unwrap())
+                .await?;
+            let dataset = match CommitBuilder::new(ds).execute(transaction).await {
+                Ok(ds) => ds,
+                Err(Error::RetryableCommitConflict { .. }) => {
+                    // Retry
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if stats.num_inserted_rows == 0 && stats.num_updated_rows == 0 {
+                return Ok((Arc::new(dataset), stats));
+            }
+        }
+        Err(Error::TooMuchContention {
+            message: format!(
+                "Attempted {} retries, but there is too much contention on the table.",
+                max_retries
+            ),
+            location: location!(),
+        })
     }
 
     /// Execute the merge insert job without committing the changes.
