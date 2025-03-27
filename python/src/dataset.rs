@@ -561,16 +561,20 @@ impl Dataset {
 
                 let mut fts_query = FullTextSearchQuery::new(query.clone());
                 if let Some(columns) = columns {
-                    if columns.len() == 1 {
-                        fts_query = fts_query.with_field(columns[0].clone()).map_err(|e| {
-                            PyValueError::new_err(format!(
-                                "Failed to set field for full text search: {}",
-                                e
-                            ))
-                        })?;
-                    } else if columns.len() > 1 {
-                        let query = MultiMatchQuery::new(query, columns);
-                        fts_query = FullTextSearchQuery::new_compound(query.into());
+                    match columns.len() {
+                        0 => {}
+                        1 => {
+                            fts_query = fts_query.with_field(columns[0].clone()).map_err(|e| {
+                                PyValueError::new_err(format!(
+                                    "Failed to set field for full text search: {}",
+                                    e
+                                ))
+                            })?;
+                        }
+                        _ => {
+                            let query = MultiMatchQuery::new(query, columns);
+                            fts_query = FullTextSearchQuery::new_compound(query.into());
+                        }
                     }
                 }
                 fts_query
