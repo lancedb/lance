@@ -22,25 +22,19 @@ use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::ROW_ID;
-use lance_index::prefilter::{FilterLoader, PreFilter};
+use lance_index::prefilter::PreFilter;
 use lance_index::scalar::inverted::query::{
-    collect_tokens, BoostQuery, FtsSearchParams, MatchQuery, MultiMatchQuery, PhraseQuery, Searcher,
+    collect_tokens, BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery, Searcher,
 };
 use lance_index::scalar::inverted::{
     flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
 };
-use lance_index::scalar::FullTextSearchQuery;
 use lance_index::DatasetIndexExt;
-use lance_table::format::Index;
 use tracing::instrument;
 
-use crate::index::prefilter::DatasetPreFilter;
 use crate::{index::DatasetIndexInternalExt, Dataset};
 
-use super::utils::{
-    build_prefilter, FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter,
-    SelectionVectorToPrefilter,
-};
+use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use super::PreFilterSource;
 
 /// An execution node that performs full text search
