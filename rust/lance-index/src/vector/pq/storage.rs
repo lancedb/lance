@@ -152,6 +152,18 @@ impl ProductQuantizationStorage {
         distance_type: DistanceType,
         transposed: bool,
     ) -> Result<Self> {
+        if batch.num_columns() != 2 {
+            log::warn!(
+                "PQ storage should have 2 columns, but got {} columns: {}",
+                batch.num_columns(),
+                batch.schema(),
+            );
+            batch = batch.project(&[
+                batch.schema().index_of(ROW_ID)?,
+                batch.schema().index_of(PQ_CODE_COLUMN)?,
+            ])?;
+        }
+
         let Some(row_ids) = batch.column_by_name(ROW_ID) else {
             return Err(Error::Index {
                 message: "Row ID column not found from PQ storage".to_string(),
@@ -509,18 +521,27 @@ impl VectorStore for ProductQuantizationStorage {
 
         let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
         let new_codes = UInt8Array::from(new_codes);
-        let num_bytes_in_code = new_codes.len() / new_row_ids.len();
-        let new_transposed_codes = transpose(&new_codes, new_row_ids.len(), num_bytes_in_code);
-        let codes_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
-            new_transposed_codes.clone(),
-            num_bytes_in_code as i32,
-        )?);
-        let batch = RecordBatch::try_new(self.schema(), vec![new_row_ids.clone(), codes_fsl])?;
+        let batch = if new_row_ids.is_empty() {
+            RecordBatch::new_empty(self.schema())
+        } else {
+            let num_bytes_in_code = new_codes.len() / new_row_ids.len();
+            let new_transposed_codes = transpose(&new_codes, new_row_ids.len(), num_bytes_in_code);
+            let codes_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
+                new_transposed_codes,
+                num_bytes_in_code as i32,
+            )?);
+            RecordBatch::try_new(self.schema(), vec![new_row_ids.clone(), codes_fsl])?
+        };
+        let transposed_codes = batch[PQ_CODE_COLUMN]
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<UInt8Type>()
+            .clone();
 
         Ok(Self {
             codebook: self.codebook.clone(),
             batch,
-            pq_code: Arc::new(new_transposed_codes),
+            pq_code: Arc::new(transposed_codes),
             row_ids: new_row_ids,
             num_sub_vectors: self.num_sub_vectors,
             num_bits: self.num_bits,
@@ -957,7 +978,7 @@ mod tests {
 
     use super::*;
 
-    use arrow_array::Float32Array;
+    use arrow_array::{Float32Array, UInt32Array};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::Schema;
@@ -992,6 +1013,40 @@ mod tests {
 
         StorageBuilder::new("vec".to_owned(), pq.distance_type, pq)
             .unwrap()
+            .build(vec![batch])
+            .unwrap()
+    }
+
+    async fn create_pq_storage_with_extra_column() -> ProductQuantizationStorage {
+        let codebook = Float32Array::from_iter_values((0..256 * DIM).map(|_| rand::random()));
+        let codebook = FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap();
+        let pq = ProductQuantizer::new(NUM_SUB_VECTORS, 8, DIM, codebook, DistanceType::Dot);
+
+        let schema = ArrowSchema::new(vec![
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Field::new_list_field(DataType::Float32, true).into(),
+                    DIM as i32,
+                ),
+                true,
+            ),
+            ROW_ID_FIELD.clone(),
+            Field::new("extra", DataType::UInt32, true),
+        ]);
+        let vectors = Float32Array::from_iter_values((0..TOTAL * DIM).map(|_| rand::random()));
+        let row_ids = UInt64Array::from_iter_values((0..TOTAL).map(|v| v as u64));
+        let extra_column = UInt32Array::from_iter_values((0..TOTAL).map(|v| v as u32));
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.into(),
+            vec![Arc::new(fsl), Arc::new(row_ids), Arc::new(extra_column)],
+        )
+        .unwrap();
+
+        StorageBuilder::new("vec".to_owned(), pq.distance_type, pq)
+            .unwrap()
+            .assert_num_columns(false)
             .build(vec![batch])
             .unwrap()
     }
@@ -1052,5 +1107,26 @@ mod tests {
         let dist1 = storage.dist_between(u, v);
         let dist2 = storage.dist_between(v, u);
         assert_eq!(dist1, dist2);
+    }
+
+    #[tokio::test]
+    async fn test_remap_with_extra_column() {
+        let storage = create_pq_storage_with_extra_column().await;
+        let mut mapping = HashMap::new();
+        for i in 0..TOTAL / 2 {
+            mapping.insert(i as u64, Some((TOTAL + i) as u64));
+        }
+        for i in TOTAL / 2..TOTAL {
+            mapping.insert(i as u64, None);
+        }
+        let new_storage = storage.remap(&mapping).unwrap();
+        assert_eq!(new_storage.len(), TOTAL / 2);
+        assert_eq!(new_storage.row_ids.len(), TOTAL / 2);
+        for (i, row_id) in new_storage.row_ids().enumerate() {
+            assert_eq!(*row_id, (TOTAL + i) as u64);
+        }
+        assert_eq!(new_storage.batch.num_columns(), 2);
+        assert!(new_storage.batch.column_by_name(ROW_ID).is_some());
+        assert!(new_storage.batch.column_by_name(PQ_CODE_COLUMN).is_some());
     }
 }

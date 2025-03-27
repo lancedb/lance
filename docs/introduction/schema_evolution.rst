@@ -160,6 +160,44 @@ unsaved results for up to an entire data file.
         return pd.DataFrame({"embedding": embeddings})
     dataset.add_columns(add_random_vector)
 
+Adding new columns with Schema only
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A common use case we've seen in production is to add a new column to a dataset without
+populating it. This is useful to later run a large distributed job to populate the column
+lazily. To do this, you can use the :py:meth:`lance.LanceDataset.add_columns` method to
+add columns with :py:class:`pyarrow.Field` or :py:class:`pyarrow.Schema`.
+
+.. testsetup::
+
+    shutil.rmtree("null_columns", ignore_errors=True)
+
+.. testcode::
+
+    table = pa.table({"id": pa.array([1, 2, 3])})
+    dataset = lance.write_dataset(table, "null_columns")
+
+    # With pyarrow Field
+    dataset.add_columns(pa.field("embedding", pa.list_(pa.float32(), 128)))
+    assert dataset.schema == pa.schema([
+        ("id", pa.int64()),
+        ("embedding", pa.list_(pa.float32(), 128)),
+    ])
+
+    # With pyarrow Schema
+    dataset.add_columns(pa.schema([
+        ("label", pa.string()),
+        ("score", pa.float32()),
+    ]))
+    assert dataset.schema == pa.schema([
+        ("id", pa.int64()),
+        ("embedding", pa.list_(pa.float32(), 128)),
+        ("label", pa.string()),
+        ("score", pa.float32()),
+    ])
+
+This operation is very fast, as it only updates the metadata of the dataset.
+
 
 Adding new columns using merge
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
