@@ -393,6 +393,32 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
                 _ => None,
             }
         }
+        ScalarValue::FixedSizeBinary(len, value) => match ty {
+            DataType::FixedSizeBinary(len2) => {
+                if len == len2 {
+                    Some(ScalarValue::FixedSizeBinary(*len, value.clone()))
+                } else {
+                    None
+                }
+            }
+            DataType::Binary => Some(ScalarValue::Binary(value.clone())),
+            _ => None,
+        },
+        ScalarValue::Binary(value) => match ty {
+            DataType::Binary => Some(ScalarValue::Binary(value.clone())),
+            DataType::FixedSizeBinary(len) => {
+                if let Some(value) = value {
+                    if value.len() == *len as usize {
+                        Some(ScalarValue::FixedSizeBinary(*len, Some(value.clone())))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
         _ => None,
     }
 }

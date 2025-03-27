@@ -221,15 +221,16 @@ def test_fixed_size_binary(tmp_path):
 
     ds.create_scalar_index("uuid", "BTREE")
 
-    print(
-        ds.scanner(
-            filter=(
-                "uuid = arrow_cast("
-                "0x32333435323334353233343532333435, "
-                "'FixedSizeBinary(16)')"
-            )
-        ).analyze_plan()
+    query = (
+        "uuid = arrow_cast("
+        "0x32333435323334353233343532333435, "
+        "'FixedSizeBinary(16)')"
     )
+    assert "MaterializeIndex" in ds.scanner(filter=query).explain_plan()
+
+    table = ds.scanner(filter=query).to_table()
+    assert table.num_rows == 1
+    assert table.column("uuid").to_pylist() == arr.slice(1, 1).to_pylist()
 
 
 def test_index_take_batch_size(tmp_path):
