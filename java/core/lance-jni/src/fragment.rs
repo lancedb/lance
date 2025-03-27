@@ -15,7 +15,7 @@
 use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema};
 use jni::objects::{JIntArray, JValueGen};
 use jni::{
     objects::{JObject, JString},
@@ -24,6 +24,7 @@ use jni::{
 };
 use lance::table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
 use std::iter::once;
+use std::sync::Arc;
 
 use lance::dataset::fragment::FileFragment;
 use lance_datafusion::utils::StreamingWriteSource;
@@ -222,6 +223,66 @@ fn create_fragment<'a>(
     export_vec(env, &fragments)
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Fragment_mergeNative<'local>(
+    mut env: JNIEnv<'local>,
+    _jfragment: JObject,            // Fragment
+    arrow_schema_addr: jlong,       // ArrowSchema
+    arrow_array_stream_addr: jlong, // ArrowArrayStream
+    jleft_on: JString,
+    jright_on: JString,
+    jmax_field_id: jint,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_merge_native(
+            &mut env,
+            _jfragment,
+            arrow_schema_addr,
+            arrow_array_stream_addr,
+            jleft_on,
+            jright_on,
+            jmax_field_id
+        )
+    )
+}
+
+pub fn inner_merge_native<'local>(
+    env: &mut JNIEnv<'local>,
+    _jfragment: JObject,            // Fragment
+    arrow_schema_addr: jlong,       // ArrowSchema
+    arrow_array_stream_addr: jlong, // ArrowArrayStream
+    jleft_on: JString,
+    jright_on: JString,
+    jmax_field_id: jint,
+) -> Result<JObject<'local>> {
+    let mut fragment: FileFragment = _jfragment.extract_object(env)?;
+
+    let left_on = jleft_on.extract(env)?;
+    let right_on = jright_on.extract(env)?;
+
+    let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+
+    let (fragment, schema) = RT.block_on(async move {
+        fragment
+            .merge_columns(
+                reader,
+                left_on.as_str(),
+                right_on.as_str(),
+                jmax_field_id as i32,
+            )
+            .await
+    })?;
+
+    let arrow_schema: Schema = Schema::from(&schema);
+    let arrow_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
+    let ffi_schema = FFI_ArrowSchema::try_from(&arrow_schema)?;
+    unsafe { std::ptr::write_unaligned(arrow_schema_ptr, ffi_schema) }
+
+    Ok(fragment.into_java(env)?)
+}
+
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/fragment/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;[I[III)V";
 const DELETE_FILE_CLASS: &str = "com/lancedb/lance/fragment/DeletionFile";
@@ -390,6 +451,30 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             physical_rows: Some(physical_rows),
             row_id_meta,
         })
+    }
+}
+
+impl FromJObjectWithEnv<FileFragment> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<FileFragment> {
+        let fragment_obj = env
+            .call_method(
+                self,
+                "getFragment",
+                "()Lcom/lancedb/lance/FragmentMetadata;",
+                &[],
+            )?
+            .l()?;
+        let fragment: Fragment = fragment_obj.extract_object(env)?;
+        let dataset_obj = env
+            .call_method(self, "getDataset", "()Lcom/lancedb/lance/Dataset;", &[])?
+            .l()?;
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(dataset_obj, NATIVE_DATASET) }?;
+
+        Ok(FileFragment::new(
+            Arc::new(dataset_guard.inner.clone()),
+            fragment,
+        ))
     }
 }
 
