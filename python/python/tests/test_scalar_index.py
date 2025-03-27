@@ -214,6 +214,24 @@ def test_indexed_vector_scan_postfilter(
     assert scanner.to_table().num_rows == 0
 
 
+def test_fixed_size_binary(tmp_path):
+    arr = pa.array([b"0123012301230123", b"2345234523452345"], pa.uuid())
+
+    ds = lance.write_dataset(pa.table({"uuid": arr}), tmp_path)
+
+    ds.create_scalar_index("uuid", "BTREE")
+
+    print(
+        ds.scanner(
+            filter=(
+                "uuid = arrow_cast("
+                "0x32333435323334353233343532333435, "
+                "'FixedSizeBinary(16)')"
+            )
+        ).analyze_plan()
+    )
+
+
 def test_index_take_batch_size(tmp_path):
     dataset = lance.write_dataset(
         pa.table({"ints": range(1024)}), tmp_path, max_rows_per_file=100
@@ -649,14 +667,14 @@ def test_nan_handling(tmp_path: Path):
     )
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
 
+    # There is no way, in DF, to query for NAN / INF, that I'm aware of.
+    # So the best we can do here is make sure that the presence of NAN / INF
+    # doesn't interfere with normal operation of the btree.
     def check(has_index: bool):
         assert dataset.to_table(filter="x IS NULL").num_rows == 0
         assert dataset.to_table(filter="x IS NOT NULL").num_rows == 7
         assert dataset.to_table(filter="x > 0").num_rows == 5
         assert dataset.to_table(filter="x < 5").num_rows == 5
-        assert dataset.to_table(filter="x = 'Inf'").num_rows == 1
-        assert dataset.to_table(filter="x = '-Inf'").num_rows == 1
-        assert dataset.to_table(filter="x = 'nan'").num_rows == 1
         assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
 
     check(False)

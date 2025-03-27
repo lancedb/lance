@@ -1726,33 +1726,39 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         field = self.schema.field(column)
+
+        field_type = field.type
+        if hasattr(field_type, "storage_type"):
+            field_type = field_type.storage_type
+
         if index_type in ["BTREE", "BITMAP"]:
             if (
-                not pa.types.is_integer(field.type)
-                and not pa.types.is_floating(field.type)
-                and not pa.types.is_boolean(field.type)
-                and not pa.types.is_string(field.type)
-                and not pa.types.is_temporal(field.type)
+                not pa.types.is_integer(field_type)
+                and not pa.types.is_floating(field_type)
+                and not pa.types.is_boolean(field_type)
+                and not pa.types.is_string(field_type)
+                and not pa.types.is_temporal(field_type)
+                and not pa.types.is_fixed_size_binary(field_type)
             ):
                 raise TypeError(
                     f"BTREE/BITMAP index column {column} must be int",
-                    ", float, bool, str, or temporal",
+                    ", float, bool, str, fixed-size-binary, or temporal ",
                 )
         elif index_type == "LABEL_LIST":
-            if not pa.types.is_list(field.type):
+            if not pa.types.is_list(field_type):
                 raise TypeError(f"LABEL_LIST index column {column} must be a list")
         elif index_type == "NGRAM":
-            if not pa.types.is_string(field.type):
+            if not pa.types.is_string(field_type):
                 raise TypeError(f"NGRAM index column {column} must be a string")
         elif index_type in ["INVERTED", "FTS"]:
-            if not pa.types.is_string(field.type) and not pa.types.is_large_string(
-                field.type
+            if not pa.types.is_string(field_type) and not pa.types.is_large_string(
+                field_type
             ):
                 raise TypeError(
                     f"INVERTED index column {column} must be string or large string"
                 )
 
-        if pa.types.is_duration(field.type):
+        if pa.types.is_duration(field_type):
             raise TypeError(
                 f"Scalar index column {column} cannot currently be a duration"
             )

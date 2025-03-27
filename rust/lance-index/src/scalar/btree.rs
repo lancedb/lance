@@ -13,15 +13,11 @@ use std::{
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion::{
-    functions_aggregate::min_max::{MaxAccumulator, MinAccumulator},
-    physical_plan::{
-        sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-        union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
-    },
+use datafusion::physical_plan::{
+    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+    union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
 use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_expr::Accumulator;
 use datafusion_physical_expr::{expressions::Column, LexOrdering, PhysicalSortExpr};
 use deepsize::{Context, DeepSizeOf};
 use futures::{
@@ -1075,22 +1071,24 @@ struct BatchStats {
     null_count: u32,
 }
 
-fn min_val(array: &Arc<dyn Array>) -> Result<ScalarValue> {
-    let mut acc = MinAccumulator::try_new(array.data_type())?;
-    acc.update_batch(&[array.clone()])?;
-    Ok(acc.evaluate()?)
-}
-
-fn max_val(array: &Arc<dyn Array>) -> Result<ScalarValue> {
-    let mut acc = MaxAccumulator::try_new(array.data_type())?;
-    acc.update_batch(&[array.clone()])?;
-    Ok(acc.evaluate()?)
-}
-
 fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
     let values = batch.column(0);
-    let min = min_val(values)?;
-    let max = max_val(values)?;
+    if values.is_empty() {
+        return Err(Error::Internal {
+            message: "received an empty batch in btree training".to_string(),
+            location: location!(),
+        });
+    }
+    let min = ScalarValue::try_from_array(&values, 0).map_err(|e| Error::Internal {
+        message: format!("failed to get min value from batch: {}", e),
+        location: location!(),
+    })?;
+    let max =
+        ScalarValue::try_from_array(&values, values.len() - 1).map_err(|e| Error::Internal {
+            message: format!("failed to get max value from batch: {}", e),
+            location: location!(),
+        })?;
+
     Ok(BatchStats {
         min,
         max,

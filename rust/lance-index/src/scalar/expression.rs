@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
     expr::{InList, ScalarFunction},
-    Between, BinaryExpr, Expr, Operator, ScalarUDF,
+    Between, BinaryExpr, Expr, Operator, ReturnTypeArgs, ScalarUDF,
 };
 
 use futures::join;
@@ -614,6 +614,44 @@ fn maybe_indexed_column<'a, 'b>(
 fn maybe_scalar(expr: &Expr, expected_type: &DataType) -> Option<ScalarValue> {
     match expr {
         Expr::Literal(value) => safe_coerce_scalar(value, expected_type),
+        // Some literals can't be expressed in datafusion's SQL and can only be expressed with
+        // a cast.  For example, there is no way to express a fixed-size-binary literal (which is
+        // commonly used for UUID).  As a result the expression could look like...
+        //
+        // col = arrow_cast(value, 'fixed_size_binary(16)')
+        //
+        // In this case we need to extract the value, apply the cast, and then test the casted value
+        Expr::Cast(cast) => match cast.expr.as_ref() {
+            Expr::Literal(value) => {
+                let casted = value.cast_to(&cast.data_type).ok()?;
+                safe_coerce_scalar(&casted, expected_type)
+            }
+            _ => None,
+        },
+        Expr::ScalarFunction(scalar_function) => {
+            if scalar_function.name() == "arrow_cast" {
+                if scalar_function.args.len() != 2 {
+                    return None;
+                }
+                match (&scalar_function.args[0], &scalar_function.args[1]) {
+                    (Expr::Literal(value), Expr::Literal(cast_type)) => {
+                        let target_type = scalar_function
+                            .func
+                            .return_type_from_args(ReturnTypeArgs {
+                                arg_types: &[value.data_type(), cast_type.data_type()],
+                                scalar_arguments: &[Some(value), Some(cast_type)],
+                                nullables: &[false, false],
+                            })
+                            .ok()?;
+                        let casted = value.cast_to(target_type.return_type()).ok()?;
+                        safe_coerce_scalar(&casted, expected_type)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -969,12 +1007,8 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow_schema::{Field, Schema};
-    use datafusion::error::Result as DFResult;
-    use datafusion_common::{config::ConfigOptions, TableReference};
+    use datafusion::prelude::SessionContext;
     use datafusion_common::{Column, DFSchema};
-    use datafusion_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
-    use datafusion_sql::planner::{ContextProvider, PlannerContext, SqlToRel};
-    use datafusion_sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
     use super::*;
 
@@ -1013,47 +1047,6 @@ mod tests {
         }
     }
 
-    struct MockContextProvider {}
-
-    // We're just compiling simple expressions (not entire statements) and so this is unused
-    impl ContextProvider for MockContextProvider {
-        fn get_table_source(&self, _name: TableReference) -> DFResult<Arc<dyn TableSource>> {
-            todo!()
-        }
-
-        fn get_function_meta(&self, _: &str) -> Option<std::sync::Arc<ScalarUDF>> {
-            todo!()
-        }
-
-        fn get_aggregate_meta(&self, _: &str) -> Option<std::sync::Arc<AggregateUDF>> {
-            todo!()
-        }
-
-        fn get_window_meta(&self, _: &str) -> Option<std::sync::Arc<WindowUDF>> {
-            todo!()
-        }
-
-        fn get_variable_type(&self, _: &[String]) -> Option<DataType> {
-            todo!()
-        }
-
-        fn options(&self) -> &ConfigOptions {
-            todo!()
-        }
-
-        fn udf_names(&self) -> Vec<String> {
-            todo!()
-        }
-
-        fn udaf_names(&self) -> Vec<String> {
-            todo!()
-        }
-
-        fn udwf_names(&self) -> Vec<String> {
-            todo!()
-        }
-    }
-
     fn check(
         index_info: &dyn IndexInformationProvider,
         expr: &str,
@@ -1066,16 +1059,11 @@ mod tests {
             Field::new("on_sale", DataType::Boolean, false),
             Field::new("price", DataType::Float32, false),
         ]);
-        let dialect = PostgreSqlDialect {};
-        let mut parser = Parser::new(&dialect).try_with_sql(expr).unwrap();
-        let expr = parser.parse_expr().unwrap();
-        let context_provider = MockContextProvider {};
-        let planner = SqlToRel::new(&context_provider);
         let df_schema: DFSchema = schema.try_into().unwrap();
-        let mut planner_context = PlannerContext::new();
-        let expr = planner
-            .sql_to_expr(expr, &df_schema, &mut planner_context)
-            .unwrap();
+
+        let ctx = SessionContext::default();
+        let state = ctx.state();
+        let expr = state.create_logical_expr(expr, &df_schema).unwrap();
 
         let actual = apply_scalar_indices(expr.clone(), index_info);
         if let Some(expected) = expected {
@@ -1145,6 +1133,13 @@ mod tests {
         ]);
 
         check_no_index(&index_info, "size BETWEEN 5 AND 10");
+        // Cast case.  We will cast 5 (an int64) to Int16 and then coerce to UInt32
+        check_simple(
+            &index_info,
+            "aisle = arrow_cast(5, 'Int16')",
+            "aisle",
+            SargableQuery::Equals(ScalarValue::UInt32(Some(5))),
+        );
         // 5 different ways of writing BETWEEN (all should be recognized)
         check_simple(
             &index_info,
