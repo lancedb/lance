@@ -4674,7 +4674,7 @@ mod tests {
 
         let params = InvertedIndexParams::default();
         let title_col =
-            GenericStringArray::<i32>::from(vec!["title hello", "title lance", "title common"]);
+            GenericStringArray::<i32>::from(vec!["title common", "title hello", "title lance"]);
         let content_col = GenericStringArray::<i32>::from(vec![
             "content world",
             "content database",
@@ -4727,6 +4727,32 @@ mod tests {
         let results = dataset
             .scan()
             .full_text_search(FullTextSearchQuery::new("common".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 2);
+
+        let results = dataset
+            .scan()
+            .full_text_search(
+                FullTextSearchQuery::new("common".to_owned())
+                    .with_field("title".to_owned())
+                    .unwrap(),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 1);
+
+        let results = dataset
+            .scan()
+            .full_text_search(
+                FullTextSearchQuery::new("common".to_owned())
+                    .with_field("content".to_owned())
+                    .unwrap(),
+            )
             .unwrap()
             .try_into_batch()
             .await

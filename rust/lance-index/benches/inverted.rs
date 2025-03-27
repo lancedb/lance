@@ -19,7 +19,7 @@ use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Searcher};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::{FullTextSearchQuery, ScalarIndex};
+use lance_index::scalar::ScalarIndex;
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
@@ -78,7 +78,7 @@ fn bench_inverted(c: &mut Criterion) {
             black_box(
                 invert_index
                     .bm25_search(
-                        vec![tokens[rand::random::<usize>() % tokens.len()].to_owned()],
+                        &[tokens[rand::random::<usize>() % tokens.len()].to_owned()],
                         &params,
                         false,
                         no_filter.clone(),

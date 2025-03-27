@@ -18,6 +18,7 @@ use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -48,9 +49,9 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::inverted::query::{
-    CompoundQuery, FtsQuery, FtsSearchParams, MultiMatchQuery,
+    fill_fts_query_field, CompoundQuery, FtsQuery, FtsSearchParams, MultiMatchQuery,
 };
-use lance_index::scalar::inverted::SCORE_COL;
+use lance_index::scalar::inverted::{FTS_SCHEMA, SCORE_COL};
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
@@ -1602,7 +1603,7 @@ impl Scanner {
                 }
             }
 
-            Self::fill_fts_query_field(&query.query, &indexed_columns)?
+            fill_fts_query_field(&query.query, &indexed_columns, false)?
         } else {
             // check whether all specified columns are indexed
             for field in &fields {
@@ -1618,7 +1619,9 @@ impl Scanner {
         };
 
         let prefilter_source = self.prefilter_source(filter_plan).await?;
-        let fts_exec = self.plan_fts(&query, &params, &prefilter_source)?;
+        let fts_exec = self
+            .plan_fts(&query, &params, filter_plan, &prefilter_source)
+            .await?;
         // let mut column_inputs = Vec::with_capacity(columns.len());
         // for column in columns {
         //     let index = self
@@ -1687,20 +1690,80 @@ impl Scanner {
         Ok(fts_exec)
     }
 
-    fn plan_fts(
+    async fn plan_fts(
         &self,
         query: &CompoundQuery,
         params: &FtsSearchParams,
+        filter_plan: &FilterPlan,
         prefilter_source: &PreFilterSource,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let plan: Arc<dyn ExecutionPlan> = match query {
             CompoundQuery::Leaf(leaf) => match leaf {
-                FtsQuery::Match(query) => Arc::new(MatchQueryExec::new(
-                    self.dataset.clone(),
-                    query.clone(),
-                    params.clone(),
-                    prefilter_source.clone(),
-                )),
+                FtsQuery::Match(query) => {
+                    let column = query
+                        .field
+                        .as_ref()
+                        .ok_or(Error::invalid_input(
+                            "the field must be specified in the query".to_string(),
+                            location!(),
+                        ))?
+                        .clone();
+
+                    let index = self
+                        .dataset
+                        .load_scalar_index_for_column(query.field.as_ref().unwrap())
+                        .await?
+                        .ok_or(Error::invalid_input(
+                            format!(
+                                "Column {} has no inverted index",
+                                query.field.as_ref().unwrap()
+                            ),
+                            location!(),
+                        ))?;
+
+                    let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+                    if unindexed_fragments.is_empty() {
+                        Arc::new(MatchQueryExec::new(
+                            self.dataset.clone(),
+                            query.clone(),
+                            params.clone(),
+                            prefilter_source.clone(),
+                        ))
+                    } else {
+                        let mut columns = vec![column.clone()];
+                        if let Some(expr) = filter_plan.full_expr.as_ref() {
+                            let filter_columns = Planner::column_names_in_expr(expr);
+                            columns.extend(filter_columns);
+                        }
+                        let flat_fts_scan_schema =
+                            Arc::new(self.dataset.schema().project(&columns).unwrap());
+                        let mut scan_node = self.scan_fragments(
+                            true,
+                            false,
+                            true,
+                            flat_fts_scan_schema,
+                            Arc::new(unindexed_fragments),
+                            None,
+                            false,
+                        );
+
+                        if let Some(expr) = filter_plan.full_expr.as_ref() {
+                            // If there is a prefilter we need to manually apply it to the new data
+                            let planner = Planner::new(scan_node.schema());
+                            let physical_refine_expr = planner.create_physical_expr(expr)?;
+                            scan_node =
+                                Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
+                        }
+
+                        Arc::new(MatchQueryExec::new_flat(
+                            self.dataset.clone(),
+                            query.clone(),
+                            params.clone(),
+                            scan_node,
+                            prefilter_source.clone(),
+                        ))
+                    }
+                }
                 FtsQuery::Phrase(query) => Arc::new(PhraseQueryExec::new(
                     self.dataset.clone(),
                     query.clone(),
@@ -1710,8 +1773,24 @@ impl Scanner {
             },
 
             CompoundQuery::Boost(query) => {
-                let positive_exec = self.plan_fts(&query.positive, params, prefilter_source)?;
-                let negative_exec = self.plan_fts(&query.negative, params, prefilter_source)?;
+                // for boost query, we need to erase the limit so that we can find
+                // the documents that are not in the top-k results of the positive query,
+                // but in the final top-k results.
+                let unlimited_params = params.clone().with_limit(usize::MAX);
+                let positive_exec = Box::pin(self.plan_fts(
+                    &query.positive,
+                    &unlimited_params,
+                    filter_plan,
+                    prefilter_source,
+                ));
+                let negative_exec = Box::pin(self.plan_fts(
+                    &query.negative,
+                    &unlimited_params,
+                    filter_plan,
+                    prefilter_source,
+                ));
+                let (positive_exec, negative_exec) =
+                    futures::future::try_join(positive_exec, negative_exec).await?;
                 Arc::new(BoostQueryExec::new(
                     query.clone(),
                     params.clone(),
@@ -1721,11 +1800,13 @@ impl Scanner {
             }
 
             CompoundQuery::MultiMatch(query) => {
-                let children = query
-                    .match_queries
-                    .iter()
-                    .map(|q| self.plan_fts(q, params, prefilter_source))
-                    .collect::<Result<Vec<_>>>()?;
+                let mut children = Vec::with_capacity(query.match_queries.len());
+                for match_query in &query.match_queries {
+                    let child =
+                        Box::pin(self.plan_fts(match_query, params, filter_plan, prefilter_source));
+                    children.push(child);
+                }
+                let children = futures::future::try_join_all(children).await?;
 
                 let schema = children[0].schema();
                 let group_expr = vec![(
@@ -1771,52 +1852,6 @@ impl Scanner {
         };
 
         Ok(plan)
-    }
-
-    fn fill_fts_query_field(
-        query: &CompoundQuery,
-        indexed_columns: &[String],
-    ) -> Result<CompoundQuery> {
-        match query {
-            CompoundQuery::Leaf(leaf) => {
-                if !leaf.is_missing_field() {
-                    return Ok(query.clone());
-                }
-
-                if !matches!(leaf, FtsQuery::Match(_)) {
-                    return Err(Error::invalid_input(
-                        "the field must be specified in the query".to_string(),
-                        location!(),
-                    ));
-                }
-
-                match indexed_columns.len() {
-                    0 => {
-                        return Err(Error::invalid_input(
-                            "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
-                            location!(),
-                        ));
-                    }
-                    1 => {
-                        let field = indexed_columns[0].clone();
-                        let query = leaf.clone().with_field(field);
-                        Ok(CompoundQuery::Leaf(query))
-                    }
-                    _ => {
-                        let multi_match_query =
-                            MultiMatchQuery::new(leaf.query().to_owned(), indexed_columns.to_vec());
-                        Ok(CompoundQuery::MultiMatch(multi_match_query))
-                    }
-                }
-            }
-            // if there is a compound query, we need to check if the field is
-            _ => {
-                return Err(Error::invalid_input(
-                    "the field must be specified in the query".to_string(),
-                    location!(),
-                ));
-            }
-        }
     }
 
     // ANN/KNN search execution node with optional prefilter

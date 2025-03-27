@@ -19,11 +19,10 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
-use inverted::query::{FtsQueryNode, FtsSearchParams};
+use inverted::query::{fill_fts_query_field, FtsQueryNode, FtsSearchParams};
 use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
-use lazy_static::lazy_static;
 use snafu::location;
 
 use crate::metrics::MetricsCollector;
@@ -291,6 +290,22 @@ impl FullTextSearchQuery {
             limit: None,
             wand_factor: None,
         }
+    }
+
+    /// Create a new compound query
+    pub fn new_compound(query: inverted::query::CompoundQuery) -> Self {
+        Self {
+            query,
+            limit: None,
+            wand_factor: None,
+        }
+    }
+
+    /// Set the field to search over
+    /// This is available for only MatchQuery and PhraseQuery
+    pub fn with_field(mut self, field: String) -> Result<Self> {
+        self.query = fill_fts_query_field(&self.query, &[field], true)?;
+        Ok(self)
     }
 
     /// limit the number of results to return
