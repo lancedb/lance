@@ -172,6 +172,13 @@ impl InvertedIndex {
 
         let mask = prefilter.mask();
         let token_ids = self.map(tokens);
+        if token_ids.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        if is_phrase_query && token_ids.len() != tokens.len() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
         let postings = stream::iter(token_ids)
             .enumerate()
             .zip(repeat_with(|| (self.inverted_list.clone(), mask.clone())))
@@ -636,10 +643,16 @@ impl InvertedListReader {
             let batch = self
                 .reader
                 .read_range(offset..offset + length, Some(&[POSITION_COL]))
-                .await?;
-            Result::Ok(batch
-                .column_by_name(POSITION_COL)
-                .ok_or(Error::Index { message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), location: location!() })?
+                .await.map_err(|e| {
+                    match e {
+                        Error::Schema { .. } => Error::Index {
+                            message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), 
+                            location: location!(),
+                        },
+                        e => e
+                    }
+                })?;
+            Result::Ok(batch[POSITION_COL]
                 .as_list::<i32>()
                 .clone())
         }).await.map_err(|e| Error::io(e.to_string(), location!()))
