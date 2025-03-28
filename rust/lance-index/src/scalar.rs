@@ -19,7 +19,7 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
-use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams};
+use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
@@ -269,8 +269,7 @@ pub struct FullTextSearchQuery {
 impl FullTextSearchQuery {
     /// Create a new terms query
     pub fn new(query: String) -> Self {
-        let query =
-            inverted::query::FtsQuery::Match(inverted::query::MatchQuery::new(query)).into();
+        let query = MatchQuery::new(query).into();
         Self {
             query,
             limit: None,
@@ -280,10 +279,7 @@ impl FullTextSearchQuery {
 
     /// Create a new fuzzy query
     pub fn new_fuzzy(term: String, max_distance: Option<u32>) -> Self {
-        let query = inverted::query::FtsQuery::Match(
-            inverted::query::MatchQuery::new(term).with_fuzziness(max_distance),
-        )
-        .into();
+        let query = MatchQuery::new(term).with_fuzziness(max_distance).into();
         Self {
             query,
             limit: None,
@@ -292,7 +288,7 @@ impl FullTextSearchQuery {
     }
 
     /// Create a new compound query
-    pub fn new_query(query: inverted::query::FtsQuery) -> Self {
+    pub fn new_query(query: FtsQuery) -> Self {
         Self {
             query,
             limit: None,

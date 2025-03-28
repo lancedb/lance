@@ -93,7 +93,7 @@ impl FtsQuery {
         match self {
             Self::Match(query) => &query.terms,
             Self::Phrase(query) => &query.terms,
-            Self::Boost(query) => &query.positive.query(),
+            Self::Boost(query) => query.positive.query(),
             Self::MultiMatch(query) => &query.match_queries[0].terms,
         }
     }
