@@ -597,7 +597,7 @@ async fn reserve_fragment_ids(
         None,
     );
 
-    let (manifest, _) = commit_transaction(
+    let (manifest, _, _) = commit_transaction(
         dataset,
         dataset.object_store(),
         dataset.commit_handler.as_ref(),
@@ -902,19 +902,9 @@ pub async fn commit_compaction(
         None,
     );
 
-    let (manifest, manifest_path) = commit_transaction(
-        dataset,
-        dataset.object_store(),
-        dataset.commit_handler.as_ref(),
-        &transaction,
-        &Default::default(),
-        &Default::default(),
-        dataset.manifest_naming_scheme,
-    )
-    .await?;
-
-    dataset.manifest = Arc::new(manifest);
-    dataset.manifest_file = manifest_path;
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await?;
 
     Ok(metrics)
 }

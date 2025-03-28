@@ -3,7 +3,6 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use crate::io::commit::commit_transaction;
 use crate::{io::exec::Planner, Error, Result};
 use arrow::compute::CastOptions;
 use arrow_array::{RecordBatch, RecordBatchReader};
@@ -315,19 +314,9 @@ pub(super) async fn add_columns(
         /*blob_op= */ None,
         None,
     );
-    let (new_manifest, new_path) = commit_transaction(
-        dataset,
-        &dataset.object_store,
-        dataset.commit_handler.as_ref(),
-        &transaction,
-        &Default::default(),
-        &Default::default(),
-        dataset.manifest_naming_scheme,
-    )
-    .await?;
-
-    dataset.manifest = Arc::new(new_manifest);
-    dataset.manifest_file = new_path;
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await?;
 
     Ok(())
 }
@@ -637,19 +626,9 @@ pub(super) async fn alter_columns(
 
     // TODO: adjust the indices here for the new schema
 
-    let (manifest, manifest_path) = commit_transaction(
-        dataset,
-        &dataset.object_store,
-        dataset.commit_handler.as_ref(),
-        &transaction,
-        &Default::default(),
-        &Default::default(),
-        dataset.manifest_naming_scheme,
-    )
-    .await?;
-
-    dataset.manifest = Arc::new(manifest);
-    dataset.manifest_file = manifest_path;
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await?;
 
     Ok(())
 }
@@ -699,19 +678,9 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         None,
     );
 
-    let (manifest, manifest_path) = commit_transaction(
-        dataset,
-        &dataset.object_store,
-        dataset.commit_handler.as_ref(),
-        &transaction,
-        &Default::default(),
-        &Default::default(),
-        dataset.manifest_naming_scheme,
-    )
-    .await?;
-
-    dataset.manifest = Arc::new(manifest);
-    dataset.manifest_file = manifest_path;
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await?;
 
     Ok(())
 }

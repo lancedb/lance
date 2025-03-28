@@ -32,6 +32,7 @@ use futures::{
     stream::BoxStream,
     StreamExt, TryStreamExt,
 };
+use lance_io::object_writer::WriteResult;
 use log::warn;
 use object_store::PutOptions;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
@@ -177,7 +178,7 @@ pub type ManifestWriter = for<'a> fn(
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
-) -> BoxFuture<'a, Result<u64>>;
+) -> BoxFuture<'a, Result<WriteResult>>;
 
 #[derive(Debug)]
 pub struct ManifestLocation {
@@ -189,6 +190,39 @@ pub struct ManifestLocation {
     pub size: Option<u64>,
     /// Naming scheme of the manifest file.
     pub naming_scheme: ManifestNamingScheme,
+    /// Optional e-tag, used for integrity checks. Manifests should be immutable, so
+    /// if we detect a change in the e-tag, it means the manifest was tampered with.
+    /// This might happen if the dataset was deleted and then re-created.
+    pub e_tag: Option<String>,
+}
+
+impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
+    type Error = Error;
+
+    fn try_from(meta: object_store::ObjectMeta) -> Result<Self> {
+        let filename = meta.location.filename().ok_or_else(|| Error::Internal {
+            message: "ObjectMeta location does not have a filename".to_string(),
+            location: location!(),
+        })?;
+        let scheme =
+            ManifestNamingScheme::detect_scheme(filename).ok_or_else(|| Error::Internal {
+                message: format!("Invalid manifest filename: '{}'", filename),
+                location: location!(),
+            })?;
+        let version = scheme
+            .parse_version(filename)
+            .ok_or_else(|| Error::Internal {
+                message: format!("Invalid manifest filename: '{}'", filename),
+                location: location!(),
+            })?;
+        Ok(Self {
+            version,
+            path: meta.location,
+            size: Some(meta.size as u64),
+            naming_scheme: scheme,
+            e_tag: meta.e_tag,
+        })
+    }
 }
 
 /// Get the latest manifest path
@@ -251,6 +285,7 @@ async fn current_manifest_path(
                 path: meta.location,
                 size: Some(meta.size as u64),
                 naming_scheme: scheme,
+                e_tag: meta.e_tag,
             })
         }
         // If the first valid manifest we see if V1, assume for now that we are
@@ -282,6 +317,7 @@ async fn current_manifest_path(
                 path: current_meta.location,
                 size: Some(current_meta.size as u64),
                 naming_scheme: scheme,
+                e_tag: current_meta.e_tag,
             })
         }
         (None, _) => Err(Error::NotFound {
@@ -343,43 +379,64 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
     if let Some((version, entry)) = latest_entry {
         let path = Path::from_filesystem_path(entry.path())
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        let metadata = entry.metadata()?;
         Ok(Some(ManifestLocation {
             version,
             path,
-            size: Some(entry.metadata()?.len()),
+            size: Some(metadata.len()),
             naming_scheme: scheme.unwrap(),
+            e_tag: Some(get_etag(&metadata)),
         }))
     } else {
         Ok(None)
     }
 }
 
+// Based on object store's implementation.
+fn get_etag(metadata: &std::fs::Metadata) -> String {
+    let inode = get_inode(metadata);
+    let size = metadata.len();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .unwrap_or_default()
+        .as_micros();
+
+    // Use an ETag scheme based on that used by many popular HTTP servers
+    // <https://httpd.apache.org/docs/2.2/mod/core.html#fileetag>
+    // <https://stackoverflow.com/questions/47512043/how-etags-are-generated-and-configured>
+    format!("{inode:x}-{mtime:x}-{size:x}")
+}
+
+#[cfg(unix)]
+/// We include the inode when available to yield an ETag more resistant to collisions
+/// and as used by popular web servers such as [Apache](https://httpd.apache.org/docs/2.2/mod/core.html#fileetag)
+fn get_inode(metadata: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(metadata)
+}
+
+#[cfg(not(unix))]
+/// On platforms where an inode isn't available, fallback to just relying on size and mtime
+fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
+    0
+}
+
 async fn list_manifests<'a>(
     base_path: &Path,
     object_store: &'a dyn OSObjectStore,
-) -> Result<BoxStream<'a, Result<Path>>> {
+) -> Result<BoxStream<'a, Result<ManifestLocation>>> {
     Ok(object_store
         .read_dir_all(&base_path.child(VERSIONS_DIR), None)
         .await?
-        .try_filter_map(|obj_meta| {
-            if obj_meta.location.extension() == Some(MANIFEST_EXTENSION) {
-                future::ready(Ok(Some(obj_meta.location)))
-            } else {
-                future::ready(Ok(None))
-            }
+        .filter_map(|obj_meta| {
+            futures::future::ready(
+                obj_meta
+                    .map(|m| ManifestLocation::try_from(m).ok())
+                    .transpose(),
+            )
         })
         .boxed())
-}
-
-pub fn parse_version_from_path(path: &Path) -> Result<u64> {
-    path.filename()
-        .and_then(|name| name.split_once('.'))
-        .filter(|(_, extension)| *extension == MANIFEST_EXTENSION)
-        .and_then(|(version, _)| version.parse::<u64>().ok())
-        .ok_or(Error::Internal {
-            message: format!("Expected manifest file, but found {}", path),
-            location: location!(),
-        })
 }
 
 fn make_staging_manifest_path(base: &Path) -> Result<Path> {
@@ -411,41 +468,6 @@ pub trait CommitHandler: Debug + Send + Sync {
         Ok(current_manifest_path(object_store, base_path).await?)
     }
 
-    /// Get the path to the latest version manifest of a dataset at the base_path
-    async fn resolve_latest_version(
-        &self,
-        base_path: &Path,
-        object_store: &ObjectStore,
-    ) -> std::result::Result<Path, Error> {
-        // TODO: we need to pade 0's to the version number on the manifest file path
-        Ok(current_manifest_path(object_store, base_path).await?.path)
-    }
-
-    // for default implementation, parse the version from the path
-    async fn resolve_latest_version_id(
-        &self,
-        base_path: &Path,
-        object_store: &ObjectStore,
-    ) -> Result<u64> {
-        Ok(current_manifest_path(object_store, base_path)
-            .await?
-            .version)
-    }
-
-    /// Get the path to a specific versioned manifest of a dataset at the base_path
-    ///
-    /// The version must already exist.
-    async fn resolve_version(
-        &self,
-        base_path: &Path,
-        version: u64,
-        object_store: &dyn OSObjectStore,
-    ) -> std::result::Result<Path, Error> {
-        Ok(default_resolve_version(base_path, version, object_store)
-            .await?
-            .path)
-    }
-
     async fn resolve_version_location(
         &self,
         base_path: &Path,
@@ -455,12 +477,11 @@ pub trait CommitHandler: Debug + Send + Sync {
         default_resolve_version(base_path, version, object_store).await
     }
 
-    /// List manifests that are available for a dataset at the base_path
-    async fn list_manifests<'a>(
+    async fn list_manifest_locations<'a>(
         &self,
         base_path: &Path,
         object_store: &'a dyn OSObjectStore,
-    ) -> Result<BoxStream<'a, Result<Path>>> {
+    ) -> Result<BoxStream<'a, Result<ManifestLocation>>> {
         list_manifests(base_path, object_store).await
     }
 
@@ -476,7 +497,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<Path, CommitError>;
+    ) -> std::result::Result<ManifestLocation, CommitError>;
 
     /// Delete the recorded manifest information for a dataset at the base_path
     async fn delete(&self, _base_path: &Path) -> Result<()> {
@@ -498,6 +519,7 @@ async fn default_resolve_version(
             // Both V1 and V2 should give the same path for detached versions
             path: ManifestNamingScheme::V2.manifest_path(base_path, version),
             size: None,
+            e_tag: None,
         });
     }
 
@@ -510,6 +532,7 @@ async fn default_resolve_version(
             path,
             size: Some(meta.size as u64),
             naming_scheme: scheme,
+            e_tag: meta.e_tag,
         }),
         Err(ObjectStoreError::NotFound { .. }) => {
             // fallback to V1
@@ -519,6 +542,7 @@ async fn default_resolve_version(
                 path: scheme.manifest_path(base_path, version),
                 size: None,
                 naming_scheme: scheme,
+                e_tag: None,
             })
         }
         Err(e) => Err(e.into()),
@@ -730,7 +754,7 @@ impl CommitHandler for UnsafeCommitHandler {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<Path, CommitError> {
+    ) -> std::result::Result<ManifestLocation, CommitError> {
         // Log a one-time warning
         if !WARNED_ON_UNSAFE_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
             WARNED_ON_UNSAFE_COMMIT.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -742,9 +766,15 @@ impl CommitHandler for UnsafeCommitHandler {
 
         let version_path = naming_scheme.manifest_path(base_path, manifest.version);
         // Write the manifest naively
-        manifest_writer(object_store, manifest, indices, &version_path).await?;
+        let res = manifest_writer(object_store, manifest, indices, &version_path).await?;
 
-        Ok(version_path)
+        Ok(ManifestLocation {
+            version: manifest.version,
+            size: Some(res.size as u64),
+            naming_scheme,
+            path: version_path,
+            e_tag: res.e_tag,
+        })
     }
 }
 
@@ -790,7 +820,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<Path, CommitError> {
+    ) -> std::result::Result<ManifestLocation, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
         // NOTE: once we have the lease we cannot use ? to return errors, since
         // we must release the lease before returning.
@@ -819,7 +849,14 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         // Release the lock
         lease.release(res.is_ok()).await?;
 
-        res.map_err(|err| err.into()).map(|_| path)
+        let res = res?;
+        Ok(ManifestLocation {
+            version: manifest.version,
+            size: Some(res.size as u64),
+            naming_scheme,
+            path,
+            e_tag: res.e_tag,
+        })
     }
 }
 
@@ -833,7 +870,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<Path, CommitError> {
+    ) -> std::result::Result<ManifestLocation, CommitError> {
         self.as_ref()
             .commit(
                 manifest,
@@ -862,7 +899,7 @@ impl CommitHandler for RenameCommitHandler {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<Path, CommitError> {
+    ) -> std::result::Result<ManifestLocation, CommitError> {
         // Create a temporary object, then use `rename_if_not_exists` to commit.
         // If failed, clean up the temporary object.
 
@@ -870,14 +907,23 @@ impl CommitHandler for RenameCommitHandler {
         let tmp_path = make_staging_manifest_path(&path)?;
 
         // Write the manifest to the temporary path
-        manifest_writer(object_store, manifest, indices, &tmp_path).await?;
+        let res = manifest_writer(object_store, manifest, indices, &tmp_path).await?;
 
         match object_store
             .inner
             .rename_if_not_exists(&tmp_path, &path)
             .await
         {
-            Ok(_) => Ok(path),
+            Ok(_) => {
+                // Successfully committed
+                Ok(ManifestLocation {
+                    version: manifest.version,
+                    path,
+                    size: Some(res.size as u64),
+                    naming_scheme,
+                    e_tag: None, // Re-name can change e-tag.
+                })
+            }
             Err(ObjectStoreError::AlreadyExists { .. }) => {
                 // Another transaction has already been committed
                 // Attempt to clean up temporary object, but ignore errors if we can't
@@ -911,14 +957,15 @@ impl CommitHandler for ConditionalPutCommitHandler {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<Path, CommitError> {
+    ) -> std::result::Result<ManifestLocation, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
 
         let memory_store = ObjectStore::memory();
         let dummy_path = "dummy";
         manifest_writer(&memory_store, manifest, indices, &dummy_path.into()).await?;
         let dummy_data = memory_store.read_one_all(&dummy_path.into()).await?;
-        object_store
+        let size = dummy_data.len() as u64;
+        let res = object_store
             .inner
             .put_opts(
                 &path,
@@ -936,7 +983,13 @@ impl CommitHandler for ConditionalPutCommitHandler {
                 _ => CommitError::OtherError(err.into()),
             })?;
 
-        Ok(path)
+        Ok(ManifestLocation {
+            version: manifest.version,
+            path,
+            size: Some(size),
+            naming_scheme,
+            e_tag: res.e_tag,
+        })
     }
 }
 

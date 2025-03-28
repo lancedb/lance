@@ -45,6 +45,7 @@ use lance_core::{
 use lance_table::{
     format::{Index, Manifest},
     io::{
+        commit::ManifestLocation,
         deletion::deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
@@ -158,10 +159,10 @@ impl<'a> CleanupTask<'a> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
             .commit_handler
-            .list_manifests(&self.dataset.base, &self.dataset.object_store.inner)
+            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store.inner)
             .await?
-            .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |path| {
-                self.process_manifest_file(path, &inspection, tagged_versions)
+            .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
+                self.process_manifest_file(location, &inspection, tagged_versions)
             })
             .await?;
         Ok(inspection.into_inner().unwrap())
@@ -169,7 +170,7 @@ impl<'a> CleanupTask<'a> {
 
     async fn process_manifest_file(
         &self,
-        path: Path,
+        location: ManifestLocation,
         inspection: &Mutex<CleanupInspection>,
         tagged_versions: &HashSet<u64>,
     ) -> Result<()> {
@@ -179,7 +180,8 @@ impl<'a> CleanupTask<'a> {
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
 
-        let manifest = read_manifest(&self.dataset.object_store, &path, None).await?;
+        let manifest =
+            read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
         let dataset_version = self.dataset.version().version;
 
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
@@ -188,7 +190,8 @@ impl<'a> CleanupTask<'a> {
         let is_latest = dataset_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || manifest.timestamp() >= self.before || is_tagged;
-        let indexes = read_manifest_indexes(&self.dataset.object_store, &path, &manifest).await?;
+        let indexes =
+            read_manifest_indexes(&self.dataset.object_store, &location.path, &manifest).await?;
 
         let mut inspection = inspection.lock().unwrap();
 
@@ -199,7 +202,7 @@ impl<'a> CleanupTask<'a> {
 
         self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
         if !in_working_set {
-            inspection.old_manifests.push(path.clone());
+            inspection.old_manifests.push(location.path.clone());
         }
         Ok(())
     }

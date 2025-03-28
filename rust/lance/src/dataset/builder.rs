@@ -331,6 +331,7 @@ impl DatasetBuilder {
             session,
             commit_handler,
             location.naming_scheme,
+            location.e_tag,
         )
         .await
     }

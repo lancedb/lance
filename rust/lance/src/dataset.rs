@@ -23,14 +23,14 @@ use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
-use lance_io::object_writer::ObjectWriter;
-use lance_io::traits::{WriteExt, Writer};
+use lance_io::object_writer::{ObjectWriter, WriteResult};
+use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
 use lance_table::format::{
     DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
 };
 use lance_table::io::commit::{
-    migrate_scheme_to_v2, CommitError, CommitHandler, CommitLock, ManifestLocation,
+    migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
     ManifestNamingScheme,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
@@ -124,6 +124,7 @@ pub struct Dataset {
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
     pub manifest_naming_scheme: ManifestNamingScheme,
+    pub manifest_e_tag: Option<String>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -341,12 +342,28 @@ impl Dataset {
         Ok(())
     }
 
+    fn already_checked_out(&self, location: &ManifestLocation) -> bool {
+        // We check the e_tag here just in case it has been overwritten. This can
+        // happen if the table has been dropped then re-created recently.
+        self.manifest.version == location.version
+            && location.e_tag.as_ref().is_some_and(|e_tag| {
+                self.manifest_e_tag
+                    .as_ref()
+                    .is_some_and(|current_e_tag| e_tag == current_e_tag)
+            })
+    }
+
     async fn checkout_by_version_number(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
         let manifest_location = self
             .commit_handler
             .resolve_version_location(&base_path, version, &self.object_store.inner)
             .await?;
+
+        if self.already_checked_out(&manifest_location) {
+            return Ok(self.clone());
+        }
+
         let manifest = Self::load_manifest(self.object_store.as_ref(), &manifest_location).await?;
         Self::checkout_manifest(
             self.object_store.clone(),
@@ -357,6 +374,7 @@ impl Dataset {
             self.session.clone(),
             self.commit_handler.clone(),
             manifest_location.naming_scheme,
+            manifest_location.e_tag,
         )
         .await
     }
@@ -442,6 +460,7 @@ impl Dataset {
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
         manifest_naming_scheme: ManifestNamingScheme,
+        e_tag: Option<String>,
     ) -> Result<Self> {
         let tags = Tags::new(
             object_store.clone(),
@@ -458,6 +477,7 @@ impl Dataset {
             session,
             tags,
             manifest_naming_scheme,
+            manifest_e_tag: e_tag,
         })
     }
 
@@ -538,6 +558,7 @@ impl Dataset {
                 self.session.clone(),
                 self.commit_handler.clone(),
                 ManifestNamingScheme::V2,
+                blob_manifest_location.e_tag,
             )
             .await?;
             Ok(Some(Arc::new(blobs_dataset)))
@@ -559,7 +580,8 @@ impl Dataset {
             .commit_handler
             .resolve_latest_location(&self.base, &self.object_store)
             .await?;
-        if location.version == self.manifest.version {
+
+        if self.already_checked_out(&location) {
             return Ok((self.manifest.as_ref().clone(), self.manifest_file.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
@@ -604,19 +626,8 @@ impl Dataset {
             None,
         );
 
-        let (restored_manifest, path) = commit_transaction(
-            self,
-            &self.object_store,
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
-
-        self.manifest = Arc::new(restored_manifest);
-        self.manifest_file = path;
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
         Ok(())
     }
@@ -791,6 +802,30 @@ impl Dataset {
         .await
     }
 
+    pub(crate) async fn apply_commit(
+        &mut self,
+        transaction: Transaction,
+        write_config: &ManifestWriteConfig,
+        commit_config: &CommitConfig,
+    ) -> Result<()> {
+        let (manifest, manifest_path, manifest_e_tag) = commit_transaction(
+            self,
+            self.object_store(),
+            self.commit_handler.as_ref(),
+            &transaction,
+            write_config,
+            commit_config,
+            self.manifest_naming_scheme,
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+        self.manifest_file = manifest_path;
+        self.manifest_e_tag = manifest_e_tag;
+
+        Ok(())
+    }
+
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(Arc::new(self.clone()))
@@ -953,19 +988,8 @@ impl Dataset {
             None,
         );
 
-        let (manifest, path) = commit_transaction(
-            self,
-            &self.object_store,
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
-
-        self.manifest = Arc::new(manifest);
-        self.manifest_file = path;
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
         Ok(())
     }
@@ -1020,10 +1044,10 @@ impl Dataset {
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let mut versions: Vec<Version> = self
             .commit_handler
-            .list_manifests(&self.base, &self.object_store.inner)
+            .list_manifest_locations(&self.base, &self.object_store.inner)
             .await?
-            .try_filter_map(|path| async move {
-                match read_manifest(&self.object_store, &path, None).await {
+            .try_filter_map(|location| async move {
+                match read_manifest(&self.object_store, &location.path, location.size).await {
                     Ok(manifest) => Ok(Some(Version::from(&manifest))),
                     Err(e) => Err(e),
                 }
@@ -1041,9 +1065,11 @@ impl Dataset {
     /// This is meant to be a fast path for checking if a dataset has changed. This is why
     /// we don't return the full version struct.
     pub async fn latest_version_id(&self) -> Result<u64> {
-        self.commit_handler
-            .resolve_latest_version_id(&self.base, &self.object_store)
-            .await
+        Ok(self
+            .commit_handler
+            .resolve_latest_location(&self.base, &self.object_store)
+            .await?
+            .version)
     }
 
     pub fn count_fragments(&self) -> usize {
@@ -1526,19 +1552,8 @@ impl Dataset {
             None,
         );
 
-        let (manifest, manifest_path) = commit_transaction(
-            self,
-            &self.object_store,
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
-
-        self.manifest = Arc::new(manifest);
-        self.manifest_file = manifest_path;
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
         Ok(())
     }
@@ -1568,19 +1583,8 @@ impl Dataset {
         let transaction =
             Transaction::new(self.manifest.version, op, /*blobs_op=*/ None, None);
 
-        let (manifest, manifest_path) = commit_transaction(
-            self,
-            &self.object_store,
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
-
-        self.manifest = Arc::new(manifest);
-        self.manifest_file = manifest_path;
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
         Ok(())
     }
@@ -1681,7 +1685,7 @@ pub(crate) async fn write_manifest_file(
     indices: Option<Vec<Index>>,
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
-) -> std::result::Result<Path, CommitError> {
+) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
         apply_feature_flags(manifest, config.use_move_stable_row_ids)?;
     }
@@ -1707,17 +1711,16 @@ fn write_manifest_file_to_path<'a>(
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
-) -> BoxFuture<'a, Result<u64>> {
+) -> BoxFuture<'a, Result<WriteResult>> {
     Box::pin(async {
         let mut object_writer = ObjectWriter::new(object_store, path).await?;
         let pos = write_manifest(&mut object_writer, manifest, indices).await?;
         object_writer
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
-        let size = object_writer.tell().await? as u64;
-        object_writer.shutdown().await?;
+        let res = object_writer.shutdown().await?;
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_MANIFEST, path = path.to_string());
-        Ok(size)
+        Ok(res)
     })
 }
 
@@ -2153,9 +2156,10 @@ mod tests {
             dataset.object_store(),
             &dataset
                 .commit_handler
-                .resolve_latest_version(&dataset.base, dataset.object_store())
+                .resolve_latest_location(&dataset.base, dataset.object_store())
                 .await
-                .unwrap(),
+                .unwrap()
+                .path,
             None,
         )
         .await
@@ -2176,9 +2180,10 @@ mod tests {
             dataset.object_store(),
             &dataset
                 .commit_handler
-                .resolve_latest_version(&dataset.base, dataset.object_store())
+                .resolve_latest_location(&dataset.base, dataset.object_store())
                 .await
-                .unwrap(),
+                .unwrap()
+                .path,
             None,
         )
         .await
@@ -5548,5 +5553,38 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Expected to modify the fragment but no changes were made"));
+    }
+
+    #[tokio::test]
+    async fn test_replace_dataset() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = gen()
+            .col("int", array::step::<Int32Type>())
+            .into_batch_rows(RowCount::from(20))
+            .unwrap();
+        let data1 = data.slice(0, 10);
+        let data2 = data.slice(10, 10);
+        let mut ds = InsertBuilder::new(test_uri)
+            .execute(vec![data1])
+            .await
+            .unwrap();
+
+        ds.object_store().remove_dir_all(test_uri).await.unwrap();
+
+        let ds2 = InsertBuilder::new(test_uri)
+            .execute(vec![data2.clone()])
+            .await
+            .unwrap();
+
+        ds.checkout_latest().await.unwrap();
+        let roundtripped = ds.scan().try_into_batch().await.unwrap();
+        assert_eq!(roundtripped, data2);
+
+        ds.validate().await.unwrap();
+        ds2.validate().await.unwrap();
+        assert_eq!(ds.manifest.version, 1);
+        assert_eq!(ds2.manifest.version, 1);
     }
 }
