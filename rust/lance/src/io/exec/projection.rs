@@ -203,9 +203,10 @@ pub fn compute_projection<'a>(
 #[cfg(test)]
 mod tests {
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, StructArray};
-    use datafusion::{physical_plan::memory::MemoryExec, prelude::SessionContext};
+    use datafusion::prelude::SessionContext;
     use futures::TryStreamExt;
     use lance_core::datatypes::Schema;
+    use lance_datafusion::exec::OneShotExec;
 
     use super::*;
 
@@ -278,8 +279,7 @@ mod tests {
     }
 
     async fn apply_to_batch(batch: RecordBatch, projection: &ArrowSchema) -> Result<RecordBatch> {
-        let schema = batch.schema();
-        let memory_exec = MemoryExec::try_new(&[vec![batch]], schema, None).unwrap();
+        let memory_exec = OneShotExec::from_batch(batch);
         let exec = project(Arc::new(memory_exec), projection)?;
         let claimed_schema = exec.schema();
         let session = SessionContext::new();

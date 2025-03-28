@@ -304,17 +304,17 @@ impl ExecutionPlan for AddRowAddrExec {
 mod test {
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::{DataType, Field};
-    use datafusion::{physical_plan::memory::MemoryExec, prelude::SessionContext};
+    use datafusion::prelude::SessionContext;
     use futures::TryStreamExt;
     use lance_core::{ROW_ADDR, ROW_ID_FIELD};
+    use lance_datafusion::exec::OneShotExec;
 
     use crate::dataset::WriteParams;
 
     use super::*;
 
     async fn apply_to_batch(batch: RecordBatch, dataset: Arc<Dataset>) -> Result<RecordBatch> {
-        let schema = batch.schema();
-        let memory_exec = MemoryExec::try_new(&[vec![batch]], schema, None).unwrap();
+        let memory_exec = OneShotExec::from_batch(batch);
         let exec = AddRowAddrExec::try_new(Arc::new(memory_exec), dataset, 0)?;
         let session = SessionContext::new();
         let task_ctx = session.task_ctx();
@@ -435,12 +435,9 @@ mod test {
         let schema = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
         let batch = RecordBatch::try_new(schema.clone(), vec![rowids.clone()]).unwrap();
 
-        let exec = AddRowAddrExec::try_new(
-            Arc::new(MemoryExec::try_new(&[vec![batch.clone()]], schema.clone(), None).unwrap()),
-            dataset.clone(),
-            0,
-        )
-        .unwrap();
+        let exec =
+            AddRowAddrExec::try_new(Arc::new(OneShotExec::from_batch(batch)), dataset.clone(), 0)
+                .unwrap();
         let stats = exec.statistics().unwrap();
         let result = apply_to_batch(batch, dataset).await.unwrap();
 

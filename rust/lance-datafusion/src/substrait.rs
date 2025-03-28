@@ -382,6 +382,7 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Res
                             Ok(Transformed::yes(Expr::Column(Column {
                                 relation: None,
                                 name: column.name,
+                                spans: column.spans.clone(), // Preserve spans if available
                             })))
                         } else {
                             // This should not be possible
@@ -451,10 +452,7 @@ mod tests {
             .unwrap();
 
         let expected = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column {
-                relation: None,
-                name: "x".to_string(),
-            })),
+            left: Box::new(Expr::Column(Column::new_unqualified("x"))),
             op: Operator::Lt,
             right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
         });
