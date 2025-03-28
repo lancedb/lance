@@ -1156,6 +1156,62 @@ def test_merge_with_schema_holes(tmp_path: Path):
     assert tbl == expected
 
 
+def test_merge_all_types(tmp_path: Path):
+    from datetime import date, datetime, time, timedelta
+
+    table = pa.table(
+        {"id": pa.array([1, 2, 3]), "name": pa.array(["one", "two", "three"])}
+    )
+    dataset_path = tmp_path / "all_types_test"
+    dataset = lance.write_dataset(table, dataset_path, mode="overwrite")
+
+    today = date.today()
+    now = datetime.now()
+    current_time = time(now.hour, now.minute, now.second)
+    long_string = "x" * 1000
+    long_binary = b"y" * 1000
+
+    new_data = pa.table(
+        {
+            "id": pa.array([1, 2]),
+            "float32_val": pa.array([1.1, 2.2], type=pa.float32()),
+            "float64_val": pa.array([3.3, 4.4], type=pa.float64()),
+            "int8_val": pa.array([10, 20], type=pa.int8()),
+            "int32_val": pa.array([100, 200], type=pa.int32()),
+            "uint16_val": pa.array([1000, 2000], type=pa.uint16()),
+            "is_active": pa.array([True, False]),
+            "date_val": pa.array([today, today]),
+            "timestamp_val": pa.array([now, now]),
+            "time_val": pa.array([current_time, current_time]),
+            "duration_val": pa.array(
+                [timedelta(hours=1, minutes=30), timedelta(minutes=45)]
+            ),
+            "large_string_val": pa.array(
+                [long_string, long_string], type=pa.large_string()
+            ),
+            "large_binary_val": pa.array(
+                [long_binary, long_binary], type=pa.large_binary()
+            ),
+        }
+    )
+
+    dataset.merge(new_data, "id")
+    result = dataset.scanner().to_table().to_pandas()
+
+    assert result.loc[result["id"] == 3, "float32_val"].isna().all()
+    assert result.loc[result["id"] == 3, "float64_val"].isna().all()
+    assert result.loc[result["id"] == 3, "int8_val"].isna().all()
+    assert result.loc[result["id"] == 3, "int32_val"].isna().all()
+    assert result.loc[result["id"] == 3, "uint16_val"].isna().all()
+    assert result.loc[result["id"] == 3, "is_active"].isna().all()
+    assert result.loc[result["id"] == 3, "date_val"].isna().all()
+    assert result.loc[result["id"] == 3, "timestamp_val"].isna().all()
+    assert result.loc[result["id"] == 3, "time_val"].isna().all()
+    assert result.loc[result["id"] == 3, "duration_val"].isna().all()
+    assert result.loc[result["id"] == 3, "large_string_val"].isna().all()
+    assert result.loc[result["id"] == 3, "large_binary_val"].isna().all()
+
+
 def test_merge_search(tmp_path: Path):
     left_table = pa.Table.from_pydict({"id": [1, 2, 3], "left": ["a", "b", "c"]})
     right_table = pa.Table.from_pydict({"id": [1, 2, 3], "right": ["A", "B", "C"]})
@@ -1275,15 +1331,16 @@ def test_merge_data(tmp_path: Path):
 
     dataset = lance.dataset(tmp_path / "dataset")
 
-    # rejects partial data for non-nullable types
     new_tab = pa.table({"a": range(40), "c": range(40)})
-    # TODO: this should be ValueError
-    with pytest.raises(
-        OSError, match=".+Lance does not yet support nulls for type Int64."
-    ):
-        dataset.merge(new_tab, "a")
+    dataset.merge(new_tab, "a")
 
-    # accepts a full merge
+    result = dataset.to_table()
+    assert result.column("c").slice(0, 40).to_pylist() == list(range(40))
+    assert all(x is None for x in result.column("c").slice(40).to_pylist())
+
+    lance.write_dataset(tab, tmp_path / "dataset2", mode="append")
+    dataset = lance.dataset(tmp_path / "dataset2")
+
     new_tab = pa.table({"a": range(100), "c": range(100)})
     dataset.merge(new_tab, "a")
     assert dataset.version == 2
@@ -1295,7 +1352,6 @@ def test_merge_data(tmp_path: Path):
         }
     )
 
-    # accepts a partial for string
     new_tab = pa.table({"a2": range(5), "d": ["a", "b", "c", "d", "e"]})
     dataset.merge(new_tab, left_on="a", right_on="a2")
     assert dataset.version == 3
@@ -1308,9 +1364,33 @@ def test_merge_data(tmp_path: Path):
         }
     )
     assert dataset.to_table() == expected
-    # Verify we can also load from fresh instance
-    dataset = lance.dataset(tmp_path / "dataset")
+
+    dataset = lance.dataset(tmp_path / "dataset2")
     assert dataset.to_table() == expected
+
+    lance.write_dataset(tab, tmp_path / "dataset3", mode="append")
+    dataset = lance.dataset(tmp_path / "dataset3")
+
+    new_tab = pa.table(
+        {"a": range(50), "float_val": [float(i) + 0.5 for i in range(50)]}
+    )
+    dataset.merge(new_tab, "a")
+    result = dataset.to_table()
+    assert len(result.column("float_val").to_pylist()) == 100
+    assert all(
+        isinstance(x, float)
+        for x in result.column("float_val").slice(0, 50).to_pylist()
+    )
+    assert all(x is None for x in result.column("float_val").slice(50).to_pylist())
+
+    new_tab = pa.table({"a": range(30), "bool_val": [i % 2 == 0 for i in range(30)]})
+    dataset.merge(new_tab, "a")
+    result = dataset.to_table()
+    assert len(result.column("bool_val").to_pylist()) == 100
+    assert all(
+        isinstance(x, bool) or x is None for x in result.column("bool_val").to_pylist()
+    )
+    assert all(x is None for x in result.column("bool_val").slice(30).to_pylist())
 
 
 def test_merge_from_dataset(tmp_path: Path):
