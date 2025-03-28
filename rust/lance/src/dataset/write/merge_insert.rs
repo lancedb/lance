@@ -2139,4 +2139,9 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_merge_insert_concurrency() {
+        todo!("Run several merge inserts on same fragment, validate they all work.");
+    }
 }
