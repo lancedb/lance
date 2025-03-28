@@ -304,7 +304,7 @@ impl ExecutionPlan for AddRowAddrExec {
 mod test {
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::{DataType, Field};
-    use datafusion::prelude::SessionContext;
+    use datafusion::{datasource::memory::MemorySourceConfig, prelude::SessionContext};
     use futures::TryStreamExt;
     use lance_core::{ROW_ADDR, ROW_ID_FIELD};
     use lance_datafusion::exec::OneShotExec;
@@ -435,12 +435,9 @@ mod test {
         let schema = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
         let batch = RecordBatch::try_new(schema.clone(), vec![rowids.clone()]).unwrap();
 
-        let exec = AddRowAddrExec::try_new(
-            Arc::new(OneShotExec::from_batch(batch.clone())),
-            dataset.clone(),
-            0,
-        )
-        .unwrap();
+        let memory_exec =
+            MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], schema, None).unwrap();
+        let exec = AddRowAddrExec::try_new(memory_exec, dataset.clone(), 0).unwrap();
         let stats = exec.statistics().unwrap();
         let result = apply_to_batch(batch, dataset).await.unwrap();
 
