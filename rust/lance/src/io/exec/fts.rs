@@ -334,7 +334,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
-        let unindexed_input = self.unindexed_input.execute(partition, context.clone())?;
+        let unindexed_input = self.unindexed_input.execute(partition, context)?;
 
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
