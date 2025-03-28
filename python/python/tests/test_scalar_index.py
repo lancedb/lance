@@ -371,6 +371,7 @@ def test_fts_fuzzy_query(tmp_path):
 
     ds = lance.write_dataset(data, tmp_path)
     ds.create_scalar_index("text", "INVERTED")
+
     results = ds.to_table(
         full_text_query=MatchQuery("foo", "text", fuzziness=1),
     )
@@ -381,6 +382,11 @@ def test_fts_fuzzy_query(tmp_path):
         "fob",  # 1 substitution
         "food",  # 1 insertion
     }
+
+    results = ds.to_table(
+        full_text_query=MatchQuery("foo", "text", fuzziness=1, max_expansions=3),
+    )
+    assert results.num_rows == 3
 
 
 def test_fts_phrase_query(tmp_path):

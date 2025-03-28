@@ -1606,16 +1606,6 @@ impl Scanner {
 
             fill_fts_query_column(&query.query, &indexed_columns, false)?
         } else {
-            // check whether all specified columns are indexed
-            for field in &fields {
-                self.dataset
-                    .load_scalar_index_for_column(field)
-                    .await?
-                    .ok_or(Error::invalid_input(
-                        format!("Column {} has no inverted index", field),
-                        location!(),
-                    ))?;
-            }
             query.query.clone()
         };
 

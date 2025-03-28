@@ -319,11 +319,16 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<CompoundQuery> {
                 .get_item("fuzziness")?
                 .ok_or(PyValueError::new_err("fuzziness not found"))?
                 .extract::<Option<u32>>()?;
+            let max_expansions = params
+                .get_item("max_expansions")?
+                .ok_or(PyValueError::new_err("max_expansions not found"))?
+                .extract::<usize>()?;
 
             let query = lance_index::scalar::inverted::query::MatchQuery::new(query)
                 .with_column(Some(column))
                 .with_boost(boost)
-                .with_fuzziness(fuzziness);
+                .with_fuzziness(fuzziness)
+                .with_max_expansions(max_expansions);
             Ok(CompoundQuery::Leaf(query.into()))
         }
 

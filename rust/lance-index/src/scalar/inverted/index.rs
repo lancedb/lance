@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -123,16 +124,17 @@ impl InvertedIndex {
     pub fn expand_fuzzy(
         &self,
         tokens: Vec<String>,
-        max_distance: Option<u32>,
+        fuzziness: Option<u32>,
+        max_expansions: usize,
     ) -> Result<Vec<String>> {
-        let mut new_tokens = Vec::with_capacity(tokens.len());
+        let mut new_tokens = Vec::with_capacity(min(tokens.len(), max_expansions));
         for token in tokens {
-            let max_dist = match max_distance {
-                Some(max_dist) => max_dist,
+            let fuzziness = match fuzziness {
+                Some(fuzziness) => fuzziness,
                 None => MatchQuery::auto_fuzziness(&token),
             };
             let lev =
-                fst::automaton::Levenshtein::new(&token, max_dist).map_err(|e| Error::Index {
+                fst::automaton::Levenshtein::new(&token, fuzziness).map_err(|e| Error::Index {
                     message: format!("failed to construct the fuzzy query: {}", e),
                     location: location!(),
                 })?;
@@ -140,6 +142,9 @@ impl InvertedIndex {
                 let mut stream = map.search(lev).into_stream();
                 while let Some((token, _)) = stream.next() {
                     new_tokens.push(String::from_utf8_lossy(token).into_owned());
+                    if new_tokens.len() >= max_expansions {
+                        break;
+                    }
                 }
             } else {
                 return Err(Error::Index {

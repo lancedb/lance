@@ -40,7 +40,13 @@ class FullTextQuery(abc.ABC):
 
 class MatchQuery(FullTextQuery):
     def __init__(
-        self, query: str, column: str, *, boost: float = 1.0, fuzziness: int = 0
+        self,
+        query: str,
+        column: str,
+        *,
+        boost: float = 1.0,
+        fuzziness: int = 0,
+        max_expansions: int = 50,
     ):
         """
         Match query for full-text search.
@@ -61,11 +67,15 @@ class MatchQuery(FullTextQuery):
                 - 0 for terms with length <= 2
                 - 1 for terms with length <= 5
                 - 2 for terms with length > 5
+        max_expansions : int, optional
+            The maximum number of terms to consider for fuzzy matching.
+            Defaults to 50.
         """
         self.column = column
         self.query = query
         self.boost = boost
         self.fuzziness = fuzziness
+        self.max_expansions = max_expansions
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MATCH
@@ -77,6 +87,7 @@ class MatchQuery(FullTextQuery):
                     "query": self.query,
                     "boost": self.boost,
                     "fuzziness": self.fuzziness,
+                    "max_expansions": self.max_expansions,
                 }
             }
         }

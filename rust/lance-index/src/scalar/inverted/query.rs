@@ -115,6 +115,10 @@ pub struct MatchQuery {
     // - 1 for terms with length <= 5
     // - 2 for terms with length > 5
     pub fuzziness: Option<u32>,
+
+    /// The maximum number of terms to expand for fuzzy matching.
+    /// Default to 50.
+    pub max_expansions: usize,
 }
 
 impl MatchQuery {
@@ -124,6 +128,7 @@ impl MatchQuery {
             terms,
             boost: 1.0,
             fuzziness: Some(0),
+            max_expansions: 50,
         }
     }
 
@@ -139,6 +144,11 @@ impl MatchQuery {
 
     pub fn with_fuzziness(mut self, fuzziness: Option<u32>) -> Self {
         self.fuzziness = fuzziness;
+        self
+    }
+
+    pub fn with_max_expansions(mut self, max_expansions: usize) -> Self {
+        self.max_expansions = max_expansions;
         self
     }
 

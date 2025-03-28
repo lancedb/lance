@@ -207,7 +207,8 @@ impl ExecutionPlan for MatchQueryExec {
             };
             let mut tokens = collect_tokens(&query.terms, &mut tokenizer, None);
             if is_fuzzy {
-                tokens = inverted_idx.expand_fuzzy(tokens, query.fuzziness)?;
+                tokens =
+                    inverted_idx.expand_fuzzy(tokens, query.fuzziness, query.max_expansions)?;
             }
 
             pre_filter.wait_for_ready().await?;

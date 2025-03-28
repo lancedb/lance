@@ -19,7 +19,7 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
-use inverted::query::{fill_fts_query_column, FtsQueryNode, FtsSearchParams};
+use inverted::query::{fill_fts_query_column, CompoundQuery, FtsQueryNode, FtsSearchParams};
 use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
@@ -254,7 +254,7 @@ impl PartialEq for dyn AnyQuery {
 /// A full text search query
 #[derive(Debug, Clone, PartialEq)]
 pub struct FullTextSearchQuery {
-    pub query: inverted::query::CompoundQuery,
+    pub query: CompoundQuery,
 
     /// The maximum number of results to return
     pub limit: Option<i64>,
