@@ -111,8 +111,6 @@ def _to_tensor(
     return ret
 
 
-logger = logging.getLogger(__name__)
-
 try:
     # When available, subclass from the newer torchdata DataPipes
     # instead of torch Datasets.
@@ -127,6 +125,7 @@ except ImportError:
         MAP_DATASET_CLASS = torch.utils.data.Dataset
         ITER_DATASET_CLASS = torch.utils.data.IterableDataset
     except ImportError:
+        logger = logging.getLogger(__name__)
         logger.error(
             "Error when importing Torch. To use PyTorch features, please install torch."
         )
