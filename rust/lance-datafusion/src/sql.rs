@@ -3,6 +3,8 @@
 
 //! SQL Parser utility
 
+use std::any::TypeId;
+
 use datafusion::sql::sqlparser::{
     ast::{Expr, SelectItem, SetExpr, Statement},
     dialect::{Dialect, GenericDialect},
@@ -22,6 +24,10 @@ impl LanceDialect {
 }
 
 impl Dialect for LanceDialect {
+    fn dialect(&self) -> TypeId {
+        self.0.dialect()
+    }
+
     fn is_identifier_start(&self, ch: char) -> bool {
         self.0.is_identifier_start(ch)
     }
