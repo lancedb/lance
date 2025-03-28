@@ -477,7 +477,7 @@ impl DatasetIndexExt for Dataset {
             .filter(|idx| {
                 indices_to_optimize
                     .as_ref()
-                    .map_or(true, |names| names.contains(&idx.name))
+                    .is_none_or(|names| names.contains(&idx.name))
             })
             .map(|idx| (idx.name.clone(), idx))
             .into_group_map();
