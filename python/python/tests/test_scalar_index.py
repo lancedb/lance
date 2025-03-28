@@ -450,7 +450,8 @@ def test_fts_multi_match_query(tmp_path):
     )
 
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", "INVERTED")
+    ds.create_scalar_index("title", "INVERTED")
+    ds.create_scalar_index("content", "INVERTED")
 
     results = ds.to_table(
         full_text_query=MultiMatchQuery("common", ["title", "content"]),

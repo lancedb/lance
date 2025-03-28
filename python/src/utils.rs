@@ -349,26 +349,17 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<FtsQuery> {
         }
 
         "boost" => {
-            let column = query_value.keys().get_item(0)?.extract::<String>()?;
-            let params = query_value
-                .get_item(&column)?
-                .ok_or(PyValueError::new_err(format!(
-                    "column {} not found",
-                    column
-                )))?;
-            let params = params.downcast::<PyDict>()?;
-
-            let positive = params
+            let positive: Bound<'_, PyAny> = query_value
                 .get_item("positive")?
                 .ok_or(PyValueError::new_err("positive not found"))?;
             let positive = positive.downcast::<PyDict>()?;
 
-            let negative = params
+            let negative = query_value
                 .get_item("negative")?
                 .ok_or(PyValueError::new_err("negative not found"))?;
             let negative = negative.downcast::<PyDict>()?;
 
-            let negative_boost = params
+            let negative_boost = query_value
                 .get_item("negative_boost")?
                 .ok_or(PyValueError::new_err("negative_boost not found"))?
                 .extract::<f32>()?;

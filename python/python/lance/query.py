@@ -180,6 +180,8 @@ class MultiMatchQuery(FullTextQuery):
         """
         self.query = query
         self.columns = columns
+        if boosts is None:
+            boosts = [1.0] * len(columns)
         self.boosts = boosts
 
     def query_type(self) -> FullTextQueryType:

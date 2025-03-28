@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use arrow::datatypes::Int32Type;
 use arrow_array::PrimitiveArray;
-use itertools::Itertools;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::Result;
 use tracing::instrument;
@@ -118,7 +117,6 @@ pub struct Wand {
     cur_doc: Option<u64>,
     num_docs: usize,
     postings: Vec<PostingIterator>,
-    candidates: BinaryHeap<Reverse<OrderedDoc>>,
 }
 
 impl Wand {
@@ -128,7 +126,6 @@ impl Wand {
             cur_doc: None,
             num_docs,
             postings: postings.filter(|posting| posting.doc().is_some()).collect(),
-            candidates: BinaryHeap::new(),
         }
     }
 
@@ -144,6 +141,7 @@ impl Wand {
             return Ok((vec![], vec![]));
         }
 
+        let mut candidates = BinaryHeap::new();
         let num_query_tokens = self.postings.len();
 
         while let Some(doc) = self.next().await? {
@@ -163,21 +161,19 @@ impl Wand {
                 }
             }
             let score = self.score(doc, &scorer);
-            if self.candidates.len() < limit {
-                self.candidates.push(Reverse(OrderedDoc::new(doc, score)));
-            } else if score > self.candidates.peek().unwrap().0.score.0 {
-                self.candidates.pop();
-                self.candidates.push(Reverse(OrderedDoc::new(doc, score)));
-                self.threshold = self.candidates.peek().unwrap().0.score.0 * factor;
+            if candidates.len() < limit {
+                candidates.push(Reverse(OrderedDoc::new(doc, score)));
+            } else if score > candidates.peek().unwrap().0.score.0 {
+                candidates.pop();
+                candidates.push(Reverse(OrderedDoc::new(doc, score)));
+                self.threshold = candidates.peek().unwrap().0.score.0 * factor;
             }
         }
 
-        Ok(self
-            .candidates
-            .iter()
-            .map(|doc| (doc.0.row_id, doc.0.score))
-            .sorted_unstable()
-            .map(|(row_id, score)| (row_id, score.0))
+        Ok(candidates
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse(doc)| (doc.row_id, doc.score.0))
             .unzip())
     }
 
