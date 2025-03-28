@@ -516,5 +516,20 @@ mod tests {
 
         let res = object_writer.shutdown().await.unwrap();
         assert_eq!(res.size, 256 * 3);
+
+        // Trigger multi part upload
+        let mut object_writer = ObjectWriter::new(&store, &Path::from("/bar"))
+            .await
+            .unwrap();
+        let buf = vec![0; INITIAL_UPLOAD_STEP / 3 * 2];
+        for i in 0..5 {
+            // Write more data to trigger the multipart upload
+            // This should be enough to trigger a multipart upload
+            object_writer.write_all(buf.as_slice()).await.unwrap();
+            // Check the cursor
+            assert_eq!(object_writer.tell().await.unwrap(), (i + 1) * buf.len());
+        }
+        let res = object_writer.shutdown().await.unwrap();
+        assert_eq!(res.size, buf.len() * 5);
     }
 }

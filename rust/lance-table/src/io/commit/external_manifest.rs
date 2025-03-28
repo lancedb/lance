@@ -170,7 +170,7 @@ impl ExternalManifestCommitHandler {
 
         // On S3, the etag can change if originally was MultipartUpload and later was Copy
         // https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html#AmazonS3-Type-Object-ETag
-        // We generally only do MultipartUpload for > 5MB files, so we can skip this check
+        // We only do MultipartUpload for > 5MB files, so we can skip this check
         // if size < 5MB
         let e_tag = if size < 5 * 1024 * 1024 {
             e_tag
