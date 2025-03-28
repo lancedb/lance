@@ -191,43 +191,43 @@ def _might_be(cls: type, type_: str) -> bool:
 
 def _check_for_numpy(obj: Any, *, check_type: bool = True) -> bool:
     return _NUMPY_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "numpy"
+        cast("Hashable", type(obj) if check_type else obj), "numpy"
     )
 
 
 def _check_for_pandas(obj: Any, *, check_type: bool = True) -> bool:
     return _PANDAS_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "pandas"
+        cast("Hashable", type(obj) if check_type else obj), "pandas"
     )
 
 
 def _check_for_polars(obj: Any, *, check_type: bool = True) -> bool:
     return _POLARS_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "polars"
+        cast("Hashable", type(obj) if check_type else obj), "polars"
     )
 
 
 def _check_for_torch(obj: Any, *, check_type: bool = True) -> bool:
     return _TORCH_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "torch"
+        cast("Hashable", type(obj) if check_type else obj), "torch"
     )
 
 
 def _check_for_hugging_face(obj: Any, *, check_type: bool = True) -> bool:
     return _HUGGING_FACE_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "datasets"
+        cast("Hashable", type(obj) if check_type else obj), "datasets"
     )
 
 
 def _check_for_tensorflow(obj: Any, *, check_type: bool = True) -> bool:
     return _TENSORFLOW_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "tensorflow"
+        cast("Hashable", type(obj) if check_type else obj), "tensorflow"
     )
 
 
 def _check_for_ray(obj: Any, *, check_type: bool = True) -> bool:
     return _RAY_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "ray"
+        cast("Hashable", type(obj) if check_type else obj), "ray"
     )
 
 

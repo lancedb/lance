@@ -222,9 +222,7 @@ def test_fixed_size_binary(tmp_path):
     ds.create_scalar_index("uuid", "BTREE")
 
     query = (
-        "uuid = arrow_cast("
-        "0x32333435323334353233343532333435, "
-        "'FixedSizeBinary(16)')"
+        "uuid = arrow_cast(0x32333435323334353233343532333435, 'FixedSizeBinary(16)')"
     )
     assert "MaterializeIndex" in ds.scanner(filter=query).explain_plan()
 
