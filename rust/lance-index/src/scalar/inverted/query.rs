@@ -8,19 +8,19 @@ use snafu::location;
 
 #[derive(Debug, Clone)]
 pub struct FtsSearchParams {
-    pub limit: usize,
+    pub limit: Option<usize>,
     pub wand_factor: f32,
 }
 
 impl FtsSearchParams {
     pub fn new() -> Self {
         Self {
-            limit: usize::MAX,
+            limit: None,
             wand_factor: 1.0,
         }
     }
 
-    pub fn with_limit(mut self, limit: usize) -> Self {
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.limit = limit;
         self
     }
@@ -43,8 +43,13 @@ pub trait FtsQueryNode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FtsQuery {
+    // leaf queries
     Match(MatchQuery),
     Phrase(PhraseQuery),
+
+    // compound queries
+    Boost(BoostQuery),
+    MultiMatch(MultiMatchQuery),
 }
 
 impl std::fmt::Display for FtsQuery {
@@ -52,6 +57,12 @@ impl std::fmt::Display for FtsQuery {
         match self {
             Self::Match(query) => write!(f, "Match({:?})", query),
             Self::Phrase(query) => write!(f, "Phrase({:?})", query),
+            Self::Boost(query) => write!(
+                f,
+                "Boosting(positive={}, negative={}, negative_boost={})",
+                query.positive, query.negative, query.negative_boost
+            ),
+            Self::MultiMatch(query) => write!(f, "MultiMatch({:?})", query),
         }
     }
 }
@@ -61,6 +72,18 @@ impl FtsQueryNode for FtsQuery {
         match self {
             Self::Match(query) => query.columns(),
             Self::Phrase(query) => query.columns(),
+            Self::Boost(query) => {
+                let mut columns = query.positive.columns();
+                columns.extend(query.negative.columns());
+                columns
+            }
+            Self::MultiMatch(query) => {
+                let mut columns = HashSet::new();
+                for match_query in &query.match_queries {
+                    columns.extend(match_query.columns());
+                }
+                columns
+            }
         }
     }
 }
@@ -70,6 +93,8 @@ impl FtsQuery {
         match self {
             Self::Match(query) => &query.terms,
             Self::Phrase(query) => &query.terms,
+            Self::Boost(query) => &query.positive.query(),
+            Self::MultiMatch(query) => &query.match_queries[0].terms,
         }
     }
 
@@ -77,6 +102,10 @@ impl FtsQuery {
         match self {
             Self::Match(query) => query.column.is_none(),
             Self::Phrase(query) => query.column.is_none(),
+            Self::Boost(query) => {
+                query.positive.is_missing_column() || query.negative.is_missing_column()
+            }
+            Self::MultiMatch(query) => query.match_queries.iter().any(|q| q.column.is_none()),
         }
     }
 
@@ -84,6 +113,23 @@ impl FtsQuery {
         match self {
             Self::Match(query) => Self::Match(query.with_column(Some(column))),
             Self::Phrase(query) => Self::Phrase(query.with_column(Some(column))),
+            Self::Boost(query) => {
+                let positive = query.positive.with_column(column.clone());
+                let negative = query.negative.with_column(column);
+                Self::Boost(BoostQuery {
+                    positive: Box::new(positive),
+                    negative: Box::new(negative),
+                    negative_boost: query.negative_boost,
+                })
+            }
+            Self::MultiMatch(query) => {
+                let match_queries = query
+                    .match_queries
+                    .into_iter()
+                    .map(|q| q.with_column(Some(column.clone())))
+                    .collect();
+                Self::MultiMatch(MultiMatchQuery { match_queries })
+            }
         }
     }
 }
@@ -97,6 +143,18 @@ impl From<MatchQuery> for FtsQuery {
 impl From<PhraseQuery> for FtsQuery {
     fn from(query: PhraseQuery) -> Self {
         Self::Phrase(query)
+    }
+}
+
+impl From<BoostQuery> for FtsQuery {
+    fn from(query: BoostQuery) -> Self {
+        Self::Boost(query)
+    }
+}
+
+impl From<MultiMatchQuery> for FtsQuery {
+    fn from(query: MultiMatchQuery) -> Self {
+        Self::MultiMatch(query)
     }
 }
 
@@ -204,77 +262,14 @@ impl FtsQueryNode for PhraseQuery {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum CompoundQuery {
-    Leaf(FtsQuery),
-    Boost(BoostQuery),
-    MultiMatch(MultiMatchQuery),
-}
-
-impl From<FtsQuery> for CompoundQuery {
-    fn from(query: FtsQuery) -> Self {
-        Self::Leaf(query)
-    }
-}
-
-impl From<BoostQuery> for CompoundQuery {
-    fn from(query: BoostQuery) -> Self {
-        Self::Boost(query)
-    }
-}
-
-impl From<MultiMatchQuery> for CompoundQuery {
-    fn from(query: MultiMatchQuery) -> Self {
-        Self::MultiMatch(query)
-    }
-}
-
-impl std::fmt::Display for CompoundQuery {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Self::Leaf(query) => write!(f, "Leaf({})", query),
-            Self::Boost(query) => write!(
-                f,
-                "Boosting(positive={}, negative={}, negative_boost={})",
-                query.positive, query.negative, query.negative_boost
-            ),
-            Self::MultiMatch(query) => write!(f, "MultiMatch({:?})", query),
-        }
-    }
-}
-
-impl FtsQueryNode for CompoundQuery {
-    fn columns(&self) -> HashSet<String> {
-        match self {
-            Self::Leaf(query) => query.columns(),
-            Self::Boost(query) => {
-                let mut columns = query.positive.columns();
-                columns.extend(query.negative.columns());
-                columns
-            }
-            Self::MultiMatch(query) => {
-                let mut columns = HashSet::new();
-                for match_query in &query.match_queries {
-                    columns.extend(match_query.columns());
-                }
-                columns
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct BoostQuery {
-    pub positive: Box<CompoundQuery>,
-    pub negative: Box<CompoundQuery>,
+    pub positive: Box<FtsQuery>,
+    pub negative: Box<FtsQuery>,
     pub negative_boost: f32,
 }
 
 impl BoostQuery {
-    pub fn new(
-        positive: CompoundQuery,
-        negative: CompoundQuery,
-        negative_boost: Option<f32>,
-    ) -> Self {
+    pub fn new(positive: FtsQuery, negative: FtsQuery, negative_boost: Option<f32>) -> Self {
         Self {
             positive: Box::new(positive),
             negative: Box::new(negative),
@@ -294,16 +289,14 @@ impl FtsQueryNode for BoostQuery {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultiMatchQuery {
     // each query must be a match query with specified column
-    pub match_queries: Vec<CompoundQuery>,
+    pub match_queries: Vec<MatchQuery>,
 }
 
 impl MultiMatchQuery {
     pub fn new(query: String, columns: Vec<String>) -> Self {
         let match_queries = columns
             .into_iter()
-            .map(|column| {
-                FtsQuery::Match(MatchQuery::new(query.clone()).with_column(Some(column))).into()
-            })
+            .map(|column| MatchQuery::new(query.clone()).with_column(Some(column)))
             .collect();
         Self { match_queries }
     }
@@ -313,12 +306,9 @@ impl MultiMatchQuery {
             .into_iter()
             .zip(boosts)
             .map(|(column, boost)| {
-                FtsQuery::Match(
-                    MatchQuery::new(query.clone())
-                        .with_column(Some(column))
-                        .with_boost(boost),
-                )
-                .into()
+                MatchQuery::new(query.clone())
+                    .with_column(Some(column))
+                    .with_boost(boost)
             })
             .collect();
         Self { match_queries }
@@ -354,16 +344,15 @@ pub fn collect_tokens(
 }
 
 pub fn fill_fts_query_column(
-    query: &CompoundQuery,
+    query: &FtsQuery,
     columns: &[String],
     replace: bool,
-) -> Result<CompoundQuery> {
+) -> Result<FtsQuery> {
+    if !query.is_missing_column() && !replace {
+        return Ok(query.clone());
+    }
     match query {
-        CompoundQuery::Leaf(leaf) => {
-            if !leaf.is_missing_column() && !replace {
-                return Ok(query.clone());
-            }
-
+        FtsQuery::Match(match_query) => {
             match columns.len() {
                 0 => {
                     Err(Error::invalid_input(
@@ -373,21 +362,63 @@ pub fn fill_fts_query_column(
                 }
                 1 => {
                     let column = columns[0].clone();
-                    let query = leaf.clone().with_column(column);
-                    Ok(CompoundQuery::Leaf(query))
+                    let query = match_query.clone().with_column(Some(column));
+                    Ok(FtsQuery::Match(query))
                 }
                 _ => {
                     // if there are multiple columns, we need to create a MultiMatch query
                     let multi_match_query =
-                        MultiMatchQuery::new(leaf.query().to_owned(), columns.to_vec());
-                    Ok(CompoundQuery::MultiMatch(multi_match_query))
+                        MultiMatchQuery::new(match_query.terms.clone(), columns.to_vec());
+                    Ok(FtsQuery::MultiMatch(multi_match_query))
                 }
             }
         }
-        // for compound queries, we require the users to specify the column
-        _ => Err(Error::invalid_input(
-            "the column must be specified in the query".to_string(),
-            location!(),
-        )),
+        FtsQuery::Phrase(phrase_query) => {
+            match columns.len() {
+                0 => {
+                    Err(Error::invalid_input(
+                        "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
+                        location!(),
+                    ))
+                }
+                1 => {
+                    let column = columns[0].clone();
+                    let query = phrase_query.clone().with_column(Some(column));
+                    Ok(FtsQuery::Phrase(query))
+                }
+                _ => {
+                    Err(Error::invalid_input(
+                        "the column must be specified in the query".to_string(),
+                        location!(),
+                    ))
+                }
+            }
+        }
+       FtsQuery::Boost(boost_query) => {
+            let positive = fill_fts_query_column(&boost_query.positive, columns, replace)?;
+            let negative = fill_fts_query_column(&boost_query.negative, columns, replace)?;
+            Ok(FtsQuery::Boost(BoostQuery {
+                positive: Box::new(positive),
+                negative: Box::new(negative),
+                negative_boost: boost_query.negative_boost,
+            }))
+        }
+        FtsQuery::MultiMatch(multi_match_query) => {
+            let match_queries = multi_match_query
+                .match_queries
+                .iter()
+                .map(|query| fill_fts_query_column(&FtsQuery::Match(query.clone()), columns, replace))
+                .map(|result| {
+                    result.map(|query| {
+                        if let FtsQuery::Match(match_query) = query {
+                            match_query
+                        } else {
+                            unreachable!("Expected MatchQuery")
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(FtsQuery::MultiMatch(MultiMatchQuery { match_queries }))
+       }
     }
 }

@@ -24,7 +24,9 @@ use lance::Result;
 use lance::{datatypes::Schema, io::ObjectStore};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
-use lance_index::scalar::inverted::query::CompoundQuery;
+use lance_index::scalar::inverted::query::{
+    BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, PhraseQuery,
+};
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
 use lance_index::vector::v3::subindex::IvfSubIndex;
@@ -286,7 +288,7 @@ pub fn class_name(ob: &Bound<'_, PyAny>) -> PyResult<String> {
     }
 }
 
-pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<CompoundQuery> {
+pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<FtsQuery> {
     let query_type = query.keys().get_item(0)?.extract::<String>()?;
     let query_value = query
         .get_item(&query_type)?
@@ -324,12 +326,12 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<CompoundQuery> {
                 .ok_or(PyValueError::new_err("max_expansions not found"))?
                 .extract::<usize>()?;
 
-            let query = lance_index::scalar::inverted::query::MatchQuery::new(query)
+            let query = MatchQuery::new(query)
                 .with_column(Some(column))
                 .with_boost(boost)
                 .with_fuzziness(fuzziness)
                 .with_max_expansions(max_expansions);
-            Ok(CompoundQuery::Leaf(query.into()))
+            Ok(query.into())
         }
 
         "match_phrase" => {
@@ -342,9 +344,8 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<CompoundQuery> {
                 )))?
                 .extract::<String>()?;
 
-            let query = lance_index::scalar::inverted::query::PhraseQuery::new(query)
-                .with_column(Some(column));
-            Ok(CompoundQuery::Leaf(query.into()))
+            let query = PhraseQuery::new(query).with_column(Some(column));
+            Ok(query.into())
         }
 
         "boost" => {
@@ -374,11 +375,7 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<CompoundQuery> {
 
             let positive_query = parse_fts_query(positive)?;
             let negative_query = parse_fts_query(negative)?;
-            let query = lance_index::scalar::inverted::query::BoostQuery::new(
-                positive_query,
-                negative_query,
-                Some(negative_boost),
-            );
+            let query = BoostQuery::new(positive_query, negative_query, Some(negative_boost));
 
             Ok(query.into())
         }
@@ -399,9 +396,7 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<CompoundQuery> {
                 .ok_or(PyValueError::new_err("boost not found"))?
                 .extract::<Vec<f32>>()?;
 
-            let query = lance_index::scalar::inverted::query::MultiMatchQuery::with_boosts(
-                query, columns, boost,
-            );
+            let query = MultiMatchQuery::with_boosts(query, columns, boost);
             Ok(query.into())
         }
 

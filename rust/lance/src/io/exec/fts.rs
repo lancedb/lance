@@ -50,7 +50,7 @@ impl DisplayAs for MatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "MatchQuery: query={:?}", self.query)
+                write!(f, "MatchQuery: query={}", self.query.terms)
             }
         }
     }
@@ -263,7 +263,7 @@ impl DisplayAs for FlatMatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "FlatMatchQuery: query={:?}", self.query)
+                write!(f, "FlatMatchQuery: query={}", self.query.terms)
             }
         }
     }
@@ -402,7 +402,7 @@ impl DisplayAs for PhraseQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "PhraseQuery: query={:?}", self.query)
+                write!(f, "PhraseQuery: query={}", self.query.terms)
             }
         }
     }
@@ -587,7 +587,11 @@ impl DisplayAs for BoostQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "BoostQuery: {:?}", self.query)
+                write!(
+                    f,
+                    "BoostQuery: negative_boost={}",
+                    self.query.negative_boost
+                )
             }
         }
     }
@@ -689,7 +693,7 @@ impl ExecutionPlan for BoostQueryExec {
             let (doc_ids, scores): (Vec<_>, Vec<_>) = res
                 .into_iter()
                 .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
-                .take(params.limit)
+                .take(params.limit.unwrap_or(usize::MAX))
                 .unzip();
 
             let batch = RecordBatch::try_new(

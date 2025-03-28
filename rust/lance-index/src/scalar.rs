@@ -19,7 +19,7 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
-use inverted::query::{fill_fts_query_column, CompoundQuery, FtsQueryNode, FtsSearchParams};
+use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams};
 use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
@@ -254,7 +254,7 @@ impl PartialEq for dyn AnyQuery {
 /// A full text search query
 #[derive(Debug, Clone, PartialEq)]
 pub struct FullTextSearchQuery {
-    pub query: CompoundQuery,
+    pub query: FtsQuery,
 
     /// The maximum number of results to return
     pub limit: Option<i64>,
@@ -292,7 +292,7 @@ impl FullTextSearchQuery {
     }
 
     /// Create a new compound query
-    pub fn new_compound(query: inverted::query::CompoundQuery) -> Self {
+    pub fn new_query(query: inverted::query::FtsQuery) -> Self {
         Self {
             query,
             limit: None,
@@ -326,13 +326,13 @@ impl FullTextSearchQuery {
         self
     }
 
-    pub fn fields(&self) -> HashSet<String> {
+    pub fn columns(&self) -> HashSet<String> {
         self.query.columns()
     }
 
     pub fn params(&self) -> FtsSearchParams {
         FtsSearchParams {
-            limit: self.limit.map(|limit| limit as usize).unwrap_or(usize::MAX),
+            limit: self.limit.map(|limit| limit as usize),
             wand_factor: self.wand_factor.unwrap_or(1.0),
         }
     }

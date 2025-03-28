@@ -195,7 +195,7 @@ impl InvertedIndex {
         let mut wand = Wand::new(self.docs.len(), postings.into_iter());
         wand.search(
             is_phrase_query,
-            params.limit,
+            params.limit.unwrap_or(usize::MAX),
             params.wand_factor,
             |doc, freq| {
                 let doc_norm = K1

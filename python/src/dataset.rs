@@ -573,14 +573,14 @@ impl Dataset {
                         }
                         _ => {
                             let query = MultiMatchQuery::new(query, columns);
-                            fts_query = FullTextSearchQuery::new_compound(query.into());
+                            fts_query = FullTextSearchQuery::new_query(query.into());
                         }
                     }
                 }
                 fts_query
             } else if let Ok(query) = query.downcast::<PyDict>() {
                 let query = parse_fts_query(query)?;
-                FullTextSearchQuery::new_compound(query)
+                FullTextSearchQuery::new_query(query)
             } else {
                 return Err(PyValueError::new_err(
                     "query must be a string or a Query object",
