@@ -12,7 +12,7 @@ jobs:
   macos-arm64:
     name: Build on MacOS Arm64
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: ./java
@@ -66,7 +66,7 @@ jobs:
           if-no-files-found: error
   linux-x86:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     needs: [macos-arm64, linux-arm64]
     defaults:
       run:
@@ -111,7 +111,7 @@ jobs:
           echo "use-agent" >> ~/.gnupg/gpg.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
           export GPG_TTY=$(tty)
-          mvn --batch-mode -DskipTests -Drust.release.build=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
+          mvn --batch-mode -DskipTests -Drust.release.build=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh -P shade-jar
         env:
           SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
           SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}

@@ -11,6 +11,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
@@ -27,7 +29,7 @@ use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::scanner::{
@@ -37,16 +39,22 @@ use crate::dataset::scanner::{
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
+use super::utils::IoMetrics;
+
 async fn open_file(
     file_fragment: FileFragment,
     projection: Arc<Schema>,
-    read_config: FragReadConfig,
+    mut read_config: FragReadConfig,
     with_make_deletions_null: bool,
-    scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
+    scan_scheduler: Option<(Arc<ScanScheduler>, u32)>,
 ) -> Result<FragmentReader> {
-    let mut reader = file_fragment
-        .open(projection.as_ref(), read_config, scan_scheduler)
-        .await?;
+    if let Some((scan_scheduler, reader_priority)) = scan_scheduler {
+        read_config = read_config
+            .with_scan_scheduler(scan_scheduler)
+            .with_reader_priority(reader_priority);
+    }
+
+    let mut reader = file_fragment.open(projection.as_ref(), read_config).await?;
 
     if with_make_deletions_null {
         reader.with_make_deletions_null();
@@ -59,6 +67,20 @@ struct FragmentWithRange {
     range: Option<Range<u32>>,
 }
 
+struct ScanMetrics {
+    baseline_metrics: BaselineMetrics,
+    io_metrics: IoMetrics,
+}
+
+impl ScanMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            baseline_metrics: BaselineMetrics::new(metrics, partition),
+            io_metrics: IoMetrics::new(metrics, partition),
+        }
+    }
+}
+
 /// Dataset Scan Node.
 pub struct LanceStream {
     inner_stream: stream::BoxStream<'static, Result<RecordBatch>>,
@@ -67,6 +89,13 @@ pub struct LanceStream {
     projection: Arc<Schema>,
 
     config: LanceScanConfig,
+
+    scan_metrics: ScanMetrics,
+
+    /// Scan scheduler for the scan node.
+    ///
+    /// Only set on v2 scans.  Used to record scan metrics.
+    scan_scheduler: Option<Arc<ScanScheduler>>,
 }
 
 impl LanceStream {
@@ -94,6 +123,8 @@ impl LanceStream {
         offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
     ) -> Result<Self> {
         let is_v2_scan = fragments
             .iter()
@@ -101,9 +132,11 @@ impl LanceStream {
             .next()
             .unwrap_or(false);
         if is_v2_scan {
-            Self::try_new_v2(dataset, fragments, offsets, projection, config)
+            Self::try_new_v2(
+                dataset, fragments, offsets, projection, config, metrics, partition,
+            )
         } else {
-            Self::try_new_v1(dataset, fragments, projection, config)
+            Self::try_new_v1(dataset, fragments, projection, config, metrics, partition)
         }
     }
 
@@ -114,7 +147,11 @@ impl LanceStream {
         offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
     ) -> Result<Self> {
+        let scan_metrics = ScanMetrics::new(metrics, partition);
+        let timer = scan_metrics.baseline_metrics.elapsed_compute().timer();
         let project_schema = projection.clone();
         let io_parallelism = dataset.object_store.io_parallelism();
         // First, use the value specified by the user in the call
@@ -159,7 +196,7 @@ impl LanceStream {
                 if let Some(next_frag) = frags_iter.next() {
                     let num_rows_in_frag = next_frag
                         .fragment
-                        .count_rows()
+                        .count_rows(None)
                         // count_rows should be a fast operation in v2 files
                         .now_or_never()
                         .ok_or(Error::Internal {
@@ -199,6 +236,8 @@ impl LanceStream {
             },
         );
 
+        let scan_scheduler_clone = scan_scheduler.clone();
+
         let batches = stream::iter(file_fragments.into_iter().enumerate())
             .map(move |(priority, file_fragment)| {
                 let project_schema = project_schema.clone();
@@ -214,7 +253,7 @@ impl LanceStream {
                             .with_row_id(config.with_row_id)
                             .with_row_address(config.with_row_address),
                         config.with_make_deletions_null,
-                        Some((scan_scheduler, priority as u64)),
+                        Some((scan_scheduler, priority as u32)),
                     )
                     .await?;
                     let batch_stream = if let Some(range) = file_fragment.range {
@@ -254,10 +293,13 @@ impl LanceStream {
             .stream_in_current_span()
             .boxed();
 
+        timer.done();
         Ok(Self {
             inner_stream: batches,
             projection,
             config,
+            scan_metrics,
+            scan_scheduler: Some(scan_scheduler_clone),
         })
     }
 
@@ -267,7 +309,11 @@ impl LanceStream {
         fragments: Arc<Vec<Fragment>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
     ) -> Result<Self> {
+        let scan_metrics = ScanMetrics::new(metrics, partition);
+        let timer = scan_metrics.baseline_metrics.elapsed_compute().timer();
         let project_schema = projection.clone();
         let fragment_readahead = config
             .fragment_readahead
@@ -347,10 +393,13 @@ impl LanceStream {
             .map(|batch| batch.map_err(DataFusionError::from))
             .boxed();
 
+        timer.done();
         Ok(Self {
             inner_stream,
             projection,
             config,
+            scan_metrics,
+            scan_scheduler: None,
         })
     }
 }
@@ -382,7 +431,16 @@ impl Stream for LanceStream {
     type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).inner_stream.poll_next_unpin(cx)
+        let this = self.get_mut();
+        let timer = this.scan_metrics.baseline_metrics.elapsed_compute().timer();
+        let poll = Pin::new(&mut this.inner_stream).poll_next(cx);
+        timer.done();
+        if matches!(poll, Poll::Ready(None)) {
+            if let Some(scan_scheduler) = this.scan_scheduler.as_ref() {
+                this.scan_metrics.io_metrics.record_final(scan_scheduler);
+            }
+        }
+        this.scan_metrics.baseline_metrics.record_poll(poll)
     }
 }
 
@@ -425,6 +483,7 @@ pub struct LanceScanExec {
     output_schema: Arc<ArrowSchema>,
     properties: PlanProperties,
     config: LanceScanConfig,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DisplayAs for LanceScanExec {
@@ -476,7 +535,8 @@ impl LanceScanExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::RoundRobinBatch(1),
-            datafusion::physical_plan::ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             dataset,
@@ -486,6 +546,7 @@ impl LanceScanExec {
             output_schema,
             properties,
             config,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -523,7 +584,7 @@ impl ExecutionPlan for LanceScanExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         Ok(Box::pin(LanceStream::try_new(
@@ -532,7 +593,13 @@ impl ExecutionPlan for LanceScanExec {
             self.range.clone(),
             self.projection.clone(),
             self.config.clone(),
+            &self.metrics,
+            partition,
         )?))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn statistics(&self) -> datafusion::error::Result<Statistics> {

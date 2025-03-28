@@ -29,7 +29,7 @@ use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use lance_io::ReadBatchParams;
 pub use serde::{read_row_ids, write_row_ids};
 
-use snafu::{location, Location};
+use snafu::location;
 
 use segment::U64Segment;
 
@@ -204,10 +204,7 @@ impl RowIdSequence {
             // If we've cycled through all segments, we know the row id is not in the sequence.
             while i < self.0.len() {
                 let (segment_idx, segment) = segment_iter.next().unwrap();
-                if segment
-                    .range()
-                    .map_or(false, |range| range.contains(&row_id))
-                {
+                if segment.range().is_some_and(|range| range.contains(&row_id)) {
                     if let Some(offset) = segment.position(row_id) {
                         segment_matches.get_mut(segment_idx).unwrap().push(offset);
                     }
@@ -343,7 +340,7 @@ pub struct RowIdSeqSlice<'a> {
     offset_last: usize,
 }
 
-impl<'a> RowIdSeqSlice<'a> {
+impl RowIdSeqSlice<'_> {
     pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
         let mut known_size = self.segments.iter().map(|segment| segment.len()).sum();
         known_size -= self.offset_start;

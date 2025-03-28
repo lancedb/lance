@@ -27,6 +27,9 @@ env:
   RUSTFLAGS: "-C debuginfo=1"
   RUST_BACKTRACE: "1"
   CI: "true"
+  # Color output for pytest is off by default.
+  PYTEST_ADDOPTS: "--color=yes"
+  FORCE_COLOR: "1"
 
 jobs:
   lint:
@@ -39,7 +42,7 @@ jobs:
     env:
       # Need up-to-date compilers for kernels
       CC: clang-18
-      CXX: clang-18
+      CXX: clang++-18
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,20 +57,22 @@ jobs:
           workspaces: python
       - name: Install linting tools
         run: |
-          pip install ruff==0.4.1 maturin tensorflow tqdm ray[data]
+          pip install ruff==0.11.2 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas]
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Lint Python
         run: |
           ruff format --check python
           ruff check python
+          pyright
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Lint Rust
         run: |
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo fmt --all -- --check
-          cargo clippy --locked --all-features --tests -- -D warnings
+          cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
       - name: Build
         run: |
           python -m venv venv
@@ -143,7 +148,7 @@ jobs:
       - uses: ./.github/workflows/build_linux_wheel
         with:
           arm-build: "true"
-          manylinux: "2_24"
+          manylinux: "2_28"
       - name: Install dependencies
         run: |
           sudo apt update -y -qq
@@ -201,22 +206,6 @@ jobs:
       run:
         shell: bash
         working-directory: python
-    services:
-      minio:
-        image: lazybit/minio
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ACCESS_KEY: ACCESSKEY
-          MINIO_SECRET_KEY: SECRETKEY
-        options: --name=minio --health-cmd "curl http://localhost:9000/minio/health/live"
-      dynamodb-local:
-        image: amazon/dynamodb-local
-        ports:
-          - 8000:8000
-        env:
-          AWS_ACCESS_KEY_ID: ACCESSKEY
-          AWS_SECRET_ACCESS_KEY: SECRETKEY
     steps:
       - uses: actions/checkout@v4
         with:

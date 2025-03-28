@@ -33,7 +33,7 @@ impl BFloat16 {
     }
 
     #[classmethod]
-    fn from_bytes(_cls: &PyType, bytes: &[u8]) -> PyResult<Self> {
+    fn from_bytes(_cls: &Bound<'_, PyType>, bytes: &[u8]) -> PyResult<Self> {
         if bytes.len() != 2 {
             PyValueError::new_err(format!(
                 "BFloat16::from_bytes: expected 2 bytes, got {}",

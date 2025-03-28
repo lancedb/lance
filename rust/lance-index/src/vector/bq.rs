@@ -10,7 +10,7 @@ use arrow_array::types::Float32Type;
 use arrow_array::{cast::AsArray, Array, ArrayRef, UInt8Array};
 use lance_core::{Error, Result};
 use num_traits::Float;
-use snafu::{location, Location};
+use snafu::location;
 
 #[derive(Clone, Default)]
 pub struct BinaryQuantization {}

@@ -15,7 +15,7 @@ use arrow_array::types::{
 use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     traits::{Reader, Writer},
@@ -62,7 +62,7 @@ impl<'a> DictionaryEncoder<'a> {
 }
 
 #[async_trait]
-impl<'a> Encoder for DictionaryEncoder<'a> {
+impl Encoder for DictionaryEncoder<'_> {
     async fn encode(&mut self, array: &[&dyn Array]) -> Result<usize> {
         use DataType::*;
 
@@ -171,7 +171,7 @@ impl<'a> DictionaryDecoder<'a> {
 }
 
 #[async_trait]
-impl<'a> Decoder for DictionaryDecoder<'a> {
+impl Decoder for DictionaryDecoder<'_> {
     async fn decode(&self) -> Result<ArrayRef> {
         self.decode_impl(..).await
     }
@@ -182,7 +182,7 @@ impl<'a> Decoder for DictionaryDecoder<'a> {
 }
 
 #[async_trait]
-impl<'a> AsyncIndex<usize> for DictionaryDecoder<'a> {
+impl AsyncIndex<usize> for DictionaryDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, _index: usize) -> Self::Output {
@@ -196,7 +196,7 @@ impl<'a> AsyncIndex<usize> for DictionaryDecoder<'a> {
 }
 
 #[async_trait]
-impl<'a> AsyncIndex<ReadBatchParams> for DictionaryDecoder<'a> {
+impl AsyncIndex<ReadBatchParams> for DictionaryDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, params: ReadBatchParams) -> Self::Output {

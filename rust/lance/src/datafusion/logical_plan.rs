@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, borrow::Cow, sync::Arc};
 
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
@@ -13,6 +13,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
+use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 
 use crate::Dataset;
 
@@ -34,7 +35,7 @@ impl TableProvider for Dataset {
         None
     }
 
-    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
+    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
         None
     }
 
@@ -52,7 +53,11 @@ impl TableProvider for Dataset {
             if projection.len() != schema_ref.fields.len() {
                 let arrow_schema: ArrowSchema = schema_ref.into();
                 let arrow_schema = arrow_schema.project(projection)?;
-                schema_ref.project_by_schema(&arrow_schema)?
+                schema_ref.project_by_schema(
+                    &arrow_schema,
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?
             } else {
                 schema_ref.clone()
             }

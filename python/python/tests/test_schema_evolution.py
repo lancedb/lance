@@ -512,3 +512,31 @@ def test_no_checkpoint_merge_columns(tmp_path: Path):
 
     with pytest.raises(ValueError, match="A checkpoint file cannot be used"):
         frag.merge_columns(some_udf, columns=["a"])
+
+
+def test_add_cols_all_null_with_sql(tmp_path: Path):
+    tab = pa.table(
+        {
+            "a": range(100),
+        }
+    )
+    dataset = lance.write_dataset(
+        tab, tmp_path, max_rows_per_file=50, data_storage_version="stable"
+    )
+    fragments_before = dataset.get_fragments()
+    dataset.add_columns({"b": "CAST(NULL AS INT)"})
+    fragments_after = dataset.get_fragments()
+
+    # assert this was a metadata only operation and no data was written
+    assert len(fragments_before) == len(fragments_after)
+    for frag_before, frag_after in zip(fragments_before, fragments_after):
+        assert frag_before.fragment_id == frag_after.fragment_id
+        assert frag_before.data_files() == frag_after.data_files()
+
+    # assert the schema is as expected
+    assert dataset.schema == pa.schema(
+        {
+            "a": pa.int64(),
+            "b": pa.int32(),
+        }
+    )

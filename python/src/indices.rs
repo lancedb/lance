@@ -13,6 +13,8 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::PyValueError;
+use pyo3::types::PyModuleMethods;
+use pyo3::Bound;
 use pyo3::{
     pyfunction,
     types::{PyList, PyModule},
@@ -136,6 +138,7 @@ fn train_pq_model(
         centroids: Some(ivf_centroids),
         offsets: vec![],
         lengths: vec![],
+        loss: None,
     };
     let codebook = RT.block_on(
         Some(py),
@@ -165,7 +168,7 @@ async fn do_transform_vectors(
     partitions_ds_uri: Option<&str>,
 ) -> PyResult<()> {
     let num_rows = dataset.ds.count_rows(None).await.infer_error()?;
-    let fragments = fragments.iter().map(|item| item.metadata().inner).collect();
+    let fragments = fragments.iter().map(|item| item.metadata().0).collect();
     let transform_input = dataset
         .ds
         .scan()
@@ -198,6 +201,7 @@ async fn do_transform_vectors(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
+#[pyo3(signature=(dataset, column, dimension, num_subvectors, distance_type, ivf_centroids, pq_codebook, dst_uri, fragments, partitions_ds_uri=None))]
 pub fn transform_vectors(
     py: Python<'_>,
     dataset: &Dataset,
@@ -284,10 +288,7 @@ pub fn shuffle_transformed_vectors(
     )?;
 
     match result {
-        Ok(partition_files) => {
-            let py_list = PyList::new(py, partition_files);
-            Ok(py_list.into())
-        }
+        Ok(partition_files) => PyList::new(py, partition_files).map(|py_list| py_list.into()),
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
     }
 }
@@ -329,6 +330,7 @@ async fn do_load_shuffled_vectors(
 }
 
 #[pyfunction]
+#[pyo3(signature=(filenames, dir_path, dataset, column, ivf_centroids, pq_codebook, pq_dimension, num_subvectors, distance_type, index_name=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn load_shuffled_vectors(
     filenames: Vec<String>,
@@ -353,6 +355,7 @@ pub fn load_shuffled_vectors(
         centroids: Some(ivf_centroids),
         offsets: vec![],
         lengths: vec![],
+        loss: None,
     };
 
     let codebook = pq_codebook.0;
@@ -375,13 +378,13 @@ pub fn load_shuffled_vectors(
     )?
 }
 
-pub fn register_indices(py: Python, m: &PyModule) -> PyResult<()> {
+pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
     indices.add_wrapped(wrap_pyfunction!(train_pq_model))?;
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(shuffle_transformed_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
-    m.add_submodule(indices)?;
+    m.add_submodule(&indices)?;
     Ok(())
 }

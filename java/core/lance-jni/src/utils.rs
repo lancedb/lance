@@ -18,7 +18,7 @@ use arrow::array::Float32Array;
 use jni::objects::{JMap, JObject, JString};
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
-use lance::index::vector::{StageParams, VectorIndexParams};
+use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
 use lance_encoding::version::LanceFileVersion;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -33,6 +33,26 @@ use crate::ffi::JNIEnvExt;
 
 use lance_index::vector::Query;
 use std::collections::HashMap;
+
+pub fn extract_storage_options(
+    env: &mut JNIEnv,
+    storage_options_obj: &JObject,
+) -> Result<HashMap<String, String>> {
+    let jmap = JMap::from_env(env, storage_options_obj)?;
+    let storage_options: HashMap<String, String> = env.with_local_frame(16, |env| {
+        let mut map = HashMap::new();
+        let mut iter = jmap.iter(env)?;
+        while let Some((key, value)) = iter.next(env)? {
+            let key_jstring = JString::from(key);
+            let value_jstring = JString::from(value);
+            let key_string: String = env.get_string(&key_jstring)?.into();
+            let value_string: String = env.get_string(&value_jstring)?.into();
+            map.insert(key_string, value_string);
+        }
+        Ok::<_, Error>(map)
+    })?;
+    Ok(storage_options)
+}
 
 pub fn extract_write_params(
     env: &mut JNIEnv,
@@ -56,21 +76,10 @@ pub fn extract_write_params(
     if let Some(mode_val) = env.get_string_opt(mode)? {
         write_params.mode = WriteMode::try_from(mode_val.as_str())?;
     }
-    // Java code always sets the data storage version to Legacy for now
-    write_params.data_storage_version = Some(LanceFileVersion::Legacy);
-    let jmap = JMap::from_env(env, storage_options_obj)?;
-    let storage_options: HashMap<String, String> = env.with_local_frame(16, |env| {
-        let mut map = HashMap::new();
-        let mut iter = jmap.iter(env)?;
-        while let Some((key, value)) = iter.next(env)? {
-            let key_jstring = JString::from(key);
-            let value_jstring = JString::from(value);
-            let key_string: String = env.get_string(&key_jstring)?.into();
-            let value_string: String = env.get_string(&value_jstring)?.into();
-            map.insert(key_string, value_string);
-        }
-        Ok::<_, Error>(map)
-    })?;
+    // Java code always sets the data storage version to stable for now
+    write_params.data_storage_version = Some(LanceFileVersion::Stable);
+    let storage_options: HashMap<String, String> =
+        extract_storage_options(env, storage_options_obj)?;
 
     write_params.store_params = Some(ObjectStoreParams {
         storage_options: Some(storage_options),
@@ -109,6 +118,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             column,
             key,
             k,
+            lower_bound: None,
+            upper_bound: None,
             nprobes,
             ef,
             refine_factor,
@@ -178,7 +189,6 @@ pub fn get_index_params(
             env.get_int_as_usize_from_method(&ivf_params_obj, "getShufflePartitionBatches")?;
         let shuffle_partition_concurrency =
             env.get_int_as_usize_from_method(&ivf_params_obj, "getShufflePartitionConcurrency")?;
-        let use_residual = env.get_boolean_from_method(&ivf_params_obj, "useResidual")?;
 
         let ivf_params = IvfBuildParams {
             num_partitions,
@@ -186,7 +196,6 @@ pub fn get_index_params(
             sample_rate,
             shuffle_partition_batches,
             shuffle_partition_concurrency,
-            use_residual,
             ..Default::default()
         };
         stages.push(StageParams::Ivf(ivf_params));
@@ -265,6 +274,7 @@ pub fn get_index_params(
         Some(VectorIndexParams {
             metric_type: distance_type,
             stages,
+            version: IndexFileVersion::V3,
         })
     } else {
         None

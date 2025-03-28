@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark;
 
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
@@ -28,9 +27,13 @@ public class LanceConfigTest {
     String dbPath = "file://path/to/db/";
     String datasetName = "testDatasetName";
     String datasetUri = LanceConfig.getDatasetUri(dbPath, datasetName);
-    CaseInsensitiveStringMap options = new CaseInsensitiveStringMap(new HashMap<String, String>() {{
-      put(LanceConfig.CONFIG_DATASET_URI, datasetUri);
-    }});
+    CaseInsensitiveStringMap options =
+        new CaseInsensitiveStringMap(
+            new HashMap<String, String>() {
+              {
+                put(LanceConfig.CONFIG_DATASET_URI, datasetUri);
+              }
+            });
 
     LanceConfig config = LanceConfig.from(options);
 
@@ -44,9 +47,13 @@ public class LanceConfigTest {
     String dbPath = "s3://bucket/folder/";
     String datasetName = "testDatasetName";
     String datasetUri = LanceConfig.getDatasetUri(dbPath, datasetName);
-    CaseInsensitiveStringMap options = new CaseInsensitiveStringMap(new HashMap<String, String>() {{
-      put(LanceConfig.CONFIG_DATASET_URI, datasetUri);
-    }});
+    CaseInsensitiveStringMap options =
+        new CaseInsensitiveStringMap(
+            new HashMap<String, String>() {
+              {
+                put(LanceConfig.CONFIG_DATASET_URI, datasetUri);
+              }
+            });
 
     LanceConfig config = LanceConfig.from(options);
 

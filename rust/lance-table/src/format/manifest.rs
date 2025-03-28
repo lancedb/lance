@@ -23,7 +23,7 @@ use lance_core::datatypes::{Schema, StorageClass};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use lance_io::utils::read_struct;
-use snafu::{location, Location};
+use snafu::location;
 
 /// Manifest of a dataset
 ///
@@ -202,6 +202,20 @@ impl Manifest {
     pub fn delete_config_keys(&mut self, delete_keys: &[&str]) {
         self.config
             .retain(|key, _| !delete_keys.contains(&key.as_str()));
+    }
+
+    /// Replaces the schema metadata with the given key-value pairs.
+    pub fn update_schema_metadata(&mut self, new_metadata: HashMap<String, String>) {
+        self.schema.metadata = new_metadata;
+    }
+
+    /// Replaces the metadata of the field with the given id with the given key-value pairs.
+    ///
+    /// If the field does not exist in the schema, this is a no-op.
+    pub fn update_field_metadata(&mut self, field_id: i32, new_metadata: HashMap<String, String>) {
+        if let Some(field) = self.schema.field_by_id_mut(field_id) {
+            field.metadata = new_metadata;
+        }
     }
 
     /// Check the current fragment list and update the high water mark

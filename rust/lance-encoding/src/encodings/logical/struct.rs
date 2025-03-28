@@ -8,15 +8,16 @@ use std::{
 };
 
 use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
-use arrow_schema::{DataType, Fields};
+use arrow_schema::{DataType, Field, Fields};
 use futures::{
     future::BoxFuture,
     stream::{FuturesOrdered, FuturesUnordered},
     FutureExt, StreamExt, TryStreamExt,
 };
 use itertools::Itertools;
+use lance_arrow::FieldExt;
 use log::trace;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     decoder::{
@@ -31,7 +32,7 @@ use crate::{
 };
 use lance_core::{Error, Result};
 
-use super::primitive::StructuralPrimitiveFieldDecoder;
+use super::{list::StructuralListDecoder, primitive::StructuralPrimitiveFieldDecoder};
 
 #[derive(Debug)]
 struct SchedulingJobWithStatus<'a> {
@@ -42,24 +43,107 @@ struct SchedulingJobWithStatus<'a> {
     rows_remaining: u64,
 }
 
-impl<'a> PartialEq for SchedulingJobWithStatus<'a> {
+impl PartialEq for SchedulingJobWithStatus<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.col_idx == other.col_idx
     }
 }
 
-impl<'a> Eq for SchedulingJobWithStatus<'a> {}
+impl Eq for SchedulingJobWithStatus<'_> {}
 
-impl<'a> PartialOrd for SchedulingJobWithStatus<'a> {
+impl PartialOrd for SchedulingJobWithStatus<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'a> Ord for SchedulingJobWithStatus<'a> {
+impl Ord for SchedulingJobWithStatus<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Note this is reversed to make it min-heap
         other.rows_scheduled.cmp(&self.rows_scheduled)
+    }
+}
+
+#[derive(Debug)]
+struct EmptyStructDecodeTask {
+    num_rows: u64,
+}
+
+impl DecodeArrayTask for EmptyStructDecodeTask {
+    fn decode(self: Box<Self>) -> Result<ArrayRef> {
+        Ok(Arc::new(StructArray::new_empty_fields(
+            self.num_rows as usize,
+            None,
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct EmptyStructDecoder {
+    num_rows: u64,
+    rows_drained: u64,
+    data_type: DataType,
+}
+
+impl EmptyStructDecoder {
+    fn new(num_rows: u64) -> Self {
+        Self {
+            num_rows,
+            rows_drained: 0,
+            data_type: DataType::Struct(Fields::from(Vec::<Field>::default())),
+        }
+    }
+}
+
+impl LogicalPageDecoder for EmptyStructDecoder {
+    fn wait_for_loaded(&mut self, _loaded_need: u64) -> BoxFuture<Result<()>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+    fn rows_loaded(&self) -> u64 {
+        self.num_rows
+    }
+    fn rows_unloaded(&self) -> u64 {
+        0
+    }
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
+    fn rows_drained(&self) -> u64 {
+        self.rows_drained
+    }
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+        self.rows_drained += num_rows;
+        Ok(NextDecodeTask {
+            num_rows,
+            task: Box::new(EmptyStructDecodeTask { num_rows }),
+        })
+    }
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+}
+
+#[derive(Debug)]
+struct EmptyStructSchedulerJob {
+    num_rows: u64,
+}
+
+impl SchedulingJob for EmptyStructSchedulerJob {
+    fn schedule_next(
+        &mut self,
+        context: &mut SchedulerContext,
+        _priority: &dyn PriorityRange,
+    ) -> Result<ScheduledScanLine> {
+        let empty_decoder = Box::new(EmptyStructDecoder::new(self.num_rows));
+        let struct_decoder = context.locate_decoder(empty_decoder);
+        Ok(ScheduledScanLine {
+            decoders: vec![MessageType::DecoderReady(struct_decoder)],
+            rows_scheduled: self.num_rows,
+        })
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.num_rows
     }
 }
 
@@ -106,7 +190,7 @@ impl<'a> SimpleStructSchedulerJob<'a> {
     }
 }
 
-impl<'a> SchedulingJob for SimpleStructSchedulerJob<'a> {
+impl SchedulingJob for SimpleStructSchedulerJob<'_> {
     fn schedule_next(
         &mut self,
         mut context: &mut SchedulerContext,
@@ -174,9 +258,15 @@ pub struct SimpleStructScheduler {
 }
 
 impl SimpleStructScheduler {
-    pub fn new(children: Vec<Arc<dyn FieldScheduler>>, child_fields: Fields) -> Self {
-        debug_assert!(!children.is_empty());
-        let num_rows = children[0].num_rows();
+    pub fn new(
+        children: Vec<Arc<dyn FieldScheduler>>,
+        child_fields: Fields,
+        num_rows: u64,
+    ) -> Self {
+        let num_rows = children
+            .first()
+            .map(|child| child.num_rows())
+            .unwrap_or(num_rows);
         debug_assert!(children.iter().all(|child| child.num_rows() == num_rows));
         Self {
             children,
@@ -192,6 +282,11 @@ impl FieldScheduler for SimpleStructScheduler {
         ranges: &[Range<u64>],
         filter: &FilterExpression,
     ) -> Result<Box<dyn SchedulingJob + 'a>> {
+        if self.children.is_empty() {
+            return Ok(Box::new(EmptyStructSchedulerJob {
+                num_rows: ranges.iter().map(|r| r.end - r.start).sum(),
+            }));
+        }
         let child_schedulers = self
             .children
             .iter()
@@ -239,21 +334,21 @@ struct StructuralSchedulingJobWithStatus<'a> {
     rows_remaining: u64,
 }
 
-impl<'a> PartialEq for StructuralSchedulingJobWithStatus<'a> {
+impl PartialEq for StructuralSchedulingJobWithStatus<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.col_idx == other.col_idx
     }
 }
 
-impl<'a> Eq for StructuralSchedulingJobWithStatus<'a> {}
+impl Eq for StructuralSchedulingJobWithStatus<'_> {}
 
-impl<'a> PartialOrd for StructuralSchedulingJobWithStatus<'a> {
+impl PartialOrd for StructuralSchedulingJobWithStatus<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'a> Ord for StructuralSchedulingJobWithStatus<'a> {
+impl Ord for StructuralSchedulingJobWithStatus<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Note this is reversed to make it min-heap
         other.rows_scheduled.cmp(&self.rows_scheduled)
@@ -297,7 +392,7 @@ impl<'a> RepDefStructSchedulingJob<'a> {
     }
 }
 
-impl<'a> StructuralSchedulingJob for RepDefStructSchedulingJob<'a> {
+impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         mut context: &mut SchedulerContext,
@@ -583,10 +678,12 @@ pub struct StructuralStructDecoder {
     children: Vec<Box<dyn StructuralFieldDecoder>>,
     data_type: DataType,
     child_fields: Fields,
+    // The root decoder is slightly different because it cannot have nulls
+    is_root: bool,
 }
 
 impl StructuralStructDecoder {
-    pub fn new(fields: Fields, should_validate: bool) -> Self {
+    pub fn new(fields: Fields, should_validate: bool, is_root: bool) -> Self {
         let children = fields
             .iter()
             .map(|field| Self::field_to_decoder(field, should_validate))
@@ -596,6 +693,7 @@ impl StructuralStructDecoder {
             data_type,
             children,
             child_fields: fields,
+            is_root,
         }
     }
 
@@ -604,14 +702,36 @@ impl StructuralStructDecoder {
         should_validate: bool,
     ) -> Box<dyn StructuralFieldDecoder> {
         match field.data_type() {
-            DataType::Struct(fields) => Box::new(Self::new(fields.clone(), should_validate)),
-            DataType::List(_) | DataType::LargeList(_) => todo!(),
+            DataType::Struct(fields) => {
+                if field.is_packed_struct() {
+                    let decoder =
+                        StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
+                    Box::new(decoder)
+                } else {
+                    Box::new(Self::new(fields.clone(), should_validate, false))
+                }
+            }
+            DataType::List(child_field) | DataType::LargeList(child_field) => {
+                let child_decoder = Self::field_to_decoder(child_field, should_validate);
+                Box::new(StructuralListDecoder::new(
+                    child_decoder,
+                    field.data_type().clone(),
+                ))
+            }
             DataType::RunEndEncoded(_, _) => todo!(),
             DataType::ListView(_) | DataType::LargeListView(_) => todo!(),
             DataType::Map(_, _) => todo!(),
             DataType::Union(_, _) => todo!(),
             _ => Box::new(StructuralPrimitiveFieldDecoder::new(field, should_validate)),
         }
+    }
+
+    pub fn drain_batch_task(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+        let array_drain = self.drain(num_rows)?;
+        Ok(NextDecodeTask {
+            num_rows,
+            task: Box::new(array_drain),
+        })
     }
 }
 
@@ -633,6 +753,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
         Ok(Box::new(RepDefStructDecodeTask {
             children: child_tasks,
             child_fields: self.child_fields.clone(),
+            is_root: self.is_root,
         }))
     }
 
@@ -645,6 +766,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
 struct RepDefStructDecodeTask {
     children: Vec<Box<dyn StructuralDecodeArrayTask>>,
     child_fields: Fields,
+    is_root: bool,
 }
 
 impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
@@ -657,15 +779,22 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         let mut children = Vec::with_capacity(arrays.len());
         let mut arrays_iter = arrays.into_iter();
         let first_array = arrays_iter.next().unwrap();
+        let length = first_array.array.len();
 
         // The repdef should be identical across all children at this point
         let mut repdef = first_array.repdef;
         children.push(first_array.array);
+
         for array in arrays_iter {
+            debug_assert_eq!(length, array.array.len());
             children.push(array.array);
         }
 
-        let validity = repdef.unravel_validity();
+        let validity = if self.is_root {
+            None
+        } else {
+            repdef.unravel_validity(length)
+        };
         let array = StructArray::new(self.child_fields, children, validity);
         Ok(DecodedArray {
             array: Arc::new(array),
@@ -760,16 +889,13 @@ impl LogicalPageDecoder for SimpleStructDecoder {
             .map(|child| child.drain(num_rows))
             .collect::<Result<Vec<_>>>()?;
         let num_rows = child_tasks[0].num_rows;
-        let has_more = child_tasks[0].has_more;
         debug_assert!(child_tasks.iter().all(|task| task.num_rows == num_rows));
-        debug_assert!(child_tasks.iter().all(|task| task.has_more == has_more));
         Ok(NextDecodeTask {
             task: Box::new(SimpleStructDecodeTask {
                 children: child_tasks,
                 child_fields: self.child_fields.clone(),
             }),
             num_rows,
-            has_more,
         })
     }
 
@@ -836,6 +962,7 @@ impl FieldEncoder for StructStructuralEncoder {
         external_buffers: &mut OutOfLineBuffers,
         mut repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let struct_array = array.as_struct();
         if let Some(validity) = struct_array.nulls() {
@@ -848,7 +975,13 @@ impl FieldEncoder for StructStructuralEncoder {
             .iter_mut()
             .zip(struct_array.columns().iter())
             .map(|(encoder, arr)| {
-                encoder.maybe_encode(arr.clone(), external_buffers, repdef.clone(), row_number)
+                encoder.maybe_encode(
+                    arr.clone(),
+                    external_buffers,
+                    repdef.clone(),
+                    row_number,
+                    num_rows,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())
@@ -913,6 +1046,7 @@ impl FieldEncoder for StructFieldEncoder {
         external_buffers: &mut OutOfLineBuffers,
         repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         self.num_rows_seen += array.len() as u64;
         let struct_array = array.as_struct();
@@ -921,7 +1055,13 @@ impl FieldEncoder for StructFieldEncoder {
             .iter_mut()
             .zip(struct_array.columns().iter())
             .map(|(encoder, arr)| {
-                encoder.maybe_encode(arr.clone(), external_buffers, repdef.clone(), row_number)
+                encoder.maybe_encode(
+                    arr.clone(),
+                    external_buffers,
+                    repdef.clone(),
+                    row_number,
+                    num_rows,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())
@@ -1070,6 +1210,15 @@ mod tests {
             ),
             Field::new("outer_int", DataType::Int32, true),
         ]));
+        let field = Field::new("row", data_type, false);
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_empty_struct() {
+        // It's technically legal for a struct to have 0 children, need to
+        // make sure we support that
+        let data_type = DataType::Struct(Fields::from(Vec::<Field>::default()));
         let field = Field::new("row", data_type, false);
         check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }

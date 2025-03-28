@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
     expr::{InList, ScalarFunction},
-    Between, BinaryExpr, Expr, Operator, ScalarUDF,
+    Between, BinaryExpr, Expr, Operator, ReturnTypeArgs, ScalarUDF,
 };
 
 use futures::join;
@@ -18,7 +18,9 @@ use lance_core::{utils::mask::RowIdMask, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use tracing::instrument;
 
-use super::{AnyQuery, LabelListQuery, SargableQuery, ScalarIndex};
+use super::{
+    AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult, TextQuery,
+};
 
 /// An indexed expression consists of a scalar index query with a post-scan filter
 ///
@@ -214,6 +216,57 @@ impl ScalarQueryParser for LabelListQueryParser {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct TextQueryParser {}
+
+impl ScalarQueryParser for TextQueryParser {
+    fn visit_between(&self, _: &str, _: ScalarValue, _: ScalarValue) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_in_list(&self, _: &str, _: Vec<ScalarValue>) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_bool(&self, _: &str, _: bool) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_null(&self, _: &str) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_comparison(&self, _: &str, _: ScalarValue, _: &Operator) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        if args.len() != 2 {
+            return None;
+        }
+        let scalar = maybe_scalar(&args[1], data_type)?;
+        if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
+            if func.name() == "contains" {
+                let query = TextQuery::StringContains(scalar_str);
+                Some(IndexedExpression::index_query(
+                    column.to_string(),
+                    Arc::new(query),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
 impl IndexedExpression {
     /// Create an expression that only does refine
     fn refine_only(refine_expr: Expr) -> Self {
@@ -341,7 +394,11 @@ impl IndexedExpression {
 #[async_trait]
 pub trait ScalarIndexLoader: Send + Sync {
     /// Load the index with the given name
-    async fn load_index(&self, name: &str) -> Result<Arc<dyn ScalarIndex>>;
+    async fn load_index(
+        &self,
+        name: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>>;
 }
 
 /// This represents a lookup into one or more scalar indices
@@ -379,6 +436,19 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
+pub enum IndexExprResult {
+    // The answer is exactly the rows in the allow list minus the rows in the block list
+    Exact(RowIdMask),
+    // The answer is at most the rows in the allow list minus the rows in the block list
+    // Some of the rows in the allow list may not be in the result and will need to be filtered
+    // by a recheck.  Every row in the block list is definitely not in the result.
+    AtMost(RowIdMask),
+    // The answer is at least the rows in the allow list minus the rows in the block list
+    // Some of the rows in the block list might be in the result.  Every row in the allow list is
+    // definitely in the result.
+    AtLeast(RowIdMask),
+}
+
 impl ScalarIndexExpr {
     /// Evaluates the scalar index expression
     ///
@@ -388,31 +458,110 @@ impl ScalarIndexExpr {
     /// any situations where the session cache has been disabled.
     #[async_recursion]
     #[instrument(level = "debug", skip_all)]
-    pub async fn evaluate(&self, index_loader: &dyn ScalarIndexLoader) -> Result<RowIdMask> {
+    pub async fn evaluate(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<IndexExprResult> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate(index_loader).await?;
-                Ok(!result)
+                let result = inner.evaluate(index_loader, metrics).await?;
+                match result {
+                    IndexExprResult::Exact(mask) => Ok(IndexExprResult::Exact(!mask)),
+                    IndexExprResult::AtMost(mask) => Ok(IndexExprResult::AtLeast(!mask)),
+                    IndexExprResult::AtLeast(mask) => Ok(IndexExprResult::AtMost(!mask)),
+                }
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate(index_loader);
-                let rhs_result = rhs.evaluate(index_loader);
+                let lhs_result = lhs.evaluate(index_loader, metrics);
+                let rhs_result = rhs.evaluate(index_loader, metrics);
                 let (lhs_result, rhs_result) = join!(lhs_result, rhs_result);
-                Ok(lhs_result? & rhs_result?)
+                match (lhs_result?, rhs_result?) {
+                    (IndexExprResult::Exact(lhs), IndexExprResult::Exact(rhs)) => {
+                        Ok(IndexExprResult::Exact(lhs & rhs))
+                    }
+                    (IndexExprResult::Exact(lhs), IndexExprResult::AtMost(rhs))
+                    | (IndexExprResult::AtMost(lhs), IndexExprResult::Exact(rhs)) => {
+                        Ok(IndexExprResult::AtMost(lhs & rhs))
+                    }
+                    (IndexExprResult::Exact(lhs), IndexExprResult::AtLeast(_)) => {
+                        // We could do better here, elements in both lhs and rhs are known
+                        // to be true and don't require a recheck.  We only need to recheck
+                        // elements in lhs that are not in rhs
+                        Ok(IndexExprResult::AtMost(lhs))
+                    }
+                    (IndexExprResult::AtLeast(_), IndexExprResult::Exact(rhs)) => {
+                        // We could do better here (see above)
+                        Ok(IndexExprResult::AtMost(rhs))
+                    }
+                    (IndexExprResult::AtMost(lhs), IndexExprResult::AtMost(rhs)) => {
+                        Ok(IndexExprResult::AtMost(lhs & rhs))
+                    }
+                    (IndexExprResult::AtLeast(lhs), IndexExprResult::AtLeast(rhs)) => {
+                        Ok(IndexExprResult::AtLeast(lhs & rhs))
+                    }
+                    (IndexExprResult::AtLeast(_), IndexExprResult::AtMost(rhs)) => {
+                        Ok(IndexExprResult::AtMost(rhs))
+                    }
+                    (IndexExprResult::AtMost(lhs), IndexExprResult::AtLeast(_)) => {
+                        Ok(IndexExprResult::AtMost(lhs))
+                    }
+                }
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate(index_loader);
-                let rhs_result = rhs.evaluate(index_loader);
+                let lhs_result = lhs.evaluate(index_loader, metrics);
+                let rhs_result = rhs.evaluate(index_loader, metrics);
                 let (lhs_result, rhs_result) = join!(lhs_result, rhs_result);
-                Ok(lhs_result? | rhs_result?)
+                match (lhs_result?, rhs_result?) {
+                    (IndexExprResult::Exact(lhs), IndexExprResult::Exact(rhs)) => {
+                        Ok(IndexExprResult::Exact(lhs | rhs))
+                    }
+                    (IndexExprResult::Exact(lhs), IndexExprResult::AtMost(rhs))
+                    | (IndexExprResult::AtMost(lhs), IndexExprResult::Exact(rhs)) => {
+                        // We could do better here.  Elements in the exact side don't need
+                        // re-check.  We only need to recheck elements exclusively in the
+                        // at-most side
+                        Ok(IndexExprResult::AtMost(lhs | rhs))
+                    }
+                    (IndexExprResult::Exact(lhs), IndexExprResult::AtLeast(rhs)) => {
+                        Ok(IndexExprResult::AtLeast(lhs | rhs))
+                    }
+                    (IndexExprResult::AtLeast(lhs), IndexExprResult::Exact(rhs)) => {
+                        Ok(IndexExprResult::AtLeast(lhs | rhs))
+                    }
+                    (IndexExprResult::AtMost(lhs), IndexExprResult::AtMost(rhs)) => {
+                        Ok(IndexExprResult::AtMost(lhs | rhs))
+                    }
+                    (IndexExprResult::AtLeast(lhs), IndexExprResult::AtLeast(rhs)) => {
+                        Ok(IndexExprResult::AtLeast(lhs | rhs))
+                    }
+                    (IndexExprResult::AtLeast(lhs), IndexExprResult::AtMost(_)) => {
+                        Ok(IndexExprResult::AtLeast(lhs))
+                    }
+                    (IndexExprResult::AtMost(_), IndexExprResult::AtLeast(rhs)) => {
+                        Ok(IndexExprResult::AtLeast(rhs))
+                    }
+                }
             }
             Self::Query(column, query) => {
-                let index = index_loader.load_index(column).await?;
-                let matching_row_ids = index.search(query.as_ref()).await?;
-                Ok(RowIdMask {
-                    block_list: None,
-                    allow_list: Some(matching_row_ids),
-                })
+                let index = index_loader.load_index(column, metrics).await?;
+                let search_result = index.search(query.as_ref(), metrics).await?;
+                match search_result {
+                    SearchResult::Exact(matching_row_ids) => {
+                        Ok(IndexExprResult::Exact(RowIdMask {
+                            block_list: None,
+                            allow_list: Some(matching_row_ids),
+                        }))
+                    }
+                    SearchResult::AtMost(row_ids) => Ok(IndexExprResult::AtMost(RowIdMask {
+                        block_list: None,
+                        allow_list: Some(row_ids),
+                    })),
+                    SearchResult::AtLeast(row_ids) => Ok(IndexExprResult::AtLeast(RowIdMask {
+                        block_list: None,
+                        allow_list: Some(row_ids),
+                    })),
+                }
             }
         }
     }
@@ -431,6 +580,14 @@ impl ScalarIndexExpr {
                 lhs.or(rhs)
             }
             Self::Query(column, query) => query.to_expr(column.clone()),
+        }
+    }
+
+    pub fn needs_recheck(&self) -> bool {
+        match self {
+            Self::Not(inner) => inner.needs_recheck(),
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.needs_recheck() || rhs.needs_recheck(),
+            Self::Query(_, query) => query.needs_recheck(),
         }
     }
 }
@@ -457,6 +614,44 @@ fn maybe_indexed_column<'a, 'b>(
 fn maybe_scalar(expr: &Expr, expected_type: &DataType) -> Option<ScalarValue> {
     match expr {
         Expr::Literal(value) => safe_coerce_scalar(value, expected_type),
+        // Some literals can't be expressed in datafusion's SQL and can only be expressed with
+        // a cast.  For example, there is no way to express a fixed-size-binary literal (which is
+        // commonly used for UUID).  As a result the expression could look like...
+        //
+        // col = arrow_cast(value, 'fixed_size_binary(16)')
+        //
+        // In this case we need to extract the value, apply the cast, and then test the casted value
+        Expr::Cast(cast) => match cast.expr.as_ref() {
+            Expr::Literal(value) => {
+                let casted = value.cast_to(&cast.data_type).ok()?;
+                safe_coerce_scalar(&casted, expected_type)
+            }
+            _ => None,
+        },
+        Expr::ScalarFunction(scalar_function) => {
+            if scalar_function.name() == "arrow_cast" {
+                if scalar_function.args.len() != 2 {
+                    return None;
+                }
+                match (&scalar_function.args[0], &scalar_function.args[1]) {
+                    (Expr::Literal(value), Expr::Literal(cast_type)) => {
+                        let target_type = scalar_function
+                            .func
+                            .return_type_from_args(ReturnTypeArgs {
+                                arg_types: &[value.data_type(), cast_type.data_type()],
+                                scalar_arguments: &[Some(value), Some(cast_type)],
+                                nullables: &[false, false],
+                            })
+                            .ok()?;
+                        let casted = value.cast_to(target_type.return_type()).ok()?;
+                        safe_coerce_scalar(&casted, expected_type)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -564,9 +759,66 @@ fn visit_comparison(
         let scalar = maybe_scalar(&expr.right, col_type)?;
         query_parser.visit_comparison(column, scalar, &expr.op)
     } else {
-        let (column, col_type, query_parser) = maybe_indexed_column(&expr.right, index_info)?;
-        let scalar = maybe_scalar(&expr.left, col_type)?;
-        query_parser.visit_comparison(column, scalar, &expr.op)
+        // Datafusion's query simplifier will canonicalize expressions and so we shouldn't reach this case.  If, for some reason, we
+        // do reach this case we can handle it in the future by inverting expr.op and swapping the left and right sides
+        None
+    }
+}
+
+fn maybe_between(expr: &BinaryExpr) -> Option<Between> {
+    let left_comparison = match expr.left.as_ref() {
+        Expr::BinaryExpr(binary_expr) => Some(binary_expr),
+        _ => None,
+    }?;
+    let right_comparison = match expr.right.as_ref() {
+        Expr::BinaryExpr(binary_expr) => Some(binary_expr),
+        _ => None,
+    }?;
+
+    match (left_comparison.op, right_comparison.op) {
+        (Operator::GtEq, Operator::LtEq) => {
+            // We have x >= y && a <= b.
+            // If x == a then it is a between query
+            // if y == b then it is a between query
+            if left_comparison.left == right_comparison.left {
+                Some(Between {
+                    expr: left_comparison.left.clone(),
+                    low: left_comparison.right.clone(),
+                    high: right_comparison.right.clone(),
+                    negated: false,
+                })
+            } else if left_comparison.right == right_comparison.right {
+                Some(Between {
+                    expr: left_comparison.right.clone(),
+                    low: right_comparison.left.clone(),
+                    high: left_comparison.left.clone(),
+                    negated: false,
+                })
+            } else {
+                None
+            }
+        }
+        (Operator::LtEq, Operator::GtEq) => {
+            // Same logic as above we just switch the low/high
+            if left_comparison.left == right_comparison.left {
+                Some(Between {
+                    expr: left_comparison.left.clone(),
+                    low: right_comparison.right.clone(),
+                    high: left_comparison.right.clone(),
+                    negated: false,
+                })
+            } else if left_comparison.right == right_comparison.right {
+                Some(Between {
+                    expr: left_comparison.right.clone(),
+                    low: left_comparison.left.clone(),
+                    high: right_comparison.left.clone(),
+                    negated: false,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -574,6 +826,17 @@ fn visit_and(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
 ) -> Option<IndexedExpression> {
+    // Many scalar indices can efficiently handle a BETWEEN query as a single search and this
+    // can be much more efficient than two separate range queries.  As an optimization we check
+    // to see if this is a between query and, if so, we handle it as a single query
+    //
+    // Note: We can't rely on users writing the SQL BETWEEN operator because:
+    //   * Some users won't realize it's an option or a good idea
+    //   * Datafusion's simplifier will rewrite the BETWEEN operator into two separate range queries
+    if let Some(between) = maybe_between(expr) {
+        return visit_between(&between, index_info);
+    }
+
     let left = visit_node(&expr.left, index_info);
     let right = visit_node(&expr.right, index_info);
     match (left, right) {
@@ -664,6 +927,8 @@ pub fn apply_scalar_indices(
 #[derive(Default, Debug)]
 pub struct FilterPlan {
     pub index_query: Option<ScalarIndexExpr>,
+    /// True if the index query is guaranteed to return exact results
+    pub skip_recheck: bool,
     pub refine_expr: Option<Expr>,
     pub full_expr: Option<Expr>,
 }
@@ -716,14 +981,20 @@ impl PlannerIndexExt for Planner {
         let logical_expr = self.optimize_expr(filter)?;
         if use_scalar_index {
             let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info);
+            let mut skip_recheck = false;
+            if let Some(scalar_query) = indexed_expr.scalar_query.as_ref() {
+                skip_recheck = !scalar_query.needs_recheck();
+            }
             Ok(FilterPlan {
                 index_query: indexed_expr.scalar_query,
                 refine_expr: indexed_expr.refine_expr,
                 full_expr: Some(logical_expr),
+                skip_recheck,
             })
         } else {
             Ok(FilterPlan {
                 index_query: None,
+                skip_recheck: true,
                 refine_expr: Some(logical_expr.clone()),
                 full_expr: Some(logical_expr),
             })
@@ -736,12 +1007,8 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow_schema::{Field, Schema};
-    use datafusion::error::Result as DFResult;
-    use datafusion_common::{config::ConfigOptions, TableReference};
+    use datafusion::prelude::SessionContext;
     use datafusion_common::{Column, DFSchema};
-    use datafusion_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
-    use datafusion_sql::planner::{ContextProvider, PlannerContext, SqlToRel};
-    use datafusion_sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
     use super::*;
 
@@ -780,47 +1047,6 @@ mod tests {
         }
     }
 
-    struct MockContextProvider {}
-
-    // We're just compiling simple expressions (not entire statements) and so this is unused
-    impl ContextProvider for MockContextProvider {
-        fn get_table_source(&self, _name: TableReference) -> DFResult<Arc<dyn TableSource>> {
-            todo!()
-        }
-
-        fn get_function_meta(&self, _: &str) -> Option<std::sync::Arc<ScalarUDF>> {
-            todo!()
-        }
-
-        fn get_aggregate_meta(&self, _: &str) -> Option<std::sync::Arc<AggregateUDF>> {
-            todo!()
-        }
-
-        fn get_window_meta(&self, _: &str) -> Option<std::sync::Arc<WindowUDF>> {
-            todo!()
-        }
-
-        fn get_variable_type(&self, _: &[String]) -> Option<DataType> {
-            todo!()
-        }
-
-        fn options(&self) -> &ConfigOptions {
-            todo!()
-        }
-
-        fn udf_names(&self) -> Vec<String> {
-            todo!()
-        }
-
-        fn udaf_names(&self) -> Vec<String> {
-            todo!()
-        }
-
-        fn udwf_names(&self) -> Vec<String> {
-            todo!()
-        }
-    }
-
     fn check(
         index_info: &dyn IndexInformationProvider,
         expr: &str,
@@ -833,16 +1059,11 @@ mod tests {
             Field::new("on_sale", DataType::Boolean, false),
             Field::new("price", DataType::Float32, false),
         ]);
-        let dialect = PostgreSqlDialect {};
-        let mut parser = Parser::new(&dialect).try_with_sql(expr).unwrap();
-        let expr = parser.parse_expr().unwrap();
-        let context_provider = MockContextProvider {};
-        let planner = SqlToRel::new(&context_provider);
         let df_schema: DFSchema = schema.try_into().unwrap();
-        let mut planner_context = PlannerContext::new();
-        let expr = planner
-            .sql_to_expr(expr, &df_schema, &mut planner_context)
-            .unwrap();
+
+        let ctx = SessionContext::default();
+        let state = ctx.state();
+        let expr = state.create_logical_expr(expr, &df_schema).unwrap();
 
         let actual = apply_scalar_indices(expr.clone(), index_info);
         if let Some(expected) = expected {
@@ -912,9 +1133,56 @@ mod tests {
         ]);
 
         check_no_index(&index_info, "size BETWEEN 5 AND 10");
+        // Cast case.  We will cast 5 (an int64) to Int16 and then coerce to UInt32
+        check_simple(
+            &index_info,
+            "aisle = arrow_cast(5, 'Int16')",
+            "aisle",
+            SargableQuery::Equals(ScalarValue::UInt32(Some(5))),
+        );
+        // 5 different ways of writing BETWEEN (all should be recognized)
         check_simple(
             &index_info,
             "aisle BETWEEN 5 AND 10",
+            "aisle",
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::UInt32(Some(5))),
+                Bound::Included(ScalarValue::UInt32(Some(10))),
+            ),
+        );
+        check_simple(
+            &index_info,
+            "aisle >= 5 AND aisle <= 10",
+            "aisle",
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::UInt32(Some(5))),
+                Bound::Included(ScalarValue::UInt32(Some(10))),
+            ),
+        );
+
+        check_simple(
+            &index_info,
+            "aisle <= 10 AND aisle >= 5",
+            "aisle",
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::UInt32(Some(5))),
+                Bound::Included(ScalarValue::UInt32(Some(10))),
+            ),
+        );
+
+        check_simple(
+            &index_info,
+            "5 <= aisle AND 10 >= aisle",
+            "aisle",
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::UInt32(Some(5))),
+                Bound::Included(ScalarValue::UInt32(Some(10))),
+            ),
+        );
+
+        check_simple(
+            &index_info,
+            "10 >= aisle AND 5 <= aisle",
             "aisle",
             SargableQuery::Range(
                 Bound::Included(ScalarValue::UInt32(Some(5))),
@@ -1023,6 +1291,10 @@ mod tests {
                 Bound::Unbounded,
             ),
         );
+        // In the future we can handle this case if we need to.  For
+        // now let's make sure we don't accidentally do the wrong thing
+        // (we were getting this backwards in the past)
+        check_no_index(&index_info, "10 > aisle");
         check_simple(
             &index_info,
             "aisle >= 10",

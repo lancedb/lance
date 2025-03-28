@@ -32,6 +32,8 @@ pub trait FieldExt {
     ///
     /// This is intended for display purposes and not for serialization
     fn to_compact_string(&self, indent: Indentation) -> String;
+
+    fn is_packed_struct(&self) -> bool;
 }
 
 impl FieldExt for Field {
@@ -78,6 +80,15 @@ impl FieldExt for Field {
             result += "?";
         }
         result
+    }
+
+    // Check if field has metadata `packed` set to true, this check is case insensitive.
+    fn is_packed_struct(&self) -> bool {
+        let field_metadata = self.metadata();
+        field_metadata
+            .get("packed")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false)
     }
 }
 

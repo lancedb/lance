@@ -24,19 +24,28 @@ runs:
       run: |
         cargo install cargo-workspaces --version 0.2.44
         cargo ws version --no-git-commit -y --exact --force 'lance*' ${{ inputs.part }}
+    - name: Update python lockfile
+      working-directory: python
+      shell: bash
+      run: |
+        cargo update -p lance
     - name: Bump java version
       working-directory: java
       shell: bash
       run: |
         # Get current version
         current_version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
-        current_version=${current_version%\%}
+        current_version=${current_version%%}
+
+        base_version="${current_version%-*}"
+        if [[ "$current_version" == *-* ]]; then
+          suffix="-${current_version#*-}"
+        else
+          suffix=""
+        fi
 
         # Split the version into components using parameter expansion
-        major=${current_version%%.*}
-        minor=${current_version#*.}
-        minor=${minor%%.*}
-        patch=${current_version##*.}
+        IFS=. read major minor patch <<<"$base_version"
 
         case "${{ inputs.part }}" in
           patch)
@@ -57,6 +66,6 @@ runs:
             ;;
         esac
 
-        new_version="${major}.${minor}.${patch}"
+        new_version="${major}.${minor}.${patch}${suffix}"
 
         mvn versions:set versions:commit -DnewVersion=$new_version

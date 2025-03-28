@@ -11,13 +11,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark;
 
 import org.apache.spark.sql.connector.catalog.Identifier;
 
 public class LanceIdentifier implements Identifier {
-  private final String[] namespace = new String[]{"default"};
+  private final String[] namespace = new String[] {"default"};
   private final String datasetUri;
 
   public LanceIdentifier(String datasetUri) {

@@ -3,21 +3,24 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
+use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
+use arrow::array::AsArray;
 use arrow::compute::concat_batches;
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{Field, SchemaRef};
+use arrow::datatypes::UInt64Type;
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, ROW_ID};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::v2::reader::FileReader;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     pb,
@@ -25,7 +28,6 @@ use crate::{
         ivf::storage::{IvfModel, IVF_METADATA_KEY},
         quantizer::Quantization,
     },
-    INDEX_METADATA_SCHEMA_KEY,
 };
 
 use super::quantizer::Quantizer;
@@ -38,6 +40,11 @@ use super::DISTANCE_TYPE_KEY;
 /// </section>
 pub trait DistCalculator {
     fn distance(&self, id: u32) -> f32;
+
+    // return the distances of all rows
+    // k_hint is a hint that can be used for optimization
+    fn distance_all(&self, k_hint: usize) -> Vec<f32>;
+
     fn prefetch(&self, _id: u32) {}
 }
 
@@ -61,13 +68,52 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     where
         Self: 'a;
 
+    /// Create a [VectorStore] from a [RecordBatch].
+    /// The batch should consist of row IDs and quantized vector.
     fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>;
 
     fn as_any(&self) -> &dyn Any;
 
     fn schema(&self) -> &SchemaRef;
 
-    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>>;
+    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch> + Send>;
+
+    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+        let batches = self
+            .to_batches()?
+            .map(|b| {
+                let mut indices = Vec::with_capacity(b.num_rows());
+                let mut new_row_ids = Vec::with_capacity(b.num_rows());
+
+                let row_ids = b.column(0).as_primitive::<UInt64Type>().values();
+                for (i, row_id) in row_ids.iter().enumerate() {
+                    match mapping.get(row_id) {
+                        Some(Some(new_id)) => {
+                            indices.push(i as u32);
+                            new_row_ids.push(*new_id);
+                        }
+                        Some(None) => {}
+                        None => {
+                            indices.push(i as u32);
+                            new_row_ids.push(*row_id);
+                        }
+                    }
+                }
+
+                let indices = UInt32Array::from(indices);
+                let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
+                let new_vectors = arrow::compute::take(b.column(1), &indices, None)?;
+
+                Ok(RecordBatch::try_new(
+                    self.schema().clone(),
+                    vec![new_row_ids, new_vectors],
+                )?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let batch = concat_batches(self.schema(), batches.iter())?;
+        Self::try_from_batch(batch, self.distance_type())
+    }
 
     fn len(&self) -> usize;
 
@@ -96,44 +142,60 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
 
-    fn distance_between(&self, a: u32, b: u32) -> f32;
-
-    fn dist_calculator_from_native(&self, _query: ArrayRef) -> Self::DistanceCalculator<'_> {
-        todo!("Implement this")
+    fn dist_between(&self, u: u32, v: u32) -> f32 {
+        let dist_cal_u = self.dist_calculator_from_id(u);
+        dist_cal_u.distance(v)
     }
 }
 
 pub struct StorageBuilder<Q: Quantization> {
-    column: String,
+    vector_column: String,
     distance_type: DistanceType,
     quantizer: Q,
+
+    // this is for testing purpose
+    assert_num_columns: bool,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
-    pub fn new(column: String, distance_type: DistanceType, quantizer: Q) -> Self {
-        Self {
-            column,
+    pub fn new(vector_column: String, distance_type: DistanceType, quantizer: Q) -> Result<Self> {
+        Ok(Self {
+            vector_column,
             distance_type,
             quantizer,
-        }
+            assert_num_columns: true,
+        })
     }
 
-    pub fn build(&self, batch: &RecordBatch) -> Result<Q::Storage> {
-        let vectors = batch.column_by_name(&self.column).ok_or(Error::Schema {
-            message: format!("column {} not found", self.column),
-            location: location!(),
-        })?;
-        let code_array = self.quantizer.quantize(vectors.as_ref())?;
-        let batch = batch
-            .try_with_column(
-                Field::new(
-                    self.quantizer.column(),
-                    code_array.data_type().clone(),
-                    true,
-                ),
-                code_array,
-            )?
-            .drop_column(&self.column)?;
+    // this is for testing purpose
+    pub fn assert_num_columns(mut self, assert_num_columns: bool) -> Self {
+        self.assert_num_columns = assert_num_columns;
+        self
+    }
+
+    pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
+        let mut batch = concat_batches(batches[0].schema_ref(), batches.iter())?;
+
+        if batch.column_by_name(self.quantizer.column()).is_none() {
+            let vectors = batch
+                .column_by_name(&self.vector_column)
+                .ok_or(Error::Index {
+                    message: format!("Vector column {} not found in batch", self.vector_column),
+                    location: location!(),
+                })?;
+            let codes = self.quantizer.quantize(vectors)?;
+            batch = batch.drop_column(&self.vector_column)?.try_with_column(
+                arrow_schema::Field::new(self.quantizer.column(), codes.data_type().clone(), true),
+                codes,
+            )?;
+        }
+
+        if self.assert_num_columns {
+            debug_assert_eq!(batch.num_columns(), 2, "{}", batch.schema());
+        }
+        debug_assert!(batch.column_by_name(ROW_ID).is_some());
+        debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
+
         let batch = batch.add_metadata(
             STORAGE_METADATA_KEY.to_owned(),
             self.quantizer.metadata(None)?.to_string(),
@@ -172,7 +234,7 @@ impl IvfQuantizationStorage {
                 .metadata
                 .get(DISTANCE_TYPE_KEY)
                 .ok_or(Error::Index {
-                    message: format!("{} not found", INDEX_METADATA_SCHEMA_KEY),
+                    message: format!("{} not found", DISTANCE_TYPE_KEY),
                     location: location!(),
                 })?
                 .as_str(),
@@ -211,9 +273,25 @@ impl IvfQuantizationStorage {
         })
     }
 
+    pub fn num_rows(&self) -> u64 {
+        self.reader.num_rows()
+    }
+
     pub fn quantizer<Q: Quantization>(&self) -> Result<Quantizer> {
-        let metadata = serde_json::from_str(&self.metadata[0])?;
+        let metadata = self.metadata::<Q>()?;
         Q::from_metadata(&metadata, self.distance_type)
+    }
+
+    pub fn metadata<Q: Quantization>(&self) -> Result<Q::Metadata> {
+        Ok(serde_json::from_str(&self.metadata[0])?)
+    }
+
+    pub fn distance_type(&self) -> DistanceType {
+        self.distance_type
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        Arc::new(self.reader.schema().as_ref().into())
     }
 
     /// Get the number of partitions in the storage.

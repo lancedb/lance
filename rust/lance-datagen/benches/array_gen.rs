@@ -119,7 +119,7 @@ fn bench_rand_gen(c: &mut Criterion) {
         lance_datagen::array::rand::<Int64Type>()
     });
     bench_gen(&mut group, "rand_varbin", || {
-        lance_datagen::array::rand_varbin(ByteCount::from(12), false)
+        lance_datagen::array::rand_fixedbin(ByteCount::from(12), false)
     });
     bench_gen(&mut group, "rand_utf8", || {
         lance_datagen::array::rand_utf8(ByteCount::from(12), false)

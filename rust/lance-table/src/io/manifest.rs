@@ -10,7 +10,7 @@ use lance_arrow::DataTypeExt;
 use lance_file::{version::LanceFileVersion, writer::ManifestProvider};
 use object_store::path::Path;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use lance_core::{datatypes::Schema, Error, Result};
@@ -28,8 +28,16 @@ use crate::format::{pb, DataStorageFormat, Index, Manifest, MAGIC};
 ///
 /// This only reads manifest files. It does not read data files.
 #[instrument(level = "debug", skip(object_store))]
-pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Manifest> {
-    let file_size = object_store.inner.head(path).await?.size;
+pub async fn read_manifest(
+    object_store: &ObjectStore,
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<Manifest> {
+    let file_size = if let Some(known_size) = known_size {
+        known_size as usize
+    } else {
+        object_store.inner.head(path).await?.size
+    };
     const PREFETCH_SIZE: usize = 64 * 1024;
     let initial_start = std::cmp::max(file_size as i64 - PREFETCH_SIZE as i64, 0) as usize;
     let range = Range {
@@ -37,6 +45,13 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
         end: file_size,
     };
     let buf = object_store.inner.get_range(path, range).await?;
+
+    // In case of corruption, the known_size might be wrong. We can retry without
+    // the size to be more robust.
+    if (buf.len() < 16 || !buf.ends_with(MAGIC)) && known_size.is_some() {
+        return Box::pin(read_manifest(object_store, path, None)).await;
+    }
+
     if buf.len() < 16 {
         return Err(Error::io(
             "Invalid format: file size is smaller than 16 bytes".to_string(),
@@ -263,7 +278,7 @@ mod test {
             .unwrap();
         writer.shutdown().await.unwrap();
 
-        let roundtripped_manifest = read_manifest(&store, &path).await.unwrap();
+        let roundtripped_manifest = read_manifest(&store, &path, None).await.unwrap();
 
         assert_eq!(manifest, roundtripped_manifest);
 

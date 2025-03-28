@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 
-import logging
 from typing import Optional, Tuple
 
 from lance.dependencies import torch
+from lance.log import LOGGER
 
 __all__ = [
     "pairwise_cosine",
@@ -225,7 +225,7 @@ def l2_distance(
             return _l2_distance(vectors, centroids, split_size=split, y2=y2)
         except RuntimeError as e:  # noqa: PERF203
             if "CUDA out of memory" in str(e):
-                logging.warning(
+                LOGGER.warning(
                     "L2: batch split=%s out of memory, attempt to use reduced split %s",
                     split,
                     split // 2,

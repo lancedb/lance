@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.ipc;
 
 import org.apache.arrow.util.Preconditions;
@@ -21,9 +20,7 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
 
-/**
- * Lance scan options.
- */
+/** Lance scan options. */
 public class ScanOptions {
   private final Optional<List<Integer>> fragmentIds;
   private final Optional<Long> batchSize;
@@ -34,33 +31,42 @@ public class ScanOptions {
   private final Optional<Long> offset;
   private final Optional<Query> nearest;
   private final boolean withRowId;
+  private final boolean withRowAddress;
   private final int batchReadahead;
+  private final Optional<List<ColumnOrdering>> columnOrderings;
 
   /**
    * Constructor for LanceScanOptions.
    *
-   * @param fragmentIds     the id of the fragments to scan
-   * @param batchSize       Maximum row number of each returned ArrowRecordBatch.
-   *                        Optional, use Optional.empty() if unspecified.
-   * @param columns         (Optional) Projected columns. Optional.empty() for
-   *                        scanning all columns.
-   *                        Otherwise, only columns present in the List will be
-   *                        scanned.
-   * @param filter          (Optional) Filter expression. Optional.empty() for no
-   *                        filter.
+   * @param fragmentIds the id of the fragments to scan
+   * @param batchSize Maximum row number of each returned ArrowRecordBatch. Optional, use
+   *     Optional.empty() if unspecified.
+   * @param columns (Optional) Projected columns. Optional.empty() for scanning all columns.
+   *     Otherwise, only columns present in the List will be scanned.
+   * @param filter (Optional) Filter expression. Optional.empty() for no filter.
    * @param substraitFilter (Optional) Substrait filter expression.
-   * @param limit           (Optional) Maximum number of rows to return.
-   * @param offset          (Optional) Number of rows to skip before returning
-   *                        results.
-   * @param withRowId       Whether to include the row ID in the results.
-   * @param nearest         (Optional) Nearest neighbor query.
-   * @param batchReadahead  Number of batches to read ahead.
+   * @param limit (Optional) Maximum number of rows to return.
+   * @param offset (Optional) Number of rows to skip before returning results.
+   * @param withRowId Whether to include the row ID in the results.
+   * @param withRowAddress Whether to include the row address in the results.
+   * @param nearest (Optional) Nearest neighbor query.
+   * @param batchReadahead Number of batches to read ahead.
    */
-  public ScanOptions(Optional<List<Integer>> fragmentIds, Optional<Long> batchSize,
-      Optional<List<String>> columns, Optional<String> filter,
-      Optional<ByteBuffer> substraitFilter, Optional<Long> limit,
-      Optional<Long> offset, Optional<Query> nearest, boolean withRowId, int batchReadahead) {
-    Preconditions.checkArgument(!(filter.isPresent() && substraitFilter.isPresent()),
+  public ScanOptions(
+      Optional<List<Integer>> fragmentIds,
+      Optional<Long> batchSize,
+      Optional<List<String>> columns,
+      Optional<String> filter,
+      Optional<ByteBuffer> substraitFilter,
+      Optional<Long> limit,
+      Optional<Long> offset,
+      Optional<Query> nearest,
+      boolean withRowId,
+      boolean withRowAddress,
+      int batchReadahead,
+      Optional<List<ColumnOrdering>> columnOrderings) {
+    Preconditions.checkArgument(
+        !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
     this.fragmentIds = fragmentIds;
     this.batchSize = batchSize;
@@ -71,7 +77,9 @@ public class ScanOptions {
     this.offset = offset;
     this.nearest = nearest;
     this.withRowId = withRowId;
+    this.withRowAddress = withRowAddress;
     this.batchReadahead = batchReadahead;
+    this.columnOrderings = columnOrderings;
   }
 
   /**
@@ -113,8 +121,7 @@ public class ScanOptions {
   /**
    * Get the substrait filter.
    *
-   * @return Optional containing the substrait filter if specified, otherwise
-   *         empty.
+   * @return Optional containing the substrait filter if specified, otherwise empty.
    */
   public Optional<ByteBuffer> getSubstraitFilter() {
     return substraitFilter;
@@ -141,8 +148,7 @@ public class ScanOptions {
   /**
    * Get the nearest neighbor query.
    *
-   * @return Optional containing the nearest neighbor query if specified,
-   *         otherwise empty.
+   * @return Optional containing the nearest neighbor query if specified, otherwise empty.
    */
   public Optional<Query> getNearest() {
     return nearest;
@@ -158,12 +164,25 @@ public class ScanOptions {
   }
 
   /**
+   * Get whether to include the row address.
+   *
+   * @return true if row address should be included, false otherwise.
+   */
+  public boolean isWithRowAddress() {
+    return withRowAddress;
+  }
+
+  /**
    * Get the batch readahead.
    *
    * @return the number of batches to read ahead.
    */
   public int getBatchReadahead() {
     return batchReadahead;
+  }
+
+  public Optional<List<ColumnOrdering>> getColumnOrderings() {
+    return columnOrderings;
   }
 
   @Override
@@ -173,19 +192,20 @@ public class ScanOptions {
         .append("batchSize", batchSize.orElse(null))
         .append("columns", columns.orElse(null))
         .append("filter", filter.orElse(null))
-        .append("substraitFilter", substraitFilter
-            .map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
+        .append(
+            "substraitFilter",
+            substraitFilter.map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
         .append("limit", limit.orElse(null))
         .append("offset", offset.orElse(null))
         .append("nearest", nearest.orElse(null))
         .append("withRowId", withRowId)
+        .append("WithRowAddress", withRowAddress)
         .append("batchReadahead", batchReadahead)
+        .append("columnOrdering", columnOrderings)
         .toString();
   }
 
-  /**
-   * Builder for constructing LanceScanOptions.
-   */
+  /** Builder for constructing LanceScanOptions. */
   public static class Builder {
     private Optional<List<Integer>> fragmentIds = Optional.empty();
     private Optional<Long> batchSize = Optional.empty();
@@ -196,10 +216,11 @@ public class ScanOptions {
     private Optional<Long> offset = Optional.empty();
     private Optional<Query> nearest = Optional.empty();
     private boolean withRowId = false;
+    private boolean withRowAddress = false;
     private int batchReadahead = 16;
+    private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
 
-    public Builder() {
-    }
+    public Builder() {}
 
     /**
      * Create a builder from another scan options.
@@ -216,7 +237,9 @@ public class ScanOptions {
       this.offset = options.getOffset();
       this.nearest = options.getNearest();
       this.withRowId = options.isWithRowId();
+      this.withRowAddress = options.isWithRowAddress();
       this.batchReadahead = options.getBatchReadahead();
+      this.columnOrderings = options.getColumnOrderings();
     }
 
     /**
@@ -319,6 +342,17 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether to include the row addr.
+     *
+     * @param withRowAddress true to include row ID, false otherwise.
+     * @return Builder instance for method chaining.
+     */
+    public Builder withRowAddress(boolean withRowAddress) {
+      this.withRowAddress = withRowAddress;
+      return this;
+    }
+
+    /**
      * Set the batch readahead.
      *
      * @param batchReadahead Number of batches to read ahead.
@@ -329,14 +363,30 @@ public class ScanOptions {
       return this;
     }
 
+    public Builder setColumnOrderings(List<ColumnOrdering> columnOrderings) {
+      this.columnOrderings = Optional.of(columnOrderings);
+      return this;
+    }
+
     /**
      * Build the LanceScanOptions instance.
      *
      * @return LanceScanOptions instance with the specified parameters.
      */
     public ScanOptions build() {
-      return new ScanOptions(fragmentIds, batchSize, columns, filter, substraitFilter,
-          limit, offset, nearest, withRowId, batchReadahead);
+      return new ScanOptions(
+          fragmentIds,
+          batchSize,
+          columns,
+          filter,
+          substraitFilter,
+          limit,
+          offset,
+          nearest,
+          withRowId,
+          withRowAddress,
+          batchReadahead,
+          columnOrderings);
     }
   }
 }

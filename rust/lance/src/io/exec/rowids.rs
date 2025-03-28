@@ -9,7 +9,7 @@ use datafusion::common::stats::Precision;
 use datafusion::common::ColumnStatistics;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::StreamExt;
@@ -19,6 +19,8 @@ use lance_table::rowids::RowIdIndex;
 use crate::dataset::rowids::get_row_id_index;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
+
+use super::utils::InstrumentedRecordBatchStreamAdapter;
 
 /// Add a `_rowaddr` column to a stream of record batches that have a `_rowid`.
 ///
@@ -36,6 +38,8 @@ pub struct AddRowAddrExec {
     rowaddr_pos: usize,
     output_schema: SchemaRef,
     properties: PlanProperties,
+
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl std::fmt::Debug for AddRowAddrExec {
@@ -105,6 +109,7 @@ impl AddRowAddrExec {
             rowaddr_pos,
             output_schema,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -184,9 +189,19 @@ impl ExecutionPlan for AddRowAddrExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if children.len() != 1 {
+            Err(DataFusionError::Internal(
+                "AddRowAddrExec: invalid number of children".into(),
+            ))
+        } else {
+            Ok(Arc::new(Self::try_new(
+                children.into_iter().next().unwrap(),
+                self.dataset.clone(),
+                self.rowaddr_pos,
+            )?))
+        }
     }
 
     fn execute(
@@ -229,7 +244,12 @@ impl ExecutionPlan for AddRowAddrExec {
             }
         });
 
-        let stream = RecordBatchStreamAdapter::new(self.output_schema.clone(), stream.boxed());
+        let stream = InstrumentedRecordBatchStreamAdapter::new(
+            self.output_schema.clone(),
+            stream.boxed(),
+            partition,
+            &self.metrics,
+        );
         Ok(Box::pin(stream))
     }
 
@@ -240,8 +260,9 @@ impl ExecutionPlan for AddRowAddrExec {
             DataFusionError::Internal("RowAddrExec: rowid column stats not found".into())
         })?;
         let row_addr_col_stats = ColumnStatistics {
-            null_count: row_id_col_stats.null_count.clone(),
-            distinct_count: row_id_col_stats.distinct_count.clone(),
+            null_count: row_id_col_stats.null_count,
+            distinct_count: row_id_col_stats.distinct_count,
+            sum_value: Precision::Absent,
             max_value: Precision::Absent,
             min_value: Precision::Absent,
         };
@@ -251,7 +272,6 @@ impl ExecutionPlan for AddRowAddrExec {
         // is a minimum size of 64 bytes.
         let mut added_byte_size = stats
             .num_rows
-            .clone()
             .map(|n| (n * 8).max(64))
             .add(&Precision::Exact(base_size));
         if row_id_col_stats
@@ -261,8 +281,7 @@ impl ExecutionPlan for AddRowAddrExec {
             .unwrap_or_default()
         {
             // Account for null buffer.
-            added_byte_size =
-                added_byte_size.add(&stats.num_rows.clone().map(|n| n.div_ceil(8).max(64)));
+            added_byte_size = added_byte_size.add(&stats.num_rows.map(|n| n.div_ceil(8).max(64)));
         }
         stats.total_byte_size = stats.total_byte_size.add(&added_byte_size);
         stats
@@ -270,6 +289,10 @@ impl ExecutionPlan for AddRowAddrExec {
             .insert(self.rowaddr_pos, row_addr_col_stats);
 
         Ok(stats)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &PlanProperties {

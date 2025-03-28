@@ -10,6 +10,7 @@ from .lance import (
     LanceBufferDescriptor,
     LanceColumnMetadata,
     LanceFileMetadata,
+    LanceFileStatistics,
     LancePageMetadata,
 )
 from .lance import (
@@ -133,7 +134,7 @@ class LanceFileReader:
             if indices[i] > indices[i + 1]:
                 raise ValueError(
                     f"Indices must be sorted in ascending order for \
-                                 file API, got {indices[i]} > {indices[i+1]}"
+                                 file API, got {indices[i]} > {indices[i + 1]}"
                 )
 
         return ReaderResults(
@@ -145,6 +146,12 @@ class LanceFileReader:
         Return metadata describing the file contents
         """
         return self._reader.metadata()
+
+    def file_statistics(self) -> LanceFileStatistics:
+        """
+        Return file statistics of the file
+        """
+        return self._reader.file_statistics()
 
     def read_global_buffer(self, index: int) -> bytes:
         """
@@ -232,7 +239,7 @@ class LanceFileWriter:
         else:
             self._writer.write_batch(batch)
 
-    def close(self) -> int:
+    def close(self) -> Optional[int]:
         """
         Write the file metadata and close the file
 
@@ -289,4 +296,5 @@ __all__ = [
     "LanceColumnMetadata",
     "LancePageMetadata",
     "LanceBufferDescriptor",
+    "LanceFileStatistics",
 ]

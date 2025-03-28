@@ -81,10 +81,15 @@ def test_sql_predicates(dataset):
         ("int >= 50", 50),
         ("int = 50", 1),
         ("int != 50", 99),
+        ("int BETWEEN 50 AND 60", 11),
         ("float < 30.0", 45),
         ("str = 'aa'", 16),
         ("str in ('aa', 'bb')", 26),
         ("rec.bool", 50),
+        ("rec.bool is true", 50),
+        ("rec.bool is not true", 50),
+        ("rec.bool is false", 50),
+        ("rec.bool is not false", 50),
         ("rec.date = cast('2021-01-01' as date)", 1),
         ("rec.dt = cast('2021-01-01 00:00:00' as timestamp(6))", 1),
         ("rec.dt = cast('2021-01-01 00:00:00' as timestamp)", 1),
@@ -101,6 +106,13 @@ def test_sql_predicates(dataset):
 
     for expr, expected_num_rows in predicates_nrows:
         assert dataset.to_table(filter=expr).num_rows == expected_num_rows
+
+
+def test_illegal_predicates(dataset):
+    predicates_nrows = ["str BETWEEN 10 AND 20", "str > 10"]
+    for expr in predicates_nrows:
+        with pytest.raises(ValueError, match="Invalid user input: *"):
+            dataset.to_table(filter=expr)
 
 
 def test_compound(dataset):
@@ -256,3 +268,19 @@ def test_duckdb(tmp_path):
     expected = duckdb.query("SELECT id, meta, price FROM ds").to_df()
     expected = expected[expected.meta == "aa"].reset_index(drop=True)
     tm.assert_frame_equal(actual, expected)
+
+
+def test_struct_field_order(tmp_path):
+    """
+    This test regresses some old behavior where the order of struct fields would get
+    messed up due to late materialization and we would get {y,x} instead of {x,y}
+    """
+    data = pa.table({"struct": [{"x": i, "y": i} for i in range(10)]})
+    dataset = lance.write_dataset(data, tmp_path)
+
+    for late_materialization in [True, False]:
+        result = dataset.to_table(
+            filter="struct.y > 5", late_materialization=late_materialization
+        )
+        expected = pa.table({"struct": [{"x": i, "y": i} for i in range(6, 10)]})
+        assert result == expected

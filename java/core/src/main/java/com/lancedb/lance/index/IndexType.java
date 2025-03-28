@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.index;
 
 public enum IndexType {
@@ -30,11 +29,10 @@ public enum IndexType {
   private final int value;
 
   IndexType(int value) {
-      this.value = value;
+    this.value = value;
   }
 
   public int getValue() {
-      return value;
+    return value;
   }
 }
-

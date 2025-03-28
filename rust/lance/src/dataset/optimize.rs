@@ -597,7 +597,7 @@ async fn reserve_fragment_ids(
         None,
     );
 
-    let manifest = commit_transaction(
+    let (manifest, _) = commit_transaction(
         dataset,
         dataset.object_store(),
         dataset.commit_handler.as_ref(),
@@ -902,7 +902,7 @@ pub async fn commit_compaction(
         None,
     );
 
-    let manifest = commit_transaction(
+    let (manifest, manifest_path) = commit_transaction(
         dataset,
         dataset.object_store(),
         dataset.commit_handler.as_ref(),
@@ -914,6 +914,7 @@ pub async fn commit_compaction(
     .await?;
 
     dataset.manifest = Arc::new(manifest);
+    dataset.manifest_file = manifest_path;
 
     Ok(metrics)
 }
@@ -1671,8 +1672,9 @@ mod tests {
         async fn vector_query(dataset: &Dataset) -> RecordBatch {
             let mut scanner = dataset.scan();
 
+            let query = Float32Array::from(vec![0.0f32; 128]);
             scanner
-                .nearest("vec", &vec![0.0; 128].into(), 10)
+                .nearest("vec", &query, 10)
                 .unwrap()
                 .project(&["i"])
                 .unwrap();

@@ -11,6 +11,7 @@ use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_array::{ListArray, RecordBatch};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
+use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_array::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{scalar::ScalarValue, Column};
@@ -21,8 +22,9 @@ use deepsize::DeepSizeOf;
 use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
+use crate::metrics::MetricsCollector;
 use crate::{Index, IndexParams, IndexType};
 
 pub mod bitmap;
@@ -32,14 +34,16 @@ pub mod flat;
 pub mod inverted;
 pub mod label_list;
 pub mod lance_format;
+pub mod ngram;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum ScalarIndexType {
     BTree,
     Bitmap,
     LabelList,
+    NGram,
     Inverted,
 }
 
@@ -51,6 +55,7 @@ impl TryFrom<IndexType> for ScalarIndexType {
             IndexType::BTree | IndexType::Scalar => Ok(Self::BTree),
             IndexType::Bitmap => Ok(Self::Bitmap),
             IndexType::LabelList => Ok(Self::LabelList),
+            IndexType::NGram => Ok(Self::NGram),
             IndexType::Inverted => Ok(Self::Inverted),
             _ => Err(Error::InvalidInput {
                 source: format!("Index type {:?} is not a scalar index", value).into(),
@@ -85,6 +90,7 @@ impl IndexParams for ScalarIndexParams {
             Some(ScalarIndexType::Bitmap) => IndexType::Bitmap,
             Some(ScalarIndexType::LabelList) => IndexType::LabelList,
             Some(ScalarIndexType::Inverted) => IndexType::Inverted,
+            Some(ScalarIndexType::NGram) => IndexType::NGram,
         }
     }
 
@@ -165,7 +171,7 @@ pub trait IndexWriter: Send {
 #[async_trait]
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
-    async fn read_record_batch(&self, n: u32) -> Result<RecordBatch>;
+    async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
     /// Read the range of rows from the file.
     /// If projection is Some, only return the columns in the projection,
     /// nested columns like Some(&["x.y"]) are not supported.
@@ -206,6 +212,12 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     ///
     /// This is often useful when remapping or updating
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
+
+    /// Rename an index file
+    async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<()>;
+
+    /// Delete an index file (used in the tmp spill store to keep tmp size down)
+    async fn delete_index_file(&self, name: &str) -> Result<()>;
 }
 
 /// Different scalar indices may support different kinds of queries
@@ -227,6 +239,10 @@ pub trait AnyQuery: std::fmt::Debug + Any + Send + Sync {
     fn to_expr(&self, col: String) -> Expr;
     /// Compare this query to another query
     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool;
+    /// If true, the query results are inexact and will need rechecked
+    fn needs_recheck(&self) -> bool {
+        false
+    }
 }
 
 impl PartialEq for dyn AnyQuery {
@@ -477,13 +493,96 @@ impl AnyQuery for LabelListQuery {
     }
 }
 
+/// A query that a NGramIndex can satisfy
+#[derive(Debug, Clone, PartialEq)]
+pub enum TextQuery {
+    /// Retrieve all row ids where the text contains the given string
+    StringContains(String),
+    // TODO: In the future we should be able to do string-insensitive contains
+    // as well as partial matches (e.g. LIKE 'foo%') and potentially even
+    // some regular expressions
+}
+
+impl AnyQuery for TextQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        format!("{}", self.to_expr(col.to_string()))
+    }
+
+    fn to_expr(&self, col: String) -> Expr {
+        match self {
+            Self::StringContains(substr) => Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(ContainsFunc::new().into()),
+                args: vec![
+                    Expr::Column(Column::new_unqualified(col)),
+                    Expr::Literal(ScalarValue::Utf8(Some(substr.clone()))),
+                ],
+            }),
+        }
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
+    }
+
+    fn needs_recheck(&self) -> bool {
+        true
+    }
+}
+
+/// The result of a search operation against a scalar index
+#[derive(Debug, PartialEq)]
+pub enum SearchResult {
+    /// The exact row ids that satisfy the query
+    Exact(RowIdTreeMap),
+    /// Any row id satisfying the query will be in this set but not every
+    /// row id in this set will satisfy the query, a further recheck step
+    /// is needed
+    AtMost(RowIdTreeMap),
+    /// All of the given row ids satisfy the query but there may be more
+    ///
+    /// No scalar index actually returns this today but it can arise from
+    /// boolean operations (e.g. NOT(AtMost(x)) == AtLeast(NOT(x)))
+    AtLeast(RowIdTreeMap),
+}
+
+impl SearchResult {
+    pub fn row_ids(&self) -> &RowIdTreeMap {
+        match self {
+            Self::Exact(row_ids) => row_ids,
+            Self::AtMost(row_ids) => row_ids,
+            Self::AtLeast(row_ids) => row_ids,
+        }
+    }
+
+    pub fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact(_))
+    }
+}
+
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Search the scalar index
     ///
     /// Returns all row ids that satisfy the query, these row ids are not necessarily ordered
-    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap>;
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult>;
+
+    /// Returns true if the query can be answered exactly
+    ///
+    /// If false is returned then the query still may be answered exactly but if true is returned
+    /// then the query must be answered exactly
+    fn can_answer_exact(&self, query: &dyn AnyQuery) -> bool;
 
     /// Load the scalar index from storage
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>

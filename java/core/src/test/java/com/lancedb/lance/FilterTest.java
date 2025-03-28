@@ -11,14 +11,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance;
-
-import java.io.IOException;
-import java.nio.file.Path;
 
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.AfterAll;
@@ -26,11 +23,14 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.Arrays;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class FilterTest {
-  @TempDir
-  static Path tempDir;
+  @TempDir static Path tempDir;
   private static BufferAllocator allocator;
   private static Dataset dataset;
 
@@ -38,7 +38,8 @@ public class FilterTest {
   static void setup() throws IOException {
     String datasetPath = tempDir.resolve("filter_test_dataset").toString();
     allocator = new RootAllocator();
-    TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+    TestUtils.SimpleTestDataset testDataset =
+        new TestUtils.SimpleTestDataset(allocator, datasetPath);
     testDataset.createEmptyDataset().close();
     // write id with value from 0 to 39
     dataset = testDataset.write(1, 40);
@@ -92,7 +93,8 @@ public class FilterTest {
 
     testFilter("(name IS NOT NULL) AND (name == 'Person 1')", 1);
     testFilter("(name IS NOT NULL) AND (name == 'Person')", 0);
-    // Not supported, bug?, LanceError(IO): Schema error: No field named person. Valid fields are id, name.
+    // Not supported, bug?, LanceError(IO): Schema error: No field named person. Valid fields are
+    // id, name.
     // testFilter("(name IS NOT NULL) AND (name == Person)", 0);
 
     // Not supported
@@ -101,7 +103,13 @@ public class FilterTest {
   }
 
   private void testFilter(String filter, int expectedCount) throws Exception {
-    try (LanceScanner scanner = dataset.newScan(new ScanOptions.Builder().filter(filter).build())) {
+    try (LanceScanner scanner =
+        dataset.newScan(
+            new ScanOptions.Builder()
+                .columns(Arrays.asList())
+                .withRowId(true)
+                .filter(filter)
+                .build())) {
       assertEquals(expectedCount, scanner.countRows());
     }
   }

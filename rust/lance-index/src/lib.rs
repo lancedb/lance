@@ -16,9 +16,10 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 use std::convert::TryFrom;
 
+pub mod metrics;
 pub mod optimize;
 pub mod prefilter;
 pub mod scalar;
@@ -79,6 +80,8 @@ pub enum IndexType {
 
     Inverted = 4, // Inverted
 
+    NGram = 5, // NGram
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -96,6 +99,7 @@ impl std::fmt::Display for IndexType {
             Self::Bitmap => write!(f, "Bitmap"),
             Self::LabelList => write!(f, "LabelList"),
             Self::Inverted => write!(f, "Inverted"),
+            Self::NGram => write!(f, "NGram"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -114,6 +118,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::BTree as i32 => Ok(Self::BTree),
             v if v == Self::Bitmap as i32 => Ok(Self::Bitmap),
             v if v == Self::LabelList as i32 => Ok(Self::LabelList),
+            v if v == Self::NGram as i32 => Ok(Self::NGram),
             v if v == Self::Inverted as i32 => Ok(Self::Inverted),
             v if v == Self::Vector as i32 => Ok(Self::Vector),
             v if v == Self::IvfFlat as i32 => Ok(Self::IvfFlat),
@@ -133,14 +138,24 @@ impl IndexType {
     pub fn is_scalar(&self) -> bool {
         matches!(
             self,
-            Self::Scalar | Self::BTree | Self::Bitmap | Self::LabelList | Self::Inverted
+            Self::Scalar
+                | Self::BTree
+                | Self::Bitmap
+                | Self::LabelList
+                | Self::Inverted
+                | Self::NGram
         )
     }
 
     pub fn is_vector(&self) -> bool {
         matches!(
             self,
-            Self::Vector | Self::IvfPq | Self::IvfHnswSq | Self::IvfHnswPq
+            Self::Vector
+                | Self::IvfPq
+                | Self::IvfHnswSq
+                | Self::IvfHnswPq
+                | Self::IvfFlat
+                | Self::IvfSq
         )
     }
 }

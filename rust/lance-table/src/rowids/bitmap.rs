@@ -92,7 +92,7 @@ pub struct BitmapSlice<'a> {
     len: usize,
 }
 
-impl<'a> BitmapSlice<'a> {
+impl BitmapSlice<'_> {
     pub fn count_ones(&self) -> usize {
         if self.len == 0 {
             return 0;
@@ -138,7 +138,7 @@ impl<'a> BitmapSlice<'a> {
     }
 }
 
-impl<'a> From<BitmapSlice<'a>> for Bitmap {
+impl From<BitmapSlice<'_>> for Bitmap {
     fn from(slice: BitmapSlice) -> Self {
         let mut bitmap = Self::new_empty(slice.len);
         for i in 0..slice.len {

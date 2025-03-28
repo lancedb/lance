@@ -15,7 +15,7 @@ use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use num_traits::*;
-use snafu::{location, Location};
+use snafu::location;
 use storage::{ScalarQuantizationMetadata, ScalarQuantizationStorage, SQ_METADATA_KEY};
 
 use super::quantizer::{Quantization, QuantizationMetadata, QuantizationType, Quantizer};
@@ -88,7 +88,7 @@ impl ScalarQuantizer {
             .as_slice();
 
         self.bounds = data.iter().fold(self.bounds.clone(), |f, v| {
-            f.start.min(v.to_f64().unwrap())..f.end.max(v.to_f64().unwrap())
+            f.start.min(v.as_())..f.end.max(v.as_())
         });
 
         Ok(self.bounds.clone())
@@ -119,7 +119,7 @@ impl ScalarQuantizer {
             .as_slice();
 
         // TODO: support SQ4
-        let builder: Vec<u8> = scale_to_u8::<T>(data, self.bounds.clone());
+        let builder: Vec<u8> = scale_to_u8::<T>(data, &self.bounds);
 
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
             UInt8Array::from(builder),
@@ -187,6 +187,35 @@ impl Quantization for ScalarQuantizer {
         Ok(quantizer)
     }
 
+    fn retrain(&mut self, data: &dyn Array) -> Result<()> {
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "SQ retrain: input is not a FixedSizeList: {}",
+                data.data_type()
+            ),
+            location: location!(),
+        })?;
+
+        match fsl.value_type() {
+            DataType::Float16 => {
+                self.update_bounds::<Float16Type>(fsl)?;
+            }
+            DataType::Float32 => {
+                self.update_bounds::<Float32Type>(fsl)?;
+            }
+            DataType::Float64 => {
+                self.update_bounds::<Float64Type>(fsl)?;
+            }
+            value_type => {
+                return Err(Error::invalid_input(
+                    format!("unsupported data type {} for scalar quantizer", value_type),
+                    location!(),
+                ))
+            }
+        }
+        Ok(())
+    }
+
     fn code_dim(&self) -> usize {
         self.dim
     }
@@ -232,21 +261,29 @@ impl Quantization for ScalarQuantizer {
     }
 }
 
-pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: Range<f64>) -> Vec<u8> {
+pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: &Range<f64>) -> Vec<u8> {
+    if bounds.start == bounds.end {
+        return vec![0; values.len()];
+    }
+
     let range = bounds.end - bounds.start;
     values
         .iter()
         .map(|&v| {
             let v = v.to_f64().unwrap();
-            match v {
-                v if v < bounds.start => 0,
-                v if v > bounds.end => 255,
-                _ => ((v - bounds.start) * f64::from_u32(255).unwrap() / range)
-                    .round()
-                    .to_u8()
-                    .unwrap(),
-            }
+            let v = ((v - bounds.start) * 255.0 / range).round();
+            v as u8 // rust `as` performs saturating cast when casting float to int, so it's safe and expected here
         })
+        .collect_vec()
+}
+
+pub(crate) fn inverse_scalar_dist(
+    values: impl Iterator<Item = f32>,
+    bounds: &Range<f64>,
+) -> Vec<f32> {
+    let range = (bounds.end - bounds.start) as f32;
+    values
+        .map(|v| v * range.powi(2) / 255.0.powi(2))
         .collect_vec()
 }
 #[cfg(test)]
@@ -339,5 +376,16 @@ mod tests {
         sq_values.values().iter().enumerate().for_each(|(i, v)| {
             assert_eq!(*v, (i * 17) as u8,);
         });
+    }
+
+    #[tokio::test]
+    async fn test_scale_to_u8_with_nan() {
+        let values = vec![0.0, 1.0, 2.0, 3.0, f64::NAN];
+        let bounds = Range::<f64> {
+            start: 0.0,
+            end: 3.0,
+        };
+        let u8_values = scale_to_u8::<Float64Type>(&values, &bounds);
+        assert_eq!(u8_values, vec![0, 85, 170, 255, 0]);
     }
 }

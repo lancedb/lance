@@ -14,7 +14,7 @@ use itertools::Itertools;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
-use snafu::{location, Location};
+use snafu::location;
 use std::cmp::min;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Debug;
@@ -30,8 +30,9 @@ use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
 use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, VECTOR_ID_FIELD};
+use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
-use crate::vector::flat::storage::FlatStorage;
+use crate::vector::flat::storage::FlatFloatStorage;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::{greedy_search, Visited};
 use crate::vector::graph::{
@@ -100,7 +101,7 @@ impl HnswBuildParams {
     /// - `data`: A FixedSizeList to build the HNSW.
     /// - `distance_type`: The distance type to use.
     pub async fn build(self, data: ArrayRef, distance_type: DistanceType) -> Result<HNSW> {
-        let vec_store = Arc::new(FlatStorage::new(
+        let vec_store = Arc::new(FlatFloatStorage::new(
             data.as_fixed_size_list().clone(),
             distance_type,
         ));
@@ -393,9 +394,10 @@ impl HnswBuilder {
     ) {
         let nodes = &self.nodes;
         let target_level = nodes[node as usize].read().unwrap().level_neighbors.len() as u16 - 1;
+        let dist_calc = storage.dist_calculator_from_id(node);
         let mut ep = OrderedNode::new(
             self.entry_point,
-            storage.distance_between(node, self.entry_point).into(),
+            dist_calc.distance(self.entry_point).into(),
         );
 
         //
@@ -406,7 +408,6 @@ impl HnswBuilder {
         //    ep = Select-Neighbors(W, 1)
         //  }
         // ```
-        let dist_calc = storage.dist_calculator_from_id(node);
         for level in (target_level + 1..self.params.max_level).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
             ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
@@ -507,7 +508,7 @@ impl<'a> HnswLevelView<'a> {
     }
 }
 
-impl<'a> Graph for HnswLevelView<'a> {
+impl Graph for HnswLevelView<'_> {
     fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -528,7 +529,7 @@ impl<'a> HnswBottomView<'a> {
     }
 }
 
-impl<'a> Graph for HnswBottomView<'a> {
+impl Graph for HnswBottomView<'_> {
     fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -544,7 +545,7 @@ pub struct HnswQueryParams {
     pub ef: usize,
 }
 
-impl<'a> From<&'a Query> for HnswQueryParams {
+impl From<&Query> for HnswQueryParams {
     fn from(query: &Query) -> Self {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {
@@ -655,7 +656,7 @@ impl IvfSubIndex for HNSW {
         .into()
     }
 
-    #[instrument(level = "debug", skip(self, query, storage, prefilter))]
+    #[instrument(level = "debug", skip(self, query, storage, prefilter, _metrics))]
     fn search(
         &self,
         query: ArrayRef,
@@ -663,6 +664,7 @@ impl IvfSubIndex for HNSW {
         params: Self::QueryParams,
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         if params.ef < k {
             return Err(Error::Index {
@@ -706,15 +708,16 @@ impl IvfSubIndex for HNSW {
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
 
-        let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| storage.row_id(x.id)));
-        let distances = Arc::new(Float32Array::from_iter_values(
-            results.iter().map(|x| x.dist.0),
-        ));
+        // need to unique by row ids in case of searching multivector
+        let (row_ids, dists): (Vec<_>, Vec<_>) = results
+            .into_iter()
+            .map(|r| (storage.row_id(r.id), r.dist.0))
+            .unique_by(|r| r.0)
+            .unzip();
+        let row_ids = Arc::new(UInt64Array::from(row_ids));
+        let distances = Arc::new(Float32Array::from(dists));
 
-        Ok(RecordBatch::try_new(
-            schema,
-            vec![distances, Arc::new(row_ids)],
-        )?)
+        Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
     }
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
@@ -747,6 +750,10 @@ impl IvfSubIndex for HNSW {
 
         assert_eq!(hnsw.inner.level_count[0].load(Ordering::Relaxed), len);
         Ok(hnsw)
+    }
+
+    fn remap(&self, _mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+        unimplemented!("HNSW remap is not supported yet");
     }
 
     /// Encode the sub index into a record batch
@@ -819,7 +826,7 @@ mod tests {
     use crate::scalar::IndexWriter;
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
-        flat::storage::FlatStorage,
+        flat::storage::FlatFloatStorage,
         graph::{DISTS_FIELD, NEIGHBORS_FIELD},
         hnsw::{builder::HnswBuildParams, HNSW, VECTOR_ID_FIELD},
     };
@@ -831,7 +838,7 @@ mod tests {
         const NUM_EDGES: usize = 20;
         let data = generate_random_array(TOTAL * DIM);
         let fsl = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
-        let store = Arc::new(FlatStorage::new(fsl.clone(), DistanceType::L2));
+        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),
             HnswBuildParams::default()

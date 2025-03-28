@@ -6,6 +6,8 @@ use snafu::{Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// Allocates error on the heap and then places `e` into it.
+#[inline]
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
     Box::new(e)
 }
@@ -149,6 +151,24 @@ impl Error {
     }
 }
 
+pub trait LanceOptionExt<T> {
+    /// Unwraps an option, returning an internal error if the option is None.
+    ///
+    /// Can be used when an option is expected to have a value.
+    fn expect_ok(self) -> Result<T>;
+}
+
+impl<T> LanceOptionExt<T> for Option<T> {
+    #[track_caller]
+    fn expect_ok(self) -> Result<T> {
+        let location = std::panic::Location::caller().to_snafu_location();
+        self.ok_or_else(|| Error::Internal {
+            message: "Expected option to have value".to_string(),
+            location,
+        })
+    }
+}
+
 trait ToSnafuLocation {
     fn to_snafu_location(&'static self) -> snafu::Location;
 }
@@ -217,6 +237,16 @@ impl From<prost::DecodeError> for Error {
 impl From<prost::EncodeError> for Error {
     #[track_caller]
     fn from(e: prost::EncodeError) -> Self {
+        Self::IO {
+            source: box_error(e),
+            location: std::panic::Location::caller().to_snafu_location(),
+        }
+    }
+}
+
+impl From<prost::UnknownEnumValue> for Error {
+    #[track_caller]
+    fn from(e: prost::UnknownEnumValue) -> Self {
         Self::IO {
             source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),

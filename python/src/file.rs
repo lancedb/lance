@@ -23,7 +23,9 @@ use lance_core::cache::FileMetadataCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::{
     v2::{
-        reader::{BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions},
+        reader::{
+            BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics,
+        },
         writer::{FileWriter, FileWriterOptions},
     },
     version::LanceFileVersion,
@@ -36,10 +38,13 @@ use lance_io::{
 use object_store::path::Path;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
-    pyclass, pymethods, IntoPy, PyObject, PyResult, Python,
+    pyclass, pymethods, IntoPyObjectExt, PyObject, PyResult, Python,
 };
 use serde::Serialize;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Mutex, MutexGuard},
+};
 use std::{pin::Pin, sync::Arc};
 use url::Url;
 
@@ -113,6 +118,58 @@ impl LanceColumnMetadata {
     }
 }
 
+/// Statistics summarize some of the file metadata for quick summary info
+#[pyclass(get_all)]
+#[derive(Clone, Debug, Serialize)]
+pub struct LanceFileStatistics {
+    /// Statistics about each of the columns in the file
+    columns: Vec<LanceColumnStatistics>,
+}
+
+#[pymethods]
+impl LanceFileStatistics {
+    fn __repr__(&self) -> String {
+        let column_reprs: Vec<String> = self.columns.iter().map(|col| col.__repr__()).collect();
+        format!("FileStatistics(columns=[{}])", column_reprs.join(", "))
+    }
+}
+
+/// Summary information describing a column
+#[pyclass(get_all)]
+#[derive(Clone, Debug, Serialize)]
+pub struct LanceColumnStatistics {
+    /// The number of pages in the column
+    num_pages: usize,
+    /// The total number of data & metadata bytes in the column
+    ///
+    /// This is the compressed on-disk size
+    size_bytes: u64,
+}
+
+#[pymethods]
+impl LanceColumnStatistics {
+    fn __repr__(&self) -> String {
+        format!(
+            "ColumnStatistics(num_pages={}, size_bytes={})",
+            self.num_pages, self.size_bytes
+        )
+    }
+}
+
+impl LanceFileStatistics {
+    fn new(inner: &FileStatistics) -> Self {
+        let columns = inner
+            .columns
+            .iter()
+            .map(|column_stat| LanceColumnStatistics {
+                num_pages: column_stat.num_pages,
+                size_bytes: column_stat.size_bytes,
+            })
+            .collect();
+        Self { columns }
+    }
+}
+
 #[pyclass(get_all)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceFileMetadata {
@@ -141,7 +198,7 @@ pub struct LanceFileMetadata {
 impl LanceFileMetadata {
     fn new(inner: &CachedFileMetadata, py: Python) -> Self {
         let arrow_schema = arrow_schema::Schema::from(inner.file_schema.as_ref());
-        let schema = Some(PyArrowType(arrow_schema).into_py(py));
+        let schema = PyArrowType(arrow_schema).into_py_any(py).ok();
         Self {
             major_version: inner.major_version,
             minor_version: inner.minor_version,
@@ -174,7 +231,7 @@ impl LanceFileMetadata {
 
 #[pyclass]
 pub struct LanceFileWriter {
-    inner: Box<FileWriter>,
+    inner: Arc<Mutex<Box<FileWriter>>>,
 }
 
 impl LanceFileWriter {
@@ -205,14 +262,21 @@ impl LanceFileWriter {
             Ok(FileWriter::new_lazy(object_writer, options))
         }?;
         Ok(Self {
-            inner: Box::new(inner),
+            inner: Arc::new(Mutex::new(Box::new(inner))),
         })
+    }
+
+    fn inner_lock(&self) -> PyResult<MutexGuard<Box<FileWriter>>> {
+        self.inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 }
 
 #[pymethods]
 impl LanceFileWriter {
     #[new]
+    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, keep_original_array=None))]
     pub fn new(
         path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
@@ -231,24 +295,27 @@ impl LanceFileWriter {
         ))
     }
 
-    pub fn write_batch(&mut self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
+    pub fn write_batch(&self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
         RT.runtime
-            .block_on(self.inner.write_batch(&batch.0))
+            .block_on(self.inner_lock()?.write_batch(&batch.0))
             .infer_error()
     }
 
-    pub fn finish(&mut self) -> PyResult<u64> {
-        RT.runtime.block_on(self.inner.finish()).infer_error()
-    }
-
-    pub fn add_global_buffer(&mut self, bytes: Vec<u8>) -> PyResult<u32> {
+    pub fn finish(&self) -> PyResult<u64> {
         RT.runtime
-            .block_on(self.inner.add_global_buffer(Bytes::from(bytes)))
+            .block_on(self.inner_lock()?.finish())
             .infer_error()
     }
 
-    pub fn add_schema_metadata(&mut self, key: String, value: String) {
-        self.inner.add_schema_metadata(key, value)
+    pub fn add_global_buffer(&self, bytes: Vec<u8>) -> PyResult<u32> {
+        RT.runtime
+            .block_on(self.inner_lock()?.add_global_buffer(Bytes::from(bytes)))
+            .infer_error()
+    }
+
+    pub fn add_schema_metadata(&self, key: String, value: String) -> PyResult<()> {
+        self.inner_lock()?.add_schema_metadata(key, value);
+        Ok(())
     }
 }
 
@@ -390,6 +457,7 @@ impl LanceFileReader {
 #[pymethods]
 impl LanceFileReader {
     #[new]
+    #[pyo3(signature=(path, storage_options=None))]
     pub fn new(path: String, storage_options: Option<HashMap<String, String>>) -> PyResult<Self> {
         RT.runtime.block_on(Self::open(path, storage_options))
     }
@@ -443,11 +511,78 @@ impl LanceFileReader {
         LanceFileMetadata::new(inner_meta, py)
     }
 
+    pub fn file_statistics(&self) -> LanceFileStatistics {
+        let inner_stat = self.inner.file_statistics();
+        LanceFileStatistics::new(&inner_stat)
+    }
+
     pub fn read_global_buffer(&mut self, index: u32) -> PyResult<Vec<u8>> {
         let buffer_bytes = RT
             .runtime
             .block_on(self.inner.read_global_buffer(index))
             .infer_error()?;
         Ok(buffer_bytes.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lance_file_statistics_repr_empty() {
+        let stats = LanceFileStatistics { columns: vec![] };
+
+        let repr_str = stats.__repr__();
+        assert_eq!(repr_str, "FileStatistics(columns=[])");
+    }
+
+    #[test]
+    fn test_lance_file_statistics_repr_single_column() {
+        let stats = LanceFileStatistics {
+            columns: vec![LanceColumnStatistics {
+                num_pages: 5,
+                size_bytes: 1024,
+            }],
+        };
+
+        let repr_str = stats.__repr__();
+        assert_eq!(
+            repr_str,
+            "FileStatistics(columns=[ColumnStatistics(num_pages=5, size_bytes=1024)])"
+        );
+    }
+
+    #[test]
+    fn test_lance_file_statistics_repr_multiple_columns() {
+        let stats = LanceFileStatistics {
+            columns: vec![
+                LanceColumnStatistics {
+                    num_pages: 5,
+                    size_bytes: 1024,
+                },
+                LanceColumnStatistics {
+                    num_pages: 3,
+                    size_bytes: 512,
+                },
+            ],
+        };
+
+        let repr_str = stats.__repr__();
+        assert_eq!(
+            repr_str,
+            "FileStatistics(columns=[ColumnStatistics(num_pages=5, size_bytes=1024), ColumnStatistics(num_pages=3, size_bytes=512)])"
+        );
+    }
+
+    #[test]
+    fn test_lance_column_statistics_repr() {
+        let column_stats = LanceColumnStatistics {
+            num_pages: 10,
+            size_bytes: 2048,
+        };
+
+        let repr_str = column_stats.__repr__();
+        assert_eq!(repr_str, "ColumnStatistics(num_pages=10, size_bytes=2048)");
     }
 }

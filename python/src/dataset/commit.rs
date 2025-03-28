@@ -15,7 +15,7 @@
 use std::fmt::Debug;
 
 use lance_table::io::commit::{CommitError, CommitLease, CommitLock};
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::Error;
 
@@ -27,14 +27,14 @@ lazy_static! {
             py.import("lance")
                 .and_then(|lance| lance.getattr("commit"))
                 .and_then(|commit| commit.getattr("CommitConflictError"))
-                .map(|error| error.to_object(py))
+                .map(|err| err.unbind())
         })
     };
 }
 
 fn handle_error(py_err: PyErr, py: Python) -> CommitError {
     let conflict_err_type = match &*PY_CONFLICT_ERROR {
-        Ok(err) => err.as_ref(py).get_type(),
+        Ok(err) => err.bind(py).get_type(),
         Err(import_error) => {
             return CommitError::OtherError(Error::Internal {
                 message: format!("Error importing from pylance {}", import_error),
@@ -43,7 +43,7 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
         }
     };
 
-    if py_err.is_instance(py, conflict_err_type) {
+    if py_err.is_instance(py, &conflict_err_type) {
         CommitError::CommitConflict
     } else {
         CommitError::OtherError(Error::Internal {

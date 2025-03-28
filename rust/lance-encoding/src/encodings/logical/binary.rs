@@ -27,7 +27,7 @@ pub struct BinarySchedulingJob<'a> {
     inner: Box<dyn SchedulingJob + 'a>,
 }
 
-impl<'a> SchedulingJob for BinarySchedulingJob<'a> {
+impl SchedulingJob for BinarySchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,
@@ -118,7 +118,6 @@ impl LogicalPageDecoder for BinaryPageDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         let inner_task = self.inner.drain(num_rows)?;
         Ok(NextDecodeTask {
-            has_more: inner_task.has_more,
             num_rows: inner_task.num_rows,
             task: Box::new(BinaryArrayDecoder {
                 inner: inner_task.task,

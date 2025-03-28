@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
 use criterion::{criterion_group, criterion_main, Criterion};
+use lance_linalg::kmeans::KMeansAlgoFloat;
 use lance_linalg::{distance::MetricType, kmeans::compute_partitions};
 use lance_testing::datagen::generate_random_array_with_seed;
 #[cfg(target_os = "linux")]
@@ -24,9 +25,9 @@ fn bench_compute_partitions(c: &mut Criterion) {
 
     c.bench_function("compute_centroids(L2)", |b| {
         b.iter(|| {
-            compute_partitions(
-                centroids.values(),
-                input.values(),
+            compute_partitions::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                centroids.as_ref(),
+                &input,
                 DIMENSION,
                 MetricType::L2,
             )
@@ -35,9 +36,9 @@ fn bench_compute_partitions(c: &mut Criterion) {
 
     c.bench_function("compute_centroids(Cosine)", |b| {
         b.iter(|| {
-            compute_partitions(
-                centroids.values(),
-                input.values(),
+            compute_partitions::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                centroids.as_ref(),
+                &input,
                 DIMENSION,
                 MetricType::Cosine,
             )

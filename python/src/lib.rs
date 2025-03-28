@@ -18,6 +18,10 @@
 //! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
 //! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
 
+// Workaround for https://github.com/rust-lang/rust-clippy/issues/12039
+// Remove after upgrading pyo3 to 0.23
+#![allow(clippy::useless_conversion)]
+
 use std::env;
 use std::sync::Arc;
 
@@ -35,13 +39,14 @@ use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
 use dataset::MergeInsertBuilder;
-use env_logger::Env;
+use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
-    LanceFileWriter, LancePageMetadata,
+    LanceFileStatistics, LanceFileWriter, LancePageMetadata,
 };
 use futures::StreamExt;
 use lance_index::DatasetIndexExt;
+use log::Level;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use session::Session;
@@ -64,17 +69,17 @@ pub(crate) mod scanner;
 pub(crate) mod schema;
 pub(crate) mod session;
 pub(crate) mod tracing;
+pub(crate) mod transaction;
 pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
-use crate::fragment::write_fragments;
+use crate::fragment::{write_fragments, write_fragments_transaction};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
-pub use dataset::{Dataset, Operation, RewriteGroup, RewrittenIndex};
-pub use fragment::FragmentMetadata;
-use fragment::{DataFile, FileFragment};
+pub use dataset::Dataset;
+use fragment::{FileFragment, PyDeletionFile, PyRowIdMeta};
 pub use indices::register_indices;
 pub use reader::LanceReader;
 pub use scanner::Scanner;
@@ -89,10 +94,10 @@ pub fn is_datagen_supported() -> bool {
 
 // A fallback module for when datagen is not enabled
 #[cfg(not(feature = "datagen"))]
-fn register_datagen(py: Python, m: &PyModule) -> PyResult<()> {
+fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let datagen = PyModule::new(py, "datagen")?;
     datagen.add_wrapped(wrap_pyfunction!(is_datagen_supported))?;
-    m.add_submodule(datagen)?;
+    m.add_submodule(&datagen)?;
     Ok(())
 }
 
@@ -101,29 +106,40 @@ lazy_static! {
     static ref RT: BackgroundExecutor = BackgroundExecutor::new();
 }
 
+pub fn init_logging(mut log_builder: Builder) {
+    let logger = log_builder.build();
+
+    let max_level = logger.filter();
+
+    let log_level = max_level.to_level().unwrap_or(Level::Error);
+
+    tracing::initialize_tracing(log_level);
+    log::set_boxed_logger(Box::new(logger)).unwrap();
+    log::set_max_level(max_level);
+}
+
 #[pymodule]
-fn lance(py: Python, m: &PyModule) -> PyResult<()> {
+fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
-    env_logger::init_from_env(env);
+    let log_builder = env_logger::Builder::from_env(env);
+    init_logging(log_builder);
 
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
-    m.add_class::<Operation>()?;
-    m.add_class::<RewriteGroup>()?;
-    m.add_class::<RewrittenIndex>()?;
     m.add_class::<FileFragment>()?;
-    m.add_class::<FragmentMetadata>()?;
+    m.add_class::<PyDeletionFile>()?;
+    m.add_class::<PyRowIdMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
     m.add_class::<LanceFileMetadata>()?;
+    m.add_class::<LanceFileStatistics>()?;
     m.add_class::<LanceColumnMetadata>()?;
     m.add_class::<LancePageMetadata>()?;
     m.add_class::<LanceBufferDescriptor>()?;
-    m.add_class::<DataFile>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
     m.add_class::<KMeans>()?;
@@ -139,21 +155,36 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
+    m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
     m.add_wrapped(wrap_pyfunction!(infer_tfrecord_schema))?;
     m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
+    m.add_wrapped(wrap_pyfunction!(language_model_home))?;
+    m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
+    m.add_wrapped(wrap_pyfunction!(iops_counter))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_fragment))?;
     m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+
     register_datagen(py, m)?;
     register_indices(py, m)?;
     Ok(())
+}
+
+#[pyfunction(name = "iops_counter")]
+fn iops_counter() -> PyResult<u64> {
+    Ok(::lance::io::iops_counter())
+}
+
+#[pyfunction(name = "bytes_read_counter")]
+fn bytes_read_counter() -> PyResult<u64> {
+    Ok(::lance::io::bytes_read_counter())
 }
 
 #[pyfunction(name = "_schema_to_json")]
@@ -172,6 +203,21 @@ fn json_to_schema(json: &str) -> PyResult<PyArrowType<ArrowSchema>> {
         ))
     })?;
     Ok(schema.into())
+}
+
+#[pyfunction]
+pub fn language_model_home() -> PyResult<String> {
+    let Some(p) = lance_index::scalar::inverted::language_model_home() else {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Failed to get language model home",
+        ));
+    };
+    let Some(pstr) = p.to_str() else {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Failed to convert language model home to str",
+        ));
+    };
+    Ok(String::from(pstr))
 }
 
 /// Infer schema from tfrecord file
@@ -297,14 +343,14 @@ fn read_tfrecord(
 
 #[pyfunction]
 #[pyo3(signature = (dataset,))]
-fn manifest_needs_migration(dataset: &PyAny) -> PyResult<bool> {
+fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
-    let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let dataset_ref = &dataset.bind(py).borrow().ds;
     let indices = RT
         .block_on(Some(py), dataset_ref.load_indices())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
-    let manifest = RT
+    let (manifest, _) = RT
         .block_on(Some(py), dataset_ref.latest_manifest())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
     Ok(::lance::io::commit::manifest_needs_migration(

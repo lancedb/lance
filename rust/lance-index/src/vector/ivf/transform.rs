@@ -10,7 +10,8 @@ use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::Field;
-use snafu::{location, Location};
+use lance_table::utils::LanceIteratorExtension;
+use snafu::location;
 use tracing::instrument;
 
 use lance_arrow::RecordBatchExt;
@@ -19,12 +20,15 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::kmeans::compute_partitions_arrow_array;
 
 use crate::vector::transform::Transformer;
+use crate::vector::LOSS_METADATA_KEY;
 
 use super::PART_ID_COLUMN;
 
-/// Ivf Transformer
+/// PartitionTransformer
 ///
-/// It transforms a Vector column, specified by the input data, into a column of partition IDs.
+/// It computes the partition ID for each row from the input batch,
+/// and adds the partition ID as a new column to the batch,
+/// and adds the loss as a metadata to the batch.
 ///
 /// If the partition ID ("__ivf_part_id") column is already present in the Batch,
 /// this transform is a Noop.
@@ -57,6 +61,7 @@ impl PartitionTransformer {
     pub(super) fn compute_partitions(&self, data: &FixedSizeListArray) -> UInt32Array {
         compute_partitions_arrow_array(&self.centroids, data, self.distance_type)
             .expect("failed to compute partitions")
+            .0
             .into()
     }
 }
@@ -67,30 +72,36 @@ impl Transformer for PartitionTransformer {
             // If the partition ID column is already present, we don't need to compute it again.
             return Ok(batch.clone());
         }
+
         let arr =
             batch
                 .column_by_name(&self.input_column)
                 .ok_or_else(|| lance_core::Error::Index {
                     message: format!(
-                        "IvfTransformer: column {} not found in the RecordBatch",
+                        "PartitionTransformer: column {} not found in the RecordBatch",
                         self.input_column
                     ),
                     location: location!(),
                 })?;
+
         let fsl = arr
             .as_fixed_size_list_opt()
             .ok_or_else(|| lance_core::Error::Index {
                 message: format!(
-                    "IvfTransformer: column {} is not a FixedSizeListArray: {}",
+                    "PartitionTransformer: column {} is not a FixedSizeListArray: {}",
                     self.input_column,
                     arr.data_type(),
                 ),
                 location: location!(),
             })?;
 
-        let part_ids = self.compute_partitions(fsl);
+        let (part_ids, loss) =
+            compute_partitions_arrow_array(&self.centroids, fsl, self.distance_type)?;
+        let part_ids = UInt32Array::from(part_ids);
         let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true);
-        Ok(batch.try_with_column(field, Arc::new(part_ids))?)
+        Ok(batch
+            .try_with_column(field, Arc::new(part_ids))?
+            .add_metadata(LOSS_METADATA_KEY.to_owned(), loss.to_string())?)
     }
 }
 
@@ -121,6 +132,8 @@ impl PartitionFilter {
                     None
                 }
             })
+            // in most cases, no partition will be filtered out.
+            .exact_size(partition_ids.len())
             .collect()
     }
 }

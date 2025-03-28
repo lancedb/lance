@@ -3,13 +3,13 @@
 
 use std::ops::Range;
 
-use arrow::compute::concat_batches;
+use arrow::{compute::concat_batches, datatypes::Float16Type};
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type, UInt8Type},
     ArrayRef, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
@@ -19,7 +19,7 @@ use lance_linalg::distance::{dot_distance, l2_distance_uint_scalar, DistanceType
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
@@ -32,7 +32,7 @@ use crate::{
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
 };
 
-use super::{scale_to_u8, ScalarQuantizer};
+use super::{inverse_scalar_dist, scale_to_u8, ScalarQuantizer};
 
 pub const SQ_METADATA_KEY: &str = "lance:sq";
 
@@ -357,7 +357,7 @@ impl VectorStore for ScalarQuantizationStorage {
     /// Using dist calculator can be more efficient as it can pre-compute some
     /// values.
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
-        SQDistCalculator::new(query, self, self.quantizer.bounds.clone())
+        SQDistCalculator::new(query, self, self.quantizer.bounds())
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
@@ -365,48 +365,77 @@ impl VectorStore for ScalarQuantizationStorage {
         let query_sq_code = chunk.sq_code_slice(id - offset).to_vec();
         SQDistCalculator {
             query_sq_code,
+            bounds: self.quantizer.bounds(),
             storage: self,
-        }
-    }
-
-    fn distance_between(&self, a: u32, b: u32) -> f32 {
-        let (offset_a, chunk_a) = self.chunk(a);
-        let (offset_b, chunk_b) = self.chunk(b);
-        let a_slice = chunk_a.sq_code_slice(a - offset_a);
-        let b_slice = chunk_b.sq_code_slice(b - offset_b);
-        match self.distance_type {
-            DistanceType::L2 | DistanceType::Cosine => l2_distance_uint_scalar(a_slice, b_slice),
-            DistanceType::Dot => dot_distance(a_slice, b_slice),
-            _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
         }
     }
 }
 
 pub struct SQDistCalculator<'a> {
     query_sq_code: Vec<u8>,
+    bounds: Range<f64>,
     storage: &'a ScalarQuantizationStorage,
 }
 
 impl<'a> SQDistCalculator<'a> {
     fn new(query: ArrayRef, storage: &'a ScalarQuantizationStorage, bounds: Range<f64>) -> Self {
-        let query_sq_code =
-            scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), bounds);
+        // This is okay-ish to use hand-rolled dynamic dispatch here
+        // since we search 10s-100s of partitions, we can afford the overhead
+        // this could be annoying at indexing time for HNSW, which requires constructing the
+        // dist calculator frequently. However, HNSW isn't first-class citizen in Lance yet. so be it.
+        let query_sq_code = match query.data_type() {
+            DataType::Float16 => {
+                scale_to_u8::<Float16Type>(query.as_primitive::<Float16Type>().values(), &bounds)
+            }
+            DataType::Float32 => {
+                scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), &bounds)
+            }
+            _ => {
+                panic!("Unsupported data type for ScalarQuantizationStorage");
+            }
+        };
         Self {
             query_sq_code,
+            bounds,
             storage,
         }
     }
 }
 
-impl<'a> DistCalculator for SQDistCalculator<'a> {
+impl DistCalculator for SQDistCalculator<'_> {
     fn distance(&self, id: u32) -> f32 {
         let (offset, chunk) = self.storage.chunk(id);
         let sq_code = chunk.sq_code_slice(id - offset);
-        match self.storage.distance_type {
+        let dist = match self.storage.distance_type {
             DistanceType::L2 | DistanceType::Cosine => {
                 l2_distance_uint_scalar(sq_code, &self.query_sq_code)
             }
             DistanceType::Dot => dot_distance(sq_code, &self.query_sq_code),
+            _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
+        };
+        inverse_scalar_dist(std::iter::once(dist), &self.bounds)[0]
+    }
+
+    fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
+        match self.storage.distance_type {
+            DistanceType::L2 | DistanceType::Cosine => inverse_scalar_dist(
+                self.storage.chunks.iter().flat_map(|c| {
+                    c.sq_codes
+                        .values()
+                        .chunks_exact(c.dim())
+                        .map(|sq_codes| l2_distance_uint_scalar(sq_codes, &self.query_sq_code))
+                }),
+                &self.bounds,
+            ),
+            DistanceType::Dot => inverse_scalar_dist(
+                self.storage.chunks.iter().flat_map(|c| {
+                    c.sq_codes
+                        .values()
+                        .chunks_exact(c.dim())
+                        .map(|sq_codes| dot_distance(sq_codes, &self.query_sq_code))
+                }),
+                &self.bounds,
+            ),
             _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
         }
     }

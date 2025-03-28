@@ -6,9 +6,10 @@ use std::{collections::BTreeMap, ops::Range, pin::Pin, sync::Arc};
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index;
 use crate::{Error, Result};
-use arrow::{array::as_struct_array, compute::concat_batches, datatypes::UInt64Type};
+use arrow::{compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::cast::AsArray;
-use arrow_array::{RecordBatch, StructArray, UInt64Array};
+use arrow_array::{Array, RecordBatch, StructArray, UInt64Array};
+use arrow_buffer::{ArrowNativeType, BooleanBuffer, Buffer, NullBuffer};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -16,9 +17,10 @@ use futures::{Future, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::deletion::OffsetMapper;
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
-use snafu::{location, Location};
+use snafu::location;
 
 use super::ProjectionRequest;
 use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
@@ -45,29 +47,45 @@ pub async fn take(
     let mut frag_iter = fragments.iter();
     let mut cur_frag = frag_iter.next();
     let mut cur_frag_rows = if let Some(cur_frag) = cur_frag {
-        cur_frag.count_rows().await? as u64
+        cur_frag.count_rows(None).await? as u64
     } else {
         0
     };
+    let mut offset_mapper = if let Some(cur_frag) = cur_frag {
+        let deletion_vector = cur_frag.get_deletion_vector().await?;
+        deletion_vector.map(OffsetMapper::new)
+    } else {
+        None
+    };
     let mut frag_offset = 0;
 
-    let mut addrs = Vec::with_capacity(sorted_offsets.len());
+    let mut addrs: Vec<u64> = Vec::with_capacity(sorted_offsets.len());
     for sorted_offset in sorted_offsets.into_iter() {
         while cur_frag.is_some() && sorted_offset >= frag_offset + cur_frag_rows {
             frag_offset += cur_frag_rows;
             cur_frag = frag_iter.next();
             cur_frag_rows = if let Some(cur_frag) = cur_frag {
-                cur_frag.count_rows().await? as u64
+                cur_frag.count_rows(None).await? as u64
             } else {
                 0
+            };
+            offset_mapper = if let Some(cur_frag) = cur_frag {
+                let deletion_vector = cur_frag.get_deletion_vector().await?;
+                deletion_vector.map(OffsetMapper::new)
+            } else {
+                None
             };
         }
         let Some(cur_frag) = cur_frag else {
             addrs.push(RowAddress::TOMBSTONE_ROW);
             continue;
         };
-        let row_addr =
-            RowAddress::new_from_parts(cur_frag.id() as u32, (sorted_offset - frag_offset) as u32);
+
+        let mut local_offset = (sorted_offset - frag_offset) as u32;
+        if let Some(offset_mapper) = &mut offset_mapper {
+            local_offset = offset_mapper.map_offset(local_offset);
+        };
+        let row_addr = RowAddress::new_from_parts(cur_frag.id() as u32, local_offset);
         addrs.push(u64::from(row_addr));
     }
 
@@ -132,7 +150,7 @@ async fn do_take_rows(
         })?;
 
         let reader = fragment
-            .open(&projection.physical_schema, FragReadConfig::default(), None)
+            .open(&projection.physical_schema, FragReadConfig::default())
             .await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_addr_stats.sorted {
@@ -266,9 +284,13 @@ async fn do_take_rows(
         // Remove the rowaddr column.
         let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
         let one_batch = one_batch.project(&keep_indices)?;
+
+        // There's a bug in arrow_select::take::take, that it doesn't handle empty struct correctly,
+        // so we need to handle it manually here.
+        // TODO: remove this once the bug is fixed.
         let struct_arr: StructArray = one_batch.into();
-        let reordered = arrow_select::take::take(&struct_arr, &remapping_index, None)?;
-        Ok(as_struct_array(&reordered).into())
+        let reordered = take_struct_array(&struct_arr, &remapping_index)?;
+        Ok(reordered.into())
     }?;
 
     let batch = projection.project_batch(batch).await?;
@@ -536,6 +558,42 @@ impl TakeBuilder {
     }
 }
 
+fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<StructArray> {
+    let nulls = array.nulls().map(|nulls| {
+        let is_valid = indices.iter().map(|index| {
+            if let Some(index) = index {
+                nulls.is_valid(index.to_usize().unwrap())
+            } else {
+                false
+            }
+        });
+        NullBuffer::new(BooleanBuffer::new(
+            Buffer::from_iter(is_valid),
+            0,
+            indices.len(),
+        ))
+    });
+
+    if array.fields().is_empty() {
+        return Ok(StructArray::new_empty_fields(indices.len(), nulls));
+    }
+
+    let arrays = array
+        .columns()
+        .iter()
+        .map(|array| {
+            let array = match array.data_type() {
+                arrow::datatypes::DataType::Struct(_) => {
+                    Arc::new(take_struct_array(array.as_struct(), indices)?)
+                }
+                _ => arrow_select::take::take(array, indices, None)?,
+            };
+            Ok(array)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(StructArray::new(array.fields().clone(), arrays, nulls))
+}
+
 #[cfg(test)]
 mod test {
     use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
@@ -616,6 +674,55 @@ mod test {
                     ])),
                     Arc::new(StringArray::from_iter_values(
                         [200, 199, 39, 40, 199, 40, 125]
+                            .iter()
+                            .map(|v| format!("str-{v}"))
+                    )),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_with_deletion() {
+        let data = test_batch(0..120);
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        dataset.delete("i in (40, 77, 78, 79)").await.unwrap();
+
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        let values = dataset
+            .take(
+                &[
+                    0,   // 0
+                    39,  // 39
+                    40,  // 41
+                    75,  // 76
+                    76,  // 80
+                    77,  // 81
+                    115, // 119
+                ],
+                projection,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            RecordBatch::try_new(
+                data.schema(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values([0, 39, 41, 76, 80, 81, 119])),
+                    Arc::new(StringArray::from_iter_values(
+                        [0, 39, 41, 76, 80, 81, 119]
                             .iter()
                             .map(|v| format!("str-{v}"))
                     )),

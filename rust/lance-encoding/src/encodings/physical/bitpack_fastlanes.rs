@@ -12,14 +12,14 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
 use log::trace;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
 use crate::compression_algo::fastlanes::BitPacking;
-use crate::data::{BlockInfo, UsedEncoding};
+use crate::data::BlockInfo;
 use crate::data::{DataBlock, FixedWidthDataBlock, NullableDataBlock};
 use crate::decoder::{MiniBlockDecompressor, PageScheduler, PrimitivePageDecoder};
 use crate::encoder::{
@@ -204,7 +204,7 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
 // It outputs an fastlanes bitpacked EncodedArray
 macro_rules! encode_fixed_width {
     ($self:expr, $unpacked:expr, $data_type:ty, $buffer_index:expr) => {{
-        let num_chunks = ($unpacked.num_values + ELEMS_PER_CHUNK - 1) / ELEMS_PER_CHUNK;
+        let num_chunks = $unpacked.num_values.div_ceil(ELEMS_PER_CHUNK);
         let num_full_chunks = $unpacked.num_values / ELEMS_PER_CHUNK;
         let uncompressed_bit_width = std::mem::size_of::<$data_type>() as u64 * 8;
 
@@ -262,7 +262,6 @@ macro_rules! encode_fixed_width {
             data: LanceBuffer::reinterpret_vec(output),
             num_values: $unpacked.num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         });
 
         Result::Ok(EncodedArray {
@@ -341,7 +340,6 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                     data: Box::new(encoded_values.data),
                     nulls: nullable.nulls,
                     block_info: BlockInfo::new(),
-                    used_encoding: UsedEncoding::new(),
                 });
                 Ok(EncodedArray {
                     data: encoded,
@@ -486,7 +484,6 @@ impl PrimitivePageDecoder for BitpackedForNonNegPageDecoder {
             bits_per_value: self.uncompressed_bits_per_value,
             num_values: num_rows,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         }))
     }
 }
@@ -1576,9 +1573,7 @@ macro_rules! chunk_data_impl {
         let data_buffer = $data.data.borrow_to_typed_slice::<$data_type>();
         let data_buffer = data_buffer.as_ref();
 
-        let bit_widths = $data
-            .get_stat(Stat::BitWidth)
-            .expect("FixedWidthDataBlock should have valid bit width statistics");
+        let bit_widths = $data.expect_stat(Stat::BitWidth);
         let bit_widths_array = bit_widths
             .as_any()
             .downcast_ref::<PrimitiveArray<UInt64Type>>()
@@ -1746,7 +1741,6 @@ impl MiniBlockDecompressor for BitpackMiniBlockDecompressor {
                     bits_per_value: uncompressed_bit_width as u64,
                     num_values,
                     block_info: BlockInfo::new(),
-                    used_encoding: UsedEncoding::new(),
                 }))
             }};
         }

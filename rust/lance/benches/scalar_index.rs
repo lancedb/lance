@@ -15,11 +15,12 @@ use lance::{io::ObjectStore, Dataset};
 use lance_core::{cache::FileMetadataCache, Result};
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{array, gen, BatchCount, RowCount};
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::{
-    btree::{train_btree_index, BTreeIndex, TrainingSource},
+    btree::{train_btree_index, BTreeIndex, TrainingSource, DEFAULT_BTREE_BATCH_SIZE},
     flat::FlatIndexMetadata,
     lance_format::LanceIndexStore,
-    IndexStore, SargableQuery, ScalarIndex,
+    IndexStore, SargableQuery, ScalarIndex, SearchResult,
 };
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -60,7 +61,6 @@ impl TrainingSource for BenchmarkDataSource {
 }
 
 impl BenchmarkFixture {
-    #[allow(dead_code)]
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.path();
         let (object_store, test_path) =
@@ -70,16 +70,6 @@ impl BenchmarkFixture {
             test_path,
             FileMetadataCache::no_cache(),
         ))
-    }
-
-    fn legacy_test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
-        let test_path = tempdir.path();
-        let (object_store, test_path) =
-            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(
-            LanceIndexStore::new(object_store, test_path, FileMetadataCache::no_cache())
-                .with_legacy_format(true),
-        )
     }
 
     async fn write_baseline_data(tempdir: &TempDir) -> Arc<Dataset> {
@@ -98,6 +88,7 @@ impl BenchmarkFixture {
             Box::new(BenchmarkDataSource {}),
             &sub_index_trainer,
             index_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE as u32,
         )
         .await
         .unwrap();
@@ -105,7 +96,7 @@ impl BenchmarkFixture {
 
     async fn open() -> Self {
         let tempdir = tempfile::tempdir().unwrap();
-        let index_store = Self::legacy_test_store(&tempdir);
+        let index_store = Self::test_store(&tempdir);
         let baseline_dataset = Self::write_baseline_data(&tempdir).await;
         Self::train_scalar_index(&index_store).await;
 
@@ -135,10 +126,16 @@ async fn baseline_equality_search(fixture: &BenchmarkFixture) {
 }
 
 async fn warm_indexed_equality_search(index: &BTreeIndex) {
-    let row_ids = index
-        .search(&SargableQuery::Equals(ScalarValue::UInt32(Some(10000))))
+    let result = index
+        .search(
+            &SargableQuery::Equals(ScalarValue::UInt32(Some(10000))),
+            &NoOpMetricsCollector,
+        )
         .await
         .unwrap();
+    let SearchResult::Exact(row_ids) = result else {
+        panic!("Expected exact results")
+    };
     assert_eq!(row_ids.len(), Some(1));
 }
 
@@ -161,27 +158,41 @@ async fn baseline_inequality_search(fixture: &BenchmarkFixture) {
 }
 
 async fn warm_indexed_inequality_search(index: &BTreeIndex) {
-    let row_ids = index
-        .search(&SargableQuery::Range(
-            std::ops::Bound::Included(ScalarValue::UInt32(Some(50_000_000))),
-            std::ops::Bound::Unbounded,
-        ))
+    let result = index
+        .search(
+            &SargableQuery::Range(
+                std::ops::Bound::Included(ScalarValue::UInt32(Some(50_000_000))),
+                std::ops::Bound::Unbounded,
+            ),
+            &NoOpMetricsCollector,
+        )
         .await
         .unwrap();
+    let SearchResult::Exact(row_ids) = result else {
+        panic!("Expected exact results")
+    };
+
     // 100Mi - 50M = 54,857,600
     assert_eq!(row_ids.len(), Some(54857600));
 }
 
 async fn warm_indexed_isin_search(index: &BTreeIndex) {
-    let row_ids = index
-        .search(&SargableQuery::IsIn(vec![
-            ScalarValue::UInt32(Some(10000)),
-            ScalarValue::UInt32(Some(50000000)),
-            ScalarValue::UInt32(Some(150000000)), // Not found
-            ScalarValue::UInt32(Some(287123)),
-        ]))
+    let result = index
+        .search(
+            &SargableQuery::IsIn(vec![
+                ScalarValue::UInt32(Some(10000)),
+                ScalarValue::UInt32(Some(50000000)),
+                ScalarValue::UInt32(Some(150000000)), // Not found
+                ScalarValue::UInt32(Some(287123)),
+            ]),
+            &NoOpMetricsCollector,
+        )
         .await
         .unwrap();
+    let SearchResult::Exact(row_ids) = result else {
+        panic!("Expected exact results")
+    };
+
     // Only 3 because 150M is not in dataset
     assert_eq!(row_ids.len(), Some(3));
 }

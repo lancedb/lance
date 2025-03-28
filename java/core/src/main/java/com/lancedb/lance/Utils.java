@@ -11,22 +11,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance;
 
-import java.util.Arrays;
-import java.util.List;
-import java.util.Optional;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
 
 /** Utility. */
 public class Utils {
 
   /**
    * Convert schema to ArrowSchema for JNI processing.
+   *
    * @param schema schema
    * @param allocator buffer allocator
    * @return ArrowSchema
@@ -39,7 +40,8 @@ public class Utils {
 
   /**
    * Convert optional array to optional list for JNI processing.
-   * @param optionalArray  Optional array
+   *
+   * @param optionalArray Optional array
    * @return Optional list
    */
   public static Optional<List<String>> convert(Optional<String[]> optionalArray) {

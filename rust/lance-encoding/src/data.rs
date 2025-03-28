@@ -15,7 +15,6 @@
 //! and decoders easier (since they can rely on a normalized representation)
 
 use std::{
-    collections::HashSet,
     ops::Range,
     sync::{Arc, RwLock},
 };
@@ -24,8 +23,9 @@ use arrow::array::{ArrayData, ArrayDataBuilder, AsArray};
 use arrow_array::{new_empty_array, new_null_array, Array, ArrayRef, UInt64Array};
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
 use arrow_schema::DataType;
+use bytemuck::try_cast_slice;
 use lance_arrow::DataTypeExt;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::{Error, Result};
 
@@ -34,17 +34,6 @@ use crate::{
     statistics::{ComputeStat, Stat},
 };
 
-/// `Encoding` enum serves as a encoding registration center.
-///
-/// All the encodings added to Lance should register here, and
-/// these encodings can be dynamically selected during encoding,
-/// users can also specify the particular encoding they want to use in the field metadata.
-#[derive(Eq, Hash, PartialEq, Debug)]
-pub enum Encoding {
-    Bitpack,
-    Fsst,
-    FixedSizeBinary,
-}
 /// A data block with no buffers where everything is null
 ///
 /// Note: this data block should not be used for future work.  It will be deprecated
@@ -104,29 +93,6 @@ impl PartialEq for BlockInfo {
         *self_info == *other_info
     }
 }
-// `UsedEncoding` is used to record the encodings that has applied to a `DataBlock`
-#[derive(Debug, Clone)]
-pub struct UsedEncoding(Arc<RwLock<HashSet<Encoding>>>);
-
-impl Default for UsedEncoding {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl UsedEncoding {
-    pub fn new() -> Self {
-        Self(Arc::new(RwLock::new(HashSet::new())))
-    }
-}
-
-impl PartialEq for UsedEncoding {
-    fn eq(&self, other: &Self) -> bool {
-        let self_used = self.0.read().unwrap();
-        let other_used = other.0.read().unwrap();
-        *self_used == *other_used
-    }
-}
 
 /// Wraps a data block and adds nullability information to it
 ///
@@ -141,8 +107,6 @@ pub struct NullableDataBlock {
     pub nulls: LanceBuffer,
 
     pub block_info: BlockInfo,
-
-    pub used_encoding: UsedEncoding,
 }
 
 impl NullableDataBlock {
@@ -168,7 +132,6 @@ impl NullableDataBlock {
             data: Box::new(self.data.borrow_and_clone()),
             nulls: self.nulls.borrow_and_clone(),
             block_info: self.block_info.clone(),
-            used_encoding: self.used_encoding.clone(),
         }
     }
 
@@ -177,7 +140,6 @@ impl NullableDataBlock {
             data: Box::new(self.data.try_clone()?),
             nulls: self.nulls.try_clone()?,
             block_info: self.block_info.clone(),
-            used_encoding: self.used_encoding.clone(),
         })
     }
 
@@ -236,8 +198,6 @@ pub struct FixedWidthDataBlock {
     pub num_values: u64,
 
     pub block_info: BlockInfo,
-
-    pub used_encoding: UsedEncoding,
 }
 
 impl FixedWidthDataBlock {
@@ -274,7 +234,6 @@ impl FixedWidthDataBlock {
             bits_per_value: self.bits_per_value,
             num_values: self.num_values,
             block_info: self.block_info.clone(),
-            used_encoding: self.used_encoding.clone(),
         }
     }
 
@@ -284,7 +243,6 @@ impl FixedWidthDataBlock {
             bits_per_value: self.bits_per_value,
             num_values: self.num_values,
             block_info: self.block_info.clone(),
-            used_encoding: self.used_encoding.clone(),
         })
     }
 
@@ -293,6 +251,7 @@ impl FixedWidthDataBlock {
     }
 }
 
+#[derive(Debug)]
 pub struct VariableWidthDataBlockBuilder {
     offsets: Vec<u32>,
     bytes: Vec<u8>,
@@ -308,12 +267,12 @@ impl VariableWidthDataBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
-    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
-        let block = data_block.as_variable_width_mut_ref().unwrap();
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+        let block = data_block.as_variable_width_ref().unwrap();
         assert!(block.bits_per_offset == 32);
 
-        let offsets = block.offsets.borrow_to_typed_slice::<u32>();
-        let offsets = offsets.as_ref();
+        let offsets: &[u32] = try_cast_slice(&block.offsets)
+            .expect("cast from a bits_per_offset=32 `VariableWidthDataBlock's offsets field field to &[32] should be fine.");
 
         let start_offset = offsets[selection.start as usize];
         let end_offset = offsets[selection.end as usize];
@@ -342,12 +301,12 @@ impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
             bits_per_offset: 32,
             num_values,
             block_info: BlockInfo::new(),
-            used_encodings: UsedEncoding::new(),
         })
     }
 }
 
-pub struct FixedWidthDataBlockBuilder {
+#[derive(Debug)]
+struct FixedWidthDataBlockBuilder {
     bits_per_value: u64,
     bytes_per_value: u64,
     values: Vec<u8>,
@@ -365,7 +324,7 @@ impl FixedWidthDataBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
-    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
         let block = data_block.as_fixed_width_ref().unwrap();
         assert_eq!(self.bits_per_value, block.bits_per_value);
         let start = selection.start as usize * self.bytes_per_value as usize;
@@ -380,11 +339,57 @@ impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
             bits_per_value: self.bits_per_value,
             num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         })
     }
 }
 
+#[derive(Debug)]
+struct StructDataBlockBuilder {
+    children: Vec<Box<dyn DataBlockBuilderImpl>>,
+}
+
+impl StructDataBlockBuilder {
+    // Currently only Struct with fixed-width fields are supported.
+    // And the assumption that all fields have `bits_per_value % 8 == 0` is made here.
+    fn new(bits_per_values: Vec<u32>, estimated_size_bytes: u64) -> Self {
+        let mut children = vec![];
+
+        debug_assert!(bits_per_values.iter().all(|bpv| bpv % 8 == 0));
+
+        let bytes_per_row: u32 = bits_per_values.iter().sum::<u32>() / 8;
+        let bytes_per_row = bytes_per_row as u64;
+
+        for bits_per_value in bits_per_values.iter() {
+            let this_estimated_size_bytes =
+                estimated_size_bytes / bytes_per_row * (*bits_per_value as u64) / 8;
+            let child =
+                FixedWidthDataBlockBuilder::new(*bits_per_value as u64, this_estimated_size_bytes);
+            children.push(Box::new(child) as Box<dyn DataBlockBuilderImpl>);
+        }
+        Self { children }
+    }
+}
+
+impl DataBlockBuilderImpl for StructDataBlockBuilder {
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+        let data_block = data_block.as_struct_ref().unwrap();
+        for i in 0..self.children.len() {
+            self.children[i].append(&data_block.children[i], selection.clone());
+        }
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        let mut children_data_block = Vec::new();
+        for child in self.children {
+            let child_data_block = child.finish();
+            children_data_block.push(child_data_block);
+        }
+        DataBlock::Struct(StructDataBlock {
+            children: children_data_block,
+            block_info: BlockInfo::new(),
+        })
+    }
+}
 /// A data block to represent a fixed size list
 #[derive(Debug)]
 pub struct FixedSizeListBlock {
@@ -445,6 +450,14 @@ impl FixedSizeListBlock {
         }
     }
 
+    pub fn flatten_as_fixed(&mut self) -> FixedWidthDataBlock {
+        match self.child.as_mut() {
+            DataBlock::FixedSizeList(fsl) => fsl.flatten_as_fixed(),
+            DataBlock::FixedWidth(fw) => fw.borrow_and_clone(),
+            _ => panic!("Expected FixedSizeList or FixedWidth data block"),
+        }
+    }
+
     /// Convert a flattened values block into a FixedSizeListBlock
     pub fn from_flat(data: FixedWidthDataBlock, data_type: &DataType) -> DataBlock {
         match data_type {
@@ -493,6 +506,34 @@ impl FixedSizeListBlock {
     }
 }
 
+#[derive(Debug)]
+struct FixedSizeListBlockBuilder {
+    inner: Box<dyn DataBlockBuilderImpl>,
+    dimension: u64,
+}
+
+impl FixedSizeListBlockBuilder {
+    fn new(inner: Box<dyn DataBlockBuilderImpl>, dimension: u64) -> Self {
+        Self { inner, dimension }
+    }
+}
+
+impl DataBlockBuilderImpl for FixedSizeListBlockBuilder {
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+        let selection = selection.start * self.dimension..selection.end * self.dimension;
+        let fsl = data_block.as_fixed_size_list_ref().unwrap();
+        self.inner.append(fsl.child.as_ref(), selection);
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        let inner_block = self.inner.finish();
+        DataBlock::FixedSizeList(FixedSizeListBlock {
+            child: Box::new(inner_block),
+            dimension: self.dimension,
+        })
+    }
+}
+
 /// A data block with no regular structure.  There is no available spot to attach
 /// validity / repdef information and it cannot be converted to Arrow without being
 /// decoded
@@ -501,7 +542,6 @@ pub struct OpaqueBlock {
     pub buffers: Vec<LanceBuffer>,
     pub num_values: u64,
     pub block_info: BlockInfo,
-    pub used_encoding: UsedEncoding,
 }
 
 impl OpaqueBlock {
@@ -514,7 +554,6 @@ impl OpaqueBlock {
                 .collect(),
             num_values: self.num_values,
             block_info: self.block_info.clone(),
-            used_encoding: self.used_encoding.clone(),
         }
     }
 
@@ -527,7 +566,6 @@ impl OpaqueBlock {
                 .collect::<Result<_>>()?,
             num_values: self.num_values,
             block_info: self.block_info.clone(),
-            used_encoding: self.used_encoding.clone(),
         })
     }
 
@@ -551,8 +589,6 @@ pub struct VariableWidthBlock {
     pub num_values: u64,
 
     pub block_info: BlockInfo,
-
-    pub used_encodings: UsedEncoding,
 }
 
 impl VariableWidthBlock {
@@ -582,7 +618,6 @@ impl VariableWidthBlock {
             bits_per_offset: self.bits_per_offset,
             num_values: self.num_values,
             block_info: self.block_info.clone(),
-            used_encodings: self.used_encodings.clone(),
         }
     }
 
@@ -593,7 +628,16 @@ impl VariableWidthBlock {
             bits_per_offset: self.bits_per_offset,
             num_values: self.num_values,
             block_info: self.block_info.clone(),
-            used_encodings: self.used_encodings.clone(),
+        })
+    }
+
+    pub fn offsets_as_block(&mut self) -> DataBlock {
+        let offsets = self.offsets.borrow_and_clone();
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: offsets,
+            bits_per_value: self.bits_per_offset as u64,
+            num_values: self.num_values + 1,
+            block_info: BlockInfo::new(),
         })
     }
 
@@ -607,6 +651,7 @@ impl VariableWidthBlock {
 pub struct StructDataBlock {
     /// The child arrays
     pub children: Vec<DataBlock>,
+    pub block_info: BlockInfo,
 }
 
 impl StructDataBlock {
@@ -640,6 +685,7 @@ impl StructDataBlock {
                 .into_iter()
                 .map(|c| c.remove_validity())
                 .collect(),
+            block_info: self.block_info,
         }
     }
 
@@ -657,6 +703,7 @@ impl StructDataBlock {
                 .iter_mut()
                 .map(|c| c.borrow_and_clone())
                 .collect(),
+            block_info: self.block_info.clone(),
         }
     }
 
@@ -667,7 +714,15 @@ impl StructDataBlock {
                 .iter()
                 .map(|c| c.try_clone())
                 .collect::<Result<_>>()?,
+            block_info: self.block_info.clone(),
         })
+    }
+
+    pub fn data_size(&self) -> u64 {
+        self.children
+            .iter()
+            .map(|data_block| data_block.data_size())
+            .sum()
     }
 }
 
@@ -847,6 +902,27 @@ impl DataBlock {
         }
     }
 
+    pub fn is_variable(&self) -> bool {
+        match self {
+            Self::Constant(_) => false,
+            Self::Empty() => false,
+            Self::AllNull(_) => false,
+            Self::Nullable(nullable) => nullable.data.is_variable(),
+            Self::FixedWidth(_) => false,
+            Self::FixedSizeList(fsl) => fsl.child.is_variable(),
+            Self::VariableWidth(_) => true,
+            Self::Struct(strct) => strct.children.iter().any(|c| c.is_variable()),
+            Self::Dictionary(_) => {
+                todo!("is_variable for DictionaryDataBlock is not implemented yet")
+            }
+            Self::Opaque(_) => panic!("Does not make sense to ask if an Opaque block is variable"),
+        }
+    }
+
+    /// The number of values in the block
+    ///
+    /// This function does not recurse into child blocks.  If this is a FSL then it will
+    /// be the number of lists and not the number of items.
     pub fn num_values(&self) -> u64 {
         match self {
             Self::Empty() => 0,
@@ -862,6 +938,25 @@ impl DataBlock {
         }
     }
 
+    /// The number of items in a single row
+    ///
+    /// This is always 1 unless there are layers of FSL
+    pub fn items_per_row(&self) -> u64 {
+        match self {
+            Self::Empty() => todo!(),     // Leave undefined until needed
+            Self::Constant(_) => todo!(), // Leave undefined until needed
+            Self::AllNull(_) => todo!(),  // Leave undefined until needed
+            Self::Nullable(nullable) => nullable.data.items_per_row(),
+            Self::FixedWidth(_) => 1,
+            Self::FixedSizeList(fsl) => fsl.dimension * fsl.child.items_per_row(),
+            Self::VariableWidth(_) => 1,
+            Self::Struct(_) => todo!(), // Leave undefined until needed
+            Self::Dictionary(_) => 1,
+            Self::Opaque(_) => 1,
+        }
+    }
+
+    /// The number of bytes in the data block (including any child blocks)
     pub fn data_size(&self) -> u64 {
         match self {
             Self::Empty() => 0,
@@ -891,13 +986,21 @@ impl DataBlock {
             Self::Empty() => Self::Empty(),
             Self::Constant(inner) => Self::Constant(inner),
             Self::AllNull(_) => panic!("Cannot remove validity on all-null data"),
-            Self::Nullable(inner) => *inner.data,
+            Self::Nullable(inner) => inner.data.remove_validity(),
             Self::FixedWidth(inner) => Self::FixedWidth(inner),
             Self::FixedSizeList(inner) => Self::FixedSizeList(inner.remove_validity()),
             Self::VariableWidth(inner) => Self::VariableWidth(inner),
             Self::Struct(inner) => Self::Struct(inner.remove_validity()),
             Self::Dictionary(inner) => Self::FixedWidth(inner.indices),
             Self::Opaque(inner) => Self::Opaque(inner),
+        }
+    }
+
+    pub fn flatten(self) -> Self {
+        if let Self::FixedSizeList(fsl) = self {
+            fsl.child.flatten()
+        } else {
+            self
         }
     }
 
@@ -913,6 +1016,25 @@ impl DataBlock {
                 } else {
                     todo!()
                 }
+            }
+            Self::FixedSizeList(inner) => {
+                let inner_builder = inner.child.make_builder(estimated_size_bytes);
+                Box::new(FixedSizeListBlockBuilder::new(
+                    inner_builder,
+                    inner.dimension,
+                ))
+            }
+            Self::Struct(struct_data_block) => {
+                let mut bits_per_values = vec![];
+                for child in struct_data_block.children.iter() {
+                    let child = child.as_fixed_width_ref().
+                        expect("Currently StructDataBlockBuilder is only used in packed-struct encoding, and currently in packed-struct encoding, only fixed-width fields are supported.");
+                    bits_per_values.push(child.bits_per_value as u32);
+                }
+                Box::new(StructDataBlockBuilder::new(
+                    bits_per_values,
+                    estimated_size_bytes,
+                ))
             }
             _ => todo!(),
         }
@@ -968,17 +1090,17 @@ impl DataBlock {
     as_type_ref!(as_variable_width_ref, VariableWidth, VariableWidthBlock);
     as_type_ref!(as_struct_ref, Struct, StructDataBlock);
     as_type_ref!(as_dictionary_ref, Dictionary, DictionaryDataBlock);
-    as_type_ref_mut!(as_all_null_mut_ref, AllNull, AllNullDataBlock);
-    as_type_ref_mut!(as_nullable_mut_ref, Nullable, NullableDataBlock);
-    as_type_ref_mut!(as_fixed_width_mut_ref, FixedWidth, FixedWidthDataBlock);
+    as_type_ref_mut!(as_all_null_ref_mut, AllNull, AllNullDataBlock);
+    as_type_ref_mut!(as_nullable_ref_mut, Nullable, NullableDataBlock);
+    as_type_ref_mut!(as_fixed_width_ref_mut, FixedWidth, FixedWidthDataBlock);
     as_type_ref_mut!(
-        as_fixed_size_list_mut_ref,
+        as_fixed_size_list_ref_mut,
         FixedSizeList,
         FixedSizeListBlock
     );
-    as_type_ref_mut!(as_variable_width_mut_ref, VariableWidth, VariableWidthBlock);
-    as_type_ref_mut!(as_struct_mut_ref, Struct, StructDataBlock);
-    as_type_ref_mut!(as_dictionary_mut_ref, Dictionary, DictionaryDataBlock);
+    as_type_ref_mut!(as_variable_width_ref_mut, VariableWidth, VariableWidthBlock);
+    as_type_ref_mut!(as_struct_ref_mut, Struct, StructDataBlock);
+    as_type_ref_mut!(as_dictionary_ref_mut, Dictionary, DictionaryDataBlock);
 }
 
 // Methods to convert from Arrow -> DataBlock
@@ -1075,7 +1197,6 @@ fn arrow_binary_to_data_block(
         bits_per_offset,
         num_values,
         block_info: BlockInfo::new(),
-        used_encodings: UsedEncoding::new(),
     })
 }
 
@@ -1241,7 +1362,6 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
             bits_per_value: bits_per_index,
             num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         }
     } else {
         FixedWidthDataBlock {
@@ -1249,7 +1369,6 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
             bits_per_value: indices.data_type().byte_width() as u64 * 8,
             num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         }
     };
 
@@ -1333,7 +1452,6 @@ impl DataBlock {
                     bits_per_value: 1,
                     num_values,
                     block_info: BlockInfo::new(),
-                    used_encoding: UsedEncoding::new(),
                 })
             }
             DataType::Date32
@@ -1363,7 +1481,6 @@ impl DataBlock {
                     bits_per_value: data_type.byte_width() as u64 * 8,
                     num_values,
                     block_info: BlockInfo::new(),
-                    used_encoding: UsedEncoding::new(),
                 })
             }
             DataType::Null => Self::AllNull(AllNullDataBlock { num_values }),
@@ -1378,7 +1495,10 @@ impl DataBlock {
                         .collect::<Vec<_>>();
                     children.push(Self::from_arrays(&child_vec, num_values));
                 }
-                Self::Struct(StructDataBlock { children })
+                Self::Struct(StructDataBlock {
+                    children,
+                    block_info: BlockInfo::default(),
+                })
             }
             DataType::FixedSizeList(_, dim) => {
                 let children = arrays
@@ -1415,7 +1535,6 @@ impl DataBlock {
                     data: Box::new(encoded),
                     nulls: LanceBuffer::Borrowed(nulls.into_inner().into_inner()),
                     block_info: BlockInfo::new(),
-                    used_encoding: UsedEncoding::new(),
                 }),
                 _ => unreachable!(),
             }
@@ -1438,11 +1557,12 @@ impl From<ArrayRef> for DataBlock {
     }
 }
 
-pub trait DataBlockBuilderImpl {
-    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>);
+pub trait DataBlockBuilderImpl: std::fmt::Debug {
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>);
     fn finish(self: Box<Self>) -> DataBlock;
 }
 
+#[derive(Debug)]
 pub struct DataBlockBuilder {
     estimated_size_bytes: u64,
     builder: Option<Box<dyn DataBlockBuilderImpl>>,
@@ -1463,7 +1583,7 @@ impl DataBlockBuilder {
         self.builder.as_mut().unwrap().as_mut()
     }
 
-    pub fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+    pub fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
         self.get_builder(data_block).append(data_block, selection);
     }
 
@@ -1480,7 +1600,7 @@ mod tests {
     use arrow::datatypes::{Int32Type, Int8Type};
     use arrow_array::{
         make_array, new_null_array, ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray,
-        StringArray, UInt8Array,
+        StringArray, UInt16Array, UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
 
@@ -1494,6 +1614,26 @@ mod tests {
 
     use arrow::compute::concat;
     use arrow_array::Array;
+
+    #[test]
+    fn test_sliced_to_data_block() {
+        let ints = UInt16Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let ints = ints.slice(2, 4);
+        let data = DataBlock::from_array(ints);
+
+        let fixed_data = data.as_fixed_width().unwrap();
+        assert_eq!(fixed_data.num_values, 4);
+        assert_eq!(fixed_data.data.len(), 8);
+
+        let nullable_ints =
+            UInt16Array::from(vec![Some(0), None, Some(2), None, Some(4), None, Some(6)]);
+        let nullable_ints = nullable_ints.slice(1, 3);
+        let data = DataBlock::from_array(nullable_ints);
+
+        let nullable = data.as_nullable().unwrap();
+        assert_eq!(nullable.nulls, LanceBuffer::Owned(vec![0b00000010]));
+    }
+
     #[test]
     fn test_string_to_data_block() {
         // Converting string arrays that contain nulls to DataBlock

@@ -12,7 +12,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use lance_arrow::*;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder},
@@ -104,7 +104,6 @@ pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize)
 /// Read a Protobuf-backed struct at file position: `pos`.
 // TODO: pub(crate)
 pub async fn read_struct<
-    'm,
     M: Message + Default + 'static,
     T: ProtoStruct<Proto = M> + TryFrom<M, Error = Error>,
 >(
@@ -118,11 +117,7 @@ pub async fn read_struct<
 pub async fn read_last_block(reader: &dyn Reader) -> object_store::Result<Bytes> {
     let file_size = reader.size().await?;
     let block_size = reader.block_size();
-    let begin = if file_size < block_size {
-        0
-    } else {
-        file_size - block_size
-    };
+    let begin = file_size.saturating_sub(block_size);
     reader.get_range(begin..file_size).await
 }
 

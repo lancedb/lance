@@ -17,7 +17,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use half::{bf16, f16};
 use lance_arrow::bfloat16::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
-use prost::Message;
+use prost_old::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -32,6 +32,20 @@ use tfrecord::protobuf::feature::Kind;
 use tfrecord::protobuf::{DataType as TensorDataType, TensorProto};
 use tfrecord::record_reader::RecordStream;
 use tfrecord::{Example, Feature};
+
+trait OldProstResultExt<T> {
+    fn map_prost_err(self, location: Location) -> Result<T>;
+}
+
+impl<T> OldProstResultExt<T> for std::result::Result<T, prost_old::DecodeError> {
+    fn map_prost_err(self, location: Location) -> Result<T> {
+        self.map_err(|err| Error::IO {
+            source: Box::new(err),
+            location,
+        })
+    }
+}
+
 /// Infer the Arrow schema from a TFRecord file.
 ///
 /// The featured named by `tensor_features` will be assumed to be binary fields
@@ -224,7 +238,7 @@ impl FeatureMeta {
     }
 
     fn extract_tensor(data: &[u8]) -> Result<FeatureType> {
-        let tensor_proto = TensorProto::decode(data)?;
+        let tensor_proto = TensorProto::decode(data).map_prost_err(location!())?;
         Ok(FeatureType::Tensor {
             shape: tensor_proto
                 .tensor_shape
@@ -617,7 +631,7 @@ fn convert_fixedshape_tensor(
         DataType::Float16 => {
             let mut values = Float16Builder::with_capacity(features.len());
             for tensors in tensor_iter {
-                if let Some(tensors) = tensors? {
+                if let Some(tensors) = tensors.map_prost_err(location!())? {
                     for tensor in tensors {
                         validate_tensor(&tensor, type_info)?;
                         if tensor.half_val.is_empty() {
@@ -645,7 +659,7 @@ fn convert_fixedshape_tensor(
             let mut values = FixedSizeBinaryBuilder::with_capacity(features.len(), 2);
 
             for tensors in tensor_iter {
-                if let Some(tensors) = tensors? {
+                if let Some(tensors) = tensors.map_prost_err(location!())? {
                     for tensor in tensors {
                         validate_tensor(&tensor, type_info)?;
                         if tensor.half_val.is_empty() {
@@ -673,7 +687,7 @@ fn convert_fixedshape_tensor(
         DataType::Float32 => {
             let mut values = Float32Builder::with_capacity(features.len());
             for tensors in tensor_iter {
-                if let Some(tensors) = tensors? {
+                if let Some(tensors) = tensors.map_prost_err(location!())? {
                     for tensor in tensors {
                         validate_tensor(&tensor, type_info)?;
                         if tensor.float_val.is_empty() {
@@ -695,7 +709,7 @@ fn convert_fixedshape_tensor(
         DataType::Float64 => {
             let mut values = Float64Builder::with_capacity(features.len());
             for tensors in tensor_iter {
-                if let Some(tensors) = tensors? {
+                if let Some(tensors) = tensors.map_prost_err(location!())? {
                     for tensor in tensors {
                         validate_tensor(&tensor, type_info)?;
                         if tensor.float_val.is_empty() {

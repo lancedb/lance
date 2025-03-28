@@ -11,10 +11,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark.read;
 
 import com.lancedb.lance.spark.internal.LanceFragmentColumnarBatchScanner;
+
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 
@@ -40,9 +40,9 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
       if (fragmentReader != null) {
         fragmentReader.close();
       }
-      fragmentReader = LanceFragmentColumnarBatchScanner.create(
-          inputPartition.getLanceSplit().getFragments().get(fragmentIndex),
-          inputPartition);
+      fragmentReader =
+          LanceFragmentColumnarBatchScanner.create(
+              inputPartition.getLanceSplit().getFragments().get(fragmentIndex), inputPartition);
       fragmentIndex++;
       if (loadNextBatchFromCurrentReader()) {
         return true;

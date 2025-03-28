@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
 use lance_core::Result;
 
 use crate::{optimize::OptimizeOptions, IndexParams, IndexType};
@@ -33,6 +34,15 @@ pub trait DatasetIndexExt {
         params: &dyn IndexParams,
         replace: bool,
     ) -> Result<()>;
+
+    /// Drop indices by name.
+    ///
+    /// Upon finish, a new dataset version is generated.
+    ///
+    /// Parameters:
+    ///
+    /// - `name`: the name of the index to drop.
+    async fn drop_index(&mut self, name: &str) -> Result<()>;
 
     /// Read all indices of this Dataset version.
     ///
@@ -88,4 +98,11 @@ pub trait DatasetIndexExt {
         column: &str,
         index_id: Uuid,
     ) -> Result<()>;
+
+    async fn read_index_partition(
+        &self,
+        index_name: &str,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> Result<SendableRecordBatchStream>;
 }

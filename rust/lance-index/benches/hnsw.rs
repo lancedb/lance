@@ -15,7 +15,7 @@ use lance_index::vector::v3::subindex::IvfSubIndex;
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_index::vector::{
-    flat::storage::FlatStorage,
+    flat::storage::FlatFloatStorage,
     hnsw::builder::{HnswBuildParams, HNSW},
 };
 use lance_linalg::distance::DistanceType;
@@ -31,7 +31,7 @@ fn bench_hnsw(c: &mut Criterion) {
 
     let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
     let fsl = FixedSizeListArray::try_new_from_values(data, DIMENSION as i32).unwrap();
-    let vectors = Arc::new(FlatStorage::new(fsl.clone(), DistanceType::L2));
+    let vectors = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
 
     let query = fsl.value(0);
     c.bench_function(

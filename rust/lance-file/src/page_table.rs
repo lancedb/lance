@@ -7,7 +7,7 @@ use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
 use lance_io::encodings::plain::PlainDecoder;
 use lance_io::encodings::Decoder;
-use snafu::{location, Location};
+use snafu::location;
 use std::collections::BTreeMap;
 use tokio::io::AsyncWriteExt;
 
@@ -51,7 +51,7 @@ impl PageTable {
     /// Non-existent pages will be represented as (0, 0) in the page table. Pages
     /// can be non-existent because they are not present in the file, or because
     /// they are struct fields which have no data pages.
-    pub async fn load<'a>(
+    pub async fn load(
         reader: &dyn Reader,
         position: usize,
         min_field_id: i32,

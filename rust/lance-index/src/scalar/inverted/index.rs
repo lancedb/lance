@@ -11,8 +11,8 @@ use arrow::array::{
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow_array::{
-    Array, ArrayRef, Float32Array, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float32Array, ListArray, OffsetSizeTrait, PrimitiveArray,
+    RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -26,18 +26,20 @@ use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
 use moka::future::Cache;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
-use tracing::instrument;
+use snafu::location;
+use tracing::{info, instrument};
 
 use super::builder::inverted_list_schema;
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::{NoFilter, PreFilter};
 use crate::scalar::{
-    AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, SargableQuery, ScalarIndex,
+    AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, InvertedIndexParams, MetricsCollector,
+    SargableQuery, ScalarIndex, SearchResult,
 };
 use crate::Index;
 
@@ -62,7 +64,7 @@ pub const K1: f32 = 1.2;
 pub const B: f32 = 0.75;
 
 lazy_static! {
-    static ref CACHE_SIZE: usize = std::env::var("LANCE_INVERTED_CACHE_SIZE")
+    pub static ref CACHE_SIZE: usize = std::env::var("LANCE_INVERTED_CACHE_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(512 * 1024 * 1024);
@@ -70,6 +72,7 @@ lazy_static! {
 
 #[derive(Clone)]
 pub struct InvertedIndex {
+    params: InvertedIndexParams,
     tokenizer: tantivy::tokenizer::TextAnalyzer,
     tokens: TokenSet,
     inverted_list: Arc<InvertedListReader>,
@@ -110,9 +113,11 @@ impl InvertedIndex {
         &self,
         query: &FullTextSearchQuery,
         prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, f32)>> {
         let mut tokenizer = self.tokenizer.clone();
         let tokens = collect_tokens(&query.query, &mut tokenizer, None);
+        metrics.record_comparisons(tokens.len());
         let token_ids = self.map(&tokens).into_iter();
         let token_ids = if !is_phrase_query(&query.query) {
             token_ids.sorted_unstable().dedup().collect()
@@ -127,7 +132,7 @@ impl InvertedIndex {
             }
             token_ids
         };
-        self.bm25_search(token_ids, query, prefilter).await
+        self.bm25_search(token_ids, query, prefilter, metrics).await
     }
 
     // search the documents that contain the query
@@ -139,6 +144,7 @@ impl InvertedIndex {
         token_ids: Vec<u32>,
         query: &FullTextSearchQuery,
         prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, f32)>> {
         let limit = query
             .limit
@@ -153,7 +159,7 @@ impl InvertedIndex {
             .zip(repeat_with(|| (self.inverted_list.clone(), mask.clone())))
             .map(|((position, token_id), (inverted_list, mask))| async move {
                 let posting = inverted_list
-                    .posting_list(token_id, is_phrase_query)
+                    .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
                 Result::Ok(PostingIterator::new(
                     token_id,
@@ -181,7 +187,7 @@ impl InvertedIndex {
         let tokens = self.tokens.clone();
         let inverted_list = self.inverted_list.clone();
         let docs = self.docs.clone();
-        InvertedIndexBuilder::from_existing_index(tokens, inverted_list, docs)
+        InvertedIndexBuilder::from_existing_index(self.params.clone(), tokens, inverted_list, docs)
     }
 }
 
@@ -222,11 +228,15 @@ impl Index for InvertedIndex {
 impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
     #[instrument(level = "debug", skip_all)]
-    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let row_ids = match query {
             SargableQuery::FullTextSearch(query) => self
-                .full_text_search(query, Arc::new(NoFilter))
+                .full_text_search(query, Arc::new(NoFilter), metrics)
                 .await?
                 .into_iter()
                 .map(|(row_id, _)| row_id),
@@ -238,7 +248,11 @@ impl ScalarIndex for InvertedIndex {
             }
         };
 
-        Ok(RowIdTreeMap::from_iter(row_ids))
+        Ok(SearchResult::Exact(RowIdTreeMap::from_iter(row_ids)))
+    }
+
+    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+        true
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
@@ -255,8 +269,7 @@ impl ScalarIndex for InvertedIndex {
                     .get("tokenizer")
                     .map(|s| serde_json::from_str::<TokenizerConfig>(s))
                     .transpose()?
-                    .unwrap_or_default()
-                    .build()?;
+                    .unwrap_or_default();
                 let tokens = TokenSet::load(token_reader).await?;
                 Result::Ok((tokenizer, tokens))
             }
@@ -278,11 +291,17 @@ impl ScalarIndex for InvertedIndex {
             }
         });
 
-        let (tokenizer, tokens) = tokens_fut.await??;
+        let (tokenizer_config, tokens) = tokens_fut.await??;
         let inverted_list = invert_list_fut.await??;
         let docs = docs_fut.await??;
 
+        let tokenizer = tokenizer_config.build()?;
+        let params = InvertedIndexParams {
+            with_position: inverted_list.has_positions(),
+            tokenizer_config,
+        };
         Ok(Arc::new(Self {
+            params,
             tokenizer,
             tokens,
             inverted_list,
@@ -318,6 +337,10 @@ pub struct TokenSet {
 }
 
 impl TokenSet {
+    pub fn num_tokens(&self) -> usize {
+        self.tokens.len()
+    }
+
     pub fn to_batch(self) -> Result<RecordBatch> {
         let mut token_builder = StringBuilder::with_capacity(self.tokens.len(), self.total_length);
         let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
@@ -382,6 +405,10 @@ impl TokenSet {
 
     pub fn get(&self, token: &str) -> Option<u32> {
         self.tokens.get(token).copied()
+    }
+
+    pub fn all_tokens(&self) -> impl Iterator<Item = u32> + '_ {
+        self.tokens.values().copied()
     }
 
     pub fn next_id(&self) -> u32 {
@@ -486,15 +513,18 @@ impl InvertedListReader {
         Ok(batch)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, metrics))]
     pub(crate) async fn posting_list(
         &self,
         token_id: u32,
         is_phrase_query: bool,
+        metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
         let mut posting = self
             .posting_cache
             .try_get_with(token_id, async move {
+                metrics.record_part_load();
+                info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
                 let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
@@ -1056,8 +1086,8 @@ pub fn flat_bm25_search(
 
     let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
     let batch = batch
-        .drop_column(doc_col)?
-        .try_with_column(SCORE_FIELD.clone(), score_col)?;
+        .try_with_column(SCORE_FIELD.clone(), score_col)?
+        .project_by_schema(&FTS_SCHEMA)?; // the scan node would probably scan some extra columns for prefilter, drop them here
     Ok(batch)
 }
 
@@ -1083,7 +1113,7 @@ pub fn flat_bm25_search_stream(
 
     let stream = input.map(move |batch| {
         let batch = batch?;
-        flat_bm25_search(
+        let scored_batch = flat_bm25_search(
             batch,
             &doc_col,
             inverted_list.as_ref(),
@@ -1092,7 +1122,17 @@ pub fn flat_bm25_search_stream(
             &mut tokenizer,
             avgdl,
             num_docs,
-        )
+        )?;
+
+        // filter out rows with score 0
+        let score_col = scored_batch[SCORE_COL].as_primitive::<Float32Type>();
+        let mask = score_col
+            .iter()
+            .map(|score| score.is_some_and(|score| score > 0.0))
+            .collect::<Vec<_>>();
+        let mask = BooleanArray::from(mask);
+        let batch = arrow::compute::filter_record_batch(&scored_batch, &mask)?;
+        Ok(batch)
     });
 
     Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream

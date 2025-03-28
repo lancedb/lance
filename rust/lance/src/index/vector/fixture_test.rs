@@ -17,11 +17,15 @@ mod test {
     use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
+    use datafusion::execution::SendableRecordBatchStream;
     use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_index::vector::ivf::storage::IvfModel;
-    use lance_index::vector::quantizer::{QuantizationType, Quantizer};
     use lance_index::vector::v3::subindex::SubIndexType;
+    use lance_index::{metrics::MetricsCollector, vector::ivf::storage::IvfModel};
+    use lance_index::{
+        metrics::NoOpMetricsCollector,
+        vector::quantizer::{QuantizationType, Quantizer},
+    };
     use lance_index::{vector::Query, Index, IndexType};
     use lance_io::{local::LocalObjectReader, traits::Reader};
     use lance_linalg::distance::MetricType;
@@ -91,6 +95,7 @@ mod test {
             &self,
             query: &Query,
             _pre_filter: Arc<dyn PreFilter>,
+            _metrics: &dyn MetricsCollector,
         ) -> Result<RecordBatch> {
             let key: &Float32Array = query.key.as_primitive();
             assert_eq!(key.len(), self.assert_query_value.len());
@@ -109,6 +114,7 @@ mod test {
             _: usize,
             _: &Query,
             _: Arc<dyn PreFilter>,
+            _: &dyn MetricsCollector,
         ) -> Result<RecordBatch> {
             unimplemented!("only for IVF")
         }
@@ -134,15 +140,23 @@ mod test {
             Ok(Box::new(self.clone()))
         }
 
+        fn num_rows(&self) -> u64 {
+            self.ret_val.num_rows() as u64
+        }
+
         fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
             todo!("this method is for only IVF_HNSW_* index");
         }
 
-        fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
             Ok(())
         }
 
-        fn ivf_model(&self) -> IvfModel {
+        async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
+            unimplemented!("only for SubIndex")
+        }
+
+        fn ivf_model(&self) -> &IvfModel {
             unimplemented!("only for IVF")
         }
         fn quantizer(&self) -> Quantizer {
@@ -164,7 +178,7 @@ mod test {
     async fn test_ivf_residual_handling() {
         let centroids = Float32Array::from_iter(vec![1.0, 1.0, -1.0, -1.0, -1.0, 1.0, 1.0, -1.0]);
         let centroids = FixedSizeListArray::try_new_from_values(centroids, 2).unwrap();
-        let mut ivf = IvfModel::new(centroids);
+        let mut ivf = IvfModel::new(centroids, None);
         // Add 4 partitions
         for _ in 0..4 {
             ivf.add_partition(0);
@@ -233,6 +247,8 @@ mod test {
                 column: "test".to_string(),
                 key: Arc::new(Float32Array::from(query)),
                 k: 1,
+                lower_bound: None,
+                upper_bound: None,
                 nprobes: 1,
                 ef: None,
                 refine_factor: None,
@@ -247,6 +263,7 @@ mod test {
                     filtered_ids: None,
                     final_mask: Mutex::new(OnceCell::new()),
                 }),
+                &NoOpMetricsCollector,
             )
             .await
             .unwrap();

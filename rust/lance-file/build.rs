@@ -6,6 +6,10 @@ use std::io::Result;
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=protos");
 
+    #[cfg(feature = "protoc")]
+    // Use vendored protobuf compiler if requested.
+    std::env::set_var("PROTOC", protobuf_src::protoc());
+
     let mut prost_build = prost_build::Config::new();
     prost_build.protoc_arg("--experimental_allow_proto3_optional");
     prost_build.extern_path(".lance.encodings", "::lance_encoding::format::pb");

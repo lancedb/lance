@@ -30,6 +30,7 @@ from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 from lance.debug import format_fragment
+from lance.schema import LanceSchema
 from lance.util import validate_vector_index
 
 # Various valid inputs for write_dataset
@@ -117,11 +118,11 @@ def test_dataset_append(tmp_path: Path):
     # verify appending batches with a different schema doesn't work
     table2 = pa.Table.from_pydict({"COLUMN-C": [1, 2, 3], "colB": [4, 5, 6]})
     with pytest.raises(OSError):
-        lance.write_dataset(table2, base_dir, mode="append")
+        lance.write_dataset(table2, dataset, mode="append")
 
     # But we can append subschemas
     table3 = pa.Table.from_pydict({"colA": [4, 5, 6]})
-    dataset = lance.write_dataset(table3, base_dir, mode="append")
+    dataset.insert(table3)  # Append is default
     assert dataset.to_table() == pa.table(
         {"colA": [1, 2, 3, 4, 5, 6], "colB": [4, 5, 6, None, None, None]}
     )
@@ -158,6 +159,39 @@ def test_dataset_from_record_batch_iterable(tmp_path: Path):
 
     # After combined into one batch, make sure it is the same as original pylist
     assert list(dataset.to_batches())[0].to_pylist() == test_pylist
+
+
+def test_schema_metadata(tmp_path: Path):
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64(), metadata={b"thisis": "a"}),
+            pa.field("b", pa.int64(), metadata={b"thisis": "b"}),
+        ],
+        metadata={b"foo": b"bar", b"baz": b"qux"},
+    )
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)}, schema=schema)
+    ds = lance.write_dataset(table, tmp_path)
+    # Original schema
+    assert ds.schema.metadata == {b"foo": b"bar", b"baz": b"qux"}
+    assert ds.schema.field("a").metadata == {b"thisis": b"a"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+    # Replace schema metadata
+    ds.replace_schema_metadata({"foo": "baz"})
+    assert ds.schema.metadata == {b"foo": b"baz"}
+    assert ds.schema.field("a").metadata == {b"thisis": b"a"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+    # Replace field metadata
+    ds.replace_field_metadata("a", {"thisis": "c"})
+    assert ds.schema.field("a").metadata == {b"thisis": b"c"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+    # Overwrite overwrites metadata
+    ds = lance.write_dataset(table, tmp_path, mode="overwrite")
+    assert ds.schema.metadata == {b"foo": b"bar", b"baz": b"qux"}
+    assert ds.schema.field("a").metadata == {b"thisis": b"a"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
 
 
 def test_versions(tmp_path: Path):
@@ -259,6 +293,41 @@ def test_asof_checkout(tmp_path: Path):
     ds = lance.dataset(base_dir, asof=ts_3)
     assert ds.version == 3
     assert len(ds.to_table()) == 9
+
+
+def test_enable_move_stable_row_ids(tmp_path: Path):
+    table = pa.Table.from_pylist(
+        [{"name": "Alice", "age": 20}, {"name": "Bob", "age": 30}]
+    )
+    lance.write_dataset(table, tmp_path, enable_move_stable_row_ids=True)
+    ds = lance.write_dataset(
+        table, tmp_path, enable_move_stable_row_ids=True, mode="append"
+    )
+    table_before = ds.scanner(with_row_id=True, with_row_address=True).to_table()
+    assert len(table_before) == 4
+    assert table_before["_rowid"][0].as_py() == 0
+    assert table_before["_rowid"][1].as_py() == 1
+    assert table_before["_rowid"][2].as_py() == 2
+    assert table_before["_rowid"][3].as_py() == 3
+
+    assert table_before["_rowaddr"][0].as_py() == 0
+    assert table_before["_rowaddr"][1].as_py() == 1
+    assert table_before["_rowaddr"][2].as_py() == (1 << 32) + 0
+    assert table_before["_rowaddr"][3].as_py() == (1 << 32) + 1
+
+    ds.optimize.compact_files()
+
+    table_after = ds.scanner(with_row_id=True, with_row_address=True).to_table()
+    assert len(table_after) == 4
+    assert table_after["_rowid"][0].as_py() == 0
+    assert table_after["_rowid"][1].as_py() == 1
+    assert table_after["_rowid"][2].as_py() == 2
+    assert table_after["_rowid"][3].as_py() == 3
+
+    assert table_after["_rowaddr"][0].as_py() == (2 << 32) + 0
+    assert table_after["_rowaddr"][1].as_py() == (2 << 32) + 1
+    assert table_after["_rowaddr"][2].as_py() == (2 << 32) + 2
+    assert table_after["_rowaddr"][3].as_py() == (2 << 32) + 3
 
 
 def test_v2_manifest_paths(tmp_path: Path):
@@ -451,9 +520,11 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
 
     # test just limit
     assert dataset.to_table(limit=10) == table.slice(0, 10)
+    assert dataset.to_table(limit=100) == table.slice(0, 100)
 
     # test just offset
-    assert dataset.to_table(offset=10) == table.slice(10, 100)
+    assert dataset.to_table(offset=0) == table.slice(0, 100)
+    assert dataset.to_table(offset=10) == table.slice(10, 90)
 
     # test both
     assert dataset.to_table(offset=10, limit=10) == table.slice(10, 10)
@@ -468,7 +539,18 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
     assert dataset.to_table(offset=50, limit=25) == table.slice(50, 25)
 
     # Limit past the end
-    assert dataset.to_table(offset=50, limit=100) == table.slice(50, 50)
+    assert dataset.to_table(limit=101) == table.slice(0, 100)
+
+    # Limit with offset past the end
+    assert dataset.to_table(offset=50, limit=51) == table.slice(50, 50)
+
+    # Offset past the end
+    assert dataset.to_table(offset=100) == table.slice(100, 0)  # Empty table
+    assert dataset.to_table(offset=101) == table.slice(100, 0)  # Empty table
+
+    # Offset with limit past the end
+    assert dataset.to_table(offset=100, limit=1) == table.slice(100, 0)  # Empty table
+    assert dataset.to_table(offset=101, limit=1) == table.slice(100, 0)  # Empty table
 
     # Invalid limit / offset
     with pytest.raises(ValueError, match="Offset must be non-negative"):
@@ -697,6 +779,68 @@ def test_count_rows(tmp_path: Path):
     assert dataset.count_rows(filter="a < 50") == 50
 
 
+def test_select_none(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir)
+
+    assert "projection=[a]" in ds.scanner(
+        columns=[], filter="a < 50", with_row_id=True
+    ).explain_plan(True)
+
+
+def test_analyze_filtered_scan(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir)
+    plan = ds.scanner(columns=[], filter="a < 50", with_row_id=True).analyze_plan()
+    print(plan)
+    assert re.search(r"^\s*LanceScan:.*output_rows=100.*$", plan, re.MULTILINE)
+    assert re.search(r"^\s*FilterExec:.*output_rows=50.*$", plan, re.MULTILINE)
+
+
+def test_analyze_index_scan(tmp_path: Path):
+    table = pa.table({"filter": range(100)})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("filter", "BTREE")
+    plan = dataset.scanner(filter="filter = 10").analyze_plan()
+    assert "MaterializeIndex: query=filter = 10, metrics=[output_rows=1" in plan
+
+
+def test_analyze_scan(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(table, tmp_path)
+    plan = dataset.scanner().analyze_plan()
+    # The bytes_read part might get brittle if we change file versions a lot
+    # future us are free to ignore that part.
+    assert "bytes_read=3643, iops=3, requests=3" in plan
+
+
+def test_analyze_take(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("a", "BTREE")
+    plan = dataset.scanner(filter="a = 50").analyze_plan()
+    assert "bytes_read=16, iops=2, requests=2" in plan
+
+
+def test_analyze_vector_search(tmp_path: Path):
+    table = pa.Table.from_pydict(
+        {
+            "id": [i for i in range(10)],
+            "vector": pa.array(
+                [[1.0, 1.0] for _ in range(10)], pa.list_(pa.float32(), 2)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path / "dataset", mode="create")
+    dataset.delete("id = 0")
+    plan = dataset.scanner(
+        nearest={"column": "vector", "k": 10, "q": [1.0, 1.0]}
+    ).analyze_plan()
+    assert "KNNVectorDistance: metric=l2, metrics=[output_rows=10" in plan
+
+
 def test_get_fragments(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -842,16 +986,16 @@ def test_append_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
 
-    lance.write_dataset(table, base_dir)
+    dataset = lance.write_dataset(table, base_dir)
 
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
     append = lance.LanceOperation.Append([fragment])
 
-    with pytest.raises(OSError):
+    with pytest.raises(ValueError):
         # Must specify read version
-        dataset = lance.LanceDataset.commit(base_dir, append)
+        dataset = lance.LanceDataset.commit(dataset, append)
 
-    dataset = lance.LanceDataset.commit(base_dir, append, read_version=1)
+    dataset = lance.LanceDataset.commit(dataset, append, read_version=1)
 
     tbl = dataset.to_table()
 
@@ -862,6 +1006,30 @@ def test_append_with_commit(tmp_path: Path):
         }
     )
     assert tbl == expected
+
+
+def test_commit_batch_append():
+    data1 = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(data1, "memory://test")
+
+    data2 = pa.Table.from_pydict({"a": range(100, 200), "b": range(100, 200)})
+    fragments2 = lance.fragment.write_fragments(data2, dataset)
+    op2 = lance.LanceOperation.Append(fragments2)
+    txn2 = lance.Transaction(1, op2)
+    data3 = pa.Table.from_pydict({"a": range(200, 300), "b": range(200, 300)})
+    fragments3 = lance.fragment.write_fragments(data3, dataset)
+    op3 = lance.LanceOperation.Append(fragments3)
+    txn3 = lance.Transaction(2, op3)
+
+    result = lance.LanceDataset.commit_batch(dataset, [txn2, txn3])
+    dataset = result["dataset"]
+    assert dataset.version == 2
+    assert len(dataset.get_fragments()) == 3
+    assert dataset.to_table() == pa.concat_tables([data1, data2, data3])
+    merged_txn = result["merged"]
+    assert isinstance(merged_txn, lance.Transaction)
+    assert isinstance(merged_txn.operation, lance.LanceOperation.Append)
+    assert merged_txn.operation.fragments == fragments2 + fragments3
 
 
 def test_delete_with_commit(tmp_path: Path):
@@ -908,6 +1076,31 @@ def test_restore_with_commit(tmp_path: Path):
 
     tbl = dataset.to_table()
     assert tbl == table
+
+
+def test_merge_insert_with_commit():
+    table = pa.table({"id": range(10), "updated": [False] * 10})
+    dataset = lance.write_dataset(table, "memory://test")
+
+    updates = pa.Table.from_pylist([{"id": 1, "updated": True}])
+    transaction, stats = (
+        dataset.merge_insert(on="id")
+        .when_matched_update_all()
+        .execute_uncommitted(updates)
+    )
+
+    assert isinstance(stats, dict)
+    assert stats["num_updated_rows"] == 1
+    assert stats["num_inserted_rows"] == 0
+    assert stats["num_deleted_rows"] == 0
+
+    assert isinstance(transaction, lance.Transaction)
+    assert isinstance(transaction.operation, lance.LanceOperation.Update)
+
+    dataset = lance.LanceDataset.commit(dataset, transaction)
+    assert dataset.to_table().sort_by("id") == pa.table(
+        {"id": range(10), "updated": [False] + [True] + [False] * 8}
+    )
 
 
 def test_merge_with_commit(tmp_path: Path):
@@ -989,12 +1182,14 @@ def test_data_files(tmp_path: Path):
     base_dir = tmp_path / "test"
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
 
-    data_files = fragment.data_files()
+    data_files = fragment.files
     assert len(data_files) == 1
     # it is a valid uuid
-    uuid.UUID(os.path.splitext(data_files[0].path())[0])
+    with pytest.warns(DeprecationWarning):
+        path = data_files[0].path()
+    uuid.UUID(os.path.splitext(path)[0])
 
-    assert fragment.deletion_file() is None
+    assert fragment.deletion_file is None
 
 
 def test_deletion_file(tmp_path: Path):
@@ -1011,8 +1206,10 @@ def test_deletion_file(tmp_path: Path):
     assert fragment.deletion_file() is None
 
     # New fragment has deletion file
-    assert new_fragment.deletion_file() is not None
-    assert re.match("_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file())
+    assert new_fragment.deletion_file is not None
+    assert re.match(
+        "_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file.path(0)
+    )
     operation = lance.LanceOperation.Overwrite(table.schema, [new_fragment])
     dataset = lance.LanceDataset.commit(base_dir, operation)
     assert dataset.count_rows() == 90
@@ -1031,6 +1228,9 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
     pickled = pickle.dumps(fragment_metadata)
     unpickled = pickle.loads(pickled)
     assert fragment_metadata == unpickled
+    with pytest.warns(DeprecationWarning):
+        path = fragment_metadata.files[0].path()
+        assert path == unpickled.files[0].path()
 
     operation = lance.LanceOperation.Overwrite(table.schema, [fragment_metadata])
     dataset = lance.LanceDataset.commit(base_dir, operation)
@@ -1055,6 +1255,18 @@ def test_load_scanner_from_fragments(tmp_path: Path):
     # Accepts an iterator
     scanner = dataset.scanner(fragments=iter(fragments[0:2]), scan_in_order=False)
     assert scanner.to_table().num_rows == 2 * 100
+
+
+def test_write_unstable_data_version(tmp_path: Path, capfd):
+    # Note: this test will only work if no earlier test attempts
+    # to use an unstable version.  If we need that later we can find a way to
+    # run this test in a separate process (pytest-xdist?)
+    tab = pa.table({"a": range(100), "b": range(100)})
+    ds = lance.write_dataset(
+        tab, tmp_path / "dataset", mode="append", data_storage_version="next"
+    )
+    assert ds.to_table() == tab
+    assert "You have requested an unstable format version" in capfd.readouterr().err
 
 
 def test_merge_data(tmp_path: Path):
@@ -1169,12 +1381,23 @@ def check_merge_stats(merge_dict, expected):
 
 def test_merge_insert(tmp_path: Path):
     nrows = 1000
+    # Create a schema with some metadata to regress an issue where the metadata
+    # caused schema comparison problems in merge_insert.
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64()),
+            pa.field("b", pa.int64()),
+            pa.field("c", pa.int64()),
+        ],
+        metadata={"foo": "bar"},
+    )
     table = pa.Table.from_pydict(
         {
             "a": range(nrows),
             "b": [1 for _ in range(nrows)],
             "c": [x % 2 for x in range(nrows)],
-        }
+        },
+        schema=schema,
     )
     dataset = lance.write_dataset(
         table, tmp_path / "dataset", mode="create", max_rows_per_file=100
@@ -1186,7 +1409,8 @@ def test_merge_insert(tmp_path: Path):
             "a": range(300, 300 + nrows),
             "b": [2 for _ in range(nrows)],
             "c": [0 for _ in range(nrows)],
-        }
+        },
+        schema=schema,
     )
 
     is_new = pc.field("b") == 2
@@ -1303,13 +1527,36 @@ def test_merge_insert_subcols(tmp_path: Path):
     assert fragments[1].fragment_id == original_fragments[1].fragment_id
 
     assert len(fragments[0].data_files()) == 2
-    assert str(fragments[0].data_files()[0]) == str(
-        original_fragments[0].data_files()[0]
+    assert (
+        fragments[0].data_files()[0].path == original_fragments[0].data_files()[0].path
     )
     assert len(fragments[1].data_files()) == 1
     assert str(fragments[1].data_files()[0]) == str(
         original_fragments[1].data_files()[0]
     )
+
+    new_values = pa.table(
+        {
+            "a": range(9, 12),
+            "b": range(30, 33),
+        }
+    )
+    (
+        dataset.merge_insert("a")
+        .when_not_matched_insert_all()
+        .when_matched_update_all()
+        .execute(new_values)
+    )
+
+    assert dataset.count_rows() == 12
+    expected = pa.table(
+        {
+            "a": range(0, 12),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 30, 31, 32],
+            "c": list(range(10, 20)) + [None] * 2,
+        }
+    )
+    assert dataset.to_table().sort_by("a") == expected
 
 
 def test_flat_vector_search_with_delete(tmp_path: Path):
@@ -1472,34 +1719,6 @@ def test_merge_insert_multiple_keys(tmp_path: Path):
     check_merge_stats(merge_dict, (0, 350, 0))
 
 
-def test_merge_insert_incompatible_schema(tmp_path: Path):
-    nrows = 1000
-    table = pa.Table.from_pydict(
-        {
-            "a": range(nrows),
-            "b": [1 for _ in range(nrows)],
-        }
-    )
-    dataset = lance.write_dataset(
-        table, tmp_path / "dataset", mode="create", max_rows_per_file=100
-    )
-
-    new_table = pa.Table.from_pydict(
-        {
-            "a": range(300, 300 + nrows),
-        }
-    )
-
-    with pytest.raises(OSError):
-        merge_dict = (
-            dataset.merge_insert("a")
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(new_table)
-        )
-        check_merge_stats(merge_dict, (None, None, None))
-
-
 def test_merge_insert_vector_column(tmp_path: Path):
     table = pa.Table.from_pydict(
         {
@@ -1536,6 +1755,103 @@ def test_merge_insert_vector_column(tmp_path: Path):
 
     assert dataset.to_table().sort_by("key") == expected
     check_merge_stats(merge_dict, (1, 1, 0))
+
+
+def test_merge_insert_large():
+    # Doing subcolumns update with merge insert triggers this error.
+    # Data needs to be large enough to make DataFusion create multiple batches
+    # when outputting join results.
+    # https://github.com/lancedb/lance/issues/3406
+    # This test is in Python because for whatever reason, the error doesn't
+    # reproduce in the equivalent Rust test.
+    dims = 32
+    nrows = 20_000
+    data = pa.table({"id": range(nrows), "num": [str(i) for i in range(nrows)]})
+
+    ds = lance.write_dataset(data, "memory://")
+
+    ds.add_columns({"vector": f"arrow_cast(NULL, 'FixedSizeList({dims}, Float32)')"})
+
+    batch_size = 10_000
+    other_columns = pa.table(
+        {
+            "id": range(batch_size),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pc.random(batch_size * dims).cast(pa.float32()), dims
+            ),
+        }
+    )
+
+    (
+        ds.merge_insert(on="id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(other_columns)
+    )
+
+
+def test_add_null_columns(tmp_path: Path):
+    data = pa.table({"id": [1, 2, 4]})
+    ds = lance.write_dataset(data, tmp_path)
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+    assert len(fragments[0].data_files()) == 1
+
+    ds.add_columns(pa.field("f1", pa.float32()))
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+    assert len(fragments[0].data_files()) == 1
+    assert ds.schema == pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("f1", pa.float32()),
+        ]
+    )
+
+    ds.add_columns(
+        [pa.field("v2", pa.list_(pa.float32(), 32)), pa.field("v3", pa.int32())]
+    )
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+    assert len(fragments[0].data_files()) == 1
+    assert ds.schema == pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("f1", pa.float32()),
+            pa.field("v2", pa.list_(pa.float32(), 32)),
+            pa.field("v3", pa.int32()),
+        ]
+    )
+
+    ds.add_columns(
+        pa.schema([pa.field("s6", pa.struct([("a", pa.int32()), ("b", pa.bool_())]))])
+    )
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+    assert len(fragments[0].data_files()) == 1
+    assert ds.schema == pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("f1", pa.float32()),
+            pa.field("v2", pa.list_(pa.float32(), 32)),
+            pa.field("v3", pa.int32()),
+            pa.field("s6", pa.struct([("a", pa.int32()), ("b", pa.bool_())])),
+        ]
+    )
+
+
+def test_add_null_columns_with_conflict_names(tmp_path: Path):
+    data = pa.table({"id": [1, 2, 4]})
+    ds = lance.write_dataset(data, tmp_path)
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+    assert len(fragments[0].data_files()) == 1
+
+    with pytest.raises(Exception, match=".*Column id already exists in the dataset.*"):
+        ds.add_columns(pa.field("id", pa.float32()))
+
+    with pytest.raises(Exception, match=".*Column id already exists in the dataset.*"):
+        ds.add_columns([pa.field("id", pa.float32()), pa.field("good", pa.int32())])
 
 
 def check_update_stats(update_dict, expected):
@@ -2023,7 +2339,7 @@ def test_scan_count_rows(tmp_path: Path):
     df = pd.DataFrame({"a": range(42), "b": range(42)})
     dataset = lance.write_dataset(df, base_dir)
 
-    assert dataset.scanner().count_rows() == 42
+    assert dataset.scanner(columns=[], with_row_id=True).count_rows() == 42
     assert dataset.count_rows(filter="a < 10") == 10
     assert dataset.count_rows(filter=pa_ds.field("a") < 20) == 20
 
@@ -2037,6 +2353,44 @@ def test_scanner_schemas(tmp_path: Path):
     scanner = dataset.scanner(columns=["a"])
     assert scanner.dataset_schema == dataset.schema
     assert scanner.projected_schema == pa.schema([pa.field("a", pa.int64())])
+
+
+def test_scan_deleted_rows(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    df = pd.DataFrame({"a": range(100), "b": range(100)})
+    ds = lance.write_dataset(df, base_dir, max_rows_per_file=25)
+    ds.create_scalar_index("b", "BTREE")
+    ds.delete("a < 30")
+
+    assert ds.count_rows() == 70
+
+    assert ds.scanner(with_row_id=True).to_table().num_rows == 70
+    with_deleted = ds.scanner(with_row_id=True, include_deleted_rows=True).to_table()
+
+    assert with_deleted.num_rows == 75
+
+    assert with_deleted.slice(0, 5) == pa.table(
+        {
+            "a": range(25, 30),
+            "b": range(25, 30),
+            "_rowid": pa.array([None] * 5, pa.uint64()),
+        }
+    )
+
+    assert (
+        ds.scanner(with_row_id=True, include_deleted_rows=True, filter="a < 32")
+        .to_table()
+        .num_rows
+        == 7
+    )
+
+    with pytest.raises(ValueError, match="Cannot include deleted rows"):
+        ds.scanner(
+            include_deleted_rows=True, with_row_id=True, filter="b < 30"
+        ).to_table()
+
+    with pytest.raises(ValueError, match="with_row_id is false"):
+        ds.scanner(include_deleted_rows=True, filter="a < 30").to_table()
 
 
 def test_custom_commit_lock(tmp_path: Path):
@@ -2623,23 +2977,53 @@ EXPECTED_MAJOR_VERSION = 2
 EXPECTED_MINOR_VERSION = 0
 
 
+def test_stats(tmp_path: Path):
+    table = pa.table({"x": [1, 2, 3, 4], "y": ["foo", "bar", "baz", "qux"]})
+    dataset = lance.write_dataset(table, tmp_path)
+    stats = dataset.stats.dataset_stats()
+
+    assert stats["num_deleted_rows"] == 0
+    assert stats["num_fragments"] == 1
+    assert stats["num_small_files"] == 1
+
+    data_stats = dataset.stats.data_stats()
+
+    assert data_stats.fields[0].id == 0
+    assert data_stats.fields[0].bytes_on_disk == 32
+    assert data_stats.fields[1].id == 1
+    assert data_stats.fields[1].bytes_on_disk == 44  # 12 bytes data + 32 bytes offset
+
+    dataset.add_columns({"z": "y"})
+
+    dataset.insert(pa.table({"x": [5], "z": ["quux"]}))
+
+    data_stats = dataset.stats.data_stats()
+
+    assert data_stats.fields[0].id == 0
+    assert data_stats.fields[0].bytes_on_disk == 40
+    assert data_stats.fields[1].id == 1
+    assert data_stats.fields[1].bytes_on_disk == 44  # 12 bytes data + 32 bytes offset
+    assert data_stats.fields[2].id == 2
+    assert data_stats.fields[2].bytes_on_disk == 56  # 16 bytes data + 40 bytes offset
+
+
 def test_default_storage_version(tmp_path: Path):
     table = pa.table({"x": [0]})
     dataset = lance.write_dataset(table, tmp_path)
     assert dataset.data_storage_version == EXPECTED_DEFAULT_STORAGE_VERSION
 
     frag = lance.LanceFragment.create(dataset.uri, table)
-    sample_file = frag.to_json()["files"][0]
-    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
-    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+    sample_file = frag.files[0]
+    assert sample_file.file_major_version == EXPECTED_MAJOR_VERSION
+    assert sample_file.file_minor_version == EXPECTED_MINOR_VERSION
 
     from lance.fragment import write_fragments
 
     frags = write_fragments(table, dataset.uri)
     frag = frags[0]
-    sample_file = frag.to_json()["files"][0]
-    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
-    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+    sample_file = frag.files[0]
+    assert sample_file.file_major_version == EXPECTED_MAJOR_VERSION
+    assert sample_file.file_minor_version == EXPECTED_MINOR_VERSION
 
 
 def test_no_detached_v1(tmp_path: Path):
@@ -2691,3 +3075,139 @@ def test_detached_commits(tmp_path: Path):
     )
 
     assert detached2.to_table() == pa.table({"x": [0, 1, 3]})
+
+
+def test_dataset_drop(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    lance.write_dataset(table, tmp_path)
+    assert Path(tmp_path).exists()
+    lance.LanceDataset.drop(tmp_path)
+    assert not Path(tmp_path).exists()
+
+
+def test_dataset_schema(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    ds = lance.write_dataset(table, str(tmp_path))  # noqa: F841
+    ds._default_scan_options = {"with_row_id": True}
+    assert ds.schema == ds.to_table().schema
+
+
+def test_data_replacement(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    table = pa.Table.from_pydict({"a": range(100, 200), "b": range(100, 200)})
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    data_file = fragment.files[0]
+    data_replacement = lance.LanceOperation.DataReplacement(
+        [lance.LanceOperation.DataReplacementGroup(0, data_file)]
+    )
+    dataset = lance.LanceDataset.commit(dataset, data_replacement, read_version=1)
+
+    tbl = dataset.to_table()
+
+    expected = pa.Table.from_pydict(
+        {
+            "a": list(range(100, 200)),
+            "b": list(range(100, 200)),
+        }
+    )
+    assert tbl == expected
+
+
+def test_schema_project_drop_column(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100, 200), "b": range(300, 400)})
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    schema = pa.Table.from_pydict({"a": range(1)}).schema
+    lance_schema = LanceSchema.from_pyarrow(schema)
+
+    project = lance.LanceOperation.Project(lance_schema)
+    dataset = lance.LanceDataset.commit(dataset, project, read_version=1)
+
+    tbl = dataset.to_table()
+
+    expected = pa.Table.from_pydict(
+        {
+            "a": list(range(100, 200)),
+        }
+    )
+    assert tbl == expected
+
+
+def test_schema_project_rename_column(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100, 200), "b": range(300, 400)})
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    schema = pa.Table.from_pydict({"c": range(1), "d": range(1)}).schema
+    lance_schema = LanceSchema.from_pyarrow(schema)
+
+    project = lance.LanceOperation.Project(lance_schema)
+    dataset = lance.LanceDataset.commit(dataset, project, read_version=1)
+
+    tbl = dataset.to_table()
+
+    expected = pa.Table.from_pydict(
+        {
+            "c": list(range(100, 200)),
+            "d": list(range(300, 400)),
+        }
+    )
+    assert tbl == expected
+
+
+def test_schema_project_swap_column(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100, 200), "b": range(300, 400)})
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    schema = pa.Table.from_pydict({"b": range(1), "a": range(1)}).schema
+    lance_schema = LanceSchema.from_pyarrow(schema)
+
+    project = lance.LanceOperation.Project(lance_schema)
+    dataset = lance.LanceDataset.commit(dataset, project, read_version=1)
+
+    tbl = dataset.to_table()
+
+    expected = pa.Table.from_pydict(
+        {
+            "b": list(range(100, 200)),
+            "a": list(range(300, 400)),
+        }
+    )
+    assert tbl == expected
+
+
+def test_empty_structs(tmp_path):
+    schema = pa.schema([pa.field("id", pa.int32()), pa.field("empties", pa.struct([]))])
+    table = pa.table({"id": [0, 1, 2], "empties": [{}] * 3}, schema=schema)
+    ds = lance.write_dataset(table, tmp_path)
+    res = ds.take([2, 0, 1])
+    assert res.num_rows == 3
+    assert res == table.take([2, 0, 1])
+
+
+def test_create_table_from_pylist(tmp_path):
+    data = [
+        {"foo": 1, "bar": "one"},
+        {"foo": 3, "bar": "three"},
+    ]
+    ds = lance.write_dataset(data, tmp_path)
+
+    assert ds.to_table() == pa.Table.from_pylist(data)
+
+
+def test_create_table_from_pydict(tmp_path):
+    dat = {
+        "foo": [1, 3],
+        "bar": ["one", "three"],
+    }
+    ds = lance.write_dataset(dat, tmp_path)
+    assert ds.to_table() == pa.Table.from_pydict(dat)

@@ -113,3 +113,10 @@ mod loongarch64 {
         flags & libc::HWCAP_LOONGARCH_LASX != 0
     }
 }
+
+#[cfg(all(target_arch = "aarch64", target_os = "android"))]
+mod aarch64 {
+    pub fn has_neon_f16_support() -> bool {
+        false
+    }
+}

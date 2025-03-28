@@ -11,11 +11,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark.read;
 
-import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 
 import java.io.IOException;

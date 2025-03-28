@@ -22,11 +22,10 @@ use itertools::Itertools;
 use lance_arrow::iter_str_array;
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, CPU_RUNTIME};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Result, ROW_ID};
 use lance_io::object_store::ObjectStore;
 use lazy_static::lazy_static;
 use object_store::path::Path;
-use snafu::{location, Location};
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
@@ -54,7 +53,7 @@ lazy_static! {
     // it doesn't mean higher value will result in better performance,
     // because the bottleneck can be the IO once the number of shards is large enough,
     // it's 8 by default
-    static ref LANCE_FTS_NUM_SHARDS: usize = std::env::var("LANCE_FTS_NUM_SHARDS")
+    pub static ref LANCE_FTS_NUM_SHARDS: usize = std::env::var("LANCE_FTS_NUM_SHARDS")
         .unwrap_or_else(|_| "8".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_NUM_SHARDS");
@@ -83,12 +82,11 @@ impl InvertedIndexBuilder {
     }
 
     pub fn from_existing_index(
+        params: InvertedIndexParams,
         tokens: TokenSet,
         inverted_list: Arc<InvertedListReader>,
         docs: DocSet,
     ) -> Self {
-        let params = InvertedIndexParams::default().with_position(inverted_list.has_positions());
-
         Self {
             params,
             tokens,
@@ -287,8 +285,7 @@ impl InvertedIndexBuilder {
                     Result::Ok((batch, max_score))
                 }
             });
-            let mut stream =
-                stream::iter(batches).buffer_unordered(get_num_compute_intensive_cpus());
+            let mut stream = stream::iter(batches).buffered(get_num_compute_intensive_cpus());
             let mut offsets = Vec::new();
             let mut max_scores = Vec::new();
             let mut num_rows = 0;
@@ -345,6 +342,7 @@ impl InvertedIndexBuilder {
         }
         let mut merged_stream = stream::select_all(posting_streams);
         let mut last_num_rows = 0;
+        self.tokens = TokenSet::default();
         let start = std::time::Instant::now();
         while let Some(r) = merged_stream.try_next().await? {
             let (token, batch, max_score) = r?;
@@ -635,6 +633,7 @@ impl PostingReader {
             let schema = schema.clone();
             let docs = docs.clone();
             tokio::spawn(async move {
+                // read the posting lists from new data
                 let batches = offsets.into_iter().map(|(offset, length)| {
                     let reader = posting_reader.reader.clone();
                     let schema = schema.clone();
@@ -648,19 +647,14 @@ impl PostingReader {
                 });
                 let mut batches = futures::future::try_join_all(batches).await?;
 
+                // read the posting lists from existing data
                 if let Some(inverted_list) = posting_reader.inverted_list_reader.as_ref() {
-                    let token_id =
-                        posting_reader
-                            .existing_tokens
-                            .get(&token)
-                            .ok_or(Error::Index {
-                                message: format!("token {} not found", token),
-                                location: location!(),
-                            })?;
-                    let batch = inverted_list
-                        .posting_batch(*token_id, inverted_list.has_positions())
-                        .await?;
-                    batches.push(batch);
+                    if let Some(token_id) = posting_reader.existing_tokens.get(&token) {
+                        let batch = inverted_list
+                            .posting_batch(*token_id, inverted_list.has_positions())
+                            .await?;
+                        batches.push(batch);
+                    }
                 }
 
                 let (batch, max_score) =
@@ -734,9 +728,10 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
 
+    use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::inverted::TokenizerConfig;
     use crate::scalar::lance_format::LanceIndexStore;
-    use crate::scalar::{FullTextSearchQuery, SargableQuery, ScalarIndex};
+    use crate::scalar::{FullTextSearchQuery, SargableQuery, ScalarIndex, SearchResult};
 
     use super::InvertedIndex;
 
@@ -787,34 +782,50 @@ mod tests {
 
     async fn test_inverted_index<Offset: arrow::array::OffsetSizeTrait>() {
         let invert_index = create_index::<Offset>(false, TokenizerConfig::default()).await;
-        let row_ids = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("lance".to_owned()).limit(Some(3)),
-            ))
+        let search_result = invert_index
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("lance".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        let SearchResult::Exact(row_ids) = search_result else {
+            panic!("unexpected search result")
+        };
         assert_eq!(row_ids.len(), Some(3));
         assert!(row_ids.contains(0));
         assert!(row_ids.contains(1));
         assert!(row_ids.contains(2));
 
-        let row_ids = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("database".to_owned()).limit(Some(3)),
-            ))
+        let result = invert_index
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("database".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(3));
         assert!(row_ids.contains(0));
         assert!(row_ids.contains(1));
         assert!(row_ids.contains(3));
 
-        let row_ids = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("unknown null".to_owned()).limit(Some(3)),
-            ))
+        let result = invert_index
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("unknown null".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(0));
 
         // test phrase query
@@ -823,64 +834,95 @@ mod tests {
 
         // we built the index without position, so the phrase query will not work
         let results = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await;
         assert!(results.unwrap_err().to_string().contains("position is not found but required for phrase queries, try recreating the index with position"));
         let results = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
-            ))
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await;
         assert!(results.unwrap_err().to_string().contains("position is not found but required for phrase queries, try recreating the index with position"));
 
         // recreate the index with position
         let invert_index = create_index::<Offset>(true, TokenizerConfig::default()).await;
-        let row_ids = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("lance database".to_owned()).limit(Some(10)),
-            ))
+        let result = invert_index
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("lance database".to_owned()).limit(Some(10)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(4));
         assert!(row_ids.contains(0));
         assert!(row_ids.contains(1));
         assert!(row_ids.contains(2));
         assert!(row_ids.contains(3));
 
-        let row_ids = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
-            ))
+        let result = invert_index
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(2));
         assert!(row_ids.contains(0));
         assert!(row_ids.contains(1));
 
-        let row_ids = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"database lance\"".to_owned()).limit(Some(10)),
-            ))
+        let result = invert_index
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("\"database lance\"".to_owned()).limit(Some(10)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(0));
 
-        let row_ids = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"lance unknown\"".to_owned()).limit(Some(10)),
-            ))
+        let result = invert_index
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("\"lance unknown\"".to_owned()).limit(Some(10)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(0));
 
-        let row_ids = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
-            ))
+        let result = invert_index
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(0));
     }
 
@@ -897,39 +939,59 @@ mod tests {
     #[tokio::test]
     async fn test_accented_chars() {
         let invert_index = create_index::<i32>(false, TokenizerConfig::default()).await;
-        let row_ids = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
-            ))
+        let result = invert_index
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(1));
 
-        let row_ids = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
-            ))
+        let result = invert_index
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(0));
 
         // with ascii folding enabled, the search should be accent-insensitive
         let invert_index =
             create_index::<i32>(true, TokenizerConfig::default().ascii_folding(true)).await;
-        let row_ids = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
-            ))
+        let result = invert_index
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(1));
 
-        let row_ids = invert_index
-            .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
-            ))
+        let result = invert_index
+            .search(
+                &SargableQuery::FullTextSearch(
+                    FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(1));
     }
 }

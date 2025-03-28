@@ -1,10 +1,11 @@
 [project]
 name = "pylance"
-dependencies = ["pyarrow>=12", "numpy>=1.22"]
+dynamic = ["version"]
+dependencies = ["pyarrow>=14", "numpy>=1.22"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
 license = { file = "LICENSE" }
-repository = "https://github.com/eto-ai/lance"
+repository = "https://github.com/lancedb/lance"
 readme = "README.md"
 requires-python = ">=3.9"
 keywords = [
@@ -57,11 +58,9 @@ tests = [
     "tensorflow",
     "tqdm",
 ]
-dev = ["ruff==0.4.1"]
+dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
-cuvs-cu11 = ["cuvs-cu11", "pylibraft-cu11"]
-cuvs-cu12 = ["cuvs-cu12", "pylibraft-cu12"]
 ray = ["ray[data]<2.38; python_version<'3.12'"]
 
 [tool.ruff]
@@ -70,11 +69,25 @@ lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 [tool.ruff.lint.per-file-ignores]
 "*.pyi" = ["E301", "E302"]
 
-[tool.mypy]
-python_version = "3.12"
-check_untyped_defs = true
-warn_redundant_casts = true
-warn_unused_ignores = true
+[tool.pyright]
+pythonVersion = "3.12"
+# TODO: expand this list as we fix more files.
+include = [
+    "python/lance/util.py",
+    "python/lance/debug.py",
+    "python/lance/tracing.py",
+    "python/lance/dependencies.py",
+    "python/lance/schema.py",
+    "python/lance/file.py",
+    "python/lance/util.py",
+]
+# Dependencies like pyarrow make this difficult to enforce strictly.
+reportMissingTypeStubs = "warning"
+reportImportCycles = "error"
+reportUnusedImport = "error"
+reportPropertyTypeMismatch = "error"
+reportUnnecessaryCast = "error"
+
 
 [tool.pytest.ini_options]
 markers = [

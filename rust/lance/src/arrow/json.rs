@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use snafu::{location, Location};
+use snafu::location;
 
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::datatypes::LogicalType;
 use lance_core::error::{Error, Result};
 
+/// JSON representation of an Apache Arrow [DataType].
 #[derive(Serialize, Deserialize, Debug)]
-struct JsonDataType {
+pub struct JsonDataType {
     #[serde(rename = "type")]
     type_: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -111,7 +112,7 @@ impl TryFrom<&JsonDataType> for DataType {
         let type_name = value.type_.as_str();
         match type_name {
             "null" | "bool" | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16"
-            | "uint32" | "halffloat" | "float" | "double" | "string" | "binary"
+            | "uint32" | "uint64" | "halffloat" | "float" | "double" | "string" | "binary"
             | "large_string" | "large_binary" | "date32:day" | "date64:ms" => {
                 let logical_type: LogicalType = type_name.into();
                 (&logical_type).try_into()
@@ -164,12 +165,16 @@ impl TryFrom<&JsonDataType> for DataType {
     }
 }
 
+/// JSON representation of an Apache Arrow [Field].
 #[derive(Serialize, Deserialize, Debug)]
-struct JsonField {
+pub struct JsonField {
     name: String,
     #[serde(rename = "type")]
     type_: JsonDataType,
     nullable: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<HashMap<String, String>>,
 }
 
 impl TryFrom<&Field> for JsonField {
@@ -178,10 +183,17 @@ impl TryFrom<&Field> for JsonField {
     fn try_from(field: &Field) -> Result<Self> {
         let data_type = JsonDataType::try_new(field.data_type())?;
 
+        let metadata = if field.metadata().is_empty() {
+            None
+        } else {
+            Some(field.metadata().clone())
+        };
+
         Ok(Self {
             name: field.name().to_string(),
             nullable: field.is_nullable(),
             type_: data_type,
+            metadata,
         })
     }
 }
@@ -191,7 +203,11 @@ impl TryFrom<&JsonField> for Field {
 
     fn try_from(value: &JsonField) -> Result<Self> {
         let data_type = DataType::try_from(&value.type_)?;
-        Ok(Self::new(&value.name, data_type, value.nullable))
+        let mut field = Self::new(&value.name, data_type, value.nullable);
+        if let Some(metadata) = value.metadata.clone() {
+            field.set_metadata(metadata);
+        }
+        Ok(field)
     }
 }
 
@@ -442,5 +458,56 @@ mod test {
 
         let actual = Schema::from_json(&json_str).unwrap();
         assert_eq!(schema, actual);
+    }
+
+    #[test]
+    fn test_metadata_roundtrip() {
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert("sk_1".to_string(), "sv_1".to_string());
+
+        let mut field1_metadata = HashMap::new();
+        field1_metadata.insert("fk_1".to_string(), "fv_1".to_string());
+
+        let field1 = Field::new("a", DataType::UInt8, false).with_metadata(field1_metadata.clone());
+        let field2 = Field::new("b", DataType::Int32, true);
+
+        let schema = Schema::new_with_metadata(vec![field1, field2], schema_metadata.clone());
+
+        let json_str = schema.to_json().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&json_str).unwrap(),
+            json!({
+                "fields": [
+                    {
+                        "name": "a",
+                        "type": {
+                            "type": "uint8"
+                        },
+                        "nullable": false,
+                        "metadata": {
+                            "fk_1": "fv_1"
+                        }
+                    },
+                    {
+                        "name": "b",
+                        "type": {
+                            "type": "int32"
+                        },
+                        "nullable": true
+                    }
+                ],
+                "metadata": {
+                    "sk_1": "sv_1"
+                }
+            })
+        );
+
+        let actual = Schema::from_json(&json_str).unwrap();
+        assert_eq!(schema, actual);
+
+        assert_eq!(actual.metadata, schema_metadata);
+
+        assert_eq!(actual.field(0).metadata(), &field1_metadata);
+        assert_eq!(actual.field(1).metadata(), &HashMap::new());
     }
 }

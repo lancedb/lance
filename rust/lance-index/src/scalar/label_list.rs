@@ -14,7 +14,7 @@ use deepsize::DeepSizeOf;
 use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
 use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use crate::{Index, IndexType};
@@ -23,10 +23,27 @@ use super::{bitmap::train_bitmap_index, SargableQuery};
 use super::{
     bitmap::BitmapIndex, btree::TrainingSource, AnyQuery, IndexStore, LabelListQuery, ScalarIndex,
 };
+use super::{MetricsCollector, SearchResult};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
-trait LabelListSubIndex: ScalarIndex + DeepSizeOf {}
+#[async_trait]
+trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
+    async fn search_exact(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RowIdTreeMap> {
+        let result = self.search(query, metrics).await?;
+        match result {
+            SearchResult::Exact(row_ids) => Ok(row_ids),
+            _ => Err(Error::Internal {
+                message: "Label list sub-index should return exact results".to_string(),
+                location: location!(),
+            }),
+        }
+    }
+}
 
 impl<T: ScalarIndex + DeepSizeOf> LabelListSubIndex for T {}
 
@@ -78,11 +95,12 @@ impl LabelListIndex {
     fn search_values<'a>(
         &'a self,
         values: &'a Vec<ScalarValue>,
-    ) -> BoxStream<Result<RowIdTreeMap>> {
+        metrics: &'a dyn MetricsCollector,
+    ) -> BoxStream<'a, Result<RowIdTreeMap>> {
         futures::stream::iter(values)
             .then(move |value| {
                 let value_query = SargableQuery::Equals(value.clone());
-                async move { self.values_index.search(&value_query).await }
+                async move { self.values_index.search_exact(&value_query, metrics).await }
             })
             .boxed()
     }
@@ -120,21 +138,30 @@ impl LabelListIndex {
 
 #[async_trait]
 impl ScalarIndex for LabelListIndex {
-    #[instrument(skip(self), level = "debug")]
-    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+    #[instrument(skip_all, level = "debug")]
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<LabelListQuery>().unwrap();
 
-        match query {
+        let row_ids = match query {
             LabelListQuery::HasAllLabels(labels) => {
-                let values_results = self.search_values(labels);
+                let values_results = self.search_values(labels, metrics);
                 self.set_intersection(values_results, labels.len() == 1)
                     .await
             }
             LabelListQuery::HasAnyLabel(labels) => {
-                let values_results = self.search_values(labels);
+                let values_results = self.search_values(labels, metrics);
                 self.set_union(values_results, labels.len() == 1).await
             }
-        }
+        }?;
+        Ok(SearchResult::Exact(row_ids))
+    }
+
+    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+        true
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
@@ -158,7 +185,9 @@ impl ScalarIndex for LabelListIndex {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        self.values_index.update(new_data, dest_store).await
+        self.values_index
+            .update(unnest_chunks(new_data)?, dest_store)
+            .await
     }
 }
 

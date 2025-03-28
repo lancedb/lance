@@ -8,29 +8,44 @@ use std::sync::{Arc, Mutex};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
+    catalog::streaming::StreamingTable,
     dataframe::DataFrame,
-    datasource::streaming::StreamingTable,
     execution::{
         context::{SessionConfig, SessionContext},
         disk_manager::DiskManagerConfig,
         memory_pool::FairSpillPool,
-        runtime_env::{RuntimeConfig, RuntimeEnv},
+        runtime_env::RuntimeEnvBuilder,
         TaskContext,
     },
     physical_plan::{
-        display::DisplayableExecutionPlan, stream::RecordBatchStreamAdapter,
-        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-        SendableRecordBatchStream,
+        analyze::AnalyzeExec,
+        display::DisplayableExecutionPlan,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
+        streaming::PartitionStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use lazy_static::lazy_static;
 
-use futures::stream;
+use futures::{stream, StreamExt};
 use lance_arrow::SchemaExt;
-use lance_core::Result;
+use lance_core::{
+    utils::{
+        futures::FinallyStreamExt,
+        tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION},
+    },
+    Error, Result,
+};
 use log::{debug, info, warn};
+use snafu::location;
+
+use crate::utils::{
+    MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
+    PARTS_LOADED_METRIC, REQUESTS_METRIC,
+};
 
 /// An source execution node created from an existing stream
 ///
@@ -57,7 +72,8 @@ impl OneShotExec {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(schema),
                 Partitioning::RoundRobinBatch(1),
-                datafusion::physical_plan::ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
         }
     }
@@ -165,6 +181,8 @@ impl ExecutionPlan for OneShotExec {
 pub struct LanceExecutionOptions {
     pub use_spilling: bool,
     pub mem_pool_size: Option<u64>,
+    pub batch_size: Option<usize>,
+    pub target_partition: Option<usize>,
 }
 
 const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
@@ -197,42 +215,118 @@ impl LanceExecutionOptions {
     }
 }
 
-pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
-    let session_config = SessionConfig::new();
-    let mut runtime_config = RuntimeConfig::new();
-    if options.use_spilling() {
-        runtime_config.disk_manager = DiskManagerConfig::NewOs;
-        runtime_config.memory_pool = Some(Arc::new(FairSpillPool::new(
-            options.mem_pool_size() as usize
-        )));
+pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
+    let mut session_config = SessionConfig::new();
+    let mut runtime_env_builder = RuntimeEnvBuilder::new();
+    if let Some(target_partition) = options.target_partition {
+        session_config = session_config.with_target_partitions(target_partition);
     }
-    let runtime_env = Arc::new(RuntimeEnv::new(runtime_config).unwrap());
+    if options.use_spilling() {
+        runtime_env_builder = runtime_env_builder
+            .with_disk_manager(DiskManagerConfig::new())
+            .with_memory_pool(Arc::new(FairSpillPool::new(
+                options.mem_pool_size() as usize
+            )));
+    }
+    let runtime_env = runtime_env_builder.build_arc().unwrap();
     SessionContext::new_with_config_rt(session_config, runtime_env)
 }
 
 lazy_static! {
     static ref DEFAULT_SESSION_CONTEXT: SessionContext =
-        new_session_context(LanceExecutionOptions::default());
+        new_session_context(&LanceExecutionOptions::default());
     static ref DEFAULT_SESSION_CONTEXT_WITH_SPILLING: SessionContext = {
-        new_session_context(LanceExecutionOptions {
+        new_session_context(&LanceExecutionOptions {
             use_spilling: true,
             ..Default::default()
         })
     };
 }
 
-pub fn get_session_context(options: LanceExecutionOptions) -> SessionContext {
-    let session_ctx: SessionContext;
-    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE {
-        if options.use_spilling() {
-            session_ctx = DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone();
+pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
+    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE && options.target_partition.is_none()
+    {
+        return if options.use_spilling() {
+            DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone()
         } else {
-            session_ctx = DEFAULT_SESSION_CONTEXT.clone();
-        }
-    } else {
-        session_ctx = new_session_context(options)
+            DEFAULT_SESSION_CONTEXT.clone()
+        };
     }
-    session_ctx
+    new_session_context(options)
+}
+
+fn get_task_context(
+    session_ctx: &SessionContext,
+    options: &LanceExecutionOptions,
+) -> Arc<TaskContext> {
+    let mut state = session_ctx.state();
+    if let Some(batch_size) = options.batch_size.as_ref() {
+        state.config_mut().options_mut().execution.batch_size = *batch_size;
+    }
+
+    state.task_ctx()
+}
+
+#[derive(Default)]
+struct SummaryCounts {
+    iops: usize,
+    requests: usize,
+    bytes_read: usize,
+    indices_loaded: usize,
+    parts_loaded: usize,
+    index_comparisons: usize,
+}
+
+fn visit_node(node: &dyn ExecutionPlan, counts: &mut SummaryCounts) {
+    if let Some(metrics) = node.metrics() {
+        counts.iops += metrics
+            .find_count(IOPS_METRIC)
+            .map(|c| c.value())
+            .unwrap_or(0);
+        counts.requests += metrics
+            .find_count(REQUESTS_METRIC)
+            .map(|c| c.value())
+            .unwrap_or(0);
+        counts.bytes_read += metrics
+            .find_count(BYTES_READ_METRIC)
+            .map(|c| c.value())
+            .unwrap_or(0);
+        counts.indices_loaded += metrics
+            .find_count(INDICES_LOADED_METRIC)
+            .map(|c| c.value())
+            .unwrap_or(0);
+        counts.parts_loaded += metrics
+            .find_count(PARTS_LOADED_METRIC)
+            .map(|c| c.value())
+            .unwrap_or(0);
+        counts.index_comparisons += metrics
+            .find_count(INDEX_COMPARISONS_METRIC)
+            .map(|c| c.value())
+            .unwrap_or(0);
+    }
+    for child in node.children() {
+        visit_node(child.as_ref(), counts);
+    }
+}
+
+fn report_plan_summary_metrics(plan: &dyn ExecutionPlan) {
+    let output_rows = plan
+        .metrics()
+        .map(|m| m.output_rows().unwrap_or(0))
+        .unwrap_or(0);
+    let mut counts = SummaryCounts::default();
+    visit_node(plan, &mut counts);
+    tracing::info!(
+        target: TRACE_EXECUTION,
+        type = EXECUTION_PLAN_RUN,
+        output_rows,
+        iops = counts.iops,
+        requests = counts.requests,
+        bytes_read = counts.bytes_read,
+        indices_loaded = counts.indices_loaded,
+        parts_loaded = counts.parts_loaded,
+        index_comparisons = counts.index_comparisons,
+    );
 }
 
 /// Executes a plan using default session & runtime configuration
@@ -247,12 +341,43 @@ pub fn execute_plan(
         DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
     );
 
-    let session_ctx = get_session_context(options);
+    let session_ctx = get_session_context(&options);
 
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
     assert_eq!(plan.properties().partitioning.partition_count(), 1);
-    Ok(plan.execute(0, session_ctx.task_ctx())?)
+    let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
+
+    let schema = stream.schema();
+    let stream = stream.finally(move || {
+        report_plan_summary_metrics(plan.as_ref());
+    });
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+}
+
+pub async fn analyze_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+) -> Result<String> {
+    let schema = plan.schema();
+    let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
+
+    let session_ctx = get_session_context(&options);
+    assert_eq!(analyze.properties().partitioning.partition_count(), 1);
+    let mut stream = analyze
+        .execute(0, get_task_context(&session_ctx, &options))
+        .map_err(|err| {
+            Error::io(
+                format!("Failed to execute analyze plan: {}", err),
+                location!(),
+            )
+        })?;
+
+    // fully execute the plan
+    while (stream.next().await).is_some() {}
+
+    let display = DisplayableExecutionPlan::with_metrics(analyze.as_ref());
+    Ok(format!("{}", display.indent(true)))
 }
 
 pub trait SessionContextExt {
@@ -268,6 +393,16 @@ pub trait SessionContextExt {
 struct OneShotPartitionStream {
     data: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     schema: Arc<ArrowSchema>,
+}
+
+impl std::fmt::Debug for OneShotPartitionStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let data = self.data.lock().unwrap();
+        f.debug_struct("OneShotPartitionStream")
+            .field("exhausted", &data.is_none())
+            .field("schema", self.schema.as_ref())
+            .finish()
+    }
 }
 
 impl OneShotPartitionStream {

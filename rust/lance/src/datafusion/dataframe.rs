@@ -9,9 +9,9 @@ use std::{
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
-    catalog::Session,
+    catalog::{streaming::StreamingTable, Session},
     dataframe::DataFrame,
-    datasource::{streaming::StreamingTable, TableProvider},
+    datasource::TableProvider,
     error::DataFusionError,
     execution::{context::SessionContext, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
@@ -22,6 +22,7 @@ use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
 
 use crate::Dataset;
 
+#[derive(Debug)]
 pub struct LanceTableProvider {
     dataset: Arc<Dataset>,
     full_schema: Arc<Schema>,
@@ -153,6 +154,14 @@ impl OneShotPartitionStream {
     }
 }
 
+impl std::fmt::Debug for OneShotPartitionStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneShotPartitionStream")
+            .field("schema", &self.schema)
+            .finish()
+    }
+}
+
 impl PartitionStream for OneShotPartitionStream {
     fn schema(&self) -> &SchemaRef {
         &self.schema
@@ -188,5 +197,60 @@ impl SessionContextExt for SessionContext {
         let part_stream = Arc::new(OneShotPartitionStream::new(data));
         let provider = StreamingTable::try_new(schema, vec![part_stream])?;
         self.read_table(Arc::new(provider))
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::AsArray,
+        datatypes::{Int32Type, Int64Type},
+    };
+    use datafusion::prelude::SessionContext;
+    use lance_datagen::array;
+    use tempfile::tempdir;
+
+    use crate::{
+        datafusion::LanceTableProvider,
+        utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
+    };
+
+    #[tokio::test]
+    pub async fn test_table_provider() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let data = lance_datagen::gen()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step_custom::<Int32Type>(0, 2))
+            .into_dataset(
+                test_uri,
+                FragmentCount::from(10),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+
+        let ctx = SessionContext::new();
+
+        ctx.register_table(
+            "foo",
+            Arc::new(LanceTableProvider::new(Arc::new(data), true, true)),
+        )
+        .unwrap();
+
+        let df = ctx
+            .sql("SELECT SUM(x) FROM foo WHERE y > 100")
+            .await
+            .unwrap();
+
+        let results = df.collect().await.unwrap();
+        assert_eq!(results.len(), 1);
+        let results = results.into_iter().next().unwrap();
+        assert_eq!(results.num_columns(), 1);
+        assert_eq!(results.num_rows(), 1);
+        // SUM(0..100) - SUM(0..50) = 3675
+        assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 3675);
     }
 }

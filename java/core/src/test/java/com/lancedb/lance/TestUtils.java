@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -48,10 +47,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TestUtils {
   public static class SimpleTestDataset {
-    private final Schema schema = new Schema(Arrays.asList(
-      Field.nullable("id", new ArrowType.Int(32, true)),
-      Field.nullable("name", new ArrowType.Utf8())
-    ), null);
+    private final Schema schema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", new ArrowType.Utf8())),
+            null);
     private final BufferAllocator allocator;
     private final String datasetPath;
 
@@ -59,25 +60,33 @@ public class TestUtils {
       this.allocator = allocator;
       this.datasetPath = datasetPath;
     }
-    
+
     public Schema getSchema() {
       return schema;
     }
-    
+
     public Dataset createEmptyDataset() {
-      Dataset dataset = Dataset.create(allocator, datasetPath,
-        schema, new WriteParams.Builder().build());
+      Dataset dataset =
+          Dataset.create(allocator, datasetPath, schema, new WriteParams.Builder().build());
       assertEquals(0, dataset.countRows());
       assertEquals(schema, dataset.getSchema());
-      List<DatasetFragment> fragments = dataset.getFragments();
+      List<Fragment> fragments = dataset.getFragments();
       assertEquals(0, fragments.size());
       assertEquals(1, dataset.version());
       assertEquals(1, dataset.latestVersion());
       return dataset;
     }
 
-    public FragmentMetadata createNewFragment(int fragmentId, int rowCount) {
-      FragmentMetadata fragmentMeta;
+    public FragmentMetadata createNewFragment(int rowCount) {
+      List<FragmentMetadata> fragmentMetas = createNewFragment(rowCount, Integer.MAX_VALUE);
+      assertEquals(1, fragmentMetas.size());
+      FragmentMetadata fragmentMeta = fragmentMetas.get(0);
+      assertEquals(rowCount, fragmentMeta.getPhysicalRows());
+      return fragmentMeta;
+    }
+
+    public List<FragmentMetadata> createNewFragment(int rowCount, int maxRowsPerFile) {
+      List<FragmentMetadata> fragmentMetas;
       try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
         root.allocateNew();
         IntVector idVector = (IntVector) root.getVector("id");
@@ -90,24 +99,81 @@ public class TestUtils {
         }
         root.setRowCount(rowCount);
 
-        fragmentMeta = Fragment.create(datasetPath,
-            allocator, root, Optional.of(fragmentId), new WriteParams.Builder().build());
-        assertEquals(fragmentId, fragmentMeta.getId());
-        assertEquals(rowCount, fragmentMeta.getPhysicalRows());
+        fragmentMetas =
+            Fragment.create(
+                datasetPath,
+                allocator,
+                root,
+                new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
       }
-      return fragmentMeta;
+      return fragmentMetas;
     }
 
     public Dataset write(long version, int rowCount) {
-      FragmentMetadata metadata = createNewFragment(rowCount, rowCount);
+      FragmentMetadata metadata = createNewFragment(rowCount);
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(metadata));
       return Dataset.commit(allocator, datasetPath, appendOp, Optional.of(version));
     }
-    
+
+    public Dataset writeSortByDataset(long version) {
+      List<FragmentMetadata> fragmentMetas;
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        root.allocateNew();
+        IntVector idVector = (IntVector) root.getVector("id");
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+        /* dataset context
+         * i: |  id   | name |
+         * 0: |  0    | null |
+         * 1: |  1    |  P0  |
+         * 2: | null  |  P1  |
+         * 3: |  2    |  P2  |
+         * 4: |  2    |  P3  |
+         * 5: | null  |  P3  |
+         * 6: |  3    | null |
+         * 7: |  4    |  P4  |
+         * 8: |  4    |  P5  |
+         * 9: |  5    |  P5  |
+         */
+        idVector.set(0, 0);
+        idVector.set(1, 1);
+        idVector.setNull(2);
+        idVector.set(3, 2);
+        idVector.set(4, 2);
+        idVector.setNull(5);
+        idVector.set(6, 3);
+        idVector.set(7, 4);
+        idVector.set(8, 4);
+        idVector.set(9, 5);
+
+        nameVector.setNull(0);
+        nameVector.set(1, "P0".getBytes());
+        nameVector.set(2, "P1".getBytes());
+        nameVector.set(3, "P2".getBytes());
+        nameVector.set(4, "P3".getBytes());
+        nameVector.set(5, "P3".getBytes());
+        nameVector.setNull(6);
+        nameVector.set(7, "P4".getBytes());
+        nameVector.set(8, "P5".getBytes());
+        nameVector.set(9, "P5".getBytes());
+
+        root.setRowCount(10);
+
+        fragmentMetas =
+            Fragment.create(
+                datasetPath,
+                allocator,
+                root,
+                new WriteParams.Builder().withMaxRowsPerFile(Integer.MAX_VALUE).build());
+      }
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(fragmentMetas);
+      return Dataset.commit(allocator, datasetPath, appendOp, Optional.of(version));
+    }
+
     public void validateScanResults(Dataset dataset, Scanner scanner, int totalRows, int batchRows)
         throws IOException {
       try (ArrowReader reader = scanner.scanBatches()) {
-        assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
+        assertEquals(
+            dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
         int rowcount = 0;
         while (reader.loadNextBatch()) {
           int currentRowCount = reader.getVectorSchemaRoot().getRowCount();
@@ -118,10 +184,12 @@ public class TestUtils {
       }
     }
 
-    public void validateScanResults(Dataset dataset, Scanner scanner, int expectedRows, int batchRows, int offset)
+    public void validateScanResults(
+        Dataset dataset, Scanner scanner, int expectedRows, int batchRows, int offset)
         throws IOException {
       try (ArrowReader reader = scanner.scanBatches()) {
-        assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
+        assertEquals(
+            dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
         int rowcount = 0;
         while (reader.loadNextBatch()) {
           VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -132,7 +200,8 @@ public class TestUtils {
           IntVector idVector = (IntVector) root.getVector("id");
           for (int i = 0; i < currentRowCount; i++) {
             int expectedId = offset + rowcount - currentRowCount + i;
-            assertEquals(expectedId, idVector.get(i), "Mismatch at row " + (rowcount - currentRowCount + i));
+            assertEquals(
+                expectedId, idVector.get(i), "Mismatch at row " + (rowcount - currentRowCount + i));
           }
         }
         assertEquals(expectedRows, rowcount);
@@ -146,32 +215,33 @@ public class TestUtils {
     private final BufferAllocator allocator;
     private final String datasetPath;
     private Schema schema;
-    
+
     public RandomAccessDataset(BufferAllocator allocator, String datasetPath) {
       this.allocator = allocator;
       this.datasetPath = datasetPath;
     }
-    
+
     public void createDatasetAndValidate() throws IOException, URISyntaxException {
       Path path = Paths.get(DatasetTest.class.getResource(DATA_FILE).toURI());
       try (BufferAllocator allocator = new RootAllocator();
-           ArrowFileReader reader =
-               new ArrowFileReader(
-                   new SeekableReadChannel(
-                       new ByteArrayReadableSeekableByteChannel(Files.readAllBytes(path))),
-                   allocator);
-           ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
+          ArrowFileReader reader =
+              new ArrowFileReader(
+                  new SeekableReadChannel(
+                      new ByteArrayReadableSeekableByteChannel(Files.readAllBytes(path))),
+                  allocator);
+          ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
         Data.exportArrayStream(allocator, reader, arrowStream);
-        try (Dataset dataset = Dataset.create(
-            allocator,
-            arrowStream,
-            datasetPath,
-            new WriteParams.Builder()
-                .withMaxRowsPerFile(10)
-                .withMaxRowsPerGroup(20)
-                .withMode(WriteParams.WriteMode.CREATE)
-                .withStorageOptions(new HashMap<>())
-                .build())) {
+        try (Dataset dataset =
+            Dataset.create(
+                allocator,
+                arrowStream,
+                datasetPath,
+                new WriteParams.Builder()
+                    .withMaxRowsPerFile(10)
+                    .withMaxRowsPerGroup(20)
+                    .withMode(WriteParams.WriteMode.CREATE)
+                    .withStorageOptions(new HashMap<>())
+                    .build())) {
           assertEquals(ROW_COUNT, dataset.countRows());
           schema = reader.getVectorSchemaRoot().getSchema();
           validateFragments(dataset);
@@ -198,7 +268,7 @@ public class TestUtils {
     private void validateFragments(Dataset dataset) {
       assertNotNull(schema);
       assertNotNull(dataset);
-      List<DatasetFragment> fragments = dataset.getFragments();
+      List<Fragment> fragments = dataset.getFragments();
       assertEquals(1, fragments.size());
       assertEquals(0, fragments.get(0).getId());
       assertEquals(9, fragments.get(0).countRows());

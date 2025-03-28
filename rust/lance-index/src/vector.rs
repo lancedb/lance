@@ -4,16 +4,22 @@
 //! Vector Index
 //!
 
+use std::any::Any;
+use std::fmt::Debug;
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
+use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
 use lance_core::{Result, ROW_ID_FIELD};
+use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lazy_static::lazy_static;
+use object_store::path::Path;
 use quantizer::{QuantizationType, Quantizer};
 use v3::subindex::SubIndexType;
 
@@ -33,6 +39,7 @@ pub mod utils;
 pub mod v3;
 
 use super::pb;
+use crate::metrics::MetricsCollector;
 use crate::{prefilter::PreFilter, Index};
 pub use residual::RESIDUAL_COLUMN;
 
@@ -43,6 +50,7 @@ pub const INDEX_UUID_COLUMN: &str = "__index_uuid";
 pub const PART_ID_COLUMN: &str = "__ivf_part_id";
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
 pub const SQ_CODE_COLUMN: &str = "__sq_code";
+pub const LOSS_METADATA_KEY: &str = "_loss";
 
 lazy_static! {
     pub static ref VECTOR_RESULT_SCHEMA: arrow_schema::SchemaRef =
@@ -50,6 +58,8 @@ lazy_static! {
             Field::new(DIST_COL, arrow_schema::DataType::Float32, false),
             ROW_ID_FIELD.clone(),
         ]));
+    pub static ref PART_ID_FIELD: arrow_schema::Field =
+        arrow_schema::Field::new(PART_ID_COLUMN, arrow_schema::DataType::UInt32, true);
 }
 
 /// Query parameters for the vector indices
@@ -63,6 +73,12 @@ pub struct Query {
 
     /// Top k results to return.
     pub k: usize,
+
+    /// The lower bound (inclusive) of the distance to be searched.
+    pub lower_bound: Option<f32>,
+
+    /// The upper bound (exclusive) of the distance to be searched.
+    pub upper_bound: Option<f32>,
 
     /// The number of probes to load and search.
     pub nprobes: usize,
@@ -127,7 +143,12 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
-    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch>;
+    async fn search(
+        &self,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch>;
 
     fn find_partitions(&self, query: &Query) -> Result<UInt32Array>;
 
@@ -136,6 +157,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         partition_id: usize,
         query: &Query,
         pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch>;
 
     /// If the index is loadable by IVF, so it can be a sub-index that
@@ -171,6 +193,21 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         self.load(reader, offset, length).await
     }
 
+    // for IVF only
+    async fn partition_reader(
+        &self,
+        _partition_id: usize,
+        _with_vector: bool,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<SendableRecordBatchStream> {
+        unimplemented!("only for IVF")
+    }
+
+    // for SubIndex only
+    async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream>;
+
+    fn num_rows(&self) -> u64;
+
     /// Return the IDs of rows in the index.
     fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_>;
 
@@ -182,14 +219,33 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// If an old row id is not in the mapping then it should be
     /// left alone.
-    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
+    async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
+
+    /// Remap the index according to mapping
+    ///
+    /// write the remapped index to the index_dir
+    /// this is available for only v3 index
+    async fn remap_to(
+        self: Arc<Self>,
+        _store: ObjectStore,
+        _mapping: &HashMap<u64, Option<u64>>,
+        _column: String,
+        _index_dir: Path,
+    ) -> Result<()> {
+        unimplemented!("only for v3 index")
+    }
 
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;
 
-    fn ivf_model(&self) -> IvfModel;
+    fn ivf_model(&self) -> &IvfModel;
     fn quantizer(&self) -> Quantizer;
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);
+}
+
+// it can be an IVF index or a partition of IVF index
+pub trait VectorIndexCacheEntry: Debug + Send + Sync + DeepSizeOf {
+    fn as_any(&self) -> &dyn Any;
 }

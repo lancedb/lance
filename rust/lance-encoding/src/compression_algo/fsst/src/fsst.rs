@@ -18,8 +18,11 @@ const FSST_CODE_MASK: u16 = FSST_CODE_MAX - 1;
 const FSST_SAMPLETARGET: usize = 1 << 14;
 const FSST_SAMPLEMAXSZ: usize = 2 * FSST_SAMPLETARGET;
 
-// the the input size is less than 4MB, we mark the file header and copy the input to the output as is
-const FSST_LEAST_INPUT_SIZE: usize = 4 * 1024 * 1024; // 4MB
+// if the input size is less than 4MB, we mark the file header and copy the input to the output as is
+pub const FSST_LEAST_INPUT_SIZE: usize = 4 * 1024 * 1024; // 4MB
+
+// if the max length of the input strings are less than `FSST_LEAST_INPUT_MAX_LENGTH`, we shouldn't use FSST.
+pub const FSST_LEAST_INPUT_MAX_LENGTH: u64 = 5;
 
 // we only use the lower 32 bits in icl, so we can use 1 << 32 to represent a free slot in the hash table
 const FSST_ICL_FREE: u64 = 1 << 32;
@@ -35,7 +38,7 @@ const FSST_HASH_PRIME: u64 = 2971215073;
 const FSST_SHIFT: usize = 15;
 #[inline]
 fn fsst_hash(w: u64) -> u64 {
-    w.wrapping_mul(FSST_HASH_PRIME) ^ (w.wrapping_mul(FSST_HASH_PRIME)) >> FSST_SHIFT
+    w.wrapping_mul(FSST_HASH_PRIME) ^ ((w.wrapping_mul(FSST_HASH_PRIME)) >> FSST_SHIFT)
 }
 
 const MAX_SYMBOL_LENGTH: usize = 8;
@@ -116,7 +119,7 @@ impl Symbol {
         Self {
             val: c as u64,
             // in a symbol which represents a single character, 56 bits(7 bytes) are ignored, code length is 1
-            icl: (1 << CODE_LEN_SHIFT_IN_ICL) | (code as u64) << CODE_SHIFT_IN_ICL | 56,
+            icl: (1 << CODE_LEN_SHIFT_IN_ICL) | ((code as u64) << CODE_SHIFT_IN_ICL) | 56,
         }
     }
 
@@ -365,7 +368,7 @@ impl SymbolTable {
             return self.byte_codes[input[0] as usize] & FSST_CODE_MASK;
         }
         if len == 2 {
-            let short_code = (input[1] as usize) << 8 | input[0] as usize;
+            let short_code = ((input[1] as usize) << 8) | input[0] as usize;
             if self.short_codes[short_code] >= FSST_CODE_BASE {
                 return self.short_codes[short_code] & FSST_CODE_MASK;
             } else {
@@ -1050,9 +1053,9 @@ impl FsstEncoder {
         let st = &self.symbol_table;
 
         let st_info: u64 = FSST_MAGIC
-            | (self.encoder_switch as u64) << 24
-            | ((st.suffix_lim & 255) as u64) << 16
-            | ((st.terminator & 255) as u64) << 8
+            | ((self.encoder_switch as u64) << 24)
+            | (((st.suffix_lim & 255) as u64) << 16)
+            | (((st.terminator & 255) as u64) << 8)
             | ((st.n_symbols & 255) as u64);
 
         let st_info_bytes = st_info.to_ne_bytes();

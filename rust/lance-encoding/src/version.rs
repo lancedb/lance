@@ -4,7 +4,7 @@
 use std::str::FromStr;
 
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
 pub const LEGACY_FORMAT_VERSION: &str = "0.1";
 pub const V2_FORMAT_2_0: &str = "2.0";
@@ -88,6 +88,7 @@ impl FromStr for LanceFileVersion {
             V2_FORMAT_2_1 => Ok(Self::V2_1),
             "stable" => Ok(Self::Stable),
             "legacy" => Ok(Self::Legacy),
+            "next" => Ok(Self::Next),
             // Version 0.3 is an alias of 2.0
             "0.3" => Ok(Self::V2_0),
             _ => Err(Error::InvalidInput {

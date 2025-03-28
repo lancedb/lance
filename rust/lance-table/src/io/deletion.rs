@@ -11,13 +11,14 @@ use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Buf;
 use lance_core::error::{box_error, CorruptFileSnafu};
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DELETION, TRACE_FILE_AUDIT};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
-use snafu::{location, Location, ResultExt};
-use tracing::instrument;
+use snafu::{location, ResultExt};
+use tracing::{info, instrument};
 
 use crate::format::{DeletionFile, DeletionFileType, Fragment};
 
@@ -56,8 +57,8 @@ pub async fn write_deletion_file(
     removed_rows: &DeletionVector,
     object_store: &ObjectStore,
 ) -> Result<Option<DeletionFile>> {
-    match removed_rows {
-        DeletionVector::NoDeletions => Ok(None),
+    let deletion_file = match removed_rows {
+        DeletionVector::NoDeletions => None,
         DeletionVector::Set(set) => {
             let id = rand::thread_rng().gen::<u64>();
             let deletion_file = DeletionFile {
@@ -90,7 +91,9 @@ pub async fn write_deletion_file(
 
             object_store.put(&path, &out).await?;
 
-            Ok(Some(deletion_file))
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_DELETION, path = path.to_string());
+
+            Some(deletion_file)
         }
         DeletionVector::Bitmap(bitmap) => {
             let id = rand::thread_rng().gen::<u64>();
@@ -107,9 +110,12 @@ pub async fn write_deletion_file(
 
             object_store.put(&path, &out).await?;
 
-            Ok(Some(deletion_file))
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_DELETION, path = path.to_string());
+
+            Some(deletion_file)
         }
-    }
+    };
+    Ok(deletion_file)
 }
 
 /// Read a deletion file for a fragment.
@@ -136,7 +142,10 @@ pub async fn read_deletion_file(
             let mut batches: Vec<RecordBatch> = ArrowFileReader::try_new(data, None)?
                 .collect::<std::result::Result<_, ArrowError>>()
                 .map_err(box_error)
-                .context(CorruptFileSnafu { path: path.clone() })?;
+                .context(CorruptFileSnafu {
+                    path: path.clone(),
+                    location: location!(),
+                })?;
 
             if batches.len() != 1 {
                 return Err(Error::corrupt_file(
@@ -189,7 +198,10 @@ pub async fn read_deletion_file(
             let reader = data.reader();
             let bitmap = RoaringBitmap::deserialize_from(reader)
                 .map_err(box_error)
-                .context(CorruptFileSnafu { path })?;
+                .context(CorruptFileSnafu {
+                    path,
+                    location: location!(),
+                })?;
 
             Ok(Some(DeletionVector::Bitmap(bitmap)))
         }

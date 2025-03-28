@@ -15,12 +15,13 @@ use datafusion::logical_expr::col;
 use datafusion::logical_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::physical_plan::{ColumnarValue, ExecutionMode, PlanProperties};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::{ColumnarValue, PlanProperties};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
-        Partitioning, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
     },
     prelude::Expr,
 };
@@ -32,7 +33,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_io::ReadBatchParams;
 use lance_table::format::Fragment;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::scanner::LEGACY_DEFAULT_FRAGMENT_READAHEAD;
@@ -46,6 +47,7 @@ use crate::{
     Dataset,
 };
 
+use super::utils::InstrumentedRecordBatchStreamAdapter;
 use super::Planner;
 
 #[derive(Debug, Clone)]
@@ -93,6 +95,7 @@ pub struct LancePushdownScanExec {
     config: ScanConfig,
     output_schema: Arc<ArrowSchema>,
     properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl LancePushdownScanExec {
@@ -131,7 +134,8 @@ impl LancePushdownScanExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
 
         Ok(Self {
@@ -143,6 +147,7 @@ impl LancePushdownScanExec {
             config,
             output_schema,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 }
@@ -166,18 +171,28 @@ impl ExecutionPlan for LancePushdownScanExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if !children.is_empty() {
+            Err(DataFusionError::Internal(
+                "LancePushdownScanExec does not accept children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         Ok(Statistics::new_unknown(self.output_schema.as_ref()))
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         // To get a stream with a static lifetime, we clone self put it into
@@ -213,9 +228,11 @@ impl ExecutionPlan for LancePushdownScanExec {
             .buffered(self.config.fragment_readahead)
             .try_flatten();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
             batch_stream,
+            partition,
+            &self.metrics,
         )))
     }
 
@@ -275,7 +292,7 @@ impl FragmentScanner {
         // We will call the reader with projections. In order for this to work
         // we must ensure that we open the fragment with the maximal schema.
         let mut reader = fragment
-            .open(dataset.schema(), FragReadConfig::default(), None)
+            .open(dataset.schema(), FragReadConfig::default())
             .await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();

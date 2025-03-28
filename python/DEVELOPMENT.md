@@ -16,6 +16,14 @@ re-building.
 
 ## Running tests
 
+To run the tests, first install the test packages:
+
+```shell
+pip install '.[tests]'
+```
+
+then:
+
 ```shell
 make test
 ```

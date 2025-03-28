@@ -3,10 +3,11 @@
 
 //! Utilities for byte arrays
 
-use std::{ops::Deref, ptr::NonNull, sync::Arc};
+use std::{ops::Deref, panic::RefUnwindSafe, ptr::NonNull, sync::Arc};
 
 use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
-use snafu::{location, Location};
+use itertools::Either;
+use snafu::location;
 
 use lance_core::{utils::bit::is_pwr_two, Error, Result};
 
@@ -104,6 +105,18 @@ impl LanceBuffer {
         hex::encode_upper(self)
     }
 
+    /// Combine multiple buffers into a single buffer
+    ///
+    /// This does involve a data copy (and allocation of a new buffer)
+    pub fn concat(buffers: &[Self]) -> Self {
+        let total_len = buffers.iter().map(|b| b.len()).sum();
+        let mut data = Vec::with_capacity(total_len);
+        for buffer in buffers {
+            data.extend_from_slice(buffer.as_ref());
+        }
+        Self::Owned(data)
+    }
+
     /// Converts the buffer into a hex string, inserting a space
     /// between words
     pub fn as_spaced_hex(&self, bytes_per_word: u32) -> String {
@@ -148,6 +161,14 @@ impl LanceBuffer {
                     Arc::new(bytes),
                 ))
             }
+        }
+    }
+
+    /// Convert a buffer into a bytes::Bytes object
+    pub fn into_bytes(self) -> bytes::Bytes {
+        match self {
+            Self::Owned(buf) => buf.into(),
+            Self::Borrowed(buf) => buf.into_vec::<u8>().unwrap().into(),
         }
     }
 
@@ -219,10 +240,29 @@ impl LanceBuffer {
         Self::Borrowed(Buffer::from_vec(vec))
     }
 
+    /// Reinterprets Arc<[T]> as a LanceBuffer
+    ///
+    /// This is similar to [`Self::reinterpret_vec`] but for Arc<[T]> instead of Vec<T>
+    ///
+    /// The same alignment constraints apply
+    pub fn reinterpret_slice<T: ArrowNativeType + RefUnwindSafe>(arc: Arc<[T]>) -> Self {
+        let slice = arc.as_ref();
+        let data = NonNull::new(slice.as_ptr() as _).unwrap_or(NonNull::dangling());
+        let len = std::mem::size_of_val(slice);
+        // SAFETY: the ptr will be valid for len items if the Arc<[T]> is valid
+        let buffer = unsafe { Buffer::from_custom_allocation(data, len, Arc::new(arc)) };
+        Self::Borrowed(buffer)
+    }
+
     /// Reinterprets a LanceBuffer into a Vec<T>
     ///
     /// If the underlying buffer is not properly aligned, this will involve a copy of the data
-    pub fn borrow_to_typed_slice<T: ArrowNativeType>(&mut self) -> impl AsRef<[T]> {
+    ///
+    /// Note: doing this sort of re-interpretation generally makes assumptions about the endianness
+    /// of the data.  Lance does not support big-endian machines so this is safe.  However, if we end
+    /// up supporting big-endian machines in the future, then any use of this method will need to be
+    /// carefully reviewed.
+    pub fn borrow_to_typed_slice<T: ArrowNativeType>(&mut self) -> ScalarBuffer<T> {
         let align = std::mem::align_of::<T>();
         let is_aligned = self.as_ptr().align_offset(align) == 0;
         if self.len() % std::mem::size_of::<T>() != 0 {
@@ -368,6 +408,40 @@ impl From<Vec<u8>> for LanceBuffer {
 impl From<Buffer> for LanceBuffer {
     fn from(buffer: Buffer) -> Self {
         Self::Borrowed(buffer)
+    }
+}
+
+// An iterator that keeps a clone of a borrowed LanceBuffer so we
+// can have a 'static lifetime
+pub struct BorrowedBufferIter {
+    buffer: arrow_buffer::Buffer,
+    index: usize,
+}
+
+impl Iterator for BorrowedBufferIter {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.buffer.len() {
+            None
+        } else {
+            // SAFETY: we just checked that index is in bounds
+            let byte = unsafe { self.buffer.get_unchecked(self.index) };
+            self.index += 1;
+            Some(*byte)
+        }
+    }
+}
+
+impl IntoIterator for LanceBuffer {
+    type Item = u8;
+    type IntoIter = Either<std::vec::IntoIter<u8>, BorrowedBufferIter>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Borrowed(buffer) => Either::Right(BorrowedBufferIter { buffer, index: 0 }),
+            Self::Owned(buffer) => Either::Left(buffer.into_iter()),
+        }
     }
 }
 

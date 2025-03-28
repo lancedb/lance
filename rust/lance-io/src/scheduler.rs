@@ -5,7 +5,7 @@ use bytes::Bytes;
 use futures::channel::oneshot;
 use futures::{FutureExt, TryFutureExt};
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -24,6 +24,19 @@ use crate::traits::Reader;
 const BACKPRESSURE_MIN: u64 = 5;
 // Don't log backpressure warnings more than once / minute
 const BACKPRESSURE_DEBOUNCE: u64 = 60;
+
+// Global counter of how many IOPS we have issued
+static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Global counter of how many bytes were read by the scheduler
+static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn iops_counter() -> u64 {
+    IOPS_COUNTER.load(Ordering::Acquire)
+}
+
+pub fn bytes_read_counter() -> u64 {
+    BYTES_READ_COUNTER.load(Ordering::Acquire)
+}
 
 // There are two structures that control the I/O scheduler concurrency.  First,
 // we have a hard limit on the number of IOPS that can be issued concurrently.
@@ -64,7 +77,7 @@ struct IopsReservation<'a> {
     value: Option<SemaphorePermit<'a>>,
 }
 
-impl<'a> IopsReservation<'a> {
+impl IopsReservation<'_> {
     // Forget the reservation, so it won't be released on drop
     fn forget(&mut self) {
         if let Some(value) = self.value.take() {
@@ -209,7 +222,7 @@ impl IoQueueState {
             || since_last_warn > BACKPRESSURE_DEBOUNCE
         {
             tracing::event!(tracing::Level::WARN, "Backpressure throttle exceeded");
-            log::warn!("Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind");
+            log::debug!("Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind");
             self.last_warn
                 .store(seconds_elapsed.max(1), Ordering::Release);
         }
@@ -456,6 +469,8 @@ impl IoTask {
             let bytes_fut = self
                 .reader
                 .get_range(self.to_read.start as usize..self.to_read.end as usize);
+            IOPS_COUNTER.fetch_add(1, Ordering::Release);
+            BYTES_READ_COUNTER.fetch_add(self.num_bytes(), Ordering::Release);
             bytes_fut.await.map_err(Error::from)
         };
         IOPS_QUOTA.release();
@@ -482,6 +497,60 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
     }
 }
 
+#[derive(Debug)]
+struct StatsCollector {
+    iops: AtomicU64,
+    requests: AtomicU64,
+    bytes_read: AtomicU64,
+}
+
+impl StatsCollector {
+    fn new() -> Self {
+        Self {
+            iops: AtomicU64::new(0),
+            requests: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
+        }
+    }
+
+    fn iops(&self) -> u64 {
+        self.iops.load(Ordering::Relaxed)
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    fn requests(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
+    }
+
+    fn record_request(&self, request: &[Range<u64>]) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.iops.fetch_add(request.len() as u64, Ordering::Relaxed);
+        self.bytes_read.fetch_add(
+            request.iter().map(|r| r.end - r.start).sum::<u64>(),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+pub struct ScanStats {
+    pub iops: u64,
+    pub requests: u64,
+    pub bytes_read: u64,
+}
+
+impl ScanStats {
+    fn new(stats: &StatsCollector) -> Self {
+        Self {
+            iops: stats.iops(),
+            requests: stats.requests(),
+            bytes_read: stats.bytes_read(),
+        }
+    }
+}
+
 /// An I/O scheduler which wraps an ObjectStore and throttles the amount of
 /// parallel I/O that can be run.
 ///
@@ -489,6 +558,7 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
 pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
     io_queue: Arc<IoQueue>,
+    stats: Arc<StatsCollector>,
 }
 
 impl Debug for ScanScheduler {
@@ -547,6 +617,7 @@ impl ScanScheduler {
         let scheduler = Self {
             object_store,
             io_queue: io_queue.clone(),
+            stats: Arc::new(StatsCollector::new()),
         };
         tokio::task::spawn(async move { run_io_loop(io_queue).await });
         Arc::new(scheduler)
@@ -646,6 +717,10 @@ impl ScanScheduler {
             rsp.data
         })
     }
+
+    pub fn stats(&self) -> ScanStats {
+        ScanStats::new(self.stats.as_ref())
+    }
 }
 
 impl Drop for ScanScheduler {
@@ -690,6 +765,8 @@ impl FileScheduler {
         request: Vec<Range<u64>>,
         priority: u64,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+        self.root.stats.record_request(&request);
+
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.base_priority as u128) << 64) + priority as u128;
 
@@ -741,6 +818,15 @@ impl FileScheduler {
             }
 
             Ok(final_bytes)
+        }
+    }
+
+    pub fn with_priority(&self, priority: u64) -> Self {
+        Self {
+            reader: self.reader.clone(),
+            root: self.root.clone(),
+            block_size: self.block_size,
+            base_priority: priority,
         }
     }
 

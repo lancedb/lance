@@ -7,7 +7,6 @@
 //! it stores the array directly in the file. It offers O(1) read access.
 
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
-use std::ptr::NonNull;
 use std::slice::from_raw_parts;
 use std::sync::Arc;
 
@@ -30,7 +29,7 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 use tokio::io::AsyncWriteExt;
 
 use crate::encodings::{AsyncIndex, Decoder};
@@ -200,25 +199,18 @@ pub fn bytes_to_array(
     {
         // this code is taken from
         // https://github.com/apache/arrow-rs/blob/master/arrow-data/src/data.rs#L748-L768
-        let len_plus_offset = bytes.len() + offset;
+        let len_plus_offset = len + offset;
         let min_buffer_size = len_plus_offset.saturating_mul(*byte_width);
 
         // alignment or size isn't right -- just make a copy
-        if (bytes.len() < min_buffer_size) || (bytes.as_ptr().align_offset(*alignment) != 0) {
-            bytes.into()
+        if bytes.len() < min_buffer_size {
+            Buffer::copy_bytes_bytes(bytes, min_buffer_size)
         } else {
-            // SAFETY: the alignment is correct we can make this conversion
-            unsafe {
-                Buffer::from_custom_allocation(
-                    NonNull::new(bytes.as_ptr() as _).expect("should be a valid pointer"),
-                    bytes.len(),
-                    Arc::new(bytes),
-                )
-            }
+            Buffer::from_bytes_bytes(bytes, *alignment as u64)
         }
     } else {
         // cases we don't handle, just copy
-        bytes.into()
+        Buffer::from_slice_ref(bytes)
     };
 
     let array_data = ArrayDataBuilder::new(data_type.clone())
@@ -401,7 +393,7 @@ fn make_chunked_requests(
 }
 
 #[async_trait]
-impl<'a> Decoder for PlainDecoder<'a> {
+impl Decoder for PlainDecoder<'_> {
     async fn decode(&self) -> Result<ArrayRef> {
         self.get(0..self.length).await
     }
@@ -640,6 +632,25 @@ mod tests {
             arrs.push(Arc::new(arr) as ArrayRef);
         }
         test_round_trip(arrs.as_slice(), t).await;
+    }
+
+    #[tokio::test]
+    async fn test_bytes_to_array_padding() {
+        let bytes = Bytes::from_static(&[0x01, 0x00, 0x02, 0x00, 0x03]);
+        let arr = bytes_to_array(&DataType::UInt16, bytes, 3, 0).unwrap();
+
+        let expected = UInt16Array::from(vec![1, 2, 3]);
+        assert_eq!(arr.as_ref(), &expected);
+
+        // Underlying data is padded to the nearest multiple of two bytes (for u16).
+        let data = arr.to_data();
+        let buf = &data.buffers()[0];
+        let repr = format!("{:?}", buf);
+        assert!(
+            repr.contains("[1, 0, 2, 0, 3, 0]"),
+            "Underlying buffer contains unexpected data: {}",
+            repr
+        );
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ arrow-data = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
+bytes = { workspace = true }
 half = { workspace = true }
 num-traits = { workspace = true }
 rand.workspace = true

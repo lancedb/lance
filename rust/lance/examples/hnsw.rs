@@ -4,7 +4,7 @@
 //! Run recall benchmarks for HNSW.
 //!
 //! run with `cargo run --release --example hnsw`
-
+#![allow(clippy::print_stdout)]
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use futures::StreamExt;
 use lance::Dataset;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::vector::{
-    flat::storage::FlatStorage,
+    flat::storage::FlatFloatStorage,
     hnsw::{builder::HnswBuildParams, HNSW},
 };
 use lance_linalg::distance::DistanceType;
@@ -79,7 +79,7 @@ async fn main() {
     let fsl = concat(&arrs).unwrap().as_fixed_size_list().clone();
     println!("Loaded {:?} batches", fsl.len());
 
-    let vector_store = Arc::new(FlatStorage::new(fsl.clone(), DistanceType::L2));
+    let vector_store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
 
     let q = fsl.value(0);
     let k = 10;

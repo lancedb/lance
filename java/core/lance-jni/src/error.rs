@@ -19,12 +19,13 @@ use jni::{errors::Error as JniError, JNIEnv};
 use lance::error::Error as LanceError;
 use serde_json::Error as JsonError;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum JavaExceptionClass {
     IllegalArgumentException,
     IOException,
     RuntimeException,
     UnsupportedOperationException,
+    AlreadyInException,
 }
 
 impl JavaExceptionClass {
@@ -34,6 +35,8 @@ impl JavaExceptionClass {
             Self::IOException => "java/io/IOException",
             Self::RuntimeException => "java/lang/RuntimeException",
             Self::UnsupportedOperationException => "java/lang/UnsupportedOperationException",
+            // Included for display purposes.  This is not a real exception.
+            Self::AlreadyInException => "AlreadyInException",
         }
     }
 }
@@ -71,7 +74,18 @@ impl Error {
         Self::new(message, JavaExceptionClass::UnsupportedOperationException)
     }
 
+    pub fn in_exception() -> Self {
+        Self {
+            message: String::default(),
+            java_class: JavaExceptionClass::AlreadyInException,
+        }
+    }
+
     pub fn throw(&self, env: &mut JNIEnv) {
+        if self.java_class == JavaExceptionClass::AlreadyInException {
+            // An exception is already in progress, so we don't need to throw another one.
+            return;
+        }
         if let Err(e) = env.throw_new(self.java_class.as_str(), &self.message) {
             eprintln!("Error when throwing Java exception: {:?}", e.to_string());
             panic!("Error when throwing Java exception: {:?}", e);
@@ -96,6 +110,7 @@ impl From<LanceError> for Error {
             | LanceError::InvalidInput { .. } => Self::input_error(err.to_string()),
             LanceError::IO { .. } => Self::io_error(err.to_string()),
             LanceError::NotSupported { .. } => Self::unsupported_error(err.to_string()),
+            LanceError::NotFound { .. } => Self::io_error(err.to_string()),
             _ => Self::runtime_error(err.to_string()),
         }
     }
@@ -120,7 +135,12 @@ impl From<JsonError> for Error {
 
 impl From<JniError> for Error {
     fn from(err: JniError) -> Self {
-        Self::runtime_error(err.to_string())
+        match err {
+            // If we get this then it means that an exception was already in progress.  We can't
+            // throw another one so we just return an error indicating that.
+            JniError::JavaException => Self::in_exception(),
+            _ => Self::runtime_error(err.to_string()),
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 Lance Formats
 =============
 
-The Lance project includes both a table format and a file format.  Lance typically refers
+The Lance format is both a table format and a file format.  Lance typically refers
 to tables as "datasets".  A Lance dataset is designed to efficiently handle secondary indices,
 fast ingestion and modification of data, and a rich set of schema evolution features.
 
@@ -31,7 +31,7 @@ Fragments
 ~~~~~~~~~
 
 ``DataFragment`` represents a chunk of data in the dataset. Itself includes one or more ``DataFile``,
-where each ``DataFile`` can contain several columns in the chunk of data. It also may include a 
+where each ``DataFile`` can contain several columns in the chunk of data. It also may include a
 ``DeletionFile``, which is explained in a later section.
 
 .. literalinclude:: ../protos/table.proto
@@ -86,7 +86,7 @@ and/or performance.  However, older software versions may not be able to read ne
 
 In addition, the latest version of the file format (next) is unstable and should not be
 used for production use cases.  Breaking changes could be made to unstable encodings and
-that would mean that files written with these encodings are no longer readable by any 
+that would mean that files written with these encodings are no longer readable by any
 newer versions of Lance.  The ``next`` version should only be used for experimentation
 and benchmarking upcoming features.
 
@@ -95,7 +95,7 @@ The following values are supported:
 .. list-table:: File Versions
     :widths: 20 20 20 40
     :header-rows: 1
-  
+
     * - Version
       - Minimal Lance Version
       - Maximum Lance Version
@@ -206,7 +206,7 @@ Feature Flags
 As the file format and dataset evolve, new feature flags are added to the
 format. There are two separate fields for checking for feature flags, depending
 on whether you are trying to read or write the table. Readers should check the
-``reader_feature_flags`` to see if there are any flag it is not aware of. Writers 
+``reader_feature_flags`` to see if there are any flag it is not aware of. Writers
 should check ``writer_feature_flags``. If either sees a flag they don't know, they
 should return an "unsupported" error on any read or write operation.
 
@@ -286,7 +286,7 @@ deleted for some fragment. For a given version of the dataset, each fragment can
 have up to one deletion file. Fragments that have no deleted rows have no deletion
 file.
 
-Readers should filter out row ids contained in these deletion files during a 
+Readers should filter out row ids contained in these deletion files during a
 scan or ANN search.
 
 Deletion files come in two flavors:
@@ -319,7 +319,7 @@ collisions. The suffix is determined by the file type (``.arrow`` for Arrow file
    :start-at: // Deletion File
    :end-at: } // DeletionFile
 
-Deletes can be materialized by re-writing data files with the deleted rows 
+Deletes can be materialized by re-writing data files with the deleted rows
 removed. However, this invalidates row indices and thus the ANN indices, which
 can be expensive to recompute.
 
@@ -388,7 +388,7 @@ The commit process is as follows:
     fails because another writer has already committed, go back to step 3.
 
 When checking whether two transactions conflict, be conservative. If the
-transaction file is missing, assume it conflicts. If the transaction file 
+transaction file is missing, assume it conflicts. If the transaction file
 has an unknown operation, assume it conflicts.
 
 .. _external-manifest-store:
@@ -555,7 +555,7 @@ The row id values for a fragment are stored in a ``RowIdSequence`` protobuf
 message. This is described in the `protos/rowids.proto`_ file. Row id sequences
 are just arrays of u64 values, which have representations optimized for the
 common case where they are sorted and possibly contiguous. For example, a new
-fragment will have a row id sequence that is just a simple range, so it is 
+fragment will have a row id sequence that is just a simple range, so it is
 stored as a ``start`` and ``end`` value.
 
 These sequence messages are either stored inline in the fragment metadata, or

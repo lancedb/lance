@@ -12,6 +12,7 @@ use self::{
     dictionary::DictionaryPageScheduler, fixed_size_list::FixedListScheduler,
     value::ValuePageScheduler,
 };
+use crate::buffer::LanceBuffer;
 use crate::encodings::physical::block_compress::CompressionScheme;
 use crate::{
     decoder::PageScheduler,
@@ -29,6 +30,7 @@ pub mod fixed_size_binary;
 pub mod fixed_size_list;
 pub mod fsst;
 pub mod packed_struct;
+pub mod struct_encoding;
 pub mod value;
 
 /// These contain the file buffers shared across the entire file
@@ -235,16 +237,32 @@ pub fn decoder_from_array_encoding(
             let inner =
                 decoder_from_array_encoding(fsst.binary.as_ref().unwrap(), buffers, data_type);
 
-            Box::new(FsstPageScheduler::new(inner, fsst.symbol_table.clone()))
+            Box::new(FsstPageScheduler::new(
+                inner,
+                LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
+            ))
         }
         pb::array_encoding::ArrayEncoding::Dictionary(dictionary) => {
             let indices_encoding = dictionary.indices.as_ref().unwrap();
             let items_encoding = dictionary.items.as_ref().unwrap();
             let num_dictionary_items = dictionary.num_dictionary_items;
 
+            // We can get here in 2 ways.  The data is dictionary encoded and the user wants a dictionary or
+            // the data is dictionary encoded, as an optimization, and the user wants the value type.  Figure
+            // out the value type.
+            let value_type = if let DataType::Dictionary(_, value_type) = data_type {
+                value_type
+            } else {
+                data_type
+            };
+
+            // Note: we don't actually know the indices type here, passing down `data_type` works ok because
+            // the dictionary indices are always integers and we don't need the data_type to figure out how
+            // to decode integers.
             let indices_scheduler =
                 decoder_from_array_encoding(indices_encoding, buffers, data_type);
-            let items_scheduler = decoder_from_array_encoding(items_encoding, buffers, data_type);
+
+            let items_scheduler = decoder_from_array_encoding(items_encoding, buffers, value_type);
 
             let should_decode_dict = !data_type.is_dictionary();
 
@@ -284,7 +302,8 @@ pub fn decoder_from_array_encoding(
         // 2.1 only
         pb::array_encoding::ArrayEncoding::Constant(_) => unreachable!(),
         pb::array_encoding::ArrayEncoding::Bitpack2(_) => unreachable!(),
-        pb::array_encoding::ArrayEncoding::BinaryMiniBlock(_) => unreachable!(),
+        pb::array_encoding::ArrayEncoding::Variable(_) => unreachable!(),
+        pb::array_encoding::ArrayEncoding::PackedStructFixedWidthMiniBlock(_) => unreachable!(),
     }
 }
 

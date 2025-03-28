@@ -7,6 +7,7 @@ pub mod commit;
 pub mod exec;
 
 pub use lance_io::{
+    bytes_read_counter, iops_counter,
     object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore},
     stream::RecordBatchStream,
 };

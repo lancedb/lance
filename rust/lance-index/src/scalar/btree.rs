@@ -10,46 +10,58 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{Array, RecordBatch, UInt32Array};
+use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion::{
-    functions_aggregate::min_max::{MaxAccumulator, MinAccumulator},
-    physical_plan::{
-        sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-        union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
-    },
+use datafusion::physical_plan::{
+    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+    union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
 use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_expr::Accumulator;
-use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
-use deepsize::DeepSizeOf;
+use datafusion_physical_expr::{expressions::Column, LexOrdering, PhysicalSortExpr};
+use deepsize::{Context, DeepSizeOf};
 use futures::{
     future::BoxFuture,
     stream::{self},
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
-    utils::{mask::RowIdTreeMap, tokio::get_num_compute_intensive_cpus},
+    utils::{
+        mask::RowIdTreeMap,
+        tokio::get_num_compute_intensive_cpus,
+        tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
+    },
     Error, Result,
 };
 use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
 };
+use log::debug;
+use moka::sync::Cache;
 use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
-use snafu::{location, Location};
+use snafu::location;
+use tracing::info;
 
 use crate::{Index, IndexType};
 
 use super::{
-    flat::FlatIndexMetadata, AnyQuery, IndexReader, IndexStore, IndexWriter, SargableQuery,
-    ScalarIndex,
+    flat::FlatIndexMetadata, AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector,
+    SargableQuery, ScalarIndex, SearchResult,
 };
 
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
+pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
+const BATCH_SIZE_META_KEY: &str = "batch_size";
+
+lazy_static::lazy_static! {
+    static ref CACHE_SIZE: u64 = std::env::var("LANCE_BTREE_CACHE_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512 * 1024 * 1024);
+}
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
@@ -566,6 +578,7 @@ impl BTreeLookup {
             .iter()
             .flat_map(|(_, pages)| pages)
             .map(|page| page.page_number)
+            .chain(self.null_pages.iter().copied())
             .collect::<Vec<_>>();
         ids.dedup();
         ids
@@ -573,7 +586,11 @@ impl BTreeLookup {
 
     // All pages that could have a value equal to val
     fn pages_eq(&self, query: &OrderableScalarValue) -> Vec<u32> {
-        self.pages_between((Bound::Included(query), Bound::Excluded(query)))
+        if query.0.is_null() {
+            self.pages_null()
+        } else {
+            self.pages_between((Bound::Included(query), Bound::Excluded(query)))
+        }
     }
 
     // All pages that could have a value equal to one of the values
@@ -653,6 +670,42 @@ impl BTreeLookup {
     }
 }
 
+// Caches btree pages in memory
+#[derive(Debug)]
+struct BTreeCache(Cache<u32, Arc<dyn ScalarIndex>>);
+
+impl DeepSizeOf for BTreeCache {
+    fn deep_size_of_children(&self, _: &mut Context) -> usize {
+        self.0.iter().map(|(_, v)| v.deep_size_of()).sum()
+    }
+}
+
+// We only need to open a file reader for pages if we need to load a page.  If all
+// pages are cached we don't open it.  If we do open it we should only open it once.
+#[derive(Clone)]
+struct LazyIndexReader {
+    index_reader: Arc<tokio::sync::Mutex<Option<Arc<dyn IndexReader>>>>,
+    store: Arc<dyn IndexStore>,
+}
+
+impl LazyIndexReader {
+    fn new(store: Arc<dyn IndexStore>) -> Self {
+        Self {
+            index_reader: Arc::new(tokio::sync::Mutex::new(None)),
+            store,
+        }
+    }
+
+    async fn get(&self) -> Result<Arc<dyn IndexReader>> {
+        let mut reader = self.index_reader.lock().await;
+        if reader.is_none() {
+            let index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+            *reader = Some(index_reader);
+        }
+        Ok(reader.as_ref().unwrap().clone())
+    }
+}
+
 /// A btree index satisfies scalar queries using a b tree
 ///
 /// The upper layers of the btree are expected to be cached and, when unloaded,
@@ -671,8 +724,10 @@ impl BTreeLookup {
 #[derive(Clone, Debug, DeepSizeOf)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
+    page_cache: Arc<BTreeCache>,
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
+    batch_size: u64,
 }
 
 impl BTreeIndex {
@@ -681,39 +736,77 @@ impl BTreeIndex {
         null_pages: Vec<u32>,
         store: Arc<dyn IndexStore>,
         sub_index: Arc<dyn BTreeSubIndex>,
+        batch_size: u64,
     ) -> Self {
         let page_lookup = Arc::new(BTreeLookup::new(tree, null_pages));
+        let page_cache = Arc::new(BTreeCache(
+            Cache::builder()
+                .max_capacity(*CACHE_SIZE)
+                .weigher(|_, v: &Arc<dyn ScalarIndex>| v.deep_size_of() as u32)
+                .build(),
+        ));
         Self {
             page_lookup,
+            page_cache,
             store,
             sub_index,
+            batch_size,
         }
+    }
+
+    async fn lookup_page(
+        &self,
+        page_number: u32,
+        index_reader: LazyIndexReader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        if let Some(cached) = self.page_cache.0.get(&page_number) {
+            return Ok(cached);
+        }
+        metrics.record_part_load();
+        info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
+        let index_reader = index_reader.get().await?;
+        let serialized_page = index_reader
+            .read_record_batch(page_number as u64, self.batch_size)
+            .await?;
+        let subindex = self.sub_index.load_subindex(serialized_page).await?;
+        self.page_cache.0.insert(page_number, subindex.clone());
+        Ok(subindex)
     }
 
     async fn search_page(
         &self,
         query: &SargableQuery,
         page_number: u32,
-        index_reader: Arc<dyn IndexReader>,
+        index_reader: LazyIndexReader,
+        metrics: &dyn MetricsCollector,
     ) -> Result<RowIdTreeMap> {
-        let serialized_page = index_reader.read_record_batch(page_number).await?;
-        let subindex = self.sub_index.load_subindex(serialized_page).await?;
+        let subindex = self.lookup_page(page_number, index_reader, metrics).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
         // 1 and 2 and three is in page 2 and seven is in pages 8 and 9 then when we search page 2 we only need
         // to search for X IN [5, 3]
-        subindex.search(query).await
+        match subindex.search(query, metrics).await? {
+            SearchResult::Exact(map) => Ok(map),
+            _ => Err(Error::Internal {
+                message: "BTree sub-indices need to return exact results".to_string(),
+                location: location!(),
+            }),
+        }
     }
 
-    fn try_from_serialized(data: RecordBatch, store: Arc<dyn IndexStore>) -> Result<Self> {
+    fn try_from_serialized(
+        data: RecordBatch,
+        store: Arc<dyn IndexStore>,
+        batch_size: u64,
+    ) -> Result<Self> {
         let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
         let mut null_pages = Vec::<u32>::new();
 
         if data.num_rows() == 0 {
-            return Err(Error::Internal {
-                message: "attempt to load btree index from empty stats batch".into(),
-                location: location!(),
-            });
+            let data_type = data.column(0).data_type().clone();
+            let sub_index = Arc::new(FlatIndexMetadata::new(data_type));
+            return Ok(Self::new(map, null_pages, store, sub_index, batch_size));
         }
 
         let mins = data.column(0);
@@ -735,9 +828,13 @@ impl BTreeIndex {
             let null_count = null_counts.values()[idx];
             let page_number = page_numbers.values()[idx];
 
-            map.entry(min)
-                .or_default()
-                .push(PageRecord { max, page_number });
+            // If the page is entirely null don't even bother putting it in the tree
+            if !max.0.is_null() {
+                map.entry(min)
+                    .or_default()
+                    .push(PageRecord { max, page_number });
+            }
+
             if null_count > 0 {
                 null_pages.push(page_number);
             }
@@ -751,7 +848,7 @@ impl BTreeIndex {
         // TODO: Support other page types?
         let sub_index = Arc::new(FlatIndexMetadata::new(data_type.clone()));
 
-        Ok(Self::new(map, null_pages, store, sub_index))
+        Ok(Self::new(map, null_pages, store, sub_index, batch_size))
     }
 
     /// Create a stream of all the data in the index, in the same format used to train the index
@@ -844,7 +941,9 @@ impl Index for BTreeIndex {
 
         let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
         for page_number in self.page_lookup.all_page_ids() {
-            let serialized = sub_index_reader.read_record_batch(page_number).await?;
+            let serialized = sub_index_reader
+                .read_record_batch(page_number as u64, self.batch_size)
+                .await?;
             let page = self.sub_index.load_subindex(serialized).await?;
             frag_ids |= page.calculate_included_frags().await?;
         }
@@ -855,7 +954,11 @@ impl Index for BTreeIndex {
 
 #[async_trait]
 impl ScalarIndex for BTreeIndex {
-    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let pages = match query {
             SargableQuery::Equals(val) => self
@@ -873,28 +976,44 @@ impl ScalarIndex for BTreeIndex {
             )),
             SargableQuery::IsNull() => self.page_lookup.pages_null(),
         };
-        let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+        let lazy_index_reader = LazyIndexReader::new(self.store.clone());
         let page_tasks = pages
             .into_iter()
             .map(|page_index| {
-                self.search_page(query, page_index, sub_index_reader.clone())
+                self.search_page(query, page_index, lazy_index_reader.clone(), metrics)
                     .boxed()
             })
             .collect::<Vec<_>>();
-        stream::iter(page_tasks)
+        debug!("Searching {} btree pages", page_tasks.len());
+        let row_ids = stream::iter(page_tasks)
             // I/O and compute mixed here but important case is index in cache so
             // use compute intensive thread count
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<RowIdTreeMap>()
-            .await
+            .await?;
+        Ok(SearchResult::Exact(row_ids))
+    }
+
+    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+        true
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BTREE_LOOKUP_NAME).await?;
-        let serialized_lookup = page_lookup_file.read_record_batch(0).await?;
+        let num_rows_in_lookup = page_lookup_file.num_rows();
+        let serialized_lookup = page_lookup_file
+            .read_range(0..num_rows_in_lookup, None)
+            .await?;
+        let file_schema = page_lookup_file.schema();
+        let batch_size = file_schema
+            .metadata
+            .get(BATCH_SIZE_META_KEY)
+            .map(|bs| bs.parse().unwrap_or(DEFAULT_BTREE_BATCH_SIZE))
+            .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
         Ok(Arc::new(Self::try_from_serialized(
             serialized_lookup,
             store,
+            batch_size,
         )?))
     }
 
@@ -911,7 +1030,9 @@ impl ScalarIndex for BTreeIndex {
         let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
 
         for page_number in self.page_lookup.all_page_ids() {
-            let old_serialized = sub_index_reader.read_record_batch(page_number).await?;
+            let old_serialized = sub_index_reader
+                .read_record_batch(page_number as u64, self.batch_size)
+                .await?;
             let remapped = self
                 .sub_index
                 .remap_subindex(old_serialized, mapping)
@@ -934,7 +1055,13 @@ impl ScalarIndex for BTreeIndex {
     ) -> Result<()> {
         // Merge the existing index data with the new data and then retrain the index on the merged stream
         let merged_data_source = Box::new(BTreeUpdater::new(self.clone(), new_data));
-        train_btree_index(merged_data_source, self.sub_index.as_ref(), dest_store).await
+        train_btree_index(
+            merged_data_source,
+            self.sub_index.as_ref(),
+            dest_store,
+            DEFAULT_BTREE_BATCH_SIZE as u32,
+        )
+        .await
     }
 }
 
@@ -944,39 +1071,24 @@ struct BatchStats {
     null_count: u32,
 }
 
-// See https://github.com/apache/arrow-datafusion/issues/8031 for the underlying issue.  We use
-// MinAccumulator / MaxAccumulator to retrieve the min/max values and these are unreliable in the
-// presence of NaN
-fn check_for_nan(value: ScalarValue) -> Result<ScalarValue> {
-    match value {
-        ScalarValue::Float32(Some(val)) if val.is_nan() => Err(Error::NotSupported {
-            source: "Scalar indices cannot currently be created on columns with NaN values".into(),
-            location: location!(),
-        }),
-        ScalarValue::Float64(Some(val)) if val.is_nan() => Err(Error::NotSupported {
-            source: "Scalar indices cannot currently be created on columns with NaN values".into(),
-            location: location!(),
-        }),
-        _ => Ok(value),
-    }
-}
-
-fn min_val(array: &Arc<dyn Array>) -> Result<ScalarValue> {
-    let mut acc = MinAccumulator::try_new(array.data_type())?;
-    acc.update_batch(&[array.clone()])?;
-    check_for_nan(acc.evaluate()?)
-}
-
-fn max_val(array: &Arc<dyn Array>) -> Result<ScalarValue> {
-    let mut acc = MaxAccumulator::try_new(array.data_type())?;
-    acc.update_batch(&[array.clone()])?;
-    check_for_nan(acc.evaluate()?)
-}
-
 fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
     let values = batch.column(0);
-    let min = min_val(values)?;
-    let max = max_val(values)?;
+    if values.is_empty() {
+        return Err(Error::Internal {
+            message: "received an empty batch in btree training".to_string(),
+            location: location!(),
+        });
+    }
+    let min = ScalarValue::try_from_array(&values, 0).map_err(|e| Error::Internal {
+        message: format!("failed to get min value from batch: {}", e),
+        location: location!(),
+    })?;
+    let max =
+        ScalarValue::try_from_array(&values, values.len() - 1).map_err(|e| Error::Internal {
+            message: format!("failed to get max value from batch: {}", e),
+            location: location!(),
+        })?;
+
     Ok(BatchStats {
         min,
         max,
@@ -1032,9 +1144,17 @@ async fn train_btree_page(
     })
 }
 
-fn btree_stats_as_batch(stats: Vec<EncodedBatch>) -> Result<RecordBatch> {
-    let mins = ScalarValue::iter_to_array(stats.iter().map(|stat| stat.stats.min.clone()))?;
-    let maxs = ScalarValue::iter_to_array(stats.iter().map(|stat| stat.stats.max.clone()))?;
+fn btree_stats_as_batch(stats: Vec<EncodedBatch>, value_type: &DataType) -> Result<RecordBatch> {
+    let mins = if stats.is_empty() {
+        new_empty_array(value_type)
+    } else {
+        ScalarValue::iter_to_array(stats.iter().map(|stat| stat.stats.min.clone()))?
+    };
+    let maxs = if stats.is_empty() {
+        new_empty_array(value_type)
+    } else {
+        ScalarValue::iter_to_array(stats.iter().map(|stat| stat.stats.max.clone()))?
+    };
     let null_counts = UInt32Array::from_iter_values(stats.iter().map(|stat| stat.stats.null_count));
     let page_numbers = UInt32Array::from_iter_values(stats.iter().map(|stat| stat.page_number));
 
@@ -1092,13 +1212,15 @@ pub async fn train_btree_index(
     data_source: Box<dyn TrainingSource + Send>,
     sub_index_trainer: &dyn BTreeSubIndex,
     index_store: &dyn IndexStore,
+    batch_size: u32,
 ) -> Result<()> {
     let mut sub_index_file = index_store
         .new_index_file(BTREE_PAGES_NAME, sub_index_trainer.schema().clone())
         .await?;
     let mut encoded_batches = Vec::new();
     let mut batch_idx = 0;
-    let mut batches_source = data_source.scan_ordered_chunks(4096).await?;
+    let mut batches_source = data_source.scan_ordered_chunks(batch_size).await?;
+    let value_type = batches_source.schema().field(0).data_type().clone();
     while let Some(batch) = batches_source.try_next().await? {
         debug_assert_eq!(batch.num_columns(), 2);
         debug_assert_eq!(*batch.column(1).data_type(), DataType::UInt64);
@@ -1108,9 +1230,13 @@ pub async fn train_btree_index(
         batch_idx += 1;
     }
     sub_index_file.finish().await?;
-    let record_batch = btree_stats_as_batch(encoded_batches)?;
+    let record_batch = btree_stats_as_batch(encoded_batches, &value_type)?;
+    let mut file_schema = record_batch.schema().as_ref().clone();
+    file_schema
+        .metadata
+        .insert(BATCH_SIZE_META_KEY.to_string(), batch_size.to_string());
     let mut btree_index_file = index_store
-        .new_index_file(BTREE_LOOKUP_NAME, record_batch.schema())
+        .new_index_file(BTREE_LOOKUP_NAME, Arc::new(file_schema))
         .await?;
     btree_index_file.write_record_batch(record_batch).await?;
     btree_index_file.finish().await?;
@@ -1144,6 +1270,13 @@ impl TrainingSource for BTreeUpdater {
         self: Box<Self>,
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
+        let data_type = self.new_data.schema().field(0).data_type().clone();
+        // Datafusion currently has bugs with spilling on string columns
+        // See https://github.com/apache/datafusion/issues/10073
+        //
+        // One we upgrade we can remove this
+        let use_spilling = !matches!(data_type, DataType::Utf8 | DataType::LargeUtf8);
+
         let new_input = Arc::new(OneShotExec::new(self.new_data));
         let old_input = Self::into_old_input(self.index);
         debug_assert_eq!(
@@ -1160,11 +1293,15 @@ impl TrainingSource for BTreeUpdater {
         // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
         // them back into a single partition.
         let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
-        let ordered = Arc::new(SortPreservingMergeExec::new(vec![sort_expr], all_data));
+        let ordered = Arc::new(SortPreservingMergeExec::new(
+            LexOrdering::new(vec![sort_expr]),
+            all_data,
+        ));
+
         let unchunked = execute_plan(
             ordered,
             LanceExecutionOptions {
-                use_spilling: true,
+                use_spilling,
                 ..Default::default()
             },
         )?;
@@ -1204,7 +1341,12 @@ impl Stream for IndexReaderStream {
         let page_number = this.pages[idx];
         this.idx += 1;
         let reader_copy = this.reader.clone();
-        let read_task = async move { reader_copy.read_record_batch(page_number).await }.boxed();
+        let read_task = async move {
+            reader_copy
+                .read_record_batch(page_number as u64, DEFAULT_BTREE_BATCH_SIZE)
+                .await
+        }
+        .boxed();
         std::task::Poll::Ready(Some(read_task))
     }
 }
@@ -1213,12 +1355,35 @@ impl Stream for IndexReaderStream {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::Int32Type;
+    use arrow::datatypes::{Float64Type, Int32Type, UInt64Type};
     use arrow_array::FixedSizeListArray;
-    use datafusion_common::ScalarValue;
+    use arrow_schema::DataType;
+    use datafusion::{
+        execution::{SendableRecordBatchStream, TaskContext},
+        physical_plan::{sorts::sort::SortExec, stream::RecordBatchStreamAdapter, ExecutionPlan},
+    };
+    use datafusion_common::{DataFusionError, ScalarValue};
+    use datafusion_physical_expr::{expressions::col, LexOrdering, PhysicalSortExpr};
     use deepsize::DeepSizeOf;
+    use futures::TryStreamExt;
+    use lance_core::{cache::FileMetadataCache, utils::mask::RowIdTreeMap};
+    use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
+    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_io::object_store::ObjectStore;
+    use object_store::path::Path;
+    use tempfile::tempdir;
 
-    use super::OrderableScalarValue;
+    use crate::{
+        metrics::NoOpMetricsCollector,
+        scalar::{
+            btree::BTreeIndex,
+            flat::FlatIndexMetadata,
+            lance_format::{tests::MockTrainingSource, LanceIndexStore},
+            SargableQuery, ScalarIndex, SearchResult,
+        },
+    };
+
+    use super::{train_btree_index, OrderableScalarValue};
 
     #[test]
     fn test_scalar_value_size() {
@@ -1234,5 +1399,59 @@ mod tests {
         // deep_size_of should account for the rust type overhead
         assert!(size_of_i32 > 4);
         assert!(size_of_many_i32 > 128 * 4);
+    }
+
+    #[tokio::test]
+    async fn test_nan_ordering() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local(),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            FileMetadataCache::no_cache(),
+        ));
+
+        let values = vec![
+            0.0,
+            1.0,
+            2.0,
+            3.0,
+            f64::NAN,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+        ];
+
+        // This is a bit overkill but we've had bugs in the past where DF's sort
+        // didn't agree with Arrow's sort so we do an end-to-end test here
+        // and use DF to sort the data like we would in a real dataset.
+        let data = gen()
+            .col("value", array::cycle::<Float64Type>(values.clone()))
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(10), BatchCount::from(100));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new(LexOrdering::new(vec![sort_expr]), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+        let data_source = Box::new(MockTrainingSource::from(stream));
+
+        let sub_index_trainer = FlatIndexMetadata::new(DataType::Float64);
+
+        train_btree_index(data_source, &sub_index_trainer, test_store.as_ref(), 64)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store).await.unwrap();
+
+        for (idx, value) in values.into_iter().enumerate() {
+            let query = SargableQuery::Equals(ScalarValue::Float64(Some(value)));
+            let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+            assert_eq!(
+                result,
+                SearchResult::Exact(RowIdTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
+            );
+        }
     }
 }

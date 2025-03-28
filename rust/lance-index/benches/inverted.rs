@@ -14,6 +14,7 @@ use futures::stream;
 use itertools::Itertools;
 use lance_core::cache::FileMetadataCache;
 use lance_core::ROW_ID;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -80,6 +81,7 @@ fn bench_inverted(c: &mut Criterion) {
                         )
                         .limit(Some(10)),
                         no_filter.clone(),
+                        &NoOpMetricsCollector,
                     )
                     .await
                     .unwrap(),

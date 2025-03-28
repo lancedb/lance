@@ -55,6 +55,7 @@ impl std::fmt::Display for TracedObjectStore {
 }
 
 #[async_trait::async_trait]
+#[deny(clippy::missing_trait_methods)]
 impl object_store::ObjectStore for TracedObjectStore {
     #[instrument(level = "debug", skip(self, bytes))]
     async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
@@ -71,6 +72,17 @@ impl object_store::ObjectStore for TracedObjectStore {
         self.target.put_opts(location, bytes, opts).await
     }
 
+    async fn put_multipart(
+        &self,
+        location: &Path,
+    ) -> OSResult<Box<dyn object_store::MultipartUpload>> {
+        let upload = self.target.put_multipart(location).await?;
+        Ok(Box::new(TracedMultipartUpload {
+            target: upload,
+            write_span: debug_span!("put_multipart"),
+        }))
+    }
+
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -81,6 +93,11 @@ impl object_store::ObjectStore for TracedObjectStore {
             target: upload,
             write_span: debug_span!("put_multipart_opts"),
         }))
+    }
+
+    #[instrument(level = "debug", skip(self, location))]
+    async fn get(&self, location: &Path) -> OSResult<GetResult> {
+        self.target.get(location).await
     }
 
     #[instrument(level = "debug", skip(self, options))]
@@ -122,6 +139,15 @@ impl object_store::ObjectStore for TracedObjectStore {
     }
 
     #[instrument(level = "debug", skip(self))]
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'_, OSResult<ObjectMeta>> {
+        self.target.list_with_offset(prefix, offset)
+    }
+
+    #[instrument(level = "debug", skip(self))]
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
         self.target.list_with_delimiter(prefix).await
     }
@@ -134,6 +160,11 @@ impl object_store::ObjectStore for TracedObjectStore {
     #[instrument(level = "debug", skip(self))]
     async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.rename(from, to).await
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.target.rename_if_not_exists(from, to).await
     }
 
     #[instrument(level = "debug", skip(self))]

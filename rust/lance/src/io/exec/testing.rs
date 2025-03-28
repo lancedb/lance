@@ -8,15 +8,17 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
     common::Statistics,
     execution::context::TaskContext,
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, PlanProperties,
-        SendableRecordBatchStream,
+        execution_plan::{Boundedness, EmissionType},
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+use futures::StreamExt;
 
 #[derive(Debug)]
 pub struct TestingExec {
@@ -29,7 +31,8 @@ impl TestingExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(batches[0].schema()),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             batches,
@@ -75,7 +78,9 @@ impl ExecutionPlan for TestingExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        todo!()
+        let stream = futures::stream::iter(self.batches.clone().into_iter().map(Ok));
+        let stream = RecordBatchStreamAdapter::new(self.schema(), stream.boxed());
+        Ok(Box::pin(stream))
     }
 
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {

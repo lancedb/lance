@@ -4,6 +4,8 @@
 //! Product Quantizer Builder
 //!
 
+use std::sync::Arc;
+
 use crate::vector::quantizer::QuantizerBuildParams;
 use arrow::array::PrimitiveBuilder;
 use arrow_array::types::{Float16Type, Float64Type};
@@ -16,7 +18,7 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::{Dot, Normalize, L2};
 use rand::SeedableRng;
 use rayon::prelude::*;
-use snafu::{location, Location};
+use snafu::location;
 
 use super::utils::divide_to_subvectors;
 use super::ProductQuantizer;
@@ -108,9 +110,21 @@ impl PQBuildParams {
 
         let d = sub_vectors
             .into_par_iter()
-            .map(|sub_vec| {
+            .enumerate()
+            .map(|(sub_vec_idx, sub_vec)| {
                 let rng = rand::rngs::SmallRng::from_entropy();
                 train_kmeans::<T>(
+                    self.codebook.as_ref().map(|cb| {
+                        let sub_vec_centroids = FixedSizeListArray::try_new_from_values(
+                            cb.as_fixed_size_list().values().as_primitive::<T>().slice(
+                                sub_vec_idx * num_centroids * sub_vector_dimension,
+                                num_centroids * sub_vector_dimension,
+                            ),
+                            sub_vector_dimension as i32,
+                        )
+                        .unwrap();
+                        Arc::new(sub_vec_centroids)
+                    }),
                     &sub_vec,
                     sub_vector_dimension,
                     num_centroids,
@@ -120,6 +134,7 @@ impl PQBuildParams {
                     distance_type,
                     self.sample_rate,
                 )
+                .map(|kmeans| kmeans.centroids)
             })
             .collect::<Result<Vec<_>>>()?;
         let mut codebook_builder = PrimitiveBuilder::<T>::with_capacity(num_centroids * dimension);
@@ -154,6 +169,19 @@ impl PQBuildParams {
             ),
             location: location!(),
         })?;
+
+        let num_centroids = 2_usize.pow(self.num_bits as u32);
+        if data.len() < num_centroids {
+            return Err(Error::Index {
+                message: format!(
+                    "Not enough rows to train PQ. Requires {:?} rows but only {:?} available",
+                    num_centroids,
+                    data.len()
+                ),
+                location: location!(),
+            });
+        }
+
         // TODO: support bf16 later.
         match fsl.value_type() {
             DataType::Float16 => self.build_from_fsl::<Float16Type>(fsl, distance_type),

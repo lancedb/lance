@@ -24,7 +24,7 @@ use lance_io::stream::RecordBatchStreamAdapter;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ID};
@@ -79,12 +79,10 @@ pub(super) async fn build_partitions(
         column,
         pq.clone(),
         Some(part_range),
-        true,
     );
 
     let stream = shuffle_dataset(
         data,
-        column,
         ivf_transformer.into(),
         precomputed_partitions,
         ivf.num_partitions() as u32,
@@ -213,7 +211,6 @@ pub async fn write_vector_storage(
         column,
         pq,
         None,
-        true,
     ));
 
     let data = if let Some(partitions_ds_uri) = precomputed_partitions_ds_uri {
@@ -288,7 +285,6 @@ pub(super) async fn build_hnsw_partitions(
 
     let stream = shuffle_dataset(
         data,
-        column,
         ivf_model.into(),
         precomputed_partitions,
         ivf.num_partitions() as u32,

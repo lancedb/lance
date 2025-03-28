@@ -22,34 +22,42 @@
 //! a conflict. Some operations have additional conditions that must be met for
 //! them to be compatible.
 //!
-//! |                  | Append | Delete / Update | Overwrite/Create | Create Index | Rewrite | Merge | Project | UpdateConfig |
-//! |------------------|--------|-----------------|------------------|--------------|---------|-------|---------|-------------|
-//! | Append           | ✅     | ✅              | ❌               | ✅           | ✅      | ❌    | ❌      | ✅           |
-//! | Delete / Update  | ✅     | (1)             | ❌               | ✅           | (1)     | ❌    | ❌      | ✅           |
-//! | Overwrite/Create | ✅     | ✅              | ✅               | ✅           | ✅      | ✅    | ✅      | (2)          |
-//! | Create index     | ✅     | ✅              | ❌               | ✅           | ✅      | ✅    | ✅      | ✅           |
-//! | Rewrite          | ✅     | (1)             | ❌               | ❌           | (1)     | ❌    | ❌      | ✅           |
-//! | Merge            | ❌     | ❌              | ❌               | ❌           | ✅      | ❌    | ❌      | ✅           |
-//! | Project          | ✅     | ✅              | ❌               | ❌           | ✅      | ❌    | ✅      | ✅           |
-//! | UpdateConfig     | ✅     | ✅              | (2)              | ✅           | ✅      | ✅    | ✅      | (2)          |
+//! NOTE/TODO(rmeng): DataReplacement conflict resolution is not fully implemented
 //!
-//! (1) Delete, update, and rewrite are compatible with each other and themselves only if
+//! |                  | Append | Delete / Update | Overwrite/Create | Create Index | Rewrite | Merge | Project | UpdateConfig | DataReplacement |
+//! |------------------|--------|-----------------|------------------|--------------|---------|-------|---------|--------------|-----------------|
+//! | Append           | ✅     | ✅              | ❌                | ✅           | ✅      | ❌     | ❌      | ✅           | ✅
+//! | Delete / Update  | ✅     | 1️⃣              | ❌                | ✅           | 1️⃣      | ❌     | ❌      | ✅           | ✅
+//! | Overwrite/Create | ✅     | ✅              | ✅                | ✅           | ✅      | ✅     | ✅      | 2️⃣           | ✅
+//! | Create index     | ✅     | ✅              | ❌                | ✅           | ✅      | ✅     | ✅      | ✅           | 3️⃣
+//! | Rewrite          | ✅     | 1️⃣              | ❌                | ❌           | 1️⃣      | ❌     | ❌      | ✅           | 3️⃣
+//! | Merge            | ❌     | ❌              | ❌                | ❌           | ✅      | ❌     | ❌      | ✅           | ✅
+//! | Project          | ✅     | ✅              | ❌                | ❌           | ✅      | ❌     | ✅      | ✅           | ✅
+//! | UpdateConfig     | ✅     | ✅              | 2️⃣                | ✅           | ✅      | ✅     | ✅      | 2️⃣           | ✅
+//! | DataReplacement  | ✅     | ✅              | ❌                | 3️⃣           | 1️⃣      | ✅     | 3️⃣      | ✅           | 3️⃣
+//!
+//! 1️⃣ Delete, update, and rewrite are compatible with each other and themselves only if
 //! they affect distinct fragments. Otherwise, they conflict.
-//! (2) Operations that mutate the config conflict if one of the operations upserts a key
-//! that if referenced by another concurrent operation.
+//! 2️⃣ Operations that mutate the config conflict if one of the operations upserts a key
+//! that if referenced by another concurrent operation or if both operations modify the schema
+//! metadata or the same field metadata.
+//! 3️⃣ DataReplacement on a column without index is compatible with any operation AS LONG AS
+//! the operation does not modify the region of the column being replaced.
+//!
 
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
+use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_io::object_store::ObjectStore;
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
-        DataStorageFormat, Fragment, Index, Manifest, RowIdMeta,
+        DataFile, DataStorageFormat, Fragment, Index, Manifest, RowIdMeta,
     },
     io::{
         commit::CommitHandler,
@@ -59,7 +67,7 @@ use lance_table::{
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 use uuid::Uuid;
 
 use super::ManifestWriteConfig;
@@ -70,7 +78,7 @@ use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 ///
 /// This contains enough information to be able to build the next manifest,
 /// given the current manifest.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct Transaction {
     /// The version of the table this transaction is based off of. If this is
     /// the first transaction, this should be 0.
@@ -93,8 +101,11 @@ pub enum BlobsOperation {
     Updated(u64),
 }
 
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct DataReplacementGroup(pub u64, pub DataFile);
+
 /// An operation on a dataset.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub enum Operation {
     /// Adding new fragments to the dataset. The fragments contained within
     /// haven't yet been assigned a final ID.
@@ -134,6 +145,25 @@ pub enum Operation {
         /// Indices that have been updated with the new row addresses
         rewritten_indices: Vec<RewrittenIndex>,
     },
+    /// Replace data in a column in the dataset with a new data. This is used for
+    /// null column population where we replace an entirely null column with a
+    /// new column that has data.
+    ///
+    /// This operation will only allow replacing files that contain the same schema
+    /// e.g. if the original files contains column A, B, C and the new files contains
+    /// only column A, B then the operation is not allowed. As we would need to split
+    /// the original files into two files, one with column A, B and the other with column C.
+    ///
+    /// Corollary to the above: the operation will also not allow replacing files unless the
+    /// affected columns all have the same datafile layout across the fragments being replaced.
+    ///
+    /// e.g. if fragments being replaced contains files with different schema layouts on
+    /// the column being replaced, the operation is not allowed.
+    /// say frag_1: [A] [B, C] and frag_2: [A, B] [C] and we are trying to replace column A
+    /// with a new column A the operation is not allowed.
+    DataReplacement {
+        replacements: Vec<DataReplacementGroup>,
+    },
     /// Merge a new column in
     Merge {
         fragments: Vec<Fragment>,
@@ -164,6 +194,8 @@ pub enum Operation {
     UpdateConfig {
         upsert_values: Option<HashMap<String, String>>,
         delete_keys: Option<Vec<String>>,
+        schema_metadata: Option<HashMap<String, String>>,
+        field_metadata: Option<HashMap<u32, HashMap<String, String>>>,
     },
 }
 
@@ -173,7 +205,13 @@ pub struct RewrittenIndex {
     pub new_id: Uuid,
 }
 
-#[derive(Debug, Clone)]
+impl DeepSizeOf for RewrittenIndex {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        0
+    }
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct RewriteGroup {
     pub old_fragments: Vec<Fragment>,
     pub new_fragments: Vec<Fragment>,
@@ -219,6 +257,7 @@ impl Operation {
                     .map(|f| f.id)
                     .chain(removed_fragment_ids.iter().copied()),
             ),
+            Self::DataReplacement { replacements } => Box::new(replacements.iter().map(|r| r.0)),
         }
     }
 
@@ -261,6 +300,38 @@ impl Operation {
         other_ids.any(|id| self_ids.contains(&id))
     }
 
+    fn modifies_same_metadata(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::UpdateConfig {
+                    schema_metadata,
+                    field_metadata,
+                    ..
+                },
+                Self::UpdateConfig {
+                    schema_metadata: other_schema_metadata,
+                    field_metadata: other_field_metadata,
+                    ..
+                },
+            ) => {
+                if schema_metadata.is_some() && other_schema_metadata.is_some() {
+                    return true;
+                }
+                if let Some(field_metadata) = field_metadata {
+                    if let Some(other_field_metadata) = other_field_metadata {
+                        for field in field_metadata.keys() {
+                            if other_field_metadata.contains_key(field) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Check whether another operation upserts a key that is referenced by another operation
     fn upsert_key_conflict(&self, other: &Self) -> bool {
         let self_upsert_keys = self.get_upsert_config_keys();
@@ -290,6 +361,7 @@ impl Operation {
             Self::Update { .. } => "Update",
             Self::Project { .. } => "Project",
             Self::UpdateConfig { .. } => "UpdateConfig",
+            Self::DataReplacement { .. } => "DataReplacement",
         }
     }
 }
@@ -328,6 +400,7 @@ impl Transaction {
                 Operation::ReserveFragments { .. } => false,
                 Operation::Project { .. } => false,
                 Operation::UpdateConfig { .. } => false,
+                Operation::DataReplacement { .. } => false,
                 _ => true,
             },
             Operation::Rewrite { .. } => match &other.operation {
@@ -343,6 +416,10 @@ impl Transaction {
                 }
                 Operation::Project { .. } => false,
                 Operation::UpdateConfig { .. } => false,
+                Operation::DataReplacement { .. } => {
+                    // TODO(rmeng): check that the fragments being replaced are not part of the groups
+                    true
+                }
                 _ => true,
             },
             // Restore always succeeds
@@ -369,6 +446,10 @@ impl Transaction {
                 // if the rewrite changed more than X% of row ids.
                 Operation::Rewrite { .. } => true,
                 Operation::UpdateConfig { .. } => false,
+                Operation::DataReplacement { .. } => {
+                    // TODO(rmeng): check that the new indices isn't on the column being replaced
+                    true
+                }
                 _ => true,
             },
             Operation::Delete { .. } | Operation::Update { .. } => match &other.operation {
@@ -383,14 +464,33 @@ impl Transaction {
                 Operation::UpdateConfig { .. } => false,
                 _ => true,
             },
-            Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
-                match &other.operation {
-                    Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
+            Operation::Overwrite { .. } => match &other.operation {
+                // Overwrite only conflicts with another operation modifying the same update config
+                Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
+                    self.operation.upsert_key_conflict(&other.operation)
+                }
+                _ => false,
+            },
+            Operation::UpdateConfig {
+                schema_metadata,
+                field_metadata,
+                ..
+            } => match &other.operation {
+                Operation::Overwrite { .. } => {
+                    // Updates to schema metadata or field metadata conflict with any kind
+                    // of overwrite.
+                    if schema_metadata.is_some() || field_metadata.is_some() {
+                        true
+                    } else {
                         self.operation.upsert_key_conflict(&other.operation)
                     }
-                    _ => false,
                 }
-            }
+                Operation::UpdateConfig { .. } => {
+                    self.operation.upsert_key_conflict(&other.operation)
+                        | self.operation.modifies_same_metadata(&other.operation)
+                }
+                _ => false,
+            },
             // Merge changes the schema, but preserves row ids, so the only operations
             // it's compatible with is CreateIndex, ReserveFragments, SetMetadata and DeleteMetadata.
             Operation::Merge { .. } => !matches!(
@@ -404,6 +504,26 @@ impl Transaction {
                 Operation::CreateIndex { .. } => false,
                 Operation::Overwrite { .. } => false,
                 Operation::UpdateConfig { .. } => false,
+                _ => true,
+            },
+            Operation::DataReplacement { .. } => match &other.operation {
+                Operation::Append { .. }
+                | Operation::Delete { .. }
+                | Operation::Update { .. }
+                | Operation::Merge { .. }
+                | Operation::UpdateConfig { .. } => false,
+                Operation::CreateIndex { .. } => {
+                    // TODO(rmeng): check that the new indices isn't on the column being replaced
+                    true
+                }
+                Operation::Rewrite { .. } => {
+                    // TODO(rmeng): check that the fragments being replaced are not part of the groups
+                    true
+                }
+                Operation::DataReplacement { .. } => {
+                    // TODO(rmeng): check cell conflicts
+                    true
+                }
                 _ => true,
             },
         }
@@ -456,13 +576,13 @@ impl Transaction {
         config: &ManifestWriteConfig,
         tx_path: &str,
     ) -> Result<(Manifest, Vec<Index>)> {
-        let path = commit_handler
-            .resolve_version(base_path, version, &object_store.inner)
+        let location = commit_handler
+            .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
-        let mut manifest = read_manifest(object_store, &path).await?;
+        let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
         manifest.transaction_file = Some(tx_path.to_string());
-        let indices = read_manifest_indexes(object_store, &path, &manifest).await?;
+        let indices = read_manifest_indexes(object_store, &location.path, &manifest).await?;
         Ok((manifest, indices))
     }
 
@@ -649,7 +769,7 @@ impl Transaction {
                 });
                 final_indices.extend(new_indices.clone());
             }
-            Operation::ReserveFragments { .. } => {
+            Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
             Operation::Merge { ref fragments, .. } => {
@@ -683,7 +803,110 @@ impl Transaction {
             Operation::Restore { .. } => {
                 unreachable!()
             }
-            Operation::UpdateConfig { .. } => {}
+            Operation::DataReplacement { replacements } => {
+                log::warn!("Building manifest with DataReplacement operation. This operation is not stable yet, please use with caution.");
+
+                let (old_fragment_ids, new_datafiles): (Vec<&u64>, Vec<&DataFile>) = replacements
+                    .iter()
+                    .map(|DataReplacementGroup(fragment_id, new_file)| (fragment_id, new_file))
+                    .unzip();
+
+                // 1. make sure the new files all have the same fields / or empty
+                // NOTE: arguably this requirement could be relaxed in the future
+                // for the sake of simplicity, we require the new files to have the same fields
+                if new_datafiles
+                    .iter()
+                    .map(|f| f.fields.clone())
+                    .collect::<HashSet<_>>()
+                    .len()
+                    > 1
+                {
+                    let field_info = new_datafiles
+                        .iter()
+                        .enumerate()
+                        .map(|(id, f)| (id, f.fields.clone()))
+                        .fold("".to_string(), |acc, (id, fields)| {
+                            format!("{}File {}: {:?}\n", acc, id, fields)
+                        });
+
+                    return Err(Error::invalid_input(
+                        format!(
+                            "All new data files must have the same fields, but found different fields:\n{field_info}"
+                        ),
+                        location!(),
+                    ));
+                }
+
+                let existing_fragments = maybe_existing_fragments?;
+
+                // 2. check that the fragments being modified have isomorphic layouts along the columns being replaced
+                // 3. add modified fragments to final_fragments
+                for (frag_id, new_file) in old_fragment_ids.iter().zip(new_datafiles) {
+                    let frag = existing_fragments
+                        .iter()
+                        .find(|f| f.id == **frag_id)
+                        .ok_or_else(|| {
+                            Error::invalid_input(
+                                "Fragment being replaced not found in existing fragments",
+                                location!(),
+                            )
+                        })?;
+                    let mut new_frag = frag.clone();
+
+                    // TODO(rmeng): check new file and fragment are the same length
+
+                    let mut columns_covered = HashSet::new();
+                    for file in &mut new_frag.files {
+                        if file.fields == new_file.fields
+                            && file.file_major_version == new_file.file_major_version
+                            && file.file_minor_version == new_file.file_minor_version
+                        {
+                            // assign the new file path to the fragment
+                            file.path = new_file.path.clone();
+                        }
+                        columns_covered.extend(file.fields.iter());
+                    }
+                    // SPECIAL CASE: if the column(s) being replaced are not covered by the fragment
+                    // Then it means it's a all-NULL column that is being replaced with real data
+                    // just add it to the final fragments
+                    if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
+                        new_frag.add_file(
+                            new_file.path.clone(),
+                            new_file.fields.clone(),
+                            new_file.column_indices.clone(),
+                            &LanceFileVersion::try_from_major_minor(
+                                new_file.file_major_version,
+                                new_file.file_minor_version,
+                            )
+                            .expect("Expected valid file version"),
+                        );
+                    }
+
+                    // Nothing changed in the current fragment, which is not expected -- error out
+                    if &new_frag == frag {
+                        return Err(Error::invalid_input(
+                            "Expected to modify the fragment but no changes were made. This means the new data files does not align with any exiting datafiles. Please check if the schema of the new data files matches the schema of the old data files including the file major and minor versions",
+                            location!(),
+                        ));
+                    }
+                    final_fragments.push(new_frag);
+                }
+
+                let fragments_changed = old_fragment_ids
+                    .iter()
+                    .cloned()
+                    .cloned()
+                    .collect::<HashSet<_>>();
+
+                // 4. push fragments that didn't change back to final_fragments
+                let unmodified_fragments = existing_fragments
+                    .iter()
+                    .filter(|f| !fragments_changed.contains(&f.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                final_fragments.extend(unmodified_fragments);
+            }
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
@@ -741,6 +964,8 @@ impl Transaction {
             Operation::UpdateConfig {
                 upsert_values,
                 delete_keys,
+                schema_metadata,
+                field_metadata,
             } => {
                 // Delete is handled first. If the same key is referenced by upsert and
                 // delete, then upserted key-value pair will remain.
@@ -755,6 +980,14 @@ impl Transaction {
                 }
                 if let Some(upsert_values) = upsert_values {
                     manifest.update_config(upsert_values.clone());
+                }
+                if let Some(schema_metadata) = schema_metadata {
+                    manifest.update_schema_metadata(schema_metadata.clone());
+                }
+                if let Some(field_metadata) = field_metadata {
+                    for (field_id, metadata) in field_metadata {
+                        manifest.update_field_metadata(*field_id as i32, metadata.clone());
+                    }
                 }
             }
             _ => {}
@@ -929,6 +1162,34 @@ impl Transaction {
     }
 }
 
+impl From<&DataReplacementGroup> for pb::transaction::DataReplacementGroup {
+    fn from(DataReplacementGroup(fragment_id, new_file): &DataReplacementGroup) -> Self {
+        Self {
+            fragment_id: *fragment_id,
+            new_file: Some(new_file.into()),
+        }
+    }
+}
+
+/// Convert a protobug DataReplacementGroup to a rust native DataReplacementGroup
+/// this is unfortunately TryFrom instead of From because of the Option in the pb::DataReplacementGroup
+impl TryFrom<pb::transaction::DataReplacementGroup> for DataReplacementGroup {
+    type Error = Error;
+
+    fn try_from(message: pb::transaction::DataReplacementGroup) -> Result<Self> {
+        Ok(Self(
+            message.fragment_id,
+            message
+                .new_file
+                .ok_or(Error::invalid_input(
+                    "DataReplacementGroup must have a new_file",
+                    location!(),
+                ))?
+                .try_into()?,
+        ))
+    }
+}
+
 impl TryFrom<pb::Transaction> for Transaction {
     type Error = Error;
 
@@ -1061,6 +1322,8 @@ impl TryFrom<pb::Transaction> for Transaction {
             Some(pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
                 upsert_values,
                 delete_keys,
+                schema_metadata,
+                field_metadata,
             })) => {
                 let upsert_values = match upsert_values.len() {
                     0 => None,
@@ -1070,11 +1333,36 @@ impl TryFrom<pb::Transaction> for Transaction {
                     0 => None,
                     _ => Some(delete_keys),
                 };
+                let schema_metadata = match schema_metadata.len() {
+                    0 => None,
+                    _ => Some(schema_metadata),
+                };
+                let field_metadata = match field_metadata.len() {
+                    0 => None,
+                    _ => Some(
+                        field_metadata
+                            .into_iter()
+                            .map(|(field_id, field_meta_update)| {
+                                (field_id, field_meta_update.metadata)
+                            })
+                            .collect(),
+                    ),
+                };
                 Operation::UpdateConfig {
                     upsert_values,
                     delete_keys,
+                    schema_metadata,
+                    field_metadata,
                 }
             }
+            Some(pb::transaction::Operation::DataReplacement(
+                pb::transaction::DataReplacement { replacements },
+            )) => Operation::DataReplacement {
+                replacements: replacements
+                    .into_iter()
+                    .map(DataReplacementGroup::try_from)
+                    .collect::<Result<Vec<_>>>()?,
+            },
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -1268,10 +1556,37 @@ impl From<&Transaction> for pb::Transaction {
             Operation::UpdateConfig {
                 upsert_values,
                 delete_keys,
+                schema_metadata,
+                field_metadata,
             } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
                 upsert_values: upsert_values.clone().unwrap_or(Default::default()),
                 delete_keys: delete_keys.clone().unwrap_or(Default::default()),
+                schema_metadata: schema_metadata.clone().unwrap_or(Default::default()),
+                field_metadata: field_metadata
+                    .as_ref()
+                    .map(|field_metadata| {
+                        field_metadata
+                            .iter()
+                            .map(|(field_id, metadata)| {
+                                (
+                                    *field_id,
+                                    pb::transaction::update_config::FieldMetadataUpdate {
+                                        metadata: metadata.clone(),
+                                    },
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or(Default::default()),
             }),
+            Operation::DataReplacement { replacements } => {
+                pb::transaction::Operation::DataReplacement(pb::transaction::DataReplacement {
+                    replacements: replacements
+                        .iter()
+                        .map(pb::transaction::DataReplacementGroup::from)
+                        .collect(),
+                })
+            }
         };
 
         let blob_operation = value.blobs_op.as_ref().map(|op| match op {
@@ -1426,6 +1741,7 @@ mod tests {
             fields: vec![0],
             dataset_version: 1,
             fragment_bitmap: None,
+            index_details: None,
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -1475,6 +1791,14 @@ mod tests {
                     "value".to_string(),
                 )])),
                 delete_keys: Some(vec!["remove-key".to_string()]),
+                schema_metadata: Some(HashMap::from_iter(vec![(
+                    "schema-key".to_string(),
+                    "schema-value".to_string(),
+                )])),
+                field_metadata: Some(HashMap::from_iter(vec![(
+                    0,
+                    HashMap::from_iter(vec![("field-key".to_string(), "field-value".to_string())]),
+                )])),
             },
         ];
         let other_transactions = other_operations
@@ -1581,6 +1905,8 @@ mod tests {
                         "new-value".to_string(),
                     )])),
                     delete_keys: None,
+                    schema_metadata: None,
+                    field_metadata: None,
                 },
                 [
                     false, false, false, false, false, false, false, false, false,
@@ -1594,6 +1920,8 @@ mod tests {
                         "new-value".to_string(),
                     )])),
                     delete_keys: None,
+                    schema_metadata: None,
+                    field_metadata: None,
                 },
                 [false, false, false, false, false, false, false, false, true],
             ),
@@ -1605,6 +1933,8 @@ mod tests {
                         "new-value".to_string(),
                     )])),
                     delete_keys: None,
+                    schema_metadata: None,
+                    field_metadata: None,
                 },
                 [false, false, false, false, false, false, false, false, true],
             ),
@@ -1613,6 +1943,8 @@ mod tests {
                 Operation::UpdateConfig {
                     upsert_values: None,
                     delete_keys: Some(vec!["remove-key".to_string()]),
+                    schema_metadata: None,
+                    field_metadata: None,
                 },
                 [
                     false, false, false, false, false, false, false, false, false,
@@ -1623,8 +1955,57 @@ mod tests {
                 Operation::UpdateConfig {
                     upsert_values: None,
                     delete_keys: Some(vec!["lance.test".to_string()]),
+                    schema_metadata: None,
+                    field_metadata: None,
                 },
                 [false, false, false, false, false, false, false, false, true],
+            ),
+            (
+                // Changing schema metadata conflicts with another update changing schema
+                // metadata or with an overwrite
+                Operation::UpdateConfig {
+                    upsert_values: None,
+                    delete_keys: None,
+                    schema_metadata: Some(HashMap::from_iter(vec![(
+                        "schema-key".to_string(),
+                        "new-value".to_string(),
+                    )])),
+                    field_metadata: None,
+                },
+                [false, false, false, false, true, false, false, false, true],
+            ),
+            (
+                // Changing field metadata conflicts with another update changing same field
+                // metadata or overwrite
+                Operation::UpdateConfig {
+                    upsert_values: None,
+                    delete_keys: None,
+                    schema_metadata: None,
+                    field_metadata: Some(HashMap::from_iter(vec![(
+                        0,
+                        HashMap::from_iter(vec![(
+                            "field_key".to_string(),
+                            "field_value".to_string(),
+                        )]),
+                    )])),
+                },
+                [false, false, false, false, true, false, false, false, true],
+            ),
+            (
+                // Updates to different field metadata are allowed
+                Operation::UpdateConfig {
+                    upsert_values: None,
+                    delete_keys: None,
+                    schema_metadata: None,
+                    field_metadata: Some(HashMap::from_iter(vec![(
+                        1,
+                        HashMap::from_iter(vec![(
+                            "field_key".to_string(),
+                            "field_value".to_string(),
+                        )]),
+                    )])),
+                },
+                [false, false, false, false, true, false, false, false, false],
             ),
         ];
 

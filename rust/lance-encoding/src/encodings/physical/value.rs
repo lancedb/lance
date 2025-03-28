@@ -6,16 +6,18 @@ use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
-use snafu::{location, Location};
+use snafu::location;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{BlockInfo, ConstantDataBlock, DataBlock, FixedWidthDataBlock, UsedEncoding};
+use crate::data::{
+    BlockInfo, ConstantDataBlock, DataBlock, FixedSizeListBlock, FixedWidthDataBlock,
+};
 use crate::decoder::{BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor};
 use crate::encoder::{
-    BlockCompressor, FixedPerValueCompressor, MiniBlockChunk, MiniBlockCompressed,
-    MiniBlockCompressor, MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES,
+    BlockCompressor, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, PerValueCompressor,
+    PerValueDataBlock, MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES,
 };
 use crate::format::pb::{self, ArrayEncoding};
 use crate::format::ProtobufUtils;
@@ -216,7 +218,6 @@ impl PrimitivePageDecoder for ValuePageDecoder {
             data: data_buffer,
             num_values: num_rows,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         }))
     }
 }
@@ -287,6 +288,17 @@ impl ValueEncoder {
             num_values: data.num_values,
         }
     }
+
+    fn make_fsl_encoding(data: &FixedSizeListBlock) -> ArrayEncoding {
+        let inner_encoding = match data.child.as_ref() {
+            DataBlock::FixedWidth(fixed_width) => {
+                ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None)
+            }
+            DataBlock::FixedSizeList(fsl) => Self::make_fsl_encoding(fsl),
+            _ => unreachable!(),
+        };
+        ProtobufUtils::fixed_size_list(inner_encoding, data.dimension)
+    }
 }
 
 impl BlockCompressor for ValueEncoder {
@@ -344,6 +356,11 @@ impl MiniBlockCompressor for ValueEncoder {
                 let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
                 Ok((Self::chunk_data(fixed_width), encoding))
             }
+            DataBlock::FixedSizeList(mut fixed_size_list) => {
+                let flattened = fixed_size_list.flatten_as_fixed();
+                let encoding = Self::make_fsl_encoding(&fixed_size_list);
+                Ok((Self::chunk_data(flattened), encoding))
+            }
             _ => Err(Error::InvalidInput {
                 source: format!(
                     "Cannot compress a data block of type {} with ValueEncoder",
@@ -395,39 +412,33 @@ impl ValueDecompressor {
             bytes_per_value: description.bits_per_value / 8,
         }
     }
+
+    fn buffer_to_block(&self, data: LanceBuffer) -> DataBlock {
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: self.bytes_per_value * 8,
+            num_values: data.len() as u64 / self.bytes_per_value,
+            data,
+            block_info: BlockInfo::new(),
+        })
+    }
 }
 
 impl BlockDecompressor for ValueDecompressor {
     fn decompress(&self, data: LanceBuffer) -> Result<DataBlock> {
-        let num_values = data.len() as u64 / self.bytes_per_value;
-        assert_eq!(data.len() as u64 % self.bytes_per_value, 0);
-        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: self.bytes_per_value * 8,
-            data,
-            num_values,
-            block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
-        }))
+        Ok(self.buffer_to_block(data))
     }
 }
 
 impl MiniBlockDecompressor for ValueDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        debug_assert!(data.len() as u64 >= num_values * self.bytes_per_value);
-
-        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-            data,
-            bits_per_value: self.bytes_per_value * 8,
-            num_values,
-            block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
-        }))
+        assert_eq!(data.len() as u64, num_values * self.bytes_per_value);
+        Ok(self.buffer_to_block(data))
     }
 }
 
 impl FixedPerValueDecompressor for ValueDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        MiniBlockDecompressor::decompress(self, data, num_values)
+    fn decompress(&self, data: FixedWidthDataBlock) -> Result<DataBlock> {
+        Ok(DataBlock::FixedWidth(data))
     }
 
     fn bits_per_value(&self) -> u64 {
@@ -435,12 +446,12 @@ impl FixedPerValueDecompressor for ValueDecompressor {
     }
 }
 
-impl FixedPerValueCompressor for ValueEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(FixedWidthDataBlock, ArrayEncoding)> {
+impl PerValueCompressor for ValueEncoder {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, ArrayEncoding)> {
         let (data, encoding) = match data {
             DataBlock::FixedWidth(fixed_width) => {
                 let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
-                (fixed_width, encoding)
+                (PerValueDataBlock::Fixed(fixed_width), encoding)
             }
             _ => unimplemented!(
                 "Cannot compress block of type {} with ValueEncoder",
@@ -456,7 +467,7 @@ impl FixedPerValueCompressor for ValueEncoder {
 pub(crate) mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{Array, Int32Array};
+    use arrow_array::{Array, ArrayRef, Decimal128Array, Int32Array};
     use arrow_schema::{DataType, Field, TimeUnit};
     use rstest::rstest;
 
@@ -502,6 +513,39 @@ pub(crate) mod tests {
             let field = Field::new("", data_type.clone(), false);
             check_round_trip_encoding_random(field, version).await;
         }
+    }
+
+    lazy_static::lazy_static! {
+        static ref LARGE_TYPES: Vec<DataType> = vec![DataType::FixedSizeList(
+            Arc::new(Field::new("", DataType::Int32, false)),
+            128,
+        )];
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_large_primitive(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
+        for data_type in LARGE_TYPES.iter() {
+            log::info!("Testing encoding for {:?}", data_type);
+            let field = Field::new("", data_type.clone(), false);
+            check_round_trip_encoding_random(field, version).await;
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_decimal128_dictionary_encoding() {
+        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+        let decimals: Vec<i32> = (0..100).collect();
+        let repeated_strings: Vec<_> = decimals
+            .iter()
+            .cycle()
+            .take(decimals.len() * 10000)
+            .map(|&v| Some(v as i128))
+            .collect();
+        let decimal_array = Arc::new(Decimal128Array::from(repeated_strings)) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![decimal_array], &test_cases, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]

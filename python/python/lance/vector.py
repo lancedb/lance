@@ -5,22 +5,21 @@
 
 from __future__ import annotations
 
-import logging
 import re
 import tempfile
-from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union
 
 import pyarrow as pa
 from tqdm.auto import tqdm
 
 from . import write_dataset
 from .dependencies import (
-    _CAGRA_AVAILABLE,
-    _RAFT_COMMON_AVAILABLE,
     _check_for_numpy,
     torch,
 )
 from .dependencies import numpy as np
+from .log import LOGGER
+from .util import MetricType, _normalize_metric_type
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -133,20 +132,19 @@ CUDA_REGEX = re.compile(r"^cuda(:\d+)?$")
 
 
 def train_pq_codebook_on_accelerator(
-    dataset: LanceDataset,
-    metric_type: Literal["l2", "cosine", "dot"],
+    dataset: LanceDataset | Path | str,
+    metric_type: MetricType,
     accelerator: Union[str, "torch.Device"],
     num_sub_vectors: int,
     batch_size: int = 1024 * 10 * 4,
+    dtype: np.dtype = np.float32,
 ) -> Tuple[np.ndarray, List[Any]]:
     """Use accelerator (GPU or MPS) to train pq codebook."""
 
     from .torch.data import LanceDataset as TorchDataset
     from .torch.kmeans import KMeans
 
-    # cuvs not particularly useful for only 256 centroids without more work
-    if accelerator == "cuvs":
-        accelerator = "cuda"
+    metric_type = _normalize_metric_type(metric_type)
 
     centroids_list = []
     kmeans_list = []
@@ -173,7 +171,7 @@ def train_pq_codebook_on_accelerator(
     )
 
     for sub_vector in range(num_sub_vectors):
-        logging.info("Training IVF partitions using GPU(%s)", accelerator)
+        LOGGER.info("Training IVF partitions using GPU(%s)", accelerator)
         if num_sub_vectors == 1:
             # sampler has different behaviour with one column
             init_centroids_slice = init_centroids
@@ -195,7 +193,7 @@ def train_pq_codebook_on_accelerator(
         centroids_list.append(ivf_centroids_local)
         kmeans_list.append(kmeans_local)
 
-    pq_codebook = np.stack(centroids_list)
+    pq_codebook = np.stack(centroids_list).astype(dtype)
     return pq_codebook, kmeans_list
 
 
@@ -203,7 +201,7 @@ def train_ivf_centroids_on_accelerator(
     dataset: LanceDataset,
     column: str,
     k: int,
-    metric_type: Literal["l2", "cosine", "dot"],
+    metric_type: MetricType,
     accelerator: Union[str, "torch.Device"],
     batch_size: int = 1024 * 10 * 4,
     *,
@@ -213,16 +211,14 @@ def train_ivf_centroids_on_accelerator(
 ) -> Tuple[np.ndarray, Any]:
     """Use accelerator (GPU or MPS) to train kmeans."""
 
-    from .cuvs.kmeans import KMeans as KMeansCuVS
     from .torch.data import LanceDataset as TorchDataset
     from .torch.kmeans import KMeans
 
+    metric_type = _normalize_metric_type(metric_type)
+    vector_value_type = dataset.schema.field(column).type.value_type
+
     if isinstance(accelerator, str) and (
-        not (
-            CUDA_REGEX.match(accelerator)
-            or accelerator == "mps"
-            or accelerator == "cuvs"
-        )
+        not (CUDA_REGEX.match(accelerator) or accelerator == "mps")
     ):
         raise ValueError(
             "Train ivf centroids on accelerator: "
@@ -238,7 +234,7 @@ def train_ivf_centroids_on_accelerator(
     else:
         filt = None
 
-    logging.info("Randomly select %s centroids from %s (filt=%s)", k, dataset, filt)
+    LOGGER.info("Randomly select %s centroids from %s (filt=%s)", k, dataset, filt)
 
     ds = TorchDataset(
         dataset,
@@ -249,7 +245,7 @@ def train_ivf_centroids_on_accelerator(
     )
 
     init_centroids = next(iter(ds))
-    logging.info("Done sampling: centroids shape: %s", init_centroids.shape)
+    LOGGER.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
     ds = TorchDataset(
         dataset,
@@ -260,40 +256,23 @@ def train_ivf_centroids_on_accelerator(
         cache=True,
     )
 
-    if accelerator == "cuvs":
-        logging.info("Training IVF partitions using cuVS+GPU")
-        print("Training IVF partitions using cuVS+GPU")
-        if not (_CAGRA_AVAILABLE and _RAFT_COMMON_AVAILABLE):
-            logging.error(
-                "Missing cuvs and pylibraft - "
-                "please install cuvs-cu11 and pylibraft-cu11 or "
-                "cuvs-cu12 and pylibraft-cu12 using --extra-index-url "
-                "https://pypi.nvidia.com/"
-            )
-            raise Exception("Missing cuvs or pylibraft dependency.")
-        kmeans = KMeansCuVS(
-            k,
-            max_iters=max_iters,
-            metric=metric_type,
-            device="cuda",
-            centroids=init_centroids,
-        )
-    else:
-        logging.info("Training IVF partitions using GPU(%s)", accelerator)
-        kmeans = KMeans(
-            k,
-            max_iters=max_iters,
-            metric=metric_type,
-            device=accelerator,
-            centroids=init_centroids,
-        )
+    LOGGER.info("Training IVF partitions using GPU(%s)", accelerator)
+    kmeans = KMeans(
+        k,
+        max_iters=max_iters,
+        metric=metric_type,
+        device=accelerator,
+        centroids=init_centroids,
+    )
     kmeans.fit(ds)
 
-    centroids = kmeans.centroids.cpu().numpy()
+    centroids = (
+        kmeans.centroids.cpu().numpy().astype(vector_value_type.to_pandas_dtype())
+    )
 
     with tempfile.NamedTemporaryFile(delete=False) as f:
         np.save(f, centroids)
-    logging.info("Saved centroids to %s", f.name)
+    LOGGER.info("Saved centroids to %s", f.name)
 
     return centroids, kmeans
 
@@ -304,7 +283,7 @@ def compute_pq_codes(
     batch_size: int = 1024 * 10 * 4,
     dst_dataset_uri: Optional[Union[str, Path]] = None,
     allow_cuda_tf32: bool = True,
-) -> str:
+) -> Tuple[Union[str, Path], List[str]]:
     """Compute pq codes for each row using GPU kmeans and spill to disk.
 
     Parameters
@@ -323,8 +302,8 @@ def compute_pq_codes(
 
     Returns
     -------
-    str
-        The absolute path of the pq codes dataset.
+    Tuple[Union[str, Path], List[str]]
+        The absolute path of the pq codes dataset and shuffle buffers
     """
     from .torch.data import LanceDataset as TorchDataset
 
@@ -409,12 +388,10 @@ def compute_pq_codes(
 
     progress.close()
 
-    logging.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
+    LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
 
     shuffle_buffers = [
-        data_file.path()
-        for frag in ds.get_fragments()
-        for data_file in frag.data_files()
+        data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
     ]
     return dst_dataset_uri, shuffle_buffers
 
@@ -561,7 +538,7 @@ def compute_partitions(
                     schema=output_schema,
                 )
                 if len(part_batch) < len(ids):
-                    logging.warning(
+                    LOGGER.warning(
                         "%s vectors are ignored during partition assignment",
                         len(part_batch) - len(ids),
                     )
@@ -582,7 +559,7 @@ def compute_partitions(
 
     progress.close()
 
-    logging.info("Saved precomputed partitions to %s", dst_dataset_uri)
+    LOGGER.info("Saved precomputed partitions to %s", dst_dataset_uri)
     return str(dst_dataset_uri)
 
 
@@ -590,7 +567,7 @@ def one_pass_train_ivf_pq_on_accelerator(
     dataset: LanceDataset,
     column: str,
     k: int,
-    metric_type: Literal["l2", "cosine", "dot"],
+    metric_type: MetricType,
     accelerator: Union[str, "torch.Device"],
     num_sub_vectors: int,
     batch_size: int = 1024 * 10 * 4,
@@ -599,6 +576,7 @@ def one_pass_train_ivf_pq_on_accelerator(
     max_iters: int = 50,
     filter_nan: bool = True,
 ):
+    metric_type = _normalize_metric_type(metric_type)
     centroids, kmeans = train_ivf_centroids_on_accelerator(
         dataset,
         column,
@@ -629,7 +607,7 @@ def one_pass_train_ivf_pq_on_accelerator(
 def one_pass_assign_ivf_pq_on_accelerator(
     dataset: LanceDataset,
     column: str,
-    metric_type: Literal["l2", "cosine", "dot"],
+    metric_type: MetricType,
     accelerator: Union[str, "torch.Device"],
     ivf_kmeans: Any,  # KMeans
     pq_kmeans_list: List[Any],  # List[KMeans]
@@ -716,7 +694,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
                 # cast centroids to the same dtype as vecs
                 if first_iter:
                     first_iter = False
-                    logging.info("Residual shape: %s", residual_vecs.shape)
+                    LOGGER.info("Residual shape: %s", residual_vecs.shape)
                     for kmeans in pq_kmeans_list:
                         cents: torch.Tensor = kmeans.centroids
                         kmeans.centroids = cents.to(
@@ -743,7 +721,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
                 )
 
                 if len(part_batch) < len(ids):
-                    logging.warning(
+                    LOGGER.warning(
                         "%s vectors are ignored during partition assignment",
                         len(part_batch) - len(ids),
                     )
@@ -765,7 +743,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
 
     progress.close()
 
-    logging.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
+    LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
 
     shuffle_buffers = [
         data_file.path()

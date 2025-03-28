@@ -11,25 +11,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance;
 
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-/**
- * The LockManager class provides a way to manage read and write locks.
- */
+/** The LockManager class provides a way to manage read and write locks. */
 public class LockManager {
   private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
   /**
-   * Represents a read lock for the LockManager.
-   * This lock allows multiple threads to read concurrently, but prevents write access.
+   * Represents a read lock for the LockManager. This lock allows multiple threads to read
+   * concurrently, but prevents write access.
    */
   public class ReadLock implements AutoCloseable {
-    /**
-     * Acquires a read lock on the lock manager.
-     */
+    /** Acquires a read lock on the lock manager. */
     public ReadLock() {
       lock.readLock().lock();
     }
@@ -40,13 +35,9 @@ public class LockManager {
     }
   }
 
-  /**
-   * Represents a write lock that can be acquired and released.
-   */
+  /** Represents a write lock that can be acquired and released. */
   public class WriteLock implements AutoCloseable {
-    /**
-     * Constructs a new WriteLock and acquires the write lock.
-     */
+    /** Constructs a new WriteLock and acquires the write lock. */
     public WriteLock() {
       lock.writeLock().lock();
     }

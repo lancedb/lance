@@ -35,7 +35,7 @@ use lance_io::utils::{
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use crate::format::metadata::Metadata;
@@ -532,7 +532,7 @@ fn read_null_array(
                 0
             } else {
                 let idx_max = *indices.values().iter().max().unwrap() as u64;
-                if idx_max >= page_info.length.try_into().unwrap() {
+                if idx_max >= page_info.length as u64 {
                     return Err(Error::io(
                         format!(
                             "NullArray Reader: request([{}]) out of range: [0..{}]",

@@ -27,20 +27,26 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
-    if cfg!(target_os = "windows") {
+    // Important: we don't use `cfg!(target_arch)` here because that is the target_arch
+    // for the build script, not the target_arch for the library. Similar story for
+    // target_os.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+
+    if target_os == "windows" {
         println!(
             "cargo:warning=fp16 kernels are not supported on Windows. Skipping compilation of kernels."
         );
         return Ok(());
     }
 
-    if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+    if target_arch == "aarch64" && target_os == "macos" {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-mtune=apple-m1"]).unwrap();
-    } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+    } else if target_arch == "aarch64" && target_os == "linux" {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-march=armv8.2-a+fp16"]).unwrap();
-    } else if cfg!(target_arch = "x86_64") {
+    } else if target_arch == "x86_64" {
         // Build a version with AVX512
         if let Err(err) = build_f16_with_flags("avx512", &["-march=sapphirerapids", "-mavx512fp16"])
         {
@@ -63,7 +69,7 @@ fn main() -> Result<(), String> {
             return Err(format!("Unable to build AVX2 f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature.  Received error: {}", err));
         };
         // There is no SSE instruction set for f16 -> f32 float conversion
-    } else if cfg!(target_arch = "loongarch64") {
+    } else if target_arch == "loongarch64" {
         // Build a version with LSX and LASX
         build_f16_with_flags("lsx", &["-mlsx"]).unwrap();
         build_f16_with_flags("lasx", &["-mlasx"]).unwrap();

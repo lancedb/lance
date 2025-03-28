@@ -11,15 +11,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.ipc;
 
 import com.lancedb.lance.Dataset;
 import com.lancedb.lance.LockManager;
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.util.List;
-import java.util.Optional;
+
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
@@ -28,6 +24,11 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Optional;
 
 /** Scanner over a Fragment. */
 public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
@@ -51,30 +52,50 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
    * @param allocator allocator
    * @return a Scanner
    */
-  public static LanceScanner create(Dataset dataset, ScanOptions options,
-      BufferAllocator allocator) {
+  public static LanceScanner create(
+      Dataset dataset, ScanOptions options, BufferAllocator allocator) {
     Preconditions.checkNotNull(dataset);
     Preconditions.checkNotNull(options);
     Preconditions.checkNotNull(allocator);
-    LanceScanner scanner = createScanner(dataset, options.getFragmentIds(), options.getColumns(),
-        options.getSubstraitFilter(), options.getFilter(), options.getBatchSize(),
-        options.getLimit(), options.getOffset(), options.getNearest(),
-        options.isWithRowId(), options.getBatchReadahead());
+    LanceScanner scanner =
+        createScanner(
+            dataset,
+            options.getFragmentIds(),
+            options.getColumns(),
+            options.getSubstraitFilter(),
+            options.getFilter(),
+            options.getBatchSize(),
+            options.getLimit(),
+            options.getOffset(),
+            options.getNearest(),
+            options.isWithRowId(),
+            options.isWithRowAddress(),
+            options.getBatchReadahead(),
+            options.getColumnOrderings());
     scanner.allocator = allocator;
     scanner.dataset = dataset;
     scanner.options = options;
     return scanner;
   }
 
-  static native LanceScanner createScanner(Dataset dataset, Optional<List<Integer>> fragmentIds,
-      Optional<List<String>> columns, Optional<ByteBuffer> substraitFilter,
-      Optional<String> filter, Optional<Long> batchSize, Optional<Long> limit,
-      Optional<Long> offset, Optional<Query> query, boolean withRowId, int batchReadahead
-      );
+  static native LanceScanner createScanner(
+      Dataset dataset,
+      Optional<List<Integer>> fragmentIds,
+      Optional<List<String>> columns,
+      Optional<ByteBuffer> substraitFilter,
+      Optional<String> filter,
+      Optional<Long> batchSize,
+      Optional<Long> limit,
+      Optional<Long> offset,
+      Optional<Query> query,
+      boolean withRowId,
+      boolean withRowAddress,
+      int batchReadahead,
+      Optional<List<ColumnOrdering>> columnOrderings);
 
   /**
-   * Closes this scanner and releases any system resources associated with it. If
-   * the scanner is already closed, then invoking this method has no effect.
+   * Closes this scanner and releases any system resources associated with it. If the scanner is
+   * already closed, then invoking this method has no effect.
    */
   @Override
   public void close() throws Exception {
@@ -87,8 +108,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
   }
 
   /**
-   * Native method to release the Lance scanner resources associated with the
-   * given handle.
+   * Native method to release the Lance scanner resources associated with the given handle.
    *
    * @param handle The native handle to the scanner resource.
    */

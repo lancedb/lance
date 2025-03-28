@@ -13,6 +13,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from lance import LanceFragment
+from lance.dataset import VectorIndexReader
 
 torch = pytest.importorskip("torch")
 from lance.util import validate_vector_index  # noqa: E402
@@ -48,6 +49,48 @@ def create_table(nvec=1000, ndim=128, nans=0, nullify=False, dtype=np.float32):
     return tbl
 
 
+def create_multivec_table(
+    nvec=1000, nvec_per_row=5, ndim=128, nans=0, nullify=False, dtype=np.float32
+):
+    mat = np.random.randn(nvec, nvec_per_row, ndim)
+    if nans > 0:
+        nans_mat = np.empty((nans, ndim))
+        nans_mat[:] = np.nan
+        mat = np.concatenate((mat, nans_mat), axis=0)
+    mat = mat.astype(dtype)
+    price = np.random.rand(nvec + nans) * 100
+
+    def gen_str(n):
+        return "".join(random.choices(string.ascii_letters + string.digits, k=n))
+
+    meta = np.array([gen_str(100) for _ in range(nvec + nans)])
+
+    multi_vec_type = pa.list_(pa.list_(pa.float32(), ndim))
+    tbl = pa.Table.from_arrays(
+        [
+            pa.array((mat[i].tolist() for i in range(nvec)), type=multi_vec_type),
+        ],
+        schema=pa.schema(
+            [
+                pa.field("vector", pa.list_(pa.list_(pa.float32(), ndim))),
+            ]
+        ),
+    )
+    tbl = (
+        tbl.append_column("price", pa.array(price))
+        .append_column("meta", pa.array(meta))
+        .append_column("id", pa.array(range(nvec + nans)))
+    )
+    if nullify:
+        idx = tbl.schema.get_field_index("vector")
+        vecs = tbl[idx].to_pylist()
+        nullified = [vec if i % 2 == 0 else None for i, vec in enumerate(vecs)]
+        field = tbl.schema.field(idx)
+        vecs = pa.array(nullified, field.type)
+        tbl = tbl.set_column(idx, field, vecs)
+    return tbl
+
+
 @pytest.fixture()
 def dataset(tmp_path):
     tbl = create_table()
@@ -60,6 +103,23 @@ def indexed_dataset(tmp_path):
     dataset = lance.write_dataset(tbl, tmp_path)
     yield dataset.create_index(
         "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+    )
+
+
+@pytest.fixture()
+def multivec_dataset():
+    tbl = create_multivec_table()
+    yield lance.write_dataset(tbl, "memory://")
+
+
+@pytest.fixture()
+def indexed_multivec_dataset(multivec_dataset):
+    yield multivec_dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        metric="cosine",
     )
 
 
@@ -373,6 +433,37 @@ def test_has_index(dataset, tmp_path):
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
 
 
+def test_index_type(dataset, tmp_path):
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        replace=True,
+    )
+    assert ann_ds.list_indices()[0]["type"] == "IVF_PQ"
+
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_SQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        replace=True,
+    )
+    assert ann_ds.list_indices()[0]["type"] == "IVF_HNSW_SQ"
+
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        replace=True,
+    )
+    assert ann_ds.list_indices()[0]["type"] == "IVF_HNSW_PQ"
+
+
 def test_create_dot_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
@@ -384,6 +475,44 @@ def test_create_dot_index(dataset, tmp_path):
         metric="dot",
     )
     assert ann_ds.has_index
+
+
+def test_create_4bit_ivf_pq_index(dataset, tmp_path):
+    assert not dataset.has_index
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=16,
+        num_bits=4,
+        metric="l2",
+    )
+    index = ann_ds.stats.index_stats("vector_idx")
+    assert index["indices"][0]["sub_index"]["nbits"] == 4
+
+
+def test_ivf_flat_over_binary_vector(tmp_path):
+    dim = 128
+    nvec = 1000
+    data = np.random.randint(0, 256, (nvec, dim // 8)).tolist()
+    array = pa.array(data, type=pa.list_(pa.uint8(), dim // 8))
+    tbl = pa.Table.from_pydict({"vector": array})
+    ds = lance.write_dataset(tbl, tmp_path)
+    ds.create_index("vector", index_type="IVF_FLAT", num_partitions=4, metric="hamming")
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["metric_type"] == "hamming"
+    assert stats["index_type"] == "IVF_FLAT"
+
+    query = np.random.randint(0, 256, dim // 8).astype(np.uint8)
+    ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 10,
+            "metric": "hamming",
+        }
+    )
 
 
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
@@ -410,11 +539,57 @@ def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
 
 
+def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
+    query = np.random.rand(5, 128)
+    results = indexed_multivec_dataset.scanner(
+        nearest={"column": "vector", "q": query, "k": 100}
+    ).to_table()
+    assert results.num_rows == 100
+    assert results["vector"].type == pa.list_(pa.list_(pa.float32(), 128))
+    assert len(results["vector"][0]) == 5
+
+    # query with single vector also works
+    query = np.random.rand(128)
+    results = indexed_multivec_dataset.to_table(
+        nearest={"column": "vector", "q": query, "k": 100}
+    )
+    # we don't verify the number of results here,
+    # because for multivector, it's not guaranteed to return k results
+    assert results["vector"].type == pa.list_(pa.list_(pa.float32(), 128))
+    assert len(results["vector"][0]) == 5
+
+    query = [query, query]
+    doubled_results = indexed_multivec_dataset.to_table(
+        nearest={"column": "vector", "q": query, "k": 100}
+    )
+    assert len(results) == len(doubled_results)
+    for i in range(len(results)):
+        assert (
+            results["_distance"][i].as_py() * 2
+            == doubled_results["_distance"][i].as_py()
+        )
+
+    # query with a vector that dim not match
+    query = np.random.rand(256)
+    with pytest.raises(ValueError, match="does not match index column size"):
+        indexed_multivec_dataset.to_table(
+            nearest={"column": "vector", "q": query, "k": 100}
+        )
+
+    # query with a list of vectors that some dim not match
+    query = [np.random.rand(128)] * 5 + [np.random.rand(256)]
+    with pytest.raises(ValueError, match="All query vectors must have the same length"):
+        indexed_multivec_dataset.to_table(
+            nearest={"column": "vector", "q": query, "k": 100}
+        )
+
+
 def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     centroids = np.random.randn(5, 128).astype(np.float32)  # IVF5
     dataset_with_index = dataset.create_index(
         ["vector"],
         index_type="IVF_PQ",
+        metric="cosine",
         ivf_centroids=centroids,
         num_partitions=5,
         num_sub_vectors=8,
@@ -439,7 +614,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
         "index_type": "IVF_PQ",
         "uuid": index_uuid,
         "uri": expected_filepath,
-        "metric_type": "l2",
+        "metric_type": "cosine",
         "num_partitions": 5,
         "sub_index": {
             "dimension": 128,
@@ -447,6 +622,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             "metric_type": "l2",
             "nbits": 8,
             "num_sub_vectors": 8,
+            "transposed": True,
         },
     }
 
@@ -467,6 +643,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     idx_stats = actual_statistics["indices"][0]
     partitions = idx_stats.pop("partitions")
     idx_stats.pop("centroids")
+    idx_stats.pop("loss")
     assert idx_stats == expected_statistics
     assert len(partitions) == 5
     partition_keys = {"size"}
@@ -626,8 +803,8 @@ def test_optimize_index_recall(tmp_path: Path):
 
     def check_index(has_knn_combined, delete_has_happened):
         for query in sample_queries:
-            results = dataset.to_table(nearest=query).column("vector")
-            assert has_target(query["q"], results)
+            results = dataset.to_table(nearest=query)
+            assert has_target(query["q"], results["vector"])
             plan = dataset.scanner(nearest=query).explain_plan(verbose=True)
             assert ("KNNVectorDistance" in plan) == has_knn_combined
         for query in sample_delete_queries:
@@ -943,3 +1120,94 @@ def test_optimize_indices(indexed_dataset):
     indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
     indices = indexed_dataset.list_indices()
     assert len(indices) == 2
+
+
+def test_retrain_indices(indexed_dataset):
+    data = create_table()
+    indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 1
+
+    indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 2
+
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    centroids = stats["indices"][0]["centroids"]
+    delta_centroids = stats["indices"][1]["centroids"]
+    assert centroids == delta_centroids
+
+    indexed_dataset.optimize.optimize_indices(retrain=True)
+    new_centroids = indexed_dataset.stats.index_stats("vector_idx")["indices"][0][
+        "centroids"
+    ]
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 1
+    assert centroids != new_centroids
+
+
+def test_no_include_deleted_rows(indexed_dataset):
+    with pytest.raises(ValueError, match="Cannot include deleted rows"):
+        indexed_dataset.to_table(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+            },
+            with_row_id=True,
+            include_deleted_rows=True,
+        )
+
+
+def test_drop_indices(indexed_dataset):
+    idx_name = indexed_dataset.list_indices()[0]["name"]
+
+    indexed_dataset.drop_index(idx_name)
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 0
+
+    test_vec = (
+        indexed_dataset.take([0], columns=["vector"]).column("vector").to_pylist()[0]
+    )
+
+    # make sure we can still search the column (will do flat search)
+    results = indexed_dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": test_vec,
+            "k": 15,
+            "nprobes": 1,
+        },
+    )
+
+    assert len(results) == 15
+
+
+def test_read_partition(indexed_dataset):
+    idx_name = indexed_dataset.list_indices()[0]["name"]
+    reader = VectorIndexReader(indexed_dataset, idx_name)
+
+    num_rows = indexed_dataset.count_rows()
+    row_sum = 0
+    for part_id in range(reader.num_partitions()):
+        res = reader.read_partition(part_id)
+        row_sum += res.num_rows
+        assert "_rowid" in res.column_names
+    assert row_sum == num_rows
+
+    row_sum = 0
+    for part_id in range(reader.num_partitions()):
+        res = reader.read_partition(part_id, with_vector=True)
+        row_sum += res.num_rows
+        pq_column = res["__pq_code"]
+        assert "_rowid" in res.column_names
+        assert pq_column.type == pa.list_(pa.uint8(), 16)
+    assert row_sum == num_rows
+
+    # error tests
+    with pytest.raises(IndexError, match="out of range"):
+        reader.read_partition(reader.num_partitions() + 1)
+
+    with pytest.raises(ValueError, match="not vector index"):
+        indexed_dataset.create_scalar_index("id", index_type="BTREE")
+        VectorIndexReader(indexed_dataset, "id_idx")

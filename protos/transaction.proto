@@ -67,7 +67,9 @@ message Transaction {
 
   // Add or replace a new secondary index.
   //
-  // - new_indices: the modified indices
+  // This is also used to remove an index (we are replacing it with nothing)
+  //
+  // - new_indices: the modified indices, empty if dropping indices only
   // - removed_indices: the indices that are being replaced
   message CreateIndex {
     repeated IndexMetadata new_indices = 1;
@@ -163,6 +165,22 @@ message Transaction {
   message UpdateConfig {
     map<string, string> upsert_values = 1;
     repeated string delete_keys = 2;
+    map<string, string> schema_metadata = 3;
+    map<uint32, FieldMetadataUpdate> field_metadata = 4;
+
+    message FieldMetadataUpdate {
+      map<string, string> metadata = 5;
+    }
+  }
+
+  message DataReplacementGroup {
+    uint64 fragment_id = 1;
+    DataFile new_file = 2;
+  }
+
+  // An operation that replaces the data in a region of the table with new data.
+  message DataReplacement {
+    repeated DataReplacementGroup replacements = 1;
   }
 
   // The operation of this transaction.
@@ -178,6 +196,7 @@ message Transaction {
     Update update = 108;
     Project project = 109;
     UpdateConfig update_config = 110;
+    DataReplacement data_replacement = 111;
   }
 
   // An operation to apply to the blob dataset

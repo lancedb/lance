@@ -43,7 +43,7 @@ use lance_file::{
     v2::{reader::EncodedBatchReaderExt, writer::EncodedBatchWriteExt},
     version::LanceFileVersion,
 };
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::substrait::FilterExpressionExt;
 
@@ -146,7 +146,7 @@ pub(crate) fn extract_zone_info(
                 let mut zone_index = zone_index.clone();
                 let inner = zone_index.inner.take().unwrap();
                 let rows_per_zone = zone_index.rows_per_zone;
-                let zone_map_buffer = zone_index.zone_map_buffer.as_ref().unwrap().clone();
+                let zone_map_buffer = *zone_index.zone_map_buffer.as_ref().unwrap();
                 assert_eq!(
                     zone_map_buffer.buffer_type,
                     i32::from(pb::buffer::BufferType::Column)
@@ -393,6 +393,8 @@ impl ZoneMapsFieldScheduler {
             &FilterExpression::no_filter(),
             Arc::<DecoderPlugins>::default(),
             /*should_validate= */ false,
+            LanceFileVersion::default(),
+            None,
         )
         .await?;
 
@@ -609,6 +611,7 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
         external_buffers: &mut OutOfLineBuffers,
         repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<lance_encoding::encoder::EncodeTask>> {
         // TODO: If we do the zone map calculation as part of the encoding task then we can
         // parallelize statistics gathering.  Could be faster too since the encoding task is
@@ -617,7 +620,7 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
         // to improve write speed.
         self.update(&array)?;
         self.items_encoder
-            .maybe_encode(array, external_buffers, repdef, row_number)
+            .maybe_encode(array, external_buffers, repdef, row_number, num_rows)
     }
 
     fn flush(

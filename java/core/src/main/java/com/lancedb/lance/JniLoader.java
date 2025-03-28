@@ -11,23 +11,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance;
 
 import io.questdb.jar.jni.JarJniLoader;
 
-/**
- * Utility class to load the native library.
- */
+/** Utility class to load the native library. */
 public class JniLoader {
   static {
     JarJniLoader.loadLib(Dataset.class, "/nativelib", "lance_jni");
   }
 
-  /**
-   * Ensures the native library is loaded.
-   * This method will trigger the static initializer
-   */
+  /** Ensures the native library is loaded. This method will trigger the static initializer */
   public static void ensureLoaded() {}
 
   private JniLoader() {}

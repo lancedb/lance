@@ -11,10 +11,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark.read;
 
 import com.lancedb.lance.spark.utils.Optional;
+
 import org.apache.spark.sql.sources.And;
 import org.apache.spark.sql.sources.EqualNullSafe;
 import org.apache.spark.sql.sources.EqualTo;
@@ -35,6 +35,7 @@ import org.apache.spark.sql.sources.StringStartsWith;
 import java.sql.Date;
 import java.sql.Timestamp;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -53,9 +54,10 @@ public class FilterPushDown {
     for (Filter filter : filters) {
       compileFilter(filter).ifPresent(compiledFilters::add);
     }
-    String whereClause = compiledFilters.stream()
-        .map(filter -> "(" + filter + ")")
-        .collect(Collectors.joining(" AND "));
+    String whereClause =
+        compiledFilters.stream()
+            .map(filter -> "(" + filter + ")")
+            .collect(Collectors.joining(" AND "));
     return Optional.of(whereClause);
   }
 
@@ -78,7 +80,7 @@ public class FilterPushDown {
     Filter[] acceptedArray = acceptedFilters.toArray(new Filter[0]);
     Filter[] rejectedArray = rejectedFilters.toArray(new Filter[0]);
 
-    return new Filter[][]{acceptedArray, rejectedArray};
+    return new Filter[][] {acceptedArray, rejectedArray};
   }
 
   public static boolean isFilterSupported(Filter filter) {
@@ -87,7 +89,7 @@ public class FilterPushDown {
     } else if (filter instanceof EqualNullSafe) {
       return false;
     } else if (filter instanceof In) {
-      return false;
+      return true;
     } else if (filter instanceof LessThan) {
       return true;
     } else if (filter instanceof LessThanOrEqual) {
@@ -149,12 +151,11 @@ public class FilterPushDown {
       Optional<String> right = compileFilter(f.right());
       if (left.isEmpty()) return right;
       if (right.isEmpty()) return left;
-      return Optional.of(String.format("(%s) AND (%s)",
-          left.get(), right.get()));
+      return Optional.of(String.format("(%s) AND (%s)", left.get(), right.get()));
     } else if (filter instanceof IsNull) {
       IsNull f = (IsNull) filter;
       return Optional.of(String.format("%s IS NULL", f.attribute()));
-    } else if (filter instanceof  IsNotNull) {
+    } else if (filter instanceof IsNotNull) {
       IsNotNull f = (IsNotNull) filter;
       return Optional.of(String.format("%s IS NOT NULL", f.attribute()));
     } else if (filter instanceof Not) {
@@ -162,6 +163,13 @@ public class FilterPushDown {
       Optional<String> child = compileFilter(f.child());
       if (child.isEmpty()) return child;
       return Optional.of(String.format("NOT (%s)", child.get()));
+    } else if (filter instanceof In) {
+      In in = (In) filter;
+      String values =
+          Arrays.stream(in.values())
+              .map(FilterPushDown::compileValue)
+              .collect(Collectors.joining(","));
+      return Optional.of(String.format("%s IN (%s)", in.attribute(), values));
     }
 
     return Optional.empty();

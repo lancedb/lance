@@ -1,3 +1,6 @@
+[default]
+extend-ignore-re = ["(?Rm)^.*(#|//)\\s*spellchecker:disable-line$"]
+
 [default.extend-words]
 DNE = "DNE"
 arange = "arange"
@@ -8,3 +11,4 @@ afe = "afe"
 
 [files]
 extend-exclude = ["notebooks/*.ipynb"]
+# If a line ends with # or // and has spellchecker:disable-line, ignore it
