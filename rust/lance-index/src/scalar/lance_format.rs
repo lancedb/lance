@@ -294,7 +294,7 @@ impl IndexStore for LanceIndexStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
 
     use std::{collections::HashMap, ops::Bound, path::Path};
 
@@ -311,7 +311,7 @@ mod tests {
     use arrow::{buffer::ScalarBuffer, datatypes::UInt8Type};
     use arrow_array::{
         cast::AsArray,
-        types::{Float32Type, Int32Type, UInt64Type},
+        types::{Int32Type, UInt64Type},
         RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
     };
     use arrow_schema::Schema as ArrowSchema;
@@ -331,15 +331,21 @@ mod tests {
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
-    struct MockTrainingSource {
+    pub struct MockTrainingSource {
         data: SendableRecordBatchStream,
     }
 
     impl MockTrainingSource {
-        async fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
+        pub async fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
             Self {
                 data: lance_datafusion::utils::reader_to_stream(Box::new(data)),
             }
+        }
+    }
+
+    impl From<SendableRecordBatchStream> for MockTrainingSource {
+        fn from(data: SendableRecordBatchStream) -> Self {
+            Self { data }
         }
     }
 
@@ -723,6 +729,7 @@ mod tests {
             DataType::Date32,
             DataType::Time64(TimeUnit::Nanosecond),
             DataType::Time32(TimeUnit::Second),
+            DataType::FixedSizeBinary(16),
             // Not supported today, error from datafusion:
             // Min/max accumulator not implemented for Duration(Nanosecond)
             // DataType::Duration(TimeUnit::Nanosecond),
@@ -784,35 +791,6 @@ mod tests {
             assert!(row_ids.len().unwrap() < data.num_rows() as u64);
             assert!(row_ids.contains(sample_row_id));
         }
-    }
-
-    #[tokio::test]
-    async fn btree_reject_nan() {
-        let tempdir = tempdir().unwrap();
-        let index_store = test_store(&tempdir);
-        let batch = gen()
-            .col("values", array::cycle::<Float32Type>(vec![0.0, f32::NAN]))
-            .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1]))
-            .into_batch_rows(RowCount::from(2));
-        let batches = vec![batch];
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Float32, false),
-            Field::new("row_ids", DataType::UInt64, false),
-        ]));
-        let data = RecordBatchIterator::new(batches, schema);
-        let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
-
-        let data = Box::new(MockTrainingSource::new(data).await);
-        // Until DF handles NaN reliably we need to make sure we reject input
-        // containing NaN
-        assert!(train_btree_index(
-            data,
-            &sub_index_trainer,
-            index_store.as_ref(),
-            DEFAULT_BTREE_BATCH_SIZE as u32
-        )
-        .await
-        .is_err());
     }
 
     #[tokio::test]

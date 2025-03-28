@@ -1536,7 +1536,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_ngram_index_with_spill() {
-        let data = lance_datagen::gen()
+        let (data, schema) = lance_datagen::gen()
             .col(
                 "values",
                 lance_datagen::array::rand_utf8(ByteCount::from(50), false),
@@ -1544,10 +1544,6 @@ mod tests {
             .col("row_ids", lance_datagen::array::step::<UInt64Type>())
             .into_reader_stream(RowCount::from(128), BatchCount::from(32));
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Utf8, false),
-            Field::new("row_ids", DataType::UInt64, false),
-        ]));
         let data = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             data.map_err(|arrow_err| DataFusionError::ArrowError(arrow_err, None)),
