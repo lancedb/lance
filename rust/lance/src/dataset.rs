@@ -4737,7 +4737,7 @@ mod tests {
             .scan()
             .full_text_search(
                 FullTextSearchQuery::new("common".to_owned())
-                    .with_field("title".to_owned())
+                    .with_column("title".to_owned())
                     .unwrap(),
             )
             .unwrap()
@@ -4750,7 +4750,7 @@ mod tests {
             .scan()
             .full_text_search(
                 FullTextSearchQuery::new("common".to_owned())
-                    .with_field("content".to_owned())
+                    .with_column("content".to_owned())
                     .unwrap(),
             )
             .unwrap()

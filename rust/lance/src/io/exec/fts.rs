@@ -7,11 +7,9 @@ use std::sync::Arc;
 use arrow::array::AsArray;
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
-use arrow_schema::SchemaRef;
 use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -20,7 +18,6 @@ use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::stream::{self};
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::ROW_ID;
 use lance_index::prefilter::PreFilter;
 use lance_index::scalar::inverted::query::{
@@ -42,7 +39,6 @@ pub struct MatchQueryExec {
     dataset: Arc<Dataset>,
     query: MatchQuery,
     params: FtsSearchParams,
-    unindexed_input: Arc<dyn ExecutionPlan>,
     prefilter_source: PreFilterSource,
     is_flat_search: bool,
 
@@ -77,34 +73,8 @@ impl MatchQueryExec {
             dataset,
             query,
             params,
-            unindexed_input: Arc::new(EmptyExec::new(FTS_SCHEMA.clone())),
             prefilter_source,
             is_flat_search: false,
-            properties,
-            metrics: ExecutionPlanMetricsSet::new(),
-        }
-    }
-
-    pub fn new_flat(
-        dataset: Arc<Dataset>,
-        query: MatchQuery,
-        params: FtsSearchParams,
-        unindexed_input: Arc<dyn ExecutionPlan>,
-        prefilter_source: PreFilterSource,
-    ) -> Self {
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(FTS_SCHEMA.clone()),
-            Partitioning::RoundRobinBatch(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-        Self {
-            dataset,
-            query,
-            params,
-            unindexed_input,
-            prefilter_source,
-            is_flat_search: true,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -120,15 +90,11 @@ impl ExecutionPlan for MatchQueryExec {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        FTS_SCHEMA.clone()
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.prefilter_source {
-            PreFilterSource::None => vec![&self.unindexed_input],
-            PreFilterSource::FilteredRowIds(src) => vec![&self.unindexed_input, &src],
-            PreFilterSource::ScalarIndexQuery(src) => vec![&self.unindexed_input, &src],
+            PreFilterSource::None => vec![],
+            PreFilterSource::FilteredRowIds(src) => vec![&src],
+            PreFilterSource::ScalarIndexQuery(src) => vec![&src],
         }
     }
 
@@ -138,35 +104,42 @@ impl ExecutionPlan for MatchQueryExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let plan = match children.len() {
             0 => {
-                return Err(DataFusionError::Internal(
-                    "Unexpected number of children".to_string(),
-                ));
-            }
-            1..=2 => {
-                let unindexed_input = children.pop().unwrap();
-
-                let mut prefilter_source = PreFilterSource::None;
-                if let Some(src) = children.pop() {
-                    prefilter_source = match &self.prefilter_source {
-                        PreFilterSource::FilteredRowIds(_) => {
-                            PreFilterSource::FilteredRowIds(src.clone())
-                        }
-                        PreFilterSource::ScalarIndexQuery(_) => {
-                            PreFilterSource::ScalarIndexQuery(src.clone())
-                        }
-                        PreFilterSource::None => {
-                            return Err(DataFusionError::Internal(
-                                "Unexpected prefilter source".to_string(),
-                            ));
-                        }
-                    };
+                if !matches!(self.prefilter_source, PreFilterSource::None) {
+                    return Err(DataFusionError::Internal(
+                        "Unexpected prefilter source".to_string(),
+                    ));
                 }
 
                 Self {
                     dataset: self.dataset.clone(),
                     query: self.query.clone(),
                     params: self.params.clone(),
-                    unindexed_input,
+                    prefilter_source: PreFilterSource::None,
+                    is_flat_search: self.is_flat_search,
+                    properties: self.properties.clone(),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                }
+            }
+            1 => {
+                let src = children.pop().unwrap();
+                let prefilter_source = match &self.prefilter_source {
+                    PreFilterSource::FilteredRowIds(_) => {
+                        PreFilterSource::FilteredRowIds(src.clone())
+                    }
+                    PreFilterSource::ScalarIndexQuery(_) => {
+                        PreFilterSource::ScalarIndexQuery(src.clone())
+                    }
+                    PreFilterSource::None => {
+                        return Err(DataFusionError::Internal(
+                            "Unexpected prefilter source".to_string(),
+                        ));
+                    }
+                };
+
+                Self {
+                    dataset: self.dataset.clone(),
+                    query: self.query.clone(),
+                    params: self.params.clone(),
                     prefilter_source,
                     is_flat_search: self.is_flat_search,
                     properties: self.properties.clone(),
@@ -193,109 +166,212 @@ impl ExecutionPlan for MatchQueryExec {
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
         let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
-        let unindexed_input = self.unindexed_input.execute(partition, context.clone())?;
-
-        let column = query.field.ok_or(DataFusionError::Execution(format!(
+        let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
             query.terms
         )))?;
-        if self.is_flat_search {
-            let stream = stream::once(async move {
-                let index_meta = ds.load_scalar_index_for_column(&column).await?.ok_or(
-                    DataFusionError::Execution(format!("No index found for column {}", column,)),
-                )?;
-                let uuid = index_meta.uuid.to_string();
-                let index = ds
-                    .open_generic_index(&column, &uuid, metrics.as_ref())
-                    .await?;
-                let inverted_idx =
-                    index
-                        .as_any()
-                        .downcast_ref::<InvertedIndex>()
-                        .ok_or_else(|| {
-                            DataFusionError::Execution(format!(
-                                "Index for column {} is not an inverted index",
-                                column,
-                            ))
-                        })?;
-                Ok::<_, DataFusionError>(flat_bm25_search_stream(
-                    unindexed_input,
-                    column,
-                    query.terms,
-                    inverted_idx,
-                ))
-            })
-            .try_flatten_unordered(Some(get_num_compute_intensive_cpus()));
-            Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
-                self.schema(),
-                stream.boxed(),
+
+        let stream = stream::once(async move {
+            let index_meta = ds.load_scalar_index_for_column(&column).await?.ok_or(
+                DataFusionError::Execution(format!("No index found for column {}", column,)),
+            )?;
+            let uuid = index_meta.uuid.to_string();
+            let index = ds
+                .open_generic_index(&column, &uuid, metrics.as_ref())
+                .await?;
+
+            let pre_filter = build_prefilter(
+                context.clone(),
                 partition,
-                &self.metrics,
-            )))
-        } else {
-            let stream = stream::once(async move {
-                let index_meta = ds.load_scalar_index_for_column(&column).await?.ok_or(
-                    DataFusionError::Execution(format!("No index found for column {}", column,)),
-                )?;
-                let uuid = index_meta.uuid.to_string();
-                let index = ds
-                    .open_generic_index(&column, &uuid, metrics.as_ref())
-                    .await?;
+                &prefilter_source,
+                ds,
+                &[index_meta],
+            )?;
 
-                let pre_filter = build_prefilter(
-                    context.clone(),
-                    partition,
-                    &prefilter_source,
-                    ds,
-                    &[index_meta],
-                )?;
+            let inverted_idx = index
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Index for column {} is not an inverted index",
+                        column,
+                    ))
+                })?;
 
-                let inverted_idx =
-                    index
-                        .as_any()
-                        .downcast_ref::<InvertedIndex>()
-                        .ok_or_else(|| {
-                            DataFusionError::Execution(format!(
-                                "Index for column {} is not an inverted index",
-                                column,
-                            ))
-                        })?;
+            let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
+            let mut tokenizer = match is_fuzzy {
+                false => inverted_idx.tokenizer(),
+                true => tantivy::tokenizer::TextAnalyzer::from(
+                    tantivy::tokenizer::SimpleTokenizer::default(),
+                ),
+            };
+            let mut tokens = collect_tokens(&query.terms, &mut tokenizer, None);
+            if is_fuzzy {
+                tokens = inverted_idx.expand_fuzzy(tokens, query.fuzziness)?;
+            }
 
-                let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
-                let mut tokenizer = match is_fuzzy {
-                    false => inverted_idx.tokenizer(),
-                    true => tantivy::tokenizer::TextAnalyzer::from(
-                        tantivy::tokenizer::SimpleTokenizer::default(),
-                    ),
-                };
-                let mut tokens = collect_tokens(&query.terms, &mut tokenizer, None);
-                if is_fuzzy {
-                    tokens = inverted_idx.expand_fuzzy(tokens, query.fuzziness)?;
-                }
-
-                pre_filter.wait_for_ready().await?;
-                let (doc_ids, mut scores) = inverted_idx
-                    .bm25_search(&tokens, &params, false, pre_filter, metrics.as_ref())
-                    .await?;
-                scores.iter_mut().for_each(|s| {
-                    *s *= query.boost;
-                });
-
-                let batch = RecordBatch::try_new(
-                    FTS_SCHEMA.clone(),
-                    vec![
-                        Arc::new(UInt64Array::from(doc_ids)),
-                        Arc::new(Float32Array::from(scores)),
-                    ],
-                )?;
-                Ok::<_, DataFusionError>(batch)
+            pre_filter.wait_for_ready().await?;
+            let (doc_ids, mut scores) = inverted_idx
+                .bm25_search(&tokens, &params, false, pre_filter, metrics.as_ref())
+                .await?;
+            scores.iter_mut().for_each(|s| {
+                *s *= query.boost;
             });
 
-            Ok(Box::pin(RecordBatchStreamAdapter::new(
-                self.schema(),
-                stream.boxed(),
-            )))
+            let batch = RecordBatch::try_new(
+                FTS_SCHEMA.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(doc_ids)),
+                    Arc::new(Float32Array::from(scores)),
+                ],
+            )?;
+            Ok::<_, DataFusionError>(batch)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream.boxed(),
+        )))
+    }
+
+    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
+        Ok(Statistics::new_unknown(&FTS_SCHEMA))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+}
+
+#[derive(Debug)]
+pub struct FlatMatchQueryExec {
+    dataset: Arc<Dataset>,
+    query: MatchQuery,
+    params: FtsSearchParams,
+    unindexed_input: Arc<dyn ExecutionPlan>,
+
+    properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl DisplayAs for FlatMatchQueryExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "FlatMatchQuery: query={:?}", self.query)
+            }
         }
+    }
+}
+
+impl FlatMatchQueryExec {
+    pub fn new(
+        dataset: Arc<Dataset>,
+        query: MatchQuery,
+        params: FtsSearchParams,
+        unindexed_input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            dataset,
+            query,
+            params,
+            unindexed_input,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
+
+impl ExecutionPlan for FlatMatchQueryExec {
+    fn name(&self) -> &str {
+        "FlatMatchQueryExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.unindexed_input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "Unexpected number of children".to_string(),
+            ));
+        }
+        let unindexed_input = children.pop().unwrap();
+        Ok(Arc::new(Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            params: self.params.clone(),
+            unindexed_input,
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }))
+    }
+
+    #[instrument(name = "flat_match_query_exec", level = "debug", skip_all)]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let query = self.query.clone();
+        let ds = self.dataset.clone();
+        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
+        let unindexed_input = self.unindexed_input.execute(partition, context.clone())?;
+
+        let column = query.column.ok_or(DataFusionError::Execution(format!(
+            "column not set for MatchQuery {}",
+            query.terms
+        )))?;
+
+        let stream = stream::once(async move {
+            let index_meta = ds.load_scalar_index_for_column(&column).await?.ok_or(
+                DataFusionError::Execution(format!("No index found for column {}", column,)),
+            )?;
+            let uuid = index_meta.uuid.to_string();
+            let index = ds
+                .open_generic_index(&column, &uuid, metrics.as_ref())
+                .await?;
+            let inverted_idx = index
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Index for column {} is not an inverted index",
+                        column,
+                    ))
+                })?;
+            Ok::<_, DataFusionError>(flat_bm25_search_stream(
+                unindexed_input,
+                column,
+                query.terms,
+                inverted_idx,
+            ))
+        })
+        .try_flatten_unordered(None);
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
+            self.schema(),
+            stream.boxed(),
+            partition,
+            &self.metrics,
+        )))
     }
 
     fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
@@ -364,10 +440,6 @@ impl ExecutionPlan for PhraseQueryExec {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        FTS_SCHEMA.clone()
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.prefilter_source {
             PreFilterSource::None => vec![],
@@ -434,7 +506,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
-            let column = query.field.ok_or(DataFusionError::Execution(format!(
+            let column = query.column.ok_or(DataFusionError::Execution(format!(
                 "column not set for PhraseQuery {}",
                 query.terms
             )))?;
@@ -551,10 +623,6 @@ impl ExecutionPlan for BoostQueryExec {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        FTS_SCHEMA.clone()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

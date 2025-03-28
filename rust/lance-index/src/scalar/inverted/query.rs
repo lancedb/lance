@@ -38,7 +38,7 @@ impl Default for FtsSearchParams {
 }
 
 pub trait FtsQueryNode {
-    fn fields(&self) -> HashSet<String>;
+    fn columns(&self) -> HashSet<String>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,10 +57,10 @@ impl std::fmt::Display for FtsQuery {
 }
 
 impl FtsQueryNode for FtsQuery {
-    fn fields(&self) -> HashSet<String> {
+    fn columns(&self) -> HashSet<String> {
         match self {
-            Self::Match(query) => query.fields(),
-            Self::Phrase(query) => query.fields(),
+            Self::Match(query) => query.columns(),
+            Self::Phrase(query) => query.columns(),
         }
     }
 }
@@ -73,17 +73,17 @@ impl FtsQuery {
         }
     }
 
-    pub fn is_missing_field(&self) -> bool {
+    pub fn is_missing_column(&self) -> bool {
         match self {
-            Self::Match(query) => query.field.is_none(),
-            Self::Phrase(query) => query.field.is_none(),
+            Self::Match(query) => query.column.is_none(),
+            Self::Phrase(query) => query.column.is_none(),
         }
     }
 
-    pub fn with_field(self, field: String) -> Self {
+    pub fn with_column(self, column: String) -> Self {
         match self {
-            Self::Match(query) => Self::Match(query.with_field(Some(field))),
-            Self::Phrase(query) => Self::Phrase(query.with_field(Some(field))),
+            Self::Match(query) => Self::Match(query.with_column(Some(column))),
+            Self::Phrase(query) => Self::Phrase(query.with_column(Some(column))),
         }
     }
 }
@@ -102,9 +102,9 @@ impl From<PhraseQuery> for FtsQuery {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchQuery {
-    // The field to search in.
+    // The column to search in.
     // If None, it will be determined at query time.
-    pub field: Option<String>,
+    pub column: Option<String>,
     pub terms: String,
     pub boost: f32,
 
@@ -120,15 +120,15 @@ pub struct MatchQuery {
 impl MatchQuery {
     pub fn new(terms: String) -> Self {
         Self {
-            field: None,
+            column: None,
             terms,
             boost: 1.0,
             fuzziness: Some(0),
         }
     }
 
-    pub fn with_field(mut self, field: Option<String>) -> Self {
-        self.field = field;
+    pub fn with_column(mut self, column: Option<String>) -> Self {
+        self.column = column;
         self
     }
 
@@ -152,41 +152,44 @@ impl MatchQuery {
 }
 
 impl FtsQueryNode for MatchQuery {
-    fn fields(&self) -> HashSet<String> {
-        let mut fields = HashSet::new();
-        if let Some(field) = &self.field {
-            fields.insert(field.clone());
+    fn columns(&self) -> HashSet<String> {
+        let mut columns = HashSet::new();
+        if let Some(column) = &self.column {
+            columns.insert(column.clone());
         }
-        fields
+        columns
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhraseQuery {
-    // The field to search in.
+    // The column to search in.
     // If None, it will be determined at query time.
-    pub field: Option<String>,
+    pub column: Option<String>,
     pub terms: String,
 }
 
 impl PhraseQuery {
     pub fn new(terms: String) -> Self {
-        Self { field: None, terms }
+        Self {
+            column: None,
+            terms,
+        }
     }
 
-    pub fn with_field(mut self, field: Option<String>) -> Self {
-        self.field = field;
+    pub fn with_column(mut self, column: Option<String>) -> Self {
+        self.column = column;
         self
     }
 }
 
 impl FtsQueryNode for PhraseQuery {
-    fn fields(&self) -> HashSet<String> {
-        let mut fields = HashSet::new();
-        if let Some(field) = &self.field {
-            fields.insert(field.clone());
+    fn columns(&self) -> HashSet<String> {
+        let mut columns = HashSet::new();
+        if let Some(column) = &self.column {
+            columns.insert(column.clone());
         }
-        fields
+        columns
     }
 }
 
@@ -230,20 +233,20 @@ impl std::fmt::Display for CompoundQuery {
 }
 
 impl FtsQueryNode for CompoundQuery {
-    fn fields(&self) -> HashSet<String> {
+    fn columns(&self) -> HashSet<String> {
         match self {
-            Self::Leaf(query) => query.fields(),
+            Self::Leaf(query) => query.columns(),
             Self::Boost(query) => {
-                let mut fields = query.positive.fields();
-                fields.extend(query.negative.fields());
-                fields
+                let mut columns = query.positive.columns();
+                columns.extend(query.negative.columns());
+                columns
             }
             Self::MultiMatch(query) => {
-                let mut fields = HashSet::new();
+                let mut columns = HashSet::new();
                 for match_query in &query.match_queries {
-                    fields.extend(match_query.fields());
+                    columns.extend(match_query.columns());
                 }
-                fields
+                columns
             }
         }
     }
@@ -271,38 +274,38 @@ impl BoostQuery {
 }
 
 impl FtsQueryNode for BoostQuery {
-    fn fields(&self) -> HashSet<String> {
-        let mut fields = self.positive.fields();
-        fields.extend(self.negative.fields());
-        fields
+    fn columns(&self) -> HashSet<String> {
+        let mut columns = self.positive.columns();
+        columns.extend(self.negative.columns());
+        columns
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultiMatchQuery {
-    // each query must be a match query with specified field
+    // each query must be a match query with specified column
     pub match_queries: Vec<CompoundQuery>,
 }
 
 impl MultiMatchQuery {
-    pub fn new(query: String, fields: Vec<String>) -> Self {
-        let match_queries = fields
+    pub fn new(query: String, columns: Vec<String>) -> Self {
+        let match_queries = columns
             .into_iter()
-            .map(|field| {
-                FtsQuery::Match(MatchQuery::new(query.clone()).with_field(Some(field))).into()
+            .map(|column| {
+                FtsQuery::Match(MatchQuery::new(query.clone()).with_column(Some(column))).into()
             })
             .collect();
         Self { match_queries }
     }
 
-    pub fn with_boosts(query: String, fields: Vec<String>, boosts: Vec<f32>) -> Self {
-        let match_queries = fields
+    pub fn with_boosts(query: String, columns: Vec<String>, boosts: Vec<f32>) -> Self {
+        let match_queries = columns
             .into_iter()
             .zip(boosts)
-            .map(|(field, boost)| {
+            .map(|(column, boost)| {
                 FtsQuery::Match(
                     MatchQuery::new(query.clone())
-                        .with_field(Some(field))
+                        .with_column(Some(column))
                         .with_boost(boost),
                 )
                 .into()
@@ -313,12 +316,12 @@ impl MultiMatchQuery {
 }
 
 impl FtsQueryNode for MultiMatchQuery {
-    fn fields(&self) -> HashSet<String> {
-        let mut fields = HashSet::with_capacity(self.match_queries.len());
+    fn columns(&self) -> HashSet<String> {
+        let mut columns = HashSet::with_capacity(self.match_queries.len());
         for query in &self.match_queries {
-            fields.extend(query.fields());
+            columns.extend(query.columns());
         }
-        fields
+        columns
     }
 }
 
@@ -340,14 +343,14 @@ pub fn collect_tokens(
     tokens
 }
 
-pub fn fill_fts_query_field(
+pub fn fill_fts_query_column(
     query: &CompoundQuery,
     columns: &[String],
     replace: bool,
 ) -> Result<CompoundQuery> {
     match query {
         CompoundQuery::Leaf(leaf) => {
-            if !leaf.is_missing_field() && !replace {
+            if !leaf.is_missing_column() && !replace {
                 return Ok(query.clone());
             }
 
@@ -359,8 +362,8 @@ pub fn fill_fts_query_field(
                     ))
                 }
                 1 => {
-                    let field = columns[0].clone();
-                    let query = leaf.clone().with_field(field);
+                    let column = columns[0].clone();
+                    let query = leaf.clone().with_column(column);
                     Ok(CompoundQuery::Leaf(query))
                 }
                 _ => {
@@ -371,9 +374,9 @@ pub fn fill_fts_query_field(
                 }
             }
         }
-        // for compound queries, we require the users to specify the field
+        // for compound queries, we require the users to specify the column
         _ => Err(Error::invalid_input(
-            "the field must be specified in the query".to_string(),
+            "the column must be specified in the query".to_string(),
             location!(),
         )),
     }

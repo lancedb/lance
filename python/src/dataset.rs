@@ -564,7 +564,7 @@ impl Dataset {
                     match columns.len() {
                         0 => {}
                         1 => {
-                            fts_query = fts_query.with_field(columns[0].clone()).map_err(|e| {
+                            fts_query = fts_query.with_column(columns[0].clone()).map_err(|e| {
                                 PyValueError::new_err(format!(
                                     "Failed to set field for full text search: {}",
                                     e

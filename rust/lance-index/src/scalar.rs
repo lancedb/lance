@@ -19,7 +19,7 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
-use inverted::query::{fill_fts_query_field, FtsQueryNode, FtsSearchParams};
+use inverted::query::{fill_fts_query_column, FtsQueryNode, FtsSearchParams};
 use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
@@ -300,10 +300,17 @@ impl FullTextSearchQuery {
         }
     }
 
-    /// Set the field to search over
+    /// Set the column to search over
     /// This is available for only MatchQuery and PhraseQuery
-    pub fn with_field(mut self, field: String) -> Result<Self> {
-        self.query = fill_fts_query_field(&self.query, &[field], true)?;
+    pub fn with_column(mut self, column: String) -> Result<Self> {
+        self.query = fill_fts_query_column(&self.query, &[column], true)?;
+        Ok(self)
+    }
+
+    /// Set the column to search over
+    /// This is available for only MatchQuery
+    pub fn with_columns(mut self, columns: &[String]) -> Result<Self> {
+        self.query = fill_fts_query_column(&self.query, columns, true)?;
         Ok(self)
     }
 
@@ -320,7 +327,7 @@ impl FullTextSearchQuery {
     }
 
     pub fn fields(&self) -> HashSet<String> {
-        self.query.fields()
+        self.query.columns()
     }
 
     pub fn params(&self) -> FtsSearchParams {

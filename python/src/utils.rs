@@ -298,10 +298,13 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<CompoundQuery> {
 
     match query_type.as_str() {
         "match" => {
-            let field = query_value.keys().get_item(0)?.extract::<String>()?;
+            let column = query_value.keys().get_item(0)?.extract::<String>()?;
             let params = query_value
-                .get_item(&field)?
-                .ok_or(PyValueError::new_err(format!("field {} not found", field)))?;
+                .get_item(&column)?
+                .ok_or(PyValueError::new_err(format!(
+                    "column {} not found",
+                    column
+                )))?;
             let params = params.downcast::<PyDict>()?;
 
             let query = params
@@ -318,29 +321,35 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<CompoundQuery> {
                 .extract::<Option<u32>>()?;
 
             let query = lance_index::scalar::inverted::query::MatchQuery::new(query)
-                .with_field(Some(field))
+                .with_column(Some(column))
                 .with_boost(boost)
                 .with_fuzziness(fuzziness);
             Ok(CompoundQuery::Leaf(query.into()))
         }
 
         "match_phrase" => {
-            let field = query_value.keys().get_item(0)?.extract::<String>()?;
+            let column = query_value.keys().get_item(0)?.extract::<String>()?;
             let query = query_value
-                .get_item(&field)?
-                .ok_or(PyValueError::new_err(format!("field {} not found", field)))?
+                .get_item(&column)?
+                .ok_or(PyValueError::new_err(format!(
+                    "column {} not found",
+                    column
+                )))?
                 .extract::<String>()?;
 
             let query = lance_index::scalar::inverted::query::PhraseQuery::new(query)
-                .with_field(Some(field));
+                .with_column(Some(column));
             Ok(CompoundQuery::Leaf(query.into()))
         }
 
         "boost" => {
-            let field = query_value.keys().get_item(0)?.extract::<String>()?;
+            let column = query_value.keys().get_item(0)?.extract::<String>()?;
             let params = query_value
-                .get_item(&field)?
-                .ok_or(PyValueError::new_err(format!("field {} not found", field)))?;
+                .get_item(&column)?
+                .ok_or(PyValueError::new_err(format!(
+                    "column {} not found",
+                    column
+                )))?;
             let params = params.downcast::<PyDict>()?;
 
             let positive = params
@@ -375,9 +384,9 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<CompoundQuery> {
                 .ok_or(PyValueError::new_err("query not found"))?
                 .extract::<String>()?;
 
-            let fields = query_value
-                .get_item("fields")?
-                .ok_or(PyValueError::new_err("fields not found"))?
+            let columns = query_value
+                .get_item("columns")?
+                .ok_or(PyValueError::new_err("columns not found"))?
                 .extract::<Vec<String>>()?;
 
             let boost = query_value
@@ -386,7 +395,7 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<CompoundQuery> {
                 .extract::<Vec<f32>>()?;
 
             let query = lance_index::scalar::inverted::query::MultiMatchQuery::with_boosts(
-                query, fields, boost,
+                query, columns, boost,
             );
             Ok(query.into())
         }

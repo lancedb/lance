@@ -48,7 +48,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::inverted::query::{
-    fill_fts_query_field, CompoundQuery, FtsQuery, FtsSearchParams,
+    fill_fts_query_column, CompoundQuery, FtsQuery, FtsSearchParams,
 };
 use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
@@ -65,7 +65,7 @@ use crate::datatypes::Schema;
 use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
-use crate::io::exec::fts::{BoostQueryExec, MatchQueryExec, PhraseQueryExec};
+use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{get_physical_optimizer, LanceScanConfig};
@@ -1573,7 +1573,9 @@ impl Scanner {
         query: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let fields = query.fields();
-        let params = query.params();
+        let params = query
+            .params()
+            .with_limit(self.limit.map(|l| l as usize).unwrap_or(usize::MAX));
         let query = if fields.is_empty() {
             // the field is not specified,
             // try to search over all indexed fields
@@ -1602,7 +1604,7 @@ impl Scanner {
                 }
             }
 
-            fill_fts_query_field(&query.query, &indexed_columns, false)?
+            fill_fts_query_column(&query.query, &indexed_columns, false)?
         } else {
             // check whether all specified columns are indexed
             for field in &fields {
@@ -1700,35 +1702,34 @@ impl Scanner {
             CompoundQuery::Leaf(leaf) => match leaf {
                 FtsQuery::Match(query) => {
                     let column = query
-                        .field
+                        .column
                         .as_ref()
                         .ok_or(Error::invalid_input(
-                            "the field must be specified in the query".to_string(),
+                            "the column must be specified in the query".to_string(),
                             location!(),
                         ))?
                         .clone();
 
                     let index = self
                         .dataset
-                        .load_scalar_index_for_column(query.field.as_ref().unwrap())
+                        .load_scalar_index_for_column(query.column.as_ref().unwrap())
                         .await?
                         .ok_or(Error::invalid_input(
                             format!(
                                 "Column {} has no inverted index",
-                                query.field.as_ref().unwrap()
+                                query.column.as_ref().unwrap()
                             ),
                             location!(),
                         ))?;
 
                     let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
-                    if unindexed_fragments.is_empty() {
-                        Arc::new(MatchQueryExec::new(
-                            self.dataset.clone(),
-                            query.clone(),
-                            params.clone(),
-                            prefilter_source.clone(),
-                        ))
-                    } else {
+                    let mut match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
+                        self.dataset.clone(),
+                        query.clone(),
+                        params.clone(),
+                        prefilter_source.clone(),
+                    ));
+                    if !unindexed_fragments.is_empty() {
                         let mut columns = vec![column.clone()];
                         if let Some(expr) = filter_plan.full_expr.as_ref() {
                             let filter_columns = Planner::column_names_in_expr(expr);
@@ -1754,14 +1755,31 @@ impl Scanner {
                                 Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
                         }
 
-                        Arc::new(MatchQueryExec::new_flat(
+                        let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
                             self.dataset.clone(),
                             query.clone(),
                             params.clone(),
                             scan_node,
-                            prefilter_source.clone(),
-                        ))
+                        ));
+
+                        match_plan = Arc::new(UnionExec::new(vec![match_plan, flat_match_plan]));
+                        match_plan = Arc::new(RepartitionExec::try_new(
+                            match_plan,
+                            Partitioning::RoundRobinBatch(1),
+                        )?);
+                        let sort_expr = PhysicalSortExpr {
+                            expr: expressions::col(SCORE_COL, match_plan.schema().as_ref())?,
+                            options: SortOptions {
+                                descending: true,
+                                nulls_first: false,
+                            },
+                        };
+                        match_plan = Arc::new(
+                            SortExec::new(LexOrdering::new(vec![sort_expr]), match_plan)
+                                .with_fetch(Some(params.limit)),
+                        );
                     }
+                    match_plan
                 }
                 FtsQuery::Phrase(query) => Arc::new(PhraseQueryExec::new(
                     self.dataset.clone(),
