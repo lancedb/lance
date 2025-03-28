@@ -687,6 +687,10 @@ impl Planner {
                 expr: Box::new(self.parse_sql_expr(expr)?),
                 data_type: self.parse_type(data_type)?,
             })),
+            SQLExpr::JsonAccess { .. } => Err(Error::invalid_input(
+                "JSON access is not supported",
+                location!(),
+            )),
             SQLExpr::CompoundFieldAccess { root, access_chain } => {
                 let mut expr = self.parse_sql_expr(root)?;
 
@@ -705,6 +709,12 @@ impl Planner {
                         AccessExpr::Subscript(Subscript::Index { index }) => {
                             let key = Box::new(self.parse_sql_expr(index)?);
                             GetFieldAccess::ListIndex { key }
+                        }
+                        AccessExpr::Subscript(Subscript::Slice { .. }) => {
+                            return Err(Error::invalid_input(
+                                "Slice subscript is not supported",
+                                location!(),
+                            ));
                         }
                         _ => {
                             // Handle other cases like JSON access
