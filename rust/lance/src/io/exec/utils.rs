@@ -4,6 +4,7 @@ use lance_datafusion::utils::{
 };
 use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::ScanScheduler;
+use lance_table::format::Index;
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use pin_project::pin_project;
@@ -30,6 +31,9 @@ use lance_core::{Result, ROW_ID};
 use lance_index::prefilter::FilterLoader;
 use snafu::location;
 
+use crate::index::prefilter::DatasetPreFilter;
+use crate::Dataset;
+
 #[derive(Debug, Clone)]
 pub enum PreFilterSource {
     /// The prefilter input is an array of row ids that match the filter condition
@@ -38,6 +42,31 @@ pub enum PreFilterSource {
     ScalarIndexQuery(Arc<dyn ExecutionPlan>),
     /// There is no prefilter
     None,
+}
+
+pub(crate) fn build_prefilter(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    index_meta: &[Index],
+) -> Result<Arc<DatasetPreFilter>> {
+    let prefilter_loader = match &prefilter_source {
+        PreFilterSource::FilteredRowIds(src_node) => {
+            let stream = src_node.execute(partition, context)?;
+            Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+        }
+        PreFilterSource::ScalarIndexQuery(src_node) => {
+            let stream = src_node.execute(partition, context)?;
+            Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
+        }
+        PreFilterSource::None => None,
+    };
+    Ok(Arc::new(DatasetPreFilter::new(
+        ds,
+        index_meta,
+        prefilter_loader,
+    )))
 }
 
 // Utility to convert an input (containing row ids) into a prefilter

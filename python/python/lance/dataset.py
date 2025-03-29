@@ -58,6 +58,7 @@ from .lance import (
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
+from .query import FullTextQuery
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
@@ -336,7 +337,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
-        full_text_query: Optional[Union[str, dict]] = None,
+        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
         *,
         prefilter: Optional[bool] = None,
         with_row_id: Optional[bool] = None,
@@ -519,9 +520,9 @@ class LanceDataset(pa.dataset.Dataset):
                     builder = builder.columns(default_columns)
 
         if full_text_query is not None:
-            if isinstance(full_text_query, str):
+            if isinstance(full_text_query, (str, FullTextQuery)):
                 builder = builder.full_text_search(full_text_query)
-            else:
+            elif isinstance(full_text_query, dict):
                 builder = builder.full_text_search(**full_text_query)
         if nearest is not None:
             builder = builder.nearest(**nearest)
@@ -575,7 +576,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict]] = None,
+        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
@@ -3381,7 +3382,7 @@ class ScannerBuilder:
 
     def full_text_search(
         self,
-        query: str,
+        query: str | FullTextQuery,
         columns: Optional[List[str]] = None,
     ) -> ScannerBuilder:
         """
@@ -3389,8 +3390,25 @@ class ScannerBuilder:
         may remove it after we support to do this within `filter` SQL-like expression
 
         Must create inverted index on the given column before searching,
+
+        Parameters
+        ----------
+        query : str | Query
+            If str, the query string to search for, a match query would be performed.
+            If Query, the query object to search for,
+            and the `columns` parameter will be ignored.
+        columns : list of str, optional
+            The columns to search in. If None, search in all indexed columns.
         """
-        self._full_text_query = {"query": query, "columns": columns}
+        if isinstance(query, FullTextQuery):
+            self._full_text_query = {
+                "query": query.to_dict(),
+            }
+        else:
+            self._full_text_query = {
+                "query": query,
+                "columns": columns,
+            }
         return self
 
     def to_scanner(self) -> LanceScanner:

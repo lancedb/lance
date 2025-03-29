@@ -38,8 +38,8 @@ impl LanceField {
         }
     }
 
-    pub fn children(&self) -> PyResult<Vec<LanceField>> {
-        Ok(self.0.children.iter().cloned().map(LanceField).collect())
+    pub fn children(&self) -> PyResult<Vec<Self>> {
+        Ok(self.0.children.iter().cloned().map(Self).collect())
     }
 
     pub fn name(&self) -> PyResult<String> {

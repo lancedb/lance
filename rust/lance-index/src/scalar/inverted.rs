@@ -3,6 +3,7 @@
 
 pub mod builder;
 mod index;
+pub mod query;
 mod tokenizer;
 mod wand;
 

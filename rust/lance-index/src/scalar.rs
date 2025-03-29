@@ -3,7 +3,7 @@
 
 //! Scalar indices for metadata search & filtering
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::{any::Any, ops::Bound, sync::Arc};
 
@@ -19,6 +19,7 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
+use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
@@ -250,17 +251,14 @@ impl PartialEq for dyn AnyQuery {
         self.dyn_eq(other)
     }
 }
-
 /// A full text search query
 #[derive(Debug, Clone, PartialEq)]
 pub struct FullTextSearchQuery {
-    /// The columns to search,
-    /// if empty, search all indexed columns
-    pub columns: Vec<String>,
-    /// The full text search query
-    pub query: String,
+    pub query: FtsQuery,
+
     /// The maximum number of results to return
     pub limit: Option<i64>,
+
     /// The wand factor to use for ranking
     /// if None, use the default value of 1.0
     /// Increasing this value will reduce the recall and improve the performance
@@ -269,22 +267,51 @@ pub struct FullTextSearchQuery {
 }
 
 impl FullTextSearchQuery {
+    /// Create a new terms query
     pub fn new(query: String) -> Self {
+        let query = MatchQuery::new(query).into();
         Self {
             query,
             limit: None,
-            columns: vec![],
             wand_factor: None,
         }
     }
 
-    pub fn columns(mut self, columns: Option<Vec<String>>) -> Self {
-        if let Some(columns) = columns {
-            self.columns = columns;
+    /// Create a new fuzzy query
+    pub fn new_fuzzy(term: String, max_distance: Option<u32>) -> Self {
+        let query = MatchQuery::new(term).with_fuzziness(max_distance).into();
+        Self {
+            query,
+            limit: None,
+            wand_factor: None,
         }
-        self
     }
 
+    /// Create a new compound query
+    pub fn new_query(query: FtsQuery) -> Self {
+        Self {
+            query,
+            limit: None,
+            wand_factor: None,
+        }
+    }
+
+    /// Set the column to search over
+    /// This is available for only MatchQuery and PhraseQuery
+    pub fn with_column(mut self, column: String) -> Result<Self> {
+        self.query = fill_fts_query_column(&self.query, &[column], true)?;
+        Ok(self)
+    }
+
+    /// Set the column to search over
+    /// This is available for only MatchQuery
+    pub fn with_columns(mut self, columns: &[String]) -> Result<Self> {
+        self.query = fill_fts_query_column(&self.query, columns, true)?;
+        Ok(self)
+    }
+
+    /// limit the number of results to return
+    /// if None, return all results
     pub fn limit(mut self, limit: Option<i64>) -> Self {
         self.limit = limit;
         self
@@ -293,6 +320,17 @@ impl FullTextSearchQuery {
     pub fn wand_factor(mut self, wand_factor: Option<f32>) -> Self {
         self.wand_factor = wand_factor;
         self
+    }
+
+    pub fn columns(&self) -> HashSet<String> {
+        self.query.columns()
+    }
+
+    pub fn params(&self) -> FtsSearchParams {
+        FtsSearchParams {
+            limit: self.limit.map(|limit| limit as usize),
+            wand_factor: self.wand_factor.unwrap_or(1.0),
+        }
     }
 }
 
@@ -406,9 +444,9 @@ impl AnyQuery for SargableQuery {
                     .collect::<Vec<_>>(),
                 false,
             ),
-            Self::FullTextSearch(query) => {
-                col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(query.query.clone()))))
-            }
+            Self::FullTextSearch(query) => col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(
+                query.query.to_string(),
+            )))),
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone())),
         }

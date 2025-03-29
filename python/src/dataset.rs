@@ -40,6 +40,7 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::scalar::inverted::query::MultiMatchQuery;
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::{
     optimize::OptimizeOptions,
@@ -72,7 +73,7 @@ use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::schema::LanceSchema;
 use crate::session::Session;
-use crate::utils::PyLance;
+use crate::utils::{parse_fts_query, PyLance};
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
@@ -538,26 +539,56 @@ impl Dataset {
         if let Some(full_text_query) = full_text_query {
             let query = full_text_query
                 .get_item("query")?
-                .ok_or_else(|| PyKeyError::new_err("Need column for full text search"))?
-                .to_string();
-            let columns = if let Some(columns) = full_text_query.get_item("columns")? {
-                if columns.is_none() {
-                    None
+                .ok_or_else(|| PyKeyError::new_err("query must be specified"))?;
+
+            let fts_query = if let Ok(query) = query.downcast::<PyString>() {
+                let query = query.to_string();
+                let columns = if let Some(columns) = full_text_query.get_item("columns")? {
+                    if columns.is_none() {
+                        None
+                    } else {
+                        Some(
+                            columns
+                                .downcast::<PyList>()?
+                                .iter()
+                                .map(|c| c.extract::<String>())
+                                .collect::<PyResult<Vec<String>>>()?,
+                        )
+                    }
                 } else {
-                    Some(
-                        columns
-                            .downcast::<PyList>()?
-                            .iter()
-                            .map(|c| c.extract::<String>())
-                            .collect::<PyResult<Vec<String>>>()?,
-                    )
+                    None
+                };
+
+                let mut fts_query = FullTextSearchQuery::new(query.clone());
+                if let Some(columns) = columns {
+                    match columns.len() {
+                        0 => {}
+                        1 => {
+                            fts_query = fts_query.with_column(columns[0].clone()).map_err(|e| {
+                                PyValueError::new_err(format!(
+                                    "Failed to set field for full text search: {}",
+                                    e
+                                ))
+                            })?;
+                        }
+                        _ => {
+                            let query = MultiMatchQuery::new(query, columns);
+                            fts_query = FullTextSearchQuery::new_query(query.into());
+                        }
+                    }
                 }
+                fts_query
+            } else if let Ok(query) = query.downcast::<PyDict>() {
+                let query = parse_fts_query(query)?;
+                FullTextSearchQuery::new_query(query)
             } else {
-                None
+                return Err(PyValueError::new_err(
+                    "query must be a string or a Query object",
+                ));
             };
-            let full_text_query = FullTextSearchQuery::new(query).columns(columns);
+
             scanner
-                .full_text_search(full_text_query)
+                .full_text_search(fts_query)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = substrait_filter {
