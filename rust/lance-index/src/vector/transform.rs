@@ -142,6 +142,7 @@ impl Transformer for KeepFiniteVectors {
                     DataType::Float32 => is_all_finite::<Float32Type>(&data),
                     DataType::Float64 => is_all_finite::<Float64Type>(&data),
                     DataType::UInt8 => data.null_count() == 0,
+                    DataType::Int8 => data.null_count() == 0,
                     _ => false,
                 };
                 if is_valid {
