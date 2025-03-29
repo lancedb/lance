@@ -29,6 +29,7 @@ from typing import (
     Tuple,
     TypedDict,
     Union,
+    overload,
 )
 
 import pyarrow as pa
@@ -78,6 +79,10 @@ if TYPE_CHECKING:
         np.ndarray,
         Iterable[float],
     ]
+
+IndexType = Literal["BTREE", "BITMAP", "LABEL_LIST", "INVERTED", "FTS", "NGRAM"]
+
+SearchType = Literal["DfsQueryThenFetch", "QueryThenFetch"]
 
 
 class MergeInsertBuilder(_MergeInsertBuilder):
@@ -436,6 +441,11 @@ class LanceDataset(pa.dataset.Dataset):
                 currently only supports a single column in the columns list.
             - query: str
                 The query string to search for.
+            - search_type: SearchType
+                The search type to use, default is QueryThenFetch.
+                QueryThenFetch: filter the results directly.
+                DfsQueryThenFetch: collect frequency of the indexed column first,
+                    then filter the results. Cost more time but more accurate.
         fast_search:  bool, default False
             If True, then the search will only be performed on the indexed data, which
             yields faster search time.
@@ -649,6 +659,11 @@ class LanceDataset(pa.dataset.Dataset):
                 currently only supports a single column in the columns list.
             - query: str
                 The query string to search for.
+            - search_type: SearchType
+                The search type to use, default is QueryThenFetch.
+                QueryThenFetch: filter the results directly.
+                DfsQueryThenFetch: collect frequency of the indexed column first,
+                    then filter the results. Cost more time but more accurate.
         include_deleted_rows: bool, optional, default False
             If True, then rows that have been deleted, but are still present in the
             fragment, will be returned.  These rows will have the _rowid column set
@@ -1547,22 +1562,42 @@ class LanceDataset(pa.dataset.Dataset):
             td_to_micros(older_than), delete_unverified, error_if_tagged_old_versions
         )
 
+    if TYPE_CHECKING:
+
+        @overload
+        def create_scalar_index(
+            self,
+            column: str,
+            index_type: IndexType,
+            name: Optional[str] = None,
+            *,
+            fragment_ids: List[int],
+            replace: bool = True,
+            **kwargs,
+        ) -> IndexInfo: ...
+
+        @overload
+        def create_scalar_index(
+            self,
+            column: str,
+            index_type: IndexType,
+            name: Optional[str] = None,
+            *,
+            fragment_ids: None = None,
+            replace: bool = True,
+            **kwargs,
+        ) -> LanceDataset: ...
+
     def create_scalar_index(
         self,
         column: str,
-        index_type: Union[
-            Literal["BTREE"],
-            Literal["BITMAP"],
-            Literal["LABEL_LIST"],
-            Literal["INVERTED"],
-            Literal["FTS"],
-            Literal["NGRAM"],
-        ],
+        index_type: IndexType,
         name: Optional[str] = None,
         *,
+        fragment_ids: Optional[List[int]] = None,
         replace: bool = True,
         **kwargs,
-    ):
+    ) -> IndexInfo | LanceDataset:
         """Create a scalar index on a column.
 
         Scalar indices, like vector indices, can be used to speed up scans.  A scalar
@@ -1635,6 +1670,9 @@ class LanceDataset(pa.dataset.Dataset):
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
+        fragment_ids: list of int, optional
+            The fragment ids to create the index on. If not provided, the index will
+            be created on all fragments.
         replace : bool, default True
             Replace the existing index if it exists.
 
@@ -1669,6 +1707,13 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.
             This would remove accents like "é" -> "e".
+
+        Returns
+        -------
+        index : IndexInfo | LanceDataset
+            Returns IndexInfo object if the fragment_ids is provided. Commit the index
+            to the dataset later with commit() method.
+            Returns LanceDataset if the fragment_ids is not provided.
 
         Examples
         --------
@@ -1762,8 +1807,76 @@ class LanceDataset(pa.dataset.Dataset):
             raise TypeError(
                 f"Scalar index column {column} cannot currently be a duration"
             )
-
+        if fragment_ids is not None:
+            return self._ds.create_fragment_index(
+                [column], index_type, name, replace, None, fragment_ids, kwargs
+            )
         self._ds.create_index([column], index_type, name, replace, None, kwargs)
+        return self
+
+    if TYPE_CHECKING:
+
+        @overload
+        def create_index(
+            self,
+            column: Union[str, List[str]],
+            index_type: str,
+            name: Optional[str] = None,
+            metric: str = "L2",
+            replace: bool = False,
+            num_partitions: Optional[int] = None,
+            ivf_centroids: Optional[
+                Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+            ] = None,
+            pq_codebook: Optional[
+                Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+            ] = None,
+            num_sub_vectors: Optional[int] = None,
+            accelerator: Optional[Union[str, "torch.Device"]] = None,
+            index_cache_size: Optional[int] = None,
+            shuffle_partition_batches: Optional[int] = None,
+            shuffle_partition_concurrency: Optional[int] = None,
+            # experimental parameters
+            ivf_centroids_file: Optional[str] = None,
+            precomputed_partition_dataset: Optional[str] = None,
+            storage_options: Optional[Dict[str, str]] = None,
+            filter_nan: bool = True,
+            one_pass_ivfpq: bool = False,
+            *,
+            fragment_ids: List[int],
+            **kwargs,
+        ) -> Index: ...
+
+        @overload
+        def create_index(
+            self,
+            column: Union[str, List[str]],
+            index_type: str,
+            name: Optional[str] = None,
+            metric: str = "L2",
+            replace: bool = False,
+            num_partitions: Optional[int] = None,
+            ivf_centroids: Optional[
+                Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+            ] = None,
+            pq_codebook: Optional[
+                Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+            ] = None,
+            num_sub_vectors: Optional[int] = None,
+            accelerator: Optional[Union[str, "torch.Device"]] = None,
+            index_cache_size: Optional[int] = None,
+            shuffle_partition_batches: Optional[int] = None,
+            shuffle_partition_concurrency: Optional[int] = None,
+            # experimental parameters
+            ivf_centroids_file: Optional[str] = None,
+            precomputed_partition_dataset: Optional[str] = None,
+            storage_options: Optional[Dict[str, str]] = None,
+            filter_nan: bool = True,
+            one_pass_ivfpq: bool = False,
+            *,
+            fragment_ids: None = None,
+            **kwargs,
+        ) -> LanceDataset: ...
 
     def create_index(
         self,
@@ -1790,8 +1903,10 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]] = None,
         filter_nan: bool = True,
         one_pass_ivfpq: bool = False,
+        *,
+        fragment_ids: Optional[List[int]] = None,
         **kwargs,
-    ) -> LanceDataset:
+    ) -> LanceDataset | Index:
         """Create index on column.
 
         **Experimental API**
@@ -1856,10 +1971,18 @@ class LanceDataset(pa.dataset.Dataset):
             for nullable columns. Obtains a small speed boost.
         one_pass_ivfpq: bool
             Defaults to False. If enabled, index type must be "IVF_PQ". Reduces disk IO.
+        fragment_ids: list of int, optional
+            The fragment ids to create the index on. If not provided, the index will
+            be created on all fragments.
         kwargs :
             Parameters passed to the index building process.
 
-
+        Returns
+        -------
+        index : Index | LanceDataset
+            Returns Index object if the fragment_ids is provided. Commit the index
+            to the dataset later with commit() method.
+            Returns LanceDataset if the fragment_ids is not provided.
 
         The SQ (Scalar Quantization) is available for only ``IVF_HNSW_SQ`` index type,
         this quantization method is used to reduce the memory usage of the index,
@@ -2310,6 +2433,18 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.drop_index(name)
 
+    def unindexed_fragments(self, name: str) -> List[FragmentMetadata]:
+        """
+        Return the fragments that are not covered by any of the deltas of the index.
+        """
+        return self._ds.unindexed_fragments(name)
+
+    def indexed_fragments(self, name: str) -> List[List[FragmentMetadata]]:
+        """
+        Return the fragments that are covered by each of the deltas of the index.
+        """
+        return self._ds.indexed_fragments(name)
+
     def session(self) -> Session:
         """
         Return the dataset session, which holds the dataset's state.
@@ -2327,7 +2462,9 @@ class LanceDataset(pa.dataset.Dataset):
             "LanceDataset._commit() is deprecated, use LanceDataset.commit() instead",
             DeprecationWarning,
         )
-        return LanceDataset.commit(base_uri, operation, read_version, commit_lock)
+        return LanceDataset.commit(
+            base_uri, operation, read_version=read_version, commit_lock=commit_lock
+        )
 
     @staticmethod
     def commit(
@@ -2664,6 +2801,14 @@ class Index(TypedDict):
     type: str
     uuid: str
     fields: List[str]
+    version: int
+    fragment_ids: Set[int]
+
+
+class IndexInfo(TypedDict):
+    name: str
+    uuid: str
+    fields: List[int]
     version: int
     fragment_ids: Set[int]
 
@@ -3005,11 +3150,8 @@ class LanceOperation:
         Operation that creates an index on the dataset.
         """
 
-        uuid: str
-        name: str
-        fields: List[int]
-        dataset_version: int
-        fragment_ids: Set[int]
+        new_indices: List[IndexInfo]
+        removed_indices: List[IndexInfo]
 
     @dataclass
     class DataReplacementGroup:
@@ -3383,6 +3525,7 @@ class ScannerBuilder:
         self,
         query: str,
         columns: Optional[List[str]] = None,
+        search_type: SearchType = "QueryThenFetch",
     ) -> ScannerBuilder:
         """
         Filter rows by full text searching. *Experimental API*,
@@ -3390,7 +3533,11 @@ class ScannerBuilder:
 
         Must create inverted index on the given column before searching,
         """
-        self._full_text_query = {"query": query, "columns": columns}
+        self._full_text_query = {
+            "query": query,
+            "columns": columns,
+            "search_type": search_type,
+        }
         return self
 
     def to_scanner(self) -> LanceScanner:

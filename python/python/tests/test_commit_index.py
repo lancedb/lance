@@ -5,6 +5,7 @@ import random
 import shutil
 import string
 from pathlib import Path
+from typing import List
 
 import lance
 import numpy as np
@@ -57,11 +58,18 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
     # Commit the index to dataset_without_index
     field_idx = dataset_without_index.schema.get_field_index("meta")
     create_index_op = lance.LanceOperation.CreateIndex(
-        index_id,
-        "meta_idx",
-        [field_idx],
-        dataset_without_index.version,
-        set([f.fragment_id for f in dataset_without_index.get_fragments()]),
+        new_indices=[
+            lance.IndexInfo(
+                uuid=index_id,
+                name="meta_idx",
+                fields=[field_idx],
+                version=dataset_without_index.version,
+                fragment_ids=set(
+                    [f.fragment_id for f in dataset_without_index.get_fragments()]
+                ),
+            )
+        ],
+        removed_indices=[],
     )
     dataset_without_index = lance.LanceDataset.commit(
         dataset_without_index.uri,
@@ -84,3 +92,286 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
         )
         plan = scanner.explain_plan()
         assert "MaterializeIndex" in plan
+
+
+@pytest.fixture()
+def tmp_tables() -> List[pa.Table]:
+    tables = [
+        {
+            "text": [
+                "Frodo was a puppy",
+                "There were several kittens playing",
+            ],
+            "sentiment": ["neutral", "neutral"],
+        },
+        {
+            "text": [
+                "Frodo was a happy puppy",
+                "Frodo was a very happy puppy",
+            ],
+            "sentiment": ["positive", "positive"],
+        },
+        {
+            "text": [
+                "Frodo was a sad puppy",
+                "Frodo was a very sad puppy",
+            ],
+            "sentiment": ["negative", "negative"],
+        },
+    ]
+    for tb in tables:
+        tb["text2"] = tb["text"]
+        tb["text3"] = tb["text"]
+    return [pa.table(tb) for tb in tables]
+
+
+def test_indexed_unindexed_fragments(tmp_tables, tmp_path):
+    ds = lance.write_dataset(tmp_tables[0], tmp_path, mode="overwrite")
+    ds = lance.write_dataset(tmp_tables[1], tmp_path, mode="append")
+    ds = lance.write_dataset(tmp_tables[2], tmp_path, mode="append")
+    frags = [f for f in ds.get_fragments()]
+    index = ds.create_scalar_index(
+        "text", "INVERTED", fragment_ids=[frags[0].fragment_id]
+    )
+    assert isinstance(index, dict)
+
+    indices = [index]
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=indices,
+        removed_indices=[],
+    )
+    ds = lance.LanceDataset.commit(
+        ds.uri,
+        create_index_op,
+        read_version=ds.version,
+    )
+
+    unindexed_fragments = ds.unindexed_fragments("text_idx")
+    assert len(unindexed_fragments) == 2
+    assert unindexed_fragments[0].id == frags[1].fragment_id
+    assert unindexed_fragments[1].id == frags[2].fragment_id
+
+    indexed_fragments = [f for fs in ds.indexed_fragments("text_idx") for f in fs]
+    assert len(indexed_fragments) == 1
+    assert indexed_fragments[0].id == frags[0].fragment_id
+
+
+def test_dfs_query_then_fetch(tmp_tables, tmp_path):
+    ds = lance.write_dataset(tmp_tables[0], tmp_path, mode="overwrite")
+    ds = lance.write_dataset(tmp_tables[1], tmp_path, mode="append")
+    ds = lance.write_dataset(tmp_tables[2], tmp_path, mode="append")
+    indices = []
+    frags = list(ds.get_fragments())
+    for f in frags[:2]:
+        # we can create an inverted index distributely
+        index = ds.create_scalar_index("text", "INVERTED", fragment_ids=[f.fragment_id])
+        assert isinstance(index, dict)
+        indices.append(index)
+
+    index = ds.create_scalar_index(
+        "text2", "INVERTED", fragment_ids=[frags[0].fragment_id, frags[1].fragment_id]
+    )
+    indices.append(index)
+    index = ds.create_scalar_index(
+        "text3", "INVERTED", fragment_ids=[frags[0].fragment_id]
+    )
+    indices.append(index)
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=indices,
+        removed_indices=[],
+    )
+
+    ds = lance.LanceDataset.commit(
+        ds.uri,
+        create_index_op,
+        read_version=ds.version,
+    )
+
+    # test query then fetch
+    text_query_fetch = ds.to_table(
+        full_text_query={"columns": ["text"], "query": "puppy"},
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert sorted(text_query_fetch["_rowid"].to_pylist()) == [
+        0,
+        1 << 32,
+        (1 << 32) + 1,
+        2 << 32,
+        (2 << 32) + 1,
+    ]
+
+    # test dfs query then fetch
+    text_dfs_query_fetch = ds.to_table(
+        full_text_query={
+            "columns": ["text"],
+            "query": "puppy",
+            "search_type": "DfsQueryThenFetch",
+        },
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert sorted(text_dfs_query_fetch["_rowid"].to_pylist()) == [
+        0,
+        1 << 32,
+        (1 << 32) + 1,
+        2 << 32,
+        (2 << 32) + 1,
+    ]
+
+    def table_to_tuple(tb):
+        return list(zip(tb["_rowid"].to_pylist(), tb["_score"].to_pylist()))
+
+    # it should be the same as dfs query then fetch for column text
+    text2_query_fetch = ds.to_table(
+        full_text_query={"columns": ["text2"], "query": "puppy"},
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert sorted(table_to_tuple(text2_query_fetch)) == sorted(
+        table_to_tuple(text_dfs_query_fetch)
+    )
+
+    # for column text2, it should be the same as query then fetch
+    text2_dfs_query_fetch = ds.to_table(
+        full_text_query={
+            "columns": ["text2"],
+            "query": "puppy",
+            "search_type": "DfsQueryThenFetch",
+        },
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert sorted(table_to_tuple(text2_query_fetch)) == sorted(
+        table_to_tuple(text2_dfs_query_fetch)
+    )
+
+    text3_dfs_neutral = ds.to_table(
+        full_text_query={
+            "columns": ["text3"],
+            "query": "puppy",
+            "search_type": "DfsQueryThenFetch",
+        },
+        filter="sentiment='neutral'",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert (
+        sorted(table_to_tuple(text3_dfs_neutral))
+        == sorted(table_to_tuple(text_query_fetch))[:1]
+    )
+
+    text3_neutral = ds.to_table(
+        full_text_query={"columns": ["text3"], "query": "puppy"},
+        filter="sentiment='neutral'",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert sorted(table_to_tuple(text3_neutral)) == sorted(
+        table_to_tuple(text3_dfs_neutral)
+    )
+
+    text_neutral = ds.to_table(
+        full_text_query={"columns": ["text"], "query": "puppy"},
+        filter="sentiment='neutral'",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert sorted(table_to_tuple(text_neutral)) == sorted(table_to_tuple(text3_neutral))
+
+
+def test_fragment_fts(tmp_tables, tmp_path):
+    ds = lance.write_dataset(tmp_tables[0], tmp_path, mode="overwrite")
+    ds = lance.write_dataset(tmp_tables[1], tmp_path, mode="append")
+    ds = lance.write_dataset(tmp_tables[2], tmp_path, mode="append")
+    indices = []
+    frags = list(ds.get_fragments())
+    for f in frags:
+        # we can create an inverted index distributely
+        index = ds.create_scalar_index("text", "INVERTED", fragment_ids=[f.fragment_id])
+        assert isinstance(index, dict)
+        indices.append(index)
+
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=indices,
+        removed_indices=[],
+    )
+    ds = lance.LanceDataset.commit(
+        ds.uri,
+        create_index_op,
+        read_version=ds.version,
+    )
+
+    # test fragment level full text search
+    scanner = ds.scanner(
+        full_text_query={"columns": ["text"], "query": "several"},
+        prefilter=True,
+        with_row_id=True,
+        fragments=[frags[0]],
+    )
+    assert scanner.to_table()["_rowid"].to_pylist() == [1]
+
+    # test fragment level full text search with filter
+    scanner = ds.scanner(
+        full_text_query={"columns": ["text"], "query": "several"},
+        prefilter=True,
+        with_row_id=True,
+        fragments=[frags[0]],
+        filter="sentiment='neutral'",
+    )
+    assert scanner.to_table()["_rowid"].to_pylist() == [1]
+
+    # test fragment level full text search with filter
+    scanner = ds.scanner(
+        full_text_query={"columns": ["text"], "query": "puppy"},
+        prefilter=True,
+        with_row_id=True,
+        fragments=[frags[0]],
+        filter="sentiment='positive'",
+    )
+    assert scanner.to_table()["_rowid"].to_pylist() == []
+
+    # test second fragment
+    # test fragment level full text search
+    scanner = ds.scanner(
+        full_text_query={"columns": ["text"], "query": "very"},
+        prefilter=True,
+        with_row_id=True,
+        fragments=[frags[1]],
+    )
+    assert scanner.to_table()["_rowid"].to_pylist() == [(1 << 32) + 1]
+
+    # test fragment level full text search with filter
+    scanner = ds.scanner(
+        full_text_query={"columns": ["text"], "query": "very"},
+        prefilter=True,
+        with_row_id=True,
+        fragments=[frags[1]],
+        filter="sentiment='neutral'",
+    )
+    assert scanner.to_table()["_rowid"].to_pylist() == []
+
+    # test fragment level full text search with filter
+    scanner = ds.scanner(
+        full_text_query={"columns": ["text"], "query": "very"},
+        prefilter=True,
+        with_row_id=True,
+        fragments=[frags[1]],
+        filter="sentiment='positive'",
+    )
+    assert scanner.to_table()["_rowid"].to_pylist() == [(1 << 32) + 1]
+
+    with pytest.raises(ValueError):
+        # DfsQueryThenFetch is not supported for fragment level full text search,
+        # because it requires a new api to expose distributed frequency information.
+        scanner = ds.scanner(
+            full_text_query={
+                "columns": ["text"],
+                "query": "very",
+                "search_type": "DfsQueryThenFetch",
+            },
+            prefilter=True,
+            with_row_id=True,
+            fragments=[frags[1]],
+        )
+        assert scanner.to_table()["_rowid"].to_pylist() == [(1 << 32) + 1]
