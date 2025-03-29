@@ -4,12 +4,13 @@
 from pathlib import Path
 
 import lance
+import pandas as pd
 import pyarrow as pa
 import pytest
 
 ray = pytest.importorskip("ray")
 
-
+from lance.ray.fragment_api import add_columns  # noqa: E402
 from lance.ray.sink import (  # noqa: E402
     LanceCommitter,
     LanceDatasink,
@@ -20,7 +21,7 @@ from lance.ray.sink import (  # noqa: E402
 # Use this hook until we have official DataSink in Ray.
 _register_hooks()
 
-ray.init()
+ray.init(ignore_reinit_error=True)
 
 
 def test_ray_sink(tmp_path: Path):
@@ -161,3 +162,35 @@ def test_ray_write_lance_none_str_datasink(tmp_path: Path):
     assert len(pylist) == 10
     for item in pylist:
         assert item is None
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_lance_parallel_merge_columns(tmp_path: Path):
+    def generate_label(batch: pa.RecordBatch) -> pa.RecordBatch:
+        heights = batch.column("height").to_pylist()
+        tags = ["big" if height > 5 else "small" for height in heights]
+        df = pd.DataFrame({"size_labels": tags})
+
+        return pa.RecordBatch.from_pandas(
+            df, schema=pa.schema([pa.field("size_labels", pa.string())])
+        )
+
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("height", pa.int64()),
+            pa.field("weight", pa.int64()),
+        ]
+    )
+    (
+        ray.data.range(11)
+        .repartition(1)
+        .map(lambda x: {"id": x["id"], "height": (x["id"] + 5), "weight": x["id"]})
+        .write_lance(tmp_path, schema=schema)
+    )
+    lance_ds = lance.dataset(tmp_path)
+    add_columns(lance_ds, generate_label, ["height"])
+    ds = lance.dataset(tmp_path)
+    tbl = ds.to_table()
+    size_labels = sorted(tbl.column("size_labels").to_pylist())
+    assert size_labels[:5] == ["big"] * 5
