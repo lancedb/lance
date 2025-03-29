@@ -50,8 +50,8 @@ class FragmentTask:
     def __call__(self) -> Dict[str, Any]:
         output = self._fn()
         return {
-            TASK_ID_KEY: self.task_input._task_id,
-            PARTITION_KEY: {FRAGMENT_KEY: self.task_input._fragment, "output": output},
+            TASK_ID_KEY: self.task_input.task_id,
+            PARTITION_KEY: {FRAGMENT_KEY: self.task_input.fragment, "output": output},
         }
 
 
@@ -70,11 +70,11 @@ class AddColumnTask(FragmentTask):
 
     def __call__(self) -> Dict[str, Any]:
         """Execute column addition and return updated fragment metadata."""
-        new_fragment, new_schema = self._fragment.merge_columns(
-            value_func=self._fn, columns=self._read_columns
+        new_fragment, new_schema = self.task_input.fragment.merge_columns(
+            value_func=self.task_input.fn, columns=self._read_columns
         )
         return {
-            TASK_ID_KEY: self._task_id,
+            TASK_ID_KEY: self.task_input.task_id,
             PARTITION_KEY: {FRAGMENT_KEY: new_fragment, SCHEMA_KEY: new_schema},
         }
 
