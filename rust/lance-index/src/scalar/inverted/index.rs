@@ -39,7 +39,7 @@ use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::{NoFilter, PreFilter};
 use crate::scalar::{
     AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, InvertedIndexParams, MetricsCollector,
-    SargableQuery, ScalarIndex, SearchResult,
+    SargableQuery, ScalarIndex, SearchResult, SearchType,
 };
 use crate::Index;
 
@@ -70,6 +70,63 @@ lazy_static! {
         .unwrap_or(512 * 1024 * 1024);
 }
 
+#[macro_export]
+macro_rules! as_inverted_index {
+    ($index:expr, $uuid:expr) => {
+        $index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!("Index {} is not an inverted index", $uuid,))
+            })
+    };
+}
+
+#[derive(Clone, Debug)]
+pub struct DistributedFrequency {
+    posting_lens: HashMap<String, usize>,
+    num_tokens: u64,
+    num_docs: usize,
+}
+
+impl DistributedFrequency {
+    fn avgdl(&self) -> f32 {
+        self.num_tokens as f32 / self.num_docs as f32
+    }
+    fn posting_frequency(&self, token: &String) -> Option<PostingDistributedFrequency> {
+        self.posting_lens
+            .get(token)
+            .map(|posting_len| PostingDistributedFrequency::new(self.num_docs, *posting_len))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedQuery {
+    query: FullTextSearchQuery,
+    tokens: Vec<String>,
+    dfs: DistributedFrequency,
+}
+
+impl ParsedQuery {
+    pub fn count(&mut self, index: &InvertedIndex) {
+        for token in &self.tokens {
+            let len = index.posting_len(token);
+            if len > 0 {
+                match self.dfs.posting_lens.get_mut(token) {
+                    Some(v) => {
+                        (*v) += len;
+                    }
+                    None => {
+                        self.dfs.posting_lens.insert(token.clone(), len);
+                    }
+                }
+            }
+        }
+        self.dfs.num_tokens += index.num_tokens();
+        self.dfs.num_docs += index.num_docs();
+    }
+}
+
 #[derive(Clone)]
 pub struct InvertedIndex {
     params: InvertedIndexParams,
@@ -98,6 +155,44 @@ impl DeepSizeOf for InvertedIndex {
 }
 
 impl InvertedIndex {
+    pub fn parse(&self, query: &FullTextSearchQuery) -> Result<ParsedQuery> {
+        let mut tokenizer = self.tokenizer.clone();
+        let tokens = collect_tokens(&query.query, &mut tokenizer, None);
+        let posting_lens = tokens
+            .iter()
+            .map(|token| {
+                let posting_len = self.posting_len(token);
+                (token.clone(), posting_len)
+            })
+            .collect();
+        let num_docs = self.num_docs();
+        let num_tokens = self.num_tokens();
+        let dfs = DistributedFrequency {
+            posting_lens,
+            num_docs,
+            num_tokens,
+        };
+        Ok(ParsedQuery {
+            query: query.clone(),
+            tokens,
+            dfs,
+        })
+    }
+
+    pub fn num_tokens(&self) -> u64 {
+        self.docs.total_tokens
+    }
+
+    pub fn num_docs(&self) -> usize {
+        self.docs.token_count.len()
+    }
+
+    pub fn posting_len(&self, token: &str) -> usize {
+        match self.tokens.get(token) {
+            Some(token_id) => self.inverted_list.posting_len(token_id),
+            None => 0,
+        }
+    }
     // map tokens to token ids
     // ignore tokens that are not in the index cause they won't contribute to the search
     #[instrument(level = "debug", skip_all)]
@@ -108,19 +203,17 @@ impl InvertedIndex {
             .collect()
     }
 
-    #[instrument(level = "debug", skip_all)]
-    pub async fn full_text_search(
-        &self,
-        query: &FullTextSearchQuery,
-        prefilter: Arc<dyn PreFilter>,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<(u64, f32)>> {
-        let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_tokens(&query.query, &mut tokenizer, None);
-        metrics.record_comparisons(tokens.len());
-        let token_ids = self.map(&tokens).into_iter();
-        let token_ids = if !is_phrase_query(&query.query) {
-            token_ids.sorted_unstable().dedup().collect()
+    fn zip_with_id(&self, texts: &[String]) -> Vec<(String, u32)> {
+        texts
+            .iter()
+            .filter_map(|text| self.tokens.get(text).map(|id| (text.clone(), id)))
+            .collect()
+    }
+
+    fn token_ids(&self, tokens: &[String], is_phrase_query: bool) -> Result<Vec<(String, u32)>> {
+        let token_ids = self.zip_with_id(tokens).into_iter();
+        if !is_phrase_query {
+            Ok(token_ids.dedup_by(|x, y| x.1 == y.1).collect())
         } else {
             if !self.inverted_list.has_positions() {
                 return Err(Error::Index { message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), location: location!() });
@@ -130,9 +223,31 @@ impl InvertedIndex {
             if token_ids.len() != tokens.len() {
                 return Ok(Vec::new());
             }
-            token_ids
-        };
-        self.bm25_search(token_ids, query, prefilter, metrics).await
+            Ok(token_ids)
+        }
+    }
+
+    pub async fn parsed_search(
+        &self,
+        parsed: &ParsedQuery,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<(u64, f32)>> {
+        metrics.record_comparisons(parsed.tokens.len());
+        let token_ids = self.token_ids(&parsed.tokens, is_phrase_query(&parsed.query.query))?;
+        self.bm25_search(token_ids, parsed, prefilter, metrics)
+            .await
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub async fn full_text_search(
+        &self,
+        query: &FullTextSearchQuery,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<(u64, f32)>> {
+        let parsed = self.parse(query)?;
+        self.parsed_search(&parsed, prefilter, metrics).await
     }
 
     // search the documents that contain the query
@@ -141,43 +256,57 @@ impl InvertedIndex {
     #[instrument(level = "debug", skip_all)]
     async fn bm25_search(
         &self,
-        token_ids: Vec<u32>,
-        query: &FullTextSearchQuery,
+        token_ids: Vec<(String, u32)>,
+        parsed: &ParsedQuery,
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, f32)>> {
-        let limit = query
+        let limit = parsed
+            .query
             .limit
             .map(|limit| limit as usize)
             .unwrap_or(usize::MAX);
-        let wand_factor = query.wand_factor.unwrap_or(1.0);
+        let wand_factor = parsed.query.wand_factor.unwrap_or(1.0);
 
         let mask = prefilter.mask();
-        let is_phrase_query = is_phrase_query(&query.query);
-        let postings = stream::iter(token_ids)
+        let is_phrase_query = is_phrase_query(&parsed.query.query);
+        let token_id_dfs: Vec<(u32, Option<PostingDistributedFrequency>)> = token_ids
+            .into_iter()
+            .map(|(token, id)| {
+                let dfs = if parsed.query.search_type == SearchType::DfsQueryThenFetch {
+                    parsed.dfs.posting_frequency(&token)
+                } else {
+                    None
+                };
+                (id, dfs)
+            })
+            .collect();
+        let postings = stream::iter(token_id_dfs)
             .enumerate()
             .zip(repeat_with(|| (self.inverted_list.clone(), mask.clone())))
-            .map(|((position, token_id), (inverted_list, mask))| async move {
-                let posting = inverted_list
-                    .posting_list(token_id, is_phrase_query, metrics)
-                    .await?;
-                Result::Ok(PostingIterator::new(
-                    token_id,
-                    position as i32,
-                    posting,
-                    self.docs.len(),
-                    mask,
-                ))
-            })
+            .map(
+                |((position, (token_id, posting_frequency)), (inverted_list, mask))| async move {
+                    let posting = inverted_list
+                        .posting_list(token_id, is_phrase_query, metrics)
+                        .await?;
+                    Result::Ok(PostingIterator::new(
+                        token_id,
+                        position as i32,
+                        posting,
+                        parsed.dfs.num_docs,
+                        mask,
+                        posting_frequency.map(|dfs| dfs.len),
+                    ))
+                },
+            )
             // Use compute count since data hopefully cached
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
-
-        let mut wand = Wand::new(self.docs.len(), postings.into_iter());
+        let avgdl = parsed.dfs.avgdl();
+        let mut wand = Wand::new(parsed.dfs.num_docs, postings.into_iter());
         wand.search(is_phrase_query, limit, wand_factor, |doc, freq| {
-            let doc_norm =
-                K1 * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / self.docs.average_length());
+            let doc_norm = K1 * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / avgdl);
             freq / (freq + doc_norm)
         })
         .await
@@ -1042,22 +1171,22 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
 pub fn flat_bm25_search(
     batch: RecordBatch,
     doc_col: &str,
-    inverted_list: &InvertedListReader,
-    query_tokens: &HashSet<String>,
-    query_token_ids: &HashMap<String, Option<u32>>,
+    parsed: &ParsedQuery,
     tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
-    avgdl: f32,
-    num_docs: usize,
 ) -> std::result::Result<RecordBatch, DataFusionError> {
+    let query_tokens: HashSet<String> = parsed.tokens.clone().into_iter().dedup().collect();
+
     let doc_iter = iter_str_array(&batch[doc_col]);
     let mut scores = Vec::with_capacity(batch.num_rows());
+    let avgdl = parsed.dfs.avgdl();
+
     for doc in doc_iter {
         let Some(doc) = doc else {
             scores.push(0.0);
             continue;
         };
 
-        let doc_tokens = collect_tokens(doc, tokenizer, Some(query_tokens));
+        let doc_tokens = collect_tokens(doc, tokenizer, Some(&query_tokens));
         let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / avgdl);
         let mut doc_token_count = HashMap::new();
         for token in doc_tokens {
@@ -1067,17 +1196,14 @@ pub fn flat_bm25_search(
                 .or_insert(1);
         }
         let mut score = 0.0;
-        for (token, token_id) in query_token_ids.iter() {
+        for token in query_tokens.iter() {
             let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
-
-            let idf = if let Some(token_id) = token_id {
-                // for known token, we just use the index's metadata to calculate the score
-                // it's not accurate but it's good enough for ranking
-                idf(inverted_list.posting_len(*token_id), num_docs)
+            let idf = if let Some(freq) = parsed.dfs.posting_frequency(token) {
+                idf(freq.len, freq.num_docs)
             } else {
                 // for unknown token, we set the idf to a very high value
                 // so that the new token will significantly effect the score
-                idf(1, num_docs)
+                idf(1, parsed.dfs.num_docs)
             };
             score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
         }
@@ -1094,35 +1220,13 @@ pub fn flat_bm25_search(
 pub fn flat_bm25_search_stream(
     input: SendableRecordBatchStream,
     doc_col: String,
-    query: FullTextSearchQuery,
+    parsed: ParsedQuery,
     index: &InvertedIndex,
 ) -> SendableRecordBatchStream {
     let mut tokenizer = index.tokenizer.clone();
-    let query_token_ids = collect_tokens(&query.query, &mut tokenizer, None)
-        .into_iter()
-        .dedup()
-        .map(|token| {
-            let token_id = index.tokens.get(&token);
-            (token, token_id)
-        })
-        .collect::<HashMap<_, _>>();
-    let query_tokens = query_token_ids.keys().cloned().collect::<HashSet<_>>();
-    let inverted_list = index.inverted_list.clone();
-    let num_docs = index.docs.len();
-    let avgdl = index.docs.average_length();
-
     let stream = input.map(move |batch| {
         let batch = batch?;
-        let scored_batch = flat_bm25_search(
-            batch,
-            &doc_col,
-            inverted_list.as_ref(),
-            &query_tokens,
-            &query_token_ids,
-            &mut tokenizer,
-            avgdl,
-            num_docs,
-        )?;
+        let scored_batch = flat_bm25_search(batch, &doc_col, &parsed, &mut tokenizer)?;
 
         // filter out rows with score 0
         let score_col = scored_batch[SCORE_COL].as_primitive::<Float32Type>();

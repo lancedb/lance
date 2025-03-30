@@ -35,6 +35,7 @@ from ..dataset import (
     AlterColumn,
     ExecuteResult,
     Index,
+    IndexInfo,
     LanceOperation,
     Tag,
     Transaction,
@@ -266,7 +267,19 @@ class _Dataset:
         storage_options: Optional[Dict[str, str]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
     ): ...
+    def create_fragment_index(
+        self,
+        columns: List[str],
+        index_type: str,
+        name: Optional[str] = None,
+        replace: Optional[bool] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+        fragment_ids: Optional[List[int]] = None,
+        kwargs: Optional[Dict[str, Any]] = None,
+    ) -> IndexInfo: ...
     def drop_index(self, name: str): ...
+    def unindexed_fragments(self, name: str) -> List[FragmentMetadata]: ...
+    def indexed_fragments(self, name: str) -> List[List[FragmentMetadata]]: ...
     def count_fragments(self) -> int: ...
     def num_small_files(self, max_rows_per_group: int) -> int: ...
     def get_fragments(self) -> List[_Fragment]: ...
