@@ -18,6 +18,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
 
 use lance_core::{Error, Result};
+use tracing::Instrument;
 
 use crate::traits::Writer;
 use snafu::location;
@@ -375,7 +376,10 @@ impl AsyncWrite for ObjectWriter {
                             *part_idx,
                             mut_self.use_constant_size_upload_parts,
                         );
-                        futures.spawn(Self::put_part(upload.as_mut(), data, *part_idx, None));
+                        futures.spawn(
+                            Self::put_part(upload.as_mut(), data, *part_idx, None)
+                                .instrument(tracing::Span::current()),
+                        );
                         *part_idx += 1;
                     }
                 }
@@ -442,7 +446,10 @@ impl AsyncWrite for ObjectWriter {
                     if !mut_self.buffer.is_empty() && futures.len() < max_upload_parallelism() {
                         // We can just use `take` since we don't need the buffer anymore.
                         let data = Bytes::from(std::mem::take(&mut mut_self.buffer));
-                        futures.spawn(Self::put_part(upload.as_mut(), data, *part_idx, None));
+                        futures.spawn(
+                            Self::put_part(upload.as_mut(), data, *part_idx, None)
+                                .instrument(tracing::Span::current()),
+                        );
                         // We need to go back to beginning of loop to poll the
                         // new feature and get the waker registered on the ctx.
                         continue;

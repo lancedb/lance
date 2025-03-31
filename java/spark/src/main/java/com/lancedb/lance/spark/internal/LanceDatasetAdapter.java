@@ -34,7 +34,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 public class LanceDatasetAdapter {
-  private static final BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+  public static final BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
 
   public static Optional<StructType> getSchema(LanceConfig config) {
     String uri = config.getDatasetUri();
@@ -88,7 +88,7 @@ public class LanceDatasetAdapter {
 
   public static LanceFragmentScanner getFragmentScanner(
       int fragmentId, LanceInputPartition inputPartition) {
-    return LanceFragmentScanner.create(fragmentId, inputPartition, allocator);
+    return LanceFragmentScanner.create(fragmentId, inputPartition);
   }
 
   public static void appendFragments(LanceConfig config, List<FragmentMetadata> fragments) {
