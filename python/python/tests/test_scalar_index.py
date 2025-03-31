@@ -13,6 +13,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from lance.query import BoostQuery, MatchQuery, MultiMatchQuery, PhraseQuery
 from lance.vector import vec_to_table
 
 
@@ -368,6 +369,112 @@ def test_indexed_filter_with_fts_index(tmp_path):
         with_row_id=True,
     )
     assert results["_rowid"].to_pylist() == [2, 3]
+
+
+def test_fts_fuzzy_query(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "fa",
+                "fo",  # spellchecker:disable-line
+                "fob",
+                "focus",
+                "foo",
+                "food",
+                "foul",
+            ]
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+
+    results = ds.to_table(
+        full_text_query=MatchQuery("foo", "text", fuzziness=1),
+    )
+    assert results.num_rows == 4
+    assert set(results["text"].to_pylist()) == {
+        "foo",
+        "fo",  # 1 deletion # spellchecker:disable-line
+        "fob",  # 1 substitution
+        "food",  # 1 insertion
+    }
+
+    results = ds.to_table(
+        full_text_query=MatchQuery("foo", "text", fuzziness=1, max_expansions=3),
+    )
+    assert results.num_rows == 3
+
+
+def test_fts_phrase_query(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "frodo was a puppy",
+                "frodo was a happy puppy",
+                "frodo was a very happy puppy",
+                "frodo was a puppy with a tail",
+            ]
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+    results = ds.to_table(
+        full_text_query=PhraseQuery("frodo was a puppy", "text"),
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+    }
+
+
+def test_fts_boost_query(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "frodo was a puppy",
+                "frodo was a happy puppy",
+                "frodo was a puppy with a tail",
+            ]
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+    results = ds.to_table(
+        full_text_query=BoostQuery(
+            MatchQuery("puppy", "text"),
+            MatchQuery("happy", "text"),
+            negative_boost=0.5,
+        ),
+    )
+    assert results.num_rows == 3
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+        "frodo was a happy puppy",
+    }
+
+
+def test_fts_multi_match_query(tmp_path):
+    data = pa.table(
+        {
+            "title": ["title common", "title hello", "title vector"],
+            "content": ["content world", "content database", "content common"],
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("title", "INVERTED")
+    ds.create_scalar_index("content", "INVERTED")
+
+    results = ds.to_table(
+        full_text_query=MultiMatchQuery("common", ["title", "content"]),
+    )
+    assert set(results["title"].to_pylist()) == {"title common", "title vector"}
+    assert set(results["content"].to_pylist()) == {"content world", "content common"}
 
 
 def test_fts_with_postfilter(tmp_path):
