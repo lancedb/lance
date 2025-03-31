@@ -1790,6 +1790,18 @@ def test_merge_insert_large():
     )
 
 
+def test_merge_insert_empty_index():
+    # Reported in https://github.com/lancedb/lancedb/issues/2285
+    empty_table = pa.table({"id": pa.array([], type=pa.float64())})
+    empty_ds = lance.write_dataset(empty_table, "memory://")
+
+    empty_ds.create_scalar_index("id", "BTREE")
+
+    df = pa.table({"id": [1.0, 2.0, 3.0]})
+
+    empty_ds.merge_insert("id").when_not_matched_insert_all().execute(df)
+
+
 def test_add_null_columns(tmp_path: Path):
     data = pa.table({"id": [1, 2, 4]})
     ds = lance.write_dataset(data, tmp_path)
