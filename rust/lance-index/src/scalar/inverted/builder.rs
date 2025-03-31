@@ -12,8 +12,8 @@ use crate::scalar::{IndexReader, IndexStore, IndexWriter, InvertedIndexParams};
 use crate::vector::graph::OrderedFloat;
 use arrow::array::{ArrayBuilder, AsArray, Int32Builder, StringBuilder};
 use arrow::datatypes;
-use arrow_array::{Int32Array, RecordBatch, StringArray};
-use arrow_schema::SchemaRef;
+use arrow_array::{Array, Int32Array, RecordBatch, StringArray, UInt64Array};
+use arrow_schema::{Field, Schema, SchemaRef};
 use crossbeam_queue::ArrayQueue;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
@@ -22,10 +22,11 @@ use itertools::Itertools;
 use lance_arrow::iter_str_array;
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, CPU_RUNTIME};
-use lance_core::{Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use lazy_static::lazy_static;
 use object_store::path::Path;
+use snafu::location;
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
@@ -108,6 +109,23 @@ impl InvertedIndexBuilder {
 
     #[instrument(level = "debug", skip_all)]
     async fn update_index(&mut self, stream: SendableRecordBatchStream) -> Result<()> {
+        let flatten_stream = stream.map(|batch| {
+            let batch = batch?;
+            let doc_col = batch.column(0);
+            match doc_col.data_type() {
+                datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => Ok(batch),
+                datatypes::DataType::List(_)   => {
+                    flatten_string_list::<i32>(&batch, doc_col)
+                }
+                datatypes::DataType::LargeList(_) => {
+                    flatten_string_list::<i64>(&batch, doc_col)
+                }
+                _ => {
+                   Err(Error::Index { message: format!("expect data type String, LargeString or List of String/LargeString, but got {}", doc_col.data_type()), location: location!() })
+                }
+            }
+        });
+
         let num_shards = *LANCE_FTS_NUM_SHARDS;
 
         // init the token maps
@@ -159,13 +177,15 @@ impl InvertedIndexBuilder {
         for _ in 0..num_shards {
             let _ = tokenizer_pool.push(tokenizer.clone());
         }
-        let mut stream = stream
+        let mut stream = flatten_stream
             .map(move |batch| {
                 let senders = senders.clone();
                 let tokenizer_pool = tokenizer_pool.clone();
                 CPU_RUNTIME.spawn_blocking(move || {
                     let batch = batch?;
-                    let doc_iter = iter_str_array(batch.column(0));
+
+                    let doc_col = batch.column(0);
+                    let doc_iter = iter_str_array(doc_col);
                     let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
                     let docs = doc_iter
                         .zip(row_id_col.values().iter())
@@ -720,4 +740,46 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
         ));
     }
     Arc::new(arrow_schema::Schema::new(fields))
+}
+
+fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
+    batch: &RecordBatch,
+    doc_col: &Arc<dyn Array>,
+) -> Result<RecordBatch> {
+    let docs = doc_col.as_list::<Offset>();
+    let row_ids = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+
+    let row_ids = row_ids
+        .values()
+        .iter()
+        .zip(docs.iter())
+        .flat_map(|(row_id, doc)| {
+            std::iter::repeat(*row_id).take(doc.map(|d| d.len()).unwrap_or(0))
+        });
+
+    let row_ids = Arc::new(UInt64Array::from_iter_values(row_ids));
+    let docs: Arc<dyn Array> = match docs.value_type() {
+        datatypes::DataType::Utf8 => Arc::new(docs.values().as_string::<i32>().clone()),
+        datatypes::DataType::LargeUtf8 => Arc::new(docs.values().as_string::<i64>().clone()),
+        _ => {
+            return Err(Error::Index {
+                message: format!(
+                    "expect data type String or LargeString but got {}",
+                    docs.value_type()
+                ),
+                location: location!(),
+            });
+        }
+    };
+
+    let schema = Schema::new(vec![
+        Field::new(
+            batch.schema().field(0).name(),
+            docs.data_type().clone(),
+            true,
+        ),
+        ROW_ID_FIELD.clone(),
+    ]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![docs, row_ids])?;
+    Ok(batch)
 }

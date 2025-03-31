@@ -1742,7 +1742,7 @@ mod tests {
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::TestDatasetGenerator;
 
-    use arrow::array::{as_struct_array, AsArray};
+    use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
     use arrow::datatypes::UInt64Type;
     use arrow_array::{
@@ -4927,7 +4927,11 @@ mod tests {
         assert_eq!(row_ids, &[0]);
     }
 
-    async fn create_fts_dataset<Offset: arrow::array::OffsetSizeTrait>(
+    async fn create_fts_dataset<
+        Offset: arrow::array::OffsetSizeTrait,
+        ListOffset: arrow::array::OffsetSizeTrait,
+    >(
+        is_list: bool,
         with_position: bool,
         tokenizer: TokenizerConfig,
     ) -> Dataset {
@@ -4937,19 +4941,46 @@ mod tests {
 
         let mut params = InvertedIndexParams::default().with_position(with_position);
         params.tokenizer_config = tokenizer;
-        let doc_col = GenericStringArray::<Offset>::from(vec![
-            "lance database the search",
-            "lance database",
-            "lance search",
-            "database search",
-            "unrelated doc",
-            "unrelated",
-            "mots accentués",
-        ]);
+        let doc_col: Arc<dyn Array> = if is_list {
+            let string_builder = GenericStringBuilder::<Offset>::new();
+            let mut list_col = GenericListBuilder::<ListOffset, _>::new(string_builder);
+            // Create a list of strings
+            list_col.values().append_value("lance database"); // for testing phrase query
+            list_col.values().append_value("the");
+            list_col.values().append_value("search");
+            list_col.append(true);
+            list_col.values().append_value("lance database"); // for testing phrase query
+            list_col.append(true);
+            list_col.values().append_value("lance");
+            list_col.values().append_value("search");
+            list_col.append(true);
+            list_col.values().append_value("database");
+            list_col.values().append_value("search");
+            list_col.append(true);
+            list_col.values().append_value("unrelated doc");
+            list_col.append(true);
+            list_col.values().append_value("unrelated");
+            list_col.append(true);
+            list_col.values().append_value("mots");
+            list_col.values().append_value("accentués");
+            list_col.append(true);
+            list_col.append(false);
+            Arc::new(list_col.finish())
+        } else {
+            Arc::new(GenericStringArray::<Offset>::from(vec![
+                "lance database the search",
+                "lance database",
+                "lance search",
+                "database search",
+                "unrelated doc",
+                "unrelated",
+                "mots accentués",
+            ]))
+        };
         let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), false),
+                arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
                 arrow_schema::Field::new("id", DataType::UInt64, false),
             ])
             .into(),
@@ -4968,8 +4999,15 @@ mod tests {
         dataset
     }
 
-    async fn test_fts_index<Offset: arrow::array::OffsetSizeTrait>() {
-        let ds = create_fts_dataset::<Offset>(false, TokenizerConfig::default()).await;
+    async fn test_fts_index<
+        Offset: arrow::array::OffsetSizeTrait,
+        ListOffset: arrow::array::OffsetSizeTrait,
+    >(
+        is_list: bool,
+    ) {
+        let ds =
+            create_fts_dataset::<Offset, ListOffset>(is_list, false, TokenizerConfig::default())
+                .await;
         let result = ds
             .scan()
             .project(&["id"])
@@ -5034,7 +5072,9 @@ mod tests {
         assert!(err.contains("position is not found but required for phrase queries, try recreating the index with position"),"{}",err);
 
         // recreate the index with position
-        let ds = create_fts_dataset::<Offset>(true, TokenizerConfig::default()).await;
+        let ds =
+            create_fts_dataset::<Offset, ListOffset>(is_list, true, TokenizerConfig::default())
+                .await;
         let result = ds
             .scan()
             .project(&["id"])
@@ -5117,17 +5157,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_fts_index_with_string() {
-        test_fts_index::<i32>().await;
+        test_fts_index::<i32, i32>(false).await;
+        test_fts_index::<i32, i32>(true).await;
+        test_fts_index::<i32, i64>(true).await;
     }
 
     #[tokio::test]
     async fn test_fts_index_with_large_string() {
-        test_fts_index::<i64>().await;
+        test_fts_index::<i64, i32>(false).await;
+        test_fts_index::<i64, i32>(true).await;
+        test_fts_index::<i64, i64>(true).await;
     }
 
     #[tokio::test]
     async fn test_fts_accented_chars() {
-        let ds = create_fts_dataset::<i32>(false, TokenizerConfig::default()).await;
+        let ds = create_fts_dataset::<i32, i32>(false, false, TokenizerConfig::default()).await;
         let result = ds
             .scan()
             .project(&["id"])
@@ -5151,8 +5195,12 @@ mod tests {
         assert_eq!(result.num_rows(), 0);
 
         // with ascii folding enabled, the search should be accent-insensitive
-        let ds =
-            create_fts_dataset::<i32>(false, TokenizerConfig::default().ascii_folding(true)).await;
+        let ds = create_fts_dataset::<i32, i32>(
+            false,
+            false,
+            TokenizerConfig::default().ascii_folding(true),
+        )
+        .await;
         let result = ds
             .scan()
             .project(&["id"])
