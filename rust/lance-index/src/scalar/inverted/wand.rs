@@ -13,6 +13,7 @@ use tracing::instrument;
 
 use super::builder::OrderedDoc;
 use super::index::{idf, K1};
+use super::query::Operator;
 use super::{DocInfo, PostingList};
 
 #[derive(Clone)]
@@ -120,12 +121,28 @@ pub struct Wand {
 }
 
 impl Wand {
-    pub(crate) fn new(num_docs: usize, postings: impl Iterator<Item = PostingIterator>) -> Self {
+    pub(crate) fn new(
+        num_docs: usize,
+        operator: Operator,
+        postings: impl Iterator<Item = PostingIterator>,
+    ) -> Self {
+        let posting_lists = postings.collect::<Vec<_>>();
+        let threshold = match operator {
+            Operator::Or => 0.0,
+            Operator::And => posting_lists
+                .iter()
+                .map(|posting| posting.approximate_upper_bound())
+                .sum::<f32>(),
+        };
+
         Self {
-            threshold: 0.0,
+            threshold,
             cur_doc: None,
             num_docs,
-            postings: postings.filter(|posting| posting.doc().is_some()).collect(),
+            postings: posting_lists
+                .into_iter()
+                .filter(|posting| posting.list.len() > 0) // filter out empty postings
+                .collect(),
         }
     }
 
@@ -142,14 +159,9 @@ impl Wand {
         }
 
         let mut candidates = BinaryHeap::new();
-        let num_query_tokens = self.postings.len();
 
         while let Some(doc) = self.next().await? {
             if is_phrase_query {
-                // all the tokens should be in the same document cause it's a phrase query
-                if self.postings.len() != num_query_tokens {
-                    break;
-                }
                 if let Some(last) = self.postings.last() {
                     if last.doc().unwrap().row_id != doc {
                         continue;
@@ -207,7 +219,7 @@ impl Wand {
             if self.cur_doc.is_some() && doc.row_id <= cur_doc {
                 self.move_term(cur_doc + 1);
             } else if self.postings[0].doc().unwrap().row_id == doc.row_id {
-                // all the posting iterators have reached this doc id,
+                // all the posting iterators preceding pivot have reached this doc id,
                 // so that means the sum of upper bound of all terms is not less than the threshold,
                 // this document is a candidate
                 self.cur_doc = Some(doc.row_id);
@@ -260,6 +272,8 @@ impl Wand {
             if doc.row_id >= least_id {
                 break;
             }
+            // a shorter posting list means this term is rare and more likely to skip more documents,
+            // so we prefer the term with a shorter posting list.
             if posting.list.len() < least_length {
                 least_length = posting.list.len();
                 pick_index = i;

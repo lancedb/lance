@@ -14,6 +14,11 @@ class FullTextQueryType(Enum):
     MULTI_MATCH = "multi_match"
 
 
+class FullTextOperator(Enum):
+    AND = "AND"
+    OR = "OR"
+
+
 class FullTextQuery(abc.ABC):
     @abc.abstractmethod
     def query_type(self) -> FullTextQueryType:
@@ -47,6 +52,7 @@ class MatchQuery(FullTextQuery):
         boost: float = 1.0,
         fuzziness: int = 0,
         max_expansions: int = 50,
+        operator: FullTextOperator = FullTextOperator.AND,
     ):
         """
         Match query for full-text search.
@@ -76,6 +82,7 @@ class MatchQuery(FullTextQuery):
         self.boost = boost
         self.fuzziness = fuzziness
         self.max_expansions = max_expansions
+        self.operator = operator
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MATCH
@@ -88,6 +95,7 @@ class MatchQuery(FullTextQuery):
                     "boost": self.boost,
                     "fuzziness": self.fuzziness,
                     "max_expansions": self.max_expansions,
+                    "operator": self.operator,
                 }
             }
         }

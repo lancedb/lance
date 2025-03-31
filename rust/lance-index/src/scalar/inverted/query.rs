@@ -37,6 +37,22 @@ impl Default for FtsSearchParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Operator {
+    And,
+    Or,
+}
+
+impl From<&str> for Operator {
+    fn from(value: &str) -> Self {
+        match value {
+            "AND" => Operator::And,
+            "OR" => Operator::Or,
+            _ => panic!("Invalid operator: {}", value),
+        }
+    }
+}
+
 pub trait FtsQueryNode {
     fn columns(&self) -> HashSet<String>;
 }
@@ -177,6 +193,12 @@ pub struct MatchQuery {
     /// The maximum number of terms to expand for fuzzy matching.
     /// Default to 50.
     pub max_expansions: usize,
+
+    /// The operator to use for combining terms.
+    /// This can be either `And` or `Or`, it's 'Or' by default.
+    /// - `And`: All terms must match.
+    /// - `Or`: At least one term must match.
+    pub operator: Operator,
 }
 
 impl MatchQuery {
@@ -187,6 +209,7 @@ impl MatchQuery {
             boost: 1.0,
             fuzziness: Some(0),
             max_expansions: 50,
+            operator: Operator::Or,
         }
     }
 
@@ -207,6 +230,11 @@ impl MatchQuery {
 
     pub fn with_max_expansions(mut self, max_expansions: usize) -> Self {
         self.max_expansions = max_expansions;
+        self
+    }
+
+    pub fn with_operator(mut self, operator: Operator) -> Self {
+        self.operator = operator;
         self
     }
 

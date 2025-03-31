@@ -25,7 +25,7 @@ use lance::{datatypes::Schema, io::ObjectStore};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
 use lance_index::scalar::inverted::query::{
-    BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, PhraseQuery,
+    BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
@@ -325,12 +325,17 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<FtsQuery> {
                 .get_item("max_expansions")?
                 .ok_or(PyValueError::new_err("max_expansions not found"))?
                 .extract::<usize>()?;
+            let operator = params
+                .get_item("operator")?
+                .ok_or(PyValueError::new_err("operator not found"))?
+                .extract::<String>()?;
 
             let query = MatchQuery::new(query)
                 .with_column(Some(column))
                 .with_boost(boost)
                 .with_fuzziness(fuzziness)
-                .with_max_expansions(max_expansions);
+                .with_max_expansions(max_expansions)
+                .with_operator(Operator::from(&operator));
             Ok(query.into())
         }
 
