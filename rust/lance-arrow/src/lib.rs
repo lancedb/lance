@@ -830,7 +830,7 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{new_empty_array, Int32Array, ListArray, StringArray};
+    use arrow_array::{new_empty_array, Int32Array, StringArray};
 
     #[test]
     fn test_merge_recursive() {
