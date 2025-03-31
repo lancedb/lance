@@ -141,7 +141,7 @@ impl Wand {
             num_docs,
             postings: posting_lists
                 .into_iter()
-                .filter(|posting| posting.list.len() > 0) // filter out empty postings
+                .filter(|posting| posting.doc().is_some())
                 .collect(),
         }
     }

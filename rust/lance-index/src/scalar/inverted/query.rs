@@ -46,8 +46,8 @@ pub enum Operator {
 impl From<&str> for Operator {
     fn from(value: &str) -> Self {
         match value {
-            "AND" => Operator::And,
-            "OR" => Operator::Or,
+            "AND" => Self::And,
+            "OR" => Self::Or,
             _ => panic!("Invalid operator: {}", value),
         }
     }
