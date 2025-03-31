@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use arrow::datatypes::UInt8Type;
+use arrow::datatypes::{Int8Type, UInt8Type};
 use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_struct_array, AsArray},
@@ -1789,6 +1789,21 @@ async fn train_ivf_model(
             do_train_ivf_model::<Float64Type>(
                 centroids,
                 values.as_primitive::<Float64Type>().values(),
+                dim,
+                distance_type,
+                params,
+            )
+            .await
+        }
+        (DataType::Int8, DistanceType::L2) 
+        | (DataType::Int8, DistanceType::Dot) 
+        | (DataType::Int8, DistanceType::Cosine) => {
+            do_train_ivf_model::<Float32Type>(
+                centroids,
+                data.convert_to_floating_point()
+                    ?.values()
+                    .as_primitive::<Float32Type>()
+                    .values(),
                 dim,
                 distance_type,
                 params,
