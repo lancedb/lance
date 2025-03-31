@@ -39,10 +39,20 @@ def _fsl_to_tensor(arr: pa.FixedSizeListArray, dimension: int) -> torch.Tensor:
     values = arr.values
     start = arr.offset * dimension
     num_vals = len(arr) * dimension
-    values = values.slice(start, num_vals)
-    # Convert to numpy
-    nparr = values.to_numpy(zero_copy_only=True).reshape(-1, dimension)
-    return torch.from_numpy(nparr)
+    sliced = values.slice(start, num_vals)
+
+    try:
+        nparr = sliced.to_numpy(zero_copy_only=True).reshape(-1, dimension)
+
+        if not nparr.flags.writeable:
+            # Smart copy: only duplicate when modification is detected later
+            # as_tensor() preserves numpy's memory layout
+            return torch.as_tensor(nparr).clone()
+
+        return torch.from_numpy(nparr)
+
+    except pa.ArrowNotImplementedError:
+        return torch.tensor(sliced.to_pylist()).reshape(-1, dimension)
 
 
 def _to_tensor(
