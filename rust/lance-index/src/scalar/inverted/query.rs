@@ -43,12 +43,16 @@ pub enum Operator {
     Or,
 }
 
-impl From<&str> for Operator {
-    fn from(value: &str) -> Self {
-        match value {
-            "AND" => Self::And,
-            "OR" => Self::Or,
-            _ => panic!("Invalid operator: {}", value),
+impl TryFrom<&str> for Operator {
+    type Error = Error;
+    fn try_from(value: &str) -> Result<Self> {
+        match value.to_ascii_uppercase().as_str() {
+            "AND" => Ok(Self::And),
+            "OR" => Ok(Self::Or),
+            _ => Err(Error::invalid_input(
+                format!("Invalid operator: {}", value),
+                location!(),
+            )),
         }
     }
 }

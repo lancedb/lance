@@ -335,7 +335,9 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<FtsQuery> {
                 .with_boost(boost)
                 .with_fuzziness(fuzziness)
                 .with_max_expansions(max_expansions)
-                .with_operator(Operator::from(&operator));
+                .with_operator(Operator::try_from(operator.as_str()).map_err(|e| {
+                    PyValueError::new_err(format!("expected operator to be AND or OR: {}", e))
+                })?);
             Ok(query.into())
         }
 
