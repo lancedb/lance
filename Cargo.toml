@@ -78,7 +78,7 @@ aws-config = "1.2.0"
 aws-credential-types = "1.2.0"
 aws-sdk-dynamodb = "1.38.0"
 aws-sdk-s3 = "1.38.0"
-half = { "version" = "2.4.1", default-features = false, features = [
+half = { "version" = "2.1", default-features = false, features = [
     "num-traits",
     "std",
 ] }
