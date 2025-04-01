@@ -572,7 +572,12 @@ impl Dataset {
                             })?;
                         }
                         _ => {
-                            let query = MultiMatchQuery::new(query, columns);
+                            let query = MultiMatchQuery::try_new(query, columns).map_err(|e| {
+                                PyValueError::new_err(format!(
+                                    "Failed to create MultiMatchQuery: {}",
+                                    e
+                                ))
+                            })?;
                             fts_query = FullTextSearchQuery::new_query(query.into());
                         }
                     }
