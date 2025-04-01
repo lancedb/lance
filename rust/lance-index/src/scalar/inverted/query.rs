@@ -92,12 +92,12 @@ impl FtsQueryNode for FtsQuery {
 }
 
 impl FtsQuery {
-    pub fn query(&self) -> &str {
+    pub fn query(&self) -> String {
         match self {
-            Self::Match(query) => &query.terms,
-            Self::Phrase(query) => &query.terms,
+            Self::Match(query) => query.terms.clone(),
+            Self::Phrase(query) => format!("\"{}\"", query.terms), // Phrase queries are quoted
             Self::Boost(query) => query.positive.query(),
-            Self::MultiMatch(query) => &query.match_queries[0].terms,
+            Self::MultiMatch(query) => query.match_queries[0].terms.clone(),
         }
     }
 
