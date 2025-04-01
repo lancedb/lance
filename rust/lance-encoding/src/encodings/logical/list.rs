@@ -1499,6 +1499,24 @@ mod tests {
         check_round_trip_encoding_random(field, version).await;
     }
 
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_deeply_nested_lists(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+        let field = Field::new("item", DataType::Int32, true).with_metadata(field_metadata);
+        for _ in 0..5 {
+            let field = Field::new("", make_list_type(field.data_type().clone()), true);
+            check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        }
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_large_list() {
         let field = Field::new("", make_large_list_type(DataType::Int32), true);
@@ -1579,6 +1597,54 @@ mod tests {
             .with_indices(vec![2])
             .with_file_version(version);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
+            .await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_simple_nested_list_ends_with_null(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        use arrow_array::Int32Array;
+
+        let values = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let inner_offsets = ScalarBuffer::<i32>::from(vec![0, 1, 2, 3, 4, 5, 5]);
+        let inner_validity = BooleanBuffer::from(vec![true, true, true, true, true, false]);
+        let outer_offsets = ScalarBuffer::<i32>::from(vec![0, 1, 2, 3, 4, 5, 6, 6]);
+        let outer_validity = BooleanBuffer::from(vec![true, true, true, true, true, true, false]);
+
+        let inner_list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            OffsetBuffer::new(inner_offsets),
+            Arc::new(values),
+            Some(NullBuffer::new(inner_validity)),
+        );
+        let outer_list = ListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            )),
+            OffsetBuffer::new(outer_offsets),
+            Arc::new(inner_list),
+            Some(NullBuffer::new(outer_validity)),
+        );
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(0..3)
+            .with_range(5..7)
+            .with_indices(vec![1, 6])
+            .with_indices(vec![6])
+            .with_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![Arc::new(outer_list)], &test_cases, field_metadata)
             .await;
     }
 

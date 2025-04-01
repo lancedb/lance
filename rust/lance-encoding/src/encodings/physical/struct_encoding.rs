@@ -107,7 +107,7 @@ impl PackedStructFixedWidthMiniBlockDecompressor {
             .as_ref()
             .unwrap()
         {
-            pb::array_encoding::ArrayEncoding::Flat(flat) => Box::new(ValueDecompressor::new(flat)),
+            pb::array_encoding::ArrayEncoding::Flat(flat) => Box::new(ValueDecompressor::from_flat(flat)),
             _ => panic!("Currently only `ArrayEncoding::Flat` is supported in packed struct encoding in Lance 2.1."),
         };
         Self {
@@ -118,7 +118,8 @@ impl PackedStructFixedWidthMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for PackedStructFixedWidthMiniBlockDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        assert_eq!(data.len(), 1);
         let encoded_data_block = self.array_encoding.decompress(data, num_values)?;
         let DataBlock::FixedWidth(encoded_data_block) = encoded_data_block else {
             panic!("ValueDecompressor should output FixedWidth DataBlock")
