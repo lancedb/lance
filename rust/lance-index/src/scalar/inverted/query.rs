@@ -338,7 +338,7 @@ impl<'de> Deserialize<'de> for MultiMatchQuery {
         let boosts = data.boost.unwrap_or(vec![1.0; data.columns.len()]);
 
         Self::try_new_with_boosts(data.query, data.columns, boosts)
-            .map_err(|e| serde::de::Error::custom(e))
+            .map_err(serde::de::Error::custom)
     }
 }
 
