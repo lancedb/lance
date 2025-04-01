@@ -302,7 +302,10 @@ impl Serialize for MultiMatchQuery {
     {
         let mut map = serializer.serialize_map(Some(3))?;
 
-        map.serialize_entry("query", &self.match_queries[0].terms)?;
+        let query = self.match_queries.first().ok_or(serde::ser::Error::custom(
+            "MultiMatchQuery must have at least one MatchQuery".to_string(),
+        ))?;
+        map.serialize_entry("query", &query.terms)?;
         let columns = self
             .match_queries
             .iter()
@@ -334,20 +337,39 @@ impl<'de> Deserialize<'de> for MultiMatchQuery {
         let data = MultiMatchQueryData::deserialize(deserializer)?;
         let boosts = data.boost.unwrap_or(vec![1.0; data.columns.len()]);
 
-        Ok(Self::with_boosts(data.query, data.columns, boosts))
+        Self::try_new_with_boosts(data.query, data.columns, boosts)
+            .map_err(|e| serde::de::Error::custom(e))
     }
 }
 
 impl MultiMatchQuery {
-    pub fn new(query: String, columns: Vec<String>) -> Self {
+    pub fn try_new(query: String, columns: Vec<String>) -> Result<Self> {
+        if columns.is_empty() {
+            return Err(Error::invalid_input(
+                "Cannot create MultiMatchQuery with no columns".to_string(),
+                location!(),
+            ));
+        }
+
         let match_queries = columns
             .into_iter()
             .map(|column| MatchQuery::new(query.clone()).with_column(Some(column)))
             .collect();
-        Self { match_queries }
+        Ok(Self { match_queries })
     }
 
-    pub fn with_boosts(query: String, columns: Vec<String>, boosts: Vec<f32>) -> Self {
+    pub fn try_new_with_boosts(
+        query: String,
+        columns: Vec<String>,
+        boosts: Vec<f32>,
+    ) -> Result<Self> {
+        if boosts.len() != columns.len() {
+            return Err(Error::invalid_input(
+                "The number of boosts must match the number of columns".to_string(),
+                location!(),
+            ));
+        }
+
         let match_queries = columns
             .into_iter()
             .zip(boosts)
@@ -357,7 +379,7 @@ impl MultiMatchQuery {
                     .with_boost(boost)
             })
             .collect();
-        Self { match_queries }
+        Ok(Self { match_queries })
     }
 }
 
@@ -414,7 +436,7 @@ pub fn fill_fts_query_column(
                 _ => {
                     // if there are multiple columns, we need to create a MultiMatch query
                     let multi_match_query =
-                        MultiMatchQuery::new(match_query.terms.clone(), columns.to_vec());
+                        MultiMatchQuery::try_new(match_query.terms.clone(), columns.to_vec())?;
                     Ok(FtsQuery::MultiMatch(multi_match_query))
                 }
             }
