@@ -410,16 +410,15 @@ impl Transaction {
                 // fragments we don't touch.
                 Operation::Append { .. } => false,
                 Operation::ReserveFragments { .. } => false,
-                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
+                Operation::Delete { .. }
+                | Operation::Rewrite { .. }
+                | Operation::Update { .. }
+                | Operation::DataReplacement { .. } => {
                     // As long as they rewrite disjoint fragments they shouldn't conflict.
                     self.operation.modifies_same_ids(&other.operation)
                 }
                 Operation::Project { .. } => false,
                 Operation::UpdateConfig { .. } => false,
-                Operation::DataReplacement { .. } => {
-                    // TODO(rmeng): check that the fragments being replaced are not part of the groups
-                    true
-                }
                 _ => true,
             },
             // Restore always succeeds
@@ -430,32 +429,48 @@ impl Transaction {
                 &other.operation,
                 Operation::Overwrite { .. } | Operation::Restore { .. }
             ),
-            Operation::CreateIndex { .. } => match &other.operation {
-                Operation::Append { .. } => false,
-                // Indices are identified by UUIDs, so they shouldn't conflict.
-                Operation::CreateIndex { .. } => false,
-                // Although some of the rows we indexed may have been deleted / moved,
-                // row ids are still valid, so we allow this optimistically.
-                Operation::Delete { .. } | Operation::Update { .. } => false,
-                // Merge & reserve don't change row ids, so this should be fine.
-                Operation::Merge { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                // Rewrite likely changed many of the row ids, so our index is
-                // likely useless. It should be rebuilt.
-                // TODO: we could be smarter here and only invalidate the index
-                // if the rewrite changed more than X% of row ids.
-                Operation::Rewrite { .. } => true,
-                Operation::UpdateConfig { .. } => false,
-                Operation::DataReplacement { .. } => {
-                    // TODO(rmeng): check that the new indices isn't on the column being replaced
-                    true
+            Operation::CreateIndex { new_indices, .. } => {
+                let affected_fields = new_indices
+                    .iter()
+                    .flat_map(|index| index.fields.iter())
+                    .collect::<HashSet<_>>();
+                match &other.operation {
+                    Operation::Append { .. } => false,
+                    // Indices are identified by UUIDs, so they shouldn't conflict.
+                    Operation::CreateIndex { .. } => false,
+                    // Although some of the rows we indexed may have been deleted / moved,
+                    // row ids are still valid, so we allow this optimistically.
+                    Operation::Delete { .. } | Operation::Update { .. } => false,
+                    // Merge & reserve don't change row ids, so this should be fine.
+                    Operation::Merge { .. } => false,
+                    Operation::ReserveFragments { .. } => false,
+                    // Rewrite likely changed many of the row ids, so our index is
+                    // likely useless. It should be rebuilt.
+                    // TODO: we could be smarter here and only invalidate the index
+                    // if the rewrite changed more than X% of row ids.
+                    Operation::Rewrite { .. } => true,
+                    Operation::UpdateConfig { .. } => false,
+                    // Because we modify the fragment in place, the index cannot be
+                    // re-used if it's on something that we've modified.
+                    Operation::DataReplacement { replacements } => {
+                        replacements.iter().any(|replacement| {
+                            replacement
+                                .1
+                                .fields
+                                .iter()
+                                .any(|field| affected_fields.contains(field))
+                        })
+                    }
+                    _ => true,
                 }
-                _ => true,
-            },
+            }
             Operation::Delete { .. } | Operation::Update { .. } => match &other.operation {
                 Operation::CreateIndex { .. } => false,
                 Operation::ReserveFragments { .. } => false,
-                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
+                Operation::Delete { .. }
+                | Operation::Rewrite { .. }
+                | Operation::Update { .. }
+                | Operation::DataReplacement { .. } => {
                     // If we update the same fragments, we conflict.
                     self.operation.modifies_same_ids(&other.operation)
                 }
@@ -506,24 +521,39 @@ impl Transaction {
                 Operation::UpdateConfig { .. } => false,
                 _ => true,
             },
-            Operation::DataReplacement { .. } => match &other.operation {
+            Operation::DataReplacement { replacements } => match &other.operation {
                 Operation::Append { .. }
                 | Operation::Delete { .. }
                 | Operation::Update { .. }
                 | Operation::Merge { .. }
                 | Operation::UpdateConfig { .. } => false,
-                Operation::CreateIndex { .. } => {
-                    // TODO(rmeng): check that the new indices isn't on the column being replaced
-                    true
+                Operation::CreateIndex { new_indices, .. } => {
+                    let affected_fields = new_indices
+                        .iter()
+                        .flat_map(|index| index.fields.iter())
+                        .collect::<HashSet<_>>();
+
+                    replacements.iter().any(|replacement| {
+                        replacement
+                            .1
+                            .fields
+                            .iter()
+                            .any(|field| affected_fields.contains(field))
+                    })
                 }
-                Operation::Rewrite { .. } => {
-                    // TODO(rmeng): check that the fragments being replaced are not part of the groups
-                    true
-                }
-                Operation::DataReplacement { .. } => {
-                    // TODO(rmeng): check cell conflicts
-                    true
-                }
+                Operation::Rewrite { .. } => self.operation.modifies_same_ids(&other.operation),
+                Operation::DataReplacement {
+                    replacements: other_replacements,
+                } => replacements.iter().any(|replacement| {
+                    other_replacements.iter().any(|other_replacement| {
+                        replacement.0 == other_replacement.0
+                            && replacement
+                                .1
+                                .fields
+                                .iter()
+                                .any(|field| other_replacement.1.fields.contains(field))
+                    })
+                }),
                 _ => true,
             },
         }
