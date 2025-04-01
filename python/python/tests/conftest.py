@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import os
+import re
 import sys
 
 import pytest
@@ -90,3 +92,29 @@ def pytest_collection_modifyitems(config, items):
         disable_items_with_mark(items, "torch", reason)
         disable_items_with_mark(items, "cuda", reason)
         disable_items_with_mark(items, "gpu", reason)
+
+
+def slugify(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]+", "-", s)
+
+
+def pytest_generate_tests(metafunc):
+    if "test_data_base_uri" in metafunc.fixturenames:
+        if "LANCE_TEST_DATA_BASE_URI" in os.environ:
+            import pyarrow.fs as pafs
+
+            base_uri = os.environ["LANCE_TEST_DATA_BASE_URI"]
+            fs, path = pafs.FileSystem.from_uri(base_uri)
+            paths = fs.get_file_info(pafs.FileSelector(path, recursive=True))
+            file_paths = [path.path for path in paths if path.is_file]
+            filenames = [os.path.basename(file_path) for file_path in file_paths]
+            metafunc.parametrize(
+                "test_data_file, test_data_base_uri",
+                [(filename, base_uri) for filename in filenames],
+                ids=[slugify(filename) for filename in filenames],
+            )
+        else:
+            metafunc.parametrize(
+                "test_data_file, test_data_base_uri",
+                [],
+            )

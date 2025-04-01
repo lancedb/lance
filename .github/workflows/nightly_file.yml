@@ -1,0 +1,57 @@
+name: Nightly File Verification
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # Runs every day at midnight UTC
+  workflow_dispatch:
+
+env:
+  # This env var is used by Swatinem/rust-cache@v2 for the cache
+  # key, so we set it to make sure it is always consistent.
+  CARGO_TERM_COLOR: always
+  # Disable full debug symbol generation to speed up CI build and keep memory down
+  # "1" means line tables only, which is useful for panic tracebacks.
+  RUSTFLAGS: "-C debuginfo=line-tables-only"
+  RUST_BACKTRACE: "1"
+  CI: "true"
+  # Color output for pytest is off by default.
+  PYTEST_ADDOPTS: "--color=yes"
+  FORCE_COLOR: "1"
+  # Change this to bust all caches (may be needed periodically if the caches accumulate
+  # a lot of cruft).
+  CACHE_PREFIX: "2"
+  LANCE_TEST_DATA_BASE_URI: "s3://bucket-o-parquets/"
+
+jobs:
+  test-files:
+    timeout-minutes: 45
+    name: "Test Files"
+    runs-on: "ubuntu-24.04"
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
+      - uses: ./.github/workflows/build_linux_wheel
+      - uses: ./.github/workflows/run_tests
+      - name: Install dependencies
+        working-directory: python
+        shell: bash
+        run: |
+          pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
+      - name: Run Tests
+        working-directory: python
+        run: |
+          python -mpytest python/tests/test_file_integration.py
