@@ -912,7 +912,7 @@ impl DecodePageTask for DecodeComplexAllNullTask {
         // in the items array.  We need to account for that here to figure out how many values
         // should be in the items array.
         let num_values = if let Some(def) = &def {
-            def.iter().filter(|&d| *d < self.max_visible_level).count() as u64
+            def.iter().filter(|&d| *d <= self.max_visible_level).count() as u64
         } else {
             num_values
         };
@@ -4233,6 +4233,7 @@ impl PrimitiveStructuralEncoder {
                 // We should not encode empty arrays.  So if we get here that should mean that we
                 // either have all empty lists or all null lists (or a mix).  We still need to encode
                 // the rep/def information but we can skip the data encoding.
+                log::debug!("Encoding column {} with {} items ({} rows) using complex-null layout", column_idx, num_values, num_rows);
                 return Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows);
             }
             let num_nulls = arrays
@@ -4243,13 +4244,20 @@ impl PrimitiveStructuralEncoder {
             if num_values == num_nulls {
                 return if repdefs.iter().all(|rd| rd.is_simple_validity()) {
                     log::debug!(
-                        "Encoding column {} with {} items using simple-null layout",
+                        "Encoding column {} with {} items ({} rows) using simple-null layout",
                         column_idx,
-                        num_values
+                        num_values,
+                        num_rows
                     );
                     // Simple case, no rep/def and all nulls, we don't need to encode any data
                     Self::encode_simple_all_null(column_idx, num_values, row_number)
                 } else {
+                    log::debug!(
+                        "Encoding column {} with {} items ({} rows) using complex-null layout",
+                        column_idx,
+                        num_values,
+                        num_rows
+                    );
                     // If we get here then we have definition levels and we need to store those
                     Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows)
                 };

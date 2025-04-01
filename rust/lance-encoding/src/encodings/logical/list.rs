@@ -828,6 +828,20 @@ mod tests {
             .await;
     }
 
+    #[test_log::test(tokio::test)]
+    async fn test_empty_list_list() {
+        let items_builder = Int32Builder::new();
+        let list_builder = ListBuilder::new(items_builder);
+        let mut outer_list_builder = ListBuilder::new(list_builder);
+        outer_list_builder.append_null();
+        outer_list_builder.append_null();
+        outer_list_builder.append_null();
+        let list_array = Arc::new(outer_list_builder.finish());
+
+        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
     #[rstest]
     #[test_log::test(tokio::test)]
     #[ignore] // This test is quite slow in debug mode
