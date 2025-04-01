@@ -542,7 +542,7 @@ impl Dataset {
                 .ok_or_else(|| PyKeyError::new_err("query must be specified"))?;
 
             let fts_query = if let Ok(query) = query.downcast::<PyString>() {
-                let query = query.to_string();
+                let mut query = query.to_string();
                 let columns = if let Some(columns) = full_text_query.get_item("columns")? {
                     if columns.is_none() {
                         None
@@ -561,6 +561,11 @@ impl Dataset {
 
                 let is_phrase = query.len() >= 2 && query.starts_with('"') && query.ends_with('"');
                 let is_multi_match = columns.as_ref().map(|cols| cols.len() > 1).unwrap_or(false);
+
+                if is_phrase {
+                    // Remove the surrounding quotes for phrase queries
+                    query = query[1..query.len() - 1].to_string();
+                }
 
                 let query: FtsQuery = match (is_phrase, is_multi_match) {
                     (false, _) => MatchQuery::new(query).into(),
