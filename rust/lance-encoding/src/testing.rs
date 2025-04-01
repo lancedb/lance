@@ -338,10 +338,9 @@ pub async fn check_round_trip_encoding_generated(
     }
 }
 
-fn supports_nulls(data_type: &DataType) -> bool {
-    // We don't yet have nullability support for all types.  Don't test nullability for the
-    // types we don't support.
-    !matches!(data_type, DataType::Struct(_))
+fn supports_nulls(data_type: &DataType, version: LanceFileVersion) -> bool {
+    // 2.0 doesn't support nullability for structs
+    !(matches!(data_type, DataType::Struct(_)) && version == LanceFileVersion::V2_0)
 }
 
 type EncodingVerificationFn = dyn Fn(&[EncodedColumn]);
@@ -940,7 +939,7 @@ async fn check_round_trip_field_encoding_random(
             }
 
             let field = if null_rate.is_some() {
-                if !supports_nulls(field.data_type()) {
+                if !supports_nulls(field.data_type(), version) {
                     continue;
                 }
                 field.clone().with_nullable(true)
