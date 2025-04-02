@@ -2107,4 +2107,154 @@ mod tests {
 
         assert_eq!(final_fragments, expected_fragments);
     }
+
+    #[test]
+    fn test_data_replacement_conflicts() {
+        let data_file0 = DataFile {
+            path: "file0".to_string(),
+            fields: vec![0],
+            column_indices: vec![],
+            file_major_version: 1,
+            file_minor_version: 0,
+        };
+
+        let data_file1 = DataFile {
+            path: "file1".to_string(),
+            fields: vec![1],
+            column_indices: vec![],
+            file_major_version: 1,
+            file_minor_version: 0,
+        };
+
+        let data_file2 = DataFile {
+            path: "file2".to_string(),
+            fields: vec![0],
+            column_indices: vec![],
+            file_major_version: 1,
+            file_minor_version: 0,
+        };
+
+        let replacements = vec![
+            DataReplacementGroup(0, data_file0),
+            DataReplacementGroup(1, data_file1.clone()),
+        ];
+
+        let other_replacements = vec![
+            DataReplacementGroup(1, data_file1),
+            DataReplacementGroup(2, data_file2.clone()),
+        ];
+
+        let operation = Operation::DataReplacement { replacements };
+        let other_operation = Operation::DataReplacement {
+            replacements: other_replacements,
+        };
+
+        let transaction = Transaction::new(0, operation, None, None);
+        let other_transaction = Transaction::new(0, other_operation, None, None);
+
+        // Conflicts because fragment 1 is being replaced in both transactions
+        assert!(transaction.conflicts_with(&other_transaction));
+
+        let non_conflicting_replacements = vec![DataReplacementGroup(2, data_file2)];
+        let non_conflicting_operation = Operation::DataReplacement {
+            replacements: non_conflicting_replacements,
+        };
+        let non_conflicting_transaction =
+            Transaction::new(0, non_conflicting_operation, None, None);
+
+        // No conflict because the fragments being replaced are disjoint
+        assert!(!transaction.conflicts_with(&non_conflicting_transaction));
+    }
+
+    #[test]
+    fn test_data_replacement_with_create_index_conflict() {
+        let data_file = DataFile {
+            path: "file0".to_string(),
+            fields: vec![0],
+            column_indices: vec![],
+            file_major_version: 1,
+            file_minor_version: 0,
+        };
+
+        let replacements = vec![DataReplacementGroup(0, data_file)];
+        let operation = Operation::DataReplacement { replacements };
+
+        let index = Index {
+            uuid: uuid::Uuid::new_v4(),
+            name: "test_index".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+        };
+
+        let create_index_operation = Operation::CreateIndex {
+            new_indices: vec![index],
+            removed_indices: vec![],
+        };
+
+        let transaction = Transaction::new(0, operation, None, None);
+        let create_index_transaction = Transaction::new(0, create_index_operation, None, None);
+
+        // Conflicts because the index is being created on the same field being replaced
+        assert!(transaction.conflicts_with(&create_index_transaction));
+    }
+
+    #[test]
+    fn test_data_replacement_with_rewrite_conflict() {
+        let fragment0 = Fragment::new(0);
+        let fragment1 = Fragment::new(1);
+
+        let data_file = DataFile {
+            path: "file0".to_string(),
+            fields: vec![0],
+            column_indices: vec![],
+            file_major_version: 1,
+            file_minor_version: 0,
+        };
+
+        let replacements = vec![DataReplacementGroup(0, data_file)];
+        let operation = Operation::DataReplacement { replacements };
+
+        let rewrite_group = RewriteGroup {
+            old_fragments: vec![fragment0],
+            new_fragments: vec![fragment1],
+        };
+
+        let rewrite_operation = Operation::Rewrite {
+            groups: vec![rewrite_group],
+            rewritten_indices: vec![],
+        };
+
+        let transaction = Transaction::new(0, operation, None, None);
+        let rewrite_transaction = Transaction::new(0, rewrite_operation, None, None);
+
+        // Conflicts because the rewrite modifies the same fragment being replaced
+        assert!(transaction.conflicts_with(&rewrite_transaction));
+    }
+
+    #[test]
+    fn test_data_replacement_no_conflict_with_append() {
+        let data_file = DataFile {
+            path: "file0".to_string(),
+            fields: vec![0],
+            column_indices: vec![],
+            file_major_version: 1,
+            file_minor_version: 0,
+        };
+
+        let replacements = vec![DataReplacementGroup(0, data_file)];
+        let operation = Operation::DataReplacement { replacements };
+
+        let fragment = Fragment::new(1);
+        let append_operation = Operation::Append {
+            fragments: vec![fragment],
+        };
+
+        let transaction = Transaction::new(0, operation, None, None);
+        let append_transaction = Transaction::new(0, append_operation, None, None);
+
+        // No conflict because append does not modify existing fragments
+        assert!(!transaction.conflicts_with(&append_transaction));
+    }
 }
