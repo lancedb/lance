@@ -22,6 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use lance_core::utils::backoff::Backoff;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::{
@@ -579,7 +580,8 @@ pub(crate) async fn do_commit_detached_transaction(
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
 
     // We still do a loop since we may have conflicts in the random version we pick
-    for attempt_i in 0..commit_config.num_retries {
+    let mut backoff = Backoff::default();
+    while backoff.attempt() < commit_config.num_retries {
         // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = thread_rng().gen::<u64>() | DETACHED_VERSION_MASK;
 
@@ -637,9 +639,7 @@ pub(crate) async fn do_commit_detached_transaction(
             Err(CommitError::CommitConflict) => {
                 // We pick a random u64 for the version, so it's possible (though extremely unlikely)
                 // that we have a conflict. In that case, we just try again.
-
-                let backoff_time = backoff_time(attempt_i);
-                tokio::time::sleep(backoff_time).await;
+                tokio::time::sleep(backoff.next_backoff()).await;
             }
             Err(CommitError::OtherError(err)) => {
                 // If other error, return
@@ -771,7 +771,8 @@ pub(crate) async fn commit_transaction(
         )?;
     }
 
-    for attempt_i in 0..commit_config.num_retries {
+    let mut backoff = Backoff::default();
+    while backoff.attempt() < commit_config.num_retries {
         // Build an up-to-date manifest from the transaction and current manifest
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
@@ -848,8 +849,7 @@ pub(crate) async fn commit_transaction(
                 // Use small amount of backoff to handle transactions that all
                 // started at exact same time better.
 
-                let backoff_time = backoff_time(attempt_i);
-                tokio::time::sleep(backoff_time).await;
+                tokio::time::sleep(backoff.next_backoff()).await;
 
                 dataset.checkout_latest().await?;
                 let latest_version = dataset.manifest.version;
@@ -888,17 +888,17 @@ pub(crate) async fn commit_transaction(
     })
 }
 
-fn backoff_time(attempt_i: u32) -> std::time::Duration {
-    // Exponential base:
-    // 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms
-    let backoff = 2_i32.pow(attempt_i) * 100;
-    // With +-100ms jitter
-    let jitter = rand::thread_rng().gen_range(-100..100);
-    let backoff = backoff + jitter;
-    // No more than 5 seconds and less than 10ms.
-    let backoff = backoff.clamp(10, 5_000) as u64;
-    std::time::Duration::from_millis(backoff)
-}
+// fn backoff_time(attempt_i: u32) -> std::time::Duration {
+//     // Exponential base:
+//     // 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms
+//     let backoff = 2_i32.pow(attempt_i) * 100;
+//     // With +-100ms jitter
+//     let jitter = rand::thread_rng().gen_range(-100..100);
+//     let backoff = backoff + jitter;
+//     // No more than 5 seconds and less than 10ms.
+//     let backoff = backoff.clamp(10, 5_000) as u64;
+//     std::time::Duration::from_millis(backoff)
+// }
 
 #[cfg(test)]
 mod tests {

@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use chrono::TimeDelta;
+use arrow_schema::Schema as ArrowSchema;
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::physical_plan::common::IPCWriter;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{StreamExt, TryStreamExt};
+use either::Either;
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions, StorageClass,
 };
@@ -641,6 +648,41 @@ async fn resolve_commit_handler(
                 Ok(commit_handler)
             }
         }
+    }
+}
+
+/// Create an iterator of record batch streams from the given source.
+///
+/// If `enable_retries` is true, the source will be collected, and the
+/// resulting iterator will be an infinite iterator that returns the same
+/// batches over and over again. Otherwise, the source will be yielded by a
+/// one-item iterator.
+///
+/// This is used to support retries on write operations.
+async fn new_source_iter(
+    source: SendableRecordBatchStream,
+    enable_retries: bool,
+) -> Result<impl Iterator<Item = SendableRecordBatchStream>> {
+    // TODO: Also support spilling to disk
+    if enable_retries {
+        let schema = source.schema();
+
+        // If size hint shows there is only one batch, spilling has no benefit, just keep that
+        // in memory. (This is a pretty common case.)
+        let size_hint = source.size_hint();
+        if size_hint.0 == 1 && size_hint.1 == Some(1) {
+            let batches: Vec<RecordBatch> = source.try_collect().await?;
+            Ok(Either::Left(std::iter::repeat_with(move || {
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(batches.clone().into_iter().map(Ok)),
+                )) as SendableRecordBatchStream
+            })))
+        } else {
+            todo!("spill to disk")
+        }
+    } else {
+        Ok(Either::Right(std::iter::once(source)))
     }
 }
 
