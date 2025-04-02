@@ -118,6 +118,12 @@ try:
 
     MAP_DATASET_CLASS = torchdata.datapipes.map.MapDataPipe
     ITER_DATASET_CLASS = torchdata.datapipes.iter.IterDataPipe
+
+    logger.warning(
+        "TorchData integration is still in BETA phase. "
+        "APIs may change without backward compatibility."
+    )
+
 except ImportError:
     try:
         import torch
@@ -125,7 +131,6 @@ except ImportError:
         MAP_DATASET_CLASS = torch.utils.data.Dataset
         ITER_DATASET_CLASS = torch.utils.data.IterableDataset
     except ImportError:
-        logger = logging.getLogger(__name__)
         logger.error(
             "Error when importing Torch. To use PyTorch features, please install torch."
         )
