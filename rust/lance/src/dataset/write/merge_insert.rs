@@ -52,14 +52,13 @@ use lance_datafusion::{
 
 use datafusion_physical_expr::expressions::Column;
 use futures::{
-    future::Either,
     stream::{self},
     Stream, StreamExt, TryStreamExt,
 };
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::{backoff::Backoff, futures::Capacity, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -225,11 +224,12 @@ struct MergeInsertParams {
     insert_not_matched: bool,
     // Controls whether data that is not matched by the source is deleted or not
     delete_not_matched_by_source: WhenNotMatchedBySource,
-    conflict_retries: u8,
+    conflict_retries: u32,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
 /// part of a single transaction.
+#[derive(Clone)]
 pub struct MergeInsertJob {
     // The column to merge the new data into
     dataset: Arc<Dataset>,
@@ -337,7 +337,7 @@ impl MergeInsertBuilder {
     /// the data, set this to 0.
     ///
     /// Default is 10.
-    pub fn conflict_retries(&mut self, retries: u8) -> &mut Self {
+    pub fn conflict_retries(&mut self, retries: u32) -> &mut Self {
         self.params.conflict_retries = retries;
         self
     }
@@ -1010,33 +1010,22 @@ impl MergeInsertJob {
         self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let num_attempts = 0;
-        let mut source_iter: Box<dyn Iterator<Item = SendableRecordBatchStream>> =
-            if self.params.conflict_retries == 0 {
-                Box::new(std::iter::once(source))
-            } else {
-                // Collect the source data into memory
-                let schema = source.schema();
-                let batches: Vec<RecordBatch> = source.try_collect().await?;
-                Box::new(std::iter::repeat_with(move || {
-                    Box::pin(RecordBatchStreamAdapter::new(
-                        schema.clone(),
-                        futures::stream::iter(batches.clone().into_iter().map(Ok)),
-                    )) as SendableRecordBatchStream
-                }))
-            };
+        let mut source_iter =
+            super::new_source_iter(source, self.params.conflict_retries > 0).await?;
 
         let dataset_ref = self.dataset.clone();
         let max_retries = self.params.conflict_retries;
-        while num_attempts <= max_retries {
+        let mut backoff = Backoff::default();
+        while backoff.attempt() <= max_retries {
             let ds = dataset_ref.clone();
             let (transaction, stats) = self
+                .clone()
                 .execute_uncommitted_impl(source_iter.next().unwrap())
                 .await?;
             let dataset = match CommitBuilder::new(ds).execute(transaction).await {
                 Ok(ds) => ds,
                 Err(Error::RetryableCommitConflict { .. }) => {
-                    // Retry
+                    tokio::time::sleep(backoff.next_backoff()).await;
                     continue;
                 }
                 Err(e) => return Err(e),
