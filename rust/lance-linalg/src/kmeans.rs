@@ -23,6 +23,7 @@ use arrow_array::{ArrowNumericType, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{ArrowError, DataType};
 use bitvec::prelude::*;
+use lance_arrow::FixedSizeListArrayExt;
 use log::{info, warn};
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
@@ -720,6 +721,15 @@ pub fn compute_partitions_arrow_array(
             centroids.value_length(),
             distance_type,
         )),
+        (DataType::Float32, DataType::Int8) => Ok(compute_partitions::<
+            Float32Type,
+            KMeansAlgoFloat<Float32Type>,
+        >(
+            centroids.values().as_primitive(),
+            vectors.convert_to_floating_point()?.values().as_primitive(),
+            centroids.value_length(),
+            distance_type,
+        )),
         (DataType::Float64, DataType::Float64) => Ok(compute_partitions::<
             Float64Type,
             KMeansAlgoFloat<Float64Type>,
@@ -736,7 +746,7 @@ pub fn compute_partitions_arrow_array(
             distance_type,
         )),
         _ => Err(ArrowError::InvalidArgumentError(
-            "Centroids and vectors have different types".to_string(),
+            "Centroids and vectors have incompatible types".to_string(),
         )),
     }
 }
