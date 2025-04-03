@@ -4831,7 +4831,7 @@ mod test {
             plan,
             "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
   ProjectionExec: expr=[_rowid@1 as _rowid]
-    FilterExec: s@0 =
+    FilterExec: s@0 = 
       LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true",
         )
         .await
