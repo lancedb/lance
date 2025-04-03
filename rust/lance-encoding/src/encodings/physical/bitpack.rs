@@ -530,9 +530,9 @@ enum StartOffset {
 /// * `buffer_len` - length buf buffer (in bytes)
 /// * `bits_per_value` - number of bits used to represent a single bitpacked value
 /// * `buffer_start_bit_offset` - offset of the start of the first value within the
-///     buffer's  first byte
+///   buffer's  first byte
 /// * `buffer_end_bit_offset` - end bit of the last value within the buffer. Can be
-///     `None` if the end of the last value is byte aligned with end of buffer.
+///   `None` if the end of the last value is byte aligned with end of buffer.
 fn compute_start_offset(
     rows_to_skip: u64,
     buffer_len: usize,
