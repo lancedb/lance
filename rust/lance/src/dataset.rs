@@ -2900,6 +2900,124 @@ mod tests {
         assert_eq!(batch.num_rows(), 0);
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn test_create_int8_index(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        use lance_testing::datagen::generate_random_int8_array;
+
+        let test_dir = tempdir().unwrap();
+
+        let dimension = 16;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "embeddings",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Int8, true)),
+                dimension,
+            ),
+            false,
+        )]));
+
+        let int8_arr = generate_random_int8_array(512 * dimension as usize);
+        let vectors = Arc::new(
+            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                int8_arr, dimension,
+            )
+            .unwrap(),
+        );
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.validate().await.unwrap();
+
+        // Make sure valid arguments should create index successfully
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
+        dataset
+            .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+
+        // The version should match the table version it was created from.
+        let indices = dataset.load_indices().await.unwrap();
+        let actual = indices.first().unwrap().dataset_version;
+        let expected = dataset.manifest.version - 1;
+        assert_eq!(actual, expected);
+        let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+        assert_eq!(fragment_bitmap.len(), 1);
+        assert!(fragment_bitmap.contains(0));
+
+        // Append should inherit index
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        };
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let actual = indices.first().unwrap().dataset_version;
+        let expected = dataset.manifest.version - 2;
+        assert_eq!(actual, expected);
+        dataset.validate().await.unwrap();
+        // Fragment bitmap should show the original fragments, and not include
+        // the newly appended fragment.
+        let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+        assert_eq!(fragment_bitmap.len(), 1);
+        assert!(fragment_bitmap.contains(0));
+
+        let actual_statistics: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("embeddings_idx").await.unwrap())
+                .unwrap();
+        let actual_statistics = actual_statistics.as_object().unwrap();
+        assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF_PQ");
+
+        let deltas = actual_statistics["indices"].as_array().unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["metric_type"].as_str().unwrap(), "l2");
+        assert_eq!(deltas[0]["num_partitions"].as_i64().unwrap(), 10);
+
+        assert!(dataset.index_statistics("non-existent_idx").await.is_err());
+        assert!(dataset.index_statistics("").await.is_err());
+
+        // Overwrite should invalidate index
+        let write_params = WriteParams {
+            mode: WriteMode::Overwrite,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        };
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert!(dataset.manifest.index_section.is_none());
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+        dataset.validate().await.unwrap();
+
+        let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+        assert_eq!(fragment_bitmap.len(), 1);
+        assert!(fragment_bitmap.contains(0));
+    }
+
     #[tokio::test]
     async fn test_create_fts_index_with_empty_strings() {
         let test_dir = tempdir().unwrap();
