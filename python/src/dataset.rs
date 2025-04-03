@@ -40,7 +40,7 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::scalar::inverted::query::MultiMatchQuery;
+use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::{
     optimize::OptimizeOptions,
@@ -542,7 +542,7 @@ impl Dataset {
                 .ok_or_else(|| PyKeyError::new_err("query must be specified"))?;
 
             let fts_query = if let Ok(query) = query.downcast::<PyString>() {
-                let query = query.to_string();
+                let mut query = query.to_string();
                 let columns = if let Some(columns) = full_text_query.get_item("columns")? {
                     if columns.is_none() {
                         None
@@ -559,25 +559,33 @@ impl Dataset {
                     None
                 };
 
-                let mut fts_query = FullTextSearchQuery::new(query.clone());
-                if let Some(columns) = columns {
-                    match columns.len() {
-                        0 => {}
-                        1 => {
-                            fts_query = fts_query.with_column(columns[0].clone()).map_err(|e| {
-                                PyValueError::new_err(format!(
-                                    "Failed to set field for full text search: {}",
-                                    e
-                                ))
-                            })?;
-                        }
-                        _ => {
-                            let query = MultiMatchQuery::new(query, columns);
-                            fts_query = FullTextSearchQuery::new_query(query.into());
-                        }
-                    }
+                let is_phrase = query.len() >= 2 && query.starts_with('"') && query.ends_with('"');
+                let is_multi_match = columns.as_ref().map(|cols| cols.len() > 1).unwrap_or(false);
+
+                if is_phrase {
+                    // Remove the surrounding quotes for phrase queries
+                    query = query[1..query.len() - 1].to_string();
                 }
-                fts_query
+
+                let query: FtsQuery = match (is_phrase, is_multi_match) {
+                    (false, _) => MatchQuery::new(query).into(),
+                    (true, false) => PhraseQuery::new(query).into(),
+                    (true, true) => {
+                        return Err(PyValueError::new_err(
+                            "Phrase queries cannot be used with multiple columns.",
+                        ));
+                    }
+                };
+                let mut query = FullTextSearchQuery::new_query(query);
+                if let Some(cols) = columns {
+                    query = query.with_columns(&cols).map_err(|e| {
+                        PyValueError::new_err(format!(
+                            "Failed to set full text search columns: {}",
+                            e
+                        ))
+                    })?;
+                }
+                query
             } else if let Ok(query) = query.downcast::<PyDict>() {
                 let query = parse_fts_query(query)?;
                 FullTextSearchQuery::new_query(query)

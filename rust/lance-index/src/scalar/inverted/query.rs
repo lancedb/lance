@@ -4,6 +4,8 @@
 use std::collections::HashSet;
 
 use lance_core::{Error, Result};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize};
 use snafu::location;
 
 #[derive(Debug, Clone)]
@@ -61,7 +63,8 @@ pub trait FtsQueryNode {
     fn columns(&self) -> HashSet<String>;
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FtsQuery {
     // leaf queries
     Match(MatchQuery),
@@ -109,12 +112,12 @@ impl FtsQueryNode for FtsQuery {
 }
 
 impl FtsQuery {
-    pub fn query(&self) -> &str {
+    pub fn query(&self) -> String {
         match self {
-            Self::Match(query) => &query.terms,
-            Self::Phrase(query) => &query.terms,
+            Self::Match(query) => query.terms.clone(),
+            Self::Phrase(query) => format!("\"{}\"", query.terms), // Phrase queries are quoted
             Self::Boost(query) => query.positive.query(),
-            Self::MultiMatch(query) => &query.match_queries[0].terms,
+            Self::MultiMatch(query) => query.match_queries[0].terms.clone(),
         }
     }
 
@@ -178,7 +181,7 @@ impl From<MultiMatchQuery> for FtsQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchQuery {
     // The column to search in.
     // If None, it will be determined at query time.
@@ -261,7 +264,7 @@ impl FtsQueryNode for MatchQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PhraseQuery {
     // The column to search in.
     // If None, it will be determined at query time.
@@ -293,7 +296,7 @@ impl FtsQueryNode for PhraseQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoostQuery {
     pub positive: Box<FtsQuery>,
     pub negative: Box<FtsQuery>,
@@ -324,16 +327,81 @@ pub struct MultiMatchQuery {
     pub match_queries: Vec<MatchQuery>,
 }
 
+impl Serialize for MultiMatchQuery {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(3))?;
+
+        let query = self.match_queries.first().ok_or(serde::ser::Error::custom(
+            "MultiMatchQuery must have at least one MatchQuery".to_string(),
+        ))?;
+        map.serialize_entry("query", &query.terms)?;
+        let columns = self
+            .match_queries
+            .iter()
+            .map(|q| q.column.as_ref().unwrap().clone())
+            .collect::<Vec<String>>();
+        map.serialize_entry("columns", &columns)?;
+        let boosts = self
+            .match_queries
+            .iter()
+            .map(|q| q.boost)
+            .collect::<Vec<f32>>();
+        map.serialize_entry("boost", &boosts)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for MultiMatchQuery {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct MultiMatchQueryData {
+            query: String,
+            columns: Vec<String>,
+            boost: Option<Vec<f32>>,
+        }
+
+        let data = MultiMatchQueryData::deserialize(deserializer)?;
+        let boosts = data.boost.unwrap_or(vec![1.0; data.columns.len()]);
+
+        Self::try_new_with_boosts(data.query, data.columns, boosts)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 impl MultiMatchQuery {
-    pub fn new(query: String, columns: Vec<String>) -> Self {
+    pub fn try_new(query: String, columns: Vec<String>) -> Result<Self> {
+        if columns.is_empty() {
+            return Err(Error::invalid_input(
+                "Cannot create MultiMatchQuery with no columns".to_string(),
+                location!(),
+            ));
+        }
+
         let match_queries = columns
             .into_iter()
             .map(|column| MatchQuery::new(query.clone()).with_column(Some(column)))
             .collect();
-        Self { match_queries }
+        Ok(Self { match_queries })
     }
 
-    pub fn with_boosts(query: String, columns: Vec<String>, boosts: Vec<f32>) -> Self {
+    pub fn try_new_with_boosts(
+        query: String,
+        columns: Vec<String>,
+        boosts: Vec<f32>,
+    ) -> Result<Self> {
+        if boosts.len() != columns.len() {
+            return Err(Error::invalid_input(
+                "The number of boosts must match the number of columns".to_string(),
+                location!(),
+            ));
+        }
+
         let match_queries = columns
             .into_iter()
             .zip(boosts)
@@ -343,7 +411,7 @@ impl MultiMatchQuery {
                     .with_boost(boost)
             })
             .collect();
-        Self { match_queries }
+        Ok(Self { match_queries })
     }
 }
 
@@ -400,7 +468,7 @@ pub fn fill_fts_query_column(
                 _ => {
                     // if there are multiple columns, we need to create a MultiMatch query
                     let multi_match_query =
-                        MultiMatchQuery::new(match_query.terms.clone(), columns.to_vec());
+                        MultiMatchQuery::try_new(match_query.terms.clone(), columns.to_vec())?;
                     Ok(FtsQuery::MultiMatch(multi_match_query))
                 }
             }

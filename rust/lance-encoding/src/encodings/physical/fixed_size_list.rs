@@ -123,7 +123,8 @@ impl ArrayEncoder for FslEncoder {
             dimension: self.dimension as u64,
         });
 
-        let encoding = ProtobufUtils::fixed_size_list(encoded_data.encoding, self.dimension as u64);
+        let encoding =
+            ProtobufUtils::fsl_encoding(self.dimension as u64, encoded_data.encoding, false);
         Ok(EncodedArray { data, encoding })
     }
 }
@@ -161,6 +162,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_simple_fsl() {
+        // [0, NULL], NULL, [4, 5]
         let items = Arc::new(Int32Array::from(vec![
             Some(0),
             None,
