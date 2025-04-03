@@ -75,4 +75,3 @@ def test_resource_cleanup(temp_lance_dataset):
     assert os.path.exists(temp_lance_dataset), "Test dataset missing"
 
     # The actual cleanup is handled by the fixture after yielding
-
