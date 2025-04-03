@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Exec plan planner
 
@@ -790,7 +788,7 @@ impl Planner {
     /// TODO: use SqlToRel from Datafusion directly?
     fn try_decode_hex_literal(s: &str) -> Option<Vec<u8>> {
         let hex_bytes = s.as_bytes();
-        let mut decoded_bytes = Vec::with_capacity((hex_bytes.len() + 1) / 2);
+        let mut decoded_bytes = Vec::with_capacity(hex_bytes.len().div_ceil(2));
 
         let start_idx = hex_bytes.len() % 2;
         if start_idx > 0 {

@@ -159,13 +159,13 @@ pub struct ReaderProjection {
     ///
     /// - Primitive: the index of the column in the schema
     /// - List: the index of the list column in the schema
-    ///         followed by the column indices of the children
+    ///   followed by the column indices of the children
     /// - FixedSizeList (of primitive): the index of the column in the schema
-    ///         (this case is not nested)
+    ///   (this case is not nested)
     /// - FixedSizeList (of non-primitive): not yet implemented
     /// - Dictionary: same as primitive
     /// - Struct: the index of the struct column in the schema
-    ///          followed by the column indices of the children
+    ///   followed by the column indices of the children
     ///
     /// In other words, this should be a DFS listing of the desired schema.
     ///

@@ -207,7 +207,7 @@ impl ArrayGenerator for NullGenerator {
             }
         } else {
             let array_len = array.len();
-            let num_validity_bytes = (array_len + 7) / 8;
+            let num_validity_bytes = array_len.div_ceil(8);
             let mut null_count = 0;
             // Sampling the RNG once per bit is kind of slow so we do this to sample once
             // per byte.  We only get 8 bits of RNG resolution but that should be good enough.
@@ -618,7 +618,7 @@ impl ArrayGenerator for RandomBooleanGenerator {
         length: RowCount,
         rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
     ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
-        let num_bytes = (length.0 + 7) / 8;
+        let num_bytes = length.0.div_ceil(8);
         let mut bytes = vec![0; num_bytes as usize];
         rng.fill_bytes(&mut bytes);
         let bytes = BooleanBuffer::new(Buffer::from(bytes), 0, length.0 as usize);
@@ -822,9 +822,10 @@ impl ArrayGenerator for RandomBinaryGenerator {
         }
         let bytes = Buffer::from(bytes);
         if self.is_large {
-            let offsets = OffsetBuffer::from_lengths(
-                iter::repeat(self.bytes_per_element.0 as usize).take(length.0 as usize),
-            );
+            let offsets = OffsetBuffer::from_lengths(iter::repeat_n(
+                self.bytes_per_element.0 as usize,
+                length.0 as usize,
+            ));
             if self.scale_to_utf8 {
                 // This is safe because we are only using printable characters
                 unsafe {
@@ -840,9 +841,10 @@ impl ArrayGenerator for RandomBinaryGenerator {
                 }
             }
         } else {
-            let offsets = OffsetBuffer::from_lengths(
-                iter::repeat(self.bytes_per_element.0 as usize).take(length.0 as usize),
-            );
+            let offsets = OffsetBuffer::from_lengths(iter::repeat_n(
+                self.bytes_per_element.0 as usize,
+                length.0 as usize,
+            ));
             if self.scale_to_utf8 {
                 // This is safe because we are only using printable characters
                 unsafe {
@@ -1047,7 +1049,7 @@ impl<T: ByteArrayType> ArrayGenerator for FixedBinaryGenerator<T> {
                 .copied(),
         ));
         let offsets =
-            OffsetBuffer::from_lengths(iter::repeat(self.value.len()).take(length.0 as usize));
+            OffsetBuffer::from_lengths(iter::repeat_n(self.value.len(), length.0 as usize));
         Ok(Arc::new(arrow_array::GenericByteArray::<T>::new(
             offsets, bytes, None,
         )))

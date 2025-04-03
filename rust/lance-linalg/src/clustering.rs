@@ -33,7 +33,7 @@ pub trait Clustering<T: Num> {
     /// ## Parameters:
     /// * `data`: an `N * D` of D-dimensional vectors.
     /// * `nprobes`: If provided, the number of partitions per vector to return.
-    ///    If not provided, return 1 partition per vector.
+    ///   If not provided, return 1 partition per vector.
     ///
     /// ## Returns:
     /// * An `N * nprobes` matrix of partition IDs.
