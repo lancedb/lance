@@ -9,7 +9,8 @@ use std::{iter::repeat_with, ops::Range};
 
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{
-    Float32Array, Int32Array, Int8Array, PrimitiveArray, RecordBatch, RecordBatchIterator, RecordBatchReader
+    Float32Array, Int32Array, Int8Array, PrimitiveArray, RecordBatch, RecordBatchIterator,
+    RecordBatchReader,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::{fixed_size_list_type, ArrowFloatType, FixedSizeListArrayExt};

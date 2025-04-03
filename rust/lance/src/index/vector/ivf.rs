@@ -1795,13 +1795,13 @@ async fn train_ivf_model(
             )
             .await
         }
-        (DataType::Int8, DistanceType::L2) 
-        | (DataType::Int8, DistanceType::Dot) 
+        (DataType::Int8, DistanceType::L2)
+        | (DataType::Int8, DistanceType::Dot)
         | (DataType::Int8, DistanceType::Cosine) => {
             do_train_ivf_model::<Float32Type>(
                 centroids,
-                data.convert_to_floating_point()
-                    ?.values()
+                data.convert_to_floating_point()?
+                    .values()
                     .as_primitive::<Float32Type>()
                     .values(),
                 dim,

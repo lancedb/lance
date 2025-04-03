@@ -237,7 +237,7 @@ pub trait FixedSizeListArrayExt {
     /// ```
     fn sample(&self, n: usize) -> Result<FixedSizeListArray>;
 
-    /// Ensure the [FixedSizeListArray] of Float16, Float32, Float64, 
+    /// Ensure the [FixedSizeListArray] of Float16, Float32, Float64,
     /// Int8, Int16, Int32, Int64, UInt8, UInt32 type to its closest floating point type.
     fn convert_to_floating_point(&self) -> Result<FixedSizeListArray>;
 }
@@ -548,7 +548,12 @@ pub trait RecordBatchExt {
     fn replace_column_by_name(&self, name: &str, column: Arc<dyn Array>) -> Result<RecordBatch>;
 
     /// Replace a column schema (specified by name) and return the new [`RecordBatch`].
-    fn replace_column_schema_by_name(&self, name: &str, new_data_type: DataType, column: Arc<dyn Array>) -> Result<RecordBatch>;
+    fn replace_column_schema_by_name(
+        &self,
+        name: &str,
+        new_data_type: DataType,
+        column: Arc<dyn Array>,
+    ) -> Result<RecordBatch>;
 
     /// Get (potentially nested) column by qualified name.
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef>;
@@ -657,22 +662,25 @@ impl RecordBatchExt for RecordBatch {
         Self::try_new(self.schema(), columns)
     }
 
-    fn replace_column_schema_by_name(&self, name: &str, new_data_type: DataType, column: Arc<dyn Array>) -> Result<RecordBatch>{
-        let fields =  self.schema()
+    fn replace_column_schema_by_name(
+        &self,
+        name: &str,
+        new_data_type: DataType,
+        column: Arc<dyn Array>,
+    ) -> Result<RecordBatch> {
+        let fields = self
+            .schema()
             .fields()
             .iter()
             .map(|x| {
                 if x.name() != name {
                     x.clone()
-                }else{
-                    let new_field = Field::new(
-                        name,
-                        new_data_type.clone(),
-                        x.is_nullable(),
-                    );
+                } else {
+                    let new_field = Field::new(name, new_data_type.clone(), x.is_nullable());
                     Arc::new(new_field)
                 }
-            }).collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
         let schema = Schema::new_with_metadata(fields, self.schema().metadata.clone());
         let mut columns = self.columns().to_vec();
         let field_i = self
