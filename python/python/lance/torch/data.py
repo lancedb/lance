@@ -375,3 +375,54 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 logging.debug("Column %s is a Large Blob column", col)
                 blob_cols.append(col)
         return blob_cols
+
+
+class SafeLanceDataset(torch.utils.data.Dataset):
+    def __init__(self, uri):
+        self.uri = uri
+        self._len = self._safe_preload()
+        self._ds = None  # Deferred initialization
+
+    def _safe_preload(self):
+        """Main-process safe metadata loading"""
+        ds = lance.dataset(self.uri)
+        length = ds.count_rows()
+        del ds  # Critical: release before spawning
+        return length
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx):
+        if self._ds is None:
+            # Worker-process initialization
+            import os
+
+            self._ds = lance.dataset(self.uri)
+            print(f"Worker {os.getpid()} initialized dataset")
+
+        return self._ds.take([idx]).to_pylist()[0]
+
+
+def get_safe_loader(dataset, batch_size=32, num_workers=4, **kwargs):
+    """Proper DataLoader configuration with spawn context"""
+
+    # For Windows or environments requiring explicit context
+    # Use one of these approaches:
+
+    # Approach 1: Set start method in main block
+    # (Must be in __main__ guard)
+    # torch.multiprocessing.set_start_method('spawn')
+
+    # Approach 2: Explicit context creation
+    ctx = torch.multiprocessing.get_context("spawn")
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        persistent_workers=True,
+        multiprocessing_context=ctx,  # Proper context object
+        # Critical for spawn compatibility:
+        pin_memory_device="cuda" if torch.cuda.is_available() else "",
+        **kwargs,
+    )
