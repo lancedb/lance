@@ -1572,9 +1572,9 @@ impl Scanner {
         filter_plan: &FilterPlan,
         query: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let fields = query.columns();
+        let columns = query.columns();
         let params = query.params().with_limit(self.limit.map(|l| l as usize));
-        let query = if fields.is_empty() {
+        let query = if columns.is_empty() {
             // the field is not specified,
             // try to search over all indexed fields
             let string_columns =

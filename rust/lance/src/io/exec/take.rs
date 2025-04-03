@@ -233,6 +233,10 @@ impl TakeStream {
 
         let batches = futures.try_collect::<Vec<_>>().await?;
 
+        if batches.is_empty() {
+            return Ok(RecordBatch::new_empty(self.output_schema.clone()));
+        }
+
         let _compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
         let schema = batches.first().expect_ok()?.schema();
         let mut new_data = concat_batches(&schema, batches.iter())?;

@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "fsst"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "rand",
 ]
@@ -2494,9 +2494,9 @@ dependencies = [
 
 [[package]]
 name = "half"
-version = "2.4.1"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6dd08c532ae367adf81c312a4580bc67f1d0fe8bc9c460520283f4c0ff277888"
+checksum = "7db2ff139bba50379da6aa0766b52fdcb62cb5b263009b09ed58ba604e14bbd1"
 dependencies = [
  "cfg-if",
  "crunchy",
@@ -3166,7 +3166,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3227,7 +3227,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3244,7 +3244,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3308,7 +3308,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3323,7 +3323,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "arrayref",
  "arrow",
@@ -3346,6 +3346,7 @@ dependencies = [
  "lance-core",
  "lazy_static",
  "log",
+ "lz4",
  "num-traits",
  "paste",
  "prost 0.13.5",
@@ -3361,7 +3362,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3395,7 +3396,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3451,7 +3452,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3489,7 +3490,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "arrow-array",
  "arrow-ord",
@@ -3512,7 +3513,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3784,6 +3785,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
 dependencies = [
  "hashbrown 0.15.2",
+]
+
+[[package]]
+name = "lz4"
+version = "1.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a20b523e860d03443e98350ceaac5e71c6ba89aea7d960769ec3ce37f4de5af4"
+dependencies = [
+ "lz4-sys",
+]
+
+[[package]]
+name = "lz4-sys"
+version = "1.11.1+lz4-1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bd8c0d6c6ed0cd30b3652886bb8711dc4bb01d637a68105a3d5158039b418e6"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]
@@ -4691,7 +4711,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "0.25.2"
+version = "0.25.3"
 dependencies = [
  "arrow",
  "arrow-array",

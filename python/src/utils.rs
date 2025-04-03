@@ -387,7 +387,10 @@ pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<FtsQuery> {
                 .ok_or(PyValueError::new_err("boost not found"))?
                 .extract::<Vec<f32>>()?;
 
-            let query = MultiMatchQuery::with_boosts(query, columns, boost);
+            let query =
+                MultiMatchQuery::try_new_with_boosts(query, columns, boost).map_err(|e| {
+                    PyValueError::new_err(format!("Error creating MultiMatchQuery: {}", e))
+                })?;
             Ok(query.into())
         }
 
