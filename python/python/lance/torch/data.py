@@ -30,6 +30,7 @@ from ..sampler import (
 from .dist import get_global_rank, get_global_world_size
 
 __all__ = ["LanceDataset"]
+logger = logging.getLogger(__name__)
 
 
 # Convert an Arrow FSL array into a 2D torch tensor
@@ -111,7 +112,33 @@ def _to_tensor(
     return ret
 
 
-class TensorDataset(torch.utils.data.Dataset):
+try:
+    # When available, subclass from the newer torchdata DataPipes
+    # instead of torch Datasets.
+    import torchdata
+
+    MAP_DATASET_CLASS = torchdata.datapipes.map.MapDataPipe
+    ITER_DATASET_CLASS = torchdata.datapipes.iter.IterDataPipe
+
+    logger.warning(
+        "TorchData integration is still in BETA phase. "
+        "APIs may change without backward compatibility."
+    )
+
+except ImportError:
+    try:
+        import torch
+
+        MAP_DATASET_CLASS = torch.utils.data.Dataset
+        ITER_DATASET_CLASS = torch.utils.data.IterableDataset
+    except ImportError:
+        logger.error(
+            "Error when importing Torch. To use PyTorch features, please install torch."
+        )
+        raise
+
+
+class TensorDataset(MAP_DATASET_CLASS):
     """A PyTorch Dataset that wraps over a tensor, returns in batches.
 
     Unlike `torch.utils.data.TensorDataset`, this has the same behavior as LanceDataset
@@ -174,7 +201,7 @@ def _buffer_arrow_batches(
         yield concat_batches(buffer)
 
 
-class LanceDataset(torch.utils.data.IterableDataset):
+class LanceDataset(ITER_DATASET_CLASS):
     """PyTorch :class:`torch.utils.data.IterableDataset` over lance dataset."""
 
     def __init__(
