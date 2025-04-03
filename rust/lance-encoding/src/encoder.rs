@@ -425,9 +425,9 @@ pub trait ArrayEncodingStrategy: Send + Sync + std::fmt::Debug {
 ///   width data block.  In other words, there is some number of bits per value.
 ///   In addition, each value should be independently decompressible.
 /// - Mini-block compression results in a small block of opaque data for chunks
-///     of rows.  Each block is somewhere between 0 and 16KiB in size.  This is
-///     used for narrow data types (both fixed and variable length) where we can
-///     fit many values into an 16KiB block.
+///   of rows.  Each block is somewhere between 0 and 16KiB in size.  This is used for
+///   narrow data types (both fixed and variable length) where we can fit many values
+///   into an 16KiB block.
 pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
     /// Create a block compressor for the given data
     fn create_block_compressor(

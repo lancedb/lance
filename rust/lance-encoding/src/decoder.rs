@@ -2184,7 +2184,7 @@ pub trait PageScheduler: Send + Sync + std::fmt::Debug {
     /// # Arguments
     ///
     /// * `range` - the range of row offsets (relative to start of page) requested
-    ///             these must be ordered and must not overlap
+    ///   these must be ordered and must not overlap
     /// * `scheduler` - a scheduler to submit the I/O request to
     /// * `top_level_row` - the row offset of the top level field currently being
     ///   scheduled.  This can be used to assign priority to I/O requests

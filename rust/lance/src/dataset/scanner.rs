@@ -829,9 +829,9 @@ impl Scanner {
     /// and using the original vector values to re-rank the distances.
     ///
     /// * `factor` - the factor of extra elements to read.  For example, if factor is 2, then
-    ///              the search will read 2x more elements than the requested k before performing
-    ///              the re-ranking. Note: even if the factor is 1, the  results will still be
-    ///              re-ranked without fetching additional elements.
+    ///   the search will read 2x more elements than the requested k before performing
+    ///   the re-ranking. Note: even if the factor is 1, the  results will still be
+    ///   re-ranked without fetching additional elements.
     pub fn refine(&mut self, factor: u32) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.refine_factor = Some(factor)

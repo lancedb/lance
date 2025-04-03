@@ -735,7 +735,7 @@ impl SerializerContext {
                 .zip(
                     validity
                         .iter()
-                        .flat_map(|v| std::iter::repeat(v).take(self.current_multiplier)),
+                        .flat_map(|v| std::iter::repeat_n(v, self.current_multiplier)),
                 )
                 .for_each(|(def, valid)| {
                     if !valid {

@@ -1280,7 +1280,7 @@ fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
     let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
     match arrow_select::concat::concat(&array_refs) {
         Ok(array) => array,
-        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError { .. }) => {
+        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
             // Slow, but hopefully a corner case.  Optimize later
             let upscaled = array_refs
                 .iter()
@@ -1293,7 +1293,7 @@ fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
                         ),
                     ) {
                         Ok(arr) => arr,
-                        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError { .. }) => {
+                        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
                             // Technically I think this means the input type was u64 already
                             unimplemented!("Dictionary arrays with more than 2^32 unique values")
                         }
@@ -1305,7 +1305,7 @@ fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
             // Can still fail if concat pushes over u32 boundary
             match arrow_select::concat::concat(&array_refs) {
                 Ok(array) => array,
-                Err(arrow_schema::ArrowError::DictionaryKeyOverflowError { .. }) => {
+                Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
                     unimplemented!("Dictionary arrays with more than 2^32 unique values")
                 }
                 err => err.unwrap(),
@@ -1968,7 +1968,7 @@ mod tests {
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
         // the NullBuffer.len() returns the length in bits so we divide_round_up by 8
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
@@ -1976,7 +1976,7 @@ mod tests {
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let mut gen = array::rand::<Int32Type>().with_nulls(&[true, true, false]);
@@ -1985,7 +1985,7 @@ mod tests {
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
@@ -1993,7 +1993,7 @@ mod tests {
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
@@ -2015,7 +2015,7 @@ mod tests {
             .map(|buffer| buffer.len())
             .sum();
 
-        let total_nulls_size_in_bytes = (concatenated_array.nulls().unwrap().len() + 7) / 8;
+        let total_nulls_size_in_bytes = concatenated_array.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + total_nulls_size_in_bytes) as u64);
     }
 }
