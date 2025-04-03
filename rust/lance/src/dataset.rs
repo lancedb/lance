@@ -275,7 +275,7 @@ impl ProjectionRequest {
     ///
     /// # Parameters
     /// - `columns`: A list of tuples where the first element is resulted column name and the second
-    ///              element is the SQL expression.
+    ///   element is the SQL expression.
     pub fn from_sql(
         columns: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Self {
@@ -1432,7 +1432,7 @@ impl Dataset {
 /// - [Self::add_columns()]: Add new columns to the dataset, similar to `ALTER TABLE ADD COLUMN`.
 /// - [Self::drop_columns()]: Drop columns from the dataset, similar to `ALTER TABLE DROP COLUMN`.
 /// - [Self::alter_columns()]: Modify columns in the dataset, changing their name, type, or nullability.
-///                    Similar to `ALTER TABLE ALTER COLUMN`.
+///   Similar to `ALTER TABLE ALTER COLUMN`.
 ///
 /// In addition, one operation is unique to Lance: [`merge`](Self::merge). This
 /// operation allows inserting precomputed data into the dataset.
