@@ -236,7 +236,7 @@ async fn current_manifest_path(
         }
     }
 
-    let manifest_files = object_store.inner.list(Some(&base.child(VERSIONS_DIR)));
+    let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));
 
     let mut valid_manifests = manifest_files.try_filter_map(|res| {
         if let Some(scheme) = ManifestNamingScheme::detect_scheme(res.location.filename().unwrap())
