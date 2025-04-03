@@ -3825,6 +3825,7 @@ dependencies = [
  "arrow-arith",
  "arrow-array",
  "arrow-buffer",
+ "arrow-ipc",
  "arrow-ord",
  "arrow-row",
  "arrow-schema",
@@ -3848,6 +3849,7 @@ dependencies = [
  "datafusion-physical-expr",
  "deepsize",
  "dirs",
+ "either",
  "env_logger",
  "futures",
  "half",
@@ -3977,6 +3979,7 @@ dependencies = [
  "prost 0.13.5",
  "snafu",
  "substrait-expr",
+ "tempfile",
  "tokio",
  "tracing",
 ]
