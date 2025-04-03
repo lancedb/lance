@@ -539,7 +539,6 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(full_text_query) = full_text_query {
-            println!("{:?}", full_text_query.get_type());
             let fts_query = if let Ok(full_text_query) = full_text_query.downcast::<PyDict>() {
                 let mut query = full_text_query
                     .get_item("query")?
