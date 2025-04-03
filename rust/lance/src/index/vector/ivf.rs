@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use arrow::datatypes::{Int8Type, UInt8Type};
+use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_struct_array, AsArray},
