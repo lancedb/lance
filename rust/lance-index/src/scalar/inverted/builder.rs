@@ -753,14 +753,11 @@ fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
         .values()
         .iter()
         .zip(docs.iter())
-        .flat_map(|(row_id, doc)| {
-            std::iter::repeat(*row_id).take(doc.map(|d| d.len()).unwrap_or(0))
-        });
+        .flat_map(|(row_id, doc)| std::iter::repeat_n(*row_id, doc.map(|d| d.len()).unwrap_or(0)));
 
     let row_ids = Arc::new(UInt64Array::from_iter_values(row_ids));
-    let docs: Arc<dyn Array> = match docs.value_type() {
-        datatypes::DataType::Utf8 => Arc::new(docs.values().as_string::<i32>().clone()),
-        datatypes::DataType::LargeUtf8 => Arc::new(docs.values().as_string::<i64>().clone()),
+    let docs = match docs.value_type() {
+        datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => docs.values().clone(),
         _ => {
             return Err(Error::Index {
                 message: format!(
