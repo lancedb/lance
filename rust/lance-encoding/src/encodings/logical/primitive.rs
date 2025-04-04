@@ -2657,7 +2657,6 @@ struct StructuralPrimitiveFieldSchedulingJob<'a> {
     ranges: Vec<Range<u64>>,
     page_idx: usize,
     range_idx: usize,
-    range_offset: u64,
     global_row_offset: u64,
 }
 
@@ -2668,7 +2667,6 @@ impl<'a> StructuralPrimitiveFieldSchedulingJob<'a> {
             ranges,
             page_idx: 0,
             range_idx: 0,
-            range_offset: 0,
             global_row_offset: 0,
         }
     }
@@ -2684,7 +2682,6 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
         }
         // Get our current range
         let mut range = self.ranges[self.range_idx].clone();
-        range.start += self.range_offset;
         let priority = range.start;
 
         let mut cur_page = &self.scheduler.page_schedulers[self.page_idx];
