@@ -42,6 +42,8 @@ def _fsl_to_tensor(arr: pa.FixedSizeListArray, dimension: int) -> torch.Tensor:
     values = values.slice(start, num_vals)
     # Convert to numpy
     nparr = values.to_numpy(zero_copy_only=True).reshape(-1, dimension)
+    if not nparr.flags.writeable:
+        nparr.setflags(write=True)
     return torch.from_numpy(nparr)
 
 
