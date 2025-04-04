@@ -684,8 +684,6 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
     }
     const PRECISION: u8 = 12;
 
-    let threshold = threshold.max(num_total_rows as u64 / 4);
-
     let mut hll: HyperLogLogPlus<String, RandomState> =
         HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
 
