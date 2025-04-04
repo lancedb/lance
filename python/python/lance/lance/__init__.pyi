@@ -453,5 +453,34 @@ class BFloat16:
 
 def bfloat16_array(values: List[str | None]) -> BFloat16Array: ...
 
+class PyFullTextQuery:
+    @staticmethod
+    def match_query(
+        column: str,
+        query: str,
+        boost: float = 1.0,
+        fuzziness: Optional[int] = 0,
+        max_expansions: int = 50,
+        operator: str = "OR",
+    ) -> PyFullTextQuery: ...
+    @staticmethod
+    def phrase_query(
+        query: str,
+        column: str,
+    ) -> PyFullTextQuery: ...
+    @staticmethod
+    def boost_query(
+        positive: PyFullTextQuery,
+        negative: PyFullTextQuery,
+        negative_boost: Optional[float],
+    ) -> PyFullTextQuery: ...
+    @staticmethod
+    def multi_match_query(
+        query: str,
+        columns: List[str],
+        boosts: Optional[List[float]] = None,
+        operator: str = "OR",
+    ) -> PyFullTextQuery: ...
+
 __version__: str
 language_model_home: Callable[[], str]

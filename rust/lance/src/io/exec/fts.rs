@@ -40,7 +40,6 @@ pub struct MatchQueryExec {
     query: MatchQuery,
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
-    is_flat_search: bool,
 
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -74,7 +73,6 @@ impl MatchQueryExec {
             query,
             params,
             prefilter_source,
-            is_flat_search: false,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -115,7 +113,6 @@ impl ExecutionPlan for MatchQueryExec {
                     query: self.query.clone(),
                     params: self.params.clone(),
                     prefilter_source: PreFilterSource::None,
-                    is_flat_search: self.is_flat_search,
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -141,7 +138,6 @@ impl ExecutionPlan for MatchQueryExec {
                     query: self.query.clone(),
                     params: self.params.clone(),
                     prefilter_source,
-                    is_flat_search: self.is_flat_search,
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -213,7 +209,14 @@ impl ExecutionPlan for MatchQueryExec {
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, mut scores) = inverted_idx
-                .bm25_search(&tokens, &params, false, pre_filter, metrics.as_ref())
+                .bm25_search(
+                    &tokens,
+                    &params,
+                    query.operator,
+                    false,
+                    pre_filter,
+                    metrics.as_ref(),
+                )
                 .await?;
             scores.iter_mut().for_each(|s| {
                 *s *= query.boost;
@@ -542,7 +545,14 @@ impl ExecutionPlan for PhraseQueryExec {
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, scores) = index
-                .bm25_search(&tokens, &params, true, pre_filter, metrics.as_ref())
+                .bm25_search(
+                    &tokens,
+                    &params,
+                    lance_index::scalar::inverted::query::Operator::And,
+                    true,
+                    pre_filter,
+                    metrics.as_ref(),
+                )
                 .await?;
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
