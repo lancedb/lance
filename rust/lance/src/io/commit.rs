@@ -37,10 +37,12 @@ use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::DatasetIndexExt;
+use log;
 use object_store::path::Path;
 use prost::Message;
 
 use super::ObjectStore;
+use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig, BLOB_DIR};
@@ -833,6 +835,11 @@ pub(crate) async fn commit_transaction(
                     .file_metadata_cache
                     .insert(cache_path, Arc::new(transaction.clone()));
 
+                match auto_cleanup_hook(&dataset, &manifest).await {
+                    Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
+                    Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
+                    _ => {}
+                };
                 return Ok((manifest, manifest_location.path, manifest_location.e_tag));
             }
             Err(CommitError::CommitConflict) => {
@@ -1256,6 +1263,7 @@ mod tests {
     #[tokio::test]
     async fn test_good_concurrent_config_writes() {
         let (_tmpdir, dataset) = get_empty_dataset().await;
+        let original_num_config_keys = dataset.manifest.config.len();
 
         // Test successful concurrent insert config operations
         let futures: Vec<_> = ["key1", "key2", "key3", "key4", "key5"]
@@ -1277,7 +1285,7 @@ mod tests {
         }
 
         let dataset = dataset.checkout_version(6).await.unwrap();
-        assert_eq!(dataset.manifest.config.len(), 5);
+        assert_eq!(dataset.manifest.config.len(), 5 + original_num_config_keys);
 
         dataset.validate().await.unwrap();
 
@@ -1300,7 +1308,7 @@ mod tests {
         let dataset = dataset.checkout_version(11).await.unwrap();
 
         // There are now two fewer keys
-        assert_eq!(dataset.manifest.config.len(), 3);
+        assert_eq!(dataset.manifest.config.len(), 3 + original_num_config_keys);
 
         dataset.validate().await.unwrap()
     }
