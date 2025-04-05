@@ -1752,11 +1752,15 @@ class LanceDataset(pa.dataset.Dataset):
             if not pa.types.is_string(field_type):
                 raise TypeError(f"NGRAM index column {column} must be a string")
         elif index_type in ["INVERTED", "FTS"]:
-            if not pa.types.is_string(field_type) and not pa.types.is_large_string(
-                field_type
+            value_type = field_type
+            if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
+                value_type = field_type.value_type
+            if not pa.types.is_string(value_type) and not pa.types.is_large_string(
+                value_type
             ):
                 raise TypeError(
-                    f"INVERTED index column {column} must be string or large string"
+                    f"INVERTED index column {column} must be string, large string"
+                    " or list of strings, but got {value_type}"
                 )
 
         if pa.types.is_duration(field_type):
