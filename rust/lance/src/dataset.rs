@@ -1769,6 +1769,7 @@ mod tests {
     use lance_index::scalar::inverted::TokenizerConfig;
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
+    use lance_io::local::to_local_path;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
@@ -5936,7 +5937,8 @@ mod tests {
     #[tokio::test]
     async fn test_replace_dataset() {
         let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_path = Path::from_filesystem_path(test_dir.path()).unwrap();
+        let test_uri = test_path.as_ref();
 
         let data = gen()
             .col("int", array::step::<Int32Type>())
