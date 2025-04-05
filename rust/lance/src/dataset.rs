@@ -5936,8 +5936,7 @@ mod tests {
     #[tokio::test]
     async fn test_replace_dataset() {
         let test_dir = tempdir().unwrap();
-        let test_path = Path::from_filesystem_path(test_dir.path()).unwrap();
-        let test_uri = test_path.as_ref();
+        let test_uri = test_dir.path().to_str().unwrap();
 
         let data = gen()
             .col("int", array::step::<Int32Type>())
