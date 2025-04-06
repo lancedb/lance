@@ -24,6 +24,7 @@ from .dataset import (
 )
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import bytes_read_counter, iops_counter
+from .lance import MyTableProvider, MyLanceTableProvider
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -58,6 +59,8 @@ __all__ = [
     "dataset",
     "batch_udf",
     "set_logger",
+    "MyTableProvider",
+    "MyLanceTableProvider",
 ]
 
 
