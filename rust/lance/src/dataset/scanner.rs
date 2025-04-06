@@ -1577,13 +1577,22 @@ impl Scanner {
         let query = if columns.is_empty() {
             // the field is not specified,
             // try to search over all indexed fields
-            let string_columns = self.dataset.schema().fields.iter().filter_map(|f| {
-                if f.data_type() == DataType::Utf8 || f.data_type() == DataType::LargeUtf8 {
-                    Some(&f.name)
-                } else {
-                    None
-                }
-            });
+            let string_columns =
+                self.dataset
+                    .schema()
+                    .fields
+                    .iter()
+                    .filter_map(|f| match f.data_type() {
+                        DataType::Utf8 | DataType::LargeUtf8 => Some(&f.name),
+                        DataType::List(field) | DataType::LargeList(field) => {
+                            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+                                Some(&f.name)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    });
 
             let mut indexed_columns = Vec::new();
             for column in string_columns {
