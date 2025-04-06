@@ -331,15 +331,40 @@ impl Dataset {
         match ref_ {
             refs::Ref::Version(version) => self.checkout_by_version_number(version).await,
             refs::Ref::Tag(tag) => self.checkout_by_tag(tag.as_str()).await,
+            refs::Ref::Location(location) => {
+                self.checkout_by_version_number(location.version).await
+            }
         }
     }
 
     /// Check out the latest version of the dataset
+    ///
+    /// To check whether there is a new version available without checking it out,
+    /// use [`new_version_available`].
     pub async fn checkout_latest(&mut self) -> Result<()> {
         let (manifest, path) = self.latest_manifest().await?;
         self.manifest = Arc::new(manifest);
         self.manifest_file = path;
         Ok(())
+    }
+
+    /// Check if a new manifest of the dataset is available.
+    ///
+    /// If a new version is available, it returns the location of the new manifest.
+    /// If no new version is available, it returns None.
+    ///
+    /// Unlike `checkout_latest`, this method doesn't require a mutable reference
+    /// to self. If there is a new version, you can pass the returned location
+    /// to `checkout_version` to check out the new version.
+    pub async fn new_version_available(&self) -> Result<Option<ManifestLocation>> {
+        let location = self
+            .commit_handler
+            .resolve_latest_location(&self.base, &self.object_store)
+            .await?;
+        if self.already_checked_out(&location) {
+            return Ok(None);
+        }
+        Ok(Some(location))
     }
 
     fn already_checked_out(&self, location: &ManifestLocation) -> bool {
@@ -353,30 +378,31 @@ impl Dataset {
             })
     }
 
-    async fn checkout_by_version_number(&self, version: u64) -> Result<Self> {
-        let base_path = self.base.clone();
-        let manifest_location = self
-            .commit_handler
-            .resolve_version_location(&base_path, version, &self.object_store.inner)
-            .await?;
-
-        if self.already_checked_out(&manifest_location) {
+    async fn checkout_by_location(&self, location: &ManifestLocation) -> Result<Self> {
+        if self.already_checked_out(location) {
             return Ok(self.clone());
         }
-
-        let manifest = Self::load_manifest(self.object_store.as_ref(), &manifest_location).await?;
+        let manifest = Self::load_manifest(self.object_store.as_ref(), location).await?;
         Self::checkout_manifest(
             self.object_store.clone(),
-            base_path,
+            self.base.clone(),
             self.uri.clone(),
             manifest,
-            manifest_location.path,
+            location.path.clone(),
             self.session.clone(),
             self.commit_handler.clone(),
-            manifest_location.naming_scheme,
-            manifest_location.e_tag,
+            location.naming_scheme,
+            location.e_tag.clone(),
         )
         .await
+    }
+
+    async fn checkout_by_version_number(&self, version: u64) -> Result<Self> {
+        let manifest_location = self
+            .commit_handler
+            .resolve_version_location(&self.base, version, &self.object_store.inner)
+            .await?;
+        self.checkout_by_location(&manifest_location).await
     }
 
     async fn checkout_by_tag(&self, tag: &str) -> Result<Self> {
@@ -3917,6 +3943,39 @@ mod tests {
         dataset.tags.update("tag1", 1).await.unwrap();
         dataset = dataset.checkout_version("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_new_version_available() {
+        // Create a table
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+        );
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let dataset2 = dataset.clone();
+
+        let new_location = dataset2.new_version_available().await.unwrap();
+        assert!(new_location.is_none());
+
+        dataset.delete("i > 50").await.unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+        assert_eq!(dataset2.manifest.version, 1);
+
+        let new_location = dataset2.new_version_available().await.unwrap();
+        assert!(new_location.is_some());
+        let new_location = new_location.unwrap();
+        assert_eq!(new_location.version, 2);
     }
 
     #[rstest]
