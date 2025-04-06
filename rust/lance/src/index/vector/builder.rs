@@ -368,7 +368,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let training_data = if self.distance_type == DistanceType::Cosine {
             lance_linalg::kernels::normalize_fsl(&training_data)?
         } else {
-            training_data.clone()
+            training_data
         };
 
         // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
