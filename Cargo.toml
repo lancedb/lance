@@ -111,6 +111,7 @@ datafusion-common = "46.0"
 datafusion-functions = { version = "46.0", features = ["regex_expressions"] }
 datafusion-sql = "46.0"
 datafusion-expr = "46.0"
+datafusion-ffi = "46.0"
 datafusion-execution = "46.0"
 datafusion-optimizer = "46.0"
 datafusion-physical-expr = { version = "46.0" }

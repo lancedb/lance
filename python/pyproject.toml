@@ -57,6 +57,7 @@ tests = [
     "pytest",
     "tensorflow",
     "tqdm",
+    "datafusion",
 ]
 dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]

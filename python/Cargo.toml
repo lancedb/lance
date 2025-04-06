@@ -18,6 +18,9 @@ arrow-data = "54.1"
 arrow-schema = "54.1"
 arrow-select = "54.1"
 object_store = "0.11.2"
+datafusion = "46.0"
+datafusion-ffi = "46.0"
+datafusion-common = "46.0"
 async-trait = "0.1"
 chrono = "0.4.31"
 env_logger = "0.11.7"
@@ -43,6 +46,7 @@ lance-index = { path = "../rust/lance-index", features = [
 lance-io = { path = "../rust/lance-io" }
 lance-linalg = { path = "../rust/lance-linalg" }
 lance-table = { path = "../rust/lance-table" }
+lance-datafusion = { path = "../rust/lance-datafusion" }
 lazy_static = "1"
 log = "0.4"
 prost = "0.13.2"
