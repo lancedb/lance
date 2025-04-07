@@ -1,25 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::fmt::{Display, Formatter};
-use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
-use bytes::Bytes;
-use futures::stream::BoxStream;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_datagen::{BatchCount, BatchGeneratorBuilder, RowCount};
 use lance_file::version::LanceFileVersion;
-use lance_io::object_store::{ObjectStoreRegistry, WrappingObjectStore};
+use lance_io::object_store::ObjectStoreRegistry;
 use lance_table::format::Fragment;
-use object_store::path::Path;
-use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
-};
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
 
