@@ -5,7 +5,7 @@ use arrow::{
     array::AsArray,
     datatypes::{Float16Type, Float32Type, Float64Type},
 };
-use arrow_array::{Array, FixedSizeListArray};
+use arrow_array::{Array, BooleanArray, FixedSizeListArray};
 use arrow_schema::{DataType, Field};
 use lance_core::{Error, Result};
 use lance_io::encodings::plain::bytes_to_array;
@@ -162,6 +162,36 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
             None,
         )?)
     }
+}
+
+/// Check if all vectors in the FixedSizeListArray are finite
+/// null values are considered as not finite
+/// returns a BooleanArray
+/// with the same length as the FixedSizeListArray
+/// with true for finite values and false for non-finite values
+pub fn is_finite(fsl: &FixedSizeListArray) -> BooleanArray {
+    let is_finite = fsl
+        .iter()
+        .map(|v| match v {
+            Some(v) => match v.data_type() {
+                DataType::Float16 => {
+                    let v = v.as_primitive::<Float16Type>();
+                    v.null_count() == 0 && v.values().iter().all(|v| v.is_finite())
+                }
+                DataType::Float32 => {
+                    let v = v.as_primitive::<Float32Type>();
+                    v.null_count() == 0 && v.values().iter().all(|v| v.is_finite())
+                }
+                DataType::Float64 => {
+                    let v = v.as_primitive::<Float64Type>();
+                    v.null_count() == 0 && v.values().iter().all(|v| v.is_finite())
+                }
+                _ => v.null_count() == 0,
+            },
+            None => false,
+        })
+        .collect::<Vec<_>>();
+    BooleanArray::from(is_finite)
 }
 
 #[cfg(test)]

@@ -118,10 +118,8 @@ impl IvfTransformer {
         vector_column: &str,
         range: Option<Range<u32>>,
     ) -> Self {
-        let mut transforms: Vec<Arc<dyn Transformer>> = vec![
-            Arc::new(KeepFiniteVectors::new(vector_column)),
-            Arc::new(super::transform::Flatten::new(vector_column)),
-        ];
+        let mut transforms: Vec<Arc<dyn Transformer>> =
+            vec![Arc::new(super::transform::Flatten::new(vector_column))];
 
         let dt = if distance_type == DistanceType::Cosine {
             transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
@@ -131,6 +129,7 @@ impl IvfTransformer {
         } else {
             distance_type
         };
+        transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
 
         let ivf_transform = Arc::new(PartitionTransformer::new(
             centroids.clone(),
@@ -159,10 +158,8 @@ impl IvfTransformer {
         pq: ProductQuantizer,
         range: Option<Range<u32>>,
     ) -> Self {
-        let mut transforms: Vec<Arc<dyn Transformer>> = vec![
-            Arc::new(KeepFiniteVectors::new(vector_column)),
-            Arc::new(super::transform::Flatten::new(vector_column)),
-        ];
+        let mut transforms: Vec<Arc<dyn Transformer>> =
+            vec![Arc::new(super::transform::Flatten::new(vector_column))];
 
         let distance_type = if distance_type == MetricType::Cosine {
             transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
@@ -172,6 +169,7 @@ impl IvfTransformer {
         } else {
             distance_type
         };
+        transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
 
         let partition_transform = Arc::new(PartitionTransformer::new(
             centroids.clone(),
@@ -210,10 +208,8 @@ impl IvfTransformer {
         sq: ScalarQuantizer,
         range: Option<Range<u32>>,
     ) -> Self {
-        let mut transforms: Vec<Arc<dyn Transformer>> = vec![
-            Arc::new(KeepFiniteVectors::new(vector_column)),
-            Arc::new(super::transform::Flatten::new(vector_column)),
-        ];
+        let mut transforms: Vec<Arc<dyn Transformer>> =
+            vec![Arc::new(super::transform::Flatten::new(vector_column))];
 
         let distance_type = if metric_type == MetricType::Cosine {
             transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
@@ -223,6 +219,7 @@ impl IvfTransformer {
         } else {
             metric_type
         };
+        transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
 
         let partition_transformer = Arc::new(PartitionTransformer::new(
             centroids.clone(),

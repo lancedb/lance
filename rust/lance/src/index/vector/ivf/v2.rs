@@ -642,8 +642,8 @@ mod tests {
     use arrow::datatypes::{UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
-        Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, FixedSizeListArray, ListArray,
-        RecordBatch, RecordBatchIterator, UInt64Array,
+        Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, FixedSizeListArray, Float32Array,
+        ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -1699,5 +1699,45 @@ mod tests {
             assert_ge!(*d, dists[0]);
             assert_lt!(*d, dists[k - 1]);
         });
+    }
+
+    #[tokio::test]
+    async fn test_index_with_zero_vectors() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (batch, schema) = generate_batch::<Float32Type>(256, None, 0.0..1.0, false);
+        let vector_field = schema.field(1).clone();
+        let zero_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![256])),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![0.0; DIM]),
+                        DIM as i32,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![batch, zero_batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                mode: crate::dataset::WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let vector_column = vector_field.name();
+        let params = VectorIndexParams::ivf_pq(4, 8, DIM / 8, DistanceType::Cosine, 50);
+        dataset
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
     }
 }
