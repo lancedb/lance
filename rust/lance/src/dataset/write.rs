@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use chrono::TimeDelta;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{
@@ -115,14 +116,14 @@ impl TryFrom<&str> for WriteMode {
 #[derive(Debug, Clone)]
 pub struct AutoCleanupParams {
     pub interval: usize,
-    pub older_than: usize,
+    pub older_than: TimeDelta,
 }
 
 impl Default for AutoCleanupParams {
     fn default() -> Self {
         Self {
             interval: 20,
-            older_than: 14,
+            older_than: TimeDelta::days(14),
         }
     }
 }

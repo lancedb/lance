@@ -3852,6 +3852,7 @@ dependencies = [
  "env_logger",
  "futures",
  "half",
+ "humantime",
  "itertools 0.13.0",
  "lance-arrow",
  "lance-core",
