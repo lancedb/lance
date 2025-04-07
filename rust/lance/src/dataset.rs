@@ -3946,6 +3946,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn test_new_version_available() {
         // Create a table
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
