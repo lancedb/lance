@@ -2043,7 +2043,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_manifest_iops() {
         // Need to use in-memory for accurate IOPS tracking.
-        use crate::utils::test::IoTrackingStore;
+        use lance_io::object_store::io_tracking::IoTrackingStore;
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
