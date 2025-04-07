@@ -40,6 +40,7 @@ use tokio::sync::RwLock;
 use url::Url;
 
 use super::local::LocalObjectReader;
+pub mod io_tracking;
 mod list_retry;
 mod tracing;
 use self::tracing::ObjectStoreTracingExt;
