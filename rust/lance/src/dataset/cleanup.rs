@@ -492,17 +492,7 @@ pub async fn auto_cleanup_hook(
                     })
                 }
             };
-            let older_than = match TimeDelta::from_std(std_older_than) {
-                Ok(t) => t,
-                Err(e) => {
-                    return Err(Error::Cleanup {
-                        message: format!(
-                        "Error encountered while converting lance.auto_cleanup.older_than to chrono::TimeDelta: {}",
-                        e
-                    ),
-                    })
-                }
-            };
+            let older_than = TimeDelta::from_std(std_older_than).ok_or(TimeDelta::MAX);
             let interval: u64 = match interval.parse() {
                 Ok(i) => i,
                 Err(e) => {
