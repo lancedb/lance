@@ -621,11 +621,13 @@ pub async fn commit_handler_from_url(
     let url = match Url::parse(url_or_path) {
         Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
             // On Windows, the drive is parsed as a scheme
-            return Ok(Arc::new(ConditionalPutCommitHandler));
+            // return Ok(Arc::new(ConditionalPutCommitHandler));
+            return Ok(Arc::new(RenameCommitHandler));
         }
         Ok(url) => url,
         Err(_) => {
-            return Ok(Arc::new(ConditionalPutCommitHandler));
+            // return Ok(Arc::new(ConditionalPutCommitHandler));
+            return Ok(Arc::new(RenameCommitHandler));
         }
     };
 
