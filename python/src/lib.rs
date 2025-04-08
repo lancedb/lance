@@ -459,7 +459,7 @@ impl MyLanceTableProvider {
         ));
         println!("LanceTableProvider created");
 
-        let ffi_provider = FFI_TableProvider::new(a_lance_table_provider, false);
+        let ffi_provider = FFI_TableProvider::new(a_lance_table_provider, false, RT.get_runtime_handle());
         println!("lance_table_ffi_provider");
         let capsule = PyCapsule::new_bound(py, ffi_provider, Some(name.clone()));
         println!("Lance PyCapsule created");
@@ -494,10 +494,11 @@ impl MyTableProvider
     {
         let name = CString::new("datafusion_table_provider").unwrap();
 
+
         let provider = self
             .create_table()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let ffi_provider = FFI_TableProvider::new(Arc::new(provider), false);
+        let ffi_provider = FFI_TableProvider::new(Arc::new(provider), false, RT.get_runtime_handle());
         let capsule = PyCapsule::new_bound(py, ffi_provider, Some(name.clone()));
         capsule
     }
