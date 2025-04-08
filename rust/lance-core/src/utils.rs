@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod address;
+pub mod backoff;
 pub mod bit;
 pub mod cpu;
 pub mod deletion;
