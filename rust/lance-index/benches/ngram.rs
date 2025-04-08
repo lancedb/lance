@@ -10,7 +10,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
 use lance_core::cache::FileMetadataCache;
-use lance_core::{timeit, ROW_ID};
+use lance_core::ROW_ID;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions};
@@ -77,12 +77,11 @@ fn bench_ngram(c: &mut Criterion) {
             let mut builder =
                 NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
             let num_spill_files = builder.train(stream).await.unwrap();
-            timeit!("ngram_bench::write_index", {
-                builder
-                    .write_index(store.as_ref(), num_spill_files, None)
-                    .await
-                    .unwrap();
-            });
+
+            builder
+                .write_index(store.as_ref(), num_spill_files, None)
+                .await
+                .unwrap();
         })
     });
 

@@ -20,7 +20,7 @@ use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::{timeit, Result};
+use lance_core::Result;
 use lance_core::{utils::mask::RowIdTreeMap, Error};
 use lance_io::object_store::ObjectStore;
 use log::info;
@@ -816,13 +816,11 @@ impl NGramIndexBuilder {
             })
             .try_buffer_unordered(*DEFAULT_TOKENIZE_PARALLELISM);
 
-        timeit!("ngram::train::send_partitions", {
-            while let Some(partitions) = partitions_stream.try_next().await? {
-                for (part_idx, partition) in partitions.into_iter().enumerate() {
-                    senders[part_idx].send(partition).await.unwrap();
-                }
+        while let Some(partitions) = partitions_stream.try_next().await? {
+            for (part_idx, partition) in partitions.into_iter().enumerate() {
+                senders[part_idx].send(partition).await.unwrap();
             }
-        });
+        }
 
         std::mem::drop(senders);
         let builders = futures::future::try_join_all(builders).await?;
@@ -832,15 +830,13 @@ impl NGramIndexBuilder {
 
         let mut to_spill = Vec::with_capacity(builders.len());
 
-        timeit!("ngram::train::final_flush", {
-            for builder in builders {
-                let mut builder = builder?;
-                let state = builder.state.take();
-                if builder.flush(state).await? {
-                    to_spill.push(builder.worker_number);
-                }
+        for builder in builders {
+            let mut builder = builder?;
+            let state = builder.state.take();
+            if builder.flush(state).await? {
+                to_spill.push(builder.worker_number);
             }
-        });
+        }
 
         Ok(to_spill)
     }
@@ -1127,9 +1123,7 @@ impl NGramIndexBuilder {
             return Ok(());
         }
 
-        let mut index_to_copy = timeit!("write_index::merge_spills", {
-            self.merge_spills(spill_files).await?
-        });
+        let mut index_to_copy = self.merge_spills(spill_files).await?;
 
         if let Some(old_index) = old_index {
             index_to_copy = self.merge_old_index(index_to_copy, old_index).await?;
@@ -1143,16 +1137,14 @@ impl NGramIndexBuilder {
         let num_rows = reader.num_rows();
         let mut offset = 0;
 
-        timeit!("write_index::write_batches", {
-            while offset < num_rows {
-                let batch_size = std::cmp::min(num_rows - offset, 64);
-                let batch = reader.read_range(offset..offset + batch_size, None).await?;
-                writer.write_record_batch(batch).await?;
-                offset += batch_size;
-            }
-        });
+        while offset < num_rows {
+            let batch_size = std::cmp::min(num_rows - offset, 64);
+            let batch = reader.read_range(offset..offset + batch_size, None).await?;
+            writer.write_record_batch(batch).await?;
+            offset += batch_size;
+        }
 
-        timeit!("write_index::finish", { writer.finish().await })
+        writer.finish().await
     }
 }
 

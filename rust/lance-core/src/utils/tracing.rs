@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use futures::Stream;
-use lazy_static::lazy_static;
 use pin_project::pin_project;
 use tracing::Span;
 
@@ -47,23 +46,6 @@ impl<S: Stream> StreamTracingExt for S {
             span: Span::current(),
         }
     }
-}
-
-lazy_static! {
-    pub static ref OUTPUT_TIMEIT_DURATION: bool =
-        std::env!("OUTPUT_TIMEIT_DURATION").parse().unwrap_or(false);
-}
-#[macro_export]
-macro_rules! timeit {
-    ($name:expr, $block:block) => {{
-        let start = std::time::Instant::now();
-        let result = { $block };
-        let duration = start.elapsed();
-        if *lance_core::utils::tracing::OUTPUT_TIMEIT_DURATION {
-            std::println!("execution time {}:\t{} ms", $name, duration.as_millis());
-        }
-        result
-    }};
 }
 
 pub const TRACE_FILE_AUDIT: &str = "lance::file_audit";
