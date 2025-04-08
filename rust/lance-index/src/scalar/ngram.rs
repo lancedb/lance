@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::any::Any;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::iter::once;
 use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
@@ -20,7 +20,7 @@ use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::Result;
+use lance_core::{timeit, Result};
 use lance_core::{utils::mask::RowIdTreeMap, Error};
 use lance_io::object_store::ObjectStore;
 use log::info;
@@ -729,7 +729,8 @@ impl NGramIndexBuilder {
                 .await?;
 
             let left_stream = stream::once(std::future::ready(Ok(spill_state)));
-            let right_stream = self.stream_spill(self.worker_number).await?;
+            let right_stream =
+                Self::stream_spill(self.spill_store.clone(), self.worker_number).await?;
             Self::merge_spill_streams(left_stream, right_stream, writer.as_mut()).await?;
             drop(writer);
             self.spill_store
@@ -815,11 +816,13 @@ impl NGramIndexBuilder {
             })
             .try_buffer_unordered(*DEFAULT_TOKENIZE_PARALLELISM);
 
-        while let Some(partitions) = partitions_stream.try_next().await? {
-            for (part_idx, partition) in partitions.into_iter().enumerate() {
-                senders[part_idx].send(partition).await.unwrap();
+        timeit!("ngram::train::send_partitions", {
+            while let Some(partitions) = partitions_stream.try_next().await? {
+                for (part_idx, partition) in partitions.into_iter().enumerate() {
+                    senders[part_idx].send(partition).await.unwrap();
+                }
             }
-        }
+        });
 
         std::mem::drop(senders);
         let builders = futures::future::try_join_all(builders).await?;
@@ -829,13 +832,15 @@ impl NGramIndexBuilder {
 
         let mut to_spill = Vec::with_capacity(builders.len());
 
-        for builder in builders {
-            let mut builder = builder?;
-            let state = builder.state.take();
-            if builder.flush(state).await? {
-                to_spill.push(builder.worker_number);
+        timeit!("ngram::train::final_flush", {
+            for builder in builders {
+                let mut builder = builder?;
+                let state = builder.state.take();
+                if builder.flush(state).await? {
+                    to_spill.push(builder.worker_number);
+                }
             }
-        }
+        });
 
         Ok(to_spill)
     }
@@ -852,7 +857,6 @@ impl NGramIndexBuilder {
     }
 
     async fn stream_spill_reader(
-        &self,
         reader: Arc<dyn IndexReader>,
     ) -> Result<impl Stream<Item = Result<NGramIndexSpillState>>> {
         let num_rows = reader.num_rows();
@@ -876,14 +880,13 @@ impl NGramIndexBuilder {
     }
 
     async fn stream_spill(
-        &self,
+        spill_store: Arc<dyn IndexStore>,
         id: usize,
     ) -> Result<impl Stream<Item = Result<NGramIndexSpillState>>> {
-        let reader = self
-            .spill_store
+        let reader = spill_store
             .open_index_file(&Self::spill_filename(id))
             .await?;
-        self.stream_spill_reader(reader).await
+        Self::stream_spill_reader(reader).await
     }
 
     fn merge_spill_states(
@@ -1007,7 +1010,7 @@ impl NGramIndexBuilder {
     }
 
     async fn merge_spill_files(
-        &mut self,
+        spill_store: Arc<dyn IndexStore>,
         index_of_left: usize,
         index_of_right: usize,
         output_index: usize,
@@ -1018,20 +1021,21 @@ impl NGramIndexBuilder {
             index_of_left, index_of_right, output_index
         );
 
-        let mut writer = self
-            .spill_store
+        let mut writer = spill_store
             .new_index_file(&Self::spill_filename(output_index), POSTINGS_SCHEMA.clone())
             .await?;
 
-        let left_stream = self.stream_spill(index_of_left).await?;
-        let right_stream = self.stream_spill(index_of_right).await?;
+        let (left_stream, right_stream) = futures::try_join!(
+            Self::stream_spill(spill_store.clone(), index_of_left),
+            Self::stream_spill(spill_store.clone(), index_of_right)
+        )?;
 
         Self::merge_spill_streams(left_stream, right_stream, writer.as_mut()).await?;
 
-        self.spill_store
+        spill_store
             .delete_index_file(&Self::spill_filename(index_of_left))
             .await?;
-        self.spill_store
+        spill_store
             .delete_index_file(&Self::spill_filename(index_of_right))
             .await?;
 
@@ -1044,23 +1048,33 @@ impl NGramIndexBuilder {
     // intermediate files
     //
     // Note: worker indices start at 1 and not 0 (hence all the +1's)
-    async fn merge_spills(&mut self, spill_files: Vec<usize>) -> Result<usize> {
+    async fn merge_spills(&mut self, mut spill_files: Vec<usize>) -> Result<usize> {
         info!(
             "Merging {} index files into one combined index",
             spill_files.len()
         );
 
         let mut spill_counter = spill_files.iter().max().expect_ok()? + 1;
-        let mut spills_remaining = VecDeque::from_iter(spill_files);
-        while spills_remaining.len() > 1 {
-            let left = spills_remaining.pop_front().expect_ok()?;
-            let right = spills_remaining.pop_front().expect_ok()?;
-            self.merge_spill_files(left, right, spill_counter).await?;
-            spills_remaining.push_back(spill_counter);
-            spill_counter += 1;
+        while spill_files.len() > 1 {
+            let mut new_spills = Vec::with_capacity(spill_files.len() / 2);
+            while spill_files.len() >= 2 {
+                let left = spill_files.pop().expect_ok()?;
+                let right = spill_files.pop().expect_ok()?;
+                new_spills.push(tokio::spawn(Self::merge_spill_files(
+                    self.spill_store.clone(),
+                    left,
+                    right,
+                    spill_counter + new_spills.len(),
+                )));
+            }
+            for i in 0..new_spills.len() {
+                spill_files.push(spill_counter + i);
+            }
+            spill_counter += new_spills.len();
+            futures::future::try_join_all(new_spills).await?;
         }
 
-        spills_remaining.pop_front().expect_ok()
+        spill_files.pop().expect_ok()
     }
 
     async fn merge_old_index(
@@ -1076,9 +1090,9 @@ impl NGramIndexBuilder {
             .new_index_file(&Self::spill_filename(final_num), POSTINGS_SCHEMA.clone())
             .await?;
 
-        let left_stream = self.stream_spill(new_data_num).await?;
+        let left_stream = Self::stream_spill(self.spill_store.clone(), new_data_num).await?;
         let old_reader = old_index.open_index_file(POSTINGS_FILENAME).await?;
-        let right_stream = self.stream_spill_reader(old_reader).await?;
+        let right_stream = Self::stream_spill_reader(old_reader).await?;
 
         Self::merge_spill_streams(left_stream, right_stream, writer.as_mut()).await?;
 
@@ -1113,7 +1127,9 @@ impl NGramIndexBuilder {
             return Ok(());
         }
 
-        let mut index_to_copy = self.merge_spills(spill_files).await?;
+        let mut index_to_copy = timeit!("write_index::merge_spills", {
+            self.merge_spills(spill_files).await?
+        });
 
         if let Some(old_index) = old_index {
             index_to_copy = self.merge_old_index(index_to_copy, old_index).await?;
@@ -1127,14 +1143,16 @@ impl NGramIndexBuilder {
         let num_rows = reader.num_rows();
         let mut offset = 0;
 
-        while offset < num_rows {
-            let batch_size = std::cmp::min(num_rows - offset, 64);
-            let batch = reader.read_range(offset..offset + batch_size, None).await?;
-            writer.write_record_batch(batch).await?;
-            offset += batch_size;
-        }
+        timeit!("write_index::write_batches", {
+            while offset < num_rows {
+                let batch_size = std::cmp::min(num_rows - offset, 64);
+                let batch = reader.read_range(offset..offset + batch_size, None).await?;
+                writer.write_record_batch(batch).await?;
+                offset += batch_size;
+            }
+        });
 
-        writer.finish().await
+        timeit!("write_index::finish", { writer.finish().await })
     }
 }
 
