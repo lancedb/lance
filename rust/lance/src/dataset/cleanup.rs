@@ -492,7 +492,7 @@ pub async fn auto_cleanup_hook(
                     })
                 }
             };
-            let older_than = TimeDelta::from_std(std_older_than).ok_or(TimeDelta::MAX);
+            let older_than = TimeDelta::from_std(std_older_than).unwrap_or(TimeDelta::MAX);
             let interval: u64 = match interval.parse() {
                 Ok(i) => i,
                 Err(e) => {
