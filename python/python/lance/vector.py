@@ -746,8 +746,6 @@ def one_pass_assign_ivf_pq_on_accelerator(
     LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
 
     shuffle_buffers = [
-        data_file.path()
-        for frag in ds.get_fragments()
-        for data_file in frag.data_files()
+        data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
     ]
     return dst_dataset_uri, shuffle_buffers
