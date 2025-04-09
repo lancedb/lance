@@ -31,8 +31,9 @@ use prost::{Message, Name};
 use snafu::location;
 
 use lance_core::{
-    cache::FileMetadataCache,
+    cache::LanceCache,
     datatypes::{Field, Schema},
+    utils::path::LancePathExt,
     Error, Result,
 };
 use lance_encoding::format::pb as pbenc;
@@ -305,7 +306,7 @@ pub struct FileReader {
     num_rows: u64,
     metadata: Arc<CachedFileMetadata>,
     decoder_plugins: Arc<DecoderPlugins>,
-    cache: Arc<FileMetadataCache>,
+    cache: Arc<LanceCache>,
     options: FileReaderOptions,
 }
 #[derive(Debug)]
@@ -734,7 +735,7 @@ impl FileReader {
         scheduler: FileScheduler,
         base_projection: Option<ReaderProjection>,
         decoder_plugins: Arc<DecoderPlugins>,
-        cache: &FileMetadataCache,
+        cache: &LanceCache,
         options: FileReaderOptions,
     ) -> Result<Self> {
         let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
@@ -762,10 +763,12 @@ impl FileReader {
         base_projection: Option<ReaderProjection>,
         decoder_plugins: Arc<DecoderPlugins>,
         file_metadata: Arc<CachedFileMetadata>,
-        cache: &FileMetadataCache,
+        cache: &LanceCache,
         options: FileReaderOptions,
     ) -> Result<Self> {
-        let cache = Arc::new(cache.with_base_path(path));
+        let cache = Arc::new(
+            cache.with_key_mapper(move |key| path.child_path(&Path::from(key)).to_string()),
+        );
 
         if let Some(base_projection) = base_projection.as_ref() {
             Self::validate_projection(base_projection, &file_metadata)?;
@@ -809,7 +812,7 @@ impl FileReader {
     fn do_read_range(
         column_infos: Vec<Arc<ColumnInfo>>,
         io: Arc<dyn EncodingsIo>,
-        cache: Arc<FileMetadataCache>,
+        cache: Arc<LanceCache>,
         num_rows: u64,
         decoder_plugins: Arc<DecoderPlugins>,
         range: Range<u64>,
@@ -873,7 +876,7 @@ impl FileReader {
     fn do_take_rows(
         column_infos: Vec<Arc<ColumnInfo>>,
         io: Arc<dyn EncodingsIo>,
-        cache: Arc<FileMetadataCache>,
+        cache: Arc<LanceCache>,
         decoder_plugins: Arc<DecoderPlugins>,
         indices: Vec<u64>,
         batch_size: u32,

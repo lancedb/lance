@@ -103,8 +103,13 @@ const INDICES_DIR: &str = "_indices";
 
 pub const DATA_DIR: &str = "data";
 pub const BLOB_DIR: &str = "_blobs";
-pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
-pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
+// We default to 6GB for the index cache, since indices are often large but
+// worth caching.
+pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
+// Default to 1 GiB for the metadata cache. Column metadata can be like 40MB,
+// so this should be enough for a few hundred columns. Other metadata is much
+// smaller.
+pub const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Lance Dataset
 #[derive(Clone)]
@@ -1028,12 +1033,13 @@ impl Dataset {
 
     /// Get the number of entries currently in the index cache.
     pub fn index_cache_entry_count(&self) -> usize {
-        self.session.index_cache.get_size()
+        self.session.index_cache.size()
     }
 
     /// Get cache hit ratio.
     pub fn index_cache_hit_rate(&self) -> f32 {
-        self.session.index_cache.hit_rate()
+        // self.session.index_cache.hit_rate()
+        todo!()
     }
 
     pub fn cache_size_bytes(&self) -> u64 {

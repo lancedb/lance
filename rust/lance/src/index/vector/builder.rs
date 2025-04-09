@@ -11,7 +11,7 @@ use futures::prelude::stream::{StreamExt, TryStreamExt};
 use futures::{stream, FutureExt};
 use itertools::Itertools;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -728,7 +728,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     scheduler.open_file(&storage_part_path).await?,
                     None,
                     Arc::<DecoderPlugins>::default(),
-                    &FileMetadataCache::no_cache(),
+                    &LanceCache::no_cache(),
                     FileReaderOptions::default(),
                 )
                 .await?;
@@ -762,7 +762,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     scheduler.open_file(&index_part_path).await?,
                     None,
                     Arc::<DecoderPlugins>::default(),
-                    &FileMetadataCache::no_cache(),
+                    &LanceCache::no_cache(),
                     FileReaderOptions::default(),
                 )
                 .await?;

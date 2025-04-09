@@ -57,7 +57,6 @@ use vector::ivf::v2::IVFIndex;
 use vector::utils::get_vector_type;
 
 pub(crate) mod append;
-pub(crate) mod cache;
 pub mod prefilter;
 pub mod scalar;
 pub mod vector;
@@ -383,10 +382,11 @@ impl DatasetIndexExt for Dataset {
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let dataset_dir = self.base.to_string();
+        let metadata_key = format!("{}-{}", dataset_dir, self.version().version);
         if let Some(indices) = self
             .session
             .index_cache
-            .get_metadata(&dataset_dir, self.version().version)
+            .get::<Vec<IndexMetadata>>(&metadata_key)
         {
             return Ok(indices);
         }
@@ -397,11 +397,10 @@ impl DatasetIndexExt for Dataset {
                 .await?
                 .into();
 
-        self.session.index_cache.insert_metadata(
-            &dataset_dir,
-            self.version().version,
-            loaded_indices.clone(),
-        );
+        let metadata_key = format!("{}-{}", dataset_dir, self.version().version);
+        self.session
+            .index_cache
+            .insert(metadata_key, loaded_indices.clone());
         Ok(loaded_indices)
     }
 
@@ -745,10 +744,18 @@ impl DatasetIndexInternalExt for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>> {
         // Checking for cache existence is cheap so we just check both scalar and vector caches
-        if let Some(index) = self.session.index_cache.get_scalar(uuid) {
+        if let Some(index) = self
+            .session
+            .index_cache
+            .get_unsized::<dyn ScalarIndex>(uuid)
+        {
             return Ok(index.as_index());
         }
-        if let Some(index) = self.session.index_cache.get_vector(uuid) {
+        if let Some(index) = self
+            .session
+            .index_cache
+            .get_unsized::<dyn VectorIndex>(uuid)
+        {
             return Ok(index.as_index());
         }
 
@@ -777,7 +784,11 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        if let Some(index) = self.session.index_cache.get_scalar(uuid) {
+        if let Some(index) = self
+            .session
+            .index_cache
+            .get_unsized::<dyn ScalarIndex>(uuid)
+        {
             return Ok(index);
         }
 
@@ -791,7 +802,9 @@ impl DatasetIndexInternalExt for Dataset {
         info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_SCALAR, index_type=index.index_type().to_string());
         metrics.record_index_load();
 
-        self.session.index_cache.insert_scalar(uuid, index.clone());
+        self.session
+            .index_cache
+            .insert_unsized(uuid.to_string(), index.clone());
         Ok(index)
     }
 
@@ -801,7 +814,11 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        if let Some(index) = self.session.index_cache.get_vector(uuid) {
+        if let Some(index) = self
+            .session
+            .index_cache
+            .get_unsized::<dyn VectorIndex>(uuid)
+        {
             log::debug!("Found vector index in cache uuid: {}", uuid);
             return Ok(index);
         }
@@ -960,7 +977,9 @@ impl DatasetIndexInternalExt for Dataset {
         };
         let index = index?;
         metrics.record_index_load();
-        self.session.index_cache.insert_vector(uuid, index.clone());
+        self.session
+            .index_cache
+            .insert(uuid.to_string(), Arc::new(index.clone()));
         Ok(index)
     }
 

@@ -28,14 +28,14 @@ pub async fn load_row_id_sequence(
             dataset
                 .session
                 .file_metadata_cache
-                .get_or_insert(&path, |_path| async { read_row_ids(data) })
+                .get_or_insert(path.to_string(), |_path| async { read_row_ids(data) })
                 .await
         }
         Some(RowIdMeta::External(file_slice)) => {
             dataset
                 .session
                 .file_metadata_cache
-                .get_or_insert(&path, |_path| async {
+                .get_or_insert(path.to_string(), |_path| async {
                     let path = dataset.base.child(file_slice.path.as_str());
                     let range = file_slice.offset as usize
                         ..(file_slice.offset as usize + file_slice.size as usize);
@@ -79,7 +79,9 @@ pub async fn get_row_id_index(
         let index = dataset
             .session
             .file_metadata_cache
-            .get_or_insert(&path, |_path| async { load_row_id_index(dataset).await })
+            .get_or_insert(path.to_string(), |_path| async {
+                load_row_id_index(dataset).await
+            })
             .await?;
         Ok(Some(index))
     } else {

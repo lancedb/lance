@@ -2888,7 +2888,7 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
         let cache_key = self.column_index.to_string();
-        if let Some(cached_data) = context.cache().get_by_str::<CachedFieldData>(&cache_key) {
+        if let Some(cached_data) = context.cache().get::<CachedFieldData>(&cache_key) {
             self.page_schedulers
                 .iter_mut()
                 .zip(cached_data.pages.iter())
@@ -2908,7 +2908,7 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
         async move {
             let page_data = page_data.try_collect::<Vec<_>>().await?;
             let cached_data = Arc::new(CachedFieldData { pages: page_data });
-            cache.insert_by_str::<CachedFieldData>(&cache_key, cached_data);
+            cache.insert::<CachedFieldData>(cache_key, cached_data);
             Ok(())
         }
         .boxed()

@@ -39,7 +39,7 @@ pub mod ngram;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, DeepSizeOf)]
 pub enum ScalarIndexType {
     BTree,
     Bitmap,

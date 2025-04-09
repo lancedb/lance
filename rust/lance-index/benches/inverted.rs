@@ -36,7 +36,7 @@ fn bench_inverted(c: &mut Criterion) {
         Arc::new(LanceIndexStore::new(
             ObjectStore::local(),
             index_dir,
-            FileMetadataCache::no_cache(),
+            LanceCache::no_cache(),
         ))
     });
 

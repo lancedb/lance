@@ -12,7 +12,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
-use lance_core::{cache::FileMetadataCache, Error, Result};
+use lance_core::{cache::LanceCache, Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
@@ -36,7 +36,7 @@ use super::{IndexReader, IndexStore, IndexWriter};
 pub struct LanceIndexStore {
     object_store: Arc<ObjectStore>,
     index_dir: Path,
-    metadata_cache: FileMetadataCache,
+    metadata_cache: LanceCache,
     scheduler: Arc<ScanScheduler>,
 }
 
@@ -50,11 +50,7 @@ impl DeepSizeOf for LanceIndexStore {
 
 impl LanceIndexStore {
     /// Create a new index store at the given directory
-    pub fn new(
-        object_store: ObjectStore,
-        index_dir: Path,
-        metadata_cache: FileMetadataCache,
-    ) -> Self {
+    pub fn new(object_store: ObjectStore, index_dir: Path, metadata_cache: LanceCache) -> Self {
         let object_store = Arc::new(object_store);
         let scheduler = ScanScheduler::new(
             object_store.clone(),
@@ -327,7 +323,7 @@ pub mod tests {
         let test_path: &Path = tempdir.path();
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
+        let cache = LanceCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 

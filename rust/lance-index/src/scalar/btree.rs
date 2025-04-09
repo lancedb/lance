@@ -1366,7 +1366,7 @@ mod tests {
     use datafusion_physical_expr::{expressions::col, LexOrdering, PhysicalSortExpr};
     use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
-    use lance_core::{cache::FileMetadataCache, utils::mask::RowIdTreeMap};
+    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
@@ -1407,7 +1407,7 @@ mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local(),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            LanceCache::no_cache(),
         ));
 
         let values = vec![

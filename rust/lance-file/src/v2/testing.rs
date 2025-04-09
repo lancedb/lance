@@ -7,7 +7,7 @@ use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::ArrowError;
 use futures::TryStreamExt;
 use lance_core::{
-    cache::{CapacityMode, FileMetadataCache},
+    cache::{CapacityMode, LanceCache},
     datatypes::Schema,
 };
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -82,8 +82,8 @@ pub async fn write_lance_file(
     }
 }
 
-pub fn test_cache() -> Arc<FileMetadataCache> {
-    Arc::new(FileMetadataCache::with_capacity(
+pub fn test_cache() -> Arc<LanceCache> {
+    Arc::new(LanceCache::with_capacity(
         128 * 1024 * 1024,
         CapacityMode::Bytes,
     ))

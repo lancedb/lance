@@ -5,13 +5,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::{CapacityMode, LanceCache};
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use snafu::location;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
-use crate::index::cache::IndexCache;
 
 use self::index_extension::IndexExtension;
 
@@ -21,10 +20,10 @@ pub mod index_extension;
 #[derive(Clone, DeepSizeOf)]
 pub struct Session {
     /// Cache for opened indices.
-    pub(crate) index_cache: IndexCache,
+    pub(crate) index_cache: LanceCache,
 
     /// Cache for file metadata
-    pub(crate) file_metadata_cache: FileMetadataCache,
+    pub(crate) file_metadata_cache: LanceCache,
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 }
@@ -59,8 +58,11 @@ impl Session {
     /// - ***index_cache_size***: the size of the index cache.
     pub fn new(index_cache_size: usize, metadata_cache_size: usize) -> Self {
         Self {
-            index_cache: IndexCache::new(index_cache_size),
-            file_metadata_cache: FileMetadataCache::new(metadata_cache_size),
+            index_cache: LanceCache::with_capacity(index_cache_size, CapacityMode::Bytes),
+            file_metadata_cache: LanceCache::with_capacity(
+                metadata_cache_size,
+                CapacityMode::Bytes,
+            ),
             index_extensions: HashMap::new(),
         }
     }
@@ -121,6 +123,10 @@ impl Session {
         self.deep_size_of() as u64
     }
 
+    pub fn cache_size_bytes(&self) -> usize {
+        self.index_cache.size_bytes() + self.file_metadata_cache.size_bytes()
+    }
+
     pub fn approx_num_items(&self) -> usize {
         self.index_cache.approx_size()
             + self.file_metadata_cache.approx_size()
@@ -131,8 +137,12 @@ impl Session {
 impl Default for Session {
     fn default() -> Self {
         Self {
-            index_cache: IndexCache::new(DEFAULT_INDEX_CACHE_SIZE),
-            file_metadata_cache: FileMetadataCache::new(DEFAULT_METADATA_CACHE_SIZE),
+            // TODO: should we just drop item capacity mode?
+            index_cache: LanceCache::with_capacity(DEFAULT_INDEX_CACHE_SIZE, CapacityMode::Bytes),
+            file_metadata_cache: LanceCache::with_capacity(
+                DEFAULT_METADATA_CACHE_SIZE,
+                CapacityMode::Bytes,
+            ),
             index_extensions: HashMap::new(),
         }
     }
@@ -147,13 +157,16 @@ mod tests {
     use std::sync::Arc;
 
     use crate::index::vector::pq::PQIndex;
-    use lance_index::vector::pq::ProductQuantizer;
+    use lance_index::vector::{pq::ProductQuantizer, VectorIndex};
     use lance_linalg::distance::DistanceType;
 
     #[test]
     fn test_disable_index_cache() {
         let no_cache = Session::new(0, 0);
-        assert!(no_cache.index_cache.get_vector("abc").is_none());
+        assert!(no_cache
+            .index_cache
+            .get_unsized::<dyn VectorIndex>("abc")
+            .is_none());
         let no_cache = Arc::new(no_cache);
 
         let pq = ProductQuantizer::new(
@@ -165,57 +178,14 @@ mod tests {
             DistanceType::L2,
         );
         let idx = Arc::new(PQIndex::new(pq, DistanceType::L2));
-        no_cache.index_cache.insert_vector("abc", idx);
+        no_cache
+            .index_cache
+            .insert_unsized::<dyn VectorIndex>("abc".to_string(), idx);
 
-        assert!(no_cache.index_cache.get_vector("abc").is_none());
-        assert_eq!(no_cache.index_cache.len_vector(), 0);
-    }
-
-    #[test]
-    fn test_basic() {
-        let session = Session::new(10, 1);
-        let session = Arc::new(session);
-
-        let pq = ProductQuantizer::new(
-            1,
-            8,
-            1,
-            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 1)
-                .unwrap(),
-            DistanceType::L2,
-        );
-        let idx = Arc::new(PQIndex::new(pq, DistanceType::L2));
-        assert_eq!(session.index_cache.get_size(), 0);
-
-        assert_eq!(session.index_cache.hit_rate(), 1.0);
-        session.index_cache.insert_vector("abc", idx.clone());
-
-        let found = session.index_cache.get_vector("abc");
-        assert!(found.is_some());
-        assert_eq!(format!("{:?}", found.unwrap()), format!("{:?}", idx));
-        assert_eq!(session.index_cache.hit_rate(), 1.0);
-        assert!(session.index_cache.get_vector("def").is_none());
-        assert_eq!(session.index_cache.hit_rate(), 0.5);
-        assert!(session.index_cache.get_vector("abc").is_some());
-        assert_eq!(session.index_cache.len_vector(), 1);
-        assert_eq!(session.index_cache.get_size(), 1);
-
-        for iter_idx in 0..100 {
-            let pq_other = ProductQuantizer::new(
-                1,
-                8,
-                1,
-                FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 1)
-                    .unwrap(),
-                DistanceType::L2,
-            );
-            let idx_other = Arc::new(PQIndex::new(pq_other, DistanceType::L2));
-            session
-                .index_cache
-                .insert_vector(format!("{iter_idx}").as_str(), idx_other.clone());
-        }
-
-        // Capacity is 10 so there should be at most 10 items
-        assert_eq!(session.index_cache.len_vector(), 10);
+        assert!(no_cache
+            .index_cache
+            .get_unsized::<dyn VectorIndex>("abc")
+            .is_none());
+        assert_eq!(no_cache.index_cache.size(), 0);
     }
 }

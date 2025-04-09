@@ -68,7 +68,7 @@ impl BenchmarkFixture {
         Arc::new(LanceIndexStore::new(
             object_store,
             test_path,
-            FileMetadataCache::no_cache(),
+            LanceCache::no_cache(),
         ))
     }
 

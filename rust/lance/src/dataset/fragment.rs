@@ -1014,7 +1014,7 @@ impl FileFragment {
                 .dataset
                 .session
                 .file_metadata_cache
-                .get_or_insert(&path, |_| async {
+                .get_or_insert(path.to_string(), |_| async {
                     read_deletion_file(&self.dataset.base, fragment, object_store)
                         .await?
                         .ok_or(Error::io(
@@ -1293,7 +1293,7 @@ impl FileFragment {
 
         let cache = &self.dataset.session.file_metadata_cache;
         let path = deletion_file_path(&self.dataset.base, self.metadata.id, deletion_file);
-        if let Some(deletion_vector) = cache.get::<DeletionVector>(&path) {
+        if let Some(deletion_vector) = cache.get::<DeletionVector>(&path.to_string()) {
             Ok(Some(deletion_vector))
         } else {
             let deletion_vector = read_deletion_file(
@@ -1305,7 +1305,7 @@ impl FileFragment {
             match deletion_vector {
                 Some(deletion_vector) => {
                     let deletion_vector = Arc::new(deletion_vector);
-                    cache.insert(path, deletion_vector.clone());
+                    cache.insert(path.to_string(), deletion_vector.clone());
                     Ok(Some(deletion_vector))
                 }
                 None => Ok(None),
@@ -1322,7 +1322,7 @@ impl FileFragment {
         let path = file_scheduler.reader().path();
 
         let file_metadata = cache
-            .get_or_insert(path, |_path| async {
+            .get_or_insert(path.to_string(), |_path| async {
                 let file_metadata: CachedFileMetadata =
                     v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
                 Ok(file_metadata)

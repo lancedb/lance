@@ -27,7 +27,7 @@ use arrow_schema::{DataType, Field, Fields};
 use futures::stream::repeat_with;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::{CapacityMode, FileMetadataCache};
+use lance_core::cache::{CapacityMode, LanceCache};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -508,8 +508,7 @@ impl IvfShuffler {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
                 let scheduler = ScanScheduler::new(object_store.into(), scheduler_config);
                 let file = scheduler.open_file(&path).await?;
-                let cache =
-                    FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
+                let cache = LanceCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
 
                 let reader = Lancev2FileReader::try_open(
                     file,
@@ -570,7 +569,7 @@ impl IvfShuffler {
                     file,
                     None,
                     Default::default(),
-                    &FileMetadataCache::no_cache(),
+                    &LanceCache::no_cache(),
                     FileReaderOptions::default(),
                 )
                 .await?;
@@ -642,7 +641,7 @@ impl IvfShuffler {
                     file,
                     None,
                     Default::default(),
-                    &FileMetadataCache::no_cache(),
+                    &LanceCache::no_cache(),
                     FileReaderOptions::default(),
                 )
                 .await?;
@@ -813,7 +812,7 @@ impl IvfShuffler {
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),
-                &FileMetadataCache::no_cache(),
+                &LanceCache::no_cache(),
                 FileReaderOptions::default(),
             )
             .await?;

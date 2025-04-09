@@ -20,7 +20,7 @@ use deepsize::DeepSizeOf;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::iter_str_array;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, CPU_RUNTIME};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
@@ -448,7 +448,7 @@ impl IndexWorker {
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local(),
             Path::from_filesystem_path(tmpdir.path())?,
-            FileMetadataCache::no_cache(),
+            LanceCache::no_cache(),
         ));
 
         let schema = inverted_list_schema(with_position);

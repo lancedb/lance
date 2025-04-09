@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::prelude::*;
+use lance_core::cache::LanceCache;
 use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
 use lance_file::reader::FileReader;
 use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
@@ -18,7 +19,6 @@ use prost_types::Timestamp;
 use super::Fragment;
 use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_MOVE_STABLE_ROW_IDS};
 use crate::format::pb;
-use lance_core::cache::FileMetadataCache;
 use lance_core::datatypes::{Schema, StorageClass};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
@@ -599,7 +599,7 @@ pub trait SelfDescribingFileReader {
     async fn try_new_self_described(
         object_store: &ObjectStore,
         path: &Path,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Self>
     where
         Self: Sized,
@@ -610,7 +610,7 @@ pub trait SelfDescribingFileReader {
 
     async fn try_new_self_described_from_reader(
         reader: Arc<dyn Reader>,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Self>
     where
         Self: Sized;
@@ -620,7 +620,7 @@ pub trait SelfDescribingFileReader {
 impl SelfDescribingFileReader for FileReader {
     async fn try_new_self_described_from_reader(
         reader: Arc<dyn Reader>,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Self> {
         let metadata = Self::read_metadata(reader.as_ref(), cache).await?;
         let manifest_position = metadata.manifest_position.ok_or(Error::Internal {
