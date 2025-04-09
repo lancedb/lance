@@ -46,11 +46,13 @@ pub enum CapacityMode {
     Bytes,
 }
 
+type KeyMapper = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 #[derive(Clone)]
 pub struct LanceCache {
     cache: Arc<Cache<(String, TypeId), SizedRecord>>,
     mode: CapacityMode,
-    key_mapper: Option<Arc<dyn Fn(&str) -> String + Send + Sync>>,
+    key_mapper: Option<KeyMapper>,
 }
 
 impl std::fmt::Debug for LanceCache {
@@ -119,7 +121,7 @@ impl LanceCache {
 
     pub fn size_bytes(&self) -> usize {
         self.cache.run_pending_tasks();
-        self.approx_size_bytes() as usize
+        self.approx_size_bytes()
     }
 
     pub fn approx_size_bytes(&self) -> usize {
@@ -131,7 +133,7 @@ impl LanceCache {
 
     pub fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, key: String, metadata: Arc<T>) {
         let key = if let Some(key_mapper) = &self.key_mapper {
-            key_mapper(&key).to_string()
+            key_mapper(&key)
         } else {
             key
         };
@@ -149,7 +151,7 @@ impl LanceCache {
 
     pub fn get<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
         let key = if let Some(key_mapper) = &self.key_mapper {
-            key_mapper(key).to_string()
+            key_mapper(key)
         } else {
             key.to_string()
         };
@@ -259,7 +261,7 @@ mod tests {
         }
 
         let item = Arc::new(MyType(42));
-        let item_dyn: Arc<dyn MyTrait> = item.clone();
+        let item_dyn: Arc<dyn MyTrait> = item;
 
         let cache = LanceCache::with_capacity(10, CapacityMode::Items);
         cache.insert_unsized("test".to_string(), item_dyn);

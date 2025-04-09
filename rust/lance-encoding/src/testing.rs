@@ -13,7 +13,7 @@ use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use lance_core::{
-    cache::{CapacityMode, FileMetadataCache},
+    cache::{CapacityMode, LanceCache},
     utils::bit::pad_bytes,
     Result,
 };
@@ -166,7 +166,7 @@ async fn test_decode(
     ) -> BoxFuture<'static, ()>,
 ) {
     let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
-    let cache = Arc::new(FileMetadataCache::with_capacity(
+    let cache = Arc::new(LanceCache::with_capacity(
         128 * 1024 * 1024,
         CapacityMode::Bytes,
     ));
