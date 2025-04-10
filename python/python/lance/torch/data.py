@@ -235,7 +235,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         to_tensor_fn : callable, optional
             A function that converts a pyarrow RecordBatch to torch.Tensor.
         """
-        super().__init__(*args, **kwargs)
+        super().__init__()
         if isinstance(dataset, (str, Path)):
             dataset = lance.dataset(dataset)
         self.dataset = dataset
