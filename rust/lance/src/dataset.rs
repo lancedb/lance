@@ -170,13 +170,13 @@ impl From<&Manifest> for Version {
 /// Customize read behavior of a dataset.
 #[derive(Clone, Debug)]
 pub struct ReadParams {
-    /// Cache size for index cache. If it is zero, index cache is disabled.
-    ///
-    pub index_cache_size: usize,
+    /// Size of the index cache in bytes. This cache stores index data in memory
+    /// for faster lookups. The default is 6 GiB.
+    pub index_cache_size_bytes: usize,
 
-    /// Metadata cache size for the fragment metadata. If it is zero, metadata
-    /// cache is disabled.
-    pub metadata_cache_size: usize,
+    /// Size of the metadata cache in bytes. This cache stores metadata in memory
+    /// for faster open table and scans. The default is 1 GiB.
+    pub metadata_cache_size_bytes: usize,
 
     /// If present, dataset will use this shared [`Session`] instead creating a new one.
     ///
@@ -208,14 +208,14 @@ pub struct ReadParams {
 
 impl ReadParams {
     /// Set the cache size for indices. Set to zero, to disable the cache.
-    pub fn index_cache_size(&mut self, cache_size: usize) -> &mut Self {
-        self.index_cache_size = cache_size;
+    pub fn index_cache_size_bytes(&mut self, cache_size: usize) -> &mut Self {
+        self.index_cache_size_bytes = cache_size;
         self
     }
 
     /// Set the cache size for the file metadata. Set to zero to disable this cache.
-    pub fn metadata_cache_size(&mut self, cache_size: usize) -> &mut Self {
-        self.metadata_cache_size = cache_size;
+    pub fn metadata_cache_size_bytes(&mut self, cache_size: usize) -> &mut Self {
+        self.metadata_cache_size_bytes = cache_size;
         self
     }
 
@@ -243,8 +243,8 @@ impl ReadParams {
 impl Default for ReadParams {
     fn default() -> Self {
         Self {
-            index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
-            metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
+            index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
+            metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             session: None,
             store_options: None,
             commit_handler: None,

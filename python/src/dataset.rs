@@ -290,27 +290,33 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, commit_handler=None, storage_options=None, manifest=None, index_cache_size_bytes=None, metadata_cache_size_bytes=None))]
     fn new(
         py: Python,
         uri: String,
         version: Option<PyObject>,
         block_size: Option<usize>,
-        index_cache_size: Option<usize>,
-        metadata_cache_size: Option<usize>,
         commit_handler: Option<PyObject>,
         storage_options: Option<HashMap<String, String>>,
         manifest: Option<&[u8]>,
+        index_cache_size_bytes: Option<usize>,
+        metadata_cache_size_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let mut params = ReadParams {
-            index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
-            metadata_cache_size: metadata_cache_size.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
             store_options: Some(ObjectStoreParams {
                 block_size,
                 ..Default::default()
             }),
             ..Default::default()
         };
+
+        if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
+            params.metadata_cache_size_bytes = metadata_cache_size_bytes;
+        }
+
+        if let Some(index_cache_size_bytes) = index_cache_size_bytes {
+            params.index_cache_size_bytes = index_cache_size_bytes;
+        }
 
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);

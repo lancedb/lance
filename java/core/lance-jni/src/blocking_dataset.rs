@@ -85,13 +85,13 @@ impl BlockingDataset {
         uri: &str,
         version: Option<i32>,
         block_size: Option<i32>,
-        index_cache_size: i32,
-        metadata_cache_size: i32,
+        index_cache_size_bytes: i64,
+        metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
     ) -> Result<Self> {
         let params = ReadParams {
-            index_cache_size: index_cache_size as usize,
-            metadata_cache_size: metadata_cache_size as usize,
+            index_cache_size_bytes: index_cache_size_bytes.try_into().unwrap_or(0),
+            metadata_cache_size_bytes: metadata_cache_size_bytes.try_into().unwrap_or(0),
             store_options: Some(ObjectStoreParams {
                 block_size: block_size.map(|size| size as usize),
                 ..Default::default()
@@ -525,8 +525,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     path: JString,
     version_obj: JObject,    // Optional<Integer>
     block_size_obj: JObject, // Optional<Integer>
-    index_cache_size: jint,
-    metadata_cache_size: jint,
+    index_cache_size_bytes: jlong,
+    metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -536,8 +536,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
             path,
             version_obj,
             block_size_obj,
-            index_cache_size,
-            metadata_cache_size,
+            index_cache_size_bytes,
+            metadata_cache_size_bytes,
             storage_options_obj
         )
     )
@@ -548,8 +548,8 @@ fn inner_open_native<'local>(
     path: JString,
     version_obj: JObject,    // Optional<Integer>
     block_size_obj: JObject, // Optional<Integer>
-    index_cache_size: jint,
-    metadata_cache_size: jint,
+    index_cache_size: jlong,
+    metadata_cache_size: jlong,
     storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;

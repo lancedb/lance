@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
-use lance_core::cache::{CapacityMode, LanceCache};
+use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use snafu::location;
@@ -58,11 +58,8 @@ impl Session {
     /// - ***index_cache_size***: the size of the index cache.
     pub fn new(index_cache_size: usize, metadata_cache_size: usize) -> Self {
         Self {
-            index_cache: LanceCache::with_capacity(index_cache_size, CapacityMode::Bytes),
-            file_metadata_cache: LanceCache::with_capacity(
-                metadata_cache_size,
-                CapacityMode::Bytes,
-            ),
+            index_cache: LanceCache::with_capacity(index_cache_size),
+            file_metadata_cache: LanceCache::with_capacity(metadata_cache_size),
             index_extensions: HashMap::new(),
         }
     }
@@ -137,12 +134,8 @@ impl Session {
 impl Default for Session {
     fn default() -> Self {
         Self {
-            // TODO: should we just drop item capacity mode?
-            index_cache: LanceCache::with_capacity(DEFAULT_INDEX_CACHE_SIZE, CapacityMode::Bytes),
-            file_metadata_cache: LanceCache::with_capacity(
-                DEFAULT_METADATA_CACHE_SIZE,
-                CapacityMode::Bytes,
-            ),
+            index_cache: LanceCache::with_capacity(DEFAULT_INDEX_CACHE_SIZE),
+            file_metadata_cache: LanceCache::with_capacity(DEFAULT_METADATA_CACHE_SIZE),
             index_extensions: HashMap::new(),
         }
     }

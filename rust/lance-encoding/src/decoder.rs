@@ -224,7 +224,7 @@ use futures::future::{maybe_done, BoxFuture, MaybeDone};
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
-use lance_core::cache::{CapacityMode, LanceCache};
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
 use log::{debug, trace, warn};
 use snafu::location;
@@ -2746,12 +2746,7 @@ pub async fn decode_batch(
     // polled twice.
 
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
-    let cache = cache.unwrap_or_else(|| {
-        Arc::new(LanceCache::with_capacity(
-            128 * 1024 * 1024,
-            CapacityMode::Bytes,
-        ))
-    });
+    let cache = cache.unwrap_or_else(|| Arc::new(LanceCache::with_capacity(128 * 1024 * 1024)));
     let mut decode_scheduler = DecodeBatchScheduler::try_new(
         batch.schema.as_ref(),
         &batch.top_level_columns,

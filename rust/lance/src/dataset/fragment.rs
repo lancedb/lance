@@ -1293,7 +1293,7 @@ impl FileFragment {
 
         let cache = &self.dataset.session.file_metadata_cache;
         let path = deletion_file_path(&self.dataset.base, self.metadata.id, deletion_file);
-        if let Some(deletion_vector) = cache.get::<DeletionVector>(&path.to_string()) {
+        if let Some(deletion_vector) = cache.get::<DeletionVector>(path.as_ref()) {
             Ok(Some(deletion_vector))
         } else {
             let deletion_vector = read_deletion_file(

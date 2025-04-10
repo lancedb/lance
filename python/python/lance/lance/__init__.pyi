@@ -165,7 +165,6 @@ class _Dataset:
         uri: str,
         version: Optional[int | str] = None,
         block_size: Optional[int] = None,
-        index_cache_size: Optional[int] = None,
         metadata_cache_size: Optional[int] = None,
         commit_handler: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,

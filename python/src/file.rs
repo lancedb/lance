@@ -19,7 +19,7 @@ use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::{
     v2::{

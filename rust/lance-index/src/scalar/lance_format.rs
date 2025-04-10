@@ -315,7 +315,7 @@ pub mod tests {
     use arrow_select::take::TakeOptions;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
-    use lance_core::{cache::CapacityMode, utils::mask::RowIdTreeMap};
+    use lance_core::utils::mask::RowIdTreeMap;
     use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
@@ -323,7 +323,7 @@ pub mod tests {
         let test_path: &Path = tempdir.path();
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        let cache = LanceCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
+        let cache = LanceCache::with_capacity(128 * 1024 * 1024);
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 

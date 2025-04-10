@@ -419,7 +419,7 @@ pub async fn detect_scalar_index_type(
     } else {
         let uuid = index.uuid.to_string();
         if let Some(index_type) = session.index_cache.get::<ScalarIndexType>(&uuid) {
-            return Ok(index_type.as_ref().clone());
+            return Ok(*index_type.as_ref());
         }
         let index_type = infer_scalar_index_type(dataset, &index.uuid.to_string(), column).await?;
         session.index_cache.insert(uuid, Arc::new(index_type));

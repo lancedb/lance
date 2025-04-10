@@ -979,7 +979,7 @@ impl DatasetIndexInternalExt for Dataset {
         metrics.record_index_load();
         self.session
             .index_cache
-            .insert(uuid.to_string(), Arc::new(index.clone()));
+            .insert_unsized(uuid.to_string(), index.clone());
         Ok(index)
     }
 
