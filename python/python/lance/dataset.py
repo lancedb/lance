@@ -2742,9 +2742,11 @@ class LanceDataset(pa.dataset.Dataset):
 
     @staticmethod
     def drop(
-        base_uri: Union[str, Path], storage_options: Optional[Dict[str, str]] = None
+        base_uri: Union[str, Path],
+        storage_options: Optional[Dict[str, str]] = None,
+        ignore_not_found: Optional[bool] = None,
     ) -> None:
-        _Dataset.drop(str(base_uri), storage_options)
+        _Dataset.drop(str(base_uri), storage_options, ignore_not_found=ignore_not_found)
 
 
 class BulkCommitResult(TypedDict):
