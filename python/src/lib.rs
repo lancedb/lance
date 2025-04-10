@@ -25,12 +25,23 @@
 use std::env;
 use std::sync::Arc;
 
+use std::ffi::CString;
+use ::arrow::array::ArrayRef;
+use ::arrow::array::Int32Array;
+
 use ::arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::ArrowError;
+use datafusion_ffi::table_provider::FFI_TableProvider;
+use datafusion::error::{DataFusionError, Result};
+use datafusion::datasource::MemTable;
+use datafusion::arrow::{
+    datatypes::{DataType, Field}
+};
+
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
 use dataset::blob::LanceBlobFile;
@@ -46,10 +57,14 @@ use file::{
 };
 use futures::StreamExt;
 use lance_index::DatasetIndexExt;
+use pyo3::exceptions::{PyIOError, PyValueError, PyRuntimeError, PyTypeError};
 use log::Level;
-use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyCapsule;
+use ::lance::datafusion::LanceTableProvider;
+use ::lance::dataset::*;
 use session::Session;
+use tokio::runtime::Runtime;
 
 #[macro_use]
 extern crate lazy_static;
@@ -126,6 +141,9 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let log_builder = env_logger::Builder::from_env(env);
     init_logging(log_builder);
 
+    m.add_class::<MyTableProvider>()?;
+    m.add_class::<MyLanceTableProvider>()?;
+    println!("✅ lance module loaded");
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_class::<FileFragment>()?;
@@ -356,4 +374,177 @@ fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(::lance::io::commit::manifest_needs_migration(
         &manifest, &indices,
     ))
+}
+
+#[pyclass(name = "MyLanceTableProvider", module = "lance", subclass)]
+#[derive(Clone)]
+struct MyLanceTableProvider {
+    dataset: Arc<::lance::Dataset>,
+}
+
+// impl MyLanceTableProvider {
+//     // Asynchronous initialization function
+//     async fn async_initialize(&self) -> Result<::lance::Dataset, String>
+//     {
+//         let fields: Vec<_> = (0..1)
+//             .map(|idx| (b'A' + idx as u8) as char)
+//             .map(|col_name| Field::new(col_name, DataType::Int32, true))
+//             .collect();
+//
+//         let schema = Arc::new(ArrowSchema::new(fields));
+//
+//         let batch = RecordBatch::try_new(
+//             schema.clone(),
+//             vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+//         )
+//             .unwrap();
+//
+//         let dataset = InsertBuilder::new("memory://test")
+//             .execute(vec![batch])
+//             .await
+//             .map_err(|e| e.to_string())?;
+//
+//         Ok(dataset)
+//         // self.dataset = Arc::new(dataset);
+//     }
+// }
+
+#[pymethods]
+impl MyLanceTableProvider {
+    #[new]
+    fn new() -> PyResult<Self> {
+        let rt = Runtime::new().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let dataset = rt.block_on(async {
+            let fields = vec![
+                Field::new("A", DataType::Int32, true),
+            ];
+            let schema = Arc::new(ArrowSchema::new(fields));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(0..10))],
+            ).map_err(|e| e.to_string())?;
+
+            let dataset = InsertBuilder::new("memory://test")
+                .execute(vec![batch])
+                .await
+                .map_err(|e| e.to_string())?;
+
+            Ok::<_, String>(Arc::new(dataset))
+        }).map_err(|e| PyRuntimeError::new_err(e))?;
+        println!("dataset created {}", dataset.schema());
+
+        let someTableProvider = Arc::new(LanceTableProvider::new(
+            dataset.clone(),
+            false,
+            false,
+        ));
+        println!("LanceTableProvider created");
+
+        Ok(Self {
+            dataset
+        })
+    }
+
+    fn __datafusion_table_provider__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyCapsule>>
+    {
+        let name = CString::new("datafusion_table_provider").unwrap();
+        let a_lance_table_provider = Arc::new(LanceTableProvider::new(
+            self.dataset.clone(),
+            false,
+            false,
+        ));
+        println!("LanceTableProvider created");
+
+        let ffi_provider = FFI_TableProvider::new(a_lance_table_provider, false, RT.get_runtime_handle());
+        println!("lance_table_ffi_provider");
+        let capsule = PyCapsule::new_bound(py, ffi_provider, Some(name.clone()));
+        println!("Lance PyCapsule created");
+        capsule
+    }
+}
+
+#[pyclass(name = "MyTableProvider", module = "lance", subclass)]
+#[derive(Clone)]
+struct MyTableProvider {
+    num_cols: usize,
+    num_rows: usize,
+    num_batches: usize,
+}
+
+#[pymethods]
+impl MyTableProvider
+{
+    #[new]
+    fn new(num_cols: usize, num_rows: usize, num_batches: usize) -> Self {
+        Self {
+            num_cols,
+            num_rows,
+            num_batches,
+        }
+    }
+
+    fn __datafusion_table_provider__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyCapsule>>
+    {
+        let name = CString::new("datafusion_table_provider").unwrap();
+
+
+        let provider = self
+            .create_table()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let ffi_provider = FFI_TableProvider::new(Arc::new(provider), false, RT.get_runtime_handle());
+        let capsule = PyCapsule::new_bound(py, ffi_provider, Some(name.clone()));
+        capsule
+    }
+}
+
+impl MyTableProvider {
+    fn create_table(&self) -> Result<MemTable> {
+        let fields: Vec<_> = (0..self.num_cols)
+        // let fields: Vec<_> = (0..0)
+            .map(|idx| (b'A' + idx as u8) as char)
+            .map(|col_name| Field::new(col_name, DataType::Int32, true))
+            .collect();
+
+        let schema = Arc::new(ArrowSchema::new(fields));
+
+        let batches: Result<Vec<_>> = (0..self.num_batches)
+        // let batches: Result<Vec<_>> = (0..0)
+            .map(|batch_idx| {
+                let start_value = batch_idx * self.num_rows;
+                create_record_batch(
+                    &schema,
+                    self.num_cols,
+                    start_value as i32,
+                    self.num_rows + batch_idx,
+                )
+            })
+            .collect();
+
+        MemTable::try_new(schema, vec![batches?])
+    }
+}
+
+fn create_record_batch(
+    schema: &Arc<ArrowSchema>,
+    num_cols: usize,
+    start_value: i32,
+    num_values: usize,
+) -> Result<RecordBatch> {
+    let end_value = start_value + num_values as i32;
+    let row_values: Vec<i32> = (start_value..end_value).collect();
+
+    let columns: Vec<_> = (0..num_cols)
+        .map(|_| {
+            std::sync::Arc::new(Int32Array::from(row_values.clone())) as ArrayRef
+        })
+        .collect();
+
+    RecordBatch::try_new(Arc::clone(schema), columns).map_err(DataFusionError::from)
 }
