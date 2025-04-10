@@ -12,7 +12,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::NoFilter;

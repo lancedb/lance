@@ -13,7 +13,7 @@ use jni::{
     JNIEnv,
 };
 use lance::io::ObjectStore;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::{FileReader, FileReaderOptions};
 use lance_io::{

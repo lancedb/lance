@@ -6,7 +6,7 @@ use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_select::take::take;
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_datagen::ArrayGeneratorExt;
 use lance_encoding::{
     decoder::{DecoderPlugins, FilterExpression},
