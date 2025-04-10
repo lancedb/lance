@@ -3095,6 +3095,9 @@ def test_dataset_drop(tmp_path: Path):
     assert Path(tmp_path).exists()
     lance.LanceDataset.drop(tmp_path)
     assert not Path(tmp_path).exists()
+    lance.LanceDataset.drop(tmp_path, ignore_not_found=True)
+    with pytest.raises(FileNotFoundError):
+        lance.LanceDataset.drop(tmp_path, ignore_not_found=False)
 
 
 def test_dataset_schema(tmp_path: Path):
