@@ -266,12 +266,7 @@ pub fn inner_merge_native<'local>(
 
     let (fragment, schema) = RT.block_on(async move {
         fragment
-            .merge_columns(
-                reader,
-                left_on.as_str(),
-                right_on.as_str(),
-                jmax_field_id as i32,
-            )
+            .merge_columns(reader, left_on.as_str(), right_on.as_str(), jmax_field_id)
             .await
     })?;
 
@@ -280,7 +275,7 @@ pub fn inner_merge_native<'local>(
     let ffi_schema = FFI_ArrowSchema::try_from(&arrow_schema)?;
     unsafe { std::ptr::write_unaligned(arrow_schema_ptr, ffi_schema) }
 
-    Ok(fragment.into_java(env)?)
+    fragment.into_java(env)
 }
 
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/fragment/DataFile";
