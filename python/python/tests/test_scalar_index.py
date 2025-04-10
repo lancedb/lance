@@ -371,6 +371,28 @@ def test_indexed_filter_with_fts_index(tmp_path):
     assert results["_rowid"].to_pylist() == [2, 3]
 
 
+def test_fts_on_list(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                ["lance database", "the", "search"],
+                ["lance database"],
+                ["lance", "search"],
+                ["database", "search"],
+                ["unrelated", "doc"],
+            ]
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED", with_position=True)
+
+    results = ds.to_table(full_text_query="lance")
+    assert results.num_rows == 3
+
+    results = ds.to_table(full_text_query=PhraseQuery("lance database", "text"))
+    assert results.num_rows == 2
+
+
 def test_fts_fuzzy_query(tmp_path):
     data = pa.table(
         {
@@ -420,6 +442,16 @@ def test_fts_phrase_query(tmp_path):
 
     ds = lance.write_dataset(data, tmp_path)
     ds.create_scalar_index("text", "INVERTED")
+
+    results = ds.to_table(
+        full_text_query='"frodo was a puppy"',
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+    }
+
     results = ds.to_table(
         full_text_query=PhraseQuery("frodo was a puppy", "text"),
     )

@@ -275,7 +275,7 @@ impl ProjectionRequest {
     ///
     /// # Parameters
     /// - `columns`: A list of tuples where the first element is resulted column name and the second
-    ///              element is the SQL expression.
+    ///   element is the SQL expression.
     pub fn from_sql(
         columns: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Self {
@@ -1432,7 +1432,7 @@ impl Dataset {
 /// - [Self::add_columns()]: Add new columns to the dataset, similar to `ALTER TABLE ADD COLUMN`.
 /// - [Self::drop_columns()]: Drop columns from the dataset, similar to `ALTER TABLE DROP COLUMN`.
 /// - [Self::alter_columns()]: Modify columns in the dataset, changing their name, type, or nullability.
-///                    Similar to `ALTER TABLE ALTER COLUMN`.
+///   Similar to `ALTER TABLE ALTER COLUMN`.
 ///
 /// In addition, one operation is unique to Lance: [`merge`](Self::merge). This
 /// operation allows inserting precomputed data into the dataset.
@@ -1742,7 +1742,7 @@ mod tests {
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::TestDatasetGenerator;
 
-    use arrow::array::{as_struct_array, AsArray};
+    use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
     use arrow::datatypes::UInt64Type;
     use arrow_array::{
@@ -2898,6 +2898,124 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(batch.num_rows(), 0);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_create_int8_index(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        use lance_testing::datagen::generate_random_int8_array;
+
+        let test_dir = tempdir().unwrap();
+
+        let dimension = 16;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "embeddings",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Int8, true)),
+                dimension,
+            ),
+            false,
+        )]));
+
+        let int8_arr = generate_random_int8_array(512 * dimension as usize);
+        let vectors = Arc::new(
+            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                int8_arr, dimension,
+            )
+            .unwrap(),
+        );
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.validate().await.unwrap();
+
+        // Make sure valid arguments should create index successfully
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
+        dataset
+            .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+
+        // The version should match the table version it was created from.
+        let indices = dataset.load_indices().await.unwrap();
+        let actual = indices.first().unwrap().dataset_version;
+        let expected = dataset.manifest.version - 1;
+        assert_eq!(actual, expected);
+        let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+        assert_eq!(fragment_bitmap.len(), 1);
+        assert!(fragment_bitmap.contains(0));
+
+        // Append should inherit index
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        };
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let actual = indices.first().unwrap().dataset_version;
+        let expected = dataset.manifest.version - 2;
+        assert_eq!(actual, expected);
+        dataset.validate().await.unwrap();
+        // Fragment bitmap should show the original fragments, and not include
+        // the newly appended fragment.
+        let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+        assert_eq!(fragment_bitmap.len(), 1);
+        assert!(fragment_bitmap.contains(0));
+
+        let actual_statistics: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("embeddings_idx").await.unwrap())
+                .unwrap();
+        let actual_statistics = actual_statistics.as_object().unwrap();
+        assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF_PQ");
+
+        let deltas = actual_statistics["indices"].as_array().unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["metric_type"].as_str().unwrap(), "l2");
+        assert_eq!(deltas[0]["num_partitions"].as_i64().unwrap(), 10);
+
+        assert!(dataset.index_statistics("non-existent_idx").await.is_err());
+        assert!(dataset.index_statistics("").await.is_err());
+
+        // Overwrite should invalidate index
+        let write_params = WriteParams {
+            mode: WriteMode::Overwrite,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        };
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert!(dataset.manifest.index_section.is_none());
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+        dataset.validate().await.unwrap();
+
+        let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+        assert_eq!(fragment_bitmap.len(), 1);
+        assert!(fragment_bitmap.contains(0));
     }
 
     #[tokio::test]
@@ -4927,7 +5045,11 @@ mod tests {
         assert_eq!(row_ids, &[0]);
     }
 
-    async fn create_fts_dataset<Offset: arrow::array::OffsetSizeTrait>(
+    async fn create_fts_dataset<
+        Offset: arrow::array::OffsetSizeTrait,
+        ListOffset: arrow::array::OffsetSizeTrait,
+    >(
+        is_list: bool,
         with_position: bool,
         tokenizer: TokenizerConfig,
     ) -> Dataset {
@@ -4937,19 +5059,46 @@ mod tests {
 
         let mut params = InvertedIndexParams::default().with_position(with_position);
         params.tokenizer_config = tokenizer;
-        let doc_col = GenericStringArray::<Offset>::from(vec![
-            "lance database the search",
-            "lance database",
-            "lance search",
-            "database search",
-            "unrelated doc",
-            "unrelated",
-            "mots accentués",
-        ]);
+        let doc_col: Arc<dyn Array> = if is_list {
+            let string_builder = GenericStringBuilder::<Offset>::new();
+            let mut list_col = GenericListBuilder::<ListOffset, _>::new(string_builder);
+            // Create a list of strings
+            list_col.values().append_value("lance database"); // for testing phrase query
+            list_col.values().append_value("the");
+            list_col.values().append_value("search");
+            list_col.append(true);
+            list_col.values().append_value("lance database"); // for testing phrase query
+            list_col.append(true);
+            list_col.values().append_value("lance");
+            list_col.values().append_value("search");
+            list_col.append(true);
+            list_col.values().append_value("database");
+            list_col.values().append_value("search");
+            list_col.append(true);
+            list_col.values().append_value("unrelated doc");
+            list_col.append(true);
+            list_col.values().append_value("unrelated");
+            list_col.append(true);
+            list_col.values().append_value("mots");
+            list_col.values().append_value("accentués");
+            list_col.append(true);
+            list_col.append(false);
+            Arc::new(list_col.finish())
+        } else {
+            Arc::new(GenericStringArray::<Offset>::from(vec![
+                "lance database the search",
+                "lance database",
+                "lance search",
+                "database search",
+                "unrelated doc",
+                "unrelated",
+                "mots accentués",
+            ]))
+        };
         let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
         let batch = RecordBatch::try_new(
             arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), false),
+                arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
                 arrow_schema::Field::new("id", DataType::UInt64, false),
             ])
             .into(),
@@ -4968,8 +5117,15 @@ mod tests {
         dataset
     }
 
-    async fn test_fts_index<Offset: arrow::array::OffsetSizeTrait>() {
-        let ds = create_fts_dataset::<Offset>(false, TokenizerConfig::default()).await;
+    async fn test_fts_index<
+        Offset: arrow::array::OffsetSizeTrait,
+        ListOffset: arrow::array::OffsetSizeTrait,
+    >(
+        is_list: bool,
+    ) {
+        let ds =
+            create_fts_dataset::<Offset, ListOffset>(is_list, false, TokenizerConfig::default())
+                .await;
         let result = ds
             .scan()
             .project(&["id"])
@@ -5034,7 +5190,9 @@ mod tests {
         assert!(err.contains("position is not found but required for phrase queries, try recreating the index with position"),"{}",err);
 
         // recreate the index with position
-        let ds = create_fts_dataset::<Offset>(true, TokenizerConfig::default()).await;
+        let ds =
+            create_fts_dataset::<Offset, ListOffset>(is_list, true, TokenizerConfig::default())
+                .await;
         let result = ds
             .scan()
             .project(&["id"])
@@ -5117,17 +5275,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_fts_index_with_string() {
-        test_fts_index::<i32>().await;
+        test_fts_index::<i32, i32>(false).await;
+        test_fts_index::<i32, i32>(true).await;
+        test_fts_index::<i32, i64>(true).await;
     }
 
     #[tokio::test]
     async fn test_fts_index_with_large_string() {
-        test_fts_index::<i64>().await;
+        test_fts_index::<i64, i32>(false).await;
+        test_fts_index::<i64, i32>(true).await;
+        test_fts_index::<i64, i64>(true).await;
     }
 
     #[tokio::test]
     async fn test_fts_accented_chars() {
-        let ds = create_fts_dataset::<i32>(false, TokenizerConfig::default()).await;
+        let ds = create_fts_dataset::<i32, i32>(false, false, TokenizerConfig::default()).await;
         let result = ds
             .scan()
             .project(&["id"])
@@ -5151,8 +5313,12 @@ mod tests {
         assert_eq!(result.num_rows(), 0);
 
         // with ascii folding enabled, the search should be accent-insensitive
-        let ds =
-            create_fts_dataset::<i32>(false, TokenizerConfig::default().ascii_folding(true)).await;
+        let ds = create_fts_dataset::<i32, i32>(
+            false,
+            false,
+            TokenizerConfig::default().ascii_folding(true),
+        )
+        .await;
         let result = ds
             .scan()
             .project(&["id"])

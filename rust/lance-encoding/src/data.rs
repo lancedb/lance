@@ -1280,7 +1280,7 @@ fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
     let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
     match arrow_select::concat::concat(&array_refs) {
         Ok(array) => array,
-        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError { .. }) => {
+        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
             // Slow, but hopefully a corner case.  Optimize later
             let upscaled = array_refs
                 .iter()
@@ -1293,7 +1293,7 @@ fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
                         ),
                     ) {
                         Ok(arr) => arr,
-                        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError { .. }) => {
+                        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
                             // Technically I think this means the input type was u64 already
                             unimplemented!("Dictionary arrays with more than 2^32 unique values")
                         }
@@ -1305,7 +1305,7 @@ fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
             // Can still fail if concat pushes over u32 boundary
             match arrow_select::concat::concat(&array_refs) {
                 Ok(array) => array,
-                Err(arrow_schema::ArrowError::DictionaryKeyOverflowError { .. }) => {
+                Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
                     unimplemented!("Dictionary arrays with more than 2^32 unique values")
                 }
                 err => err.unwrap(),

@@ -829,9 +829,9 @@ impl Scanner {
     /// and using the original vector values to re-rank the distances.
     ///
     /// * `factor` - the factor of extra elements to read.  For example, if factor is 2, then
-    ///              the search will read 2x more elements than the requested k before performing
-    ///              the re-ranking. Note: even if the factor is 1, the  results will still be
-    ///              re-ranked without fetching additional elements.
+    ///   the search will read 2x more elements than the requested k before performing
+    ///   the re-ranking. Note: even if the factor is 1, the  results will still be
+    ///   re-ranked without fetching additional elements.
     pub fn refine(&mut self, factor: u32) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.refine_factor = Some(factor)
@@ -1572,18 +1572,27 @@ impl Scanner {
         filter_plan: &FilterPlan,
         query: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let fields = query.columns();
+        let columns = query.columns();
         let params = query.params().with_limit(self.limit.map(|l| l as usize));
-        let query = if fields.is_empty() {
+        let query = if columns.is_empty() {
             // the field is not specified,
             // try to search over all indexed fields
-            let string_columns = self.dataset.schema().fields.iter().filter_map(|f| {
-                if f.data_type() == DataType::Utf8 || f.data_type() == DataType::LargeUtf8 {
-                    Some(&f.name)
-                } else {
-                    None
-                }
-            });
+            let string_columns =
+                self.dataset
+                    .schema()
+                    .fields
+                    .iter()
+                    .filter_map(|f| match f.data_type() {
+                        DataType::Utf8 | DataType::LargeUtf8 => Some(&f.name),
+                        DataType::List(field) | DataType::LargeList(field) => {
+                            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+                                Some(&f.name)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    });
 
             let mut indexed_columns = Vec::new();
             for column in string_columns {

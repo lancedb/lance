@@ -193,7 +193,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         batch_readahead: int = 16,
         to_tensor_fn: Optional[
             Callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
-        ] = None,
+        ] = _to_tensor,
         sampler: Optional[Sampler] = None,
         **kwargs,
     ):
@@ -245,8 +245,6 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.filter = filter
         self.with_row_id = with_row_id
         self.batch_readahead = batch_readahead
-        if to_tensor_fn is None:
-            to_tensor_fn = _to_tensor
         self._to_tensor_fn = to_tensor_fn
         self._hf_converter = None
 

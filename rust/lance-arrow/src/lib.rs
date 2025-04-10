@@ -13,6 +13,7 @@ use arrow_array::{
     GenericListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt32Array,
     UInt8Array,
 };
+use arrow_array::{Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array};
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema};
@@ -235,6 +236,10 @@ pub trait FixedSizeListArrayExt {
     /// assert_eq!(sampled.values().len(), 160);
     /// ```
     fn sample(&self, n: usize) -> Result<FixedSizeListArray>;
+
+    /// Ensure the [FixedSizeListArray] of Float16, Float32, Float64,
+    /// Int8, Int16, Int32, Int64, UInt8, UInt32 type to its closest floating point type.
+    fn convert_to_floating_point(&self) -> Result<FixedSizeListArray>;
 }
 
 impl FixedSizeListArrayExt for FixedSizeListArray {
@@ -252,6 +257,136 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
         let mut rng = SmallRng::from_entropy();
         let chosen = (0..self.len() as u32).choose_multiple(&mut rng, n);
         take(self, &UInt32Array::from(chosen), None).map(|arr| arr.as_fixed_size_list().clone())
+    }
+
+    fn convert_to_floating_point(&self) -> Result<FixedSizeListArray> {
+        match self.data_type() {
+            DataType::FixedSizeList(field, size) => match field.data_type() {
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(self.clone()),
+                DataType::Int8 => Ok(Self::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float32,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float32Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<Int8Array>()
+                            .ok_or(ArrowError::ParseError(
+                                "Fail to cast primitive array to Int8Type".to_string(),
+                            ))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f32)),
+                    )),
+                    self.nulls().cloned(),
+                )),
+                DataType::Int16 => Ok(Self::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float32,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float32Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<Int16Array>()
+                            .ok_or(ArrowError::ParseError(
+                                "Fail to cast primitive array to Int8Type".to_string(),
+                            ))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f32)),
+                    )),
+                    self.nulls().cloned(),
+                )),
+                DataType::Int32 => Ok(Self::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float32,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float32Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .ok_or(ArrowError::ParseError(
+                                "Fail to cast primitive array to Int8Type".to_string(),
+                            ))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f32)),
+                    )),
+                    self.nulls().cloned(),
+                )),
+                DataType::Int64 => Ok(Self::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float64,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float64Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or(ArrowError::ParseError(
+                                "Fail to cast primitive array to Int8Type".to_string(),
+                            ))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f64)),
+                    )),
+                    self.nulls().cloned(),
+                )),
+                DataType::UInt8 => Ok(Self::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float64,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float64Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<UInt8Array>()
+                            .ok_or(ArrowError::ParseError(
+                                "Fail to cast primitive array to Int8Type".to_string(),
+                            ))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f64)),
+                    )),
+                    self.nulls().cloned(),
+                )),
+                DataType::UInt32 => Ok(Self::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float64,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float64Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<UInt32Array>()
+                            .ok_or(ArrowError::ParseError(
+                                "Fail to cast primitive array to Int8Type".to_string(),
+                            ))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f64)),
+                    )),
+                    self.nulls().cloned(),
+                )),
+                data_type => Err(ArrowError::ParseError(format!(
+                    "Expect either floating type or integer got {:?}",
+                    data_type
+                ))),
+            },
+            data_type => Err(ArrowError::ParseError(format!(
+                "Expect either FixedSizeList got {:?}",
+                data_type
+            ))),
+        }
     }
 }
 
@@ -412,6 +547,14 @@ pub trait RecordBatchExt {
     /// Replace a column (specified by name) and return the new [`RecordBatch`].
     fn replace_column_by_name(&self, name: &str, column: Arc<dyn Array>) -> Result<RecordBatch>;
 
+    /// Replace a column schema (specified by name) and return the new [`RecordBatch`].
+    fn replace_column_schema_by_name(
+        &self,
+        name: &str,
+        new_data_type: DataType,
+        column: Arc<dyn Array>,
+    ) -> Result<RecordBatch>;
+
     /// Get (potentially nested) column by qualified name.
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef>;
 
@@ -517,6 +660,37 @@ impl RecordBatchExt for RecordBatch {
             .ok_or_else(|| ArrowError::SchemaError(format!("Field {} does not exist", name)))?;
         columns[field_i] = column;
         Self::try_new(self.schema(), columns)
+    }
+
+    fn replace_column_schema_by_name(
+        &self,
+        name: &str,
+        new_data_type: DataType,
+        column: Arc<dyn Array>,
+    ) -> Result<RecordBatch> {
+        let fields = self
+            .schema()
+            .fields()
+            .iter()
+            .map(|x| {
+                if x.name() != name {
+                    x.clone()
+                } else {
+                    let new_field = Field::new(name, new_data_type.clone(), x.is_nullable());
+                    Arc::new(new_field)
+                }
+            })
+            .collect::<Vec<_>>();
+        let schema = Schema::new_with_metadata(fields, self.schema().metadata.clone());
+        let mut columns = self.columns().to_vec();
+        let field_i = self
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == name)
+            .ok_or_else(|| ArrowError::SchemaError(format!("Field {} does not exist", name)))?;
+        columns[field_i] = column;
+        Self::try_new(Arc::new(schema), columns)
     }
 
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef> {
@@ -822,7 +996,7 @@ impl BufferExt for arrow_buffer::Buffer {
         let mut buf = MutableBuffer::with_capacity(size_bytes);
         let to_fill = size_bytes - bytes.len();
         buf.extend(bytes);
-        buf.extend(std::iter::repeat(0_u8).take(to_fill));
+        buf.extend(std::iter::repeat_n(0_u8, to_fill));
         Self::from(buf)
     }
 }

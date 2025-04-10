@@ -221,7 +221,7 @@ impl IoQueueState {
             && seconds_elapsed < BACKPRESSURE_DEBOUNCE)
             || since_last_warn > BACKPRESSURE_DEBOUNCE
         {
-            tracing::event!(tracing::Level::WARN, "Backpressure throttle exceeded");
+            tracing::event!(tracing::Level::DEBUG, "Backpressure throttle exceeded");
             log::debug!("Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind");
             self.last_warn
                 .store(seconds_elapsed.max(1), Ordering::Release);
@@ -629,8 +629,8 @@ impl ScanScheduler {
     ///
     /// * path - the path to the file to open
     /// * base_priority - the base priority for I/O requests submitted to this file scheduler
-    ///                   this will determine the upper 64 bits of priority (the lower 64 bits
-    ///                   come from `submit_request` and `submit_single`)
+    ///   this will determine the upper 64 bits of priority (the lower 64 bits
+    ///   come from `submit_request` and `submit_single`)
     pub async fn open_file_with_priority(
         self: &Arc<Self>,
         path: &Path,

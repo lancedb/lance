@@ -612,7 +612,7 @@ impl BinaryMiniBlockEncoder {
                 let this_chunk_size = (num_values_in_this_chunk + 1) * 4
                     + (offsets[offsets.len() - 1] - offsets[last_offset_in_orig_idx]) as usize;
 
-                let padded_chunk_size = ((this_chunk_size + 3) / 4) * 4;
+                let padded_chunk_size = this_chunk_size.next_multiple_of(4);
 
                 // the bytes are put after the offsets
                 let this_chunk_bytes_start_offset = (num_values_in_this_chunk + 1) * 4;
@@ -636,7 +636,7 @@ impl BinaryMiniBlockEncoder {
                     + (offsets[this_last_offset_in_orig_idx] - offsets[last_offset_in_orig_idx])
                         as usize;
 
-                let padded_chunk_size = ((this_chunk_size + 3) / 4) * 4;
+                let padded_chunk_size = this_chunk_size.next_multiple_of(4);
 
                 // the bytes are put after the offsets
                 let this_chunk_bytes_start_offset = (num_values_in_this_chunk + 1) * 4;

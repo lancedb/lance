@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -16,9 +17,11 @@ use aws_credential_types::provider::ProvideCredentials;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
+use futures::Stream;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use list_retry::ListRetryStream;
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
 };
@@ -37,6 +40,7 @@ use tokio::sync::RwLock;
 use url::Url;
 
 use super::local::LocalObjectReader;
+mod list_retry;
 mod tracing;
 use self::tracing::ObjectStoreTracingExt;
 use crate::object_writer::WriteResult;
@@ -618,6 +622,13 @@ impl ObjectStore {
             .chain(output.objects.iter().map(|o| &o.location))
             .map(|s| s.filename().unwrap().to_string())
             .collect())
+    }
+
+    pub fn list(
+        &self,
+        path: Option<Path>,
+    ) -> Pin<Box<dyn Stream<Item = Result<ObjectMeta>> + Send>> {
+        Box::pin(ListRetryStream::new(self.inner.clone(), path, 5).map(|m| m.map_err(|e| e.into())))
     }
 
     /// Read all files (start from base directory) recursively

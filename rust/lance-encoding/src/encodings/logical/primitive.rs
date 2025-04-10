@@ -364,7 +364,7 @@ impl DecodeMiniBlockTask {
                 // with 0 (valid)
                 let mut new_levels_vec =
                     LevelBuffer::with_capacity(dest_offset + (range.end - range.start) as usize);
-                new_levels_vec.extend(iter::repeat(0).take(dest_offset));
+                new_levels_vec.extend(iter::repeat_n(0, dest_offset));
                 *levels = Some(new_levels_vec);
             }
             levels.as_mut().unwrap().extend(
@@ -376,7 +376,7 @@ impl DecodeMiniBlockTask {
             let num_values = (range.end - range.start) as usize;
             // This is an all-valid level_buf but we had nulls earlier and so we
             // need to materialize it
-            levels.extend(iter::repeat(0).take(num_values));
+            levels.extend(iter::repeat_n(0, num_values));
         }
     }
 
@@ -2657,7 +2657,6 @@ struct StructuralPrimitiveFieldSchedulingJob<'a> {
     ranges: Vec<Range<u64>>,
     page_idx: usize,
     range_idx: usize,
-    range_offset: u64,
     global_row_offset: u64,
 }
 
@@ -2668,7 +2667,6 @@ impl<'a> StructuralPrimitiveFieldSchedulingJob<'a> {
             ranges,
             page_idx: 0,
             range_idx: 0,
-            range_offset: 0,
             global_row_offset: 0,
         }
     }
@@ -2684,7 +2682,6 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
         }
         // Get our current range
         let mut range = self.ranges[self.range_idx].clone();
-        range.start += self.range_offset;
         let priority = range.start;
 
         let mut cur_page = &self.scheduler.page_schedulers[self.page_idx];
@@ -3690,7 +3687,7 @@ impl PrimitiveStructuralEncoder {
             // Pad
             let add_padding = |data_buffer: &mut Vec<u8>| {
                 let pad = pad_bytes::<MINIBLOCK_ALIGNMENT>(data_buffer.len());
-                data_buffer.extend(iter::repeat(FILL_BYTE).take(pad));
+                data_buffer.extend(iter::repeat_n(FILL_BYTE, pad));
             };
             add_padding(&mut data_buffer);
 

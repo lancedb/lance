@@ -391,7 +391,7 @@ impl FileReader {
 /// - **reader**: An opened file reader.
 /// - **projection**: The schema of the returning [RecordBatch].
 /// - **predicate**: A function that takes a batch ID and returns true if the batch should be
-///                  returned.
+///   returned.
 ///
 /// Returns:
 /// - A stream of [RecordBatch]s, each one corresponding to one full batch in the file.
