@@ -70,6 +70,9 @@ def dataset(
     index_cache_size: Optional[int] = None,
     storage_options: Optional[Dict[str, str]] = None,
     default_scan_options: Optional[Dict[str, str]] = None,
+    *,
+    index_cache_size_bytes: Optional[int] = None,
+    metadata_cache_size_bytes: Optional[int] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -90,16 +93,6 @@ def dataset(
     commit_lock : optional, lance.commit.CommitLock
         A custom commit lock.  Only needed if your object store does not support
         atomic commits.  See the user guide for more details.
-    index_cache_size : optional, int
-        Index cache size. Index cache is a LRU cache with TTL. This number specifies the
-        number of index pages, for example, IVF partitions, to be cached in
-        the host memory. Default value is ``256``.
-
-        Roughly, for an ``IVF_PQ`` partition with ``n`` rows, the size of each index
-        page equals the combination of the pq code (``nd.array([n,pq], dtype=uint8))``
-        and the row ids (``nd.array([n], dtype=uint64)``).
-        Approximately, ``n = Total Rows / number of IVF partitions``.
-        ``pq = number of PQ sub-vectors``.
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
@@ -115,7 +108,29 @@ def dataset(
         fields such as ``_rowid`` or ``_rowaddr``.  If ``default_scan_options`` is
         provided then the schema returned by :py:meth:`lance.LanceDataset.schema` will
         include these fields if the appropriate scan options are set.
+    index_cache_size_bytes : optional, int
+        Size of index cache in bytes. This cache indices in memory for faster
+        index lookups. The default size is 6 GiB.
+    metadata_cache_size_bytes : optional, int
+        Size of metadata cache in bytes. This cache metadata in memory for faster
+        opening of tables and scans. The default size is 1 GiB.
+    index_cache_size : optional, int
+        DEPRECATED: Use `index_cache_size_bytes` instead.
+        Index cache size. Index cache is a LRU cache with TTL. This number specifies the
+        number of index pages, for example, IVF partitions, to be cached in
+        the host memory. Default value is ``256``.
+
+        Roughly, for an ``IVF_PQ`` partition with ``n`` rows, the size of each index
+        page equals the combination of the pq code (``nd.array([n,pq], dtype=uint8))``
+        and the row ids (``nd.array([n], dtype=uint64)``).
+        Approximately, ``n = Total Rows / number of IVF partitions``.
+        ``pq = number of PQ sub-vectors``.
     """
+    if index_cache_size is not None:
+        warnings.warn(
+            "index_cache_size is deprecated. Use index_cache_size_bytes instead.",
+            DeprecationWarning,
+        )
     ds = LanceDataset(
         uri,
         version,
@@ -124,6 +139,8 @@ def dataset(
         index_cache_size=index_cache_size,
         storage_options=storage_options,
         default_scan_options=default_scan_options,
+        index_cache_size_bytes=index_cache_size_bytes,
+        metadata_cache_size_bytes=metadata_cache_size_bytes,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -142,6 +159,10 @@ def dataset(
                 block_size,
                 commit_lock=commit_lock,
                 index_cache_size=index_cache_size,
+                storage_options=storage_options,
+                default_scan_options=default_scan_options,
+                index_cache_size_bytes=index_cache_size_bytes,
+                metadata_cache_size_bytes=metadata_cache_size_bytes,
             )
     else:
         return ds

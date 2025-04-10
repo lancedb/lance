@@ -3204,7 +3204,6 @@ dependencies = [
  "lance-table",
  "lazy_static",
  "log",
- "moka",
  "object_store",
  "permutation",
  "pin-project",

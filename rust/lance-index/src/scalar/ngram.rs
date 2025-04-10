@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -640,7 +640,7 @@ impl NGramIndexBuilder {
         let spill_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local(),
             Path::from_filesystem_path(tmpdir.path())?,
-            FileMetadataCache::no_cache(),
+            LanceCache::no_cache(),
         ));
 
         Ok(Self {
@@ -1166,7 +1166,7 @@ mod tests {
     use datafusion_common::DataFusionError;
     use futures::{stream, TryStreamExt};
     use itertools::Itertools;
-    use lance_core::{cache::FileMetadataCache, utils::mask::RowIdTreeMap};
+    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
@@ -1236,7 +1236,7 @@ mod tests {
         let test_store = LanceIndexStore::new(
             ObjectStore::local(),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            LanceCache::no_cache(),
         );
 
         builder
@@ -1440,7 +1440,7 @@ mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local(),
             Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            LanceCache::no_cache(),
         ));
 
         index.update(data, test_store.as_ref()).await.unwrap();
@@ -1475,7 +1475,7 @@ mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local(),
             Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            LanceCache::no_cache(),
         ));
 
         let remapping = HashMap::from([(2, Some(100)), (3, None), (4, Some(101))]);
@@ -1515,7 +1515,7 @@ mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local(),
             Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            LanceCache::no_cache(),
         ));
 
         index.update(data, test_store.as_ref()).await.unwrap();

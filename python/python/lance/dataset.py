@@ -192,7 +192,28 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]] = None,
         serialized_manifest: Optional[bytes] = None,
         default_scan_options: Optional[Dict[str, Any]] = None,
+        *,
+        index_cache_size_bytes: Optional[int] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
     ):
+        if index_cache_size is not None:
+            warnings.warn(
+                "index_cache_size is deprecated. Use index_cache_size_bytes instead.",
+                DeprecationWarning,
+            )
+            if index_cache_size_bytes is None:
+                # Assume 128 MiB per entry
+                index_cache_size_bytes = index_cache_size * 128 * 1024 * 1024
+        if metadata_cache_size is not None:
+            warnings.warn(
+                "metadata_cache_size is deprecated. Use "
+                "metadata_cache_size_bytes instead.",
+                DeprecationWarning,
+            )
+            if metadata_cache_size_bytes is None:
+                # Assume 1 MiB per entry
+                metadata_cache_size_bytes = metadata_cache_size * 1024 * 1024
+
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._storage_options = storage_options
@@ -205,6 +226,8 @@ class LanceDataset(pa.dataset.Dataset):
             commit_lock,
             storage_options,
             serialized_manifest,
+            index_cache_size_bytes=index_cache_size_bytes,
+            metadata_cache_size_bytes=metadata_cache_size_bytes,
         )
         self._default_scan_options = default_scan_options
 
@@ -1786,7 +1809,6 @@ class LanceDataset(pa.dataset.Dataset):
         ] = None,
         num_sub_vectors: Optional[int] = None,
         accelerator: Optional[Union[str, "torch.Device"]] = None,
-        index_cache_size: Optional[int] = None,
         shuffle_partition_batches: Optional[int] = None,
         shuffle_partition_concurrency: Optional[int] = None,
         # experimental parameters
@@ -1838,8 +1860,6 @@ class LanceDataset(pa.dataset.Dataset):
             If set, use an accelerator to speed up the training process.
             Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
             If not set, use the CPU.
-        index_cache_size : int, optional
-            The size of the index cache in number of entries. Default value is 256.
         shuffle_partition_batches : int, optional
             The number of batches, using the row group size of the dataset, to include
             in each shuffle partition. Default value is 10240.

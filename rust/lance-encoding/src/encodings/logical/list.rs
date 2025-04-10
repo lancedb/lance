@@ -17,7 +17,7 @@ use log::trace;
 use snafu::location;
 use tokio::task::JoinHandle;
 
-use lance_core::{cache::FileMetadataCache, Error, Result};
+use lance_core::{cache::LanceCache, Error, Result};
 
 use crate::{
     buffer::LanceBuffer,
@@ -329,7 +329,7 @@ async fn indirect_schedule_task(
     items_scheduler: Arc<dyn FieldScheduler>,
     items_type: DataType,
     io: Arc<dyn EncodingsIo>,
-    cache: Arc<FileMetadataCache>,
+    cache: Arc<LanceCache>,
     priority: Box<dyn PriorityRange>,
 ) -> Result<IndirectlyLoaded> {
     let num_offsets = offsets_decoder.num_rows();

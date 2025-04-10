@@ -22,7 +22,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID};
@@ -130,7 +130,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let file_metadata_cache = session
             .upgrade()
             .map(|sess| sess.file_metadata_cache.clone())
-            .unwrap_or_else(FileMetadataCache::no_cache);
+            .unwrap_or_else(LanceCache::no_cache);
         let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
         let index_reader = FileReader::try_open(
             scheduler.open_file(&uri).await?,
@@ -223,7 +223,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             location: location!(),
         })?;
         let part_entry = if let Some(part_idx) =
-            session.index_cache.get_vector_partition(&cache_key)
+            session.index_cache.get::<PartitionEntry<S, Q>>(&cache_key)
         {
             part_idx
         } else {
@@ -245,7 +245,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
             // check the cache again, as the partition may have been loaded by another
             // thread that held the lock on loading the partition
-            if let Some(part_idx) = session.index_cache.get_vector_partition(&cache_key) {
+            if let Some(part_idx) = session.index_cache.get::<PartitionEntry<S, Q>>(&cache_key) {
                 part_idx
             } else {
                 let schema = Arc::new(self.reader.schema().as_ref().into());
@@ -283,7 +283,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 if write_cache {
                     session
                         .index_cache
-                        .insert_vector_partition(&cache_key, partition_entry.clone());
+                        .insert_unsized(cache_key, partition_entry.clone());
                 }
 
                 partition_entry

@@ -82,7 +82,7 @@ async fn read_dataset_transaction_file(
     dataset
         .session
         .file_metadata_cache
-        .get_or_insert(&cache_path, |_| async move {
+        .get_or_insert(cache_path.to_string(), |_| async move {
             let dataset_version = dataset.checkout_version(version).await?;
             let object_store = dataset_version.object_store();
             let path = dataset_version
@@ -191,7 +191,7 @@ async fn do_commit_new_dataset(
     match result {
         Ok(manifest_location) => {
             session.file_metadata_cache.insert(
-                transaction_file_cache_path(base_path, manifest.version),
+                transaction_file_cache_path(base_path, manifest.version).to_string(),
                 Arc::new(transaction.clone()),
             );
             Ok((manifest, manifest_location.path, manifest_location.e_tag))
@@ -831,7 +831,7 @@ pub(crate) async fn commit_transaction(
                 dataset
                     .session()
                     .file_metadata_cache
-                    .insert(cache_path, Arc::new(transaction.clone()));
+                    .insert(cache_path.to_string(), Arc::new(transaction.clone()));
 
                 return Ok((manifest, manifest_location.path, manifest_location.e_tag));
             }
