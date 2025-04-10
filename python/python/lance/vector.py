@@ -507,7 +507,7 @@ def compute_partitions(
                 assert vecs.shape[0] == ids.shape[0]
 
                 # Ignore any invalid vectors.
-                mask_gpu = partitions.isfinite()
+                mask_gpu = partitions.isfinite() & (partitions >= 0)
                 mask = mask_gpu.cpu()
                 ids = ids[mask]
                 partitions = partitions[mask_gpu]
