@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::borrow::Cow;
+use std::collections::BinaryHeap;
+use std::pin::Pin;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
@@ -189,6 +191,112 @@ impl ExecutionPlanMetricsSetExt for ExecutionPlanMetricsSet {
                 count: count.clone(),
             });
         count
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Intermediate<K: Ord + Clone, V> {
+    idx: usize,
+    key: K,
+    value: V,
+}
+
+impl<K: Ord + Clone, V> Intermediate<K, V> {
+    fn new(idx: usize, key: K, value: V) -> Self {
+        Self { idx, key, value }
+    }
+}
+
+impl<K: Ord + Clone, V> PartialEq for Intermediate<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl<K: Ord + Clone, V> Eq for Intermediate<K, V> {}
+
+impl<K: Ord + Clone, V> PartialOrd for Intermediate<K, V> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<K: Ord + Clone, V> Ord for Intermediate<K, V> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+/// A stream that merges multiple streams in order of key.
+/// All the stream must have the same schema, and the key must be produced
+/// in the same order.
+pub struct BatchMergeStream<K: Ord + Clone, Item> {
+    streams: Vec<Pin<Box<dyn Stream<Item = Result<(K, Item)>> + Send>>>,
+    heap: BinaryHeap<std::cmp::Reverse<Intermediate<K, Item>>>,
+}
+
+impl<K: Ord + Clone, Item> BatchMergeStream<K, Item> {
+    pub async fn try_new(
+        mut streams: Vec<Pin<Box<dyn Stream<Item = Result<(K, Item)>> + Send>>>,
+    ) -> Result<Self> {
+        // get the first batch from each stream
+        let mut heap = BinaryHeap::with_capacity(streams.len());
+        let mut futures = Vec::with_capacity(streams.len());
+        for stream in streams.iter_mut() {
+            let fut = stream.try_next();
+            futures.push(fut);
+        }
+        let results = futures::future::try_join_all(futures).await?;
+        for (i, result) in results.into_iter().enumerate() {
+            if let Some((key, batch)) = result {
+                heap.push(std::cmp::Reverse(Intermediate::new(i, key, batch)));
+            }
+        }
+
+        Ok(Self { streams, heap })
+    }
+}
+
+impl<K: Ord + Clone + Unpin, Item: Unpin> Stream for BatchMergeStream<K, Item> {
+    type Item = Result<Item>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.heap.is_empty() {
+            return std::task::Poll::Ready(None);
+        }
+
+        let intermediate = this.heap.pop().unwrap().0;
+
+        // consume the stream that produced the value,
+        // and push the next value to the heap
+        let stream = &mut this.streams[intermediate.idx];
+        loop {
+            match stream.poll_next_unpin(cx) {
+                std::task::Poll::Ready(Some(Ok((key, value)))) => {
+                    this.heap.push(std::cmp::Reverse(Intermediate::new(
+                        intermediate.idx,
+                        key,
+                        value,
+                    )));
+                    return std::task::Poll::Ready(Some(Ok(intermediate.value)));
+                }
+                std::task::Poll::Ready(Some(Err(err))) => {
+                    return std::task::Poll::Ready(Some(Err(err)));
+                }
+                std::task::Poll::Ready(None) => {
+                    // stream is done, we can just return the value
+                    return std::task::Poll::Ready(Some(Ok(intermediate.value)));
+                }
+                std::task::Poll::Pending => {
+                    // stream is not ready yet, keep waiting
+                    continue;
+                }
+            }
+        }
     }
 }
 

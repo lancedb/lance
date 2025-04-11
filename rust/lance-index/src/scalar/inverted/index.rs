@@ -983,7 +983,7 @@ impl Ord for DocInfo {
 // It's used to sort the documents by the bm25 score
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct DocSet {
-    // row id -> (num tokens, norm_len)
+    // row id -> num tokens
     token_count: HashMap<u64, u32>,
     total_tokens: u64,
 }
