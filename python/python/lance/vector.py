@@ -685,7 +685,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
                 assert vecs.shape[0] == ids.shape[0]
 
                 # Ignore any invalid vectors.
-                mask_gpu = partitions.isfinite()
+                mask_gpu = partitions.isfinite() & (partitions >= 0)
                 ids = ids.to(ivf_kmeans.device)[mask_gpu].cpu().reshape(-1)
                 partitions = partitions[mask_gpu].cpu()
                 vecs = vecs[mask_gpu]
