@@ -39,6 +39,26 @@ impl Default for FtsSearchParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Operator {
+    And,
+    Or,
+}
+
+impl TryFrom<&str> for Operator {
+    type Error = Error;
+    fn try_from(value: &str) -> Result<Self> {
+        match value.to_ascii_uppercase().as_str() {
+            "AND" => Ok(Self::And),
+            "OR" => Ok(Self::Or),
+            _ => Err(Error::invalid_input(
+                format!("Invalid operator: {}", value),
+                location!(),
+            )),
+        }
+    }
+}
+
 pub trait FtsQueryNode {
     fn columns(&self) -> HashSet<String>;
 }
@@ -180,6 +200,12 @@ pub struct MatchQuery {
     /// The maximum number of terms to expand for fuzzy matching.
     /// Default to 50.
     pub max_expansions: usize,
+
+    /// The operator to use for combining terms.
+    /// This can be either `And` or `Or`, it's 'Or' by default.
+    /// - `And`: All terms must match.
+    /// - `Or`: At least one term must match.
+    pub operator: Operator,
 }
 
 impl MatchQuery {
@@ -190,6 +216,7 @@ impl MatchQuery {
             boost: 1.0,
             fuzziness: Some(0),
             max_expansions: 50,
+            operator: Operator::Or,
         }
     }
 
@@ -210,6 +237,11 @@ impl MatchQuery {
 
     pub fn with_max_expansions(mut self, max_expansions: usize) -> Self {
         self.max_expansions = max_expansions;
+        self
+    }
+
+    pub fn with_operator(mut self, operator: Operator) -> Self {
+        self.operator = operator;
         self
     }
 
@@ -337,7 +369,9 @@ impl<'de> Deserialize<'de> for MultiMatchQuery {
         let data = MultiMatchQueryData::deserialize(deserializer)?;
         let boosts = data.boost.unwrap_or(vec![1.0; data.columns.len()]);
 
-        Self::try_new_with_boosts(data.query, data.columns, boosts)
+        Self::try_new(data.query, data.columns)
+            .map_err(serde::de::Error::custom)?
+            .try_with_boosts(boosts)
             .map_err(serde::de::Error::custom)
     }
 }
@@ -358,28 +392,25 @@ impl MultiMatchQuery {
         Ok(Self { match_queries })
     }
 
-    pub fn try_new_with_boosts(
-        query: String,
-        columns: Vec<String>,
-        boosts: Vec<f32>,
-    ) -> Result<Self> {
-        if boosts.len() != columns.len() {
+    pub fn try_with_boosts(mut self, boosts: Vec<f32>) -> Result<Self> {
+        if boosts.len() != self.match_queries.len() {
             return Err(Error::invalid_input(
-                "The number of boosts must match the number of columns".to_string(),
+                "The number of boosts must match the number of queries".to_string(),
                 location!(),
             ));
         }
 
-        let match_queries = columns
-            .into_iter()
-            .zip(boosts)
-            .map(|(column, boost)| {
-                MatchQuery::new(query.clone())
-                    .with_column(Some(column))
-                    .with_boost(boost)
-            })
-            .collect();
-        Ok(Self { match_queries })
+        for (query, boost) in self.match_queries.iter_mut().zip(boosts) {
+            query.boost = boost;
+        }
+        Ok(self)
+    }
+
+    pub fn with_operator(mut self, operator: Operator) -> Self {
+        for query in &mut self.match_queries {
+            query.operator = operator;
+        }
+        self
     }
 }
 

@@ -3405,9 +3405,7 @@ class ScannerBuilder:
             The columns to search in. If None, search in all indexed columns.
         """
         if isinstance(query, FullTextQuery):
-            self._full_text_query = {
-                "query": query.to_dict(),
-            }
+            self._full_text_query = query.inner
         else:
             self._full_text_query = {
                 "query": query,
