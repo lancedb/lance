@@ -51,6 +51,7 @@ def _to_tensor(
     uint64_as_int64: bool = True,
     hf_converter: Optional[dict] = None,
     use_blob_api: bool = False,
+    pin_memory: bool = False,
     **kwargs,
 ) -> Union[dict[str, torch.Tensor], torch.Tensor]:
     """Convert a pyarrow RecordBatch to torch Tensor."""
@@ -104,6 +105,9 @@ def _to_tensor(
 
         del arr
         ret[col] = tensor
+        if pin_memory is not None:
+            # Pin memory if requested
+            tensor = tensor.pin_memory()
     if len(ret) == 1:
         t = next(iter(ret.values()))
         del ret
@@ -195,6 +199,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
             Callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
         ] = _to_tensor,
         sampler: Optional[Sampler] = None,
+        pin_memory: bool = False,
         **kwargs,
     ):
         """Use PyTorch Dataset API to read Lance dataset.
@@ -247,6 +252,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.batch_readahead = batch_readahead
         self._to_tensor_fn = to_tensor_fn
         self._hf_converter = None
+        self.pin_memory = pin_memory
 
         self._blob_columns = self._blob_columns()
         if self._blob_columns:
@@ -354,7 +360,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 batch = dict_batch
             if self._to_tensor_fn is not None:
                 batch = self._to_tensor_fn(
-                    batch, hf_converter=self._hf_converter, use_blob_api=use_blob_api
+                    batch, hf_converter=self._hf_converter, use_blob_api=use_blob_api, pin_memory=self.pin_memory
                 )
             yield batch
             del batch

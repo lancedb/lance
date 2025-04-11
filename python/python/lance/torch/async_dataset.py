@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import contextlib
-from multiprocessing import Process, Queue, Value
+from multiprocessing import Queue, Value, get_context
 from typing import Callable, Iterable
 
 from torch.utils.data import IterableDataset
@@ -41,17 +41,18 @@ class AsyncDataset(IterableDataset):
         *,
         queue_size: int = 4,
     ):
+        self._ctx = get_context("spawn")
         self.dataset_creator = dataset_creator
-        self.queue = Queue(maxsize=queue_size)
+        self.queue = self._ctx.Queue(maxsize=queue_size)
         self.started = False
 
-        self.shutdown = Value("b", False)
+        self.shutdown = self._ctx.Value("b", False)
 
     def _start(self):
         if self.started:
             return
         self.started = True
-        self.worker = Process(
+        self.worker = self._ctx.Process(
             target=_worker_ep,
             args=(self.dataset_creator, self.queue, self.shutdown),
         )

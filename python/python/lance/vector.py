@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import functools
 import re
 import tempfile
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union
@@ -638,116 +639,123 @@ def one_pass_assign_ivf_pq_on_accelerator(
     else:
         filt = None
 
-    torch_ds = TorchDataset(
-        dataset,
-        batch_size=batch_size,
-        with_row_id=True,
-        columns=[column],
-        filter=filt,
-    )
-    loader = torch.utils.data.DataLoader(
-        torch_ds,
-        batch_size=1,
-        pin_memory=True,
-        collate_fn=_collate_fn,
-    )
+    from .torch.async_dataset import async_dataset
 
-    num_sub_vectors = len(pq_kmeans_list)
-    dim = ivf_kmeans.centroids.shape[1]
-    subvector_size = dim // num_sub_vectors
+    with async_dataset(
+        functools.partial(
+            TorchDataset,
+            dataset,
+            batch_size=batch_size,
+            with_row_id=True,
+            columns=[column],
+            filter=filt,
+        )
+    ) as torch_ds:
+        loader = torch.utils.data.DataLoader(
+            torch_ds,
+            batch_size=1,
+            pin_memory=True,
+            collate_fn=_collate_fn,
+        )
 
-    output_schema = pa.schema(
-        [
-            pa.field("_rowid", pa.uint64()),
-            pa.field("__ivf_part_id", pa.uint32()),
-            pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
-        ]
-    )
+        num_sub_vectors = len(pq_kmeans_list)
+        dim = ivf_kmeans.centroids.shape[1]
+        subvector_size = dim // num_sub_vectors
 
-    progress = tqdm(total=num_rows)
+        output_schema = pa.schema(
+            [
+                pa.field("_rowid", pa.uint64()),
+                pa.field("__ivf_part_id", pa.uint32()),
+                pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
+            ]
+        )
 
-    progress.set_description("Assigning partitions and computing pq codes")
+        progress = tqdm(total=num_rows)
 
-    def _partition_and_pq_codes_assignment() -> Iterable[pa.RecordBatch]:
-        with torch.no_grad():
-            first_iter = True
-            for batch in loader:
-                vecs = (
-                    batch[column]
-                    .to(ivf_kmeans.device)
-                    .reshape(-1, ivf_kmeans.centroids.shape[1])
-                )
+        progress.set_description("Assigning partitions and computing pq codes")
 
-                partitions = ivf_kmeans.transform(vecs)
-                ids = batch["_rowid"].reshape(-1)
-
-                # this is expected to be true, so just assert
-                assert vecs.shape[0] == ids.shape[0]
-
-                # Ignore any invalid vectors.
-                mask_gpu = partitions.isfinite()
-                ids = ids.to(ivf_kmeans.device)[mask_gpu].cpu().reshape(-1)
-                partitions = partitions[mask_gpu].cpu()
-                vecs = vecs[mask_gpu]
-
-                residual_vecs = vecs - ivf_kmeans.centroids[partitions]
-                # cast centroids to the same dtype as vecs
-                if first_iter:
-                    first_iter = False
-                    LOGGER.info("Residual shape: %s", residual_vecs.shape)
-                    for kmeans in pq_kmeans_list:
-                        cents: torch.Tensor = kmeans.centroids
-                        kmeans.centroids = cents.to(
-                            dtype=vecs.dtype, device=ivf_kmeans.device
-                        )
-                pq_codes = torch.stack(
-                    [
-                        pq_kmeans_list[i].transform(
-                            residual_vecs[
-                                :, i * subvector_size : (i + 1) * subvector_size
-                            ]
-                        )
-                        for i in range(num_sub_vectors)
-                    ],
-                    dim=1,
-                )
-                pq_codes = pq_codes.to(torch.uint8)
-
-                pq_values = pa.array(pq_codes.cpu().numpy().reshape(-1))
-                pq_codes = pa.FixedSizeListArray.from_arrays(pq_values, num_sub_vectors)
-                part_batch = pa.RecordBatch.from_arrays(
-                    [ids, partitions, pq_codes],
-                    schema=output_schema,
-                )
-
-                if len(part_batch) < len(ids):
-                    LOGGER.warning(
-                        "%s vectors are ignored during partition assignment",
-                        len(part_batch) - len(ids),
+        def _partition_and_pq_codes_assignment() -> Iterable[pa.RecordBatch]:
+            with torch.no_grad():
+                first_iter = True
+                for batch in loader:
+                    vecs = (
+                        batch[column]
+                        .to(ivf_kmeans.device)
+                        .reshape(-1, ivf_kmeans.centroids.shape[1])
                     )
 
-                progress.update(part_batch.num_rows)
-                yield part_batch
+                    partitions = ivf_kmeans.transform(vecs)
+                    ids = batch["_rowid"].reshape(-1)
 
-    rbr = pa.RecordBatchReader.from_batches(
-        output_schema, _partition_and_pq_codes_assignment()
-    )
-    if dst_dataset_uri is None:
-        dst_dataset_uri = tempfile.mkdtemp()
-    ds = write_dataset(
-        rbr,
-        dst_dataset_uri,
-        schema=output_schema,
-        data_storage_version="legacy",
-    )
+                    # this is expected to be true, so just assert
+                    assert vecs.shape[0] == ids.shape[0]
 
-    progress.close()
+                    # Ignore any invalid vectors.
+                    mask_gpu = partitions.isfinite()
+                    ids = ids.to(ivf_kmeans.device)[mask_gpu].cpu().reshape(-1)
+                    partitions = partitions[mask_gpu].cpu()
+                    vecs = vecs[mask_gpu]
 
-    LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
+                    residual_vecs = vecs - ivf_kmeans.centroids[partitions]
+                    # cast centroids to the same dtype as vecs
+                    if first_iter:
+                        first_iter = False
+                        LOGGER.info("Residual shape: %s", residual_vecs.shape)
+                        for kmeans in pq_kmeans_list:
+                            cents: torch.Tensor = kmeans.centroids
+                            kmeans.centroids = cents.to(
+                                dtype=vecs.dtype, device=ivf_kmeans.device
+                            )
+                    pq_codes = torch.stack(
+                        [
+                            pq_kmeans_list[i].transform(
+                                residual_vecs[
+                                    :, i * subvector_size : (i + 1) * subvector_size
+                                ]
+                            )
+                            for i in range(num_sub_vectors)
+                        ],
+                        dim=1,
+                    )
+                    pq_codes = pq_codes.to(torch.uint8)
 
-    shuffle_buffers = [
-        data_file.path()
-        for frag in ds.get_fragments()
-        for data_file in frag.data_files()
-    ]
-    return dst_dataset_uri, shuffle_buffers
+                    pq_values = pa.array(pq_codes.cpu().numpy().reshape(-1))
+                    pq_codes = pa.FixedSizeListArray.from_arrays(
+                        pq_values, num_sub_vectors
+                    )
+                    part_batch = pa.RecordBatch.from_arrays(
+                        [ids, partitions, pq_codes],
+                        schema=output_schema,
+                    )
+
+                    if len(part_batch) < len(ids):
+                        LOGGER.warning(
+                            "%s vectors are ignored during partition assignment",
+                            len(part_batch) - len(ids),
+                        )
+
+                    progress.update(part_batch.num_rows)
+                    yield part_batch
+
+        rbr = pa.RecordBatchReader.from_batches(
+            output_schema, _partition_and_pq_codes_assignment()
+        )
+        if dst_dataset_uri is None:
+            dst_dataset_uri = tempfile.mkdtemp()
+        ds = write_dataset(
+            rbr,
+            dst_dataset_uri,
+            schema=output_schema,
+            data_storage_version="legacy",
+        )
+
+        progress.close()
+
+        LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
+
+        shuffle_buffers = [
+            data_file.path()
+            for frag in ds.get_fragments()
+            for data_file in frag.data_files()
+        ]
+        return dst_dataset_uri, shuffle_buffers
