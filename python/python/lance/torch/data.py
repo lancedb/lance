@@ -41,7 +41,7 @@ def _fsl_to_tensor(arr: pa.FixedSizeListArray, dimension: int) -> torch.Tensor:
     num_vals = len(arr) * dimension
     values = values.slice(start, num_vals)
     # Convert to numpy
-    nparr = values.to_numpy(zero_copy_only=True).reshape(-1, dimension)
+    nparr = values.to_numpy(zero_copy_only=False).reshape(-1, dimension)
     return torch.from_numpy(nparr)
 
 
@@ -89,7 +89,7 @@ def _to_tensor(
             or pa.types.is_floating(arr.type)
             or pa.types.is_boolean(arr.type)
         ):
-            tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=True))
+            tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=False))
 
             if uint64_as_int64 and tensor.dtype == torch.uint64:
                 tensor = tensor.to(torch.int64)
