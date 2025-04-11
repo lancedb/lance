@@ -639,7 +639,7 @@ mod tests {
     use std::{ops::Range, sync::Arc};
 
     use all_asserts::{assert_ge, assert_lt};
-    use arrow::datatypes::{UInt64Type, UInt8Type};
+    use arrow::datatypes::{Float64Type, UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, FixedSizeListArray, Float32Array,
@@ -852,6 +852,15 @@ mod tests {
             }
             _ => {
                 test_index_impl::<Float32Type>(
+                    params.clone(),
+                    nlist,
+                    recall_requirement,
+                    0.0..1.0,
+                    dataset.clone(),
+                )
+                .await;
+
+                test_index_impl::<Float64Type>(
                     params,
                     nlist,
                     recall_requirement,
