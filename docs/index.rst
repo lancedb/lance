@@ -66,6 +66,7 @@ Preview releases receive the same level of testing as regular releases.
    Tensorflow <./integrations/tensorflow>
    PyTorch <./integrations/pytorch>
    Ray <./integrations/ray>
+   Spark <./integrations/spark>
 
 .. toctree::
    :maxdepth: 1
