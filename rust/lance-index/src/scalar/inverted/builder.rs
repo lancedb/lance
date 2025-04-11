@@ -6,6 +6,7 @@ use std::fmt::Debug;
 use std::hash::{DefaultHasher, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::{IndexReader, IndexStore, IndexWriter, InvertedIndexParams};
@@ -102,8 +103,13 @@ impl InvertedIndexBuilder {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
+        let start = std::time::Instant::now();
         self.update_index(new_data).await?;
+        println!("FTS indexing documents elapsed {:?}", start.elapsed());
+
+        let start = std::time::Instant::now();
         self.write(dest_store).await?;
+        println!("FTS writing documents elapsed {:?}", start.elapsed());
         Ok(())
     }
 
@@ -126,155 +132,88 @@ impl InvertedIndexBuilder {
             }
         });
 
-        let num_shards = *LANCE_FTS_NUM_SHARDS;
+        let num_workers = *LANCE_FTS_NUM_SHARDS;
 
         // init the token maps
-        let mut token_maps = vec![HashMap::new(); num_shards];
-
-        match self.tokens.tokens {
-            TokenMap::HashMap(ref tokens) => {
-                for (token, token_id) in tokens.iter() {
-                    let mut hasher = DefaultHasher::new();
-                    hasher.write(token.as_bytes());
-                    let shard = hasher.finish() as usize % num_shards;
-                    token_maps[shard].insert(token.clone(), *token_id);
-                }
-            }
+        let token_map = match self.tokens.tokens {
+            TokenMap::HashMap(ref tokens) => tokens.clone(),
             _ => unreachable!("tokens must be HashMap at indexing"),
-        }
+        };
 
         // spawn `num_shards` workers to build the index,
-        // this thread will consume the stream and send the tokens to the workers,
-        // because the workers can be CPU intensive, we need to limit concurrency the consuming stream,
-        // so it's `num_cpus - num_shards`, and higher than `num_shards` may not help much, so we also limit it to `num_shards`
-        let buffer_size = get_num_compute_intensive_cpus()
-            .saturating_sub(num_shards)
-            .max(1)
-            .min(num_shards);
-        let mut result_futs = Vec::with_capacity(num_shards);
-        let mut senders = Vec::with_capacity(num_shards);
-        for token_map in token_maps.into_iter() {
-            let inverted_list = self.inverted_list.clone();
-            let mut worker = IndexWorker::new(token_map, self.params.with_position).await?;
-
-            let (sender, mut receiver) = tokio::sync::mpsc::channel(buffer_size);
-            senders.push(sender);
-            result_futs.push(tokio::spawn({
-                async move {
-                    while let Some((row_id, tokens, positions)) = receiver.recv().await {
-                        worker.add(row_id, tokens, positions).await?;
-                    }
-                    let reader = worker.into_reader(inverted_list).await?;
-                    Result::Ok(reader)
-                }
-            }));
-        }
-
-        let start = std::time::Instant::now();
-        let senders = Arc::new(senders);
-        let tokenizer_pool = Arc::new(ArrayQueue::new(num_shards));
+        // this thread will consume the stream and send the tokens to the workers.
         let tokenizer = self.params.tokenizer_config.build()?;
-        for _ in 0..num_shards {
-            let _ = tokenizer_pool.push(tokenizer.clone());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(num_workers);
+        let mut workers = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let worker = IndexWorker::new(
+                tokenizer.clone(),
+                token_map.clone(),
+                self.params.with_position,
+            )
+            .await?;
+            workers.push(worker);
         }
+
+        let indexing_task = tokio::spawn({
+            async move {
+                let mut wokrer_id = 0;
+                while let Some(batch) = receiver.recv().await {
+                    workers[wokrer_id].process_batch(batch).await?;
+                    wokrer_id = (wokrer_id + 1) % num_workers;
+                }
+                Result::Ok(workers)
+            }
+        });
         let mut stream = flatten_stream
-            .map(move |batch| {
-                let senders = senders.clone();
-                let tokenizer_pool = tokenizer_pool.clone();
-                CPU_RUNTIME.spawn_blocking(move || {
+            .map(|batch| {
+                let sender = sender.clone();
+                async move {
                     let batch = batch?;
-
-                    let doc_col = batch.column(0);
-                    let doc_iter = iter_str_array(doc_col);
-                    let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-                    let docs = doc_iter
-                        .zip(row_id_col.values().iter())
-                        .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
-
-                    let mut tokenizer = tokenizer_pool.pop().unwrap();
-
-                    let num_tokens = docs
-                        .map(|(doc, row_id)| {
-                            // tokenize the document
-                            let predicted_num_tokens = doc.len() / 5 / num_shards;
-                            let mut token_buffers = std::iter::repeat_with(|| {
-                                (
-                                    StringBuilder::with_capacity(
-                                        predicted_num_tokens,
-                                        doc.len() / num_shards,
-                                    ),
-                                    Int32Builder::with_capacity(predicted_num_tokens),
-                                )
-                            })
-                            .take(num_shards)
-                            .collect_vec();
-                            let mut num_tokens = 0;
-                            let mut token_stream = tokenizer.token_stream(doc);
-                            while token_stream.advance() {
-                                let token = token_stream.token_mut();
-                                let mut hasher = DefaultHasher::new();
-                                hasher.write(token.text.as_bytes());
-                                let shard = hasher.finish() as usize % num_shards;
-                                let (ref mut token_builder, ref mut position_builder) =
-                                    &mut token_buffers[shard];
-                                token_builder.append_value(&token.text);
-                                position_builder.append_value(token.position as i32);
-                                num_tokens += 1;
-                            }
-
-                            for (shard, (token_builder, position_builder)) in
-                                token_buffers.iter_mut().enumerate()
-                            {
-                                if token_builder.is_empty() {
-                                    continue;
-                                }
-
-                                let tokens = token_builder.finish();
-                                let positions = position_builder.finish();
-                                senders[shard]
-                                    .blocking_send((row_id, tokens, positions))
-                                    .unwrap();
-                            }
-
-                            (row_id, num_tokens)
-                        })
-                        .collect_vec();
-
-                    let _ = tokenizer_pool.push(tokenizer);
-                    Result::Ok(num_tokens)
-                })
+                    let num_rows = batch.num_rows();
+                    sender.send(batch).await.expect("failed to send batch");
+                    Result::Ok(num_rows)
+                }
             })
-            .buffer_unordered(buffer_size);
-        log::info!(
-            "indexing FTS with {} shards and {} buffer concurrency ",
-            num_shards,
-            buffer_size,
-        );
+            .buffer_unordered(8); // let it be faster than IO then it's enough
+        log::info!("indexing FTS with {} workers", num_workers);
 
         let mut last_num_rows = 0;
-        while let Some(num_tokens) = stream.try_next().await? {
-            let num_tokens = num_tokens?;
-            for (row_id, num_tokens) in num_tokens {
-                self.docs.add(row_id, num_tokens);
-            }
-
-            if self.docs.len() >= last_num_rows + 100_000 {
+        let mut total_num_rows = 0;
+        let start = std::time::Instant::now();
+        while let Some(num_rows) = stream.try_next().await? {
+            total_num_rows += num_rows;
+            if total_num_rows >= last_num_rows + 100_000 {
                 log::debug!(
                     "indexed {} documents, elapsed: {:?}, speed: {}rows/s",
-                    self.docs.len(),
+                    num_rows,
                     start.elapsed(),
-                    self.docs.len() as f32 / start.elapsed().as_secs_f32()
+                    num_rows as f32 / start.elapsed().as_secs_f32()
                 );
-                last_num_rows = self.docs.len();
+                last_num_rows = total_num_rows;
             }
         }
-        // drop the stream to stop receivers
+        // drop the sender to stop receivers
         drop(stream);
+        debug_assert_eq!(sender.strong_count(), 1);
+        drop(sender);
+        let duration = std::time::Instant::now() - start;
+        println!("tokenize elapsed: {:?}", duration);
 
         // wait for the workers to finish
-        for result in result_futs {
-            let result = result.await??;
-            self.posting_readers.push(result);
+        let start = std::time::Instant::now();
+        let workers = indexing_task.await??;
+        let duration = std::time::Instant::now() - start;
+        println!("wait workers indexing elapsed: {:?}", duration);
+
+        // update doc set
+        for worker in workers {
+            for (row_id, num_tokens) in
+                std::iter::zip(worker.row_ids.iter(), worker.doc_token_num.iter())
+            {
+                self.docs.add(*row_id, *num_tokens as u32);
+            }
+            self.posting_readers.push(worker.into_reader().await?);
         }
 
         log::info!("FTS indexing documents elapsed {:?}", start.elapsed());
@@ -357,21 +296,20 @@ impl InvertedIndexBuilder {
             )
             .await?;
 
-        let docs = Arc::new(self.docs.clone());
         let mut offsets = Vec::new();
         let mut max_scores = Vec::new();
         let mut num_rows = 0;
         log::info!("writing {} posting lists", self.posting_readers.len());
-        let mut posting_streams = Vec::with_capacity(self.posting_readers.len());
+        let mut posting_streams = Vec::with_capacity(self.posting_readers.len() + 1);
         for reader in std::mem::take(&mut self.posting_readers) {
-            posting_streams.push(reader.stream(docs.clone()).await?);
+            posting_streams.push(reader.into_stream().await?);
         }
+        if let Some(inverted_list_reader) = self.inverted_list.as_ref() {}
         let mut merged_stream = stream::select_all(posting_streams);
         let mut last_num_rows = 0;
         self.tokens = TokenSet::default();
         let start = std::time::Instant::now();
-        while let Some(r) = merged_stream.try_next().await? {
-            let (token, batch, max_score) = r?;
+        while let Some((token, batches)) = merged_stream.try_next().await? {
             self.tokens.add(token);
             offsets.push(num_rows);
             max_scores.push(max_score);
@@ -431,6 +369,7 @@ impl InvertedIndexBuilder {
 struct IndexWorker {
     // we have to keep track of the existing tokens
     // because we need to know the token id when we receive posting list from existing inverted list
+    tokenizer: tantivy::tokenizer::TextAnalyzer,
     existing_tokens: HashMap<String, u32>,
     posting_lists: HashMap<String, PostingListBuilder>,
     schema: SchemaRef,
@@ -439,11 +378,20 @@ struct IndexWorker {
     writer: Box<dyn IndexWriter>,
     offset: usize,
     token_offsets: HashMap<String, Vec<(usize, usize)>>,
+    row_ids: Vec<u64>,
+    doc_token_num: Vec<usize>,
     estimated_size: usize,
+
+    total_doc_length: usize,
+    total_token_num: usize,
 }
 
 impl IndexWorker {
-    async fn new(existing_tokens: HashMap<String, u32>, with_position: bool) -> Result<Self> {
+    async fn new(
+        tokenizer: tantivy::tokenizer::TextAnalyzer,
+        existing_tokens: HashMap<String, u32>,
+        with_position: bool,
+    ) -> Result<Self> {
         let tmpdir = tempdir()?;
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local(),
@@ -457,6 +405,7 @@ impl IndexWorker {
             .await?;
 
         Ok(Self {
+            tokenizer,
             existing_tokens,
             posting_lists: HashMap::new(),
             schema,
@@ -465,7 +414,11 @@ impl IndexWorker {
             writer,
             offset: 0,
             token_offsets: HashMap::new(),
+            row_ids: Vec::new(),
+            doc_token_num: Vec::new(),
             estimated_size: 0,
+            total_doc_length: 0,
+            total_token_num: 0,
         })
     }
 
@@ -473,35 +426,54 @@ impl IndexWorker {
         self.schema.column_with_name(POSITION_COL).is_some()
     }
 
-    async fn add(&mut self, row_id: u64, tokens: StringArray, positions: Int32Array) -> Result<()> {
-        let mut token_occurrences = HashMap::new();
-        for (token, position) in tokens.iter().zip(positions.values().into_iter()) {
-            let Some(token) = token else {
-                continue;
-            };
-            token_occurrences
-                .entry(token)
-                .or_insert_with(Vec::new)
-                .push(*position);
-        }
+    async fn process_batch(&mut self, batch: RecordBatch) -> Result<()> {
         let with_position = self.has_position();
-        token_occurrences
-            .into_iter()
-            .for_each(|(token, term_positions)| {
-                let posting_list = self
-                    .posting_lists
-                    .entry(token.to_owned())
-                    .or_insert_with(|| PostingListBuilder::empty(with_position));
 
-                let old_size = if posting_list.is_empty() {
-                    0
-                } else {
-                    posting_list.size()
-                };
-                posting_list.add(row_id, term_positions);
-                let new_size = posting_list.size();
-                self.estimated_size += new_size - old_size;
-            });
+        let doc_col = batch.column(0);
+        let doc_iter = iter_str_array(doc_col);
+        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+        let docs = doc_iter
+            .zip(row_id_col.values().iter())
+            .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
+
+        for (doc, row_id) in docs {
+            let mut token_occurrences = HashMap::with_capacity(self.predict_doc_token_num(doc));
+            let mut token_num = 0;
+            {
+                let mut token_stream = self.tokenizer.token_stream(doc);
+                while token_stream.advance() {
+                    let token = token_stream.token_mut();
+                    let token_text = std::mem::take(&mut token.text);
+                    token_occurrences
+                        .entry(token_text)
+                        .or_insert_with(Vec::new)
+                        .push(token.position as i32);
+                    token_num += 1;
+                }
+            }
+            self.row_ids.push(row_id);
+            self.doc_token_num.push(token_num);
+            self.total_token_num += token_num;
+            self.total_doc_length += doc.len();
+
+            token_occurrences
+                .into_iter()
+                .for_each(|(token, term_positions)| {
+                    let posting_list = self
+                        .posting_lists
+                        .entry(token.to_owned())
+                        .or_insert_with(|| PostingListBuilder::empty(with_position));
+
+                    let old_size = if posting_list.is_empty() {
+                        0
+                    } else {
+                        posting_list.size()
+                    };
+                    posting_list.add(row_id, term_positions);
+                    let new_size = posting_list.size();
+                    self.estimated_size += new_size - old_size;
+                });
+        }
 
         if self.estimated_size > *LANCE_FTS_FLUSH_THRESHOLD * 1024 * 1024 {
             self.flush(false).await?;
@@ -510,25 +482,32 @@ impl IndexWorker {
         Ok(())
     }
 
+    fn predict_doc_token_num(&self, doc: &str) -> usize {
+        match self.total_doc_length {
+            0 => doc.len() / 5,
+            _ => self.total_token_num * doc.len() / self.total_doc_length,
+        }
+    }
+
     #[instrument(level = "debug", skip_all)]
     async fn flush(&mut self, flush_all: bool) -> Result<()> {
         if self.posting_lists.is_empty() {
             return Ok(());
         }
 
-        let keys = self
+        let tokens = self
             .posting_lists
             .iter()
-            .map(|(key, list)| (key, list.size()))
+            .map(|(token, list)| (token, list.size()))
             .sorted_unstable_by_key(|(_, size)| *size)
-            .map(|(key, _)| key)
+            .map(|(token, _)| token)
             .rev()
             .cloned()
             .collect_vec();
 
         let mut flushed_size = 0;
         let mut count = 0;
-        for key in keys {
+        for key in tokens {
             flushed_size += self.flush_posting_list(key).await?;
             count += 1;
             if !flush_all && flushed_size >= *LANCE_FTS_FLUSH_SIZE * 1024 * 1024 {
@@ -566,16 +545,12 @@ impl IndexWorker {
         Ok(0)
     }
 
-    async fn into_reader(
-        mut self,
-        inverted_list: Option<Arc<InvertedListReader>>,
-    ) -> Result<PostingReader> {
+    async fn into_reader(mut self) -> Result<PostingReader> {
         self.flush(true).await?;
         self.writer.finish().await?;
         PostingReader::new(
             Some(self.tmpdir),
             self.existing_tokens,
-            inverted_list,
             self.store,
             self.token_offsets,
         )
@@ -586,7 +561,6 @@ impl IndexWorker {
 pub struct PostingReader {
     tmpdir: Option<TempDir>,
     existing_tokens: HashMap<String, u32>,
-    inverted_list_reader: Option<Arc<InvertedListReader>>,
     store: Arc<dyn IndexStore>,
     reader: Arc<dyn IndexReader>,
     token_offsets: HashMap<String, Vec<(usize, usize)>>,
@@ -612,7 +586,6 @@ impl PostingReader {
     async fn new(
         tmpdir: Option<TempDir>,
         existing_tokens: HashMap<String, u32>,
-        inverted_list_reader: Option<Arc<InvertedListReader>>,
         store: Arc<dyn IndexStore>,
         token_offsets: HashMap<String, Vec<(usize, usize)>>,
     ) -> Result<Self> {
@@ -621,7 +594,6 @@ impl PostingReader {
         Ok(Self {
             tmpdir,
             existing_tokens,
-            inverted_list_reader,
             store,
             reader,
             token_offsets,
@@ -629,21 +601,10 @@ impl PostingReader {
     }
 
     // returns a stream of (token, batch, max_score)
-    async fn stream(
+    async fn into_stream(
         mut self,
-        docs: Arc<DocSet>,
-    ) -> Result<
-        Pin<
-            Box<
-                dyn Stream<
-                        Item = std::result::Result<
-                            Result<(String, RecordBatch, f32)>,
-                            tokio::task::JoinError,
-                        >,
-                    > + Send,
-            >,
-        >,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(String, Vec<RecordBatch>)>> + Send>>> {
+        let io_parallelism = self.store.io_parallelism();
         let mut token_offsets = std::mem::take(&mut self.token_offsets);
         for token in self.existing_tokens.keys() {
             if !token_offsets.contains_key(token) {
@@ -657,8 +618,7 @@ impl PostingReader {
         let inverted_batches = token_offsets.into_iter().map(move |(token, offsets)| {
             let posting_reader = posting_reader.clone();
             let schema = schema.clone();
-            let docs = docs.clone();
-            tokio::spawn(async move {
+            async move {
                 // read the posting lists from new data
                 let batches = offsets.into_iter().map(|(offset, length)| {
                     let reader = posting_reader.reader.clone();
@@ -671,27 +631,13 @@ impl PostingReader {
                         }
                     }
                 });
-                let mut batches = futures::future::try_join_all(batches).await?;
+                let batches = futures::future::try_join_all(batches).await?;
 
-                // read the posting lists from existing data
-                if let Some(inverted_list) = posting_reader.inverted_list_reader.as_ref() {
-                    if let Some(token_id) = posting_reader.existing_tokens.get(&token) {
-                        let batch = inverted_list
-                            .posting_batch(*token_id, inverted_list.has_positions())
-                            .await?;
-                        batches.push(batch);
-                    }
-                }
-
-                let (batch, max_score) =
-                    PostingListBuilder::from_batches(&batches).to_batch(Some(docs))?;
-
-                Ok((token, batch, max_score))
-            })
+                Ok((token, batches))
+            }
         });
 
-        let stream = stream::iter(inverted_batches)
-            .buffer_unordered(get_num_compute_intensive_cpus().div_ceil(*LANCE_FTS_NUM_SHARDS));
+        let stream = stream::iter(inverted_batches).buffer_unordered(io_parallelism);
         Ok(Box::pin(stream))
     }
 }
