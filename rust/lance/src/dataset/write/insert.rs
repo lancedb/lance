@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
 use datafusion::execution::SendableRecordBatchStream;
+use humantime::format_duration;
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::datatypes::Schema;
 use lance_core::datatypes::SchemaCompareOptions;
@@ -203,7 +205,44 @@ impl<'a> InsertBuilder<'a> {
         context: &WriteContext<'_>,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
+            WriteMode::Create => {
+                // Fetch auto_cleanup params from context
+                let config_upsert_values = match context.params.auto_cleanup.as_ref() {
+                    Some(auto_cleanup_params) => {
+                        let mut upsert_values = HashMap::new();
+
+                        upsert_values.insert(
+                            String::from("lance.auto_cleanup.interval"),
+                            auto_cleanup_params.interval.to_string(),
+                        );
+
+                        match auto_cleanup_params.older_than.to_std() {
+                            Ok(d) => {
+                                upsert_values.insert(
+                                    String::from("lance.auto_cleanup.older_than"),
+                                    format_duration(d).to_string(),
+                                );
+                            }
+                            Err(e) => {
+                                return Err(Error::InvalidInput {
+                                    source: e.into(),
+                                    location: location!(),
+                                })
+                            }
+                        };
+
+                        Some(upsert_values)
+                    }
+                    None => None,
+                };
+                Operation::Overwrite {
+                    // Use the full schema, not the written schema
+                    schema,
+                    fragments: written_frags.default.0,
+                    config_upsert_values,
+                }
+            }
+            WriteMode::Overwrite => Operation::Overwrite {
                 // Use the full schema, not the written schema
                 schema,
                 fragments: written_frags.default.0,

@@ -121,6 +121,7 @@ fst = { version = "0.4.7", features = ["levenshtein"] }
 fsst = { version = "=0.25.3", path = "./rust/lance-encoding/src/compression_algo/fsst" }
 futures = "0.3"
 http = "1.1.0"
+humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
 jieba-rs = { version = "0.7", default-features = false }
