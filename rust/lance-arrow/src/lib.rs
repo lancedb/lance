@@ -755,6 +755,66 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
     StructArray::try_new(fields.clone(), columns, None)
 }
 
+fn lists_have_same_offsets_helper<T: OffsetSizeTrait>(left: &dyn Array, right: &dyn Array) -> bool {
+    let left_list: &GenericListArray<T> = left.as_list();
+    let right_list: &GenericListArray<T> = right.as_list();
+    left_list.offsets().inner() == right_list.offsets().inner()
+}
+
+fn merge_list_structs_helper<T: OffsetSizeTrait>(
+    left: &dyn Array,
+    right: &dyn Array,
+    items_field_name: impl Into<String>,
+    items_nullable: bool,
+) -> Arc<dyn Array> {
+    let left_list: &GenericListArray<T> = left.as_list();
+    let right_list: &GenericListArray<T> = right.as_list();
+    let left_struct = left_list.values();
+    let right_struct = right_list.values();
+    let left_struct_arr = left_struct.as_struct();
+    let right_struct_arr = right_struct.as_struct();
+    let merged_items = Arc::new(merge(left_struct_arr, right_struct_arr));
+    let items_field = Arc::new(Field::new(
+        items_field_name,
+        merged_items.data_type().clone(),
+        items_nullable,
+    ));
+    Arc::new(GenericListArray::<T>::new(
+        items_field,
+        left_list.offsets().clone(),
+        merged_items,
+        left_list.nulls().cloned(),
+    ))
+}
+
+fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
+    match (left.data_type(), right.data_type()) {
+        (DataType::List(left_field), DataType::List(_)) => {
+            if !lists_have_same_offsets_helper::<i32>(left, right) {
+                panic!("Attempt to merge list struct arrays which do not have same offsets");
+            }
+            merge_list_structs_helper::<i32>(
+                left,
+                right,
+                left_field.name(),
+                left_field.is_nullable(),
+            )
+        }
+        (DataType::LargeList(left_field), DataType::LargeList(_)) => {
+            if !lists_have_same_offsets_helper::<i64>(left, right) {
+                panic!("Attempt to merge list struct arrays which do not have same offsets");
+            }
+            merge_list_structs_helper::<i64>(
+                left,
+                right,
+                left_field.name(),
+                left_field.is_nullable(),
+            )
+        }
+        _ => unreachable!(),
+    }
+}
+
 fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> StructArray {
     let mut fields: Vec<Field> = vec![];
     let mut columns: Vec<ArrayRef> = vec![];
@@ -787,6 +847,27 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                             left_field.is_nullable(),
                         ));
                         columns.push(Arc::new(merged_sub_array) as ArrayRef);
+                    }
+                    (DataType::List(left_list), DataType::List(right_list))
+                        if left_list.data_type().is_struct()
+                            && right_list.data_type().is_struct() =>
+                    {
+                        // If there is nothing to merge just use the left field
+                        if left_list.data_type() == right_list.data_type() {
+                            fields.push(left_field.as_ref().clone());
+                            columns.push(left_column.clone());
+                        }
+                        // If we have two List<Struct> and they have different sets of fields then
+                        // we can merge them if the offsets arrays are the same.  Otherwise, we
+                        // have to consider it an error.
+                        let merged_sub_array = merge_list_struct(&left_column, &right_column);
+
+                        fields.push(Field::new(
+                            left_field.name(),
+                            merged_sub_array.data_type().clone(),
+                            left_field.is_nullable(),
+                        ));
+                        columns.push(merged_sub_array);
                     }
                     // otherwise, just use the field on the left hand side
                     _ => {
@@ -1004,7 +1085,8 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{new_empty_array, Int32Array, StringArray};
+    use arrow_array::{new_empty_array, Int32Array, ListArray, StringArray};
+    use arrow_buffer::OffsetBuffer;
 
     #[test]
     fn test_merge_recursive() {
@@ -1132,6 +1214,73 @@ mod tests {
         );
         let merged = left_batch.merge(&right_batch).unwrap();
         assert_eq!(merged.schema().as_ref(), &naive_schema);
+    }
+
+    #[test]
+    fn test_merge_list_struct() {
+        let x_field = Arc::new(Field::new("x", DataType::Int32, true));
+        let y_field = Arc::new(Field::new("y", DataType::Int32, true));
+        let x_struct_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![x_field.clone()])),
+            true,
+        ));
+        let y_struct_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![y_field.clone()])),
+            true,
+        ));
+        let both_struct_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![x_field.clone(), y_field.clone()])),
+            true,
+        ));
+        let left_schema = Schema::new(vec![Field::new(
+            "list_struct",
+            DataType::List(x_struct_field.clone()),
+            true,
+        )]);
+        let right_schema = Schema::new(vec![Field::new(
+            "list_struct",
+            DataType::List(y_struct_field.clone()),
+            true,
+        )]);
+        let both_schema = Schema::new(vec![Field::new(
+            "list_struct",
+            DataType::List(both_struct_field.clone()),
+            true,
+        )]);
+
+        let x = Arc::new(Int32Array::from(vec![1]));
+        let y = Arc::new(Int32Array::from(vec![2]));
+        let x_struct = Arc::new(StructArray::new(
+            Fields::from(vec![x_field.clone()]),
+            vec![x.clone()],
+            None,
+        ));
+        let y_struct = Arc::new(StructArray::new(
+            Fields::from(vec![y_field.clone()]),
+            vec![y.clone()],
+            None,
+        ));
+        let both_struct = Arc::new(StructArray::new(
+            Fields::from(vec![x_field, y_field]),
+            vec![x, y],
+            None,
+        ));
+        let offsets = OffsetBuffer::from_lengths([1]);
+        let x_s_list = ListArray::new(x_struct_field, offsets.clone(), x_struct, None);
+        let y_s_list = ListArray::new(y_struct_field, offsets.clone(), y_struct, None);
+        let both_list = ListArray::new(both_struct_field, offsets, both_struct, None);
+        let x_batch =
+            RecordBatch::try_new(Arc::new(left_schema), vec![Arc::new(x_s_list)]).unwrap();
+        let y_batch =
+            RecordBatch::try_new(Arc::new(right_schema), vec![Arc::new(y_s_list)]).unwrap();
+        let merged = x_batch.merge(&y_batch).unwrap();
+        let expected =
+            RecordBatch::try_new(Arc::new(both_schema), vec![Arc::new(both_list)]).unwrap();
+        println!("Expected: {:#?}", &expected);
+        assert_eq!(merged, expected);
     }
 
     #[test]
