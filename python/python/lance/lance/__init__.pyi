@@ -217,7 +217,7 @@ class _Dataset:
     ) -> pa.RecordBatch: ...
     def take_rows(
         self,
-        row_indices: List[int],
+        row_ids: List[int],
         columns: Optional[List[str]] = None,
         columns_with_transform: Optional[List[Tuple[str, str]]] = None,
     ) -> pa.RecordBatch: ...
