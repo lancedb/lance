@@ -539,6 +539,18 @@ def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
 
 
+def test_create_ivf_hnsw_flat_index(dataset, tmp_path):
+    assert not dataset.has_index
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_FLAT",
+        num_partitions=4,
+        num_sub_vectors=16,
+    )
+    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
 def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
     query = np.random.rand(5, 128)
     results = indexed_multivec_dataset.scanner(

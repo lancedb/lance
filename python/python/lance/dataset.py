@@ -2005,7 +2005,13 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
-        valid_index_types = ["IVF_FLAT", "IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
+        valid_index_types = [
+            "IVF_FLAT",
+            "IVF_PQ",
+            "IVF_HNSW_FLAT",
+            "IVF_HNSW_PQ",
+            "IVF_HNSW_SQ",
+        ]
         if index_type not in valid_index_types:
             raise NotImplementedError(
                 f"Only {valid_index_types} index types supported. Got {index_type}"
