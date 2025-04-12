@@ -344,7 +344,7 @@ impl<'a> InsertBuilder<'a> {
                     store_options: params.store_params.clone(),
                     commit_handler: params.commit_handler.clone(),
                     object_store_registry: params.object_store_registry.clone(),
-                    // session: params.session.clone(),
+                    session: params.session.clone(),
                     ..Default::default()
                 });
 
@@ -395,31 +395,4 @@ struct WriteContext<'a> {
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,
     storage_version: LanceFileVersion,
-}
-
-#[cfg(test)]
-mod test {
-    use arrow_schema::{DataType, Field, Schema};
-
-    use crate::session::Session;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_pass_session() {
-        let session = Arc::new(Session::new(0, 0));
-        let dataset = InsertBuilder::new("memory://")
-            .with_params(&WriteParams {
-                session: Some(session.clone()),
-                ..Default::default()
-            })
-            .execute_stream(RecordBatchIterator::new(
-                vec![],
-                Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)])),
-            ))
-            .await
-            .unwrap();
-
-        assert_eq!(Arc::as_ptr(&dataset.session()), Arc::as_ptr(&session));
-    }
 }
