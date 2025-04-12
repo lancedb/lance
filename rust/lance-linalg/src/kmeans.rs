@@ -796,7 +796,7 @@ pub fn compute_partition<T: Float + L2 + Dot>(
 
 #[cfg(test)]
 mod tests {
-    use std::iter::repeat;
+    use std::iter::repeat_n;
 
     use lance_arrow::*;
     use lance_testing::datagen::generate_random_array;
@@ -868,7 +868,7 @@ mod tests {
         const K: usize = 32;
         const NUM_CENTROIDS: usize = 16 * 2048;
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
-        let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
+        let values = Float32Array::from_iter_values(repeat_n(f32::NAN, DIM * K));
 
         compute_partitions::<Float32Type, KMeansAlgoFloat<Float32Type>>(
             &centroids,
@@ -889,7 +889,7 @@ mod tests {
         const K: usize = 32;
         const NUM_CENTROIDS: usize = 16 * 2048;
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
-        let values = repeat(f32::NAN).take(DIM * K).collect::<Vec<_>>();
+        let values = repeat_n(f32::NAN, DIM * K).collect::<Vec<_>>();
 
         let (membership, _) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_loss(
             centroids.as_slice(),

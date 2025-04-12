@@ -1841,7 +1841,7 @@ mod tests {
     use super::*;
 
     use std::collections::HashSet;
-    use std::iter::repeat;
+    use std::iter::repeat_n;
     use std::ops::Range;
 
     use arrow_array::types::UInt64Type;
@@ -2740,7 +2740,7 @@ mod tests {
             .scan()
             .nearest(
                 "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                &Float32Array::from_iter_values(repeat_n(0.5, DIM)),
                 5,
             )
             .unwrap()
@@ -2808,7 +2808,7 @@ mod tests {
             .scan()
             .nearest(
                 "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                &Float32Array::from_iter_values(repeat_n(0.5, DIM)),
                 5,
             )
             .unwrap()

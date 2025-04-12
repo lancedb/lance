@@ -1968,7 +1968,7 @@ mod tests {
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
         // the NullBuffer.len() returns the length in bits so we divide_round_up by 8
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
@@ -1976,7 +1976,7 @@ mod tests {
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let mut gen = array::rand::<Int32Type>().with_nulls(&[true, true, false]);
@@ -1985,7 +1985,7 @@ mod tests {
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
@@ -1993,7 +1993,7 @@ mod tests {
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
@@ -2015,7 +2015,7 @@ mod tests {
             .map(|buffer| buffer.len())
             .sum();
 
-        let total_nulls_size_in_bytes = (concatenated_array.nulls().unwrap().len() + 7) / 8;
+        let total_nulls_size_in_bytes = concatenated_array.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + total_nulls_size_in_bytes) as u64);
     }
 }
