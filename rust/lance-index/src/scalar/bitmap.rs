@@ -29,6 +29,8 @@ use super::{btree::OrderableScalarValue, SargableQuery, SearchResult};
 use super::{btree::TrainingSource, AnyQuery, IndexStore, ScalarIndex};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
+// The maximum bitmap bytes per chunk - set to 1.9G
+const MAX_BITMAP_CHUNK_BYTES: usize = 1_900_000_000;
 
 /// A scalar index that stores a bitmap for each possible value
 ///
@@ -314,45 +316,95 @@ fn get_batch_from_arrays(
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-// Takes an iterator of Vec<u64> and processes each vector
-// to turn it into a RoaringTreemap. Each RoaringTreeMap is
-// serialized to bytes. The entire collection is converted to a BinaryArray
-fn get_bitmaps_from_iter<I>(iter: I) -> Arc<dyn Array>
-where
-    I: Iterator<Item = RowIdTreeMap>,
-{
-    let mut builder = BinaryBuilder::new();
-    iter.for_each(|bitmap| {
-        let mut bytes = Vec::new();
-        bitmap.serialize_into(&mut bytes).unwrap();
-        builder.append_value(&bytes);
-    });
-
-    Arc::new(builder.finish())
-}
-
 async fn write_bitmap_index(
-    state: HashMap<ScalarValue, RowIdTreeMap>,
+    mut state: HashMap<ScalarValue, RowIdTreeMap>,
     index_store: &dyn IndexStore,
     value_type: &DataType,
 ) -> Result<()> {
-    let keys_iter = state.keys().cloned();
-    let keys_array = if state.is_empty() {
-        new_empty_array(value_type)
-    } else {
-        ScalarValue::iter_to_array(keys_iter)?
-    };
+    if state.is_empty() {
+        let keys_array = new_empty_array(value_type);
+        let value_array = Arc::new(BinaryBuilder::new().finish());
 
-    let values_iter = state.into_values();
-    let binary_bitmap_array = get_bitmaps_from_iter(values_iter);
+        let empty_batch = get_batch_from_arrays(keys_array, value_array)?;
+        let mut file = index_store
+            .new_index_file(BITMAP_LOOKUP_NAME, empty_batch.schema())
+            .await?;
 
-    let record_batch = get_batch_from_arrays(keys_array, binary_bitmap_array)?;
+        file.write_record_batch(empty_batch).await?;
+        file.finish().await?;
+        return Ok(());
+    }
 
-    let mut bitmap_index_file = index_store
-        .new_index_file(BITMAP_LOOKUP_NAME, record_batch.schema())
-        .await?;
-    bitmap_index_file.write_record_batch(record_batch).await?;
-    bitmap_index_file.finish().await?;
+    let mut current_keys = vec![];
+    let mut builder = BinaryBuilder::new();
+    let mut current_size = 0usize;
+
+    // The schema should be determined by the recordbatch, we initialize
+    // index file after processing the first value chunk.
+    let mut index_file = None;
+
+    for (key, bitmap) in state.drain() {
+        let mut bytes = Vec::with_capacity(1024);
+        // Each vector to turn it into a RoaringTreemap. Each RoaringTreeMap is
+        // serialized to bytes.
+        bitmap.serialize_into(&mut bytes).unwrap();
+
+        let len = bytes.len();
+
+        if current_size + len >= MAX_BITMAP_CHUNK_BYTES && !current_keys.is_empty() {
+            let key_array = ScalarValue::iter_to_array(current_keys.into_iter())?;
+            let value_array = Arc::new(builder.finish());
+
+            let batch = get_batch_from_arrays(key_array, value_array)?;
+            if index_file.is_none() {
+                index_file = Some(
+                    index_store
+                        .new_index_file(BITMAP_LOOKUP_NAME, batch.schema())
+                        .await?,
+                );
+            }
+
+            index_file
+                .as_mut()
+                .unwrap()
+                .write_record_batch(batch)
+                .await?;
+
+            current_keys = vec![];
+            builder = BinaryBuilder::new();
+            current_size = 0;
+        }
+
+        current_size += len;
+        current_keys.push(key);
+        builder.append_value(&bytes);
+    }
+
+    if !current_keys.is_empty() {
+        let key_array = ScalarValue::iter_to_array(current_keys.into_iter())?;
+        let value_array = Arc::new(builder.finish());
+
+        let batch = get_batch_from_arrays(key_array, value_array)?;
+
+        if index_file.is_none() {
+            index_file = Some(
+                index_store
+                    .new_index_file(BITMAP_LOOKUP_NAME, batch.schema())
+                    .await?,
+            );
+        }
+
+        index_file
+            .as_mut()
+            .unwrap()
+            .write_record_batch(batch)
+            .await?;
+    }
+
+    if let Some(mut file) = index_file {
+        file.finish().await?;
+    }
+
     Ok(())
 }
 
