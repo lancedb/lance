@@ -52,8 +52,9 @@ jobs:
           echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
       - uses: auguwu/clippy-action@1.4.0
         with:
-          check-args: --locked --features ${{ env.ALL_FEATURES }} --tests --benches -- -D warnings
+          check-args: --locked --features ${{ env.ALL_FEATURES }} --tests --benches
           token: ${{secrets.GITHUB_TOKEN}}
+          deny: warnings
   cargo-deny:
     name: Check Rust dependencies (cargo-deny)
     runs-on: ubuntu-24.04
