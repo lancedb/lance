@@ -772,7 +772,7 @@ mod tests {
             ));
             let array = Arc::new(ListArray::new(
                 vector_field,
-                OffsetBuffer::from_lengths(std::iter::repeat(VECTOR_NUM_PER_ROW).take(num_rows)),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(VECTOR_NUM_PER_ROW, num_rows)),
                 Arc::new(fsl),
                 None,
             ));

@@ -527,7 +527,7 @@ impl TryFrom<Quantizer> for ProductQuantizer {
 mod tests {
     use super::*;
 
-    use std::iter::repeat;
+    use std::iter::repeat_n;
 
     use approx::assert_relative_eq;
     use arrow::datatypes::UInt8Type;
@@ -546,7 +546,7 @@ mod tests {
             8,
             16,
             FixedSizeListArray::try_new_from_values(
-                Float16Array::from_iter_values(repeat(f16::zero()).take(256 * 16)),
+                Float16Array::from_iter_values(repeat_n(f16::zero(), 256 * 16)),
                 16,
             )
             .unwrap(),

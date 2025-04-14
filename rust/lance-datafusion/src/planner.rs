@@ -1583,9 +1583,7 @@ mod tests {
         ];
 
         let expected: ArrayRef = Arc::new(BooleanArray::from_iter(
-            std::iter::repeat(Some(false))
-                .take(5)
-                .chain(std::iter::repeat(Some(true)).take(5)),
+            std::iter::repeat_n(Some(false), 5).chain(std::iter::repeat_n(Some(true), 5)),
         ));
         for expression in expressions {
             // convert to physical expression
