@@ -237,7 +237,8 @@ class LanceDataset(torch.utils.data.IterableDataset):
         """
         super().__init__()
         if isinstance(dataset, (str, Path)):
-            dataset = lance.dataset(dataset)
+            storage_options = kwargs.pop("storage_options", None)
+            dataset = lance.dataset(uri=dataset, storage_options=storage_options)
         self.dataset = dataset
         self.columns = columns
         self.batch_size = batch_size
