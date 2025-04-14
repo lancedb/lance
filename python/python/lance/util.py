@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Iterator, Literal, Optional, Union, cast
 
@@ -246,3 +247,8 @@ class HNSW:
 
     def vectors(self) -> pa.Array:
         return self._hnsw.vectors()
+
+
+# Generate a unique temporary directory name
+def get_temp_dir(uri, dir_type="tmp"):
+    return f"{uri}/_{dir_type}_{uuid.uuid4().hex}"

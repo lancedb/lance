@@ -65,7 +65,7 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
-from .util import td_to_micros
+from .util import get_temp_dir, td_to_micros
 
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
@@ -1853,6 +1853,9 @@ class LanceDataset(pa.dataset.Dataset):
         shuffle_partition_batches: Optional[int] = None,
         shuffle_partition_concurrency: Optional[int] = None,
         # experimental parameters
+        # TODO: Add parameters for directories to store
+        # intermediate results, ensuring the process can
+        # resume if existing intermediate data is detected
         ivf_centroids_file: Optional[str] = None,
         precomputed_partition_dataset: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
@@ -2014,60 +2017,62 @@ class LanceDataset(pa.dataset.Dataset):
         """
         # Only support building index for 1 column from the API aspect, however
         # the internal implementation might support building multi-column index later.
-        if isinstance(column, str):
-            column = [column]
+        try:
+            if isinstance(column, str):
+                column = [column]
 
-        # validate args
-        for c in column:
-            if c not in self.schema.names:
-                raise KeyError(f"{c} not found in schema")
-            field = self.schema.field(c)
-            is_multivec = False
-            if pa.types.is_fixed_size_list(field.type):
-                dimension = field.type.list_size
-            elif pa.types.is_list(field.type) and pa.types.is_fixed_size_list(
-                field.type.value_type
-            ):
-                dimension = field.type.value_type.list_size
-                is_multivec = True
-            elif (
-                isinstance(field.type, pa.FixedShapeTensorType)
-                and len(field.type.shape) == 1
-            ):
-                dimension = field.type.shape[0]
-            else:
-                raise TypeError(
-                    f"Vector column {c} must be FixedSizeListArray "
-                    f"1-dimensional FixedShapeTensorArray, got {field.type}"
-                )
+            # validate args
+            for c in column:
+                if c not in self.schema.names:
+                    raise KeyError(f"{c} not found in schema")
+                field = self.schema.field(c)
+                is_multivec = False
+                if pa.types.is_fixed_size_list(field.type):
+                    dimension = field.type.list_size
+                elif pa.types.is_list(field.type) and pa.types.is_fixed_size_list(
+                    field.type.value_type
+                ):
+                    dimension = field.type.value_type.list_size
+                    is_multivec = True
+                elif (
+                    isinstance(field.type, pa.FixedShapeTensorType)
+                    and len(field.type.shape) == 1
+                ):
+                    dimension = field.type.shape[0]
+                else:
+                    raise TypeError(
+                        f"Vector column {c} must be FixedSizeListArray "
+                        f"1-dimensional FixedShapeTensorArray, got {field.type}"
+                    )
 
-            if num_sub_vectors is not None and dimension % num_sub_vectors != 0:
-                raise ValueError(
-                    f"dimension ({dimension}) must be divisible by num_sub_vectors"
-                    f" ({num_sub_vectors})"
-                )
+                if num_sub_vectors is not None and dimension % num_sub_vectors != 0:
+                    raise ValueError(
+                        f"dimension ({dimension}) must be divisible by num_sub_vectors"
+                        f" ({num_sub_vectors})"
+                    )
 
-            element_type = field.type.value_type
-            if is_multivec:
-                element_type = field.type.value_type.value_type
-            if not (
-                pa.types.is_floating(element_type) or pa.types.is_uint8(element_type)
-            ):
-                raise TypeError(
-                    f"Vector column {c} must have floating value type, "
-                    f"got {field.type.value_type}"
-                )
+                element_type = field.type.value_type
+                if is_multivec:
+                    element_type = field.type.value_type.value_type
+                if not (
+                    pa.types.is_floating(element_type)
+                    or pa.types.is_uint8(element_type)
+                ):
+                    raise TypeError(
+                        f"Vector column {c} must have floating value type, "
+                        f"got {field.type.value_type}"
+                    )
 
-        if not isinstance(metric, str) or metric.lower() not in [
-            "l2",
-            "cosine",
-            "euclidean",
-            "dot",
-            "hamming",
-        ]:
-            raise ValueError(f"Metric {metric} not supported.")
+            if not isinstance(metric, str) or metric.lower() not in [
+                "l2",
+                "cosine",
+                "euclidean",
+                "dot",
+                "hamming",
+            ]:
+                raise ValueError(f"Metric {metric} not supported.")
 
-        kwargs["metric_type"] = metric
+            kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
         valid_index_types = [
@@ -2087,293 +2092,352 @@ class LanceDataset(pa.dataset.Dataset):
                 f'one_pass_ivfpq requires index_type="IVF_PQ", got {index_type}'
             )
 
-        # Handle timing for various parts of accelerated builds
-        timers = {}
-        if one_pass_ivfpq and accelerator is not None:
-            from .vector import (
-                one_pass_assign_ivf_pq_on_accelerator,
-                one_pass_train_ivf_pq_on_accelerator,
-            )
-
-            LOGGER.info("Doing one-pass ivfpq accelerated computations")
-
-            timers["ivf+pq_train:start"] = time.time()
-            (
-                ivf_centroids,
-                ivf_kmeans,
-                pq_codebook,
-                pq_kmeans_list,
-            ) = one_pass_train_ivf_pq_on_accelerator(
-                self,
-                column[0],
-                num_partitions,
-                metric,
-                accelerator,
-                num_sub_vectors=num_sub_vectors,
-                batch_size=20480,
-                filter_nan=filter_nan,
-            )
-            timers["ivf+pq_train:end"] = time.time()
-            ivfpq_train_time = timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
-            LOGGER.info("ivf+pq training time: %ss", ivfpq_train_time)
-            timers["ivf+pq_assign:start"] = time.time()
-            shuffle_output_dir, shuffle_buffers = one_pass_assign_ivf_pq_on_accelerator(
-                self,
-                column[0],
-                metric,
-                accelerator,
-                ivf_kmeans,
-                pq_kmeans_list,
-                batch_size=20480,
-                filter_nan=filter_nan,
-            )
-            timers["ivf+pq_assign:end"] = time.time()
-            ivfpq_assign_time = (
-                timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
-            )
-            LOGGER.info("ivf+pq transform time: %ss", ivfpq_assign_time)
-
-            kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
-            kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
-                shuffle_output_dir, "data"
-            )
-        if index_type.startswith("IVF"):
-            if (ivf_centroids is not None) and (ivf_centroids_file is not None):
-                raise ValueError(
-                    "ivf_centroids and ivf_centroids_file"
-                    " cannot be provided at the same time"
-                )
-
-            if ivf_centroids_file is not None:
-                from pyarrow.fs import FileSystem
-
-                fs, path = FileSystem.from_uri(ivf_centroids_file)
-                with fs.open_input_file(path) as f:
-                    ivf_centroids = np.load(f)
-                num_partitions = ivf_centroids.shape[0]
-
-            if num_partitions is None:
-                raise ValueError(
-                    "num_partitions and num_sub_vectors are required for IVF_PQ"
-                )
-            if isinstance(num_partitions, float):
-                warnings.warn("num_partitions is float, converting to int")
-                num_partitions = int(num_partitions)
-            elif not isinstance(num_partitions, int):
-                raise TypeError(
-                    f"num_partitions must be int, got {type(num_partitions)}"
-                )
-            kwargs["num_partitions"] = num_partitions
-
-            if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
-                raise ValueError(
-                    "ivf_centroids must be provided when"
-                    " precomputed_partition_dataset is provided"
-                )
-            if precomputed_partition_dataset is not None:
-                LOGGER.info("Using provided precomputed partition dataset")
-                precomputed_ds = LanceDataset(
-                    precomputed_partition_dataset, storage_options=storage_options
-                )
-                if not (
-                    "PQ" in index_type
-                    and pq_codebook is None
-                    and accelerator is not None
-                    and "precomputed_partitions_file" in kwargs
-                ):
-                    # In this case, the precomputed partitions file would be used
-                    # without being turned into a set of precomputed buffers, so it
-                    # needs to have a very specific format
-                    if len(precomputed_ds.get_fragments()) != 1:
-                        raise ValueError(
-                            "precomputed_partition_dataset must have only one fragment"
-                        )
-                    files = precomputed_ds.get_fragments()[0].data_files()
-                    if len(files) != 1:
-                        raise ValueError(
-                            "precomputed_partition_dataset must have only one files"
-                        )
-                kwargs["precomputed_partitions_file"] = precomputed_partition_dataset
-
-            if accelerator is not None and ivf_centroids is None and not one_pass_ivfpq:
-                LOGGER.info("Computing new precomputed partition dataset")
-                # Use accelerator to train ivf centroids
+            # Handle timing for various parts of accelerated builds
+            timers = {}
+            if one_pass_ivfpq and accelerator is not None:
                 from .vector import (
-                    compute_partitions,
-                    train_ivf_centroids_on_accelerator,
+                    one_pass_assign_ivf_pq_on_accelerator,
+                    one_pass_train_ivf_pq_on_accelerator,
                 )
 
-                timers["ivf_train:start"] = time.time()
-                ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
+                LOGGER.info("Doing one-pass ivfpq accelerated computations")
+                resident_dir = get_temp_dir(self.uri, dir_type="resident_dir")
+                timers["ivf+pq_train:start"] = time.time()
+                (
+                    ivf_centroids,
+                    ivf_kmeans,
+                    pq_codebook,
+                    pq_kmeans_list,
+                ) = one_pass_train_ivf_pq_on_accelerator(
                     self,
                     column[0],
                     num_partitions,
                     metric,
                     accelerator,
-                    filter_nan=filter_nan,
-                )
-                timers["ivf_train:end"] = time.time()
-                ivf_train_time = timers["ivf_train:end"] - timers["ivf_train:start"]
-                LOGGER.info("ivf training time: %ss", ivf_train_time)
-                timers["ivf_assign:start"] = time.time()
-                num_sub_vectors_cur = None
-                if "PQ" in index_type and pq_codebook is None:
-                    # compute residual subspace columns in the same pass
-                    num_sub_vectors_cur = num_sub_vectors
-                partitions_file = compute_partitions(
-                    self,
-                    column[0],
-                    kmeans,
-                    batch_size=20480,
-                    num_sub_vectors=num_sub_vectors_cur,
-                    filter_nan=filter_nan,
-                )
-                timers["ivf_assign:end"] = time.time()
-                ivf_assign_time = timers["ivf_assign:end"] - timers["ivf_assign:start"]
-                LOGGER.info("ivf transform time: %ss", ivf_assign_time)
-                kwargs["precomputed_partitions_file"] = partitions_file
-
-            if (ivf_centroids is None) and (pq_codebook is not None):
-                raise ValueError(
-                    "ivf_centroids must be specified when pq_codebook is provided"
-                )
-
-            if ivf_centroids is not None:
-                # User provided IVF centroids
-                if _check_for_numpy(ivf_centroids) and isinstance(
-                    ivf_centroids, np.ndarray
-                ):
-                    if (
-                        len(ivf_centroids.shape) != 2
-                        or ivf_centroids.shape[0] != num_partitions
-                    ):
-                        raise ValueError(
-                            f"Ivf centroids must be 2D array: (clusters, dim), "
-                            f"got {ivf_centroids.shape}"
-                        )
-                    if ivf_centroids.dtype not in [np.float16, np.float32, np.float64]:
-                        raise TypeError(
-                            "IVF centroids must be floating number"
-                            + f"got {ivf_centroids.dtype}"
-                        )
-                    dim = ivf_centroids.shape[1]
-                    values = pa.array(ivf_centroids.reshape(-1))
-                    ivf_centroids = pa.FixedSizeListArray.from_arrays(values, dim)
-                # Convert it to RecordBatch because Rust side only accepts RecordBatch.
-                ivf_centroids_batch = pa.RecordBatch.from_arrays(
-                    [ivf_centroids], ["_ivf_centroids"]
-                )
-                kwargs["ivf_centroids"] = ivf_centroids_batch
-
-        if "PQ" in index_type:
-            if num_sub_vectors is None:
-                raise ValueError(
-                    "num_partitions and num_sub_vectors are required for IVF_PQ"
-                )
-            kwargs["num_sub_vectors"] = num_sub_vectors
-
-            if (
-                pq_codebook is None
-                and accelerator is not None
-                and "precomputed_partitions_file" in kwargs
-                and not one_pass_ivfpq
-            ):
-                LOGGER.info("Computing new precomputed shuffle buffers for PQ.")
-                partitions_file = kwargs["precomputed_partitions_file"]
-                del kwargs["precomputed_partitions_file"]
-
-                partitions_ds = LanceDataset(partitions_file)
-                # Use accelerator to train pq codebook
-                from .vector import (
-                    compute_pq_codes,
-                    train_pq_codebook_on_accelerator,
-                )
-
-                timers["pq_train:start"] = time.time()
-                pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
-                    partitions_ds,
-                    metric,
-                    accelerator=accelerator,
                     num_sub_vectors=num_sub_vectors,
-                    dtype=element_type.to_pandas_dtype(),
-                )
-                timers["pq_train:end"] = time.time()
-                pq_train_time = timers["pq_train:end"] - timers["pq_train:start"]
-                LOGGER.info("pq training time: %ss", pq_train_time)
-                timers["pq_assign:start"] = time.time()
-                shuffle_output_dir, shuffle_buffers = compute_pq_codes(
-                    partitions_ds,
-                    kmeans_list,
                     batch_size=20480,
+                    filter_nan=filter_nan,
+                    resident_dir=resident_dir,
+                    storage_options=storage_options,
                 )
-                timers["pq_assign:end"] = time.time()
-                pq_assign_time = timers["pq_assign:end"] - timers["pq_assign:start"]
-                LOGGER.info("pq transform time: %ss", pq_assign_time)
-                # Save disk space
-                if precomputed_partition_dataset is not None and os.path.exists(
-                    partitions_file
-                ):
-                    LOGGER.info(
-                        "Temporary partitions file stored at %s,"
-                        "you may want to delete it.",
-                        partitions_file,
+                LanceDataset.drop(resident_dir, storage_options)
+                timers["ivf+pq_train:end"] = time.time()
+                ivfpq_train_time = (
+                    timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
+                )
+                LOGGER.info("ivf+pq training time: %ss", ivfpq_train_time)
+                timers["ivf+pq_assign:start"] = time.time()
+                # TODO: add func params for those dirs
+                shuffle_output_dir = get_temp_dir(self.uri, dir_type="shuffle_output")
+                shuffle_output_dir, shuffle_buffers = (
+                    one_pass_assign_ivf_pq_on_accelerator(
+                        self,
+                        column[0],
+                        metric,
+                        accelerator,
+                        ivf_kmeans,
+                        pq_kmeans_list,
+                        batch_size=20480,
+                        filter_nan=filter_nan,
+                        shuffle_output_dir=shuffle_output_dir,
+                        storage_options=storage_options,
                     )
+                )
+                timers["ivf+pq_assign:end"] = time.time()
+                ivfpq_assign_time = (
+                    timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
+                )
+                LOGGER.info("ivf+pq transform time: %ss", ivfpq_assign_time)
 
                 kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
                 kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
                     shuffle_output_dir, "data"
                 )
-
-            if pq_codebook is not None:
-                # User provided IVF centroids
-                if _check_for_numpy(pq_codebook) and isinstance(
-                    pq_codebook, np.ndarray
-                ):
-                    if (
-                        len(pq_codebook.shape) != 3
-                        or pq_codebook.shape[0] != num_sub_vectors
-                        or pq_codebook.shape[1] != 256
-                    ):
-                        raise ValueError(
-                            f"PQ codebook must be 3D array: (sub_vectors, 256, dim), "
-                            f"got {pq_codebook.shape}"
-                        )
-                    if pq_codebook.dtype not in [np.float16, np.float32, np.float64]:
-                        raise TypeError(
-                            "PQ codebook must be floating number"
-                            + f"got {pq_codebook.dtype}"
-                        )
-                    values = pa.array(pq_codebook.reshape(-1))
-                    pq_codebook = pa.FixedSizeListArray.from_arrays(
-                        values, pq_codebook.shape[2]
+            if index_type.startswith("IVF"):
+                if (ivf_centroids is not None) and (ivf_centroids_file is not None):
+                    raise ValueError(
+                        "ivf_centroids and ivf_centroids_file"
+                        " cannot be provided at the same time"
                     )
-                pq_codebook_batch = pa.RecordBatch.from_arrays(
-                    [pq_codebook], ["_pq_codebook"]
-                )
-                kwargs["pq_codebook"] = pq_codebook_batch
 
-        if shuffle_partition_batches is not None:
-            kwargs["shuffle_partition_batches"] = shuffle_partition_batches
-        if shuffle_partition_concurrency is not None:
-            kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
+                if ivf_centroids_file is not None:
+                    from pyarrow.fs import FileSystem
 
-        timers["final_create_index:start"] = time.time()
-        self._ds.create_index(
-            column, index_type, name, replace, storage_options, kwargs
-        )
-        timers["final_create_index:end"] = time.time()
-        final_create_index_time = (
-            timers["final_create_index:end"] - timers["final_create_index:start"]
-        )
-        LOGGER.info("Final create_index rust time: %ss", final_create_index_time)
-        # Save disk space
-        if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(
-            kwargs["precomputed_shuffle_buffers_path"]
-        ):
-            LOGGER.info(
-                "Temporary shuffle buffers stored at %s, you may want to delete it.",
-                kwargs["precomputed_shuffle_buffers_path"],
+                    fs, path = FileSystem.from_uri(ivf_centroids_file)
+                    with fs.open_input_file(path) as f:
+                        ivf_centroids = np.load(f)
+                    num_partitions = ivf_centroids.shape[0]
+
+                if num_partitions is None:
+                    raise ValueError(
+                        "num_partitions and num_sub_vectors are required for IVF_PQ"
+                    )
+                if isinstance(num_partitions, float):
+                    warnings.warn("num_partitions is float, converting to int")
+                    num_partitions = int(num_partitions)
+                elif not isinstance(num_partitions, int):
+                    raise TypeError(
+                        f"num_partitions must be int, got {type(num_partitions)}"
+                    )
+                kwargs["num_partitions"] = num_partitions
+
+                if (precomputed_partition_dataset is not None) and (
+                    ivf_centroids is None
+                ):
+                    raise ValueError(
+                        "ivf_centroids must be provided when"
+                        " precomputed_partition_dataset is provided"
+                    )
+                if precomputed_partition_dataset is not None:
+                    LOGGER.info("Using provided precomputed partition dataset")
+                    precomputed_ds = LanceDataset(
+                        precomputed_partition_dataset, storage_options=storage_options
+                    )
+                    if not (
+                        "PQ" in index_type
+                        and pq_codebook is None
+                        and accelerator is not None
+                        and "precomputed_partitions_file" in kwargs
+                    ):
+                        # In this case, the precomputed partitions file would be used
+                        # without being turned into a set of precomputed buffers, so it
+                        # needs to have a very specific format
+                        if len(precomputed_ds.get_fragments()) != 1:
+                            raise ValueError(
+                                "precomputed_partition_dataset must "
+                                "have only one fragment"
+                            )
+                        files = precomputed_ds.get_fragments()[0].data_files()
+                        if len(files) != 1:
+                            raise ValueError(
+                                "precomputed_partition_dataset must have only one files"
+                            )
+                    kwargs["precomputed_partitions_file"] = (
+                        precomputed_partition_dataset
+                    )
+
+                if (
+                    accelerator is not None
+                    and ivf_centroids is None
+                    and not one_pass_ivfpq
+                ):
+                    LOGGER.info("Computing new precomputed partition dataset")
+                    # Use accelerator to train ivf centroids
+                    from .vector import (
+                        compute_partitions,
+                        train_ivf_centroids_on_accelerator,
+                    )
+
+                    timers["ivf_train:start"] = time.time()
+                    ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
+                        self,
+                        column[0],
+                        num_partitions,
+                        metric,
+                        accelerator,
+                        filter_nan=filter_nan,
+                    )
+                    timers["ivf_train:end"] = time.time()
+                    ivf_train_time = timers["ivf_train:end"] - timers["ivf_train:start"]
+                    LOGGER.info("ivf training time: %ss", ivf_train_time)
+                    timers["ivf_assign:start"] = time.time()
+                    num_sub_vectors_cur = None
+                    if "PQ" in index_type and pq_codebook is None:
+                        # compute residual subspace columns in the same pass
+                        num_sub_vectors_cur = num_sub_vectors
+                    temp_partition_dir = get_temp_dir(self.uri, "partitions_dir")
+                    partitions_file = compute_partitions(
+                        self,
+                        column[0],
+                        kmeans,
+                        batch_size=20480,
+                        num_sub_vectors=num_sub_vectors_cur,
+                        filter_nan=filter_nan,
+                        temp_dir=temp_partition_dir,
+                        storage_options=storage_options,
+                    )
+                    timers["ivf_assign:end"] = time.time()
+                    ivf_assign_time = (
+                        timers["ivf_assign:end"] - timers["ivf_assign:start"]
+                    )
+                    LOGGER.info("ivf transform time: %ss", ivf_assign_time)
+                    kwargs["precomputed_partitions_file"] = partitions_file
+
+                if (ivf_centroids is None) and (pq_codebook is not None):
+                    raise ValueError(
+                        "ivf_centroids must be specified when pq_codebook is provided"
+                    )
+
+                if ivf_centroids is not None:
+                    # User provided IVF centroids
+                    if _check_for_numpy(ivf_centroids) and isinstance(
+                        ivf_centroids, np.ndarray
+                    ):
+                        if (
+                            len(ivf_centroids.shape) != 2
+                            or ivf_centroids.shape[0] != num_partitions
+                        ):
+                            raise ValueError(
+                                f"Ivf centroids must be 2D array: (clusters, dim), "
+                                f"got {ivf_centroids.shape}"
+                            )
+                        if ivf_centroids.dtype not in [
+                            np.float16,
+                            np.float32,
+                            np.float64,
+                        ]:
+                            raise TypeError(
+                                "IVF centroids must be floating number"
+                                + f"got {ivf_centroids.dtype}"
+                            )
+                        dim = ivf_centroids.shape[1]
+                        values = pa.array(ivf_centroids.reshape(-1))
+                        ivf_centroids = pa.FixedSizeListArray.from_arrays(values, dim)
+                    # Convert it to RecordBatch because
+                    # Rust side only accepts RecordBatch.
+                    ivf_centroids_batch = pa.RecordBatch.from_arrays(
+                        [ivf_centroids], ["_ivf_centroids"]
+                    )
+                    kwargs["ivf_centroids"] = ivf_centroids_batch
+
+            if "PQ" in index_type:
+                if num_sub_vectors is None:
+                    raise ValueError(
+                        "num_partitions and num_sub_vectors are required for IVF_PQ"
+                    )
+                kwargs["num_sub_vectors"] = num_sub_vectors
+
+                if (
+                    pq_codebook is None
+                    and accelerator is not None
+                    and "precomputed_partitions_file" in kwargs
+                    and not one_pass_ivfpq
+                ):
+                    LOGGER.info("Computing new precomputed shuffle buffers for PQ.")
+                    partitions_file = kwargs["precomputed_partitions_file"]
+                    del kwargs["precomputed_partitions_file"]
+
+                    partitions_ds = LanceDataset(partitions_file)
+                    # Use accelerator to train pq codebook
+                    from .vector import (
+                        compute_pq_codes,
+                        train_pq_codebook_on_accelerator,
+                    )
+
+                    timers["pq_train:start"] = time.time()
+                    pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
+                        partitions_ds,
+                        metric,
+                        accelerator=accelerator,
+                        num_sub_vectors=num_sub_vectors,
+                        dtype=element_type.to_pandas_dtype(),
+                    )
+                    timers["pq_train:end"] = time.time()
+                    pq_train_time = timers["pq_train:end"] - timers["pq_train:start"]
+                    LOGGER.info("pq training time: %ss", pq_train_time)
+                    timers["pq_assign:start"] = time.time()
+                    shuffle_output_dir = get_temp_dir(self.uri)
+                    shuffle_output_dir, shuffle_buffers = compute_pq_codes(
+                        partitions_ds,
+                        kmeans_list,
+                        batch_size=20480,
+                    )
+                    timers["pq_assign:end"] = time.time()
+                    pq_assign_time = timers["pq_assign:end"] - timers["pq_assign:start"]
+                    LOGGER.info("pq transform time: %ss", pq_assign_time)
+                    # Save disk space
+                    if precomputed_partition_dataset is not None and os.path.exists(
+                        partitions_file
+                    ):
+                        LOGGER.info(
+                            "Temporary partitions file stored at %s,"
+                            "you may want to delete it.",
+                            partitions_file,
+                        )
+
+                    kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
+                    kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
+                        shuffle_output_dir, "data"
+                    )
+
+                if pq_codebook is not None:
+                    # User provided IVF centroids
+                    if _check_for_numpy(pq_codebook) and isinstance(
+                        pq_codebook, np.ndarray
+                    ):
+                        if (
+                            len(pq_codebook.shape) != 3
+                            or pq_codebook.shape[0] != num_sub_vectors
+                            or pq_codebook.shape[1] != 256
+                        ):
+                            raise ValueError(
+                                f"PQ codebook must be 3D array:"
+                                f"(sub_vectors, 256, dim), "
+                                f"got {pq_codebook.shape}"
+                            )
+                        if pq_codebook.dtype not in [
+                            np.float16,
+                            np.float32,
+                            np.float64,
+                        ]:
+                            raise TypeError(
+                                "PQ codebook must be floating number"
+                                + f"got {pq_codebook.dtype}"
+                            )
+                        values = pa.array(pq_codebook.reshape(-1))
+                        pq_codebook = pa.FixedSizeListArray.from_arrays(
+                            values, pq_codebook.shape[2]
+                        )
+                    pq_codebook_batch = pa.RecordBatch.from_arrays(
+                        [pq_codebook], ["_pq_codebook"]
+                    )
+                    kwargs["pq_codebook"] = pq_codebook_batch
+
+            if shuffle_partition_batches is not None:
+                kwargs["shuffle_partition_batches"] = shuffle_partition_batches
+            if shuffle_partition_concurrency is not None:
+                kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
+
+            timers["final_create_index:start"] = time.time()
+            self._ds.create_index(
+                column, index_type, name, replace, storage_options, kwargs
             )
+            timers["final_create_index:end"] = time.time()
+            final_create_index_time = (
+                timers["final_create_index:end"] - timers["final_create_index:start"]
+            )
+            LOGGER.info("Final create_index rust time: %ss", final_create_index_time)
+        except ValueError:
+            raise
+        except KeyError:
+            raise
+        except NotImplementedError:
+            raise
+        except Exception as e:
+            LOGGER.error(f"Failed to create index: {e}")
+            raise RuntimeError("Failed to create index") from e
+        finally:
+            # clean disk space
+            if "precomputed_shuffle_buffers_path" in kwargs.keys():
+                LOGGER.warning(
+                    "Temporary shuffle buffers stored at %s, will delete it.",
+                    kwargs["precomputed_shuffle_buffers_path"],
+                )
+                LanceDataset.drop(
+                    kwargs["precomputed_shuffle_buffers_path"],
+                    storage_options=storage_options,
+                )
+            if "precomputed_partitions_file" in kwargs.keys():
+                LOGGER.warning(
+                    "Temporary precomputed partition files stored at %s, "
+                    "will delete it.",
+                    kwargs["precomputed_shuffle_buffers_path"],
+                )
+                LanceDataset.drop(
+                    kwargs["precomputed_partitions_file"],
+                    storage_options=storage_options,
+                )
+                print(f"delete dir: {kwargs['precomputed_partitions_file']}")
         return self
 
     def drop_index(self, name: str):

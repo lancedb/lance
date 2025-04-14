@@ -68,10 +68,22 @@ use lance_index::{
     },
     DatasetIndexExt, IndexParams, IndexType,
 };
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
+use log::error;
+use pyo3::exceptions::{PyStopIteration, PyTypeError};
+use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
+use pyo3::{
+    exceptions::{PyIOError, PyKeyError, PyValueError},
+    pybacked::PyBackedStr,
+    pyclass,
+    types::{IntoPyDict, PyDict},
+    PyObject, PyResult,
+};
+use pyo3::{prelude::*, IntoPyObjectExt};
+use snafu::location;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
@@ -2102,34 +2114,66 @@ fn prepare_vector_index_params(
             ivf_params.precomputed_partitions_file = Some(f.to_string());
         };
 
-        if let Some(storage_options) = storage_options {
-            ivf_params.storage_options = Some(storage_options);
+        if let Some(ref storage_options_inner) = storage_options {
+            ivf_params.storage_options = Some(storage_options_inner.clone());
         }
 
         match (
-                kwargs.get_item("precomputed_shuffle_buffers")?,
-                kwargs.get_item("precomputed_shuffle_buffers_path")?
-            ) {
-                (Some(l), Some(p)) => {
-                    let path = Path::parse(p.to_string()).map_err(|e| {
-                        PyValueError::new_err(format!(
-                            "Failed to parse precomputed_shuffle_buffers_path: {}",
-                            e
-                        ))
+            kwargs.get_item("precomputed_shuffle_buffers")?,
+            kwargs.get_item("precomputed_shuffle_buffers_path")?
+        ) {
+            (Some(l), Some(p)) => {
+                // Extract path string from Python object
+                let uri = p.to_string();
+                if let Some(storage_options_inner) = storage_options {
+
+                    // Create Tokio runtime for async operations
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|e| PyValueError::new_err(format!("Failed to create runtime: {}", e)))?;
+
+                    // Execute async block in synchronous context
+                    let (path, list) = rt.block_on(async {
+                        // Initialize cloud storage backend asynchronously
+                        let (store, path) = ObjectStore::from_uri_and_params(
+                            Arc::new(ObjectStoreRegistry::default()),
+                            &uri,
+                            &ObjectStoreParams {
+                                storage_options: Some(storage_options_inner.clone()),
+                                ..Default::default()
+                            }
+                        )
+                        .await
+                        .map_err(|e| PyValueError::new_err(format!("ObjectStore init failed: {}", e)))?;
+
+                        // Verify path existence asynchronously
+                        if !store.path_exists(&path).await.map_err(|e| {
+                            PyValueError::new_err(format!("Path check failed: {}", e)
+                        )})? {
+                            return Err(PyValueError::new_err(format!("Path does not exist: {}", uri)));
+                        }
+
+                        // Convert Python list to Rust string vector
+                        let list = l.downcast::<PyList>()?
+                            .iter()
+                            .map(|f| f.to_string())
+                            .collect::<Vec<_>>();
+
+                        Ok::<_, PyErr>((path, list))
                     })?;
-                    let list = l.downcast::<PyList>()?
-                        .iter()
-                        .map(|f| f.to_string())
-                        .collect();
-                    ivf_params.precomputed_shuffle_buffers = Some((path, list));
-                },
-                (None, None) => {},
-                _ => {
-                    return Err(PyValueError::new_err(
-                        "precomputed_shuffle_buffers and precomputed_shuffle_buffers_path must be specified together."
-                    ))
+
+                    // Build final parameters structure
+                    ivf_params.precomputed_shuffle_buffers = Some((
+                        path,
+                        list
+                    ));
                 }
-            }
+            },
+            (None, None) => {},
+            _ => {
+                return Err(PyValueError::new_err(
+                    "precomputed_shuffle_buffers and precomputed_shuffle_buffers_path must be specified together."
+                ))}
+        }
 
         // Parse HNSW params
         if let Some(max_level) = kwargs.get_item("max_level")? {

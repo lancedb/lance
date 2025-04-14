@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 import tempfile
-from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import pyarrow as pa
 from tqdm.auto import tqdm
@@ -138,6 +138,7 @@ def train_pq_codebook_on_accelerator(
     num_sub_vectors: int,
     batch_size: int = 1024 * 10 * 4,
     dtype: np.dtype = np.float32,
+    storage_options: Optional[Dict[str, str]] = None,
 ) -> Tuple[np.ndarray, List[Any]]:
     """Use accelerator (GPU or MPS) to train pq codebook."""
 
@@ -158,6 +159,7 @@ def train_pq_codebook_on_accelerator(
         batch_size=256,
         columns=field_names,
         samples=256,
+        storage_options=storage_options,
     )
 
     init_centroids = next(iter(ds_init))
@@ -168,6 +170,7 @@ def train_pq_codebook_on_accelerator(
         columns=field_names,
         samples=sample_size,
         cache=True,
+        storage_options=storage_options,
     )
 
     for sub_vector in range(num_sub_vectors):
@@ -410,6 +413,8 @@ def compute_partitions(
     num_sub_vectors: Optional[int] = None,
     filter_nan: bool = True,
     sample_size: Optional[int] = None,
+    temp_dir: Optional[str] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
@@ -547,20 +552,19 @@ def compute_partitions(
                 yield part_batch
 
     rbr = pa.RecordBatchReader.from_batches(output_schema, _partition_assignment())
-    if dst_dataset_uri is None:
-        dst_dataset_uri = tempfile.mkdtemp()
     write_dataset(
         rbr,
-        dst_dataset_uri,
+        temp_dir,
         schema=output_schema,
         max_rows_per_file=dataset.count_rows(),
         data_storage_version="stable",
+        storage_options=storage_options,
     )
 
     progress.close()
 
-    LOGGER.info("Saved precomputed partitions to %s", dst_dataset_uri)
-    return str(dst_dataset_uri)
+    LOGGER.info("Saved precomputed partitions to %s", temp_dir)
+    return str(temp_dir)
 
 
 def one_pass_train_ivf_pq_on_accelerator(
@@ -575,6 +579,8 @@ def one_pass_train_ivf_pq_on_accelerator(
     sample_rate: int = 256,
     max_iters: int = 50,
     filter_nan: bool = True,
+    resident_dir: Optional[str] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
 ):
     metric_type = _normalize_metric_type(metric_type)
     centroids, kmeans = train_ivf_centroids_on_accelerator(
@@ -596,9 +602,16 @@ def one_pass_train_ivf_pq_on_accelerator(
         num_sub_vectors=num_sub_vectors,
         filter_nan=filter_nan,
         sample_size=256 * 256,
+        temp_dir=resident_dir,
+        storage_options=storage_options,
     )
     pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
-        dataset_residuals, metric_type, accelerator, num_sub_vectors, batch_size
+        dataset_residuals,
+        metric_type,
+        accelerator,
+        num_sub_vectors,
+        batch_size,
+        storage_options=storage_options,
     )
     pq_codebook = pq_codebook.astype(dtype=centroids.dtype)
     return centroids, kmeans, pq_codebook, kmeans_list
@@ -616,6 +629,8 @@ def one_pass_assign_ivf_pq_on_accelerator(
     *,
     filter_nan: bool = True,
     allow_cuda_tf32: bool = True,
+    shuffle_output_dir: Optional[str] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
 ):
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
@@ -644,6 +659,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
         with_row_id=True,
         columns=[column],
         filter=filt,
+        storage_options=storage_options,
     )
     loader = torch.utils.data.DataLoader(
         torch_ds,
@@ -736,16 +752,17 @@ def one_pass_assign_ivf_pq_on_accelerator(
         dst_dataset_uri = tempfile.mkdtemp()
     ds = write_dataset(
         rbr,
-        dst_dataset_uri,
+        shuffle_output_dir,
         schema=output_schema,
         data_storage_version="legacy",
+        storage_options=storage_options,
     )
 
     progress.close()
 
-    LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
+    LOGGER.info("Saved precomputed pq_codes to %s", shuffle_output_dir)
 
     shuffle_buffers = [
         data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
     ]
-    return dst_dataset_uri, shuffle_buffers
+    return shuffle_output_dir, shuffle_buffers

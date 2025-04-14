@@ -559,6 +559,27 @@ impl ObjectStore {
         }
     }
 
+    /// Unified path existence checker with storage-type optimized implementations
+    ///
+    /// # Arguments
+    /// * `path` - Filesystem path to check (supports both local and cloud storage paths)
+    ///
+    /// # Returns
+    /// - `Ok(true)` if path exists and is accessible
+    /// - `Ok(false)` if path doesn't exist
+    /// - `Err` for any storage access errors
+    pub async fn path_exists(&self, path: &Path) -> Result<bool> {
+        if self.is_local() {
+            // Direct filesystem check for local storage using OS metadata
+            self.exists(path).await
+        } else {
+            // Cloud-optimized existence check:
+            // List first object at path to avoid full directory scanning
+            let mut stream = self.list(Some(path.to_owned())).take(1);
+            Ok(stream.next().await.is_some())
+        }
+    }
+
     /// Get file size.
     pub async fn size(&self, path: &Path) -> Result<u64> {
         Ok(self.inner.head(path).await?.size)
