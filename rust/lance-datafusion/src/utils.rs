@@ -258,7 +258,7 @@ impl<K: Ord + Clone, Item> BatchMergeStream<K, Item> {
 }
 
 impl<K: Ord + Clone + Unpin, Item: Unpin> Stream for BatchMergeStream<K, Item> {
-    type Item = Result<Item>;
+    type Item = Result<(K, Item)>;
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
@@ -269,32 +269,30 @@ impl<K: Ord + Clone + Unpin, Item: Unpin> Stream for BatchMergeStream<K, Item> {
             return std::task::Poll::Ready(None);
         }
 
-        let intermediate = this.heap.pop().unwrap().0;
+        let idx = this.heap.peek().unwrap().0.idx;
 
         // consume the stream that produced the value,
         // and push the next value to the heap
-        let stream = &mut this.streams[intermediate.idx];
-        loop {
-            match stream.poll_next_unpin(cx) {
-                std::task::Poll::Ready(Some(Ok((key, value)))) => {
-                    this.heap.push(std::cmp::Reverse(Intermediate::new(
-                        intermediate.idx,
-                        key,
-                        value,
-                    )));
-                    return std::task::Poll::Ready(Some(Ok(intermediate.value)));
-                }
-                std::task::Poll::Ready(Some(Err(err))) => {
-                    return std::task::Poll::Ready(Some(Err(err)));
-                }
-                std::task::Poll::Ready(None) => {
-                    // stream is done, we can just return the value
-                    return std::task::Poll::Ready(Some(Ok(intermediate.value)));
-                }
-                std::task::Poll::Pending => {
-                    // stream is not ready yet, keep waiting
-                    continue;
-                }
+        let stream = &mut this.streams[idx];
+        match stream.poll_next_unpin(cx) {
+            std::task::Poll::Ready(Some(Ok((key, value)))) => {
+                let intermediate = this.heap.pop().unwrap().0;
+                this.heap.push(std::cmp::Reverse(Intermediate::new(
+                    intermediate.idx,
+                    key,
+                    value,
+                )));
+                std::task::Poll::Ready(Some(Ok((intermediate.key, intermediate.value))))
+            }
+            std::task::Poll::Ready(Some(Err(err))) => std::task::Poll::Ready(Some(Err(err))),
+            std::task::Poll::Ready(None) => {
+                // stream is done, we can just return the value
+                let intermediate = this.heap.pop().unwrap().0;
+                std::task::Poll::Ready(Some(Ok((intermediate.key, intermediate.value))))
+            }
+            std::task::Poll::Pending => {
+                // stream is not ready yet, keep waiting
+                std::task::Poll::Pending
             }
         }
     }

@@ -14,12 +14,12 @@ use futures::stream;
 use itertools::Itertools;
 use lance_core::cache::FileMetadataCache;
 use lance_core::ROW_ID;
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::query::FtsSearchParams;
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
+use lance_index::{metrics::NoOpMetricsCollector, scalar::InvertedIndexParams};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
@@ -72,7 +72,7 @@ fn bench_inverted(c: &mut Criterion) {
                 stream::iter(vec![Ok(batch.clone())]),
             );
             let stream = Box::pin(stream);
-            let mut builder = InvertedIndexBuilder::default();
+            let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default());
             black_box(builder.update(stream, store.as_ref()).await.unwrap());
         })
     });
