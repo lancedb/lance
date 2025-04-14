@@ -36,6 +36,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
   clippy:
+    permissions:
+      checks: write
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
