@@ -290,7 +290,7 @@ impl<K: Ord + Clone + Unpin, Item: Unpin> Stream for BatchMergeStream<K, Item> {
             }
             std::task::Poll::Pending => {
                 // stream is not ready yet
-                if this.heap.len() > 0 && this.heap.peek().unwrap().0.key == intermediate.key {
+                if !this.heap.is_empty() && this.heap.peek().unwrap().0.key == intermediate.key {
                     // if the next value is the same key, we can just return it
                     std::task::Poll::Ready(Some(Ok((intermediate.key, intermediate.value))))
                 } else {
