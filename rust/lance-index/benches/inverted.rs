@@ -74,7 +74,10 @@ fn bench_inverted(c: &mut Criterion) {
             let stream = Box::pin(stream);
             let mut builder =
                 InvertedIndexBuilder::new(InvertedIndexParams::default().with_position(false));
-            black_box(builder.update(stream, store.as_ref()).await.unwrap());
+            black_box({
+                builder.update(stream, store.as_ref()).await.unwrap();
+                builder
+            });
         })
     });
     let invert_index = rt.block_on(InvertedIndex::load(store)).unwrap();
