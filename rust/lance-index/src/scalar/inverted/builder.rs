@@ -364,7 +364,7 @@ impl InvertedIndexBuilder {
             }
         }
 
-        if token_batches.len() > 0 {
+        if !token_batches.is_empty() {
             self.tokens.add(last_token.unwrap());
             let posting_builder = PostingListBuilder::from_batches(&token_batches);
             token_batches.clear();
@@ -664,30 +664,34 @@ pub enum PositionRecorder {
 impl PositionRecorder {
     fn new(with_position: bool) -> Self {
         if with_position {
-            PositionRecorder::Position(Vec::new())
+            Self::Position(Vec::new())
         } else {
-            PositionRecorder::Count(0)
+            Self::Count(0)
         }
     }
 
     fn push(&mut self, position: i32) {
         match self {
-            PositionRecorder::Position(positions) => positions.push(position),
-            PositionRecorder::Count(count) => *count += 1,
+            Self::Position(positions) => positions.push(position),
+            Self::Count(count) => *count += 1,
         }
     }
 
     pub fn len(&self) -> usize {
         match self {
-            PositionRecorder::Position(positions) => positions.len(),
-            PositionRecorder::Count(count) => *count,
+            Self::Position(positions) => positions.len(),
+            Self::Count(count) => *count,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn into_vec(self) -> Vec<i32> {
         match self {
-            PositionRecorder::Position(positions) => positions,
-            PositionRecorder::Count(_) => vec![0],
+            Self::Position(positions) => positions,
+            Self::Count(_) => vec![0],
         }
     }
 }
@@ -735,6 +739,7 @@ impl PostingReader {
     }
 
     // returns a stream of (token, batch)
+    #[allow(clippy::type_complexity)]
     fn into_stream(
         mut self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(String, Vec<RecordBatch>)>> + Send>>> {
@@ -754,8 +759,7 @@ impl PostingReader {
                         if length == 0 {
                             Ok(RecordBatch::new_empty(schema))
                         } else {
-                            let res = reader.read_range(offset..offset + length, None).await;
-                            res
+                            reader.read_range(offset..offset + length, None).await
                         }
                     }
                 });
