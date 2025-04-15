@@ -227,18 +227,18 @@ impl<K: Ord + Clone, V> Ord for Intermediate<K, V> {
     }
 }
 
+type KeyStream<K, Item> = Pin<Box<dyn Stream<Item = Result<(K, Item)>> + Send>>;
+
 /// A stream that merges multiple streams in order of key.
 /// All the stream must have the same schema, and the key must be produced
 /// in the same order.
 pub struct BatchMergeStream<K: Ord + Clone, Item> {
-    streams: Vec<Pin<Box<dyn Stream<Item = Result<(K, Item)>> + Send>>>,
+    streams: Vec<KeyStream<K, Item>>,
     heap: BinaryHeap<std::cmp::Reverse<Intermediate<K, Item>>>,
 }
 
 impl<K: Ord + Clone, Item> BatchMergeStream<K, Item> {
-    pub async fn try_new(
-        mut streams: Vec<Pin<Box<dyn Stream<Item = Result<(K, Item)>> + Send>>>,
-    ) -> Result<Self> {
+    pub async fn try_new(mut streams: Vec<KeyStream<K, Item>>) -> Result<Self> {
         // get the first batch from each stream
         let mut heap = BinaryHeap::with_capacity(streams.len());
         let mut futures = Vec::with_capacity(streams.len());
