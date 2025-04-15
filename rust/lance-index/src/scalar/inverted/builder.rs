@@ -34,9 +34,9 @@ use super::index::*;
 lazy_static! {
     // the size threshold to trigger flush the posting lists while indexing FTS,
     // lower value will result in slower indexing and less memory usage
-    // it's in 512MiB by default
+    // it's in 1GiB by default
     static ref LANCE_FTS_FLUSH_THRESHOLD: usize = std::env::var("LANCE_FTS_FLUSH_THRESHOLD")
-        .unwrap_or_else(|_| "512".to_string())
+        .unwrap_or_else(|_| "1024".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_FLUSH_THRESHOLD");
     // the size of each flush, lower value will result in more frequent flushes, but better IO locality
@@ -150,17 +150,12 @@ impl InvertedIndexBuilder {
             index_tasks.push(task);
         }
 
-        let mut stream = flatten_stream
-            .map(|batch| {
-                let sender = sender.clone();
-                async move {
-                    let batch = batch?;
-                    let num_rows = batch.num_rows();
-                    sender.send(batch).await.expect("failed to send batch");
-                    Result::Ok(num_rows)
-                }
-            })
-            .buffer_unordered(8); // let it be faster than IO then it's enough
+        let mut stream = flatten_stream.map(|batch| {
+            let batch = batch?;
+            let num_rows = batch.num_rows();
+            sender.send_blocking(batch).expect("failed to send batch");
+            Result::Ok(num_rows)
+        });
         log::info!("indexing FTS with {} workers", num_workers);
 
         let mut last_num_rows = 0;
@@ -301,12 +296,12 @@ impl InvertedIndexBuilder {
         }
         if let Some(inverted_list_reader) = self.inverted_list.as_ref() {
             let tokens = match self.tokens.tokens {
-                TokenMap::HashMap(ref tokens) => tokens.clone(),
+                TokenMap::HashMap(ref mut tokens) => std::mem::take(tokens),
                 _ => unreachable!("tokens must be HashMap at indexing"),
             };
 
             let inverted_list_reader = inverted_list_reader.clone();
-            let stream = stream::iter(tokens)
+            let stream = stream::iter(tokens.into_iter().sorted_unstable())
                 .map(move |(token, token_id)| {
                     let inverted_list_reader = inverted_list_reader.clone();
                     async move {
@@ -490,6 +485,8 @@ impl IndexWorker {
             .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
 
         let with_position = self.has_position();
+        self.row_ids.extend_from_slice(row_id_col.values());
+        self.doc_token_num.reserve(row_id_col.len());
         for (doc, row_id) in docs {
             let start = std::time::Instant::now();
             let mut token_occurrences = HashMap::with_capacity(self.predict_doc_token_num(doc));
@@ -509,7 +506,6 @@ impl IndexWorker {
             self.tokenize_duration += start.elapsed();
 
             let start = std::time::Instant::now();
-            self.row_ids.push(row_id);
             self.doc_token_num.push(token_num);
             self.total_token_num += token_num;
             self.total_doc_length += doc.len();
@@ -522,11 +518,7 @@ impl IndexWorker {
                         .entry(token)
                         .or_insert_with(|| PostingListBuilder::empty(with_position));
 
-                    let old_size = if posting_list.is_empty() {
-                        0
-                    } else {
-                        posting_list.size()
-                    };
+                    let old_size = posting_list.size();
                     posting_list.add(row_id, term_positions);
                     let new_size = posting_list.size();
                     self.estimated_size += new_size - old_size;
@@ -653,7 +645,7 @@ pub struct PostingReader {
     tmpdir: Option<TempDir>,
     store: Arc<dyn IndexStore>,
     reader: Arc<dyn IndexReader>,
-    token_offsets: HashMap<String, Vec<(usize, usize)>>,
+    token_offsets: Vec<(String, Vec<(usize, usize)>)>,
 }
 
 impl Debug for PostingReader {
@@ -676,7 +668,7 @@ impl PostingReader {
     async fn new(
         tmpdir: Option<TempDir>,
         store: Arc<dyn IndexStore>,
-        token_offsets: HashMap<String, Vec<(usize, usize)>>,
+        token_offsets: impl IntoIterator<Item = (String, Vec<(usize, usize)>)>,
     ) -> Result<Self> {
         let reader = store.open_index_file(INVERT_LIST_FILE).await?;
 
@@ -684,7 +676,10 @@ impl PostingReader {
             tmpdir,
             store,
             reader,
-            token_offsets,
+            token_offsets: token_offsets
+                .into_iter()
+                .sorted_unstable_by(|(a, _), (b, _)| a.cmp(b))
+                .collect_vec(),
         })
     }
 
