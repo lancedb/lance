@@ -591,6 +591,7 @@ async fn resolve_commit_handler(
 ) -> Result<Arc<dyn CommitHandler>> {
     match commit_handler {
         None => {
+            #[allow(deprecated)]
             if store_options
                 .as_ref()
                 .map(|opts| opts.object_store.is_some())

@@ -15,16 +15,17 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
-use futures::Stream;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream};
 use lance_core::utils::parse::str_is_truthy;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use list_retry::ListRetryStream;
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
 use object_store::DynObjectStore;
-use object_store::{local::LocalFileSystem, memory::InMemory, Error as ObjectStoreError};
+use object_store::{local::LocalFileSystem, Error as ObjectStoreError};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
+use providers::local::FileStoreProvider;
+use providers::memory::MemoryStoreProvider;
 use shellexpand::tilde;
 use snafu::location;
 use tokio::io::AsyncWriteExt;
@@ -138,6 +139,7 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ObjectStoreParams {
     pub block_size: Option<usize>,
+    #[deprecated(note = "Implement an ObjectStoreProvider instead")]
     pub object_store: Option<(Arc<DynObjectStore>, Url)>,
     pub s3_credentials_refresh_offset: Duration,
     #[cfg(feature = "aws")]
@@ -154,6 +156,7 @@ pub struct ObjectStoreParams {
 
 impl Default for ObjectStoreParams {
     fn default() -> Self {
+        #[allow(deprecated)]
         Self {
             object_store: None,
             block_size: None,
@@ -186,6 +189,7 @@ impl ObjectStore {
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Self, Path)> {
+        #[allow(deprecated)]
         if let Some((store, path)) = params.object_store.as_ref() {
             let mut inner = store.clone();
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
@@ -264,33 +268,36 @@ impl ObjectStore {
         url: Url,
         params: ObjectStoreParams,
     ) -> Result<Self> {
-        configure_store(registry, url.as_str(), params).await
+        let url = ensure_table_uri(url)?;
+        let scheme = url.scheme();
+        if let Some(provider) = registry.get_provider(scheme) {
+            provider.new_store(url, &params).await
+        } else {
+            let err = lance_core::Error::from(object_store::Error::NotSupported {
+                source: format!("Unsupported URI scheme: {} in url {}", scheme, url).into(),
+            });
+            Err(err)
+        }
     }
 
     /// Local object store.
     pub fn local() -> Self {
-        Self {
-            inner: Arc::new(LocalFileSystem::new()).traced(),
-            scheme: String::from("file"),
-            block_size: 4 * 1024, // 4KB block size
-            use_constant_size_upload_parts: false,
-            list_is_lexically_ordered: false,
-            io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
-            download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
-        }
+        let provider = FileStoreProvider;
+        provider
+            .new_store(Url::parse("file:///").unwrap(), &Default::default())
+            .now_or_never()
+            .unwrap()
+            .unwrap()
     }
 
     /// Create a in-memory object store directly for testing.
     pub fn memory() -> Self {
-        Self {
-            inner: Arc::new(InMemory::new()).traced(),
-            scheme: String::from("memory"),
-            block_size: 4 * 1024,
-            use_constant_size_upload_parts: false,
-            list_is_lexically_ordered: true,
-            io_parallelism: get_num_compute_intensive_cpus(),
-            download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
-        }
+        let provider = MemoryStoreProvider;
+        provider
+            .new_store(Url::parse("memory:///").unwrap(), &Default::default())
+            .now_or_never()
+            .unwrap()
+            .unwrap()
     }
 
     /// Returns true if the object store pointed to a local file system.
@@ -573,23 +580,6 @@ impl From<HashMap<String, String>> for StorageOptions {
     }
 }
 
-async fn configure_store(
-    registry: Arc<ObjectStoreRegistry>,
-    url: &str,
-    options: ObjectStoreParams,
-) -> Result<ObjectStore> {
-    let url = ensure_table_uri(url)?;
-    let scheme = url.scheme();
-    if let Some(provider) = registry.get_provider(scheme) {
-        provider.new_store(url, &options).await
-    } else {
-        let err = lance_core::Error::from(object_store::Error::NotSupported {
-            source: format!("Unsupported URI scheme: {} in url {}", scheme, url).into(),
-        });
-        Err(err)
-    }
-}
-
 impl ObjectStore {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -689,22 +679,10 @@ pub fn ensure_table_uri(table_uri: impl AsRef<str>) -> Result<Url> {
     Ok(url)
 }
 
-lazy_static::lazy_static! {
-  static ref KNOWN_SCHEMES: Vec<&'static str> =
-      Vec::from([
-        "s3",
-        "s3+ddb",
-        "gs",
-        "az",
-        "file",
-        "file-object-store",
-        "memory"
-      ]);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::memory::InMemory;
     use parquet::data_type::AsBytes;
     use rstest::rstest;
     use std::env::set_current_dir;

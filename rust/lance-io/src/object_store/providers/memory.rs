@@ -12,6 +12,7 @@ use crate::object_store::{
 };
 use lance_core::{error::Result, utils::tokio::get_num_compute_intensive_cpus};
 
+/// Provides a fresh in-memory object store for each call to `new_store`.
 #[derive(Default, Debug)]
 pub struct MemoryStoreProvider;
 
@@ -23,6 +24,30 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
+            scheme: String::from("memory"),
+            block_size,
+            use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: true,
+            io_parallelism: get_num_compute_intensive_cpus(),
+            download_retry_count,
+        })
+    }
+}
+
+/// Provides the given in-memory object store for each call to `new_store`.
+#[derive(Debug)]
+pub struct PersistentMemoryStoreProvider {
+    pub inner: Arc<InMemory>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for PersistentMemoryStoreProvider {
+    async fn new_store(&self, _base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+        let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
+        let storage_options = StorageOptions(params.storage_options.clone().unwrap_or_default());
+        let download_retry_count = storage_options.download_retry_count();
+        Ok(ObjectStore {
+            inner: self.inner.clone(),
             scheme: String::from("memory"),
             block_size,
             use_constant_size_upload_parts: false,
