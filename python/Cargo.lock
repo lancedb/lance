@@ -2271,7 +2271,7 @@ dependencies = [
 
 [[package]]
 name = "fsst"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "rand",
 ]
@@ -3186,7 +3186,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3247,7 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3264,7 +3264,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3328,7 +3328,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3343,7 +3343,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "arrayref",
  "arrow",
@@ -3382,7 +3382,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3416,7 +3416,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3472,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3510,7 +3510,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "arrow-array",
  "arrow-ord",
@@ -3533,7 +3533,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4731,7 +4731,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "arrow",
  "arrow-array",
