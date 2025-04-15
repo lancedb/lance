@@ -192,25 +192,15 @@ impl InvertedIndexBuilder {
 
         // update doc set
         let mut readers = Vec::with_capacity(workers.len());
-        let mut worker_tokenize_duration = std::time::Duration::ZERO;
-        let mut worker_update_duration = std::time::Duration::ZERO;
-        let mut worker_flush_duration = std::time::Duration::ZERO;
         for worker in workers {
             for (row_id, num_tokens) in
                 std::iter::zip(worker.row_ids.iter(), worker.doc_token_num.iter())
             {
                 self.docs.add(*row_id, *num_tokens as u32);
             }
-            worker_tokenize_duration += worker.tokenize_duration;
-            worker_update_duration += worker.update_duration;
-            worker_flush_duration += worker.flush_duration;
             readers.push(worker.into_reader());
         }
         self.posting_readers = futures::future::try_join_all(readers).await?;
-        log::info!(
-            "FTS indexing documents, tokenize elapsed: {:?}, update elapsed: {:?}, flush elapsed: {:?}",
-            worker_tokenize_duration,worker_update_duration, worker_flush_duration
-        );
         log::info!("FTS indexing documents elapsed {:?}", start.elapsed());
 
         Ok(())
@@ -439,10 +429,6 @@ struct IndexWorker {
 
     total_doc_length: usize,
     total_token_num: usize,
-
-    tokenize_duration: std::time::Duration,
-    update_duration: std::time::Duration,
-    flush_duration: std::time::Duration,
 }
 
 impl IndexWorker {
@@ -488,10 +474,6 @@ impl IndexWorker {
             estimated_size: 0,
             total_doc_length: 0,
             total_token_num: 0,
-
-            tokenize_duration: std::time::Duration::ZERO,
-            update_duration: std::time::Duration::ZERO,
-            flush_duration: std::time::Duration::ZERO,
         })
     }
 
@@ -511,7 +493,6 @@ impl IndexWorker {
         self.row_ids.extend_from_slice(row_id_col.values());
         self.doc_token_num.reserve(row_id_col.len());
         for (doc, row_id) in docs {
-            let start = std::time::Instant::now();
             let mut token_occurrences = HashMap::with_capacity(self.predict_doc_token_num(doc));
             let mut token_num = 0;
             {
@@ -526,9 +507,7 @@ impl IndexWorker {
                     token_num += 1;
                 }
             }
-            self.tokenize_duration += start.elapsed();
 
-            let start = std::time::Instant::now();
             self.doc_token_num.push(token_num);
             self.total_token_num += token_num;
             self.total_doc_length += doc.len();
@@ -546,7 +525,6 @@ impl IndexWorker {
                     let new_size = posting_list.size();
                     self.estimated_size += new_size - old_size;
                 });
-            self.update_duration += start.elapsed();
         }
 
         if self.estimated_size > *LANCE_FTS_FLUSH_THRESHOLD * 1024 * 1024 {
@@ -569,7 +547,6 @@ impl IndexWorker {
             return Ok(());
         }
 
-        let start = std::time::Instant::now();
         let mut tokens = self
             .posting_lists
             .iter()
@@ -594,7 +571,6 @@ impl IndexWorker {
         for token in to_flush {
             flushed_size += self.emit_flush_posting_list(token);
         }
-        self.flush_duration += start.elapsed();
         log::debug!(
             "flushed {} lists of {}MiB, posting_lists num: {}, posting_lists size: {}MiB",
             flush_count,
