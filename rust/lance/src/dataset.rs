@@ -2059,6 +2059,7 @@ mod tests {
                     object_store_wrapper: Some(io_stats_wrapper),
                     ..Default::default()
                 }),
+                object_store_registry: store_registry.clone(),
                 ..Default::default()
             })
             .load()
