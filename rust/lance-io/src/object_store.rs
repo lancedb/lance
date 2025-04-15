@@ -171,6 +171,59 @@ impl Default for ObjectStoreParams {
     }
 }
 
+// We implement hash for caching
+impl std::hash::Hash for ObjectStoreParams {
+    #[allow(deprecated)]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.block_size.hash(state);
+        if let Some((store, url)) = &self.object_store {
+            Arc::as_ptr(store).hash(state);
+            url.hash(state);
+        }
+        self.s3_credentials_refresh_offset.hash(state);
+        #[cfg(feature = "aws")]
+        if let Some(aws_credentials) = &self.aws_credentials {
+            Arc::as_ptr(aws_credentials).hash(state);
+        }
+        if let Some(wrapper) = &self.object_store_wrapper {
+            Arc::as_ptr(wrapper).hash(state);
+        }
+        if let Some(storage_options) = &self.storage_options {
+            for (key, value) in storage_options {
+                key.hash(state);
+                value.hash(state);
+            }
+        }
+        self.use_constant_size_upload_parts.hash(state);
+        self.list_is_lexically_ordered.hash(state);
+    }
+}
+
+// We implement eq for caching
+impl Eq for ObjectStoreParams {}
+impl PartialEq for ObjectStoreParams {
+    #[allow(deprecated)]
+    fn eq(&self, other: &Self) -> bool {
+        self.block_size == other.block_size
+            && self
+                .object_store
+                .as_ref()
+                .map(|(store, url)| (Arc::as_ptr(store), url))
+                == other
+                    .object_store
+                    .as_ref()
+                    .map(|(store, url)| (Arc::as_ptr(store), url))
+            && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
+            && self.aws_credentials.as_ref().map(Arc::as_ptr)
+                == other.aws_credentials.as_ref().map(Arc::as_ptr)
+            && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
+                == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
+            && self.storage_options == other.storage_options
+            && self.use_constant_size_upload_parts == other.use_constant_size_upload_parts
+            && self.list_is_lexically_ordered == other.list_is_lexically_ordered
+    }
+}
+
 impl ObjectStore {
     /// Parse from a string URI.
     ///
