@@ -72,7 +72,8 @@ fn bench_inverted(c: &mut Criterion) {
                 stream::iter(vec![Ok(batch.clone())]),
             );
             let stream = Box::pin(stream);
-            let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default());
+            let mut builder =
+                InvertedIndexBuilder::new(InvertedIndexParams::default().with_position(false));
             black_box(builder.update(stream, store.as_ref()).await.unwrap());
         })
     });

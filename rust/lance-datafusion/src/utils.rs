@@ -269,14 +269,13 @@ impl<K: Ord + Clone + Unpin, Item: Unpin> Stream for BatchMergeStream<K, Item> {
             return std::task::Poll::Ready(None);
         }
 
-        let idx = this.heap.peek().unwrap().0.idx;
+        let intermediate = this.heap.pop().unwrap().0;
 
         // consume the stream that produced the value,
         // and push the next value to the heap
-        let stream = &mut this.streams[idx];
+        let stream = &mut this.streams[intermediate.idx];
         match stream.poll_next_unpin(cx) {
             std::task::Poll::Ready(Some(Ok((key, value)))) => {
-                let intermediate = this.heap.pop().unwrap().0;
                 this.heap.push(std::cmp::Reverse(Intermediate::new(
                     intermediate.idx,
                     key,
@@ -287,12 +286,18 @@ impl<K: Ord + Clone + Unpin, Item: Unpin> Stream for BatchMergeStream<K, Item> {
             std::task::Poll::Ready(Some(Err(err))) => std::task::Poll::Ready(Some(Err(err))),
             std::task::Poll::Ready(None) => {
                 // stream is done, we can just return the value
-                let intermediate = this.heap.pop().unwrap().0;
                 std::task::Poll::Ready(Some(Ok((intermediate.key, intermediate.value))))
             }
             std::task::Poll::Pending => {
-                // stream is not ready yet, keep waiting
-                std::task::Poll::Pending
+                // stream is not ready yet
+                if this.heap.len() > 0 && this.heap.peek().unwrap().0.key == intermediate.key {
+                    // if the next value is the same key, we can just return it
+                    std::task::Poll::Ready(Some(Ok((intermediate.key, intermediate.value))))
+                } else {
+                    // otherwise, we need to wait for the stream to be ready
+                    this.heap.push(std::cmp::Reverse(intermediate));
+                    std::task::Poll::Pending
+                }
             }
         }
     }

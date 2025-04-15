@@ -940,7 +940,7 @@ impl PositionBuilder {
 
     pub fn size(&self) -> usize {
         std::mem::size_of::<i32>() * self.positions.len()
-            + std::mem::size_of::<i32>() * self.offsets.len()
+            + std::mem::size_of::<i32>() * (self.offsets.len() - 1)
     }
 
     pub fn total_len(&self) -> usize {

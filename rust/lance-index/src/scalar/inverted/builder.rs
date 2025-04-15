@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::scalar::lance_format::LanceIndexStore;
-use crate::scalar::{IndexReader, IndexStore, IndexWriter, InvertedIndexParams};
+use crate::scalar::{IndexReader, IndexStore, InvertedIndexParams};
 use crate::vector::graph::OrderedFloat;
 use arrow::array::AsArray;
 use arrow::datatypes;
@@ -18,8 +18,8 @@ use deepsize::DeepSizeOf;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::iter_str_array;
-use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::{cache::FileMetadataCache, utils::tokio::spawn_cpu};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::utils::BatchMergeStream;
 use lance_io::object_store::ObjectStore;
@@ -33,7 +33,8 @@ use super::index::*;
 
 lazy_static! {
     // the size threshold to trigger flush the posting lists while indexing FTS,
-    // lower value will result in slower indexing and less memory usage
+    // lower value will result in slower indexing and less memory usage.
+    // This means the indexing process would eat up to `LANCE_FTS_FLUSH_THRESHOLD * num_cpus * 2` MiB of memory,
     // it's in 1GiB by default
     static ref LANCE_FTS_FLUSH_THRESHOLD: usize = std::env::var("LANCE_FTS_FLUSH_THRESHOLD")
         .unwrap_or_else(|_| "1024".to_string())
@@ -44,7 +45,7 @@ lazy_static! {
     // and then flush posting lists until the size of the flushed posting lists reaches `LANCE_FTS_FLUSH_SIZE`
     // it's in 64MiB by default
     static ref LANCE_FTS_FLUSH_SIZE: usize = std::env::var("LANCE_FTS_FLUSH_SIZE")
-        .unwrap_or_else(|_| "128".to_string())
+        .unwrap_or_else(|_| "16".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_FLUSH_SIZE");
     // the number of shards to split the indexing work,
@@ -101,13 +102,11 @@ impl InvertedIndexBuilder {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        let start = std::time::Instant::now();
         self.update_index(new_data).await?;
-        println!("FTS indexing documents elapsed {:?}", start.elapsed());
 
         let start = std::time::Instant::now();
         self.write(dest_store).await?;
-        println!("FTS writing documents elapsed {:?}", start.elapsed());
+        log::info!("FTS writing documents elapsed {:?}", start.elapsed());
         Ok(())
     }
 
@@ -137,13 +136,17 @@ impl InvertedIndexBuilder {
         let with_position = self.params.with_position;
         let (sender, receiver) = async_channel::bounded(num_workers);
         let mut index_tasks = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
-            let tokenizer = tokenizer.clone();
+        let workers = futures::future::try_join_all((0..num_workers).map(|_| async {
+            let worker = IndexWorker::new(tokenizer.clone(), with_position).await?;
+            Result::Ok(worker)
+        }))
+        .await?;
+        for worker in workers {
             let receiver = receiver.clone();
-            let task = tokio::task::spawn(async move {
-                let mut worker = IndexWorker::new(tokenizer, with_position).await?;
-                while let Ok(batch) = receiver.recv().await {
-                    worker.process_batch(batch).await?;
+            let task = spawn_cpu(move || {
+                let mut worker = worker;
+                while let Ok(batch) = receiver.recv_blocking() {
+                    worker.process_batch(batch)?;
                 }
                 Result::Ok(worker)
             });
@@ -179,13 +182,13 @@ impl InvertedIndexBuilder {
         sender.close();
         drop(sender);
         let duration = std::time::Instant::now() - start;
-        println!("tokenize elapsed: {:?}", duration);
+        log::info!("dispatching elapsed: {:?}", duration);
 
         // wait for the workers to finish
         let start = std::time::Instant::now();
         let workers = futures::future::try_join_all(index_tasks).await?;
         let duration = std::time::Instant::now() - start;
-        println!("wait workers indexing elapsed: {:?}", duration);
+        log::info!("wait workers indexing elapsed: {:?}", duration);
 
         // update doc set
         let mut readers = Vec::with_capacity(workers.len());
@@ -193,7 +196,6 @@ impl InvertedIndexBuilder {
         let mut worker_update_duration = std::time::Duration::ZERO;
         let mut worker_flush_duration = std::time::Duration::ZERO;
         for worker in workers {
-            let worker = worker?;
             for (row_id, num_tokens) in
                 std::iter::zip(worker.row_ids.iter(), worker.doc_token_num.iter())
             {
@@ -205,8 +207,8 @@ impl InvertedIndexBuilder {
             readers.push(worker.into_reader());
         }
         self.posting_readers = futures::future::try_join_all(readers).await?;
-        println!(
-            "FTS indexing documents, tokenize elapsed: {:?},update elapsed: {:?}, flush elapsed: {:?}",
+        log::info!(
+            "FTS indexing documents, tokenize elapsed: {:?}, update elapsed: {:?}, flush elapsed: {:?}",
             worker_tokenize_duration,worker_update_duration, worker_flush_duration
         );
         log::info!("FTS indexing documents elapsed {:?}", start.elapsed());
@@ -292,7 +294,7 @@ impl InvertedIndexBuilder {
         log::info!("writing {} posting lists", self.posting_readers.len());
         let mut posting_streams = Vec::with_capacity(self.posting_readers.len() + 1);
         for reader in std::mem::take(&mut self.posting_readers) {
-            posting_streams.push(reader.into_stream().await?);
+            posting_streams.push(reader.into_stream()?);
         }
         if let Some(inverted_list_reader) = self.inverted_list.as_ref() {
             let tokens = match self.tokens.tokens {
@@ -342,8 +344,13 @@ impl InvertedIndexBuilder {
                     num_rows += batch.num_rows();
                     writer.write_record_batch(batch).await?;
 
-                    if num_rows > last_num_rows + 100_000 {
-                        log::debug!("written {} rows, elapsed: {:?}", num_rows, start.elapsed());
+                    if num_rows > last_num_rows + 1_000_000 {
+                        log::debug!(
+                            "written {} tokens and {} rows, elapsed: {:?}",
+                            self.tokens.num_tokens(),
+                            num_rows,
+                            start.elapsed()
+                        );
                         last_num_rows = num_rows;
                     }
 
@@ -419,10 +426,11 @@ struct IndexWorker {
     // because we need to know the token id when we receive posting list from existing inverted list
     tokenizer: tantivy::tokenizer::TextAnalyzer,
     posting_lists: HashMap<String, PostingListBuilder>,
+    flush_channel: tokio::sync::mpsc::Sender<PostingListBuilder>,
+    flush_task: tokio::task::JoinHandle<Result<()>>,
     schema: SchemaRef,
     tmpdir: TempDir,
     store: Arc<dyn IndexStore>,
-    writer: Box<dyn IndexWriter>,
     offset: usize,
     token_offsets: HashMap<String, Vec<(usize, usize)>>,
     row_ids: Vec<u64>,
@@ -451,13 +459,28 @@ impl IndexWorker {
             .new_index_file(INVERT_LIST_FILE, schema.clone())
             .await?;
 
+        let (sender, receiver) = tokio::sync::mpsc::channel::<PostingListBuilder>(
+            *LANCE_FTS_FLUSH_THRESHOLD / *LANCE_FTS_FLUSH_SIZE,
+        );
+        let flush_task = tokio::spawn(async move {
+            let mut receiver = receiver;
+            let mut writer = writer;
+            while let Some(posting_list) = receiver.recv().await {
+                let batch = posting_list.to_batch()?;
+                writer.write_record_batch(batch).await?;
+            }
+            writer.finish().await?;
+            Result::Ok(())
+        });
+
         Ok(Self {
             tokenizer,
             posting_lists: HashMap::new(),
+            flush_channel: sender,
+            flush_task,
             schema,
             tmpdir,
             store,
-            writer,
             offset: 0,
             token_offsets: HashMap::new(),
             row_ids: Vec::new(),
@@ -476,7 +499,7 @@ impl IndexWorker {
         self.schema.column_with_name(POSITION_COL).is_some()
     }
 
-    async fn process_batch(&mut self, batch: RecordBatch) -> Result<()> {
+    fn process_batch(&mut self, batch: RecordBatch) -> Result<()> {
         let doc_col = batch.column(0);
         let doc_iter = iter_str_array(doc_col);
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
@@ -527,7 +550,7 @@ impl IndexWorker {
         }
 
         if self.estimated_size > *LANCE_FTS_FLUSH_THRESHOLD * 1024 * 1024 {
-            self.flush(false).await?;
+            self.flush()?;
         }
 
         Ok(())
@@ -541,35 +564,40 @@ impl IndexWorker {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn flush(&mut self, flush_all: bool) -> Result<()> {
+    fn flush(&mut self) -> Result<()> {
         if self.posting_lists.is_empty() {
             return Ok(());
         }
 
         let start = std::time::Instant::now();
-        let tokens = self
+        let mut tokens = self
             .posting_lists
             .iter()
-            .map(|(token, list)| (token, list.size()))
-            .sorted_unstable_by_key(|(_, size)| *size)
-            .map(|(token, _)| token)
-            .rev()
-            .cloned()
-            .collect_vec();
+            .sorted_unstable_by_key(|(_, list)| list.size())
+            .rev();
 
         let mut flushed_size = 0;
-        let mut count = 0;
-        for key in tokens {
-            flushed_size += self.flush_posting_list(key).await?;
-            count += 1;
-            if !flush_all && flushed_size >= *LANCE_FTS_FLUSH_SIZE * 1024 * 1024 {
+        let mut to_flush = Vec::new();
+        // we must flush at least one posting list
+        if let Some((token, _)) = tokens.next() {
+            to_flush.push(token.clone());
+        }
+        // flush the posting lists that are large enough
+        for (token, list) in tokens {
+            if list.size() < *LANCE_FTS_FLUSH_SIZE * 1024 * 1024 {
                 break;
             }
+
+            to_flush.push(token.clone());
+        }
+        let flush_count = to_flush.len();
+        for token in to_flush {
+            flushed_size += self.emit_flush_posting_list(token);
         }
         self.flush_duration += start.elapsed();
         log::debug!(
             "flushed {} lists of {}MiB, posting_lists num: {}, posting_lists size: {}MiB",
-            count,
+            flush_count,
             flushed_size / 1024 / 1024,
             self.posting_lists.len(),
             self.posting_lists.deep_size_of() / 1024 / 1024,
@@ -578,29 +606,52 @@ impl IndexWorker {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip_all)]
-    async fn flush_posting_list(&mut self, token: String) -> Result<usize> {
-        if let Some(posting_list) = self.posting_lists.remove(&token) {
-            let size = posting_list.size();
-            self.estimated_size -= size;
-            let batch = posting_list.to_batch()?;
-            let length = batch.num_rows();
-            assert!(length > 0);
-            self.writer.write_record_batch(batch).await?;
-            self.token_offsets
-                .entry(token)
-                .or_default()
-                .push((self.offset, length));
-            self.offset += length;
-            return Ok(size);
+    fn emit_flush_posting_list(&mut self, token: String) -> usize {
+        match self.posting_lists.remove(&token) {
+            Some(posting_list) => {
+                let size = self.pre_flush_posting_list(token, &posting_list);
+                self.flush_channel
+                    .blocking_send(posting_list)
+                    .expect("failed to send posting list");
+                size
+            }
+            None => 0,
         }
+    }
 
-        Ok(0)
+    fn pre_flush_posting_list(
+        &mut self,
+        token: String,
+        posting_list: &PostingListBuilder,
+    ) -> usize {
+        let size = posting_list.size();
+        self.estimated_size -= size;
+        let length = posting_list.len();
+        assert!(length > 0);
+        self.token_offsets
+            .entry(token)
+            .or_default()
+            .push((self.offset, length));
+        self.offset += length;
+        size
+    }
+
+    async fn flush_all(&mut self) -> Result<()> {
+        let posting_lists = std::mem::take(&mut self.posting_lists);
+        for (token, posting_list) in posting_lists {
+            self.pre_flush_posting_list(token, &posting_list);
+            self.flush_channel
+                .send(posting_list)
+                .await
+                .expect("failed to send posting list");
+        }
+        Ok(())
     }
 
     async fn into_reader(mut self) -> Result<PostingReader> {
-        self.flush(true).await?;
-        self.writer.finish().await?;
+        self.flush_all().await?;
+        std::mem::drop(self.flush_channel);
+        self.flush_task.await??;
         PostingReader::new(Some(self.tmpdir), self.store, self.token_offsets).await
     }
 }
@@ -683,8 +734,8 @@ impl PostingReader {
         })
     }
 
-    // returns a stream of (token, batch, max_score)
-    async fn into_stream(
+    // returns a stream of (token, batch)
+    fn into_stream(
         mut self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(String, Vec<RecordBatch>)>> + Send>>> {
         let io_parallelism = self.store.io_parallelism();
@@ -703,7 +754,8 @@ impl PostingReader {
                         if length == 0 {
                             Ok(RecordBatch::new_empty(schema))
                         } else {
-                            reader.read_range(offset..offset + length, None).await
+                            let res = reader.read_range(offset..offset + length, None).await;
+                            res
                         }
                     }
                 });
