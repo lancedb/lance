@@ -125,8 +125,8 @@ Index Cache
 ~~~~~~~~~~~
 
 Lance uses an index cache to speed up queries.  This caches vector and scalar indices in memory.  The
-max size of this cache can be configured when creating a ``LanceDataset`` using the ``index_cache_size``
-parameter.  This cache is an LRU cached that is sized by "number of entries".  The size of each entry
+max size of this cache can be configured when creating a ``LanceDataset`` using the ``index_cache_size_bytes``
+parameter.  This cache is an LRU cached that is sized by total size in bytes.  The size of each entry
 and the number of entries needed depends on the index in question.  For example, an IVF/PQ vector index
 contains 1 header entry and 1 entry for each partition.  The size of each entry is determined by the
 number of vectors and the PQ parameters (e.g. number of subvectors).  You can view the size of this cache
