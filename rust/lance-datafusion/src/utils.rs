@@ -3,7 +3,6 @@
 
 use std::borrow::Cow;
 use std::collections::BinaryHeap;
-use std::pin::Pin;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
