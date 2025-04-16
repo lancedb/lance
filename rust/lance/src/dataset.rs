@@ -1765,7 +1765,7 @@ mod tests {
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
-    use lance_index::scalar::inverted::query::PhraseQuery;
+    use lance_index::scalar::inverted::query::{MatchQuery, Operator, PhraseQuery};
     use lance_index::scalar::inverted::TokenizerConfig;
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
@@ -5151,12 +5151,29 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-
         assert_eq!(result.num_rows(), 3);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(ids.contains(&3));
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    MatchQuery::new("lance database".to_owned())
+                        .with_operator(Operator::And)
+                        .into(),
+                )
+                .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
 
         let result = ds
             .scan()
@@ -5224,8 +5241,8 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 2);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert_eq!(result.num_rows(), 2, "{:?}", ids);
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
 

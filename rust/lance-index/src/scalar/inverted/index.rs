@@ -168,6 +168,7 @@ impl InvertedIndex {
         &self,
         tokens: &[String],
         params: &FtsSearchParams,
+        operator: Operator,
         is_phrase_query: bool,
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
@@ -203,7 +204,7 @@ impl InvertedIndex {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut wand = Wand::new(self.docs.len(), postings.into_iter());
+        let mut wand = Wand::new(self.docs.len(), operator, postings.into_iter());
         wand.search(
             is_phrase_query,
             params.limit.unwrap_or(usize::MAX),
