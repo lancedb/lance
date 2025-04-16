@@ -383,6 +383,7 @@ impl<'a> InsertBuilder<'a> {
                     store_options: params.store_params.clone(),
                     commit_handler: params.commit_handler.clone(),
                     object_store_registry: params.object_store_registry.clone(),
+                    session: params.session.clone(),
                     ..Default::default()
                 });
 
