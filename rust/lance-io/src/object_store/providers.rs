@@ -65,6 +65,11 @@ impl Default for ObjectStoreRegistry {
         };
         registry.insert("memory", Arc::new(memory::MemoryStoreProvider));
         registry.insert("file", Arc::new(local::FileStoreProvider));
+        // The "file" scheme has special optimized code paths that bypass
+        // the ObjectStore API for better performance. However, this can make it
+        // hard to test when using ObjectStore wrappers, such as IOTrackingStore.
+        // So we provide a "file-object-store" scheme that uses the ObjectStore API.
+        // The specialized code paths are differentiated by the scheme name.
         registry.insert("file-object-store", Arc::new(local::FileStoreProvider));
         #[cfg(feature = "aws")]
         {
