@@ -4,8 +4,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptions,
-    DEFAULT_CLOUD_IO_PARALLELISM,
+    ObjectStore, ObjectStoreParams, StorageOptions, DEFAULT_CLOUD_IO_PARALLELISM,
 };
 use lance_table::{
     format::Manifest,
@@ -226,7 +225,7 @@ impl DatasetBuilder {
             .session
             .as_ref()
             .map(|s| s.store_registry())
-            .unwrap_or_else(|| Arc::new(ObjectStoreRegistry::default()));
+            .unwrap_or_default();
 
         #[allow(deprecated)]
         match &self.options.object_store {
@@ -260,8 +259,8 @@ impl DatasetBuilder {
 
     #[instrument(skip_all)]
     pub async fn load(mut self) -> Result<Dataset> {
-        let session = match self.session.take() {
-            Some(session) => session,
+        let session = match self.session.as_ref() {
+            Some(session) => session.clone(),
             None => Arc::new(Session::new(
                 self.index_cache_size,
                 self.metadata_cache_size,

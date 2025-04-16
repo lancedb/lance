@@ -22,7 +22,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
@@ -665,7 +665,7 @@ impl Dataset {
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
-        object_store_registry: Arc<ObjectStoreRegistry>,
+        session: Arc<Session>,
         enable_v2_manifest_paths: bool,
         detached: bool,
     ) -> Result<Self> {
@@ -683,8 +683,8 @@ impl Dataset {
         let transaction = Transaction::new(read_version, operation, blobs_op, None);
 
         let mut builder = CommitBuilder::new(base_uri)
-            .with_object_store_registry(object_store_registry)
             .enable_v2_manifest_paths(enable_v2_manifest_paths)
+            .with_session(session)
             .with_detached(detached);
 
         if let Some(store_params) = store_params {
@@ -738,7 +738,7 @@ impl Dataset {
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
-        object_store_registry: Arc<ObjectStoreRegistry>,
+        session: Arc<Session>,
         enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
         Self::do_commit(
@@ -750,7 +750,7 @@ impl Dataset {
             read_version,
             store_params,
             commit_handler,
-            object_store_registry,
+            session,
             enable_v2_manifest_paths,
             /*detached=*/ false,
         )
@@ -771,7 +771,7 @@ impl Dataset {
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
-        object_store_registry: Arc<ObjectStoreRegistry>,
+        session: Arc<Session>,
         enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
         Self::do_commit(
@@ -783,7 +783,7 @@ impl Dataset {
             read_version,
             store_params,
             commit_handler,
-            object_store_registry,
+            session,
             enable_v2_manifest_paths,
             /*detached=*/ true,
         )
@@ -3156,7 +3156,7 @@ mod tests {
             None,
             None,
             None,
-            Arc::new(ObjectStoreRegistry::default()),
+            Default::default(),
             true, // enable_v2_manifest_paths
         )
         .await

@@ -2233,7 +2233,6 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen, RowCount};
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::ObjectStoreRegistry;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use tempfile::tempdir;
@@ -2822,10 +2821,10 @@ mod tests {
             config_upsert_values: None,
         };
 
-        let registry = Arc::new(ObjectStoreRegistry::default());
-        let new_dataset = Dataset::commit(test_uri, op, None, None, None, registry, false)
-            .await
-            .unwrap();
+        let new_dataset =
+            Dataset::commit(test_uri, op, None, None, None, Default::default(), false)
+                .await
+                .unwrap();
 
         assert_eq!(new_dataset.count_rows(None).await.unwrap(), dataset_rows);
 
@@ -2931,10 +2930,10 @@ mod tests {
                 config_upsert_values: None,
             };
 
-            let registry = Arc::new(ObjectStoreRegistry::default());
-            let dataset = Dataset::commit(test_uri, op, None, None, None, registry, false)
-                .await
-                .unwrap();
+            let dataset =
+                Dataset::commit(test_uri, op, None, None, None, Default::default(), false)
+                    .await
+                    .unwrap();
 
             // We only kept the first fragment of 40 rows
             assert_eq!(
@@ -3152,7 +3151,6 @@ mod tests {
 
         // Rearrange schema so it's `s` then `i`.
         let schema = updater.schema().unwrap().clone().project(&["s", "i"])?;
-        let registry = Arc::new(ObjectStoreRegistry::default());
 
         let dataset = Dataset::commit(
             test_uri,
@@ -3163,7 +3161,7 @@ mod tests {
             Some(dataset.manifest.version),
             None,
             None,
-            registry,
+            Default::default(),
             false,
         )
         .await?;
@@ -3292,14 +3290,13 @@ mod tests {
         let op = Operation::Append {
             fragments: vec![frag],
         };
-        let object_store_registry = Arc::new(ObjectStoreRegistry::default());
         let dataset = Dataset::commit(
             &dataset.uri,
             op,
             Some(dataset.version().version),
             None,
             None,
-            object_store_registry,
+            Default::default(),
             false,
         )
         .await

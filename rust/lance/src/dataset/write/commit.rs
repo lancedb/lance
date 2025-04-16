@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use lance_file::version::LanceFileVersion;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::{
     format::{is_detached_version, DataStorageFormat},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
@@ -36,7 +36,6 @@ pub struct CommitBuilder<'a> {
     storage_format: Option<LanceFileVersion>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     store_params: Option<ObjectStoreParams>,
-    object_store_registry: Arc<ObjectStoreRegistry>,
     object_store: Option<Arc<ObjectStore>>,
     session: Option<Arc<Session>>,
     detached: bool,
@@ -52,7 +51,6 @@ impl<'a> CommitBuilder<'a> {
             storage_format: None,
             commit_handler: None,
             store_params: None,
-            object_store_registry: Default::default(),
             object_store: None,
             session: None,
             detached: false,
@@ -104,17 +102,6 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    /// Pass an object store registry to use.
-    ///
-    /// If an object store is passed, this registry will be ignored.
-    pub fn with_object_store_registry(
-        mut self,
-        object_store_registry: Arc<ObjectStoreRegistry>,
-    ) -> Self {
-        self.object_store_registry = object_store_registry;
-        self
-    }
-
     /// Pass a session to use for the dataset.
     ///
     /// If a session is not passed, but a dataset is used as the destination,
@@ -162,6 +149,11 @@ impl<'a> CommitBuilder<'a> {
     }
 
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
+        let session = self
+            .session
+            .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
+            .unwrap_or_default();
+
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
@@ -170,7 +162,7 @@ impl<'a> CommitBuilder<'a> {
             ),
             WriteDestination::Uri(uri) => {
                 let (object_store, base_path) = ObjectStore::from_uri_and_params(
-                    self.object_store_registry.clone(),
+                    session.store_registry(),
                     uri,
                     &self.store_params.clone().unwrap_or_default(),
                 )
@@ -189,11 +181,6 @@ impl<'a> CommitBuilder<'a> {
                 (object_store, base_path, commit_handler)
             }
         };
-
-        let session = self
-            .session
-            .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
-            .unwrap_or_default();
 
         let dest = match &self.dest {
             WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
@@ -422,10 +409,7 @@ pub struct BatchCommitResult {
 mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use lance_table::{
-        format::{DataFile, Fragment},
-        io::commit::ConditionalPutCommitHandler,
-    };
+    use lance_table::format::{DataFile, Fragment};
 
     use crate::dataset::{InsertBuilder, WriteParams};
 
@@ -465,7 +449,6 @@ mod tests {
         use crate::utils::test::IoTrackingStore;
 
         let session = Arc::new(Session::default());
-        let store_registry = session.store_registry();
         // Create new dataset
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
@@ -485,7 +468,6 @@ mod tests {
         let dataset = InsertBuilder::new("memory://test")
             .with_params(&WriteParams {
                 store_params: Some(store_params.clone()),
-                commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
                 session: Some(session.clone()),
                 ..Default::default()
             })
@@ -533,8 +515,6 @@ mod tests {
         // Commit transaction with URI and session
         let new_ds = CommitBuilder::new("memory://test")
             .with_store_params(store_params.clone())
-            .with_object_store_registry(store_registry.clone())
-            .with_commit_handler(Arc::new(ConditionalPutCommitHandler))
             .with_session(dataset.session.clone())
             .execute(sample_transaction(1))
             .await
@@ -547,11 +527,12 @@ mod tests {
         assert_eq!(reads, 3);
         assert_eq!(writes, 2);
 
-        // Commit transaction with URI and no session
+        // Commit transaction with URI and new session. Re-use the store
+        // registry so we see the same store.
+        let new_session = Arc::new(Session::new(0, 0, session.store_registry()));
         let new_ds = CommitBuilder::new("memory://test")
             .with_store_params(store_params)
-            .with_commit_handler(Arc::new(ConditionalPutCommitHandler))
-            .with_object_store_registry(store_registry.clone())
+            .with_session(new_session)
             .execute(sample_transaction(1))
             .await
             .unwrap();
