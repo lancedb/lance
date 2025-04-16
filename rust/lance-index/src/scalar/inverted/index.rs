@@ -637,6 +637,26 @@ impl InvertedListReader {
         Ok(posting)
     }
 
+    pub(crate) async fn prewarm(&self) -> Result<()> {
+        let batch = self.reader.read_range(0..self.reader.num_rows(), Some(&[ROW_ID,FREQUENCY_COL])).await?;
+        for token_id in 0..self.offsets.len() {
+            let offset = self.offsets[token_id];
+            let length = self.posting_len(token_id as u32);
+            let batch = batch.slice(offset, length);
+            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>();
+            self.posting_cache.insert(token_id as u32, PostingList::new(
+                row_ids.values().clone(),
+                frequencies.values().clone(),
+                self.max_scores
+                    .as_ref()
+                    .map(|max_scores| max_scores[token_id as usize]),
+            )).await;
+        }
+
+        Ok(())
+    }
+
     async fn read_positions(&self, token_id: u32) -> Result<ListArray> {
         self.position_cache.try_get_with(token_id, async move {
             let length = self.posting_len(token_id);
