@@ -31,7 +31,7 @@ fn bench_ngram(c: &mut Criterion) {
     let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
     let store = rt.block_on(async {
         Arc::new(LanceIndexStore::new(
-            ObjectStore::local(),
+            Arc::new(ObjectStore::local()),
             index_dir,
             FileMetadataCache::no_cache(),
         ))

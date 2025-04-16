@@ -187,8 +187,6 @@ pub struct WriteParams {
     /// Default is False.
     pub enable_v2_manifest_paths: bool,
 
-    pub object_store_registry: Arc<ObjectStoreRegistry>,
-
     pub session: Option<Arc<Session>>,
 
     /// If Some and this is a new dataset, old dataset versions will be
@@ -215,7 +213,6 @@ impl Default for WriteParams {
             data_storage_version: None,
             enable_move_stable_row_ids: false,
             enable_v2_manifest_paths: false,
-            object_store_registry: Arc::new(ObjectStoreRegistry::default()),
             session: None,
             auto_cleanup: Some(AutoCleanupParams::default()),
         }
@@ -234,6 +231,13 @@ impl WriteParams {
 
     pub fn storage_version_or_default(&self) -> LanceFileVersion {
         self.data_storage_version.unwrap_or_default()
+    }
+
+    pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
+        self.session
+            .as_ref()
+            .map(|s| s.store_registry())
+            .unwrap_or_default()
     }
 }
 
@@ -413,7 +417,6 @@ pub async fn write_fragments_internal(
         enable_move_stable_row_ids: true,
         // This shouldn't really matter since all commits are detached
         enable_v2_manifest_paths: true,
-        object_store_registry: params.object_store_registry.clone(),
         max_bytes_per_file: params.max_bytes_per_file,
         max_rows_per_file: params.max_rows_per_file,
         ..Default::default()

@@ -197,8 +197,6 @@ pub struct ReadParams {
     /// If a custom object store is provided (via store_params.object_store) then this
     /// must also be provided.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
-
-    pub object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl ReadParams {
@@ -220,15 +218,6 @@ impl ReadParams {
         self
     }
 
-    /// Provide an object store registry for custom object stores
-    pub fn with_object_store_registry(
-        &mut self,
-        object_store_registry: Arc<ObjectStoreRegistry>,
-    ) -> &mut Self {
-        self.object_store_registry = object_store_registry;
-        self
-    }
-
     /// Use the explicit locking to resolve the latest version
     pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
         self.commit_handler = Some(Arc::new(lock));
@@ -243,7 +232,6 @@ impl Default for ReadParams {
             session: None,
             store_options: None,
             commit_handler: None,
-            object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
@@ -1769,7 +1757,6 @@ mod tests {
     use lance_index::scalar::inverted::TokenizerConfig;
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
-    use lance_io::object_store::providers::memory::PersistentMemoryStoreProvider;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
@@ -2019,16 +2006,8 @@ mod tests {
         // Need to use in-memory for accurate IOPS tracking.
         use crate::utils::test::IoTrackingStore;
 
-        let mut store_registry = ObjectStoreRegistry::empty();
-        let memory_store = Arc::new(object_store::memory::InMemory::new());
-        store_registry.insert(
-            "memory",
-            Arc::new(PersistentMemoryStoreProvider {
-                inner: memory_store,
-            }),
-        );
-        let store_registry = Arc::new(store_registry);
-
+        // Use consistent session so memory store can be reused.
+        let session = Arc::new(Session::default());
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
             DataType::Int32,
@@ -2040,26 +2019,31 @@ mod tests {
         )
         .unwrap();
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        Dataset::write(
+        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let _original_ds = Dataset::write(
             batches,
             "memory://test",
             Some(WriteParams {
-                object_store_registry: store_registry.clone(),
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(io_stats_wrapper.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
 
-        // Then open with wrapping store.
-        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        io_stats.lock().unwrap().read_iops = 0;
+
         let _dataset = DatasetBuilder::from_uri("memory://test")
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
                     object_store_wrapper: Some(io_stats_wrapper),
                     ..Default::default()
                 }),
-                object_store_registry: store_registry.clone(),
+                session: Some(session),
                 ..Default::default()
             })
             .load()
@@ -6112,5 +6096,76 @@ mod tests {
         ds2.validate().await.unwrap();
         assert_eq!(ds.manifest.version, 1);
         assert_eq!(ds2.manifest.version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_session_store_registry() {
+        // Create a session
+        let session = Arc::new(Session::default());
+        let registry = session.store_registry();
+        assert!(registry.active_stores().is_empty());
+
+        // Create a dataset with memory store
+        let write_params = WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://test")
+            .with_params(&write_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+
+        // Assert there is one active store.
+        assert_eq!(registry.active_stores().len(), 1);
+
+        // If we create another dataset also in memory, it should re-use the
+        // existing store.
+        let dataset2 = InsertBuilder::new("memory://test2")
+            .with_params(&write_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(registry.active_stores().len(), 1);
+        assert_eq!(
+            Arc::as_ptr(&dataset.object_store().inner),
+            Arc::as_ptr(&dataset2.object_store().inner)
+        );
+
+        // If we create another with **different parameters**, it should create a new store.
+        let write_params2 = WriteParams {
+            session: Some(session.clone()),
+            store_params: Some(ObjectStoreParams {
+                block_size: Some(10_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset3 = InsertBuilder::new("memory://test3")
+            .with_params(&write_params2)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(registry.active_stores().len(), 2);
+        assert_ne!(
+            Arc::as_ptr(&dataset.object_store().inner),
+            Arc::as_ptr(&dataset3.object_store().inner)
+        );
+
+        // Remove both datasets
+        drop(dataset3);
+        assert_eq!(registry.active_stores().len(), 1);
+        drop(dataset2);
+        drop(dataset);
+        assert_eq!(registry.active_stores().len(), 0);
     }
 }

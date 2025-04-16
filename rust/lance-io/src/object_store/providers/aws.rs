@@ -25,8 +25,8 @@ use tokio::sync::RwLock;
 use url::Url;
 
 use crate::object_store::{
-    tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams, ObjectStoreProvider,
-    StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
+    DEFAULT_CLOUD_IO_PARALLELISM,
 };
 use lance_core::error::{Error, Result};
 
@@ -92,10 +92,10 @@ impl ObjectStoreProvider for AwsStoreProvider {
             .with_credentials(aws_creds)
             .with_retry(retry_config)
             .with_region(region);
-        let store = builder.build()?;
+        let inner = Arc::new(builder.build()?);
 
         Ok(ObjectStore {
-            inner: Arc::new(store).traced(),
+            inner,
             scheme: String::from(base_path.scheme()),
             block_size,
             use_constant_size_upload_parts,

@@ -3,14 +3,14 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, RwLock, Weak},
 };
 
+use deepsize::DeepSizeOf;
 use snafu::location;
-use tokio::sync::RwLock;
 use url::Url;
 
-use super::{ObjectStore, ObjectStoreParams};
+use super::{tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams};
 use lance_core::error::{Error, Result};
 
 #[cfg(feature = "aws")]
@@ -29,11 +29,35 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
 
 #[derive(Debug)]
 pub struct ObjectStoreRegistry {
-    providers: Mutex<HashMap<String, Arc<dyn ObjectStoreProvider>>>,
+    providers: RwLock<HashMap<String, Arc<dyn ObjectStoreProvider>>>,
     // Cache of object stores currently in use. We use a weak reference so the
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
-    cache: RwLock<HashMap<(String, ObjectStoreParams), Weak<ObjectStore>>>,
+    active_stores: RwLock<HashMap<(String, ObjectStoreParams), Weak<ObjectStore>>>,
+}
+
+impl DeepSizeOf for ObjectStoreRegistry {
+    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+        let mut size = 0;
+        let providers = self
+            .providers
+            .read()
+            .expect("ObjectStoreRegistry lock poisoned");
+        for (key, _provider) in providers.iter() {
+            size += key.deep_size_of();
+            // Ignore provider for simplicity
+        }
+        let active_stores = self
+            .active_stores
+            .read()
+            .expect("ObjectStoreRegistry lock poisoned");
+        for ((base_path, _params), _store) in active_stores.iter() {
+            size += base_path.deep_size_of();
+            // Ignore params for simplicity
+            size += std::mem::size_of::<Weak<ObjectStore>>();
+        }
+        size
+    }
 }
 
 /// Convert a URL to a cache key.
@@ -45,7 +69,7 @@ pub struct ObjectStoreRegistry {
 /// * s3://bucket/path?param=value -> s3://bucket/path?param=value
 /// * file:///path/to/file -> file:///
 fn cache_url(url: &Url) -> String {
-    if url.scheme() == "file" || url.scheme() == "file-object-store" {
+    if ["file", "file-object-store", "memory"].contains(&url.scheme()) {
         // For file URLs, we want to cache the URL without the path.
         // This is because the path can be different for different
         // object stores, but we want to cache the object store itself.
@@ -67,17 +91,44 @@ fn cache_url(url: &Url) -> String {
 impl ObjectStoreRegistry {
     pub fn empty() -> Self {
         Self {
-            providers: Mutex::new(HashMap::new()),
-            cache: RwLock::new(HashMap::new()),
+            providers: RwLock::new(HashMap::new()),
+            active_stores: RwLock::new(HashMap::new()),
         }
     }
 
     pub fn get_provider(&self, scheme: &str) -> Option<Arc<dyn ObjectStoreProvider>> {
         self.providers
-            .lock()
+            .read()
             .expect("ObjectStoreRegistry lock poisoned")
             .get(scheme)
             .cloned()
+    }
+
+    pub fn active_stores(&self) -> Vec<Arc<ObjectStore>> {
+        let mut found_inactive = false;
+        let output = self
+            .active_stores
+            .read()
+            .expect("ObjectStoreRegistry lock poisoned")
+            .values()
+            .filter_map(|weak| match weak.upgrade() {
+                Some(store) => Some(store),
+                None => {
+                    found_inactive = true;
+                    None
+                }
+            })
+            .collect();
+
+        if found_inactive {
+            // Clean up the cache by removing any weak references that are no longer valid
+            let mut cache_lock = self
+                .active_stores
+                .write()
+                .expect("ObjectStoreRegistry lock poisoned");
+            cache_lock.retain(|_, weak| weak.upgrade().is_some());
+        }
+        output
     }
 
     pub async fn get_store(
@@ -90,12 +141,20 @@ impl ObjectStoreRegistry {
 
         // Check if we have a cached store for this base path and params
         {
-            if let Some(store) = self.cache.read().await.get(&cache_key) {
+            if let Some(store) = self
+                .active_stores
+                .read()
+                .expect("ObjectStoreRegistry lock poisoned")
+                .get(&cache_key)
+            {
                 if let Some(store) = store.upgrade() {
                     return Ok(store);
                 } else {
                     // Remove the weak reference if it is no longer valid
-                    let mut cache_lock = self.cache.write().await;
+                    let mut cache_lock = self
+                        .active_stores
+                        .write()
+                        .expect("ObjectStoreRegistry lock poisoned");
                     if let Some(store) = cache_lock.get(&cache_key) {
                         if store.upgrade().is_none() {
                             // Remove the weak reference if it is no longer valid
@@ -108,17 +167,38 @@ impl ObjectStoreRegistry {
 
         let scheme = base_path.scheme();
         let provider = self.get_provider(scheme).ok_or_else(|| {
+            let valid_schemes = self
+                .providers
+                .read()
+                .expect("ObjectStoreRegistry lock poisoned")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
             Error::invalid_input(
-                format!("No object store provider found for scheme: {}", scheme),
+                format!(
+                    "No object store provider found for scheme: '{}'\n valid_schemes: {}",
+                    scheme, valid_schemes
+                ),
                 location!(),
             )
         })?;
-        let store = provider.new_store(base_path, params).await?;
+        let mut store = provider.new_store(base_path, params).await?;
+
+        store.inner = store.inner.traced();
+
+        if let Some(wrapper) = &params.object_store_wrapper {
+            store.inner = wrapper.wrap(store.inner);
+        }
+
         let store = Arc::new(store);
 
         {
             // Insert the store into the cache
-            let mut cache_lock = self.cache.write().await;
+            let mut cache_lock = self
+                .active_stores
+                .write()
+                .expect("ObjectStoreRegistry lock poisoned");
             cache_lock.insert(cache_key, Arc::downgrade(&store));
         }
 
@@ -153,8 +233,8 @@ impl Default for ObjectStoreRegistry {
         #[cfg(feature = "gcp")]
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
         Self {
-            providers: Mutex::new(providers),
-            cache: RwLock::new(HashMap::new()),
+            providers: RwLock::new(providers),
+            active_stores: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -162,7 +242,7 @@ impl Default for ObjectStoreRegistry {
 impl ObjectStoreRegistry {
     pub fn insert(&self, scheme: &str, provider: Arc<dyn ObjectStoreProvider>) {
         self.providers
-            .lock()
+            .write()
             .expect("ObjectStoreRegistry lock poisoned")
             .insert(scheme.into(), provider);
     }

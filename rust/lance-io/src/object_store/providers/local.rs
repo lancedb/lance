@@ -7,8 +7,8 @@ use object_store::local::LocalFileSystem;
 use url::Url;
 
 use crate::object_store::{
-    tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams, ObjectStoreProvider,
-    StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE,
+    DEFAULT_LOCAL_IO_PARALLELISM,
 };
 use lance_core::error::Result;
 
@@ -22,7 +22,7 @@ impl ObjectStoreProvider for FileStoreProvider {
         let storage_options = StorageOptions(params.storage_options.clone().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
-            inner: Arc::new(LocalFileSystem::new()).traced(),
+            inner: Arc::new(LocalFileSystem::new()),
             scheme: base_path.scheme().to_owned(),
             block_size,
             use_constant_size_upload_parts: false,

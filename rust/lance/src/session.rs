@@ -8,6 +8,7 @@ use deepsize::DeepSizeOf;
 use lance_core::cache::FileMetadataCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
+use lance_io::object_store::ObjectStoreRegistry;
 use snafu::location;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
@@ -27,6 +28,8 @@ pub struct Session {
     pub(crate) file_metadata_cache: FileMetadataCache,
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
+
+    pub(crate) store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl std::fmt::Debug for Session {
@@ -57,11 +60,16 @@ impl Session {
     /// Parameters:
     ///
     /// - ***index_cache_size***: the size of the index cache.
-    pub fn new(index_cache_size: usize, metadata_cache_size: usize) -> Self {
+    pub fn new(
+        index_cache_size: usize,
+        metadata_cache_size: usize,
+        store_registry: Arc<ObjectStoreRegistry>,
+    ) -> Self {
         Self {
             index_cache: IndexCache::new(index_cache_size),
             file_metadata_cache: FileMetadataCache::new(metadata_cache_size),
             index_extensions: HashMap::new(),
+            store_registry,
         }
     }
 
@@ -126,6 +134,10 @@ impl Session {
             + self.file_metadata_cache.approx_size()
             + self.index_extensions.len()
     }
+
+    pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
+        self.store_registry.clone()
+    }
 }
 
 impl Default for Session {
@@ -134,6 +146,7 @@ impl Default for Session {
             index_cache: IndexCache::new(DEFAULT_INDEX_CACHE_SIZE),
             file_metadata_cache: FileMetadataCache::new(DEFAULT_METADATA_CACHE_SIZE),
             index_extensions: HashMap::new(),
+            store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
@@ -152,7 +165,7 @@ mod tests {
 
     #[test]
     fn test_disable_index_cache() {
-        let no_cache = Session::new(0, 0);
+        let no_cache = Session::new(0, 0, Default::default());
         assert!(no_cache.index_cache.get_vector("abc").is_none());
         let no_cache = Arc::new(no_cache);
 
@@ -173,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_basic() {
-        let session = Session::new(10, 1);
+        let session = Session::new(10, 1, Default::default());
         let session = Arc::new(session);
 
         let pq = ProductQuantizer::new(

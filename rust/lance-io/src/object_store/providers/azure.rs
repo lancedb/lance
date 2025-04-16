@@ -10,8 +10,8 @@ use object_store::{
 use url::Url;
 
 use crate::object_store::{
-    tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams, ObjectStoreProvider,
-    StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
+    DEFAULT_CLOUD_IO_PARALLELISM,
 };
 use lance_core::error::Result;
 
@@ -41,11 +41,10 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         for (key, value) in storage_options.as_azure_options() {
             builder = builder.with_config(key, value);
         }
-        let store = builder.build()?;
-        let store = Arc::new(store).traced();
+        let inner = Arc::new(builder.build()?);
 
         Ok(ObjectStore {
-            inner: store,
+            inner,
             scheme: String::from("az"),
             block_size,
             use_constant_size_upload_parts: false,

@@ -175,7 +175,7 @@ impl<'a> CommitBuilder<'a> {
                     &self.store_params.clone().unwrap_or_default(),
                 )
                 .await?;
-                let mut object_store = Arc::new(object_store);
+                let mut object_store = object_store;
                 let commit_handler = if self.commit_handler.is_some() && self.object_store.is_some()
                 {
                     self.commit_handler.as_ref().unwrap().clone()
@@ -203,7 +203,6 @@ impl<'a> CommitBuilder<'a> {
                     .with_read_params(ReadParams {
                         store_options: self.store_params.clone(),
                         commit_handler: self.commit_handler.clone(),
-                        object_store_registry: self.object_store_registry.clone(),
                         ..Default::default()
                     })
                     .with_session(session.clone());
@@ -423,7 +422,6 @@ pub struct BatchCommitResult {
 mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use lance_io::object_store::providers::memory::PersistentMemoryStoreProvider;
     use lance_table::{
         format::{DataFile, Fragment},
         io::commit::ConditionalPutCommitHandler,
@@ -466,16 +464,8 @@ mod tests {
         // Need to use in-memory for accurate IOPS tracking.
         use crate::utils::test::IoTrackingStore;
 
-        let mut store_registry = ObjectStoreRegistry::empty();
-        let memory_store = Arc::new(object_store::memory::InMemory::new());
-        store_registry.insert(
-            "memory",
-            Arc::new(PersistentMemoryStoreProvider {
-                inner: memory_store,
-            }),
-        );
-        let store_registry = Arc::new(store_registry);
-
+        let session = Arc::new(Session::default());
+        let store_registry = session.store_registry();
         // Create new dataset
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
@@ -496,7 +486,7 @@ mod tests {
             .with_params(&WriteParams {
                 store_params: Some(store_params.clone()),
                 commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
-                object_store_registry: store_registry.clone(),
+                session: Some(session.clone()),
                 ..Default::default()
             })
             .execute(vec![batch])
