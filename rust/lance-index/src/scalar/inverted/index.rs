@@ -657,7 +657,7 @@ impl InvertedListReader {
                         frequencies.values().clone(),
                         self.max_scores
                             .as_ref()
-                            .map(|max_scores| max_scores[token_id as usize]),
+                            .map(|max_scores| max_scores[token_id]),
                     ),
                 )
                 .await;
