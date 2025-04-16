@@ -1383,15 +1383,18 @@ impl Dataset {
                 Err(e) => {
                     let is_not_found = matches!(&e, lance_core::Error::NotFound { .. });
 
-                    if ignore_not_found && is_not_found {
-                        Ok(())
-                    } else if is_not_found {
-                        Err(PyFileNotFoundError::new_err(format!(
-                            "Path not found: {}",
-                            dest
-                        )))
+                    if let Some(true) = ignore_not_found {
+                        if is_not_found {
+                            Ok(())
+                        } else {
+                            Err(PyIOError::new_err(e.to_string()))
+                        }
                     } else {
-                        Err(PyIOError::new_err(e.to_string()))
+                        if is_not_found && ignore_not_found.is_none() {
+                            Err(PyFileNotFoundError::new_err(format!("Path not found: {}", dest)))
+                        } else {
+                            Err(PyIOError::new_err(e.to_string()))
+                        }
                     }
                 }
             }
