@@ -6,18 +6,14 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use arrow::array::{
+    AsArray, Float32Builder, Int32Builder, ListBuilder, StringBuilder, UInt32Builder, UInt64Builder,
+};
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
-use arrow::{
-    array::{
-        AsArray, Float32Builder, Int32Builder, ListBuilder, StringBuilder, UInt32Builder,
-        UInt64Builder,
-    },
-    buffer::OffsetBuffer,
-};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Int32Array, ListArray, OffsetSizeTrait,
-    PrimitiveArray, RecordBatch, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float32Array, ListArray, OffsetSizeTrait, PrimitiveArray,
+    RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -39,7 +35,7 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{info, instrument};
 
-use super::builder::{inverted_list_schema, PositionRecorder};
+use super::builder::inverted_list_schema;
 use super::query::*;
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::PreFilter;
@@ -210,8 +206,7 @@ impl InvertedIndex {
             params.wand_factor,
             |doc, freq| {
                 let doc_norm = K1
-                    * (1.0 - B
-                        + B * self.docs.num_tokens(&doc) as f32 / self.docs.average_length());
+                    * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / self.docs.average_length());
                 freq / (freq + doc_norm)
             },
         )
@@ -798,11 +793,11 @@ impl PostingListBuilder {
         self.len() == 0
     }
 
-    pub fn add(&mut self, row_id: u64, term_positions: PositionRecorder) {
+    pub fn add(&mut self, row_id: u64, term_positions: Vec<i32>) {
         self.row_ids.push(row_id);
         self.frequencies.push(term_positions.len() as f32);
         if let Some(positions) = self.positions.as_mut() {
-            positions.push(term_positions.into_vec());
+            positions.push(term_positions);
         }
     }
 
@@ -846,33 +841,15 @@ impl PostingListBuilder {
         self.positions = new_positions;
     }
 
-    pub fn to_batch(self) -> Result<RecordBatch> {
-        let row_ids = UInt64Array::from(self.row_ids);
-        let frequencies = Float32Array::from(self.frequencies);
-        let mut columns = vec![
-            Arc::new(row_ids) as ArrayRef,
-            Arc::new(frequencies) as ArrayRef,
-        ];
-        let schema = inverted_list_schema(self.positions.is_some());
-        if let Some(positions) = self.positions {
-            let list = ListArray::try_new(
-                Arc::new(Field::new("item", DataType::Int32, true)),
-                OffsetBuffer::<i32>::new(positions.offsets.into()),
-                Arc::new(Int32Array::from(positions.positions)),
-                None,
-            )?;
-            columns.push(Arc::new(list) as ArrayRef);
-        }
-        let batch = RecordBatch::try_new(schema, columns)?;
-        Ok(batch)
-    }
-
     // convert the posting list to a record batch
     // with docs, it would calculate the max score to accelerate the search
-    pub fn to_sorted_batch(mut self, docs: Option<&DocSet>) -> Result<(RecordBatch, f32)> {
+    pub fn to_batch(mut self, docs: Option<Arc<DocSet>>) -> Result<(RecordBatch, f32)> {
         let length = self.len();
         let num_docs = docs.as_ref().map(|docs| docs.len()).unwrap_or(0);
-        let avgdl = docs.map(|docs| docs.average_length()).unwrap_or(0.0);
+        let avgdl = docs
+            .as_ref()
+            .map(|docs| docs.average_length())
+            .unwrap_or(0.0);
         let mut max_score = 0.0;
 
         let mut row_id_builder = UInt64Builder::with_capacity(length);
@@ -892,7 +869,7 @@ impl PostingListBuilder {
             }
             // calculate the max score
             if let Some(docs) = &docs {
-                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(&row_id) as f32 / avgdl);
+                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(row_id) as f32 / avgdl);
                 let score = freq / (freq + doc_norm);
                 if score > max_score {
                     max_score = score;
@@ -921,7 +898,7 @@ impl PostingListBuilder {
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct PositionBuilder {
     positions: Vec<i32>,
-    offsets: Vec<i32>,
+    offsets: Vec<usize>,
 }
 
 impl Default for PositionBuilder {
@@ -940,7 +917,7 @@ impl PositionBuilder {
 
     pub fn size(&self) -> usize {
         std::mem::size_of::<i32>() * self.positions.len()
-            + std::mem::size_of::<i32>() * (self.offsets.len() - 1)
+            + std::mem::size_of::<usize>() * self.offsets.len()
     }
 
     pub fn total_len(&self) -> usize {
@@ -949,12 +926,12 @@ impl PositionBuilder {
 
     pub fn push(&mut self, positions: Vec<i32>) {
         self.positions.extend(positions);
-        self.offsets.push(self.positions.len() as i32);
+        self.offsets.push(self.positions.len());
     }
 
     pub fn get(&self, i: usize) -> &[i32] {
-        let start = self.offsets[i] as usize;
-        let end = self.offsets[i + 1] as usize;
+        let start = self.offsets[i];
+        let end = self.offsets[i + 1];
         &self.positions[start..end]
     }
 }
@@ -1006,7 +983,7 @@ impl Ord for DocInfo {
 // It's used to sort the documents by the bm25 score
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct DocSet {
-    // row id -> num tokens
+    // row id -> (num tokens, norm_len)
     token_count: HashMap<u64, u32>,
     total_tokens: u64,
 }
@@ -1083,8 +1060,8 @@ impl DocSet {
     }
 
     #[inline]
-    pub fn num_tokens(&self, row_id: &u64) -> u32 {
-        self.token_count.get(row_id).cloned().unwrap_or_default()
+    pub fn num_tokens(&self, row_id: u64) -> u32 {
+        self.token_count.get(&row_id).cloned().unwrap_or_default()
     }
 
     pub fn add(&mut self, row_id: u64, num_tokens: u32) {
