@@ -2147,6 +2147,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
+                auto_cleanup: None,
                 ..Default::default()
             }),
         );
@@ -3736,8 +3737,8 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
-        let mut desired_config = HashMap::new();
-        desired_config.insert("lance:test".to_string(), "value".to_string());
+        let mut desired_config = dataset.manifest.config.clone();
+        desired_config.insert("lance.test".to_string(), "value".to_string());
         desired_config.insert("other-key".to_string(), "other-value".to_string());
 
         dataset.update_config(desired_config.clone()).await.unwrap();
