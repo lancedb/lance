@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::scalar::lance_format::LanceIndexStore;
@@ -16,7 +15,7 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::stream::BoxStream;
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::iter_str_array;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -36,9 +35,9 @@ lazy_static! {
     // the size threshold to trigger flush the posting lists while indexing FTS,
     // lower value will result in slower indexing and less memory usage.
     // This means the indexing process would eat up to `LANCE_FTS_FLUSH_THRESHOLD * num_cpus * 2` MiB of memory,
-    // it's in 1GiB by default
+    // it's in 512GiB by default
     static ref LANCE_FTS_FLUSH_THRESHOLD: usize = std::env::var("LANCE_FTS_FLUSH_THRESHOLD")
-        .unwrap_or_else(|_| "1024".to_string())
+        .unwrap_or_else(|_| "512".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_FLUSH_THRESHOLD");
     // the size of each flush, lower value will result in more frequent flushes, but better IO locality
