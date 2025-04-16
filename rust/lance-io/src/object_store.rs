@@ -32,6 +32,7 @@ use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use super::local::LocalObjectReader;
+pub mod io_tracking;
 mod list_retry;
 pub mod providers;
 mod tracing;

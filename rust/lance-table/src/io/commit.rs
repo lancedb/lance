@@ -180,7 +180,7 @@ pub type ManifestWriter = for<'a> fn(
     path: &'a Path,
 ) -> BoxFuture<'a, Result<WriteResult>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ManifestLocation {
     /// The version the manifest corresponds to.
     pub version: u64,
@@ -621,11 +621,18 @@ pub async fn commit_handler_from_url(
     let url = match Url::parse(url_or_path) {
         Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
             // On Windows, the drive is parsed as a scheme
+            // For some reason, Windows does not support conditional put well.
+            #[cfg(windows)]
             return Ok(Arc::new(RenameCommitHandler));
+            #[cfg(not(windows))]
+            return Ok(Arc::new(ConditionalPutCommitHandler));
         }
         Ok(url) => url,
         Err(_) => {
+            #[cfg(windows)]
             return Ok(Arc::new(RenameCommitHandler));
+            #[cfg(not(windows))]
+            return Ok(Arc::new(ConditionalPutCommitHandler));
         }
     };
 

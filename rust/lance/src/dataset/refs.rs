@@ -7,7 +7,7 @@ use futures::future;
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
-use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::{CommitHandler, ManifestLocation};
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use std::collections::HashMap;
 pub enum Ref {
     Version(u64),
     Tag(String),
+    Location(ManifestLocation),
 }
 
 impl From<u64> for Ref {
@@ -31,6 +32,12 @@ impl From<u64> for Ref {
 impl From<&str> for Ref {
     fn from(ref_: &str) -> Self {
         Self::Tag(ref_.to_string())
+    }
+}
+
+impl From<ManifestLocation> for Ref {
+    fn from(ref_: ManifestLocation) -> Self {
+        Self::Location(ref_)
     }
 }
 

@@ -175,7 +175,7 @@ impl Drop for DynamoDBCommitTable {
 
 #[tokio::test]
 async fn test_concurrent_writers() {
-    use crate::utils::test::IoTrackingStore;
+    use lance_io::object_store::io_tracking::IoTrackingStore;
 
     let datagen = gen().col("values", array::step::<Int32Type>());
     let data = datagen.into_batch_rows(RowCount::from(100)).unwrap();
@@ -259,7 +259,7 @@ async fn test_concurrent_writers() {
 
 #[tokio::test]
 async fn test_ddb_open_iops() {
-    use crate::utils::test::IoTrackingStore;
+    use lance_io::object_store::io_tracking::IoTrackingStore;
 
     let bucket = S3Bucket::new("test-ddb-iops").await;
     let ddb_table = DynamoDBCommitTable::new("test-ddb-iops").await;

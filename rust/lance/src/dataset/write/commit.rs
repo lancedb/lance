@@ -464,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn test_reuse_session() {
         // Need to use in-memory for accurate IOPS tracking.
-        use crate::utils::test::IoTrackingStore;
+        use lance_io::object_store::io_tracking::IoTrackingStore;
 
         let mut store_registry = ObjectStoreRegistry::empty();
         let memory_store = Arc::new(object_store::memory::InMemory::new());

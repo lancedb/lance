@@ -292,6 +292,7 @@ impl DatasetBuilder {
                     );
                     Some(tags.get_version(t.as_str()).await?)
                 }
+                Ref::Location(location) => Some(location.version),
             }
         }
 

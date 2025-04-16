@@ -2779,7 +2779,7 @@ mod test {
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
     use crate::index::vector::{StageParams, VectorIndexParams};
-    use crate::utils::test::{IoStats, IoTrackingStore};
+    use lance_io::object_store::io_tracking::{IoStats, IoTrackingStore};
 
     #[tokio::test]
     async fn test_batch_size() {
