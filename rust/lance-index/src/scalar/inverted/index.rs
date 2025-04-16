@@ -30,7 +30,6 @@ use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
@@ -186,9 +185,10 @@ impl InvertedIndex {
 
         let postings = stream::iter(token_ids)
             .enumerate()
-            .zip(repeat_with(|| (self.inverted_list.clone(), mask.clone())))
-            .map(|((position, token_id), (inverted_list, mask))| async move {
-                let posting = inverted_list
+            .zip(repeat_with(|| mask.clone()))
+            .map(|((position, token_id), mask)| async move {
+                let posting = self
+                    .inverted_list
                     .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
                 Result::Ok(PostingIterator::new(
