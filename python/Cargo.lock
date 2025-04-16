@@ -3424,7 +3424,6 @@ dependencies = [
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
- "async-channel 2.3.1",
  "async-recursion",
  "async-trait",
  "bitvec",
