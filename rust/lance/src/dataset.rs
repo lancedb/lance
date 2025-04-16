@@ -3162,6 +3162,8 @@ mod tests {
         .await
         .unwrap();
 
+        dbg!(&dataset.base);
+
         assert!(dataset.manifest_naming_scheme == ManifestNamingScheme::V2);
 
         assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
