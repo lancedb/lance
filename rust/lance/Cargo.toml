@@ -44,7 +44,7 @@ deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
 itertools.workspace = true
-object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
+object_store = { workspace = true }
 aws-credential-types.workspace = true
 pin-project.workspace = true
 prost.workspace = true
@@ -105,6 +105,7 @@ aws-sdk-s3 = { workspace = true }
 
 
 [features]
+default = ["aws", "azure", "gcp"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["clap", "lzma-sys/static"]
@@ -118,6 +119,9 @@ protoc = [
     "lance-index/protoc",
     "lance-table/protoc",
 ]
+aws = ["lance-io/aws"]
+gcp = ["lance-io/gcp"]
+azure = ["lance-io/azure"]
 
 [[bin]]
 name = "lq"

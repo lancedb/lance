@@ -1769,17 +1769,17 @@ mod tests {
     use lance_index::scalar::inverted::TokenizerConfig;
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
+    use lance_io::object_store::providers::memory::PersistentMemoryStoreProvider;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
-    use lance_table::io::commit::RenameCommitHandler;
+
     use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
-    use url::Url;
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -2019,6 +2019,16 @@ mod tests {
         // Need to use in-memory for accurate IOPS tracking.
         use crate::utils::test::IoTrackingStore;
 
+        let mut store_registry = ObjectStoreRegistry::empty();
+        let memory_store = Arc::new(object_store::memory::InMemory::new());
+        store_registry.insert(
+            "memory",
+            Arc::new(PersistentMemoryStoreProvider {
+                inner: memory_store,
+            }),
+        );
+        let store_registry = Arc::new(store_registry);
+
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
             DataType::Int32,
@@ -2030,12 +2040,18 @@ mod tests {
         )
         .unwrap();
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let dataset = Dataset::write(batches, "memory://test", None)
-            .await
-            .unwrap();
+        Dataset::write(
+            batches,
+            "memory://test",
+            Some(WriteParams {
+                object_store_registry: store_registry.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         // Then open with wrapping store.
-        let memory_store = dataset.object_store.inner.clone();
         let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
         let _dataset = DatasetBuilder::from_uri("memory://test")
             .with_read_params(ReadParams {
@@ -2043,13 +2059,9 @@ mod tests {
                     object_store_wrapper: Some(io_stats_wrapper),
                     ..Default::default()
                 }),
+                object_store_registry: store_registry.clone(),
                 ..Default::default()
             })
-            .with_object_store(
-                memory_store,
-                Url::parse("memory://test").unwrap(),
-                Arc::new(RenameCommitHandler),
-            )
             .load()
             .await
             .unwrap();

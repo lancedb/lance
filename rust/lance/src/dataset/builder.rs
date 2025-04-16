@@ -114,6 +114,8 @@ impl DatasetBuilder {
     }
 
     /// Directly set the object store to use.
+    #[deprecated(note = "Implement an ObjectStoreProvider instead")]
+    #[allow(deprecated)]
     pub fn with_object_store(
         mut self,
         object_store: Arc<DynObjectStore>,
@@ -229,6 +231,7 @@ impl DatasetBuilder {
             .unwrap_or_default();
         let download_retry_count = storage_options.download_retry_count();
 
+        #[allow(deprecated)]
         match &self.options.object_store {
             Some(store) => Ok((
                 ObjectStore::new(
