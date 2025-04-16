@@ -18,6 +18,7 @@ use datafusion::{
     },
 };
 use datafusion_common::DataFusionError;
+use futures::stream::BoxStream;
 use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::datatypes::Schema;
 use lance_core::Result;
@@ -227,7 +228,7 @@ impl<K: Ord + Clone, V> Ord for Intermediate<K, V> {
     }
 }
 
-type KeyStream<K, Item> = Pin<Box<dyn Stream<Item = Result<(K, Item)>> + Send>>;
+type KeyStream<K, Item> = BoxStream<'static, Result<(K, Item)>>;
 
 /// A stream that merges multiple streams in order of key.
 /// All the stream must have the same schema, and the key must be produced

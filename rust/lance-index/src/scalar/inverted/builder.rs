@@ -15,6 +15,7 @@ use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
+use futures::stream::BoxStream;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::iter_str_array;
@@ -715,10 +716,7 @@ impl PostingReader {
     }
 
     // returns a stream of (token, batch)
-    #[allow(clippy::type_complexity)]
-    fn into_stream(
-        mut self,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<(String, Vec<RecordBatch>)>> + Send>>> {
+    fn into_stream(mut self) -> Result<BoxStream<'static, Result<(String, Vec<RecordBatch>)>>> {
         let io_parallelism = self.store.io_parallelism();
         let token_offsets = std::mem::take(&mut self.token_offsets);
         let schema: Arc<arrow_schema::Schema> = Arc::new(self.reader.schema().into());
