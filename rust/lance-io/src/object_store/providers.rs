@@ -27,6 +27,25 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore>;
 }
 
+/// A registry of object store providers.
+///
+/// Use [`Self::default()`] to create one with the available default providers.
+/// This includes (depending on features enabled):
+/// - `memory`: An in-memory object store.
+/// - `file`: A local file object store, with optimized code paths.
+/// - `file-object-store`: A local file object store that uses the ObjectStore API,
+///   for all operations. Used for testing with ObjectStore wrappers.
+/// - `s3`: An S3 object store.
+/// - `s3+ddb`: An S3 object store with DynamoDB for metadata.
+/// - `az`: An Azure Blob Storage object store.
+/// - `gs`: A Google Cloud Storage object store.
+///
+/// Use [`Self::empty()`] to create an empty registry, with no providers registered.
+///
+/// The registry also caches object stores that are currently in use. It holds
+/// weak references to the object stores, so they are not held onto. If an object
+/// store is no longer in use, it will be removed from the cache on the next
+/// call to either [`Self::active_stores()`] or [`Self::get_store()`].
 #[derive(Debug)]
 pub struct ObjectStoreRegistry {
     providers: RwLock<HashMap<String, Arc<dyn ObjectStoreProvider>>>,
@@ -75,20 +94,18 @@ fn cache_url(url: &Url) -> String {
         // object stores, but we want to cache the object store itself.
         format!("{}://", url.scheme())
     } else {
-        // drop path after bucket, but keep query params
-        // e.g. s3://bucket/path?param=value -> s3://bucket?param=value
+        // Bucket is parsed as domain, so we just drop the path.
         let mut url = url.clone();
-        let first_segment = url
-            .path_segments()
-            .and_then(|mut iter| iter.next().map(|s| s.to_string()));
-        if let Some(first_segment) = first_segment {
-            url.set_path(&first_segment);
-        }
+        url.set_path("");
         url.to_string()
     }
 }
 
 impl ObjectStoreRegistry {
+    /// Create a new registry with no providers registered.
+    ///
+    /// Typically, you want to use [`Self::default()`] instead, so you get the
+    /// default providers.
     pub fn empty() -> Self {
         Self {
             providers: RwLock::new(HashMap::new()),
@@ -96,6 +113,7 @@ impl ObjectStoreRegistry {
         }
     }
 
+    /// Get the object store provider for a given scheme.
     pub fn get_provider(&self, scheme: &str) -> Option<Arc<dyn ObjectStoreProvider>> {
         self.providers
             .read()
@@ -104,6 +122,10 @@ impl ObjectStoreRegistry {
             .cloned()
     }
 
+    /// Get a list of all active object stores.
+    ///
+    /// Calling this will also clean up any weak references to object stores that
+    /// are no longer valid.
     pub fn active_stores(&self) -> Vec<Arc<ObjectStore>> {
         let mut found_inactive = false;
         let output = self
@@ -131,6 +153,11 @@ impl ObjectStoreRegistry {
         output
     }
 
+    /// Get an object store for a given base path and parameters.
+    ///
+    /// If the object store is already in use, it will return a strong reference
+    /// to the object store. If the object store is not in use, it will create a
+    /// new object store and return a strong reference to it.
     pub async fn get_store(
         &self,
         base_path: Url,
@@ -240,10 +267,37 @@ impl Default for ObjectStoreRegistry {
 }
 
 impl ObjectStoreRegistry {
+    /// Add a new object store provider to the registry. This will be called
+    /// in [`Self::get_store()`] when a URL is passed with a matching scheme.
     pub fn insert(&self, scheme: &str, provider: Arc<dyn ObjectStoreProvider>) {
         self.providers
             .write()
             .expect("ObjectStoreRegistry lock poisoned")
             .insert(scheme.into(), provider);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_url() {
+        let cases = [
+            ("s3://bucket/path?param=value", "s3://bucket?param=value"),
+            ("file:///path/to/file", "file://"),
+            ("file-object-store:///path/to/file", "file-object-store://"),
+            ("memory:///", "memory://"),
+            (
+                "http://example.com/path?param=value",
+                "http://example.com/?param=value",
+            ),
+        ];
+
+        for (url, expected_cache_url) in cases {
+            let url = Url::parse(url).unwrap();
+            let cache_url = cache_url(&url);
+            assert_eq!(cache_url, expected_cache_url);
+        }
     }
 }

@@ -173,6 +173,7 @@ impl Default for ObjectStoreParams {
 impl std::hash::Hash for ObjectStoreParams {
     #[allow(deprecated)]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // For hashing, we use pointer values for ObjectStore, S3 credentials, and wrapper
         self.block_size.hash(state);
         if let Some((store, url)) = &self.object_store {
             Arc::as_ptr(store).hash(state);
@@ -202,6 +203,7 @@ impl Eq for ObjectStoreParams {}
 impl PartialEq for ObjectStoreParams {
     #[allow(deprecated)]
     fn eq(&self, other: &Self) -> bool {
+        // For equality, we use pointer comparison for ObjectStore, S3 credentials, and wrapper
         self.block_size == other.block_size
             && self
                 .object_store
@@ -271,8 +273,9 @@ impl ObjectStore {
     ///
     /// Returns the ObjectStore instance and the absolute path to the object.
     ///
-    /// This uses the default [ObjectStoreRegistry] to find the object store.
-    /// To re-use object store instances, use [Self::from_uri_and_params].
+    /// This uses the default [ObjectStoreRegistry] to find the object store. To
+    /// allow for potential re-use of object store instances, it's recommended to
+    /// create a shared [ObjectStoreRegistry] and pass that to [Self::from_uri_and_params].
     pub async fn from_uri(uri: &str) -> Result<(Arc<Self>, Path)> {
         let registry = Arc::new(ObjectStoreRegistry::default());
 

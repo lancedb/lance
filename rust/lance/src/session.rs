@@ -29,7 +29,7 @@ pub struct Session {
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
-    pub(crate) store_registry: Arc<ObjectStoreRegistry>,
+    store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl std::fmt::Debug for Session {
@@ -60,6 +60,10 @@ impl Session {
     /// Parameters:
     ///
     /// - ***index_cache_size***: the size of the index cache.
+    /// - ***metadata_cache_size***: the size of the metadata cache.
+    /// - ***store_registry***: the object store registry to use when opening
+    ///   datasets. This determines which schemes are available, and also allows
+    ///   re-using object stores.
     pub fn new(
         index_cache_size: usize,
         metadata_cache_size: usize,
@@ -135,6 +139,7 @@ impl Session {
             + self.index_extensions.len()
     }
 
+    /// Get the object store registry.
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
         self.store_registry.clone()
     }
