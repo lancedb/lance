@@ -1006,7 +1006,7 @@ mod tests {
             format!("{drive_letter}:\\test_folder\\test.lance"),
         ] {
             let (store, base) = ObjectStore::from_uri(uri).await.unwrap();
-            let contents = read_from_store(store, &base.child("test_file"))
+            let contents = read_from_store(store.as_ref(), &base.child("test_file"))
                 .await
                 .unwrap();
             assert_eq!(contents, "WINDOWS");
