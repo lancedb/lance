@@ -12,15 +12,12 @@ use lance::{
     dataset::{builder::DatasetBuilder, ProjectionRequest},
 };
 use lance_file::version::LanceFileVersion;
-use lance_table::io::commit::RenameCommitHandler;
-use object_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
-use url::Url;
 
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 
@@ -95,7 +92,7 @@ async fn create_dataset(
     num_batches: i32,
     file_size: i32,
 ) -> Dataset {
-    let store = create_file(
+    create_file(
         std::path::Path::new(path),
         WriteMode::Create,
         data_storage_version,
@@ -104,15 +101,7 @@ async fn create_dataset(
     )
     .await;
 
-    DatasetBuilder::from_uri(path)
-        .with_object_store(
-            store,
-            Url::parse(path).unwrap(),
-            Arc::new(RenameCommitHandler),
-        )
-        .load()
-        .await
-        .unwrap()
+    DatasetBuilder::from_uri(path).load().await.unwrap()
 }
 
 async fn create_file(
@@ -121,7 +110,7 @@ async fn create_file(
     data_storage_version: LanceFileVersion,
     num_batches: i32,
     file_size: i32,
-) -> Arc<dyn ObjectStore> {
+) {
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("i", DataType::Int32, false),
         Field::new("f", DataType::Float32, false),
@@ -183,10 +172,9 @@ async fn create_file(
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-    let ds = Dataset::write(reader, test_uri, Some(write_params))
+    Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
-    ds.object_store.inner.clone()
 }
 
 #[cfg(target_os = "linux")]

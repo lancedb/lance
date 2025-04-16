@@ -26,7 +26,6 @@ use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
@@ -74,6 +73,7 @@ lazy_static! {
 
 #[derive(Clone)]
 pub struct InvertedIndex {
+    io_parallelism: usize,
     params: InvertedIndexParams,
     tokenizer: tantivy::tokenizer::TextAnalyzer,
     tokens: TokenSet,
@@ -164,6 +164,7 @@ impl InvertedIndex {
         &self,
         tokens: &[String],
         params: &FtsSearchParams,
+        operator: Operator,
         is_phrase_query: bool,
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
@@ -181,9 +182,10 @@ impl InvertedIndex {
 
         let postings = stream::iter(token_ids)
             .enumerate()
-            .zip(repeat_with(|| (self.inverted_list.clone(), mask.clone())))
-            .map(|((position, token_id), (inverted_list, mask))| async move {
-                let posting = inverted_list
+            .zip(repeat_with(|| mask.clone()))
+            .map(|((position, token_id), mask)| async move {
+                let posting = self
+                    .inverted_list
                     .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
                 Result::Ok(PostingIterator::new(
@@ -194,12 +196,11 @@ impl InvertedIndex {
                     mask,
                 ))
             })
-            // Use compute count since data hopefully cached
-            .buffered(get_num_compute_intensive_cpus())
+            .buffer_unordered(self.io_parallelism)
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut wand = Wand::new(self.docs.len(), postings.into_iter());
+        let mut wand = Wand::new(self.docs.len(), operator, postings.into_iter());
         wand.search(
             is_phrase_query,
             params.limit.unwrap_or(usize::MAX),
@@ -313,6 +314,7 @@ impl ScalarIndex for InvertedIndex {
             tokenizer_config,
         };
         Ok(Arc::new(Self {
+            io_parallelism: store.io_parallelism(),
             params,
             tokenizer,
             tokens,
@@ -613,8 +615,8 @@ impl InvertedListReader {
                 metrics.record_part_load();
                 info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-                let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>();
                 Result::Ok(PostingList::new(
                     row_ids.values().clone(),
                     frequencies.values().clone(),

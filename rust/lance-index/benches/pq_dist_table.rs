@@ -3,7 +3,7 @@
 
 //! Benchmark of building PQ distance table.
 
-use std::iter::repeat;
+use std::iter::repeat_n;
 
 use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, UInt8Array};
@@ -72,7 +72,7 @@ fn compute_distances(c: &mut Criterion) {
     let query = generate_random_array_with_seed::<Float32Type>(DIM, [32; 32]);
 
     let mut rnd = StdRng::from_seed([32; 32]);
-    let code = UInt8Array::from_iter_values(repeat(rnd.gen::<u8>()).take(TOTAL * PQ));
+    let code = UInt8Array::from_iter_values(repeat_n(rnd.gen::<u8>(), TOTAL * PQ));
 
     for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot].iter() {
         let pq = ProductQuantizer::new(

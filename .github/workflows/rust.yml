@@ -36,6 +36,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
   clippy:
+    permissions:
+      checks: write
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -44,11 +46,15 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
-      - name: Run clippy
+      - name: Get features
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo clippy --version
-          cargo clippy --locked --features ${ALL_FEATURES} --tests --benches -- -D warnings
+          echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
+      - uses: auguwu/clippy-action@1.4.0
+        with:
+          check-args: --locked --features ${{ env.ALL_FEATURES }} --tests --benches
+          token: ${{secrets.GITHUB_TOKEN}}
+          deny: warnings
   cargo-deny:
     name: Check Rust dependencies (cargo-deny)
     runs-on: ubuntu-24.04

@@ -22,7 +22,7 @@ arrow-buffer.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
-aws-credential-types.workspace = true
+aws-credential-types = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 byteorder.workspace = true
 bytes.workspace = true
@@ -60,7 +60,7 @@ prost-build.workspace = true
 protobuf-src = { version = "2.1", optional = true }
 
 [features]
-dynamodb = ["aws-sdk-dynamodb", "lazy_static"]
+dynamodb = ["aws-sdk-dynamodb", "lazy_static", "aws-credential-types", "lance-io/aws"]
 protoc = ["dep:protobuf-src"]
 
 [package.metadata.docs.rs]

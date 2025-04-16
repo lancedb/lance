@@ -24,6 +24,7 @@ use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
 };
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
+use lance_index::vector::utils::is_finite;
 use lance_index::vector::v3::shuffler::IvfShufflerReader;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN};
@@ -370,6 +371,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             training_data
         };
 
+        // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
+        let training_data = arrow::compute::filter(&training_data, &is_finite(&training_data))?;
+        let training_data = training_data.as_fixed_size_list();
+
         let training_data = match (self.ivf.as_ref(), Q::use_residual(self.distance_type)) {
             (Some(ivf), true) => {
                 let ivf_transformer = lance_index::vector::ivf::new_ivf_transformer(
@@ -378,9 +383,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     vec![],
                 );
                 span!(Level::INFO, "compute residual for PQ training")
-                    .in_scope(|| ivf_transformer.compute_residual(&training_data))?
+                    .in_scope(|| ivf_transformer.compute_residual(training_data))?
             }
-            _ => training_data,
+            _ => training_data.clone(),
         };
 
         info!("Start to train quantizer");

@@ -972,11 +972,9 @@ mod tests {
         assert!(!single_bin.is_noop());
 
         let big_bin = CandidateBin {
-            fragments: std::iter::repeat(fragment).take(8).collect(),
+            fragments: std::iter::repeat_n(fragment, 8).collect(),
             pos_range: 0..8,
-            candidacy: std::iter::repeat(CompactionCandidacy::CompactItself)
-                .take(8)
-                .collect(),
+            candidacy: std::iter::repeat_n(CompactionCandidacy::CompactItself, 8).collect(),
             row_counts: vec![100, 400, 200, 200, 400, 300, 300, 100],
             indices: vec![],
             // Will group into: [[100, 400], [200, 200, 400], [300, 300, 100]]

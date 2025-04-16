@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::any::Any;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::iter::once;
 use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
@@ -729,7 +729,8 @@ impl NGramIndexBuilder {
                 .await?;
 
             let left_stream = stream::once(std::future::ready(Ok(spill_state)));
-            let right_stream = self.stream_spill(self.worker_number).await?;
+            let right_stream =
+                Self::stream_spill(self.spill_store.clone(), self.worker_number).await?;
             Self::merge_spill_streams(left_stream, right_stream, writer.as_mut()).await?;
             drop(writer);
             self.spill_store
@@ -852,7 +853,6 @@ impl NGramIndexBuilder {
     }
 
     async fn stream_spill_reader(
-        &self,
         reader: Arc<dyn IndexReader>,
     ) -> Result<impl Stream<Item = Result<NGramIndexSpillState>>> {
         let num_rows = reader.num_rows();
@@ -876,14 +876,13 @@ impl NGramIndexBuilder {
     }
 
     async fn stream_spill(
-        &self,
+        spill_store: Arc<dyn IndexStore>,
         id: usize,
     ) -> Result<impl Stream<Item = Result<NGramIndexSpillState>>> {
-        let reader = self
-            .spill_store
+        let reader = spill_store
             .open_index_file(&Self::spill_filename(id))
             .await?;
-        self.stream_spill_reader(reader).await
+        Self::stream_spill_reader(reader).await
     }
 
     fn merge_spill_states(
@@ -1007,7 +1006,7 @@ impl NGramIndexBuilder {
     }
 
     async fn merge_spill_files(
-        &mut self,
+        spill_store: Arc<dyn IndexStore>,
         index_of_left: usize,
         index_of_right: usize,
         output_index: usize,
@@ -1018,20 +1017,21 @@ impl NGramIndexBuilder {
             index_of_left, index_of_right, output_index
         );
 
-        let mut writer = self
-            .spill_store
+        let mut writer = spill_store
             .new_index_file(&Self::spill_filename(output_index), POSTINGS_SCHEMA.clone())
             .await?;
 
-        let left_stream = self.stream_spill(index_of_left).await?;
-        let right_stream = self.stream_spill(index_of_right).await?;
+        let (left_stream, right_stream) = futures::try_join!(
+            Self::stream_spill(spill_store.clone(), index_of_left),
+            Self::stream_spill(spill_store.clone(), index_of_right)
+        )?;
 
         Self::merge_spill_streams(left_stream, right_stream, writer.as_mut()).await?;
 
-        self.spill_store
+        spill_store
             .delete_index_file(&Self::spill_filename(index_of_left))
             .await?;
-        self.spill_store
+        spill_store
             .delete_index_file(&Self::spill_filename(index_of_right))
             .await?;
 
@@ -1044,23 +1044,33 @@ impl NGramIndexBuilder {
     // intermediate files
     //
     // Note: worker indices start at 1 and not 0 (hence all the +1's)
-    async fn merge_spills(&mut self, spill_files: Vec<usize>) -> Result<usize> {
+    async fn merge_spills(&mut self, mut spill_files: Vec<usize>) -> Result<usize> {
         info!(
             "Merging {} index files into one combined index",
             spill_files.len()
         );
 
         let mut spill_counter = spill_files.iter().max().expect_ok()? + 1;
-        let mut spills_remaining = VecDeque::from_iter(spill_files);
-        while spills_remaining.len() > 1 {
-            let left = spills_remaining.pop_front().expect_ok()?;
-            let right = spills_remaining.pop_front().expect_ok()?;
-            self.merge_spill_files(left, right, spill_counter).await?;
-            spills_remaining.push_back(spill_counter);
-            spill_counter += 1;
+        while spill_files.len() > 1 {
+            let mut new_spills = Vec::with_capacity(spill_files.len() / 2);
+            while spill_files.len() >= 2 {
+                let left = spill_files.pop().expect_ok()?;
+                let right = spill_files.pop().expect_ok()?;
+                new_spills.push(tokio::spawn(Self::merge_spill_files(
+                    self.spill_store.clone(),
+                    left,
+                    right,
+                    spill_counter + new_spills.len(),
+                )));
+            }
+            for i in 0..new_spills.len() {
+                spill_files.push(spill_counter + i);
+            }
+            spill_counter += new_spills.len();
+            futures::future::try_join_all(new_spills).await?;
         }
 
-        spills_remaining.pop_front().expect_ok()
+        spill_files.pop().expect_ok()
     }
 
     async fn merge_old_index(
@@ -1076,9 +1086,9 @@ impl NGramIndexBuilder {
             .new_index_file(&Self::spill_filename(final_num), POSTINGS_SCHEMA.clone())
             .await?;
 
-        let left_stream = self.stream_spill(new_data_num).await?;
+        let left_stream = Self::stream_spill(self.spill_store.clone(), new_data_num).await?;
         let old_reader = old_index.open_index_file(POSTINGS_FILENAME).await?;
-        let right_stream = self.stream_spill_reader(old_reader).await?;
+        let right_stream = Self::stream_spill_reader(old_reader).await?;
 
         Self::merge_spill_streams(left_stream, right_stream, writer.as_mut()).await?;
 

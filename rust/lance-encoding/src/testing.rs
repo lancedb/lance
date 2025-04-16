@@ -455,16 +455,14 @@ impl SimulatedWriter {
         self.encoded_data.extend_from_slice(&buffer);
         let size = self.encoded_data.len() as u64 - offset;
         let pad_bytes = pad_bytes::<TEST_ALIGNMENT>(self.encoded_data.len());
-        self.encoded_data
-            .extend(std::iter::repeat(0).take(pad_bytes));
+        self.encoded_data.extend(std::iter::repeat_n(0, pad_bytes));
         (offset, size)
     }
 
     fn write_lance_buffer(&mut self, buffer: LanceBuffer) {
         self.encoded_data.extend_from_slice(&buffer);
         let pad_bytes = pad_bytes::<TEST_ALIGNMENT>(self.encoded_data.len());
-        self.encoded_data
-            .extend(std::iter::repeat(0).take(pad_bytes));
+        self.encoded_data.extend(std::iter::repeat_n(0, pad_bytes));
     }
 
     fn write_page(&mut self, encoded_page: EncodedPage) {

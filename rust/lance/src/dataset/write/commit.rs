@@ -423,11 +423,11 @@ pub struct BatchCommitResult {
 mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_io::object_store::providers::memory::PersistentMemoryStoreProvider;
     use lance_table::{
         format::{DataFile, Fragment},
         io::commit::ConditionalPutCommitHandler,
     };
-    use url::Url;
 
     use crate::dataset::{InsertBuilder, WriteParams};
 
@@ -466,6 +466,16 @@ mod tests {
         // Need to use in-memory for accurate IOPS tracking.
         use crate::utils::test::IoTrackingStore;
 
+        let mut store_registry = ObjectStoreRegistry::empty();
+        let memory_store = Arc::new(object_store::memory::InMemory::new());
+        store_registry.insert(
+            "memory",
+            Arc::new(PersistentMemoryStoreProvider {
+                inner: memory_store,
+            }),
+        );
+        let store_registry = Arc::new(store_registry);
+
         // Create new dataset
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
@@ -477,17 +487,16 @@ mod tests {
             vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
         )
         .unwrap();
-        let memory_store = Arc::new(object_store::memory::InMemory::new());
         let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
         let store_params = ObjectStoreParams {
             object_store_wrapper: Some(io_stats_wrapper),
-            object_store: Some((memory_store.clone(), Url::parse("memory://test").unwrap())),
             ..Default::default()
         };
         let dataset = InsertBuilder::new("memory://test")
             .with_params(&WriteParams {
                 store_params: Some(store_params.clone()),
                 commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+                object_store_registry: store_registry.clone(),
                 ..Default::default()
             })
             .execute(vec![batch])
@@ -534,6 +543,7 @@ mod tests {
         // Commit transaction with URI and session
         let new_ds = CommitBuilder::new("memory://test")
             .with_store_params(store_params.clone())
+            .with_object_store_registry(store_registry.clone())
             .with_commit_handler(Arc::new(ConditionalPutCommitHandler))
             .with_session(dataset.session.clone())
             .execute(sample_transaction(1))
@@ -551,6 +561,7 @@ mod tests {
         let new_ds = CommitBuilder::new("memory://test")
             .with_store_params(store_params)
             .with_commit_handler(Arc::new(ConditionalPutCommitHandler))
+            .with_object_store_registry(store_registry.clone())
             .execute(sample_transaction(1))
             .await
             .unwrap();

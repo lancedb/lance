@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use chrono::TimeDelta;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{
@@ -111,6 +112,22 @@ impl TryFrom<&str> for WriteMode {
     }
 }
 
+/// Auto cleanup parameters
+#[derive(Debug, Clone)]
+pub struct AutoCleanupParams {
+    pub interval: usize,
+    pub older_than: TimeDelta,
+}
+
+impl Default for AutoCleanupParams {
+    fn default() -> Self {
+        Self {
+            interval: 20,
+            older_than: TimeDelta::days(14),
+        }
+    }
+}
+
 /// Dataset Write Parameters
 #[derive(Debug, Clone)]
 pub struct WriteParams {
@@ -173,6 +190,14 @@ pub struct WriteParams {
     pub object_store_registry: Arc<ObjectStoreRegistry>,
 
     pub session: Option<Arc<Session>>,
+
+    /// If Some and this is a new dataset, old dataset versions will be
+    /// automatically cleaned up according to the parameters set out in
+    /// `AutoCleanupParams`. This parameter has no effect on existing datasets.
+    /// To add autocleaning to an existing dataset, use Dataset::update_config
+    /// to set lance.auto_cleanup.interval and lance.auto_cleanup.older_than.
+    /// Both parameters must be set to invoke autocleaning.
+    pub auto_cleanup: Option<AutoCleanupParams>,
 }
 
 impl Default for WriteParams {
@@ -192,6 +217,7 @@ impl Default for WriteParams {
             enable_v2_manifest_paths: false,
             object_store_registry: Arc::new(ObjectStoreRegistry::default()),
             session: None,
+            auto_cleanup: Some(AutoCleanupParams::default()),
         }
     }
 }
@@ -591,6 +617,7 @@ async fn resolve_commit_handler(
 ) -> Result<Arc<dyn CommitHandler>> {
     match commit_handler {
         None => {
+            #[allow(deprecated)]
             if store_options
                 .as_ref()
                 .map(|opts| opts.object_store.is_some())

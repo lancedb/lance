@@ -221,7 +221,7 @@ impl IoQueueState {
             && seconds_elapsed < BACKPRESSURE_DEBOUNCE)
             || since_last_warn > BACKPRESSURE_DEBOUNCE
         {
-            tracing::event!(tracing::Level::WARN, "Backpressure throttle exceeded");
+            tracing::event!(tracing::Level::DEBUG, "Backpressure throttle exceeded");
             log::debug!("Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind");
             self.last_warn
                 .store(seconds_elapsed.max(1), Ordering::Release);
