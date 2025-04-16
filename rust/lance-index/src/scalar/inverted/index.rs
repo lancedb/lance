@@ -78,6 +78,7 @@ lazy_static! {
 
 #[derive(Clone)]
 pub struct InvertedIndex {
+    io_parallelism: usize,
     params: InvertedIndexParams,
     tokenizer: tantivy::tokenizer::TextAnalyzer,
     tokens: TokenSet,
@@ -198,8 +199,7 @@ impl InvertedIndex {
                     mask,
                 ))
             })
-            // Use compute count since data hopefully cached
-            .buffered(get_num_compute_intensive_cpus())
+            .buffer_unordered(self.io_parallelism)
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -318,6 +318,7 @@ impl ScalarIndex for InvertedIndex {
             tokenizer_config,
         };
         Ok(Arc::new(Self {
+            io_parallelism: store.io_parallelism(),
             params,
             tokenizer,
             tokens,
@@ -618,8 +619,8 @@ impl InvertedListReader {
                 metrics.record_part_load();
                 info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-                let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>();
                 Result::Ok(PostingList::new(
                     row_ids.values().clone(),
                     frequencies.values().clone(),
