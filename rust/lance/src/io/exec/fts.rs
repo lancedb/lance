@@ -733,3 +733,95 @@ impl ExecutionPlan for BoostQueryExec {
         &self.properties
     }
 }
+
+#[cfg(test)]
+pub mod tests {
+    use std::sync::Arc;
+
+    use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
+    use lance_datafusion::datagen::DatafusionDatagenExt;
+    use lance_datagen::{BatchCount, ByteCount, RowCount};
+    use lance_index::scalar::inverted::query::{
+        BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
+    };
+
+    use crate::{io::exec::PreFilterSource, utils::test::NoContextTestFixture};
+
+    use super::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
+
+    #[test]
+    fn execute_without_context() {
+        // These tests ensure we can create nodes and call execute without a tokio Runtime
+        // being active.  This is a requirement for proper implementation of a Datafusion foreign
+        // table provider.
+        let fixture = NoContextTestFixture::new();
+        let match_query = MatchQueryExec::new(
+            Arc::new(fixture.dataset.clone()),
+            MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        );
+        match_query
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+
+        let flat_input = lance_datagen::gen()
+            .col(
+                "text",
+                lance_datagen::array::rand_utf8(ByteCount::from(10), false),
+            )
+            .into_df_exec(RowCount::from(15), BatchCount::from(2));
+
+        let flat_match_query = FlatMatchQueryExec::new(
+            Arc::new(fixture.dataset.clone()),
+            MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+            FtsSearchParams::default(),
+            flat_input,
+        );
+        flat_match_query
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+
+        let phrase_query = PhraseQueryExec::new(
+            Arc::new(fixture.dataset.clone()),
+            PhraseQuery::new("blah".to_string()),
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        );
+        phrase_query
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+
+        let boost_input_one = MatchQueryExec::new(
+            Arc::new(fixture.dataset.clone()),
+            MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        );
+
+        let boost_input_two = MatchQueryExec::new(
+            Arc::new(fixture.dataset),
+            MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        );
+
+        let boost_query = BoostQueryExec::new(
+            BoostQuery::new(
+                FtsQuery::Match(
+                    MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+                ),
+                FtsQuery::Match(
+                    MatchQuery::new("test".to_string()).with_column(Some("text".to_string())),
+                ),
+                Some(1.0),
+            ),
+            FtsSearchParams::default(),
+            Arc::new(boost_input_one),
+            Arc::new(boost_input_two),
+        );
+        boost_query
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+    }
+}

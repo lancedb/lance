@@ -708,9 +708,11 @@ mod tests {
 
     use crate::{
         io::exec::scalar_index::MaterializeIndexExec,
-        utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
+        utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
         Dataset,
     };
+
+    use super::{MapIndexExec, ScalarIndexExec};
 
     struct TestFixture {
         dataset: Arc<Dataset>,
@@ -781,5 +783,34 @@ mod tests {
 
         assert_eq!(batches.len(), 10);
         assert_eq!(batches[0].num_rows(), 5);
+    }
+
+    #[test]
+    fn no_context_scalar_index() {
+        // These tests ensure we can create nodes and call execute without a tokio Runtime
+        // being active.  This is a requirement for proper implementation of a Datafusion foreign
+        // table provider.
+        let fixture = NoContextTestFixture::new();
+        let arc_dasaset = Arc::new(fixture.dataset);
+
+        let query = ScalarIndexExpr::Query(
+            "ordered".to_string(),
+            Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::UInt64(Some(47))),
+            )),
+        );
+
+        // These plans aren't even valid but it appears we defer all work (even validation) until
+        // read time.
+        let plan = ScalarIndexExec::new(arc_dasaset.clone(), query.clone());
+        plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+
+        let plan = MapIndexExec::new(arc_dasaset.clone(), "ordered".to_string(), Arc::new(plan));
+        plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+
+        let plan =
+            MaterializeIndexExec::new(arc_dasaset.clone(), query, arc_dasaset.fragments().clone());
+        plan.execute(0, Arc::new(TaskContext::default())).unwrap();
     }
 }

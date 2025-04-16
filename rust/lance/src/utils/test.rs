@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
-use lance_datagen::{BatchCount, BatchGeneratorBuilder, RowCount};
+use lance_datagen::{BatchCount, BatchGeneratorBuilder, ByteCount, RowCount};
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStoreRegistry, WrappingObjectStore};
 use lance_table::format::Fragment;
@@ -22,6 +22,7 @@ use object_store::{
 };
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
+use tempfile::{tempdir, TempDir};
 
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
@@ -526,6 +527,36 @@ impl DatagenExt for BatchGeneratorBuilder {
             }),
         )
         .await
+    }
+}
+
+pub struct NoContextTestFixture {
+    _tmp_dir: TempDir,
+    pub dataset: Dataset,
+}
+
+impl NoContextTestFixture {
+    pub fn new() -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let tempdir = tempdir().unwrap();
+            let tmppath = tempdir.path().to_str().unwrap();
+            let dataset = lance_datagen::gen()
+                .col(
+                    "text",
+                    lance_datagen::array::rand_utf8(ByteCount::from(10), false),
+                )
+                .into_dataset(tmppath, FragmentCount::from(4), FragmentRowCount::from(100))
+                .await
+                .unwrap();
+            Self {
+                dataset,
+                _tmp_dir: tempdir,
+            }
+        })
     }
 }
 
