@@ -790,7 +790,7 @@ pub mod tests {
         );
 
         let boost_input_two = MatchQueryExec::new(
-            Arc::new(fixture.dataset.clone()),
+            Arc::new(fixture.dataset),
             MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
             FtsSearchParams::default(),
             PreFilterSource::None,

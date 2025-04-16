@@ -909,7 +909,7 @@ mod tests {
         // being active.  This is a requirement for proper implementation of a Datafusion foreign
         // table provider.
         let fixture = NoContextTestFixture::new();
-        let arc_dasaset = Arc::new(fixture.dataset.clone());
+        let arc_dasaset = Arc::new(fixture.dataset);
 
         let input = lance_datagen::gen()
             .col(ROW_ID, lance_datagen::array::step::<UInt64Type>())
