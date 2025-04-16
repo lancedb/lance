@@ -284,7 +284,7 @@ impl InvertedIndexBuilder {
         log::info!("writing {} posting lists", self.posting_readers.len());
         let mut posting_streams = Vec::with_capacity(self.posting_readers.len() + 1);
         for reader in std::mem::take(&mut self.posting_readers) {
-            posting_streams.push(reader.into_stream()?);
+            posting_streams.push(reader.into_stream());
         }
         if let Some(inverted_list_reader) = self.inverted_list.as_ref() {
             let tokens = match self.tokens.tokens {
@@ -715,7 +715,7 @@ impl PostingReader {
     }
 
     // returns a stream of (token, batch)
-    fn into_stream(mut self) -> Result<BoxStream<'static, Result<(String, Vec<RecordBatch>)>>> {
+    fn into_stream(mut self) -> BoxStream<'static, Result<(String, Vec<RecordBatch>)>> {
         let io_parallelism = self.store.io_parallelism();
         let token_offsets = std::mem::take(&mut self.token_offsets);
         let schema: Arc<arrow_schema::Schema> = Arc::new(self.reader.schema().into());
@@ -743,7 +743,7 @@ impl PostingReader {
         });
 
         let stream = stream::iter(inverted_batches).buffer_unordered(io_parallelism);
-        Ok(Box::pin(stream))
+        Box::pin(stream)
     }
 }
 
