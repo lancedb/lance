@@ -235,8 +235,8 @@ fn uri_to_url(uri: &str) -> Result<Url> {
     }
 }
 
-fn local_path_to_url(str_path: &str) -> Result<Url> {
-    let expanded = tilde(str_path).to_string();
+fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
+    let expanded = tilde(str_path.as_ref()).to_string();
 
     let mut expanded_path = path_abs::PathAbs::new(expanded)
         .unwrap()
@@ -249,6 +249,12 @@ fn local_path_to_url(str_path: &str) -> Result<Url> {
         }
     }
 
+    Ok(expanded_path)
+}
+
+fn local_path_to_url(str_path: &str) -> Result<Url> {
+    let expanded_path = expand_path(str_path)?;
+
     Url::from_directory_path(expanded_path).map_err(|_| Error::InvalidInput {
         source: format!("Invalid table location: '{}'", str_path).into(),
         location: location!(),
@@ -256,15 +262,21 @@ fn local_path_to_url(str_path: &str) -> Result<Url> {
 }
 
 fn extract_path(url: &Url) -> Path {
-    if url.scheme() == "memory" {
-        let mut output = String::new();
-        if let Some(domain) = url.domain() {
-            output.push_str(domain);
+    match url.scheme() {
+        "memory" => {
+            let mut output = String::new();
+            if let Some(domain) = url.domain() {
+                output.push_str(domain);
+            }
+            output.push_str(url.path());
+            Path::from(output)
         }
-        output.push_str(url.path());
-        Path::from(output)
-    } else {
-        Path::from(url.path())
+        "file" | "file-object-store" => url
+            .to_file_path()
+            .ok()
+            .and_then(|p| Path::from_absolute_path(p).ok())
+            .unwrap_or_else(|| Path::from(url.path())),
+        _ => Path::from(url.path()),
     }
 }
 
@@ -402,14 +414,16 @@ impl ObjectStore {
     /// Create an [ObjectWriter] from local [std::path::Path]
     pub async fn create_local_writer(path: &std::path::Path) -> Result<ObjectWriter> {
         let object_store = Self::local();
-        let os_path = Path::from(path.to_str().unwrap());
+        let absolute_path = expand_path(path.to_string_lossy())?;
+        let os_path = Path::from_absolute_path(absolute_path)?;
         object_store.create(&os_path).await
     }
 
     /// Open an [Reader] from local [std::path::Path]
     pub async fn open_local(path: &std::path::Path) -> Result<Box<dyn Reader>> {
         let object_store = Self::local();
-        let os_path = Path::from(path.to_str().unwrap());
+        let absolute_path = expand_path(path.to_string_lossy())?;
+        let os_path = Path::from_absolute_path(absolute_path)?;
         object_store.open(&os_path).await
     }
 
@@ -961,6 +975,26 @@ mod tests {
             ("s3+ddb://bucket/path", "path"),
             ("gs://bucket/path", "path"),
             ("az://account/path", "path"),
+        ];
+        for (uri, expected_path) in cases {
+            let url = uri_to_url(uri).unwrap();
+            let path = extract_path(&url);
+            assert_eq!(path.to_string(), expected_path);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_path_parsing_windows() {
+        let cases = [
+            (
+                "C:\\Users\\ADMINI~1\\AppData\\Local\\",
+                "C:/Users/ADMINI~1/AppData/Local",
+            ),
+            (
+                "C:\\Users\\ADMINI~1\\AppData\\Local\\..\\",
+                "C:/Users/ADMINI~1/AppData",
+            ),
         ];
         for (uri, expected_path) in cases {
             let url = uri_to_url(uri).unwrap();
