@@ -111,7 +111,7 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
 
 
 def test_indexed_between(tmp_path):
-    dataset = lance.write_dataset(pa.table({"val": range(100)}), tmp_path)
+    dataset = lance.write_dataset(pa.table({"val": range(0, 10000)}), tmp_path)
     dataset.create_scalar_index("val", index_type="BTREE")
 
     scanner = dataset.scanner(filter="val BETWEEN 10 AND 20", prefilter=True)
@@ -127,6 +127,23 @@ def test_indexed_between(tmp_path):
 
     actual_data = scanner.to_table()
     assert actual_data.num_rows == 11
+
+    # The following cases are slightly ill-formed since end is before start
+    # but we should handle them gracefully and simply return an empty result
+    # (previously we panicked here)
+    scanner = dataset.scanner(filter="val >= 5000 AND val <= 0", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 0
+
+    scanner = dataset.scanner(filter="val BETWEEN 5000 AND 0", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 0
 
 
 def test_temporal_index(tmp_path):
