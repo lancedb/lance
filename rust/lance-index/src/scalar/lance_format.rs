@@ -127,7 +127,7 @@ impl IndexReader for FileReader {
         self.read_range(range, &projection).await
     }
 
-    async fn num_batches(&self) -> u32 {
+    async fn num_batches(&self, _batch_size: u64) -> u32 {
         self.num_batches() as u32
     }
 
@@ -183,8 +183,8 @@ impl IndexReader for v2::reader::FileReader {
 
     // V2 format has removed the row group concept,
     // so here we assume each batch is with 4096 rows.
-    async fn num_batches(&self) -> u32 {
-        unimplemented!("v2 format has no concept of row groups")
+    async fn num_batches(&self, batch_size: u64) -> u32 {
+        Self::num_rows(self).div_ceil(batch_size) as u32
     }
 
     fn num_rows(&self) -> usize {
