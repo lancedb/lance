@@ -180,26 +180,14 @@ void dropColumns() {
 }
 ```
 
-## Integrations
-
-This section introduces the ecosystem integration with Lance format.
-With the integration, users are able to access lance dataset with other technology or tools.
-
-### Spark connector
-
-The [spark](https://github.com/lancedb/lance/tree/main/java/spark) module is a standard maven module.
-It is the implementation of spark-lance connector that allows Apache Spark to efficiently access datasets stored in Lance format.
-More details please see the [README](https://github.com/lancedb/lance/blob/main/java/spark/README.md) file.
-
 ## Contributing
 
 From the codebase dimension, the lance project is a multiple-lang project. All Java-related code is located in the `java` directory.
 And the whole `java` dir is a standard maven project(named `lance-parent`) can be imported into any IDEs support java project.
 
-Overall, it contains two Maven sub-modules:
+Overall, it contains one Maven sub-module:
 
 * lance-core: the core module of Lance Java binding, including `lance-jni`.
-* lance-spark: the spark connector module.
 
 To build the project, you can run the following command:
 
