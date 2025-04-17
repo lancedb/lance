@@ -177,11 +177,31 @@ impl ExecutionPlan for OneShotExec {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+/// Callback for reporting statistics after a scan
+pub type ExecutionStatsCallback = Arc<dyn Fn(&ExecutionSummaryCounts) + Send + Sync>;
+
+#[derive(Default, Clone)]
 pub struct LanceExecutionOptions {
     pub use_spilling: bool,
     pub mem_pool_size: Option<u64>,
     pub batch_size: Option<usize>,
+    pub target_partition: Option<usize>,
+    pub execution_stats_callback: Option<ExecutionStatsCallback>,
+}
+
+impl std::fmt::Debug for LanceExecutionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LanceExecutionOptions")
+            .field("use_spilling", &self.use_spilling)
+            .field("mem_pool_size", &self.mem_pool_size)
+            .field("batch_size", &self.batch_size)
+            .field("target_partition", &self.target_partition)
+            .field(
+                "execution_stats_callback",
+                &self.execution_stats_callback.is_some(),
+            )
+            .finish()
+    }
 }
 
 const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
@@ -215,8 +235,11 @@ impl LanceExecutionOptions {
 }
 
 pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
-    let session_config = SessionConfig::new();
+    let mut session_config = SessionConfig::new();
     let mut runtime_env_builder = RuntimeEnvBuilder::new();
+    if let Some(target_partition) = options.target_partition {
+        session_config = session_config.with_target_partitions(target_partition);
+    }
     if options.use_spilling() {
         runtime_env_builder = runtime_env_builder
             .with_disk_manager(DiskManagerConfig::new())
@@ -240,17 +263,15 @@ lazy_static! {
 }
 
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
-    let session_ctx: SessionContext;
-    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE {
-        if options.use_spilling() {
-            session_ctx = DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone();
+    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE && options.target_partition.is_none()
+    {
+        return if options.use_spilling() {
+            DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone()
         } else {
-            session_ctx = DEFAULT_SESSION_CONTEXT.clone();
-        }
-    } else {
-        session_ctx = new_session_context(options)
+            DEFAULT_SESSION_CONTEXT.clone()
+        };
     }
-    session_ctx
+    new_session_context(options)
 }
 
 fn get_task_context(
@@ -266,16 +287,16 @@ fn get_task_context(
 }
 
 #[derive(Default)]
-struct SummaryCounts {
-    iops: usize,
-    requests: usize,
-    bytes_read: usize,
-    indices_loaded: usize,
-    parts_loaded: usize,
-    index_comparisons: usize,
+pub struct ExecutionSummaryCounts {
+    pub iops: usize,
+    pub requests: usize,
+    pub bytes_read: usize,
+    pub indices_loaded: usize,
+    pub parts_loaded: usize,
+    pub index_comparisons: usize,
 }
 
-fn visit_node(node: &dyn ExecutionPlan, counts: &mut SummaryCounts) {
+fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
         counts.iops += metrics
             .find_count(IOPS_METRIC)
@@ -307,12 +328,12 @@ fn visit_node(node: &dyn ExecutionPlan, counts: &mut SummaryCounts) {
     }
 }
 
-fn report_plan_summary_metrics(plan: &dyn ExecutionPlan) {
+fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutionOptions) {
     let output_rows = plan
         .metrics()
         .map(|m| m.output_rows().unwrap_or(0))
         .unwrap_or(0);
-    let mut counts = SummaryCounts::default();
+    let mut counts = ExecutionSummaryCounts::default();
     visit_node(plan, &mut counts);
     tracing::info!(
         target: TRACE_EXECUTION,
@@ -325,6 +346,9 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan) {
         parts_loaded = counts.parts_loaded,
         index_comparisons = counts.index_comparisons,
     );
+    if let Some(callback) = options.execution_stats_callback.as_ref() {
+        callback(&counts);
+    }
 }
 
 /// Executes a plan using default session & runtime configuration
@@ -348,7 +372,7 @@ pub fn execute_plan(
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
-        report_plan_summary_metrics(plan.as_ref());
+        report_plan_summary_metrics(plan.as_ref(), &options);
     });
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }

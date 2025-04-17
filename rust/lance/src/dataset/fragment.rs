@@ -761,7 +761,7 @@ impl FileFragment {
     /// - `projection`: The projection schema.
     /// - `read_config`: Controls what columns are included in the output.
     /// - `scan_scheduler`: The scheduler to use for reading data files.  If not supplied
-    ///                     and the data is v2 data then a new scheduler will be created
+    ///   and the data is v2 data then a new scheduler will be created
     ///
     /// `projection` may be an empty schema only if `with_row_id` is true. In that
     /// case, the reader will only be generating row ids.

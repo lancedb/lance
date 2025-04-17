@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_buffer::bit_util;
+use arrow_buffer::{bit_util, BooleanBufferBuilder};
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use crate::buffer::LanceBuffer;
 use crate::data::{
     BlockInfo, ConstantDataBlock, DataBlock, FixedSizeListBlock, FixedWidthDataBlock,
+    NullableDataBlock,
 };
 use crate::decoder::{BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor};
 use crate::encoder::{
@@ -266,7 +267,7 @@ impl ValueEncoder {
             if row_offset + vals_per_chunk <= data.num_values {
                 chunks.push(MiniBlockChunk {
                     log_num_values: log_vals_per_chunk as u8,
-                    num_bytes: bytes_per_chunk,
+                    buffer_sizes: vec![bytes_per_chunk],
                 });
                 row_offset += vals_per_chunk;
                 bytes_counter += bytes_per_chunk as u64;
@@ -276,7 +277,7 @@ impl ValueEncoder {
                 let num_bytes = u16::try_from(num_bytes).unwrap();
                 chunks.push(MiniBlockChunk {
                     log_num_values: 0,
-                    num_bytes,
+                    buffer_sizes: vec![num_bytes],
                 });
                 break;
             }
@@ -284,20 +285,334 @@ impl ValueEncoder {
 
         MiniBlockCompressed {
             chunks,
-            data: data_buffer,
+            data: vec![data_buffer],
             num_values: data.num_values,
         }
     }
+}
 
-    fn make_fsl_encoding(data: &FixedSizeListBlock) -> ArrayEncoding {
-        let inner_encoding = match data.child.as_ref() {
+#[derive(Debug)]
+struct MiniblockFslLayer {
+    validity: Option<LanceBuffer>,
+    dimension: u64,
+}
+
+/// This impl deals with encoding FSL<FSL<...<FSL<FixedWidth>>>> data as a mini-block compressor.
+/// The tricky part of FSL data is that we want to include inner validity buffers (we don't want these
+/// to be part of the rep-def because that usually ends up being more expensive).
+///
+/// The resulting mini-block will, instead of having a single buffer, have X + 1 buffers where X is
+/// the number of FSL layers that contain validity.
+///
+/// In the simple case where there is no validity inside the FSL layers, all we are doing here is flattening
+/// the FSL layers into a single buffer.
+///
+/// Also: We don't allow a row to be broken across chunks.  This typically isn't too big of a deal since we
+/// are usually dealing with relatively small vectors if we are using mini-block.
+///
+/// Note: when we do have validity we have to make copies of the validity buffers because they are bit buffers
+/// and we need to bit slice them which requires copies or offsets.  Paying the price at write time to make
+/// the copies is better than paying the price at read time to do the bit slicing.
+impl ValueEncoder {
+    fn make_fsl_encoding(layers: &[MiniblockFslLayer], bits_per_value: u64) -> ArrayEncoding {
+        let mut encoding = ProtobufUtils::flat_encoding(bits_per_value, 0, None);
+        for layer in layers.iter().rev() {
+            let has_validity = layer.validity.is_some();
+            let dimension = layer.dimension;
+            encoding = ProtobufUtils::fsl_encoding(dimension, encoding, has_validity);
+        }
+        encoding
+    }
+
+    fn extract_fsl_chunk(
+        data: &FixedWidthDataBlock,
+        layers: &[MiniblockFslLayer],
+        row_offset: usize,
+        num_rows: usize,
+        validity_buffers: &mut [Vec<u8>],
+    ) -> Vec<u16> {
+        let mut row_offset = row_offset;
+        let mut num_values = num_rows;
+        let mut buffer_counter = 0;
+        let mut buffer_sizes = Vec::with_capacity(validity_buffers.len() + 1);
+        for layer in layers {
+            row_offset *= layer.dimension as usize;
+            num_values *= layer.dimension as usize;
+            if let Some(validity) = &layer.validity {
+                let validity_slice = validity
+                    .try_clone()
+                    .unwrap()
+                    .bit_slice_le_with_length(row_offset, num_values);
+                validity_buffers[buffer_counter].extend_from_slice(&validity_slice);
+                buffer_sizes.push(validity_slice.len() as u16);
+                buffer_counter += 1;
+            }
+        }
+
+        let bytes_per_value = data.bits_per_value as usize / 8;
+        buffer_sizes.push((bytes_per_value * num_values) as u16);
+
+        buffer_sizes
+    }
+
+    fn chunk_fsl(
+        data: FixedWidthDataBlock,
+        layers: Vec<MiniblockFslLayer>,
+        num_rows: u64,
+    ) -> (MiniBlockCompressed, ArrayEncoding) {
+        // Count size to calculate rows per chunk
+        let mut ceil_bytes_validity = 0;
+        let mut cum_dim = 1;
+        let mut num_validity_buffers = 0;
+        for layer in &layers {
+            cum_dim *= layer.dimension;
+            if layer.validity.is_some() {
+                ceil_bytes_validity += cum_dim.div_ceil(8);
+                num_validity_buffers += 1;
+            }
+        }
+        // It's an estimate because validity buffers may have some padding bits
+        let est_bytes_per_value = ceil_bytes_validity + (data.bits_per_value * cum_dim).div_ceil(8);
+        let (log_rows_per_chunk, rows_per_chunk) =
+            Self::find_log_vals_per_chunk(est_bytes_per_value);
+
+        let num_chunks = num_rows.div_ceil(rows_per_chunk) as usize;
+
+        // Allocate buffers for validity, these will be slightly bigger than the input validity buffers
+        let mut chunks = Vec::with_capacity(num_chunks);
+        let mut validity_buffers: Vec<Vec<u8>> = Vec::with_capacity(num_validity_buffers);
+        cum_dim = 1;
+        for layer in &layers {
+            cum_dim *= layer.dimension;
+            if let Some(validity) = &layer.validity {
+                let layer_bytes_validity = cum_dim.div_ceil(8);
+                let validity_with_padding =
+                    layer_bytes_validity as usize * num_chunks * rows_per_chunk as usize;
+                debug_assert!(validity_with_padding >= validity.len());
+                validity_buffers.push(Vec::with_capacity(
+                    layer_bytes_validity as usize * num_chunks,
+                ));
+            }
+        }
+
+        // Now go through and extract validity buffers
+        let mut row_offset = 0;
+        while row_offset + rows_per_chunk <= num_rows {
+            let buffer_sizes = Self::extract_fsl_chunk(
+                &data,
+                &layers,
+                row_offset as usize,
+                rows_per_chunk as usize,
+                &mut validity_buffers,
+            );
+            row_offset += rows_per_chunk;
+            chunks.push(MiniBlockChunk {
+                log_num_values: log_rows_per_chunk as u8,
+                buffer_sizes,
+            })
+        }
+        let rows_in_chunk = num_rows - row_offset;
+        if rows_in_chunk > 0 {
+            let buffer_sizes = Self::extract_fsl_chunk(
+                &data,
+                &layers,
+                row_offset as usize,
+                rows_in_chunk as usize,
+                &mut validity_buffers,
+            );
+            chunks.push(MiniBlockChunk {
+                log_num_values: 0,
+                buffer_sizes,
+            });
+        }
+
+        let encoding = Self::make_fsl_encoding(&layers, data.bits_per_value);
+        // Finally, add the data buffer
+        let buffers = validity_buffers
+            .into_iter()
+            .map(LanceBuffer::Owned)
+            .chain(std::iter::once(data.data))
+            .collect::<Vec<_>>();
+
+        (
+            MiniBlockCompressed {
+                chunks,
+                data: buffers,
+                num_values: num_rows,
+            },
+            encoding,
+        )
+    }
+
+    fn miniblock_fsl(data: DataBlock) -> (MiniBlockCompressed, ArrayEncoding) {
+        let num_rows = data.num_values();
+        let fsl = data.as_fixed_size_list().unwrap();
+        let mut layers = Vec::new();
+        let mut child = *fsl.child;
+        let mut cur_layer = MiniblockFslLayer {
+            validity: None,
+            dimension: fsl.dimension,
+        };
+        loop {
+            if let DataBlock::Nullable(nullable) = child {
+                cur_layer.validity = Some(nullable.nulls);
+                child = *nullable.data;
+            }
+            match child {
+                DataBlock::FixedSizeList(inner) => {
+                    layers.push(cur_layer);
+                    cur_layer = MiniblockFslLayer {
+                        validity: None,
+                        dimension: inner.dimension,
+                    };
+                    child = *inner.child;
+                }
+                DataBlock::FixedWidth(inner) => {
+                    layers.push(cur_layer);
+                    return Self::chunk_fsl(inner, layers, num_rows);
+                }
+                _ => unreachable!("Unexpected data block type in value encoder's miniblock_fsl"),
+            }
+        }
+    }
+}
+
+struct PerValueFslValidityIter {
+    buffer: LanceBuffer,
+    bits_per_row: usize,
+    offset: usize,
+}
+
+/// In this section we deal with per-value encoding of FSL<FSL<...<FSL<FixedWidth>>>> data.
+///
+/// It's easier than mini-block.  All we need to do is flatten the FSL layers into a single buffer.
+/// This includes any validity buffers we encounter on the way.
+impl ValueEncoder {
+    fn fsl_to_encoding(fsl: &FixedSizeListBlock) -> ArrayEncoding {
+        let mut inner = fsl.child.as_ref();
+        let mut has_validity = false;
+        inner = match inner {
+            DataBlock::Nullable(nullable) => {
+                has_validity = true;
+                nullable.data.as_ref()
+            }
+            _ => inner,
+        };
+        let inner_encoding = match inner {
             DataBlock::FixedWidth(fixed_width) => {
                 ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None)
             }
-            DataBlock::FixedSizeList(fsl) => Self::make_fsl_encoding(fsl),
-            _ => unreachable!(),
+            DataBlock::FixedSizeList(inner) => Self::fsl_to_encoding(inner),
+            _ => unreachable!("Unexpected data block type in value encoder's fsl_to_encoding"),
         };
-        ProtobufUtils::fixed_size_list(inner_encoding, data.dimension)
+        ProtobufUtils::fsl_encoding(fsl.dimension, inner_encoding, has_validity)
+    }
+
+    fn simple_per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, ArrayEncoding) {
+        // The simple case is zero-copy, we just return the flattened inner buffer
+        let encoding = Self::fsl_to_encoding(&fsl);
+        let num_values = fsl.num_values();
+        let mut child = *fsl.child;
+        let mut cum_dim = 1;
+        loop {
+            cum_dim *= fsl.dimension;
+            match child {
+                DataBlock::Nullable(nullable) => {
+                    child = *nullable.data;
+                }
+                DataBlock::FixedSizeList(inner) => {
+                    child = *inner.child;
+                }
+                DataBlock::FixedWidth(inner) => {
+                    let data = FixedWidthDataBlock {
+                        bits_per_value: inner.bits_per_value * cum_dim,
+                        num_values,
+                        data: inner.data,
+                        block_info: BlockInfo::new(),
+                    };
+                    return (PerValueDataBlock::Fixed(data), encoding);
+                }
+                _ => unreachable!(
+                    "Unexpected data block type in value encoder's simple_per_value_fsl"
+                ),
+            }
+        }
+    }
+
+    fn nullable_per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, ArrayEncoding) {
+        // If there are nullable inner values then we need to zip the validity with the values
+        let encoding = Self::fsl_to_encoding(&fsl);
+        let num_values = fsl.num_values();
+        let mut bytes_per_row = 0;
+        let mut cum_dim = 1;
+        let mut current = fsl;
+        let mut validity_iters: Vec<PerValueFslValidityIter> = Vec::new();
+        let data_bytes_per_row: usize;
+        let data_buffer: LanceBuffer;
+        loop {
+            cum_dim *= current.dimension;
+            let mut child = *current.child;
+            if let DataBlock::Nullable(nullable) = child {
+                // Each item will need this many bytes of validity prepended to it
+                bytes_per_row += cum_dim.div_ceil(8) as usize;
+                validity_iters.push(PerValueFslValidityIter {
+                    buffer: nullable.nulls,
+                    bits_per_row: cum_dim as usize,
+                    offset: 0,
+                });
+                child = *nullable.data;
+            };
+            match child {
+                DataBlock::FixedSizeList(inner) => {
+                    current = inner;
+                }
+                DataBlock::FixedWidth(fixed_width) => {
+                    data_bytes_per_row =
+                        (fixed_width.bits_per_value.div_ceil(8) * cum_dim) as usize;
+                    bytes_per_row += data_bytes_per_row;
+                    data_buffer = fixed_width.data;
+                    break;
+                }
+                _ => unreachable!(
+                    "Unexpected data block type in value encoder's nullable_per_value_fsl: {:?}",
+                    child
+                ),
+            }
+        }
+
+        let bytes_needed = bytes_per_row * num_values as usize;
+        let mut zipped = Vec::with_capacity(bytes_needed);
+        let data_slice = &data_buffer;
+        // Hopefully values are pretty large so we don't iterate this loop _too_ many times
+        for i in 0..num_values as usize {
+            for validity in validity_iters.iter_mut() {
+                let validity_slice = validity
+                    .buffer
+                    .bit_slice_le_with_length(validity.offset, validity.bits_per_row);
+                zipped.extend_from_slice(&validity_slice);
+                validity.offset += validity.bits_per_row;
+            }
+            let start = i * data_bytes_per_row;
+            let end = start + data_bytes_per_row;
+            zipped.extend_from_slice(&data_slice[start..end]);
+        }
+
+        let zipped = LanceBuffer::Owned(zipped);
+        let data = PerValueDataBlock::Fixed(FixedWidthDataBlock {
+            bits_per_value: bytes_per_row as u64 * 8,
+            num_values,
+            data: zipped,
+            block_info: BlockInfo::new(),
+        });
+        (data, encoding)
+    }
+
+    fn per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, ArrayEncoding) {
+        if !fsl.child.is_nullable() {
+            Self::simple_per_value_fsl(fsl)
+        } else {
+            Self::nullable_per_value_fsl(fsl)
+        }
     }
 }
 
@@ -356,11 +671,7 @@ impl MiniBlockCompressor for ValueEncoder {
                 let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
                 Ok((Self::chunk_data(fixed_width), encoding))
             }
-            DataBlock::FixedSizeList(mut fixed_size_list) => {
-                let flattened = fixed_size_list.flatten_as_fixed();
-                let encoding = Self::make_fsl_encoding(&fixed_size_list);
-                Ok((Self::chunk_data(flattened), encoding))
-            }
+            DataBlock::FixedSizeList(_) => Ok(Self::miniblock_fsl(chunk)),
             _ => Err(Error::InvalidInput {
                 source: format!(
                     "Cannot compress a data block of type {} with ValueEncoder",
@@ -377,46 +688,100 @@ impl MiniBlockCompressor for ValueEncoder {
 #[derive(Debug)]
 pub struct ConstantDecompressor {
     scalar: LanceBuffer,
-    num_values: u64,
 }
 
 impl ConstantDecompressor {
-    pub fn new(scalar: LanceBuffer, num_values: u64) -> Self {
+    pub fn new(scalar: LanceBuffer) -> Self {
         Self {
             scalar: scalar.into_borrowed(),
-            num_values,
         }
     }
 }
 
 impl BlockDecompressor for ConstantDecompressor {
-    fn decompress(&self, _data: LanceBuffer) -> Result<DataBlock> {
+    fn decompress(&self, _data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
         Ok(DataBlock::Constant(ConstantDataBlock {
             data: self.scalar.try_clone().unwrap(),
-            num_values: self.num_values,
+            num_values,
         }))
     }
+}
+
+#[derive(Debug)]
+struct ValueFslDesc {
+    dimension: u64,
+    has_validity: bool,
 }
 
 /// A decompressor for fixed-width data that has
 /// been written, as-is, to disk in single contiguous array
 #[derive(Debug)]
 pub struct ValueDecompressor {
+    /// How many bytes are in each inner-most item (e.g. FSL<Int32, 100> would be 4)
+    bytes_per_item: u64,
+    /// How many bytes are in each value (e.g. FSL<Int32, 100> would be 400)
+    ///
+    /// This number is a little trickier to compute because we also have to include bytes
+    /// of any inner validity
     bytes_per_value: u64,
+    layers: Vec<ValueFslDesc>,
 }
 
 impl ValueDecompressor {
-    pub fn new(description: &pb::Flat) -> Self {
+    pub fn from_flat(description: &pb::Flat) -> Self {
         assert!(description.bits_per_value % 8 == 0);
+        let bytes_per_item = description.bits_per_value / 8;
         Self {
-            bytes_per_value: description.bits_per_value / 8,
+            bytes_per_item,
+            bytes_per_value: bytes_per_item,
+            layers: Vec::default(),
+        }
+    }
+
+    pub fn from_fsl(mut description: &pb::FixedSizeList) -> Self {
+        let mut layers = Vec::new();
+        let mut cum_dim = 1;
+        let mut bytes_per_value = 0;
+        loop {
+            layers.push(ValueFslDesc {
+                has_validity: description.has_validity,
+                dimension: description.dimension as u64,
+            });
+            cum_dim *= description.dimension as u64;
+            if description.has_validity {
+                bytes_per_value += cum_dim.div_ceil(8);
+            }
+            match description
+                .items
+                .as_ref()
+                .unwrap()
+                .array_encoding
+                .as_ref()
+                .unwrap()
+            {
+                pb::array_encoding::ArrayEncoding::FixedSizeList(inner) => {
+                    description = inner;
+                }
+                pb::array_encoding::ArrayEncoding::Flat(flat) => {
+                    let bytes_per_item = flat.bits_per_value / 8;
+                    bytes_per_value += bytes_per_item * cum_dim;
+                    assert_eq!(flat.bits_per_value % 8, 0);
+                    return Self {
+                        bytes_per_item,
+                        bytes_per_value,
+                        layers,
+                    };
+                }
+                _ => unreachable!(),
+            }
         }
     }
 
     fn buffer_to_block(&self, data: LanceBuffer) -> DataBlock {
+        let num_values = data.len() as u64 / self.bytes_per_item;
         DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: self.bytes_per_value * 8,
-            num_values: data.len() as u64 / self.bytes_per_value,
+            bits_per_value: self.bytes_per_item * 8,
+            num_values,
             data,
             block_info: BlockInfo::new(),
         })
@@ -424,21 +789,159 @@ impl ValueDecompressor {
 }
 
 impl BlockDecompressor for ValueDecompressor {
-    fn decompress(&self, data: LanceBuffer) -> Result<DataBlock> {
-        Ok(self.buffer_to_block(data))
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        let block = self.buffer_to_block(data);
+        assert_eq!(block.num_values(), num_values);
+        Ok(block)
     }
 }
 
 impl MiniBlockDecompressor for ValueDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        assert_eq!(data.len() as u64, num_values * self.bytes_per_value);
-        Ok(self.buffer_to_block(data))
+    fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let mut buffer_iter = data.into_iter().rev();
+
+        // Always at least 1 buffer
+        let data_buf = buffer_iter.next().unwrap();
+        let mut items = self.buffer_to_block(data_buf);
+
+        for layer in self.layers.iter().rev() {
+            if layer.has_validity {
+                let validity_buf = buffer_iter.next().unwrap();
+                items = DataBlock::Nullable(NullableDataBlock {
+                    data: Box::new(items),
+                    nulls: validity_buf,
+                    block_info: BlockInfo::default(),
+                });
+            }
+            items = DataBlock::FixedSizeList(FixedSizeListBlock {
+                child: Box::new(items),
+                dimension: layer.dimension,
+            })
+        }
+
+        assert_eq!(items.num_values(), num_values);
+        Ok(items)
+    }
+}
+
+struct FslDecompressorValidityBuilder {
+    buffer: BooleanBufferBuilder,
+    bits_per_row: usize,
+    bytes_per_row: usize,
+}
+
+// Helper methods for per-value decompression
+impl ValueDecompressor {
+    fn has_validity(&self) -> bool {
+        self.layers.iter().any(|layer| layer.has_validity)
+    }
+
+    // If there is no validity then decompression is zero-copy, we just need to restore any FSL layers
+    fn simple_decompress(&self, data: FixedWidthDataBlock, num_rows: u64) -> DataBlock {
+        let mut cum_dim = 1;
+        for layer in &self.layers {
+            cum_dim *= layer.dimension;
+        }
+        debug_assert_eq!(self.bytes_per_item, data.bits_per_value / 8 / cum_dim);
+        let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: self.bytes_per_item * 8,
+            num_values: num_rows * cum_dim,
+            data: data.data,
+            block_info: BlockInfo::new(),
+        });
+        for layer in self.layers.iter().rev() {
+            block = DataBlock::FixedSizeList(FixedSizeListBlock {
+                child: Box::new(block),
+                dimension: layer.dimension,
+            });
+        }
+        debug_assert_eq!(num_rows, block.num_values());
+        block
+    }
+
+    // If there is validity then it has been zipped in with the values and we must unzip it
+    fn unzip_decompress(&self, data: FixedWidthDataBlock, num_rows: usize) -> DataBlock {
+        let mut buffer_builders = Vec::with_capacity(self.layers.len());
+        let mut cum_dim = 1;
+        let mut total_size_bytes = 0;
+        // First, go through the layers, setup our builders, allocate space
+        for layer in &self.layers {
+            cum_dim *= layer.dimension as usize;
+            if layer.has_validity {
+                let validity_size_bits = cum_dim;
+                let validity_size_bytes = validity_size_bits.div_ceil(8);
+                total_size_bytes += num_rows * validity_size_bytes;
+                buffer_builders.push(FslDecompressorValidityBuilder {
+                    buffer: BooleanBufferBuilder::new(validity_size_bits * num_rows),
+                    bits_per_row: cum_dim,
+                    bytes_per_row: validity_size_bytes,
+                })
+            }
+        }
+        let num_items = num_rows * cum_dim;
+        let data_size = num_items * self.bytes_per_item as usize;
+        total_size_bytes += data_size;
+        let mut data_buffer = Vec::with_capacity(data_size);
+
+        assert_eq!(data.data.len(), total_size_bytes);
+
+        let bytes_per_value = self.bytes_per_item as usize;
+        let data_bytes_per_row = bytes_per_value * cum_dim;
+
+        // Next, unzip
+        let mut data_offset = 0;
+        while data_offset < total_size_bytes {
+            for builder in buffer_builders.iter_mut() {
+                let start = data_offset * 8;
+                let end = start + builder.bits_per_row;
+                builder.buffer.append_packed_range(start..end, &data.data);
+                data_offset += builder.bytes_per_row;
+            }
+            let end = data_offset + data_bytes_per_row;
+            data_buffer.extend_from_slice(&data.data[data_offset..end]);
+            data_offset += data_bytes_per_row;
+        }
+
+        // Finally, restore the structure
+        let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: self.bytes_per_item * 8,
+            num_values: num_items as u64,
+            data: LanceBuffer::Owned(data_buffer),
+            block_info: BlockInfo::new(),
+        });
+
+        let mut validity_bufs = buffer_builders
+            .into_iter()
+            .rev()
+            .map(|mut b| LanceBuffer::Borrowed(b.buffer.finish().into_inner()));
+        for layer in self.layers.iter().rev() {
+            if layer.has_validity {
+                let nullable = NullableDataBlock {
+                    data: Box::new(block),
+                    nulls: validity_bufs.next().unwrap(),
+                    block_info: BlockInfo::new(),
+                };
+                block = DataBlock::Nullable(nullable);
+            }
+            block = DataBlock::FixedSizeList(FixedSizeListBlock {
+                child: Box::new(block),
+                dimension: layer.dimension,
+            });
+        }
+
+        assert_eq!(num_rows, block.num_values() as usize);
+
+        block
     }
 }
 
 impl FixedPerValueDecompressor for ValueDecompressor {
-    fn decompress(&self, data: FixedWidthDataBlock) -> Result<DataBlock> {
-        Ok(DataBlock::FixedWidth(data))
+    fn decompress(&self, data: FixedWidthDataBlock, num_rows: u64) -> Result<DataBlock> {
+        if self.has_validity() {
+            Ok(self.unzip_decompress(data, num_rows as usize))
+        } else {
+            Ok(self.simple_decompress(data, num_rows))
+        }
     }
 
     fn bits_per_value(&self) -> u64 {
@@ -453,6 +956,7 @@ impl PerValueCompressor for ValueEncoder {
                 let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
                 (PerValueDataBlock::Fixed(fixed_width), encoding)
             }
+            DataBlock::FixedSizeList(fixed_size_list) => Self::per_value_fsl(fixed_size_list),
             _ => unimplemented!(
                 "Cannot compress block of type {} with ValueEncoder",
                 data.name()
@@ -467,14 +971,25 @@ impl PerValueCompressor for ValueEncoder {
 pub(crate) mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{Array, ArrayRef, Decimal128Array, Int32Array};
+    use arrow_array::{
+        make_array, Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array,
+    };
+    use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
+    use lance_datagen::{array, gen, ArrayGeneratorExt, Dimension, RowCount};
     use rstest::rstest;
 
     use crate::{
+        data::DataBlock,
+        decoder::{FixedPerValueDecompressor, MiniBlockDecompressor},
+        encoder::{MiniBlockCompressor, PerValueCompressor, PerValueDataBlock},
+        encodings::physical::value::ValueDecompressor,
+        format::pb,
         testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
         version::LanceFileVersion,
     };
+
+    use super::ValueEncoder;
 
     const PRIMITIVE_TYPES: &[DataType] = &[
         DataType::Null,
@@ -502,6 +1017,29 @@ pub(crate) mod tests {
         // at the moment and Lance schema can't parse interval
         // DataType::Interval(IntervalUnit::DayTime),
     ];
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_value() {
+        let items = Arc::new(Int32Array::from(vec![
+            Some(0),
+            None,
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+        ]));
+
+        let test_cases = TestCases::default()
+            .with_range(0..3)
+            .with_range(0..2)
+            .with_range(1..3)
+            .with_indices(vec![0, 1, 2])
+            .with_indices(vec![1])
+            .with_indices(vec![2])
+            .with_file_version(LanceFileVersion::V2_1);
+
+        check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
+    }
 
     #[rstest]
     #[test_log::test(tokio::test)]
@@ -595,5 +1133,190 @@ pub(crate) mod tests {
                 check_round_trip_encoding_of_data(data.clone(), &test_cases, HashMap::new()).await;
             }
         }
+    }
+
+    fn create_simple_fsl() -> FixedSizeListArray {
+        // [[0, 1], NULL], [NULL, NULL], [[8, 9], [NULL, 11]]
+        let items = Arc::new(Int32Array::from(vec![
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            None,
+            None,
+            None,
+            None,
+            Some(8),
+            Some(9),
+            None,
+            Some(11),
+        ]));
+        let items_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let inner_list_nulls = BooleanBuffer::from(vec![true, false, false, false, true, true]);
+        let inner_list = Arc::new(FixedSizeListArray::new(
+            items_field.clone(),
+            2,
+            items,
+            Some(NullBuffer::new(inner_list_nulls)),
+        ));
+        let inner_list_field = Arc::new(Field::new(
+            "item",
+            DataType::FixedSizeList(items_field, 2),
+            true,
+        ));
+        FixedSizeListArray::new(inner_list_field, 2, inner_list, None)
+    }
+
+    #[test]
+    fn test_fsl_value_compression_miniblock() {
+        let sample_list = create_simple_fsl();
+
+        let starting_data = DataBlock::from_array(sample_list.clone());
+
+        let encoder = ValueEncoder::default();
+        let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
+
+        assert_eq!(data.num_values, 3);
+        assert_eq!(data.data.len(), 3);
+        assert_eq!(data.chunks.len(), 1);
+        assert_eq!(data.chunks[0].buffer_sizes, vec![1, 2, 48]);
+        assert_eq!(data.chunks[0].log_num_values, 0);
+
+        let pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) =
+            compression.array_encoding.unwrap()
+        else {
+            panic!()
+        };
+
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+
+        let decompressed =
+            MiniBlockDecompressor::decompress(&decompressor, data.data, data.num_values).unwrap();
+
+        let decompressed = make_array(
+            decompressed
+                .into_arrow(sample_list.data_type().clone(), true)
+                .unwrap(),
+        );
+
+        assert_eq!(decompressed.as_ref(), &sample_list);
+    }
+
+    #[test]
+    fn test_fsl_value_compression_per_value() {
+        let sample_list = create_simple_fsl();
+
+        let starting_data = DataBlock::from_array(sample_list.clone());
+
+        let encoder = ValueEncoder::default();
+        let (data, compression) = PerValueCompressor::compress(&encoder, starting_data).unwrap();
+
+        let PerValueDataBlock::Fixed(data) = data else {
+            panic!()
+        };
+
+        assert_eq!(data.bits_per_value, 144);
+        assert_eq!(data.num_values, 3);
+        assert_eq!(data.data.len(), 18 * 3);
+
+        let pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) =
+            compression.array_encoding.unwrap()
+        else {
+            panic!()
+        };
+
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+
+        let num_values = data.num_values;
+        let decompressed =
+            FixedPerValueDecompressor::decompress(&decompressor, data, num_values).unwrap();
+
+        let decompressed = make_array(
+            decompressed
+                .into_arrow(sample_list.data_type().clone(), true)
+                .unwrap(),
+        );
+
+        assert_eq!(decompressed.as_ref(), &sample_list);
+    }
+
+    fn create_random_fsl() -> Arc<dyn Array> {
+        // Several levels of def and multiple pages
+        let inner = array::rand_type(&DataType::Int32).with_random_nulls(0.1);
+        let list_one = array::cycle_vec(inner, Dimension::from(4)).with_random_nulls(0.1);
+        let list_two = array::cycle_vec(list_one, Dimension::from(4)).with_random_nulls(0.1);
+        let list_three = array::cycle_vec(list_two, Dimension::from(2));
+
+        // Should be 256Ki rows ~ 1MiB of data
+        let batch = gen()
+            .anon_col(list_three)
+            .into_batch_rows(RowCount::from(8 * 1024))
+            .unwrap();
+        batch.column(0).clone()
+    }
+
+    #[test]
+    fn fsl_value_miniblock_stress() {
+        let sample_array = create_random_fsl();
+
+        let starting_data =
+            DataBlock::from_arrays(&[sample_array.clone()], sample_array.len() as u64);
+
+        let encoder = ValueEncoder::default();
+        let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
+
+        let pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) =
+            compression.array_encoding.unwrap()
+        else {
+            panic!()
+        };
+
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+
+        let decompressed =
+            MiniBlockDecompressor::decompress(&decompressor, data.data, data.num_values).unwrap();
+
+        let decompressed = make_array(
+            decompressed
+                .into_arrow(sample_array.data_type().clone(), true)
+                .unwrap(),
+        );
+
+        assert_eq!(decompressed.as_ref(), sample_array.as_ref());
+    }
+
+    #[test]
+    fn fsl_value_per_value_stress() {
+        let sample_array = create_random_fsl();
+
+        let starting_data =
+            DataBlock::from_arrays(&[sample_array.clone()], sample_array.len() as u64);
+
+        let encoder = ValueEncoder::default();
+        let (data, compression) = PerValueCompressor::compress(&encoder, starting_data).unwrap();
+
+        let pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) =
+            compression.array_encoding.unwrap()
+        else {
+            panic!()
+        };
+
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+
+        let PerValueDataBlock::Fixed(data) = data else {
+            panic!()
+        };
+
+        let num_values = data.num_values;
+        let decompressed =
+            FixedPerValueDecompressor::decompress(&decompressor, data, num_values).unwrap();
+
+        let decompressed = make_array(
+            decompressed
+                .into_arrow(sample_array.data_type().clone(), true)
+                .unwrap(),
+        );
+
+        assert_eq!(decompressed.as_ref(), sample_array.as_ref());
     }
 }

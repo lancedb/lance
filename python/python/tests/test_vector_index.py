@@ -254,6 +254,22 @@ def test_index_with_nans(tmp_path):
     validate_vector_index(dataset, "vector")
 
 
+def test_torch_index_with_nans(tmp_path):
+    # 1024 rows, the entire table should be sampled
+    tbl = create_table(nvec=1000, nans=24)
+
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator=torch.device("cpu"),
+        one_pass_ivfpq=True,
+    )
+    validate_vector_index(dataset, "vector")
+
+
 def test_index_with_no_centroid_movement(tmp_path):
     # this test makes the centroids essentially [1..]
     # this makes sure the early stop condition in the index building code

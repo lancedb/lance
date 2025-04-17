@@ -24,9 +24,10 @@ use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
 };
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
+use lance_index::vector::utils::is_finite;
 use lance_index::vector::v3::shuffler::IvfShufflerReader;
 use lance_index::vector::v3::subindex::SubIndexType;
-use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY, PQ_CODE_COLUMN};
+use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_index::{
     pb,
     vector::{
@@ -370,6 +371,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             training_data
         };
 
+        // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
+        let training_data = arrow::compute::filter(&training_data, &is_finite(&training_data))?;
+        let training_data = training_data.as_fixed_size_list();
+
         let training_data = match (self.ivf.as_ref(), Q::use_residual(self.distance_type)) {
             (Some(ivf), true) => {
                 let ivf_transformer = lance_index::vector::ivf::new_ivf_transformer(
@@ -378,9 +383,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     vec![],
                 );
                 span!(Level::INFO, "compute residual for PQ training")
-                    .in_scope(|| ivf_transformer.compute_residual(&training_data))?
+                    .in_scope(|| ivf_transformer.compute_residual(training_data))?
             }
-            _ => training_data,
+            _ => training_data.clone(),
         };
 
         info!("Start to train quantizer");
@@ -653,8 +658,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         original_codes,
                         codes_num_bytes as i32,
                     )?;
-                    *batch =
-                        batch.replace_column_by_name(PQ_CODE_COLUMN, Arc::new(original_codes))?;
+                    *batch = batch
+                        .replace_column_by_name(PQ_CODE_COLUMN, Arc::new(original_codes))?
+                        .drop_column(PART_ID_COLUMN)?;
                 }
             }
             batches.extend(part_batches);
@@ -672,6 +678,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .get(LOSS_METADATA_KEY)
                     .map(|s| s.parse::<f64>().unwrap_or(0.0))
                     .unwrap_or(0.0);
+                let batch = batch.drop_column(PART_ID_COLUMN)?;
                 batches.push(batch);
             }
         }

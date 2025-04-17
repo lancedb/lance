@@ -67,7 +67,6 @@ pub use crate::index::prefilter::{FilterLoader, PreFilter};
 
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::vector::remap_vector_index;
-use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};
 
 use self::append::merge_indices;
@@ -351,19 +350,8 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let (new_manifest, manifest_path) = commit_transaction(
-            self,
-            self.object_store(),
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
-
-        self.manifest = Arc::new(new_manifest);
-        self.manifest_file = manifest_path;
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
         Ok(())
     }
@@ -387,19 +375,25 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let (new_manifest, manifest_path) = commit_transaction(
-            self,
-            self.object_store(),
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
-        self.manifest = Arc::new(new_manifest);
-        self.manifest_file = manifest_path;
+        Ok(())
+    }
+
+    async fn prewarm_index(&self, name: &str) -> Result<()> {
+        let indices = self.load_indices_by_name(name).await?;
+        if indices.is_empty() {
+            return Err(Error::IndexNotFound {
+                identity: format!("name={}", name),
+                location: location!(),
+            });
+        }
+
+        let index = self
+            .open_generic_index(name, &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .await?;
+        index.prewarm().await?;
 
         Ok(())
     }
@@ -463,19 +457,8 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let (new_manifest, new_path) = commit_transaction(
-            self,
-            self.object_store(),
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
-
-        self.manifest = Arc::new(new_manifest);
-        self.manifest_file = new_path;
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
         Ok(())
     }
@@ -511,7 +494,7 @@ impl DatasetIndexExt for Dataset {
             .filter(|idx| {
                 indices_to_optimize
                     .as_ref()
-                    .map_or(true, |names| names.contains(&idx.name))
+                    .is_none_or(|names| names.contains(&idx.name))
             })
             .map(|idx| (idx.name.clone(), idx))
             .into_group_map();
@@ -562,19 +545,9 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let (new_manifest, manifest_path) = commit_transaction(
-            self,
-            self.object_store(),
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
-        self.manifest = Arc::new(new_manifest);
-        self.manifest_file = manifest_path;
         Ok(())
     }
 

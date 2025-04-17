@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
 use std::str;
@@ -20,6 +9,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::UInt8Type;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
+use arrow_array::Array;
 use arrow_array::{make_array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
@@ -37,9 +27,12 @@ use crate::RT;
 use crate::{LanceReader, Scanner};
 use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
+
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
-use lance::dataset::scanner::{DatasetRecordBatchStream, MaterializationStyle};
+use lance::dataset::scanner::{
+    DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
+};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment,
@@ -60,6 +53,9 @@ use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::scalar::inverted::query::{
+    BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
+};
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::{
     optimize::OptimizeOptions,
@@ -74,6 +70,7 @@ use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
+use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
@@ -86,6 +83,16 @@ use pyo3::{
 };
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
+
+use crate::error::PythonErrorExt;
+use crate::file::object_store_from_uri_or_path;
+use crate::fragment::FileFragment;
+use crate::scanner::ScanStatistics;
+use crate::schema::LanceSchema;
+use crate::session::Session;
+use crate::utils::PyLance;
+use crate::RT;
+use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
@@ -491,7 +498,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -512,10 +519,11 @@ impl Dataset {
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
-        full_text_query: Option<&Bound<'_, PyDict>>,
+        full_text_query: Option<&Bound<'_, PyAny>>,
         late_materialization: Option<PyObject>,
         use_scalar_index: Option<bool>,
         include_deleted_rows: Option<bool>,
+        scan_stats_callback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -547,28 +555,65 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(full_text_query) = full_text_query {
-            let query = full_text_query
-                .get_item("query")?
-                .ok_or_else(|| PyKeyError::new_err("Need column for full text search"))?
-                .to_string();
-            let columns = if let Some(columns) = full_text_query.get_item("columns")? {
-                if columns.is_none() {
-                    None
+            let fts_query = if let Ok(full_text_query) = full_text_query.downcast::<PyDict>() {
+                let mut query = full_text_query
+                    .get_item("query")?
+                    .ok_or_else(|| PyKeyError::new_err("query must be specified"))?
+                    .to_string();
+                let columns = if let Some(columns) = full_text_query.get_item("columns")? {
+                    if columns.is_none() {
+                        None
+                    } else {
+                        Some(
+                            columns
+                                .downcast::<PyList>()?
+                                .iter()
+                                .map(|c| c.extract::<String>())
+                                .collect::<PyResult<Vec<String>>>()?,
+                        )
+                    }
                 } else {
-                    Some(
-                        columns
-                            .downcast::<PyList>()?
-                            .iter()
-                            .map(|c| c.extract::<String>())
-                            .collect::<PyResult<Vec<String>>>()?,
-                    )
+                    None
+                };
+
+                let is_phrase = query.len() >= 2 && query.starts_with('"') && query.ends_with('"');
+                let is_multi_match = columns.as_ref().map(|cols| cols.len() > 1).unwrap_or(false);
+
+                if is_phrase {
+                    // Remove the surrounding quotes for phrase queries
+                    query = query[1..query.len() - 1].to_string();
                 }
+
+                let query: FtsQuery = match (is_phrase, is_multi_match) {
+                    (false, _) => MatchQuery::new(query).into(),
+                    (true, false) => PhraseQuery::new(query).into(),
+                    (true, true) => {
+                        return Err(PyValueError::new_err(
+                            "Phrase queries cannot be used with multiple columns.",
+                        ));
+                    }
+                };
+                let mut query = FullTextSearchQuery::new_query(query);
+                if let Some(cols) = columns {
+                    query = query.with_columns(&cols).map_err(|e| {
+                        PyValueError::new_err(format!(
+                            "Failed to set full text search columns: {}",
+                            e
+                        ))
+                    })?;
+                }
+                query
+            } else if let Ok(query) = full_text_query.downcast::<PyFullTextQuery>() {
+                let query = query.borrow();
+                FullTextSearchQuery::new_query(query.inner.clone())
             } else {
-                None
+                return Err(PyValueError::new_err(
+                    "query must be a string or a Query object",
+                ));
             };
-            let full_text_query = FullTextSearchQuery::new(query).columns(columns);
+
             scanner
-                .full_text_search(full_text_query)
+                .full_text_search(fts_query)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = substrait_filter {
@@ -627,6 +672,11 @@ impl Dataset {
                 })
                 .collect();
             scanner.with_fragments(fragments);
+        }
+
+        if let Some(scan_stats_callback) = scan_stats_callback {
+            let callback = Self::make_scan_stats_callback(scan_stats_callback.clone())?;
+            scanner.scan_stats_callback(callback);
         }
 
         if let Some(late_materialization) = late_materialization {
@@ -1291,6 +1341,11 @@ impl Dataset {
         Ok(())
     }
 
+    fn prewarm_index(&self, name: &str) -> PyResult<()> {
+        RT.block_on(None, self.ds.prewarm_index(name))?
+            .infer_error()
+    }
+
     fn count_fragments(&self) -> usize {
         self.ds.count_fragments()
     }
@@ -1568,6 +1623,23 @@ impl Dataset {
         Ok(())
     }
 
+    /// Add NULL columns with only ArrowSchema.
+    #[pyo3(signature = (schema))]
+    fn add_columns_with_schema(&mut self, schema: PyArrowType<ArrowSchema>) -> PyResult<()> {
+        let arrow_schema: &ArrowSchema = &schema.0;
+        let transform = NewColumnTransform::AllNulls(Arc::new(arrow_schema.clone()));
+
+        let mut new_self = self.ds.as_ref().clone();
+        let new_self = RT
+            .spawn(None, async move {
+                new_self.add_columns(transform, None, None).await?;
+                Ok(new_self)
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     #[pyo3(signature = (index_name,partition_id, with_vector=false))]
     fn read_index_partition(
         &self,
@@ -1626,6 +1698,27 @@ impl Dataset {
 
     fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
         RT.runtime.block_on(self.ds.tags.list())
+    }
+
+    fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {
+        if !callback.is_callable() {
+            return Err(PyValueError::new_err("Callback must be callable"));
+        }
+
+        let callback = callback.unbind();
+
+        Ok(Arc::new(move |stats| {
+            Python::with_gil(|py| {
+                let stats = ScanStatistics::from_lance(stats);
+                match callback.call1(py, (stats,)) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        // Don't fail scan if callback fails
+                        error!("Error in scan stats callback: {}", e);
+                    }
+                }
+            });
+        }))
     }
 }
 
@@ -2087,6 +2180,84 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
                 ),
                 location!(),
             )
+        })
+    }
+}
+
+#[pyclass(name = "PyFullTextQuery")]
+#[derive(Debug, Clone)]
+pub struct PyFullTextQuery {
+    pub(crate) inner: FtsQuery,
+}
+
+#[pymethods]
+impl PyFullTextQuery {
+    #[staticmethod]
+    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR"))]
+    fn match_query(
+        query: String,
+        column: String,
+        boost: f32,
+        fuzziness: Option<u32>,
+        max_expansions: usize,
+        operator: &str,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            inner: MatchQuery::new(query)
+                .with_column(Some(column))
+                .with_boost(boost)
+                .with_fuzziness(fuzziness)
+                .with_max_expansions(max_expansions)
+                .with_operator(
+                    Operator::try_from(operator)
+                        .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?,
+                )
+                .into(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (query, column))]
+    fn phrase_query(query: String, column: String) -> PyResult<Self> {
+        Ok(Self {
+            inner: PhraseQuery::new(query).with_column(Some(column)).into(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (positive, negative,negative_boost=None))]
+    fn boost_query(
+        positive: PyFullTextQuery,
+        negative: PyFullTextQuery,
+        negative_boost: Option<f32>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            inner: BoostQuery::new(positive.inner, negative.inner, negative_boost).into(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (query, columns, boosts=None, operator="OR"))]
+    fn multi_match_query(
+        query: String,
+        columns: Vec<String>,
+        boosts: Option<Vec<f32>>,
+        operator: &str,
+    ) -> PyResult<Self> {
+        let q = MultiMatchQuery::try_new(query, columns)
+            .map_err(|e| PyValueError::new_err(format!("Invalid query: {}", e)))?;
+        let q = if let Some(boosts) = boosts {
+            q.try_with_boosts(boosts)
+                .map_err(|e| PyValueError::new_err(format!("Invalid boosts: {}", e)))?
+        } else {
+            q
+        };
+
+        let op = Operator::try_from(operator)
+            .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?;
+
+        Ok(Self {
+            inner: q.with_operator(op).into(),
         })
     }
 }

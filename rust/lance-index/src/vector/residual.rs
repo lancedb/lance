@@ -136,6 +136,13 @@ pub(crate) fn compute_residual(
         (DataType::Float64, DataType::Float64) => {
             do_compute_residual::<Float64Type>(centroids, vectors, distance_type, partitions)
         }
+        (DataType::Float32, DataType::Int8) => {
+            do_compute_residual::<Float32Type>(
+                centroids,
+                &vectors.convert_to_floating_point()?,
+                distance_type,
+                partitions)
+        }
         _ => Err(Error::Index {
             message: format!(
                 "Compute residual vector: centroids and vector type mismatch: centroid: {}, vector: {}",
@@ -181,7 +188,16 @@ impl Transformer for ResidualTransform {
             compute_residual(&self.centroids, original_vectors, None, Some(part_ids_ref))?;
 
         // Replace original column with residual column.
-        let batch = batch.replace_column_by_name(&self.vec_col, Arc::new(residual_arr))?;
+        let batch = if residual_arr.data_type() != original.data_type() {
+            batch.replace_column_schema_by_name(
+                &self.vec_col,
+                residual_arr.data_type().clone(),
+                Arc::new(residual_arr),
+            )?
+        } else {
+            batch.replace_column_by_name(&self.vec_col, Arc::new(residual_arr))?
+        };
+
         Ok(batch)
     }
 }

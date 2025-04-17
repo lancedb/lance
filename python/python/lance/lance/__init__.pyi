@@ -267,6 +267,7 @@ class _Dataset:
         kwargs: Optional[Dict[str, Any]] = None,
     ): ...
     def drop_index(self, name: str): ...
+    def prewarm_index(self, name: str): ...
     def count_fragments(self) -> int: ...
     def num_small_files(self, max_rows_per_group: int) -> int: ...
     def get_fragments(self) -> List[_Fragment]: ...
@@ -311,6 +312,7 @@ class _Dataset:
         read_columns: Optional[List[str]] = None,
         batch_size: Optional[int] = None,
     ): ...
+    def add_columns_with_schema(self, schema: pa.Schema): ...
 
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...
@@ -451,6 +453,41 @@ class BFloat16:
     def __ge__(self, other: BFloat16) -> bool: ...
 
 def bfloat16_array(values: List[str | None]) -> BFloat16Array: ...
+
+class PyFullTextQuery:
+    @staticmethod
+    def match_query(
+        column: str,
+        query: str,
+        boost: float = 1.0,
+        fuzziness: Optional[int] = 0,
+        max_expansions: int = 50,
+        operator: str = "OR",
+    ) -> PyFullTextQuery: ...
+    @staticmethod
+    def phrase_query(
+        query: str,
+        column: str,
+    ) -> PyFullTextQuery: ...
+    @staticmethod
+    def boost_query(
+        positive: PyFullTextQuery,
+        negative: PyFullTextQuery,
+        negative_boost: Optional[float],
+    ) -> PyFullTextQuery: ...
+    @staticmethod
+    def multi_match_query(
+        query: str,
+        columns: List[str],
+        boosts: Optional[List[float]] = None,
+        operator: str = "OR",
+    ) -> PyFullTextQuery: ...
+
+class ScanStatistics:
+    iops: int
+    bytes_read: int
+    indices_loaded: int
+    parts_loaded: int
 
 __version__: str
 language_model_home: Callable[[], str]

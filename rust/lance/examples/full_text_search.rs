@@ -74,8 +74,8 @@ async fn main() {
     }
 
     let dataset = Dataset::open(dataset_dir.as_ref()).await.unwrap();
-    let query = tokens[0];
-    let query = FullTextSearchQuery::new(query.to_owned()).limit(Some(10));
+    let query_string = tokens[0];
+    let query = FullTextSearchQuery::new(query_string.to_owned()).limit(Some(10));
     println!("query: {:?}", query);
     let batch = dataset
         .scan()
@@ -108,7 +108,7 @@ async fn main() {
         .try_into_batch()
         .await
         .unwrap();
-    let flat_results = flat_full_text_search(&[&batch], "doc", &query.query, None)
+    let flat_results = flat_full_text_search(&[&batch], "doc", query_string, None)
         .unwrap()
         .into_iter()
         .collect::<HashSet<_>>();

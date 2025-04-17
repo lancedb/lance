@@ -29,7 +29,7 @@ env:
 
 jobs:
   Benchmark:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: warp-ubuntu-latest-arm64-8x
     timeout-minutes: 120
     steps:
       - name: Checkout

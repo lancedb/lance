@@ -25,7 +25,7 @@ def _normalize_metric_type(metric_type: str) -> MetricType:
         normalized = "l2"
     if normalized not in {"l2", "dot", "cosine"}:
         raise ValueError(f"Invalid metric_type: {metric_type}")
-    return cast(MetricType, normalized)
+    return cast("MetricType", normalized)
 
 
 def sanitize_ts(ts: ts_types) -> datetime:

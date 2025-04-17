@@ -23,7 +23,7 @@ from .dataset import (
     write_dataset,
 )
 from .fragment import FragmentMetadata, LanceFragment
-from .lance import bytes_read_counter, iops_counter
+from .lance import ScanStatistics, bytes_read_counter, iops_counter
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -48,6 +48,7 @@ __all__ = [
     "LanceOperation",
     "LanceScanner",
     "MergeInsertBuilder",
+    "ScanStatistics",
     "Transaction",
     "__version__",
     "bytes_read_counter",
@@ -159,8 +160,7 @@ def set_logger(
 
 def __warn_on_fork():
     warnings.warn(
-        "lance is not fork-safe. If you are using multiprocessing, "
-        "use spawn instead."
+        "lance is not fork-safe. If you are using multiprocessing, use spawn instead."
     )
 
 

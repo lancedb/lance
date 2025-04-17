@@ -334,6 +334,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
         Ok(self)
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: We should prewarm the IVF index by loading the partitions into memory
+        Ok(())
+    }
+
     fn index_type(&self) -> IndexType {
         match self.sub_index_type() {
             (SubIndexType::Flat, QuantizationType::Flat) => IndexType::IvfFlat,
@@ -642,8 +647,8 @@ mod tests {
     use arrow::datatypes::{UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
-        Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, FixedSizeListArray, ListArray,
-        RecordBatch, RecordBatchIterator, UInt64Array,
+        Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, FixedSizeListArray, Float32Array,
+        ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -668,7 +673,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::dataset::optimize::{compact_files, CompactionOptions};
-    use crate::dataset::UpdateBuilder;
+    use crate::dataset::{UpdateBuilder, WriteParams};
     use crate::index::DatasetIndexInternalExt;
     use crate::{index::vector::VectorIndexParams, Dataset};
 
@@ -685,7 +690,16 @@ mod tests {
         let (batch, schema) = generate_batch::<T>(NUM_ROWS, None, range, false);
         let vectors = batch.column_by_name("vector").unwrap().clone();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                mode: crate::dataset::WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
         (dataset, Arc::new(vectors.as_fixed_size_list().clone()))
     }
 
@@ -763,7 +777,7 @@ mod tests {
             ));
             let array = Arc::new(ListArray::new(
                 vector_field,
-                OffsetBuffer::from_lengths(std::iter::repeat(VECTOR_NUM_PER_ROW).take(num_rows)),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(VECTOR_NUM_PER_ROW, num_rows)),
                 Arc::new(fsl),
                 None,
             ));
@@ -935,7 +949,7 @@ mod tests {
     {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
 
         let vector_column = "vector";
         dataset
@@ -970,18 +984,10 @@ mod tests {
             .await
             .unwrap();
         // query again, the result should not include the deleted row
-        let result = dataset
-            .scan()
-            .nearest(vector_column, query.as_primitive::<T>(), half_rows)
-            .unwrap()
-            .nprobs(nlist)
-            .with_row_id()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids = result["id"].as_primitive::<UInt64Type>();
-        assert_eq!(row_ids.len(), half_rows);
-        row_ids.values().iter().for_each(|id| {
+        let result = dataset.scan().try_into_batch().await.unwrap();
+        let ids = result["id"].as_primitive::<UInt64Type>();
+        assert_eq!(ids.len(), half_rows);
+        ids.values().iter().for_each(|id| {
             assert!(*id >= half_rows as u64 + 50);
         });
 
@@ -1004,6 +1010,30 @@ mod tests {
             .collect::<HashSet<_>>();
         let recall = row_ids.intersection(&gt).count() as f32 / 100.0;
         assert_ge!(recall, 0.8, "{}", recall);
+
+        // delete so that only one row left, to trigger remap and there must be some empty partitions
+        let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
+        dataset
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+        dataset.delete("id > 0").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        let results = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), 100)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 1);
     }
 
     async fn test_optimize_strategy(params: VectorIndexParams) {
@@ -1106,7 +1136,8 @@ mod tests {
             }
             if count >= 10 {
                 panic!(
-                    "failed to hit the retrain threshold {}",
+                    "failed to hit the retrain threshold {} < {}",
+                    last_avg_loss / original_avg_loss,
                     AVG_LOSS_RETRAIN_THRESHOLD
                 );
             }
@@ -1131,7 +1162,7 @@ mod tests {
         let ivf_models = get_ivf_models(&dataset).await;
         let ivf = &ivf_models[0];
         assert_ne!(original_ivf.centroids, ivf.centroids);
-        if params.metric_type != DistanceType::Hamming {
+        if ivf.num_partitions() > 1 && params.metric_type != DistanceType::Hamming {
             assert_lt!(get_avg_loss(&dataset).await, last_avg_loss);
         }
     }
@@ -1186,6 +1217,9 @@ mod tests {
     }
 
     #[rstest]
+    #[case(1, DistanceType::L2, 0.9)]
+    #[case(1, DistanceType::Cosine, 0.9)]
+    #[case(1, DistanceType::Dot, 0.85)]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
     #[case(4, DistanceType::Dot, 0.85)]
@@ -1670,5 +1704,45 @@ mod tests {
             assert_ge!(*d, dists[0]);
             assert_lt!(*d, dists[k - 1]);
         });
+    }
+
+    #[tokio::test]
+    async fn test_index_with_zero_vectors() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (batch, schema) = generate_batch::<Float32Type>(256, None, 0.0..1.0, false);
+        let vector_field = schema.field(1).clone();
+        let zero_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![256])),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![0.0; DIM]),
+                        DIM as i32,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![batch, zero_batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                mode: crate::dataset::WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let vector_column = vector_field.name();
+        let params = VectorIndexParams::ivf_pq(4, 8, DIM / 8, DistanceType::Cosine, 50);
+        dataset
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
     }
 }

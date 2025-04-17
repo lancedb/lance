@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -51,6 +52,7 @@ from .lance import (
     Compaction,
     CompactionMetrics,
     LanceSchema,
+    ScanStatistics,
     _Dataset,
     _MergeInsertBuilder,
     _Scanner,
@@ -58,6 +60,7 @@ from .lance import (
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
+from .query import FullTextQuery
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
@@ -336,7 +339,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
-        full_text_query: Optional[Union[str, dict]] = None,
+        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
         *,
         prefilter: Optional[bool] = None,
         with_row_id: Optional[bool] = None,
@@ -347,6 +350,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
+        scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -439,6 +443,10 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search:  bool, default False
             If True, then the search will only be performed on the indexed data, which
             yields faster search time.
+        scan_stats_callback: Callable[[ScanStatistics], None], default None
+            A callback function that will be called with the scan statistics after the
+            scan is complete.  Errors raised by the callback will be logged but not
+            re-raised.
         include_deleted_rows: bool, default False
             If True, then rows that have been deleted, but are still present in the
             fragment, will be returned.  These rows will have the _rowid column set
@@ -499,7 +507,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.use_scalar_index, use_scalar_index)
         setopt(builder.fast_search, fast_search)
         setopt(builder.include_deleted_rows, include_deleted_rows)
-
+        setopt(builder.scan_stats_callback, scan_stats_callback)
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
             # No defaults, use user-provided, if any
@@ -519,9 +527,9 @@ class LanceDataset(pa.dataset.Dataset):
                     builder = builder.columns(default_columns)
 
         if full_text_query is not None:
-            if isinstance(full_text_query, str):
+            if isinstance(full_text_query, (str, FullTextQuery)):
                 builder = builder.full_text_search(full_text_query)
-            else:
+            elif isinstance(full_text_query, dict):
                 builder = builder.full_text_search(**full_text_query)
         if nearest is not None:
             builder = builder.nearest(**nearest)
@@ -575,7 +583,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict]] = None,
+        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
@@ -1101,7 +1109,12 @@ class LanceDataset(pa.dataset.Dataset):
 
     def add_columns(
         self,
-        transforms: Dict[str, str] | BatchUDF | ReaderLike,
+        transforms: Dict[str, str]
+        | BatchUDF
+        | ReaderLike
+        | pyarrow.Field
+        | List[pyarrow.Field]
+        | pyarrow.Schema,
         read_columns: List[str] | None = None,
         reader_schema: Optional[pa.Schema] = None,
         batch_size: Optional[int] = None,
@@ -1129,6 +1142,8 @@ class LanceDataset(pa.dataset.Dataset):
             reference existing columns in the dataset.
             If this is a AddColumnsUDF, then it is a UDF that takes a batch of
             existing data and returns a new batch with the new columns.
+            If this is :class:`pyarrow.Field` or :class:`pyarrow.Schema`, it adds
+            all NULL columns with the given schema, in a metadata-only operation.
         read_columns : list of str, optional
             The names of the columns that the UDF will read. If None, then the
             UDF will read all columns. This is only used when transforms is a
@@ -1168,6 +1183,18 @@ class LanceDataset(pa.dataset.Dataset):
         LanceDataset.merge :
             Merge a pre-computed set of columns into the dataset.
         """
+        if isinstance(transforms, pa.Field):
+            transforms = [transforms]
+        if (
+            isinstance(transforms, list)
+            and len(transforms) > 0
+            and isinstance(transforms[0], pa.Field)
+        ):
+            transforms = pa.schema(transforms)
+        if isinstance(transforms, pa.Schema):
+            self._ds.add_columns_with_schema(transforms)
+            return
+
         transforms = normalize_transform(transforms, self, read_columns, reader_schema)
         if isinstance(transforms, pa.RecordBatchReader):
             self._ds.add_columns_from_reader(transforms, batch_size)
@@ -1707,33 +1734,43 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         field = self.schema.field(column)
+
+        field_type = field.type
+        if hasattr(field_type, "storage_type"):
+            field_type = field_type.storage_type
+
         if index_type in ["BTREE", "BITMAP"]:
             if (
-                not pa.types.is_integer(field.type)
-                and not pa.types.is_floating(field.type)
-                and not pa.types.is_boolean(field.type)
-                and not pa.types.is_string(field.type)
-                and not pa.types.is_temporal(field.type)
+                not pa.types.is_integer(field_type)
+                and not pa.types.is_floating(field_type)
+                and not pa.types.is_boolean(field_type)
+                and not pa.types.is_string(field_type)
+                and not pa.types.is_temporal(field_type)
+                and not pa.types.is_fixed_size_binary(field_type)
             ):
                 raise TypeError(
                     f"BTREE/BITMAP index column {column} must be int",
-                    ", float, bool, str, or temporal",
+                    ", float, bool, str, fixed-size-binary, or temporal ",
                 )
         elif index_type == "LABEL_LIST":
-            if not pa.types.is_list(field.type):
+            if not pa.types.is_list(field_type):
                 raise TypeError(f"LABEL_LIST index column {column} must be a list")
         elif index_type == "NGRAM":
-            if not pa.types.is_string(field.type):
+            if not pa.types.is_string(field_type):
                 raise TypeError(f"NGRAM index column {column} must be a string")
         elif index_type in ["INVERTED", "FTS"]:
-            if not pa.types.is_string(field.type) and not pa.types.is_large_string(
-                field.type
+            value_type = field_type
+            if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
+                value_type = field_type.value_type
+            if not pa.types.is_string(value_type) and not pa.types.is_large_string(
+                value_type
             ):
                 raise TypeError(
-                    f"INVERTED index column {column} must be string or large string"
+                    f"INVERTED index column {column} must be string, large string"
+                    " or list of strings, but got {value_type}"
                 )
 
-        if pa.types.is_duration(field.type):
+        if pa.types.is_duration(field_type):
             raise TypeError(
                 f"Scalar index column {column} cannot currently be a duration"
             )
@@ -2284,6 +2321,21 @@ class LanceDataset(pa.dataset.Dataset):
         the indices.
         """
         return self._ds.drop_index(name)
+
+    def prewarm_index(self, name: str):
+        """
+        Prewarm an index
+
+        This will load the entire index into memory.  This can help avoid cold start
+        issues with index queries.  If the index does not fit in the index cache, then
+        this will result in wasted I/O.
+
+        Parameters
+        ----------
+        name: str
+            The name of the index to prewarm.
+        """
+        return self._ds.prewarm_index(name)
 
     def session(self) -> Session:
         """
@@ -3068,6 +3120,7 @@ class ScannerBuilder:
         self._full_text_query = None
         self._use_scalar_index = None
         self._include_deleted_rows = None
+        self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -3356,7 +3409,7 @@ class ScannerBuilder:
 
     def full_text_search(
         self,
-        query: str,
+        query: str | FullTextQuery,
         columns: Optional[List[str]] = None,
     ) -> ScannerBuilder:
         """
@@ -3364,8 +3417,34 @@ class ScannerBuilder:
         may remove it after we support to do this within `filter` SQL-like expression
 
         Must create inverted index on the given column before searching,
+
+        Parameters
+        ----------
+        query : str | Query
+            If str, the query string to search for, a match query would be performed.
+            If Query, the query object to search for,
+            and the `columns` parameter will be ignored.
+        columns : list of str, optional
+            The columns to search in. If None, search in all indexed columns.
         """
-        self._full_text_query = {"query": query, "columns": columns}
+        if isinstance(query, FullTextQuery):
+            self._full_text_query = query.inner
+        else:
+            self._full_text_query = {
+                "query": query,
+                "columns": columns,
+            }
+        return self
+
+    def scan_stats_callback(
+        self, callback: Callable[[ScanStatistics], None]
+    ) -> ScannerBuilder:
+        """
+        Set a callback function that will be called with the scan statistics after the
+        scan is complete.  Errors raised by the callback will be logged but not
+        re-raised.
+        """
+        self._scan_stats_callback = callback
         return self
 
     def to_scanner(self) -> LanceScanner:
@@ -3392,6 +3471,7 @@ class ScannerBuilder:
             self._late_materialization,
             self._use_scalar_index,
             self._include_deleted_rows,
+            self._scan_stats_callback,
         )
         return LanceScanner(scanner, self.ds)
 

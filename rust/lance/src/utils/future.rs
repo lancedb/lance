@@ -11,7 +11,7 @@ use std::sync::Arc;
 /// SharedPrerequisite is very similar to a shared future except:
 ///  * It must be created by spawning a new task (runs in the background)
 ///  * Shared future doesn't support Result.  This class handles errors by
-///      serializing them to string.
+///    serializing them to string.
 ///  * This class can optionally cache the output so that it can be accessed synchronously
 pub struct SharedPrerequisite<T: Clone>(Arc<AsyncCell<std::result::Result<T, String>>>);
 

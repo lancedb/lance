@@ -611,14 +611,29 @@ impl SerializerContext {
             let mut empties_seen = 0;
             for off in offset_desc.offsets.windows(2) {
                 let offset_ctx = last_offsets[off[0] as usize];
+                let offset_ctx_end = last_offsets[off[1] as usize];
                 new_last_off.push(offset_ctx);
                 new_last_off_full.push(last_offsets_full[off[0] as usize] + empties_seen);
                 if off[0] == off[1] {
+                    // This list has an empty/null
                     empties_seen += 1;
+                } else if offset_ctx == offset_ctx_end {
+                    // Inner list is empty/null
+                    // We previously added a special record but now we need to upgrade its repetition
+                    // level to the current level
+                    let matching_special_idx = self
+                        .specials
+                        .binary_search_by_key(&offset_ctx, |spec| spec.pos)
+                        .unwrap();
+                    self.specials[matching_special_idx].rep_level = rep_level;
                 } else {
                     self.rep_levels[offset_ctx] = rep_level;
                 }
             }
+            new_last_off.push(last_offsets[*offset_desc.offsets.last().unwrap() as usize]);
+            new_last_off_full.push(
+                last_offsets_full[*offset_desc.offsets.last().unwrap() as usize] + empties_seen,
+            );
             self.last_offsets = Some(new_last_off);
             self.last_offsets_full = Some(new_last_off_full);
         } else {
@@ -634,6 +649,8 @@ impl SerializerContext {
                     self.rep_levels[off[0] as usize] = rep_level;
                 }
             }
+            new_last_off.push(*offset_desc.offsets.last().unwrap() as usize);
+            new_last_off_full.push(*offset_desc.offsets.last().unwrap() as usize + empties_seen);
             self.last_offsets = Some(new_last_off);
             self.last_offsets_full = Some(new_last_off_full);
         }
@@ -718,7 +735,7 @@ impl SerializerContext {
                 .zip(
                     validity
                         .iter()
-                        .flat_map(|v| std::iter::repeat(v).take(self.current_multiplier)),
+                        .flat_map(|v| std::iter::repeat_n(v, self.current_multiplier)),
                 )
                 .for_each(|(def, valid)| {
                     if !valid {

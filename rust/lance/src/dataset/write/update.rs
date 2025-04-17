@@ -25,7 +25,6 @@ use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
 
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::io::commit::commit_transaction;
 use crate::{io::exec::Planner, Dataset};
 use crate::{Error, Result};
 
@@ -382,20 +381,10 @@ impl UpdateJob {
             None,
         );
 
-        let (manifest, manifest_path) = commit_transaction(
-            self.dataset.as_ref(),
-            self.dataset.object_store(),
-            self.dataset.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.dataset.manifest_naming_scheme,
-        )
-        .await?;
-
         let mut dataset = self.dataset.as_ref().clone();
-        dataset.manifest = Arc::new(manifest);
-        dataset.manifest_file = manifest_path;
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
         Ok(Arc::new(dataset))
     }
@@ -429,9 +418,9 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(Int64Array::from_iter_values(0..30)),
-                Arc::new(StringArray::from_iter_values(
-                    std::iter::repeat("foo").take(30),
-                )),
+                Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                    "foo", 30,
+                ))),
             ],
         )
         .unwrap();

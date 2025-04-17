@@ -414,14 +414,7 @@ impl FixedSizeListBlock {
         })
     }
 
-    fn remove_validity(self) -> Self {
-        Self {
-            child: Box::new(self.child.remove_validity()),
-            dimension: self.dimension,
-        }
-    }
-
-    fn num_values(&self) -> u64 {
+    pub fn num_values(&self) -> u64 {
         self.child.num_values() / self.dimension
     }
 
@@ -530,6 +523,43 @@ impl DataBlockBuilderImpl for FixedSizeListBlockBuilder {
         DataBlock::FixedSizeList(FixedSizeListBlock {
             child: Box::new(inner_block),
             dimension: self.dimension,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct NullableDataBlockBuilder {
+    inner: Box<dyn DataBlockBuilderImpl>,
+    validity: BooleanBufferBuilder,
+}
+
+impl NullableDataBlockBuilder {
+    fn new(inner: Box<dyn DataBlockBuilderImpl>, estimated_size_bytes: usize) -> Self {
+        Self {
+            inner,
+            validity: BooleanBufferBuilder::new(estimated_size_bytes * 8),
+        }
+    }
+}
+
+impl DataBlockBuilderImpl for NullableDataBlockBuilder {
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+        let nullable = data_block.as_nullable_ref().unwrap();
+        let bool_buf = BooleanBuffer::new(
+            nullable.nulls.try_clone().unwrap().into_buffer(),
+            selection.start as usize,
+            (selection.end - selection.start) as usize,
+        );
+        self.validity.append_buffer(&bool_buf);
+        self.inner.append(nullable.data.as_ref(), selection);
+    }
+
+    fn finish(mut self: Box<Self>) -> DataBlock {
+        let inner_block = self.inner.finish();
+        DataBlock::Nullable(NullableDataBlock {
+            data: Box::new(inner_block),
+            nulls: LanceBuffer::Borrowed(self.validity.finish().into_inner()),
+            block_info: BlockInfo::new(),
         })
     }
 }
@@ -678,12 +708,12 @@ impl StructDataBlock {
         }
     }
 
-    fn remove_validity(self) -> Self {
+    fn remove_outer_validity(self) -> Self {
         Self {
             children: self
                 .children
                 .into_iter()
-                .map(|c| c.remove_validity())
+                .map(|c| c.remove_outer_validity())
                 .collect(),
             block_info: self.block_info,
         }
@@ -919,6 +949,20 @@ impl DataBlock {
         }
     }
 
+    pub fn is_nullable(&self) -> bool {
+        match self {
+            Self::AllNull(_) => true,
+            Self::Nullable(_) => true,
+            Self::FixedSizeList(fsl) => fsl.child.is_nullable(),
+            Self::Struct(strct) => strct.children.iter().any(|c| c.is_nullable()),
+            Self::Dictionary(_) => {
+                todo!("is_nullable for DictionaryDataBlock is not implemented yet")
+            }
+            Self::Opaque(_) => panic!("Does not make sense to ask if an Opaque block is nullable"),
+            _ => false,
+        }
+    }
+
     /// The number of values in the block
     ///
     /// This function does not recurse into child blocks.  If this is a FSL then it will
@@ -981,26 +1025,14 @@ impl DataBlock {
     /// This does not filter the block (e.g. remove rows).  It only removes
     /// the validity bitmaps (if present).  Any garbage masked by null bits
     /// will now appear as proper values.
-    pub fn remove_validity(self) -> Self {
+    ///
+    /// If `recurse` is true, then this will also remove validity from any child blocks.
+    pub fn remove_outer_validity(self) -> Self {
         match self {
-            Self::Empty() => Self::Empty(),
-            Self::Constant(inner) => Self::Constant(inner),
             Self::AllNull(_) => panic!("Cannot remove validity on all-null data"),
-            Self::Nullable(inner) => inner.data.remove_validity(),
-            Self::FixedWidth(inner) => Self::FixedWidth(inner),
-            Self::FixedSizeList(inner) => Self::FixedSizeList(inner.remove_validity()),
-            Self::VariableWidth(inner) => Self::VariableWidth(inner),
-            Self::Struct(inner) => Self::Struct(inner.remove_validity()),
-            Self::Dictionary(inner) => Self::FixedWidth(inner.indices),
-            Self::Opaque(inner) => Self::Opaque(inner),
-        }
-    }
-
-    pub fn flatten(self) -> Self {
-        if let Self::FixedSizeList(fsl) = self {
-            fsl.child.flatten()
-        } else {
-            self
+            Self::Nullable(inner) => *inner.data,
+            Self::Struct(inner) => Self::Struct(inner.remove_outer_validity()),
+            other => other,
         }
     }
 
@@ -1024,6 +1056,18 @@ impl DataBlock {
                     inner.dimension,
                 ))
             }
+            Self::Nullable(nullable) => {
+                // There's no easy way to know what percentage of the data is in the valiidty buffer
+                // but 1/16th seems like a reasonable guess.
+                let estimated_validity_size_bytes = estimated_size_bytes / 16;
+                let inner_builder = nullable
+                    .data
+                    .make_builder(estimated_size_bytes - estimated_validity_size_bytes);
+                Box::new(NullableDataBlockBuilder::new(
+                    inner_builder,
+                    estimated_validity_size_bytes as usize,
+                ))
+            }
             Self::Struct(struct_data_block) => {
                 let mut bits_per_values = vec![];
                 for child in struct_data_block.children.iter() {
@@ -1036,7 +1080,7 @@ impl DataBlock {
                     estimated_size_bytes,
                 ))
             }
-            _ => todo!(),
+            _ => todo!("make_builder for {:?}", self),
         }
     }
 }
@@ -1236,7 +1280,7 @@ fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
     let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
     match arrow_select::concat::concat(&array_refs) {
         Ok(array) => array,
-        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError { .. }) => {
+        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
             // Slow, but hopefully a corner case.  Optimize later
             let upscaled = array_refs
                 .iter()
@@ -1249,7 +1293,7 @@ fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
                         ),
                     ) {
                         Ok(arr) => arr,
-                        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError { .. }) => {
+                        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
                             // Technically I think this means the input type was u64 already
                             unimplemented!("Dictionary arrays with more than 2^32 unique values")
                         }
@@ -1261,7 +1305,7 @@ fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
             // Can still fail if concat pushes over u32 boundary
             match arrow_select::concat::concat(&array_refs) {
                 Ok(array) => array,
-                Err(arrow_schema::ArrowError::DictionaryKeyOverflowError { .. }) => {
+                Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
                     unimplemented!("Dictionary arrays with more than 2^32 unique values")
                 }
                 err => err.unwrap(),
@@ -1924,7 +1968,7 @@ mod tests {
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
         // the NullBuffer.len() returns the length in bits so we divide_round_up by 8
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
@@ -1932,7 +1976,7 @@ mod tests {
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let mut gen = array::rand::<Int32Type>().with_nulls(&[true, true, false]);
@@ -1941,7 +1985,7 @@ mod tests {
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
@@ -1949,7 +1993,7 @@ mod tests {
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
@@ -1971,7 +2015,7 @@ mod tests {
             .map(|buffer| buffer.len())
             .sum();
 
-        let total_nulls_size_in_bytes = (concatenated_array.nulls().unwrap().len() + 7) / 8;
+        let total_nulls_size_in_bytes = concatenated_array.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + total_nulls_size_in_bytes) as u64);
     }
 }

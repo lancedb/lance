@@ -335,12 +335,14 @@ mod tests {
         let left = batch_task_stream(
             lance_datagen::gen()
                 .col("x", lance_datagen::array::step::<Int32Type>())
-                .into_reader_stream(RowCount::from(100), BatchCount::from(10)),
+                .into_reader_stream(RowCount::from(100), BatchCount::from(10))
+                .0,
         );
         let right = batch_task_stream(
             lance_datagen::gen()
                 .col("y", lance_datagen::array::step::<Int32Type>())
-                .into_reader_stream(RowCount::from(100), BatchCount::from(10)),
+                .into_reader_stream(RowCount::from(100), BatchCount::from(10))
+                .0,
         );
 
         let merged = super::merge_streams(vec![left, right])
@@ -370,7 +372,9 @@ mod tests {
                     datagen = datagen.col("x", lance_datagen::array::rand::<Int32Type>());
                 }
                 let data = batch_task_stream(
-                    datagen.into_reader_stream(RowCount::from(10), BatchCount::from(10)),
+                    datagen
+                        .into_reader_stream(RowCount::from(10), BatchCount::from(10))
+                        .0,
                 );
 
                 let config = RowIdAndDeletesConfig {
@@ -465,7 +469,8 @@ mod tests {
                             // 100 rows across 10 batches of 10 rows
                             let data = batch_task_stream(
                                 datagen
-                                    .into_reader_stream(RowCount::from(10), BatchCount::from(10)),
+                                    .into_reader_stream(RowCount::from(10), BatchCount::from(10))
+                                    .0,
                             );
 
                             let config = RowIdAndDeletesConfig {

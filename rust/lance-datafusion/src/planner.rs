@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Exec plan planner
 
@@ -34,9 +32,9 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
 use datafusion::sql::sqlparser::ast::{
-    Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
-    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Subscript, TimezoneInfo,
-    UnaryOperator, Value,
+    AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
+    Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Subscript,
+    TimezoneInfo, UnaryOperator, Value,
 };
 use datafusion::{
     common::Column,
@@ -414,6 +412,7 @@ impl Planner {
                 enable_ident_normalization: false,
                 support_varchar_with_length: false,
                 enable_options_value_normalization: false,
+                collect_spans: false,
             },
         );
 
@@ -442,7 +441,7 @@ impl Planner {
             SQLDataType::String(_) => Ok(ArrowDataType::Utf8),
             SQLDataType::Binary(_) => Ok(ArrowDataType::Binary),
             SQLDataType::Float(_) => Ok(ArrowDataType::Float32),
-            SQLDataType::Double => Ok(ArrowDataType::Float64),
+            SQLDataType::Double(_) => Ok(ArrowDataType::Float64),
             SQLDataType::Boolean => Ok(ArrowDataType::Boolean),
             SQLDataType::TinyInt(_) => Ok(ArrowDataType::Int8),
             SQLDataType::SmallInt(_) => Ok(ArrowDataType::Int16),
@@ -686,66 +685,50 @@ impl Planner {
                 expr: Box::new(self.parse_sql_expr(expr)?),
                 data_type: self.parse_type(data_type)?,
             })),
-            SQLExpr::MapAccess { column, keys } => {
-                let mut expr = self.parse_sql_expr(column)?;
+            SQLExpr::JsonAccess { .. } => Err(Error::invalid_input(
+                "JSON access is not supported",
+                location!(),
+            )),
+            SQLExpr::CompoundFieldAccess { root, access_chain } => {
+                let mut expr = self.parse_sql_expr(root)?;
 
-                for key in keys {
-                    let field_access = match &key.key {
-                        SQLExpr::Value(
-                            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
-                        ) => GetFieldAccess::NamedStructField {
+                for access in access_chain {
+                    let field_access = match access {
+                        // x.y or x['y']
+                        AccessExpr::Dot(SQLExpr::Identifier(Ident { value: s, .. }))
+                        | AccessExpr::Subscript(Subscript::Index {
+                            index:
+                                SQLExpr::Value(
+                                    Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+                                ),
+                        }) => GetFieldAccess::NamedStructField {
                             name: ScalarValue::from(s.as_str()),
                         },
-                        SQLExpr::JsonAccess { .. } => {
-                            return Err(Error::invalid_input(
-                                "JSON access is not supported",
-                                location!(),
-                            ));
-                        }
-                        key => {
-                            let key = Box::new(self.parse_sql_expr(key)?);
+                        AccessExpr::Subscript(Subscript::Index { index }) => {
+                            let key = Box::new(self.parse_sql_expr(index)?);
                             GetFieldAccess::ListIndex { key }
                         }
-                    };
-
-                    let field_access_expr = RawFieldAccessExpr { expr, field_access };
-
-                    expr = self.plan_field_access(field_access_expr)?;
-                }
-
-                Ok(expr)
-            }
-            SQLExpr::Subscript { expr, subscript } => {
-                let expr = self.parse_sql_expr(expr)?;
-
-                let field_access = match subscript.as_ref() {
-                    Subscript::Index { index } => match index {
-                        SQLExpr::Value(
-                            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
-                        ) => GetFieldAccess::NamedStructField {
-                            name: ScalarValue::from(s.as_str()),
-                        },
-                        SQLExpr::JsonAccess { .. } => {
+                        AccessExpr::Subscript(Subscript::Slice { .. }) => {
                             return Err(Error::invalid_input(
-                                "JSON access is not supported",
+                                "Slice subscript is not supported",
                                 location!(),
                             ));
                         }
                         _ => {
-                            let key = Box::new(self.parse_sql_expr(index)?);
-                            GetFieldAccess::ListIndex { key }
+                            // Handle other cases like JSON access
+                            // Note: JSON access is not supported in lance
+                            return Err(Error::invalid_input(
+                                "Only dot notation or index access is supported for field access",
+                                location!(),
+                            ));
                         }
-                    },
-                    Subscript::Slice { .. } => {
-                        return Err(Error::invalid_input(
-                            "Slice subscript is not supported",
-                            location!(),
-                        ));
-                    }
-                };
+                    };
 
-                let field_access_expr = RawFieldAccessExpr { expr, field_access };
-                self.plan_field_access(field_access_expr)
+                    let field_access_expr = RawFieldAccessExpr { expr, field_access };
+                    expr = self.plan_field_access(field_access_expr)?;
+                }
+
+                Ok(expr)
             }
             SQLExpr::Between {
                 expr,
@@ -805,7 +788,7 @@ impl Planner {
     /// TODO: use SqlToRel from Datafusion directly?
     fn try_decode_hex_literal(s: &str) -> Option<Vec<u8>> {
         let hex_bytes = s.as_bytes();
-        let mut decoded_bytes = Vec::with_capacity((hex_bytes.len() + 1) / 2);
+        let mut decoded_bytes = Vec::with_capacity(hex_bytes.len().div_ceil(2));
 
         let start_idx = hex_bytes.len() % 2;
         if start_idx > 0 {
@@ -1045,20 +1028,14 @@ mod tests {
             }
         }
 
-        let expected = Expr::Column(Column {
-            relation: None,
-            name: "s0".to_string(),
-        });
+        let expected = Expr::Column(Column::new_unqualified("s0"));
         assert_column_eq(&planner, "s0", &expected);
         assert_column_eq(&planner, "`s0`", &expected);
 
         let expected = Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
             args: vec![
-                Expr::Column(Column {
-                    relation: None,
-                    name: "st".to_string(),
-                }),
+                Expr::Column(Column::new_unqualified("st")),
                 Expr::Literal(ScalarValue::Utf8(Some("s1".to_string()))),
             ],
         });
@@ -1072,10 +1049,7 @@ mod tests {
                 Expr::ScalarFunction(ScalarFunction {
                     func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
                     args: vec![
-                        Expr::Column(Column {
-                            relation: None,
-                            name: "st".to_string(),
-                        }),
+                        Expr::Column(Column::new_unqualified("st")),
                         Expr::Literal(ScalarValue::Utf8(Some("st".to_string()))),
                     ],
                 }),
@@ -1609,9 +1583,7 @@ mod tests {
         ];
 
         let expected: ArrayRef = Arc::new(BooleanArray::from_iter(
-            std::iter::repeat(Some(false))
-                .take(5)
-                .chain(std::iter::repeat(Some(true)).take(5)),
+            std::iter::repeat_n(Some(false), 5).chain(std::iter::repeat_n(Some(true), 5)),
         ));
         for expression in expressions {
             // convert to physical expression

@@ -12,8 +12,8 @@ use crate::scalar::{IndexReader, IndexStore, IndexWriter, InvertedIndexParams};
 use crate::vector::graph::OrderedFloat;
 use arrow::array::{ArrayBuilder, AsArray, Int32Builder, StringBuilder};
 use arrow::datatypes;
-use arrow_array::{Int32Array, RecordBatch, StringArray};
-use arrow_schema::SchemaRef;
+use arrow_array::{Array, Int32Array, RecordBatch, StringArray, UInt64Array};
+use arrow_schema::{Field, Schema, SchemaRef};
 use crossbeam_queue::ArrayQueue;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
@@ -22,10 +22,11 @@ use itertools::Itertools;
 use lance_arrow::iter_str_array;
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, CPU_RUNTIME};
-use lance_core::{Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use lazy_static::lazy_static;
 use object_store::path::Path;
+use snafu::location;
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
@@ -108,15 +109,38 @@ impl InvertedIndexBuilder {
 
     #[instrument(level = "debug", skip_all)]
     async fn update_index(&mut self, stream: SendableRecordBatchStream) -> Result<()> {
+        let flatten_stream = stream.map(|batch| {
+            let batch = batch?;
+            let doc_col = batch.column(0);
+            match doc_col.data_type() {
+                datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => Ok(batch),
+                datatypes::DataType::List(_)   => {
+                    flatten_string_list::<i32>(&batch, doc_col)
+                }
+                datatypes::DataType::LargeList(_) => {
+                    flatten_string_list::<i64>(&batch, doc_col)
+                }
+                _ => {
+                   Err(Error::Index { message: format!("expect data type String, LargeString or List of String/LargeString, but got {}", doc_col.data_type()), location: location!() })
+                }
+            }
+        });
+
         let num_shards = *LANCE_FTS_NUM_SHARDS;
 
         // init the token maps
         let mut token_maps = vec![HashMap::new(); num_shards];
-        for (token, token_id) in self.tokens.tokens.iter() {
-            let mut hasher = DefaultHasher::new();
-            hasher.write(token.as_bytes());
-            let shard = hasher.finish() as usize % num_shards;
-            token_maps[shard].insert(token.clone(), *token_id);
+
+        match self.tokens.tokens {
+            TokenMap::HashMap(ref tokens) => {
+                for (token, token_id) in tokens.iter() {
+                    let mut hasher = DefaultHasher::new();
+                    hasher.write(token.as_bytes());
+                    let shard = hasher.finish() as usize % num_shards;
+                    token_maps[shard].insert(token.clone(), *token_id);
+                }
+            }
+            _ => unreachable!("tokens must be HashMap at indexing"),
         }
 
         // spawn `num_shards` workers to build the index,
@@ -153,13 +177,15 @@ impl InvertedIndexBuilder {
         for _ in 0..num_shards {
             let _ = tokenizer_pool.push(tokenizer.clone());
         }
-        let mut stream = stream
+        let mut stream = flatten_stream
             .map(move |batch| {
                 let senders = senders.clone();
                 let tokenizer_pool = tokenizer_pool.clone();
                 CPU_RUNTIME.spawn_blocking(move || {
                     let batch = batch?;
-                    let doc_iter = iter_str_array(batch.column(0));
+
+                    let doc_col = batch.column(0);
+                    let doc_iter = iter_str_array(doc_col);
                     let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
                     let docs = doc_iter
                         .zip(row_id_col.values().iter())
@@ -716,282 +742,41 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
     Arc::new(arrow_schema::Schema::new(fields))
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
+fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
+    batch: &RecordBatch,
+    doc_col: &Arc<dyn Array>,
+) -> Result<RecordBatch> {
+    let docs = doc_col.as_list::<Offset>();
+    let row_ids = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
 
-    use arrow_array::{Array, ArrayRef, GenericStringArray, RecordBatch, UInt64Array};
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use futures::stream;
-    use lance_core::cache::{CapacityMode, FileMetadataCache};
-    use lance_core::ROW_ID_FIELD;
-    use lance_io::object_store::ObjectStore;
-    use object_store::path::Path;
+    let row_ids = row_ids
+        .values()
+        .iter()
+        .zip(docs.iter())
+        .flat_map(|(row_id, doc)| std::iter::repeat_n(*row_id, doc.map(|d| d.len()).unwrap_or(0)));
 
-    use crate::metrics::NoOpMetricsCollector;
-    use crate::scalar::inverted::TokenizerConfig;
-    use crate::scalar::lance_format::LanceIndexStore;
-    use crate::scalar::{FullTextSearchQuery, SargableQuery, ScalarIndex, SearchResult};
-
-    use super::InvertedIndex;
-
-    async fn create_index<Offset: arrow::array::OffsetSizeTrait>(
-        with_position: bool,
-        tokenizer: TokenizerConfig,
-    ) -> Arc<InvertedIndex> {
-        let tempdir = tempfile::tempdir().unwrap();
-        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
-        let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
-        let store = LanceIndexStore::new(ObjectStore::local(), index_dir, cache);
-
-        let mut params = super::InvertedIndexParams::default().with_position(with_position);
-        params.tokenizer_config = tokenizer;
-        let mut invert_index = super::InvertedIndexBuilder::new(params);
-        let doc_col = GenericStringArray::<Offset>::from(vec![
-            "lance database the search",
-            "lance database",
-            "lance search",
-            "database search",
-            "unrelated doc",
-            "unrelated",
-            "mots accentués",
-        ]);
-        let row_id_col = UInt64Array::from(Vec::from_iter(0..doc_col.len() as u64));
-        let batch = RecordBatch::try_new(
-            arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), false),
-                ROW_ID_FIELD.clone(),
-            ])
-            .into(),
-            vec![
-                Arc::new(doc_col) as ArrayRef,
-                Arc::new(row_id_col) as ArrayRef,
-            ],
-        )
-        .unwrap();
-        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
-        let stream = Box::pin(stream);
-
-        invert_index
-            .update(stream, &store)
-            .await
-            .expect("failed to update invert index");
-
-        super::InvertedIndex::load(Arc::new(store)).await.unwrap()
-    }
-
-    async fn test_inverted_index<Offset: arrow::array::OffsetSizeTrait>() {
-        let invert_index = create_index::<Offset>(false, TokenizerConfig::default()).await;
-        let search_result = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("lance".to_owned()).limit(Some(3)),
+    let row_ids = Arc::new(UInt64Array::from_iter_values(row_ids));
+    let docs = match docs.value_type() {
+        datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => docs.values().clone(),
+        _ => {
+            return Err(Error::Index {
+                message: format!(
+                    "expect data type String or LargeString but got {}",
+                    docs.value_type()
                 ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        let SearchResult::Exact(row_ids) = search_result else {
-            panic!("unexpected search result")
-        };
-        assert_eq!(row_ids.len(), Some(3));
-        assert!(row_ids.contains(0));
-        assert!(row_ids.contains(1));
-        assert!(row_ids.contains(2));
+                location: location!(),
+            });
+        }
+    };
 
-        let result = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("database".to_owned()).limit(Some(3)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(3));
-        assert!(row_ids.contains(0));
-        assert!(row_ids.contains(1));
-        assert!(row_ids.contains(3));
-
-        let result = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("unknown null".to_owned()).limit(Some(3)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(0));
-
-        // test phrase query
-        // for non-phrasal query, the order of the tokens doesn't matter
-        // so there should be 4 documents that contain "database" or "lance"
-
-        // we built the index without position, so the phrase query will not work
-        let results = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await;
-        assert!(results.unwrap_err().to_string().contains("position is not found but required for phrase queries, try recreating the index with position"));
-        let results = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await;
-        assert!(results.unwrap_err().to_string().contains("position is not found but required for phrase queries, try recreating the index with position"));
-
-        // recreate the index with position
-        let invert_index = create_index::<Offset>(true, TokenizerConfig::default()).await;
-        let result = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("lance database".to_owned()).limit(Some(10)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(4));
-        assert!(row_ids.contains(0));
-        assert!(row_ids.contains(1));
-        assert!(row_ids.contains(2));
-        assert!(row_ids.contains(3));
-
-        let result = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(2));
-        assert!(row_ids.contains(0));
-        assert!(row_ids.contains(1));
-
-        let result = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("\"database lance\"".to_owned()).limit(Some(10)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(0));
-
-        let result = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("\"lance unknown\"".to_owned()).limit(Some(10)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(0));
-
-        let result = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(0));
-    }
-
-    #[tokio::test]
-    async fn test_inverted_index_with_string() {
-        test_inverted_index::<i32>().await;
-    }
-
-    #[tokio::test]
-    async fn test_inverted_index_with_large_string() {
-        test_inverted_index::<i64>().await;
-    }
-
-    #[tokio::test]
-    async fn test_accented_chars() {
-        let invert_index = create_index::<i32>(false, TokenizerConfig::default()).await;
-        let result = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(1));
-
-        let result = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(0));
-
-        // with ascii folding enabled, the search should be accent-insensitive
-        let invert_index =
-            create_index::<i32>(true, TokenizerConfig::default().ascii_folding(true)).await;
-        let result = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(1));
-
-        let result = invert_index
-            .search(
-                &SargableQuery::FullTextSearch(
-                    FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        assert!(result.is_exact());
-        let row_ids = result.row_ids();
-        assert_eq!(row_ids.len(), Some(1));
-    }
+    let schema = Schema::new(vec![
+        Field::new(
+            batch.schema().field(0).name(),
+            docs.data_type().clone(),
+            true,
+        ),
+        ROW_ID_FIELD.clone(),
+    ]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![docs, row_ids])?;
+    Ok(batch)
 }

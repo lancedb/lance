@@ -378,6 +378,42 @@ impl LanceBuffer {
             Self::Owned(buffer) => Self::Owned(buffer[offset..offset + length].to_vec()),
         }
     }
+
+    // Backport of https://github.com/apache/arrow-rs/pull/6707
+    fn arrow_bit_slice(
+        buf: &arrow_buffer::Buffer,
+        offset: usize,
+        len: usize,
+    ) -> arrow_buffer::Buffer {
+        if offset % 8 == 0 {
+            return buf.slice_with_length(offset / 8, len.div_ceil(8));
+        }
+
+        arrow_buffer::bitwise_unary_op_helper(buf, offset, len, |a| a)
+    }
+
+    /// Returns a new [LanceBuffer] that is a slice of this buffer starting at bit `offset`
+    /// with `length` bits.
+    ///
+    /// Unlike `slice_with_length`, this method allows for slicing at a bit level but always
+    /// requires a copy of the data (unless offset is byte-aligned)
+    ///
+    /// This method also converts to a borrowed buffer for convenience, but that could be optimized
+    /// away in the future if needed.
+    ///
+    /// This method performs the bit slice using the Arrow convention of *bitwise* little-endian
+    ///
+    /// This means, given the bit buffer 0bABCDEFGH_HIJKLMNOP and the slice starting at bit 3 and
+    /// with length 8, the result will be 0bNOPABCDE
+    pub fn bit_slice_le_with_length(&mut self, offset: usize, length: usize) -> Self {
+        let Self::Borrowed(borrowed) = self.borrow_and_clone() else {
+            unreachable!()
+        };
+        // Use this and remove backport once we upgrade to arrow-rs 54
+        // let sliced = borrowed.bit_slice(offset, length);
+        let sliced = Self::arrow_bit_slice(&borrowed, offset, length);
+        Self::Borrowed(sliced)
+    }
 }
 
 impl AsRef<[u8]> for LanceBuffer {
@@ -554,5 +590,18 @@ mod tests {
         let view_ptr2 = borrow2.as_ref().as_ptr();
 
         assert_ne!(view_ptr, view_ptr2);
+    }
+
+    #[test]
+    fn test_bit_slice_le() {
+        let mut buf = LanceBuffer::Owned(vec![0x0F, 0x0B]);
+
+        // Keep in mind that validity buffers are *bitwise* little-endian
+        assert_eq!(buf.bit_slice_le_with_length(0, 4).as_ref(), &[0x0F]);
+        assert_eq!(buf.bit_slice_le_with_length(4, 4).as_ref(), &[0x00]);
+        assert_eq!(buf.bit_slice_le_with_length(3, 8).as_ref(), &[0x61]);
+        assert_eq!(buf.bit_slice_le_with_length(0, 8).as_ref(), &[0x0F]);
+        assert_eq!(buf.bit_slice_le_with_length(4, 8).as_ref(), &[0xB0]);
+        assert_eq!(buf.bit_slice_le_with_length(4, 12).as_ref(), &[0xB0, 0x00]);
     }
 }

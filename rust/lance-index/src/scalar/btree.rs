@@ -13,15 +13,11 @@ use std::{
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion::{
-    functions_aggregate::min_max::{MaxAccumulator, MinAccumulator},
-    physical_plan::{
-        sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-        union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
-    },
+use datafusion::physical_plan::{
+    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+    union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
 use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_expr::Accumulator;
 use datafusion_physical_expr::{expressions::Column, LexOrdering, PhysicalSortExpr};
 use deepsize::{Context, DeepSizeOf};
 use futures::{
@@ -917,6 +913,11 @@ impl Index for BTreeIndex {
         })
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: BTree can (and should) support pre-warming by loading the pages into memory
+        Ok(())
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::BTree
     }
@@ -1075,39 +1076,24 @@ struct BatchStats {
     null_count: u32,
 }
 
-// See https://github.com/apache/arrow-datafusion/issues/8031 for the underlying issue.  We use
-// MinAccumulator / MaxAccumulator to retrieve the min/max values and these are unreliable in the
-// presence of NaN
-fn check_for_nan(value: ScalarValue) -> Result<ScalarValue> {
-    match value {
-        ScalarValue::Float32(Some(val)) if val.is_nan() => Err(Error::NotSupported {
-            source: "Scalar indices cannot currently be created on columns with NaN values".into(),
-            location: location!(),
-        }),
-        ScalarValue::Float64(Some(val)) if val.is_nan() => Err(Error::NotSupported {
-            source: "Scalar indices cannot currently be created on columns with NaN values".into(),
-            location: location!(),
-        }),
-        _ => Ok(value),
-    }
-}
-
-fn min_val(array: &Arc<dyn Array>) -> Result<ScalarValue> {
-    let mut acc = MinAccumulator::try_new(array.data_type())?;
-    acc.update_batch(&[array.clone()])?;
-    check_for_nan(acc.evaluate()?)
-}
-
-fn max_val(array: &Arc<dyn Array>) -> Result<ScalarValue> {
-    let mut acc = MaxAccumulator::try_new(array.data_type())?;
-    acc.update_batch(&[array.clone()])?;
-    check_for_nan(acc.evaluate()?)
-}
-
 fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
     let values = batch.column(0);
-    let min = min_val(values)?;
-    let max = max_val(values)?;
+    if values.is_empty() {
+        return Err(Error::Internal {
+            message: "received an empty batch in btree training".to_string(),
+            location: location!(),
+        });
+    }
+    let min = ScalarValue::try_from_array(&values, 0).map_err(|e| Error::Internal {
+        message: format!("failed to get min value from batch: {}", e),
+        location: location!(),
+    })?;
+    let max =
+        ScalarValue::try_from_array(&values, values.len() - 1).map_err(|e| Error::Internal {
+            message: format!("failed to get max value from batch: {}", e),
+            location: location!(),
+        })?;
+
     Ok(BatchStats {
         min,
         max,
@@ -1374,12 +1360,35 @@ impl Stream for IndexReaderStream {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::Int32Type;
+    use arrow::datatypes::{Float64Type, Int32Type, UInt64Type};
     use arrow_array::FixedSizeListArray;
-    use datafusion_common::ScalarValue;
+    use arrow_schema::DataType;
+    use datafusion::{
+        execution::{SendableRecordBatchStream, TaskContext},
+        physical_plan::{sorts::sort::SortExec, stream::RecordBatchStreamAdapter, ExecutionPlan},
+    };
+    use datafusion_common::{DataFusionError, ScalarValue};
+    use datafusion_physical_expr::{expressions::col, LexOrdering, PhysicalSortExpr};
     use deepsize::DeepSizeOf;
+    use futures::TryStreamExt;
+    use lance_core::{cache::FileMetadataCache, utils::mask::RowIdTreeMap};
+    use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
+    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_io::object_store::ObjectStore;
+    use object_store::path::Path;
+    use tempfile::tempdir;
 
-    use super::OrderableScalarValue;
+    use crate::{
+        metrics::NoOpMetricsCollector,
+        scalar::{
+            btree::BTreeIndex,
+            flat::FlatIndexMetadata,
+            lance_format::{tests::MockTrainingSource, LanceIndexStore},
+            SargableQuery, ScalarIndex, SearchResult,
+        },
+    };
+
+    use super::{train_btree_index, OrderableScalarValue};
 
     #[test]
     fn test_scalar_value_size() {
@@ -1395,5 +1404,59 @@ mod tests {
         // deep_size_of should account for the rust type overhead
         assert!(size_of_i32 > 4);
         assert!(size_of_many_i32 > 128 * 4);
+    }
+
+    #[tokio::test]
+    async fn test_nan_ordering() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local(),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            FileMetadataCache::no_cache(),
+        ));
+
+        let values = vec![
+            0.0,
+            1.0,
+            2.0,
+            3.0,
+            f64::NAN,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+        ];
+
+        // This is a bit overkill but we've had bugs in the past where DF's sort
+        // didn't agree with Arrow's sort so we do an end-to-end test here
+        // and use DF to sort the data like we would in a real dataset.
+        let data = gen()
+            .col("value", array::cycle::<Float64Type>(values.clone()))
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(10), BatchCount::from(100));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new(LexOrdering::new(vec![sort_expr]), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+        let data_source = Box::new(MockTrainingSource::from(stream));
+
+        let sub_index_trainer = FlatIndexMetadata::new(DataType::Float64);
+
+        train_btree_index(data_source, &sub_index_trainer, test_store.as_ref(), 64)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store).await.unwrap();
+
+        for (idx, value) in values.into_iter().enumerate() {
+            let query = SargableQuery::Equals(ScalarValue::Float64(Some(value)));
+            let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+            assert_eq!(
+                result,
+                SearchResult::Exact(RowIdTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
+            );
+        }
     }
 }

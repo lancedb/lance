@@ -21,12 +21,12 @@ impl std::fmt::Debug for Bitmap {
 
 impl Bitmap {
     pub fn new_empty(len: usize) -> Self {
-        let data = vec![0; (len + 7) / 8];
+        let data = vec![0; len.div_ceil(8)];
         Self { data, len }
     }
 
     pub fn new_full(len: usize) -> Self {
-        let mut data = vec![0xff; (len + 7) / 8];
+        let mut data = vec![0xff; len.div_ceil(8)];
         // Zero past the end of len
         let remainder = len % 8;
         if remainder != 0 {

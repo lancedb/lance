@@ -9,7 +9,8 @@ use std::{iter::repeat_with, ops::Range};
 
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{
-    Float32Array, Int32Array, PrimitiveArray, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    Float32Array, Int32Array, Int8Array, PrimitiveArray, RecordBatch, RecordBatchIterator,
+    RecordBatchReader,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::{fixed_size_list_type, ArrowFloatType, FixedSizeListArrayExt};
@@ -220,6 +221,13 @@ where
 pub fn generate_random_array(n: usize) -> Float32Array {
     let mut rng = rand::thread_rng();
     Float32Array::from_iter_values(repeat_with(|| rng.gen::<f32>()).take(n))
+}
+
+/// Create a random float32 array where each element is uniformly
+/// distributed between [0..1]
+pub fn generate_random_int8_array(n: usize) -> Int8Array {
+    let mut rng = rand::thread_rng();
+    Int8Array::from_iter_values(repeat_with(|| rng.gen::<i8>()).take(n))
 }
 
 /// Create a random primitive array where each element is uniformly distributed a
