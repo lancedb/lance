@@ -239,6 +239,10 @@ impl Index for InvertedIndex {
         }))
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        self.inverted_list.prewarm().await
+    }
+
     fn index_type(&self) -> crate::IndexType {
         crate::IndexType::Inverted
     }
@@ -637,7 +641,6 @@ impl InvertedListReader {
         Ok(posting)
     }
 
-    #[allow(dead_code)]
     async fn prewarm(&self) -> Result<()> {
         let batch = self
             .reader

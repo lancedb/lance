@@ -20,7 +20,9 @@ use futures::{StreamExt, TryFutureExt};
 
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
-use lance::dataset::scanner::{DatasetRecordBatchStream, MaterializationStyle};
+use lance::dataset::scanner::{
+    DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
+};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment,
@@ -57,6 +59,7 @@ use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
+use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
@@ -73,6 +76,7 @@ use snafu::location;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
+use crate::scanner::ScanStatistics;
 use crate::schema::LanceSchema;
 use crate::session::Session;
 use crate::utils::PyLance;
@@ -483,7 +487,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -508,6 +512,7 @@ impl Dataset {
         late_materialization: Option<PyObject>,
         use_scalar_index: Option<bool>,
         include_deleted_rows: Option<bool>,
+        scan_stats_callback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -656,6 +661,11 @@ impl Dataset {
                 })
                 .collect();
             scanner.with_fragments(fragments);
+        }
+
+        if let Some(scan_stats_callback) = scan_stats_callback {
+            let callback = Self::make_scan_stats_callback(scan_stats_callback.clone())?;
+            scanner.scan_stats_callback(callback);
         }
 
         if let Some(late_materialization) = late_materialization {
@@ -1320,6 +1330,11 @@ impl Dataset {
         Ok(())
     }
 
+    fn prewarm_index(&self, name: &str) -> PyResult<()> {
+        RT.block_on(None, self.ds.prewarm_index(name))?
+            .infer_error()
+    }
+
     fn count_fragments(&self) -> usize {
         self.ds.count_fragments()
     }
@@ -1672,6 +1687,27 @@ impl Dataset {
 
     fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
         RT.runtime.block_on(self.ds.tags.list())
+    }
+
+    fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {
+        if !callback.is_callable() {
+            return Err(PyValueError::new_err("Callback must be callable"));
+        }
+
+        let callback = callback.unbind();
+
+        Ok(Arc::new(move |stats| {
+            Python::with_gil(|py| {
+                let stats = ScanStatistics::from_lance(stats);
+                match callback.call1(py, (stats,)) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        // Don't fail scan if callback fails
+                        error!("Error in scan stats callback: {}", e);
+                    }
+                }
+            });
+        }))
     }
 }
 

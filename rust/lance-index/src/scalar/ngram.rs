@@ -361,6 +361,11 @@ impl Index for NGramIndex {
         })
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: NGram index can pre-warm by loading all posting lists into memory
+        Ok(())
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::NGram
     }

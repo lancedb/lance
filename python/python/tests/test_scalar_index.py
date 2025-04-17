@@ -1007,3 +1007,35 @@ def test_drop_index(tmp_path):
     assert ds.to_table(filter="bitmap = 1").num_rows == 1
     assert ds.to_table(filter="fts = 'a'").num_rows == test_table_size
     assert ds.to_table(filter="contains(ngram, 'a')").num_rows == test_table_size
+
+
+def test_index_prewarm(tmp_path: Path):
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table_size = 100
+    test_table = pa.table(
+        {
+            "fts": ["a" for _ in range(test_table_size)],
+        }
+    )
+
+    # Write index, cache should not be populated
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("fts", index_type="INVERTED")
+    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    assert scan_stats.parts_loaded > 0
+
+    # Fresh load, no prewarm, cache should not be populated
+    ds = lance.dataset(tmp_path)
+    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    assert scan_stats.parts_loaded > 0
+
+    # Prewarm index, cache should be populated
+    ds = lance.dataset(tmp_path)
+    ds.prewarm_index("fts_idx")
+    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    assert scan_stats.parts_loaded == 0

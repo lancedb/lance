@@ -49,6 +49,7 @@ use lance_index::DatasetIndexExt;
 use log::Level;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
+use scanner::ScanStatistics;
 use session::Session;
 
 #[macro_use]
@@ -149,6 +150,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionPlan>()?;
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
+    m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
     m.add_class::<TraceGuard>()?;
     m.add_class::<schema::LanceSchema>()?;
