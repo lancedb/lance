@@ -334,6 +334,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
         Ok(self)
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: We should prewarm the IVF index by loading the partitions into memory
+        Ok(())
+    }
+
     fn index_type(&self) -> IndexType {
         match self.sub_index_type() {
             (SubIndexType::Flat, QuantizationType::Flat) => IndexType::IvfFlat,

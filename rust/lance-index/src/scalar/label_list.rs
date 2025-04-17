@@ -78,6 +78,10 @@ impl Index for LabelListIndex {
         })
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        self.values_index.prewarm().await
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::LabelList
     }

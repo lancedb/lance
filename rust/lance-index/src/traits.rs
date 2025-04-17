@@ -44,6 +44,17 @@ pub trait DatasetIndexExt {
     /// - `name`: the name of the index to drop.
     async fn drop_index(&mut self, name: &str) -> Result<()>;
 
+    /// Prewarm an index by name.
+    ///
+    /// This will load the index into memory and cache it.
+    ///
+    /// Generally, this should only be called when it is known the entire index will
+    /// fit into the index cache.
+    ///
+    /// This is a hint that is not enforced by all indices today.  Some indices may choose
+    /// to ignore this hint.
+    async fn prewarm_index(&self, name: &str) -> Result<()>;
+
     /// Read all indices of this Dataset version.
     ///
     /// The indices are lazy loaded and cached in memory within the [`Dataset`] instance.

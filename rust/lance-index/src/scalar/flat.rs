@@ -174,6 +174,11 @@ impl Index for FlatIndex {
         IndexType::Scalar
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // There is nothing to pre-warm
+        Ok(())
+    }
+
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
             "num_values": self.data.num_rows(),

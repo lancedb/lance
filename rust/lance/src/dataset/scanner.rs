@@ -76,6 +76,7 @@ use crate::io::exec::{
 use crate::{Error, Result};
 use snafu::location;
 
+pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
 
@@ -338,6 +339,9 @@ pub struct Scanner {
 
     /// If true, the scanner will emit deleted rows
     include_deleted_rows: bool,
+
+    /// If set, this callback will be called after the scan with summary statistics
+    scan_stats_callback: Option<ExecutionStatsCallback>,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -377,6 +381,7 @@ impl Scanner {
             fast_search: false,
             use_scalar_index: true,
             include_deleted_rows: false,
+            scan_stats_callback: None,
         }
     }
 
@@ -468,6 +473,12 @@ impl Scanner {
     /// results do not match the filter.
     pub fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
         self.prefilter = should_prefilter;
+        self
+    }
+
+    /// Set the callback to be called after the scan with summary statistics
+    pub fn scan_stats_callback(&mut self, callback: ExecutionStatsCallback) -> &mut Self {
+        self.scan_stats_callback = Some(callback);
         self
     }
 
@@ -1036,6 +1047,7 @@ impl Scanner {
                 plan,
                 LanceExecutionOptions {
                     batch_size: self.batch_size,
+                    execution_stats_callback: self.scan_stats_callback.clone(),
                     ..Default::default()
                 },
             )?))
@@ -1045,9 +1057,15 @@ impl Scanner {
 
     pub(crate) async fn try_into_dfstream(
         &self,
-        options: LanceExecutionOptions,
+        mut options: LanceExecutionOptions,
     ) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
+
+        // Use the scan stats callback if the user didn't set an execution stats callback
+        if options.execution_stats_callback.is_none() {
+            options.execution_stats_callback = self.scan_stats_callback.clone();
+        }
+
         execute_plan(plan, options)
     }
 

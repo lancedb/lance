@@ -913,6 +913,11 @@ impl Index for BTreeIndex {
         })
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: BTree can (and should) support pre-warming by loading the pages into memory
+        Ok(())
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::BTree
     }
