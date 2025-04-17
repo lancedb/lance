@@ -1,222 +1,274 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    io::Error,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
+use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::RecordBatch;
-use arrow_schema::ArrowError;
-use datafusion::physical_plan::common::IPCWriter;
+use arrow_schema::{ArrowError, Schema};
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::DataFusionError;
-use lance_core::datatypes::Schema;
 
-/// A spill writer that writes to a temporary file.
-pub struct SpillWriter {
-    tmp_dir: tempfile::TempDir,
-    path: PathBuf,
-    writer: IPCWriter,
-}
-
-impl SpillWriter {
-    pub async fn try_new(schema: &Schema) -> Result<Self, DataFusionError> {
-        tokio::task::spawn_blocking(|| {
-            let tmp_dir = tempfile::tempdir()?;
-            let path = tmp_dir.path().join("spill.arrows");
-            let writer = IPCWriter::new(&path, schema)?;
-            Ok(SpillWriter {
-                tmp_dir,
-                path,
-                writer,
-            })
-        })?
-    }
-
-    pub async fn write(&mut self, batch: &RecordBatch) -> Result<(), DataFusionError> {
-        tokio::task::spawn_blocking(move || {
-            self.writer.write(batch)?;
-            Ok(())
-        })
-        .await?
-    }
-
-    pub async fn finish(self) -> Result<Spill, DataFusionError> {
-        let schema = self.writer.schema().clone();
-        tokio::task::spawn_blocking(move || self.writer.finish()).await??;
-        let tmp_dir = Arc::new(self.tmp_dir);
-        let path = Arc::new(self.path);
-        Ok(Spill {
-            tmp_dir,
-            path,
-            schema: Arc::new(schema),
-        })
-    }
-}
-
-#[derive(Clone)]
+/// A spill of Arrow data to a temporary file. The file is an Arrow IPC stream
+/// file.
+///
+/// Use [`Self::write()`] to write batches to the spill. They will immediately
+/// be flushed to the IPC stream file. The file is created on the first write.
+/// Use [`Self::finish()`] once all batches have been written to finalize the
+/// file.
+///
+/// To acquire a reading stream, call [`Self::read()`]. This can be called
+/// before or after the spill has finished. If called before, the stream
+/// will emit batches as they are written to the file. If called after, the stream
+/// will emit all batches in the file. The stream will not complete until
+/// [`Self::finish()`] is called.
+///
+/// When this is dropped, the temporary file is deleted. However, to handle
+/// potential IO errors, it's preferable to call [`Self::shutdown()`] before
+/// dropping the spill.
 pub struct Spill {
-    tmp_dir: Arc<tempfile::TempDir>,
-    path: Arc<PathBuf>,
+    tmp_dir: tempfile::TempDir,
     schema: Arc<Schema>,
+    path: PathBuf,
+    state: SpillState,
+    status_sender: tokio::sync::watch::Sender<WriteStatus>,
+    status_receiver: tokio::sync::watch::Receiver<WriteStatus>,
+}
+
+enum SpillState {
+    Uninitialized,
+    Initialized {
+        writer: AsyncStreamWriter,
+        batches_written: usize,
+    },
+    Finished {
+        batches_written: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct WriteStatus {
+    finished: bool,
+    batches_written: usize,
+}
+
+impl From<&SpillState> for WriteStatus {
+    fn from(state: &SpillState) -> Self {
+        match state {
+            SpillState::Uninitialized => WriteStatus {
+                finished: false,
+                batches_written: 0,
+            },
+            SpillState::Initialized {
+                batches_written, ..
+            } => WriteStatus {
+                finished: false,
+                batches_written: *batches_written,
+            },
+            SpillState::Finished { batches_written } => WriteStatus {
+                finished: true,
+                batches_written: *batches_written,
+            },
+        }
+    }
 }
 
 impl Spill {
-    pub fn read(&self) -> Result<SpillReader, ArrowError> {
+    /// Creates a new spill writer. The temporary directory is created
+    /// in the system's temporary directory. The schema is used to
+    /// create the Arrow IPC stream file.
+    pub fn new(tmp_dir: tempfile::TempDir, schema: Arc<Schema>) -> Self {
+        let path = tmp_dir.path().join("spill.arrow");
+        let (status_sender, status_receiver) = tokio::sync::watch::channel(WriteStatus {
+            finished: false,
+            batches_written: 0,
+        });
+        Self {
+            tmp_dir,
+            schema,
+            path,
+            state: SpillState::Uninitialized,
+            status_sender,
+            status_receiver,
+        }
+    }
+
+    /// Write a batch to the spill. The batch is immediately flushed to the
+    /// IPC stream file.
+    pub async fn write(&mut self, batch: RecordBatch) -> Result<(), DataFusionError> {
+        match &mut self.state {
+            SpillState::Uninitialized => {
+                let writer =
+                    AsyncStreamWriter::open(self.path.clone(), self.schema.clone()).await?;
+                writer.write(batch).await?;
+                self.state = SpillState::Initialized {
+                    writer,
+                    batches_written: 1,
+                };
+                self.status_sender
+                    .send_replace(WriteStatus::from(&self.state));
+            }
+            SpillState::Initialized {
+                writer,
+                batches_written,
+            } => {
+                writer.write(batch).await?;
+                *batches_written += 1;
+                self.status_sender
+                    .send_replace(WriteStatus::from(&self.state));
+            }
+            SpillState::Finished { .. } => {
+                return Err(DataFusionError::Execution(
+                    "Spill has already been finished".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Complete the spill write. This will finalize the Arrow IPC stream file.
+    /// The file will remain available for reading until [`Self::shutdown()`]
+    /// or until the spill is dropped.
+    pub async fn finish(&mut self) -> Result<(), DataFusionError> {
+        // We create a temporary state to get an owned copy of current state.
+        // Since we hold an exclusive reference to `self`, no one should be
+        // able to see this temporary state.
+        let tmp_state = SpillState::Finished { batches_written: 0 };
+        match std::mem::replace(&mut self.state, tmp_state) {
+            SpillState::Uninitialized => {
+                return Err(DataFusionError::Execution(
+                    "Spill has not been initialized".to_string(),
+                ));
+            }
+            SpillState::Initialized {
+                writer,
+                batches_written,
+            } => {
+                writer.finish().await?;
+                self.state = SpillState::Finished { batches_written };
+                self.status_sender
+                    .send_replace(WriteStatus::from(&self.state));
+            }
+            SpillState::Finished { .. } => {
+                return Err(DataFusionError::Execution(
+                    "Spill has already been finished".to_string(),
+                ));
+            }
+        };
+
+        Ok(())
+    }
+
+    pub fn read(&self) -> Result<SendableRecordBatchStream, DataFusionError> {
         todo!()
+        // Take a copy of the write path, status reciever.
+        // In thee stream, watch the status reciever to show > 0 batches written
+        // before opening the file.
+        // After that, open the file and create a stream reader.
+        // Wait until the status reciever says a batch has been written, before
+        // reading the next batch.
+        // When the status reciever says the spill has been finished, read the
+        // remaining batches in the file and then finish the stream.
+    }
+
+    pub async fn shutdown(self) -> Result<(), DataFusionError> {
+        self.tmp_dir.close()?;
+        Ok(())
     }
 }
 
-pub struct SpillReader {
-    tmp_dir: Arc<tempfile::TempDir>,
+/// An async wrapper around [`StreamWriter`]. Each call uses [`tokio::task::spawn_blocking`]
+/// to spawn a blocking task to write the batch.
+struct AsyncStreamWriter {
+    writer: Arc<Mutex<StreamWriter<std::fs::File>>>,
 }
 
-impl RecordBatchStream for SpillReader {
-    fn schema(&self) -> &Schema {
-        todo!()
+impl AsyncStreamWriter {
+    pub async fn open(path: PathBuf, schema: Arc<Schema>) -> Result<Self, ArrowError> {
+        let writer = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::create(&path).map_err(ArrowError::from)?;
+            StreamWriter::try_new(file, &schema)
+        })
+        .await
+        .unwrap()?;
+        let writer = Arc::new(Mutex::new(writer));
+        Ok(Self { writer })
+    }
+
+    pub async fn write(&self, batch: RecordBatch) -> Result<(), ArrowError> {
+        let writer = self.writer.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut writer = writer.lock().unwrap();
+            writer.write(&batch)
+        })
+        .await
+        .unwrap()
+    }
+
+    pub async fn finish(self) -> Result<(), ArrowError> {
+        let writer = self.writer.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut writer = writer.lock().unwrap();
+            writer.finish()
+        })
+        .await
+        .unwrap()
     }
 }
 
-impl Stream for SpillReader {
-    type Item = Result<RecordBatch, ArrowError>;
+struct AsyncStreamReader {
+    reader: Arc<Mutex<StreamReader<std::fs::File>>>,
+}
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        todo!()
+impl AsyncStreamReader {
+    pub async fn open(path: PathBuf) -> Result<Self, ArrowError> {
+        let reader = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&path).map_err(ArrowError::from)?;
+            StreamReader::try_new(file, None)
+        })
+        .await
+        .unwrap()?;
+        let reader = Arc::new(Mutex::new(reader));
+        Ok(Self { reader })
+    }
+
+    pub async fn read(&self) -> Result<Option<RecordBatch>, ArrowError> {
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut reader = reader.lock().unwrap();
+            reader.next()
+        })
+        .await
+        .unwrap()
+        .transpose()
     }
 }
 
-// #[derive(Clone)]
-// pub struct SpilledStream {
-//     tmp_dir: Arc<tempfile::TempDir>,
-//     path: Arc<PathBuf>,
-//     schema: Arc<ArrowSchema>,
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-// impl SpilledStream {
-//     #[instrument(level = "debug", skip_all, fields(
-//         num_rows = tracing::field::Empty,
-//         num_batches = tracing::field::Empty,
-//         num_bytes = tracing::field::Empty,
-//     ))]
-//     async fn try_new(mut stream: SendableRecordBatchStream) -> Result<Self> {
-//         let tmp_dir = tempfile::tempdir()?;
-//         let path = tmp_dir.path().join("spill.arrows");
-//         let schema = stream.schema();
+    #[tokio::test]
+    async fn test_spill() {
+        // Create a stream
 
-//         // We don't split the batches up. We assume if we need to read in smaller
-//         // increments, the writer has already handled this.
+        // Open a reader before writing. Assert we can't get any data.
 
-//         // Writing an IPC file is synchronous, so we spawn a blocking task to do it.
-//         let (tx, mut rx) = tokio::sync::mpsc::channel(0);
-//         let schema_ref = schema.clone();
-//         let writer_fut = tokio::task::spawn_blocking(move || {
-//             let mut writer = IPCWriter::new(&path, schema_ref.as_ref())?;
-//             while let Some(batch) = rx.blocking_recv() {
-//                 if let Err(err) = writer.write(&batch) {
-//                     return Err(err);
-//                 }
-//             }
-//             Ok((writer, path))
-//         });
+        // Write some data. Assert it shows up, but can't advanced past.
 
-//         tokio::pin!(writer_fut);
+        // Open a reader now. Assert we can get the data.
 
-//         loop {
-//             tokio::select! {
-//                 res = stream.next() => {
-//                     match res {
-//                         Some(Ok(batch)) => {
-//                             tx.send(batch).await.map_err(|_| Error::Internal {
-//                                 message: "Failed to send batch to writer".into(),
-//                                 location: location!(),
-//                             })?;
-//                         }
-//                         Some(Err(err)) => {
-//                             writer_fut.abort();
-//                             // Delete the tmp dir in the background so we don't block.
-//                             tokio::task::spawn_blocking(move || drop(tmp_dir));
-//                             return Err(err.into());
-//                         },
-//                         None => {
-//                             // No more batches, so we can close the writer
-//                             drop(tx);
-//                             let (writer, path) = writer_fut.await??;
-//                             let current_span = tracing::Span::current();
-//                             current_span.record("num_rows", &writer.num_rows);
-//                             current_span.record("num_batches", &writer.num_batches);
-//                             current_span.record("num_bytes", &writer.num_bytes);
-//                             return Ok(SpilledStream {
-//                                 tmp_dir: Arc::new(tmp_dir),
-//                                 path: Arc::new(path),
-//                                 schema,
-//                             });
-//                         }
-//                     }
-//                 },
-//                 res = &mut writer_fut => {
-//                     // Writer task finished before stream finished, so we need to delete the tmp dir
-//                     let _ = tokio::task::spawn_blocking(move || drop(tmp_dir));
-//                     match res {
-//                         Ok(Ok(_)) => {
-//                             return Err(Error::Internal {
-//                                 message: "Writer finished before stream finished".into(),
-//                                 location: location!(),
-//                             });
-//                         }
-//                         Ok(Err(err)) => {
-//                             return Err(err.into());
-//                         }
-//                         Err(_) => {
-//                             return Err(Error::Internal {
-//                                 message: "Writer task was cancelled".into(),
-//                                 location: location!(),
-//                             });
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-//     }
+        // Finish the spill. Assert we can get all the data from two existing readers.
 
-//     fn get_stream(&self) -> SendableRecordBatchStream {
-//         // IPC reader is a blocking operation, so we spawn a blocking task to do it.
-//         let self_clone = self.clone();
-//         let stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> = Box::pin(futures::stream::once(async move {
-//             tokio::task::spawn_blocking(move || {
-//                 let file = std::fs::File::open(self_clone.path.as_ref())?;
-//                 arrow_ipc::reader::StreamReader::try_new_buffered(file, None)
-//             }).await
-//         }).flat_map(|reader| {
-//             match reader {
-//                 Ok(Ok(reader)) => {
-//                     Box::pin(futures::stream::try_unfold(reader, |mut reader| async move {
-//                         let fut = tokio::task::spawn_blocking(move || {
-//                             let batch = reader.next();
-//                             (batch, reader)
-//                         });
-//                         match fut.await {
-//                             Ok((Some(Ok(batch)), reader)) => Ok(Some((batch, reader))),
-//                             Ok((Some(Err(err)), _)) => Err(err.into()),
-//                             Ok((None, _)) => Ok(None),
-//                             Err(err) => Err(DataFusionError::ExecutionJoin(err)),
-//                         }
-//                     })) as Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>
-//                 }
-//                 Ok(Err(err)) => {
-//                     Box::pin(futures::stream::once(futures::future::ready(Err(err.into()))))
-//                 }
-//                 Err(err) => {
-//                     Box::pin(futures::stream::once(futures::future::ready(Err(
-//                         DataFusionError::ExecutionJoin(err)))))
-//                 }
-//             }
-//         }));
+        // Create a new reader. Assert we can get all the data from it.
 
-//         Box::pin(RecordBatchStreamAdapter::new(
-//             self.schema.clone(),
-//             stream,
-//         ))
-//     }
-// }
+        // Close the spill. Assert new readers can't get any data.
 
-// struct SpilledStreamReader {
-//     spill: SpilledStream,
-//     reader: StreamRearder
-// }
+        // Assert the file is actually deleted.
+    }
+}
