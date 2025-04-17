@@ -25,7 +25,6 @@ use crate::session::Session;
 use crate::utils::PyLance;
 use crate::RT;
 use crate::{LanceReader, Scanner};
-use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 
 use lance::dataset::builder::DatasetBuilder;
@@ -84,15 +83,7 @@ use pyo3::{
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
-use crate::error::PythonErrorExt;
-use crate::file::object_store_from_uri_or_path;
-use crate::fragment::FileFragment;
 use crate::scanner::ScanStatistics;
-use crate::schema::LanceSchema;
-use crate::session::Session;
-use crate::utils::PyLance;
-use crate::RT;
-use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
