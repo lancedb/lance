@@ -230,6 +230,7 @@ fn uri_to_url(uri: &str) -> Result<Url> {
             // On Windows, the drive is parsed as a scheme
             local_path_to_url(uri)
         }
+        Ok(url) if url.scheme() == "file" => local_path_to_url(uri),
         Ok(url) => Ok(url),
         Err(_) => local_path_to_url(uri),
     }

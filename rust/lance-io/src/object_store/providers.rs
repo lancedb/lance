@@ -168,12 +168,13 @@ impl ObjectStoreRegistry {
 
         // Check if we have a cached store for this base path and params
         {
-            if let Some(store) = self
+            let maybe_store = self
                 .active_stores
                 .read()
                 .expect("ObjectStoreRegistry lock poisoned")
                 .get(&cache_key)
-            {
+                .cloned();
+            if let Some(store) = maybe_store {
                 if let Some(store) = store.upgrade() {
                     return Ok(store);
                 } else {

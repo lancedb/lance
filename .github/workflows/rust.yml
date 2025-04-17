@@ -215,6 +215,8 @@ jobs:
         shell: powershell
       - name: Build tests
         run: cargo test --locked --no-run
+      - name: Run lance-io tests first
+        run: cargo test --lib lance-io
       - name: Run tests
         run: cargo test
       - name: Check benchmarks
