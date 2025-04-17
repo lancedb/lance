@@ -229,15 +229,18 @@ pub struct ValueEncoder {}
 
 impl ValueEncoder {
     /// Use the largest chunk we can smaller than 4KiB
-    fn find_log_vals_per_chunk(bytes_per_value: u64) -> (u64, u64) {
-        let mut size_bytes = 2 * bytes_per_value;
-        let mut log_num_vals = 1;
-        let mut num_vals = 2;
+    fn find_log_vals_per_chunk(bytes_per_word: u64, values_per_word: u64) -> (u64, u64) {
+        let mut size_bytes = 2 * bytes_per_word;
+        let (mut log_num_vals, mut num_vals) = match values_per_word {
+            1 => (1, 2),
+            8 => (3, 8),
+            _ => unreachable!(),
+        };
 
         // If the type is so wide that we can't even fit 2 values we shouldn't be here
         assert!(size_bytes < MAX_MINIBLOCK_BYTES);
 
-        while 2 * size_bytes < MAX_MINIBLOCK_BYTES && 2 * num_vals < MAX_MINIBLOCK_VALUES {
+        while 2 * size_bytes < MAX_MINIBLOCK_BYTES && 2 * num_vals <= MAX_MINIBLOCK_VALUES {
             log_num_vals += 1;
             size_bytes *= 2;
             num_vals *= 2;
@@ -247,14 +250,22 @@ impl ValueEncoder {
     }
 
     fn chunk_data(data: FixedWidthDataBlock) -> MiniBlockCompressed {
-        // For now, only support byte-sized data
-        debug_assert!(data.bits_per_value % 8 == 0);
-        let bytes_per_value = data.bits_per_value / 8;
+        // Usually there are X bytes per value.  However, when working with boolean
+        // or FSL<boolean> we might have some number of bits per value that isn't
+        // divisible by 8.  In this case, to avoid chunking in the middle of a byte
+        // we calculate how many 8-value words we can fit in a chunk.
+        let (bytes_per_word, values_per_word) = if data.bits_per_value % 8 == 0 {
+            (data.bits_per_value / 8, 1)
+        } else {
+            (data.bits_per_value, 8)
+        };
 
         // Aim for 4KiB chunks
-        let (log_vals_per_chunk, vals_per_chunk) = Self::find_log_vals_per_chunk(bytes_per_value);
+        let (log_vals_per_chunk, vals_per_chunk) =
+            Self::find_log_vals_per_chunk(bytes_per_word, values_per_word);
         let num_chunks = bit_util::ceil(data.num_values as usize, vals_per_chunk as usize);
-        let bytes_per_chunk = bytes_per_value * vals_per_chunk;
+        debug_assert_eq!(vals_per_chunk % values_per_word, 0);
+        let bytes_per_chunk = bytes_per_word * (vals_per_chunk / values_per_word);
         let bytes_per_chunk = u16::try_from(bytes_per_chunk).unwrap();
 
         let data_buffer = data.data;
@@ -349,8 +360,10 @@ impl ValueEncoder {
             }
         }
 
-        let bytes_per_value = data.bits_per_value as usize / 8;
-        buffer_sizes.push((bytes_per_value * num_values) as u16);
+        let bits_in_chunk = data.bits_per_value * num_values as u64;
+        let bytes_in_chunk = bits_in_chunk.div_ceil(8);
+        let bytes_in_chunk = u16::try_from(bytes_in_chunk).unwrap();
+        buffer_sizes.push(bytes_in_chunk);
 
         buffer_sizes
     }
@@ -372,9 +385,15 @@ impl ValueEncoder {
             }
         }
         // It's an estimate because validity buffers may have some padding bits
-        let est_bytes_per_value = ceil_bytes_validity + (data.bits_per_value * cum_dim).div_ceil(8);
+        let cum_bits_per_value = data.bits_per_value * cum_dim;
+        let (cum_bytes_per_word, vals_per_word) = if cum_bits_per_value % 8 == 0 {
+            (cum_bits_per_value / 8, 1)
+        } else {
+            (cum_bits_per_value, 8)
+        };
+        let est_bytes_per_word = (ceil_bytes_validity * vals_per_word) + cum_bytes_per_word;
         let (log_rows_per_chunk, rows_per_chunk) =
-            Self::find_log_vals_per_chunk(est_bytes_per_value);
+            Self::find_log_vals_per_chunk(est_bytes_per_word, vals_per_word);
 
         let num_chunks = num_rows.div_ceil(rows_per_chunk) as usize;
 
@@ -717,23 +736,24 @@ struct ValueFslDesc {
 /// been written, as-is, to disk in single contiguous array
 #[derive(Debug)]
 pub struct ValueDecompressor {
-    /// How many bytes are in each inner-most item (e.g. FSL<Int32, 100> would be 4)
-    bytes_per_item: u64,
-    /// How many bytes are in each value (e.g. FSL<Int32, 100> would be 400)
+    /// How many bits are in each inner-most item (e.g. FSL<Int32, 100> would be 32)
+    bits_per_item: u64,
+    /// How many bits are in each value (e.g. FSL<Int32, 100> would be 3200)
     ///
     /// This number is a little trickier to compute because we also have to include bytes
     /// of any inner validity
-    bytes_per_value: u64,
+    bits_per_value: u64,
+    /// How many items are in each value (e.g. FSL<Int32, 100> would be 100)
+    items_per_value: u64,
     layers: Vec<ValueFslDesc>,
 }
 
 impl ValueDecompressor {
     pub fn from_flat(description: &pb::Flat) -> Self {
-        assert!(description.bits_per_value % 8 == 0);
-        let bytes_per_item = description.bits_per_value / 8;
         Self {
-            bytes_per_item,
-            bytes_per_value: bytes_per_item,
+            bits_per_item: description.bits_per_value,
+            bits_per_value: description.bits_per_value,
+            items_per_value: 1,
             layers: Vec::default(),
         }
     }
@@ -763,12 +783,12 @@ impl ValueDecompressor {
                     description = inner;
                 }
                 pb::array_encoding::ArrayEncoding::Flat(flat) => {
-                    let bytes_per_item = flat.bits_per_value / 8;
-                    bytes_per_value += bytes_per_item * cum_dim;
-                    assert_eq!(flat.bits_per_value % 8, 0);
+                    let mut bits_per_value = bytes_per_value * 8;
+                    bits_per_value += flat.bits_per_value * cum_dim;
                     return Self {
-                        bytes_per_item,
-                        bytes_per_value,
+                        bits_per_item: flat.bits_per_value,
+                        bits_per_value,
+                        items_per_value: cum_dim,
                         layers,
                     };
                 }
@@ -777,10 +797,9 @@ impl ValueDecompressor {
         }
     }
 
-    fn buffer_to_block(&self, data: LanceBuffer) -> DataBlock {
-        let num_values = data.len() as u64 / self.bytes_per_item;
+    fn buffer_to_block(&self, data: LanceBuffer, num_values: u64) -> DataBlock {
         DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: self.bytes_per_item * 8,
+            bits_per_value: self.bits_per_item,
             num_values,
             data,
             block_info: BlockInfo::new(),
@@ -790,7 +809,7 @@ impl ValueDecompressor {
 
 impl BlockDecompressor for ValueDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        let block = self.buffer_to_block(data);
+        let block = self.buffer_to_block(data, num_values);
         assert_eq!(block.num_values(), num_values);
         Ok(block)
     }
@@ -798,29 +817,31 @@ impl BlockDecompressor for ValueDecompressor {
 
 impl MiniBlockDecompressor for ValueDecompressor {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let num_items = num_values * self.items_per_value;
         let mut buffer_iter = data.into_iter().rev();
 
         // Always at least 1 buffer
         let data_buf = buffer_iter.next().unwrap();
-        let mut items = self.buffer_to_block(data_buf);
+        let items = self.buffer_to_block(data_buf, num_items);
+        let mut lists = items;
 
         for layer in self.layers.iter().rev() {
             if layer.has_validity {
                 let validity_buf = buffer_iter.next().unwrap();
-                items = DataBlock::Nullable(NullableDataBlock {
-                    data: Box::new(items),
+                lists = DataBlock::Nullable(NullableDataBlock {
+                    data: Box::new(lists),
                     nulls: validity_buf,
                     block_info: BlockInfo::default(),
                 });
             }
-            items = DataBlock::FixedSizeList(FixedSizeListBlock {
-                child: Box::new(items),
+            lists = DataBlock::FixedSizeList(FixedSizeListBlock {
+                child: Box::new(lists),
                 dimension: layer.dimension,
             })
         }
 
-        assert_eq!(items.num_values(), num_values);
-        Ok(items)
+        assert_eq!(lists.num_values(), num_values);
+        Ok(lists)
     }
 }
 
@@ -842,9 +863,9 @@ impl ValueDecompressor {
         for layer in &self.layers {
             cum_dim *= layer.dimension;
         }
-        debug_assert_eq!(self.bytes_per_item, data.bits_per_value / 8 / cum_dim);
+        debug_assert_eq!(self.bits_per_item, data.bits_per_value / cum_dim);
         let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: self.bytes_per_item * 8,
+            bits_per_value: self.bits_per_item,
             num_values: num_rows * cum_dim,
             data: data.data,
             block_info: BlockInfo::new(),
@@ -861,6 +882,9 @@ impl ValueDecompressor {
 
     // If there is validity then it has been zipped in with the values and we must unzip it
     fn unzip_decompress(&self, data: FixedWidthDataBlock, num_rows: usize) -> DataBlock {
+        // No support for full-zip on per-value encodings
+        assert_eq!(self.bits_per_item % 8, 0);
+        let bytes_per_item = self.bits_per_item / 8;
         let mut buffer_builders = Vec::with_capacity(self.layers.len());
         let mut cum_dim = 1;
         let mut total_size_bytes = 0;
@@ -879,13 +903,13 @@ impl ValueDecompressor {
             }
         }
         let num_items = num_rows * cum_dim;
-        let data_size = num_items * self.bytes_per_item as usize;
+        let data_size = num_items * bytes_per_item as usize;
         total_size_bytes += data_size;
         let mut data_buffer = Vec::with_capacity(data_size);
 
         assert_eq!(data.data.len(), total_size_bytes);
 
-        let bytes_per_value = self.bytes_per_item as usize;
+        let bytes_per_value = bytes_per_item as usize;
         let data_bytes_per_row = bytes_per_value * cum_dim;
 
         // Next, unzip
@@ -904,7 +928,7 @@ impl ValueDecompressor {
 
         // Finally, restore the structure
         let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: self.bytes_per_item * 8,
+            bits_per_value: self.bits_per_value,
             num_values: num_items as u64,
             data: LanceBuffer::Owned(data_buffer),
             block_info: BlockInfo::new(),
@@ -945,7 +969,7 @@ impl FixedPerValueDecompressor for ValueDecompressor {
     }
 
     fn bits_per_value(&self) -> u64 {
-        self.bytes_per_value * 8
+        self.bits_per_value
     }
 }
 
