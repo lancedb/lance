@@ -1827,16 +1827,10 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         {
             let mut file_writer_options = FileWriterOptions::default();
             if let Some(max_page_bytes) = writer_options.get("max_page_bytes") {
-                file_writer_options.max_page_bytes = match max_page_bytes.parse::<u64>() {
-                    Ok(n) => Some(n),
-                    Err(_e) => None,
-                }
+                file_writer_options.max_page_bytes = max_page_bytes.parse::<u64>().ok()
             }
             if let Some(data_cache_bytes) = writer_options.get("data_cache_bytes") {
-                file_writer_options.data_cache_bytes = match data_cache_bytes.parse::<u64>() {
-                    Ok(n) => Some(n),
-                    Err(_e) => None,
-                }
+                file_writer_options.data_cache_bytes = data_cache_bytes.parse::<u64>().ok()
             }
             p.file_writer_options = Some(file_writer_options);
         }
