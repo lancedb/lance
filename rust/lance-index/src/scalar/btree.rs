@@ -636,6 +636,25 @@ impl BTreeLookup {
             // matches an upper bound.  This will all be moot if/when we merge pages.
             Bound::Excluded(upper) => Bound::Included(upper),
         };
+
+        match (lower_bound, upper_bound) {
+            (Bound::Excluded(lower), Bound::Excluded(upper))
+            | (Bound::Excluded(lower), Bound::Included(upper))
+            | (Bound::Included(lower), Bound::Excluded(upper)) => {
+                // It's not really clear what (Included(5), Excluded(5)) would mean so we
+                // interpret it as an empty range which matches rust's BTreeMap behavior
+                if lower >= upper {
+                    return vec![];
+                }
+            }
+            (Bound::Included(lower), Bound::Included(upper)) => {
+                if lower > upper {
+                    return vec![];
+                }
+            }
+            _ => {}
+        }
+
         let candidates = self
             .tree
             .range((lower_bound, upper_bound))
