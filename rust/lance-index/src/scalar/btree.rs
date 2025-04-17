@@ -1338,7 +1338,7 @@ impl Stream for IndexReaderStream {
         let batch_num = this.batch_idx;
         this.batch_idx += 1;
         let reader_copy = this.reader.clone();
-        let batch_size = this.batch_size as u64;
+        let batch_size = this.batch_size;
         let read_task = async move {
             reader_copy
                 .read_record_batch(batch_num as u64, batch_size)
