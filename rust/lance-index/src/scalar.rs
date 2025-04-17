@@ -183,7 +183,7 @@ pub trait IndexReader: Send + Sync {
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch>;
     /// Return the number of batches in the file
-    async fn num_batches(&self) -> u32;
+    async fn num_batches(&self, batch_size: u64) -> u32;
     /// Return the number of rows in the file
     fn num_rows(&self) -> usize;
     /// Return the metadata of the file
