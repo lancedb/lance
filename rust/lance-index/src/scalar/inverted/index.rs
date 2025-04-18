@@ -40,6 +40,7 @@ use snafu::location;
 use tracing::{info, instrument};
 
 use super::builder::{inverted_list_schema, PositionRecorder};
+use super::compressor::ExLinkedList;
 use super::query::*;
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::PreFilter;
@@ -721,21 +722,21 @@ impl PostingList {
     }
 }
 
-#[derive(Debug, Clone, DeepSizeOf)]
+#[derive(Debug, Clone)]
 pub struct PostingListBuilder {
-    pub row_ids: Vec<u64>,
-    pub frequencies: Vec<f32>,
+    pub row_ids: ExLinkedList<u64>,
+    pub frequencies: ExLinkedList<f32>,
     pub positions: Option<PositionBuilder>,
 }
 
 impl PostingListBuilder {
-    pub fn new(row_ids: Vec<u64>, frequencies: Vec<f32>, positions: Option<Vec<Vec<i32>>>) -> Self {
-        Self {
-            row_ids,
-            frequencies,
-            positions: positions.map(PositionBuilder::from),
-        }
-    }
+    // pub fn new(row_ids: Vec<u64>, frequencies: Vec<f32>, positions: Option<Vec<Vec<i32>>>) -> Self {
+    //     Self {
+    //         row_ids,
+    //         frequencies,
+    //         positions: positions.map(PositionBuilder::from),
+    //     }
+    // }
 
     pub fn size(&self) -> usize {
         std::mem::size_of::<u64>() * self.row_ids.len()
@@ -784,8 +785,8 @@ impl PostingListBuilder {
 
     pub fn empty(with_position: bool) -> Self {
         Self {
-            row_ids: Vec::new(),
-            frequencies: Vec::new(),
+            row_ids: ExLinkedList::new(),
+            frequencies: ExLinkedList::new(),
             positions: with_position.then(PositionBuilder::new),
         }
     }
@@ -847,8 +848,8 @@ impl PostingListBuilder {
     }
 
     pub fn to_batch(self) -> Result<RecordBatch> {
-        let row_ids = UInt64Array::from(self.row_ids);
-        let frequencies = Float32Array::from(self.frequencies);
+        let row_ids = UInt64Array::from_iter_values(self.row_ids.into_iter());
+        let frequencies = Float32Array::from_iter_values(self.frequencies.into_iter());
         let mut columns = vec![
             Arc::new(row_ids) as ArrayRef,
             Arc::new(frequencies) as ArrayRef,
