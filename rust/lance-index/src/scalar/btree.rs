@@ -542,7 +542,7 @@ impl Ord for OrderableScalarValue {
     }
 }
 
-#[derive(Debug, DeepSizeOf)]
+#[derive(Debug, DeepSizeOf, PartialEq, Eq)]
 struct PageRecord {
     max: OrderableScalarValue,
     page_number: u32,
@@ -560,7 +560,7 @@ impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
 }
 
 /// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
-#[derive(Debug, DeepSizeOf)]
+#[derive(Debug, DeepSizeOf, PartialEq, Eq)]
 pub struct BTreeLookup {
     tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
     /// Pages where the value may be null
@@ -570,18 +570,6 @@ pub struct BTreeLookup {
 impl BTreeLookup {
     fn new(tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>, null_pages: Vec<u32>) -> Self {
         Self { tree, null_pages }
-    }
-
-    fn all_page_ids(&self) -> Vec<u32> {
-        let mut ids = self
-            .tree
-            .iter()
-            .flat_map(|(_, pages)| pages)
-            .map(|page| page.page_number)
-            .chain(self.null_pages.iter().copied())
-            .collect::<Vec<_>>();
-        ids.dedup();
-        ids
     }
 
     // All pages that could have a value equal to val
@@ -648,6 +636,25 @@ impl BTreeLookup {
             // matches an upper bound.  This will all be moot if/when we merge pages.
             Bound::Excluded(upper) => Bound::Included(upper),
         };
+
+        match (lower_bound, upper_bound) {
+            (Bound::Excluded(lower), Bound::Excluded(upper))
+            | (Bound::Excluded(lower), Bound::Included(upper))
+            | (Bound::Included(lower), Bound::Excluded(upper)) => {
+                // It's not really clear what (Included(5), Excluded(5)) would mean so we
+                // interpret it as an empty range which matches rust's BTreeMap behavior
+                if lower >= upper {
+                    return vec![];
+                }
+            }
+            (Bound::Included(lower), Bound::Included(upper)) => {
+                if lower > upper {
+                    return vec![];
+                }
+            }
+            _ => {}
+        }
+
         let candidates = self
             .tree
             .range((lower_bound, upper_bound))
@@ -854,16 +861,12 @@ impl BTreeIndex {
     /// Create a stream of all the data in the index, in the same format used to train the index
     async fn into_data_stream(self) -> Result<impl RecordBatchStream> {
         let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
-        let pages = self.page_lookup.all_page_ids();
         let schema = self.sub_index.schema().clone();
-        let batches = IndexReaderStream {
-            reader,
-            pages,
-            idx: 0,
-        }
-        .map(|fut| fut.map_err(DataFusionError::from))
-        .buffered(self.store.io_parallelism())
-        .boxed();
+        let reader_stream = IndexReaderStream::new(reader, self.batch_size).await;
+        let batches = reader_stream
+            .map(|fut| fut.map_err(DataFusionError::from))
+            .buffered(self.store.io_parallelism())
+            .boxed();
         Ok(RecordBatchStreamAdapter::new(schema, batches))
     }
 }
@@ -945,10 +948,10 @@ impl Index for BTreeIndex {
         let mut frag_ids = RoaringBitmap::default();
 
         let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
-        for page_number in self.page_lookup.all_page_ids() {
-            let serialized = sub_index_reader
-                .read_record_batch(page_number as u64, self.batch_size)
-                .await?;
+        let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
+            .await
+            .buffered(self.store.io_parallelism());
+        while let Some(serialized) = reader_stream.try_next().await? {
             let page = self.sub_index.load_subindex(serialized).await?;
             frag_ids |= page.calculate_included_frags().await?;
         }
@@ -1033,15 +1036,11 @@ impl ScalarIndex for BTreeIndex {
             .await?;
 
         let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
-
-        for page_number in self.page_lookup.all_page_ids() {
-            let old_serialized = sub_index_reader
-                .read_record_batch(page_number as u64, self.batch_size)
-                .await?;
-            let remapped = self
-                .sub_index
-                .remap_subindex(old_serialized, mapping)
-                .await?;
+        let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
+            .await
+            .buffered(self.store.io_parallelism());
+        while let Some(serialized) = reader_stream.try_next().await? {
+            let remapped = self.sub_index.remap_subindex(serialized, mapping).await?;
             sub_index_file.write_record_batch(remapped).await?;
         }
 
@@ -1327,8 +1326,21 @@ impl TrainingSource for BTreeUpdater {
 /// This is used for updating the index
 struct IndexReaderStream {
     reader: Arc<dyn IndexReader>,
-    pages: Vec<u32>,
-    idx: usize,
+    batch_size: u64,
+    num_batches: u32,
+    batch_idx: u32,
+}
+
+impl IndexReaderStream {
+    async fn new(reader: Arc<dyn IndexReader>, batch_size: u64) -> Self {
+        let num_batches = reader.num_batches(batch_size).await;
+        Self {
+            reader,
+            batch_size,
+            num_batches,
+            batch_idx: 0,
+        }
+    }
 }
 
 impl Stream for IndexReaderStream {
@@ -1339,16 +1351,16 @@ impl Stream for IndexReaderStream {
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let idx = this.idx;
-        if idx >= this.pages.len() {
+        if this.batch_idx >= this.num_batches {
             return std::task::Poll::Ready(None);
         }
-        let page_number = this.pages[idx];
-        this.idx += 1;
+        let batch_num = this.batch_idx;
+        this.batch_idx += 1;
         let reader_copy = this.reader.clone();
+        let batch_size = this.batch_size;
         let read_task = async move {
             reader_copy
-                .read_record_batch(page_number as u64, DEFAULT_BTREE_BATCH_SIZE)
+                .read_record_batch(batch_num as u64, batch_size)
                 .await
         }
         .boxed();
@@ -1358,9 +1370,9 @@ impl Stream for IndexReaderStream {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
-    use arrow::datatypes::{Float64Type, Int32Type, UInt64Type};
+    use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::FixedSizeListArray;
     use arrow_schema::DataType;
     use datafusion::{
@@ -1373,7 +1385,7 @@ mod tests {
     use futures::TryStreamExt;
     use lance_core::{cache::FileMetadataCache, utils::mask::RowIdTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
-    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
     use tempfile::tempdir;
@@ -1381,10 +1393,10 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
-            btree::BTreeIndex,
+            btree::{BTreeIndex, BTREE_PAGES_NAME, DEFAULT_BTREE_BATCH_SIZE},
             flat::FlatIndexMetadata,
             lance_format::{tests::MockTrainingSource, LanceIndexStore},
-            SargableQuery, ScalarIndex, SearchResult,
+            IndexStore, SargableQuery, ScalarIndex, SearchResult,
         },
     };
 
@@ -1404,6 +1416,73 @@ mod tests {
         // deep_size_of should account for the rust type overhead
         assert!(size_of_i32 > 4);
         assert!(size_of_many_i32 > 128 * 4);
+    }
+
+    #[tokio::test]
+    async fn test_null_ids() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local(),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            FileMetadataCache::no_cache(),
+        ));
+
+        // Generate 50,000 rows of random data with 80% nulls
+        let stream = gen()
+            .col(
+                "value",
+                array::rand::<Float32Type>().with_nulls(&[true, false, false, false, false]),
+            )
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(5000), BatchCount::from(10));
+        let data_source = Box::new(MockTrainingSource::from(stream));
+        let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
+
+        train_btree_index(
+            data_source,
+            &sub_index_trainer,
+            test_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE as u32,
+        )
+        .await
+        .unwrap();
+
+        let index = BTreeIndex::load(test_store.clone()).await.unwrap();
+
+        assert_eq!(index.page_lookup.null_pages.len(), 10);
+
+        let remap_dir = Arc::new(tempdir().unwrap());
+        let remap_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local(),
+            Path::from_filesystem_path(remap_dir.path()).unwrap(),
+            FileMetadataCache::no_cache(),
+        ));
+
+        // Remap with a no-op mapping.  The remapped index should be identical to the original
+        index
+            .remap(&HashMap::default(), remap_store.as_ref())
+            .await
+            .unwrap();
+
+        let remap_index = BTreeIndex::load(remap_store.clone()).await.unwrap();
+
+        assert_eq!(remap_index.page_lookup, index.page_lookup);
+
+        let original_pages = test_store.open_index_file(BTREE_PAGES_NAME).await.unwrap();
+        let remapped_pages = remap_store.open_index_file(BTREE_PAGES_NAME).await.unwrap();
+
+        assert_eq!(original_pages.num_rows(), remapped_pages.num_rows());
+
+        let original_data = original_pages
+            .read_record_batch(0, original_pages.num_rows() as u64)
+            .await
+            .unwrap();
+        let remapped_data = remapped_pages
+            .read_record_batch(0, remapped_pages.num_rows() as u64)
+            .await
+            .unwrap();
+
+        assert_eq!(original_data, remapped_data);
     }
 
     #[tokio::test]

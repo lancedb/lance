@@ -306,6 +306,41 @@ impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
 }
 
 #[derive(Debug)]
+struct BitmapDataBlockBuilder {
+    values: BooleanBufferBuilder,
+}
+
+impl BitmapDataBlockBuilder {
+    fn new(estimated_size_bytes: u64) -> Self {
+        Self {
+            values: BooleanBufferBuilder::new(estimated_size_bytes as usize * 8),
+        }
+    }
+}
+
+impl DataBlockBuilderImpl for BitmapDataBlockBuilder {
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+        let bitmap_blk = data_block.as_fixed_width_ref().unwrap();
+        self.values.append_packed_range(
+            selection.start as usize..selection.end as usize,
+            &bitmap_blk.data,
+        );
+    }
+
+    fn finish(mut self: Box<Self>) -> DataBlock {
+        let bool_buf = self.values.finish();
+        let num_values = bool_buf.len() as u64;
+        let bits_buf = bool_buf.into_inner();
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::from(bits_buf),
+            bits_per_value: 1,
+            num_values,
+            block_info: BlockInfo::new(),
+        })
+    }
+}
+
+#[derive(Debug)]
 struct FixedWidthDataBlockBuilder {
     bits_per_value: u64,
     bytes_per_value: u64,
@@ -1038,10 +1073,16 @@ impl DataBlock {
 
     pub fn make_builder(&self, estimated_size_bytes: u64) -> Box<dyn DataBlockBuilderImpl> {
         match self {
-            Self::FixedWidth(inner) => Box::new(FixedWidthDataBlockBuilder::new(
-                inner.bits_per_value,
-                estimated_size_bytes,
-            )),
+            Self::FixedWidth(inner) => {
+                if inner.bits_per_value == 1 {
+                    Box::new(BitmapDataBlockBuilder::new(estimated_size_bytes))
+                } else {
+                    Box::new(FixedWidthDataBlockBuilder::new(
+                        inner.bits_per_value,
+                        estimated_size_bytes,
+                    ))
+                }
+            }
             Self::VariableWidth(inner) => {
                 if inner.bits_per_offset == 32 {
                     Box::new(VariableWidthDataBlockBuilder::new(estimated_size_bytes))
