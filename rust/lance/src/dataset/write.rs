@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -12,14 +10,15 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::physical_plan::common::IPCWriter;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use either::Either;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions, StorageClass,
 };
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
+use lance_datafusion::spill::{create_spill, SpillReceiver};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
@@ -662,8 +661,7 @@ async fn resolve_commit_handler(
 async fn new_source_iter(
     source: SendableRecordBatchStream,
     enable_retries: bool,
-) -> Result<impl Iterator<Item = SendableRecordBatchStream>> {
-    // TODO: Also support spilling to disk
+) -> Result<Box<dyn Iterator<Item = SendableRecordBatchStream> + Send + 'static>> {
     if enable_retries {
         let schema = source.schema();
 
@@ -672,17 +670,68 @@ async fn new_source_iter(
         let size_hint = source.size_hint();
         if size_hint.0 == 1 && size_hint.1 == Some(1) {
             let batches: Vec<RecordBatch> = source.try_collect().await?;
-            Ok(Either::Left(std::iter::repeat_with(move || {
+            Ok(Box::new(std::iter::repeat_with(move || {
                 Box::pin(RecordBatchStreamAdapter::new(
                     schema.clone(),
                     futures::stream::iter(batches.clone().into_iter().map(Ok)),
                 )) as SendableRecordBatchStream
             })))
         } else {
-            todo!("spill to disk")
+            Ok(Box::new(SpillStreamIter::try_new(source).await?))
         }
     } else {
-        Ok(Either::Right(std::iter::once(source)))
+        Ok(Box::new(std::iter::once(source)))
+    }
+}
+
+struct SpillStreamIter {
+    receiver: SpillReceiver,
+    #[allow(dead_code)] // Exists to keep the temp dir alive
+    tmp_dir: tempfile::TempDir,
+}
+
+impl SpillStreamIter {
+    pub async fn try_new(mut source: SendableRecordBatchStream) -> Result<Self> {
+        let tmp_dir = tokio::task::spawn_blocking(|| {
+            tempfile::tempdir().map_err(|e| Error::InvalidInput {
+                source: format!("Failed to create temp dir: {}", e).into(),
+                location: location!(),
+            })
+        })
+        .await
+        .ok()
+        .expect_ok()??;
+
+        let tmp_path = tmp_dir.path().join("spill.arrows");
+        let (mut sender, receiver) = create_spill(tmp_path, source.schema());
+
+        tokio::task::spawn(async move {
+            while let Some(res) = source.next().await {
+                match res {
+                    Ok(batch) => match sender.write(batch).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            sender.send_error(e);
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        sender.send_error(e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self { receiver, tmp_dir })
+    }
+}
+
+impl Iterator for SpillStreamIter {
+    type Item = SendableRecordBatchStream;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.receiver.read())
     }
 }
 

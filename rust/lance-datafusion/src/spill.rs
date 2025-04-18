@@ -16,30 +16,127 @@ use datafusion_common::DataFusionError;
 use futures::TryStreamExt;
 use lance_core::error::LanceOptionExt;
 
-/// A spill of Arrow data to a temporary file. The file is an Arrow IPC stream
-/// file.
+/// Start a spill of Arrow data to a temporary file. The file is an Arrow IPC
+/// stream file.
+///
+/// The [`SpillSender`] allows you to write batches to the spill.
+///
+/// The [`SpillReceiver`] can open a [`SendableRecordBatchStream`] that reads
+/// batches from the spill. This can be opened before, during, or after batches
+/// have been written to the spill.
+///
+/// Once [`SpillSender`] is dropped, the temporary file is deleted. This will
+/// cause the [`SpillReceiver`] to return an error if it is still open.
+pub fn create_spill(path: std::path::PathBuf, schema: Arc<Schema>) -> (SpillSender, SpillReceiver) {
+    let initial_status = WriteStatus {
+        finished: false,
+        batches_written: 0,
+        error: None,
+    };
+    let (status_sender, status_receiver) = tokio::sync::watch::channel(initial_status);
+    let sender = SpillSender {
+        path: path.clone(),
+        schema: schema.clone(),
+        state: SpillState::Uninitialized,
+        status_sender,
+    };
+
+    let receiver = SpillReceiver {
+        status_receiver,
+        path,
+        schema,
+    };
+
+    (sender, receiver)
+}
+
+#[derive(Clone)]
+pub struct SpillReceiver {
+    status_receiver: tokio::sync::watch::Receiver<WriteStatus>,
+    path: PathBuf,
+    schema: Arc<Schema>,
+}
+
+impl SpillReceiver {
+    /// Returns a stream of batches from the spill. The stream will emit
+    /// batches as they are written to the spill. If the spill has already
+    /// been finished, the stream will emit all batches in the spill.
+    ///
+    /// The stream will not complete until [`Self::finish()`] is called.
+    ///
+    /// If the spill has been dropped, an error will be returned.
+    pub fn read(&self) -> SendableRecordBatchStream {
+        let mut rx = self.status_receiver.clone();
+        let batches_read = 0;
+        let path = self.path.clone();
+
+        async fn wait_for_more_data(
+            rx: &mut tokio::sync::watch::Receiver<WriteStatus>,
+            batches_read: usize,
+        ) -> Result<(), DataFusionError> {
+            let status = rx
+                .wait_for(|status| {
+                    status.error.is_some()
+                        || status.finished
+                        || status.batches_written > batches_read
+                })
+                .await
+                .map_err(|_| {
+                    DataFusionError::Execution(
+                        "Spill has been dropped before reader has finish.".into(),
+                    )
+                })?;
+
+            if let Some(error) = &status.error {
+                let mut guard = error.lock().ok().expect_ok()?;
+                return Err(DataFusionError::from(&mut (*guard)));
+            }
+
+            Ok(())
+        }
+
+        let stream = futures::stream::once(async move {
+            wait_for_more_data(&mut rx, 0).await?;
+            let reader = AsyncStreamReader::open(path).await?;
+
+            Ok::<_, DataFusionError>(futures::stream::try_unfold(
+                (rx, batches_read, reader),
+                move |(mut rx, mut batches_read, reader)| async move {
+                    wait_for_more_data(&mut rx, batches_read).await?;
+
+                    if rx.borrow().finished && batches_read >= rx.borrow().batches_written {
+                        return Ok(None);
+                    }
+
+                    let batch = reader.read().await?.ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "Got fewer than expected batches from spill".into(),
+                        )
+                    })?;
+
+                    batches_read += 1;
+
+                    Ok(Some((batch, (rx, batches_read, reader))))
+                },
+            ))
+        })
+        .try_flatten();
+
+        Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream))
+    }
+}
+
+/// A spill of Arrow data to an IPC stream file.
 ///
 /// Use [`Self::write()`] to write batches to the spill. They will immediately
 /// be flushed to the IPC stream file. The file is created on the first write.
 /// Use [`Self::finish()`] once all batches have been written to finalize the
 /// file.
-///
-/// To acquire a reading stream, call [`Self::read()`]. This can be called
-/// before or after the spill has finished. If called before, the stream
-/// will emit batches as they are written to the file. If called after, the stream
-/// will emit all batches in the file. The stream will not complete until
-/// [`Self::finish()`] is called.
-///
-/// When this is dropped, the temporary file is deleted. However, to handle
-/// potential IO errors, it's preferable to call [`Self::shutdown()`] before
-/// dropping the spill.
-pub struct Spill {
-    tmp_dir: tempfile::TempDir,
+pub struct SpillSender {
     schema: Arc<Schema>,
     path: PathBuf,
     state: SpillState,
     status_sender: tokio::sync::watch::Sender<WriteStatus>,
-    status_receiver: tokio::sync::watch::Receiver<WriteStatus>,
 }
 
 enum SpillState {
@@ -116,28 +213,7 @@ impl From<&SpillState> for WriteStatus {
     }
 }
 
-impl Spill {
-    /// Creates a new spill writer. The temporary directory is created
-    /// in the system's temporary directory. The schema is used to
-    /// create the Arrow IPC stream file.
-    pub fn new(tmp_dir: tempfile::TempDir, schema: Arc<Schema>) -> Self {
-        let path = tmp_dir.path().join("spill.arrow");
-        let initial_status = WriteStatus {
-            finished: false,
-            batches_written: 0,
-            error: None,
-        };
-        let (status_sender, status_receiver) = tokio::sync::watch::channel(initial_status);
-        Self {
-            tmp_dir,
-            schema,
-            path,
-            state: SpillState::Uninitialized,
-            status_sender,
-            status_receiver,
-        }
-    }
-
+impl SpillSender {
     /// Write a batch to the spill. The batch is immediately flushed to the
     /// IPC stream file.
     pub async fn write(&mut self, batch: RecordBatch) -> Result<(), DataFusionError> {
@@ -231,87 +307,6 @@ impl Spill {
         };
 
         Ok(())
-    }
-
-    /// Returns a stream of batches from the spill. The stream will emit
-    /// batches as they are written to the spill. If the spill has already
-    /// been finished, the stream will emit all batches in the spill.
-    ///
-    /// The stream will not complete until [`Self::finish()`] is called.
-    ///
-    /// If the spill has been dropped, an error will be returned.
-    pub fn read(&self) -> Result<SendableRecordBatchStream, DataFusionError> {
-        let mut rx = self.status_receiver.clone();
-        let batches_read = 0;
-        let path = self.path.clone();
-
-        async fn wait_for_more_data(
-            rx: &mut tokio::sync::watch::Receiver<WriteStatus>,
-            batches_read: usize,
-        ) -> Result<(), DataFusionError> {
-            let status = rx
-                .wait_for(|status| {
-                    status.error.is_some()
-                        || status.finished
-                        || status.batches_written > batches_read
-                })
-                .await
-                .map_err(|_| {
-                    DataFusionError::Execution(
-                        "Spill has been dropped before reader has finish.".into(),
-                    )
-                })?;
-
-            if let Some(error) = &status.error {
-                let mut guard = error.lock().ok().expect_ok()?;
-                return Err(DataFusionError::from(&mut (*guard)));
-            }
-
-            Ok(())
-        }
-
-        let stream = futures::stream::once(async move {
-            wait_for_more_data(&mut rx, 0).await?;
-            let reader = AsyncStreamReader::open(path).await?;
-
-            Ok::<_, DataFusionError>(futures::stream::try_unfold(
-                (rx, batches_read, reader),
-                move |(mut rx, mut batches_read, reader)| async move {
-                    wait_for_more_data(&mut rx, batches_read).await?;
-
-                    if rx.borrow().finished && batches_read >= rx.borrow().batches_written {
-                        return Ok(None);
-                    }
-
-                    let batch = reader.read().await?.ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "Got fewer than expected batches from spill".into(),
-                        )
-                    })?;
-
-                    batches_read += 1;
-
-                    Ok(Some((batch, (rx, batches_read, reader))))
-                },
-            ))
-        })
-        .try_flatten();
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema.clone(),
-            stream,
-        )))
-    }
-
-    pub async fn shutdown(self) -> Result<(), DataFusionError> {
-        let res =
-            tokio::task::spawn_blocking(move || self.tmp_dir.close().map_err(ArrowError::from))
-                .await;
-        match res {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(DataFusionError::Execution(e.to_string())),
-            Err(e) => Err(DataFusionError::Execution(e.to_string())),
-        }
     }
 }
 
@@ -409,10 +404,11 @@ mod tests {
 
         // Create a stream
         let tmp_dir = tempfile::tempdir().unwrap();
-        let mut spill = Spill::new(tmp_dir, schema.clone());
+        let path = tmp_dir.path().join("spill.arrows");
+        let (mut spill, reciever) = create_spill(path.clone(), schema.clone());
 
         // We can open a reader prior to writing any data. No batches will be ready.
-        let mut stream_before = spill.read().unwrap();
+        let mut stream_before = reciever.read();
         let mut stream_before_next = stream_before.next();
         let poll_res = poll!(&mut stream_before_next);
         assert!(poll_res.is_pending());
@@ -430,7 +426,7 @@ mod tests {
 
         // We can also open a ready while the spill is being written to. We can
         // retrieve batches written so far immediately.
-        let mut stream_during = spill.read().unwrap();
+        let mut stream_during = reciever.read();
         let stream_during_batch1 = stream_during
             .next()
             .await
@@ -461,12 +457,11 @@ mod tests {
         assert!(stream_during.next().await.is_none());
 
         // Can also start a reader after finishing.
-        let stream_after = spill.read().unwrap();
+        let stream_after = reciever.read();
         let stream_after_batches = stream_after.try_collect::<Vec<_>>().await.unwrap();
         assert_eq!(&stream_after_batches, &batches);
 
-        // Once we close the spill, the file is deleted.
-        spill.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
@@ -474,7 +469,8 @@ mod tests {
         // Create a spill
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let tmp_dir = tempfile::tempdir().unwrap();
-        let mut spill = Spill::new(tmp_dir, schema.clone());
+        let path = tmp_dir.path().join("spill.arrows");
+        let (mut spill, reciever) = create_spill(path.clone(), schema.clone());
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -483,7 +479,7 @@ mod tests {
 
         spill.write(batch.clone()).await.unwrap();
 
-        let mut stream = spill.read().unwrap();
+        let mut stream = reciever.read();
         let stream_batch = stream
             .next()
             .await
@@ -517,7 +513,7 @@ mod tests {
         ));
 
         // If we try to read after sending an error, it should return an error.
-        let mut stream = spill.read().unwrap();
+        let mut stream = reciever.read();
         let stream_error = stream
             .next()
             .await
@@ -527,5 +523,7 @@ mod tests {
             stream_error,
             DataFusionError::Execution(message) if message.contains("🥱")
         ));
+
+        std::fs::remove_file(path).unwrap();
     }
 }

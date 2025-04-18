@@ -1483,12 +1483,14 @@ mod tests {
     };
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
+    use futures::future::try_join_all;
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use tempfile::tempdir;
+    use tokio::sync::Barrier;
 
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{builder::DatasetBuilder, InsertBuilder, WriteMode, WriteParams};
 
     use super::*;
 
@@ -2131,6 +2133,76 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_insert_concurrency() {
-        todo!("Run several merge inserts on same fragment, validate they all work.");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let num_rows = 10;
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..num_rows)),
+                Arc::new(UInt32Array::from_iter_values(
+                    std::iter::repeat(0).take(num_rows as usize),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = InsertBuilder::new(test_uri)
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+
+        // do 10 merge inserts in parallel. Each will open the dataset, signal
+        // they have opened, and then wait for a signal to proceed. Once the signal
+        // is received, they will do a merge insert and close the dataset.
+
+        let barrier = Arc::new(Barrier::new(10));
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let uri_ref = test_uri.to_string();
+            let schema_ref = schema.clone();
+            let barrier_ref = barrier.clone();
+            let handle = tokio::task::spawn(async move {
+                let dataset = DatasetBuilder::from_uri(&uri_ref).load().await.unwrap();
+                let dataset = Arc::new(dataset);
+
+                let new_data = RecordBatch::try_new(
+                    schema_ref.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(vec![i])),
+                        Arc::new(UInt32Array::from(vec![1])),
+                    ],
+                )
+                .unwrap();
+                let source = Box::new(RecordBatchIterator::new([Ok(new_data)], schema_ref.clone()));
+
+                let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap();
+                barrier_ref.wait().await;
+
+                job.execute_reader(source).await.unwrap();
+            });
+            handles.push(handle);
+        }
+
+        try_join_all(handles).await.unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+        let batches = dataset.scan().try_into_batch().await.unwrap();
+
+        let values = batches["value"].as_primitive::<UInt32Type>();
+        assert!(
+            values.values().iter().all(|&v| v == 1),
+            "All values should be 1 after merge insert. Got: {:?}",
+            values
+        );
     }
 }
