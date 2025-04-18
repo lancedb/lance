@@ -877,8 +877,6 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
     match (left.data_type(), right.data_type()) {
         (DataType::List(left_field), DataType::List(_)) => {
             if !lists_have_same_offsets_helper::<i32>(left, right) {
-                println!("Left: {:#?}", &left);
-                println!("Right: {:#?}", &right);
                 panic!("Attempt to merge list struct arrays which do not have same offsets");
             }
             merge_list_structs_helper::<i32>(
@@ -1390,7 +1388,6 @@ mod tests {
         let expected =
             RecordBatch::try_new(Arc::new(both_schema), vec![Arc::new(both_null_list)]).unwrap();
         let merged = x_batch.merge(&y_null_batch).unwrap();
-        println!("Expected: {:#?}", &expected);
         assert_eq!(merged, expected);
     }
 
