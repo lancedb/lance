@@ -45,6 +45,12 @@ pub enum Operator {
     Or,
 }
 
+impl Default for Operator {
+    fn default() -> Self {
+        Self::Or
+    }
+}
+
 impl TryFrom<&str> for Operator {
     type Error = Error;
     fn try_from(value: &str) -> Result<Self> {
@@ -187,6 +193,9 @@ pub struct MatchQuery {
     // If None, it will be determined at query time.
     pub column: Option<String>,
     pub terms: String,
+
+    // literal default is not supported so we set it by function
+    #[serde(default = "MatchQuery::default_boost")]
     pub boost: f32,
 
     // The max edit distance for fuzzy matching.
@@ -199,12 +208,14 @@ pub struct MatchQuery {
 
     /// The maximum number of terms to expand for fuzzy matching.
     /// Default to 50.
+    #[serde(default = "MatchQuery::default_max_expansions")]
     pub max_expansions: usize,
 
     /// The operator to use for combining terms.
     /// This can be either `And` or `Or`, it's 'Or' by default.
     /// - `And`: All terms must match.
     /// - `Or`: At least one term must match.
+    #[serde(default)]
     pub operator: Operator,
 }
 
@@ -218,6 +229,14 @@ impl MatchQuery {
             max_expansions: 50,
             operator: Operator::Or,
         }
+    }
+
+    fn default_boost() -> f32 {
+        1.0
+    }
+
+    fn default_max_expansions() -> usize {
+        50
     }
 
     pub fn with_column(mut self, column: Option<String>) -> Self {
@@ -300,6 +319,7 @@ impl FtsQueryNode for PhraseQuery {
 pub struct BoostQuery {
     pub positive: Box<FtsQuery>,
     pub negative: Box<FtsQuery>,
+    #[serde(default = "BoostQuery::default_negative_boost")]
     pub negative_boost: f32,
 }
 
@@ -310,6 +330,10 @@ impl BoostQuery {
             negative: Box::new(negative),
             negative_boost: negative_boost.unwrap_or(0.5),
         }
+    }
+
+    fn default_negative_boost() -> f32 {
+        0.5
     }
 }
 
@@ -519,5 +543,45 @@ pub fn fill_fts_query_column(
                 .collect::<Result<Vec<_>>>()?;
             Ok(FtsQuery::MultiMatch(MultiMatchQuery { match_queries }))
        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_match_query_serde() {
+        use super::*;
+        use serde_json::json;
+
+        let query = MatchQuery::new("hello world".to_string())
+            .with_column(Some("text".to_string()))
+            .with_boost(2.0)
+            .with_fuzziness(Some(1))
+            .with_max_expansions(10)
+            .with_operator(Operator::And);
+
+        let serialized = serde_json::to_value(&query).unwrap();
+        let expected = json!({
+            "column": "text",
+            "terms": "hello world",
+            "boost": 2.0,
+            "fuzziness": 1,
+            "max_expansions": 10,
+            "operator": "And"
+        });
+        assert_eq!(serialized, expected);
+
+        let expected = json!({
+            "column": "text",
+            "terms": "hello world",
+            "fuzziness": 0,
+        });
+        let query = serde_json::from_str::<MatchQuery>(&expected.to_string()).unwrap();
+        assert_eq!(query.column, Some("text".to_owned()));
+        assert_eq!(query.terms, "hello world");
+        assert_eq!(query.boost, 1.0);
+        assert_eq!(query.fuzziness, Some(0));
+        assert_eq!(query.max_expansions, 50);
+        assert_eq!(query.operator, Operator::Or);
     }
 }
