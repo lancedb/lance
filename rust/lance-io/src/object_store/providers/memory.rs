@@ -3,12 +3,11 @@
 
 use std::sync::Arc;
 
-use object_store::memory::InMemory;
+use object_store::{memory::InMemory, path::Path};
 use url::Url;
 
 use crate::object_store::{
-    tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams, ObjectStoreProvider,
-    StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE,
 };
 use lance_core::{error::Result, utils::tokio::get_num_compute_intensive_cpus};
 
@@ -23,7 +22,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         let storage_options = StorageOptions(params.storage_options.clone().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
-            inner: Arc::new(InMemory::new()).traced(),
+            inner: Arc::new(InMemory::new()),
             scheme: String::from("memory"),
             block_size,
             use_constant_size_upload_parts: false,
@@ -32,28 +31,28 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             download_retry_count,
         })
     }
+
+    fn extract_path(&self, url: &Url) -> Path {
+        let mut output = String::new();
+        if let Some(domain) = url.domain() {
+            output.push_str(domain);
+        }
+        output.push_str(url.path());
+        Path::from(output)
+    }
 }
 
-/// Provides the given in-memory object store for each call to `new_store`.
-#[derive(Debug)]
-pub struct PersistentMemoryStoreProvider {
-    pub inner: Arc<InMemory>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[async_trait::async_trait]
-impl ObjectStoreProvider for PersistentMemoryStoreProvider {
-    async fn new_store(&self, _base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
-        let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options.clone().unwrap_or_default());
-        let download_retry_count = storage_options.download_retry_count();
-        Ok(ObjectStore {
-            inner: self.inner.clone(),
-            scheme: String::from("memory"),
-            block_size,
-            use_constant_size_upload_parts: false,
-            list_is_lexically_ordered: true,
-            io_parallelism: get_num_compute_intensive_cpus(),
-            download_retry_count,
-        })
+    #[test]
+    fn test_memory_store_path() {
+        let provider = MemoryStoreProvider;
+
+        let url = Url::parse("memory://path/to/file").unwrap();
+        let path = provider.extract_path(&url);
+        let expected_path = Path::from("path/to/file");
+        assert_eq!(path, expected_path);
     }
 }

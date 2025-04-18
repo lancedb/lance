@@ -51,11 +51,10 @@ impl DeepSizeOf for LanceIndexStore {
 impl LanceIndexStore {
     /// Create a new index store at the given directory
     pub fn new(
-        object_store: ObjectStore,
+        object_store: Arc<ObjectStore>,
         index_dir: Path,
         metadata_cache: FileMetadataCache,
     ) -> Self {
-        let object_store = Arc::new(object_store);
         let scheduler = ScanScheduler::new(
             object_store.clone(),
             SchedulerConfig::max_bandwidth(&object_store),
@@ -319,6 +318,7 @@ pub mod tests {
     use arrow_select::take::TakeOptions;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
+    use futures::FutureExt;
     use lance_core::{cache::CapacityMode, utils::mask::RowIdTreeMap};
     use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
@@ -326,7 +326,10 @@ pub mod tests {
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path: &Path = tempdir.path();
         let (object_store, test_path) =
-            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
+            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
+                .now_or_never()
+                .unwrap()
+                .unwrap();
         let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }

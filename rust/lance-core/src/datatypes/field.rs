@@ -674,7 +674,11 @@ impl Field {
         }
         let self_type = self.data_type();
         let other_type = other.data_type();
-        if self_type.is_struct() && other_type.is_struct() {
+
+        if matches!(
+            (&self_type, &other_type),
+            (DataType::Struct(_), DataType::Struct(_)) | (DataType::List(_), DataType::List(_))
+        ) {
             let children = self
                 .children
                 .iter()

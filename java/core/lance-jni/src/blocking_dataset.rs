@@ -116,7 +116,6 @@ impl BlockingDataset {
         read_version: Option<u64>,
         storage_options: HashMap<String, String>,
     ) -> Result<Self> {
-        let object_store_registry = Arc::new(ObjectStoreRegistry::default());
         let inner = RT.block_on(Dataset::commit(
             uri,
             operation,
@@ -126,7 +125,7 @@ impl BlockingDataset {
                 ..Default::default()
             }),
             None,
-            object_store_registry,
+            Default::default(),
             false, // TODO: support enable_v2_manifest_paths
         ))?;
         Ok(Self { inner })
