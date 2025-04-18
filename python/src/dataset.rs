@@ -16,15 +16,6 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::Duration;
-
-use crate::error::PythonErrorExt;
-use crate::file::object_store_from_uri_or_path;
-use crate::fragment::FileFragment;
-use crate::schema::LanceSchema;
-use crate::session::Session;
-use crate::utils::PyLance;
-use crate::RT;
-use crate::{LanceReader, Scanner};
 use futures::{StreamExt, TryFutureExt};
 
 use lance::dataset::builder::DatasetBuilder;
@@ -69,7 +60,7 @@ use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
-use log::error;
+use log::{error, warn};
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
@@ -83,7 +74,15 @@ use pyo3::{
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
+use crate::error::PythonErrorExt;
+use crate::file::object_store_from_uri_or_path;
+use crate::fragment::FileFragment;
 use crate::scanner::ScanStatistics;
+use crate::schema::LanceSchema;
+use crate::session::Session;
+use crate::utils::PyLance;
+use crate::RT;
+use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
@@ -1827,10 +1826,22 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         {
             let mut file_writer_options = FileWriterOptions::default();
             if let Some(max_page_bytes) = writer_options.get("max_page_bytes") {
-                file_writer_options.max_page_bytes = max_page_bytes.parse::<u64>().ok()
+                file_writer_options.max_page_bytes = match max_page_bytes.parse::<u64>() {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!("Failed to parse max_page_bytes: {}, using default", e);
+                        None
+                    }
+                }
             }
             if let Some(data_cache_bytes) = writer_options.get("data_cache_bytes") {
-                file_writer_options.data_cache_bytes = data_cache_bytes.parse::<u64>().ok()
+                file_writer_options.data_cache_bytes = match data_cache_bytes.parse::<u64>() {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!("Failed to parse data_cache_bytes: {}, using default", e);
+                        None
+                    }
+                }
             }
             p.file_writer_options = Some(file_writer_options);
         }

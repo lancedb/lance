@@ -306,7 +306,7 @@ class LanceFragment(pa.dataset.Fragment):
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
         file_writer_options : optional, dict
-            Extra file write options that make sense to control lance data file.
+            Extra options for the lance file writer.
             These options can be set in dict:
             `data_cache_bytes`: how many bytes to use for buffering column data,
                 the default value is 8 * 1024 * 1024

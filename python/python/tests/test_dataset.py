@@ -3233,3 +3233,33 @@ def test_write_dataset_with_file_writer_options(tmp_path):
     file_writer_options = {"data_cache_bytes": "4096", "max_page_bytes": "4096"}
     ds = lance.write_dataset(dat, tmp_path, file_writer_options=file_writer_options)
     assert ds.to_table() == pa.Table.from_pydict(dat)
+
+def test_write_dataset_with_error_file_writer_options(tmp_path):
+    dat = {
+        "foo": [1, 3],
+        "bar": ["one", "three"],
+    }
+    file_writer_options = {"data_cache_bytes": "4096e", "max_page_bytes": "4096m"}
+    ds = lance.write_dataset(dat, tmp_path, file_writer_options=file_writer_options)
+    assert ds.to_table() == pa.Table.from_pydict(dat)
+
+def test_write_dataset_with_diff_file_writer_options(tmp_path):
+    dat = {
+        "id": [str(i).zfill(8) for i in range(100000)],
+    }
+    lance.write_dataset(dat, tmp_path)
+    data_files = os.listdir(tmp_path / "data")
+    assert len(data_files) == 1
+    from lance.file import LanceFileReader
+    reader = LanceFileReader(str(tmp_path / f"data/{data_files[0]}"))
+    for c in reader.metadata().columns:
+        # fill in one page
+        assert len(c.pages) == 1
+
+    file_writer_options = {"data_cache_bytes": "4096", "max_page_bytes": "4096"}
+    lance.write_dataset(dat, tmp_path, file_writer_options=file_writer_options, mode="overwrite")
+    small_page_data_files = list(set(os.listdir(tmp_path / "data")) - set(data_files))
+    assert len(small_page_data_files) == 1
+    small_page_reader = LanceFileReader(str(tmp_path / f"data/{small_page_data_files[0]}"))
+    for c in small_page_reader.metadata().columns:
+        assert len(c.pages) == 293
