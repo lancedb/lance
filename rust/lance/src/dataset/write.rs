@@ -5,9 +5,6 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use chrono::TimeDelta;
-use arrow_schema::Schema as ArrowSchema;
-use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::physical_plan::common::IPCWriter;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{Stream, StreamExt, TryStreamExt};

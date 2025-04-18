@@ -2142,9 +2142,10 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(UInt32Array::from_iter_values(0..num_rows)),
-                Arc::new(UInt32Array::from_iter_values(
-                    std::iter::repeat(0).take(num_rows as usize),
-                )),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(
+                    0,
+                    num_rows as usize,
+                ))),
             ],
         )
         .unwrap();
@@ -2217,9 +2218,10 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(UInt32Array::from_iter_values(0..num_rows)),
-                Arc::new(UInt32Array::from_iter_values(
-                    std::iter::repeat(0).take(num_rows as usize),
-                )),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(
+                    0,
+                    num_rows as usize,
+                ))),
             ],
         )
         .unwrap();
@@ -2260,9 +2262,7 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(UInt32Array::from_iter_values(0..1000)),
-                Arc::new(UInt32Array::from_iter_values(
-                    std::iter::repeat(2).take(1000),
-                )),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(2, 1000))),
             ],
         )
         .unwrap();

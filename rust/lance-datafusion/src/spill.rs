@@ -179,7 +179,7 @@ impl From<&mut SpillError> for DataFusionError {
     fn from(err: &mut SpillError) -> Self {
         match err {
             SpillError::Original(inner) => {
-                let copy = DataFusionError::Execution(inner.to_string());
+                let copy = Self::Execution(inner.to_string());
                 let original = std::mem::replace(err, SpillError::Copy(copy));
                 if let SpillError::Original(inner) = original {
                     inner
@@ -187,9 +187,7 @@ impl From<&mut SpillError> for DataFusionError {
                     unreachable!()
                 }
             }
-            SpillError::Copy(DataFusionError::Execution(message)) => {
-                DataFusionError::Execution(message.clone())
-            }
+            SpillError::Copy(Self::Execution(message)) => Self::Execution(message.clone()),
             _ => unreachable!(),
         }
     }
@@ -205,7 +203,7 @@ impl From<&SpillState> for WriteStatus {
             SpillState::Finished { batches_written } => (true, *batches_written, None),
             SpillState::Errored { error } => (false, 0, Some(error.clone())),
         };
-        WriteStatus {
+        Self {
             finished,
             batches_written,
             error,
