@@ -262,6 +262,13 @@ public class Dataset implements Closeable {
       List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
 
+  public static native Dataset commitMerge(
+      String path,
+      long arrowSchemaMemoryAddress,
+      Optional<Long> readVersion,
+      List<FragmentMetadata> fragmentsMetadata,
+      Map<String, String> storageOptions);
+
   /**
    * Drop a Dataset.
    *
@@ -607,4 +614,10 @@ public class Dataset implements Closeable {
   }
 
   private native FragmentMetadata getFragmentNative(int fragmentId);
+
+  public int getMaxFieldId() {
+    return getMaxFieldIdNative();
+  }
+
+  private native int getMaxFieldIdNative();
 }
