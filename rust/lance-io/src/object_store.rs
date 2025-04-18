@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
 #[cfg(feature = "aws")]
@@ -261,25 +262,6 @@ fn local_path_to_url(str_path: &str) -> Result<Url> {
     })
 }
 
-fn extract_path(url: &Url) -> Path {
-    match url.scheme() {
-        "memory" => {
-            let mut output = String::new();
-            if let Some(domain) = url.domain() {
-                output.push_str(domain);
-            }
-            output.push_str(url.path());
-            Path::from(output)
-        }
-        "file" | "file-object-store" => url
-            .to_file_path()
-            .ok()
-            .and_then(|p| Path::from_absolute_path(p).ok())
-            .unwrap_or_else(|| Path::from(url.path())),
-        _ => Path::from(url.path()),
-    }
-}
-
 impl ObjectStore {
     /// Parse from a string URI.
     ///
@@ -321,8 +303,11 @@ impl ObjectStore {
             return Ok((Arc::new(store), path));
         }
         let url = uri_to_url(uri)?;
-        let path = extract_path(&url);
-        let store = registry.get_store(url, params).await?;
+        let store = registry.get_store(url.clone(), params).await?;
+        // We know the scheme is valid if we got a store back.
+        let provider = registry.get_provider(url.scheme()).expect_ok()?;
+        let path = provider.extract_path(&url);
+
         Ok((store, path))
     }
 
@@ -963,44 +948,6 @@ mod tests {
 
         let buf = obj_store.read_one_range(&file_path_os, 0..5).await.unwrap();
         assert_eq!(buf.as_bytes(), b"LOCAL");
-    }
-
-    #[test]
-    fn test_path_parsing() {
-        let cases = [
-            ("file:///", ""),
-            ("file:///usr/local/bin", "usr/local/bin"),
-            ("memory://test/path", "test/path"),
-            ("s3://bucket/path", "path"),
-            ("s3+ddb://bucket/path", "path"),
-            ("gs://bucket/path", "path"),
-            ("az://account/path", "path"),
-        ];
-        for (uri, expected_path) in cases {
-            let url = uri_to_url(uri).unwrap();
-            let path = extract_path(&url);
-            assert_eq!(path.to_string(), expected_path);
-        }
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn test_path_parsing_windows() {
-        let cases = [
-            (
-                "C:\\Users\\ADMINI~1\\AppData\\Local\\",
-                "C:/Users/ADMINI~1/AppData/Local",
-            ),
-            (
-                "C:\\Users\\ADMINI~1\\AppData\\Local\\..\\",
-                "C:/Users/ADMINI~1/AppData",
-            ),
-        ];
-        for (uri, expected_path) in cases {
-            let url = uri_to_url(uri).unwrap();
-            let path = extract_path(&url);
-            assert_eq!(path.to_string(), expected_path);
-        }
     }
 
     #[tokio::test]

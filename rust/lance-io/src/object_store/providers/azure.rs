@@ -81,3 +81,18 @@ impl StorageOptions {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_azure_store_path() {
+        let provider = AzureBlobStoreProvider;
+
+        let url = Url::parse("az://bucket/path/to/file").unwrap();
+        let path = provider.extract_path(&url);
+        let expected_path = object_store::path::Path::from("path/to/file");
+        assert_eq!(path, expected_path);
+    }
+}

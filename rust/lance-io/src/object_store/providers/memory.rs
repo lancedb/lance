@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use object_store::memory::InMemory;
+use object_store::{memory::InMemory, path::Path};
 use url::Url;
 
 use crate::object_store::{
@@ -30,5 +30,29 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             io_parallelism: get_num_compute_intensive_cpus(),
             download_retry_count,
         })
+    }
+
+    fn extract_path(&self, url: &Url) -> Path {
+        let mut output = String::new();
+        if let Some(domain) = url.domain() {
+            output.push_str(domain);
+        }
+        output.push_str(url.path());
+        Path::from(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memory_store_path() {
+        let provider = MemoryStoreProvider;
+
+        let url = Url::parse("memory://path/to/file").unwrap();
+        let path = provider.extract_path(&url);
+        let expected_path = Path::from("path/to/file");
+        assert_eq!(path, expected_path);
     }
 }

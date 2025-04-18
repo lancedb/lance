@@ -19,7 +19,7 @@ use self::index_extension::IndexExtension;
 pub mod index_extension;
 
 /// A user session tracks the runtime state.
-#[derive(Clone, DeepSizeOf)]
+#[derive(Clone)]
 pub struct Session {
     /// Cache for opened indices.
     pub(crate) index_cache: IndexCache,
@@ -30,6 +30,18 @@ pub struct Session {
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
     store_registry: Arc<ObjectStoreRegistry>,
+}
+
+impl DeepSizeOf for Session {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        let mut size = 0;
+        size += self.index_cache.deep_size_of_children(context);
+        size += self.file_metadata_cache.deep_size_of_children(context);
+        for ext in self.index_extensions.values() {
+            size += ext.deep_size_of_children(context);
+        }
+        size
+    }
 }
 
 impl std::fmt::Debug for Session {

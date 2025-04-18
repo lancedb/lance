@@ -396,4 +396,24 @@ mod tests {
         // Not called yet
         assert!(mock_provider.called.load(Ordering::Relaxed));
     }
+
+    #[test]
+    fn test_s3_path_parsing() {
+        let provider = AwsStoreProvider;
+
+        let cases = [
+            ("s3://bucket/path/to/file", "path/to/file"),
+            (
+                "s3+ddb://bucket/path/to/file?ddbTableName=test",
+                "path/to/file",
+            ),
+        ];
+
+        for (uri, expected_path) in cases {
+            let url = Url::parse(uri).unwrap();
+            let path = provider.extract_path(&url);
+            let expected_path = Path::from(expected_path);
+            assert_eq!(path, expected_path);
+        }
+    }
 }

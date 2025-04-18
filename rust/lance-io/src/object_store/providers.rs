@@ -6,12 +6,12 @@ use std::{
     sync::{Arc, RwLock, Weak},
 };
 
-use deepsize::DeepSizeOf;
+use object_store::path::Path;
 use snafu::location;
 use url::Url;
 
 use super::{tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams};
-use lance_core::error::{Error, Result};
+use lance_core::error::{Error, LanceOptionExt, Result};
 
 #[cfg(feature = "aws")]
 pub mod aws;
@@ -25,6 +25,17 @@ pub mod memory;
 #[async_trait::async_trait]
 pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore>;
+
+    /// Extract the path relative to the base of the store.
+    ///
+    /// For example, in S3 the path is relative to the bucket. So a URL of
+    /// `s3://bucket/path/to/file` would return `path/to/file`.
+    ///
+    /// Meanwhile, for a file store, the path is relative to the filesystem root.
+    /// So a URL of `file:///path/to/file` would return `/path/to/file`.
+    fn extract_path(&self, url: &Url) -> Path {
+        Path::from(url.path())
+    }
 }
 
 /// A registry of object store providers.
@@ -53,30 +64,6 @@ pub struct ObjectStoreRegistry {
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
     active_stores: RwLock<HashMap<(String, ObjectStoreParams), Weak<ObjectStore>>>,
-}
-
-impl DeepSizeOf for ObjectStoreRegistry {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        let mut size = 0;
-        let providers = self
-            .providers
-            .read()
-            .expect("ObjectStoreRegistry lock poisoned");
-        for (key, _provider) in providers.iter() {
-            size += key.deep_size_of();
-            // Ignore provider for simplicity
-        }
-        let active_stores = self
-            .active_stores
-            .read()
-            .expect("ObjectStoreRegistry lock poisoned");
-        for ((base_path, _params), _store) in active_stores.iter() {
-            size += base_path.deep_size_of();
-            // Ignore params for simplicity
-            size += std::mem::size_of::<Weak<ObjectStore>>();
-        }
-        size
-    }
 }
 
 /// Convert a URL to a cache key.
@@ -171,7 +158,8 @@ impl ObjectStoreRegistry {
             let maybe_store = self
                 .active_stores
                 .read()
-                .expect("ObjectStoreRegistry lock poisoned")
+                .ok()
+                .expect_ok()?
                 .get(&cache_key)
                 .cloned();
             if let Some(store) = maybe_store {
@@ -194,23 +182,15 @@ impl ObjectStoreRegistry {
         }
 
         let scheme = base_path.scheme();
-        let provider = self.get_provider(scheme).ok_or_else(|| {
-            let valid_schemes = self
-                .providers
-                .read()
-                .expect("ObjectStoreRegistry lock poisoned")
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            Error::invalid_input(
-                format!(
-                    "No object store provider found for scheme: '{}'\n valid_schemes: {}",
-                    scheme, valid_schemes
-                ),
-                location!(),
-            )
-        })?;
+        let Some(provider) = self.get_provider(scheme) else {
+            let mut message = format!("No object store provider found for scheme: '{}'", scheme);
+            if let Ok(providers) = self.providers.read() {
+                let valid_schemes = providers.keys().cloned().collect::<Vec<_>>().join(", ");
+                message.push_str(&format!("\nValid schemes: {}", valid_schemes));
+            }
+
+            return Err(Error::invalid_input(message, location!()));
+        };
         let mut store = provider.new_store(base_path, params).await?;
 
         store.inner = store.inner.traced();
@@ -223,10 +203,7 @@ impl ObjectStoreRegistry {
 
         {
             // Insert the store into the cache
-            let mut cache_lock = self
-                .active_stores
-                .write()
-                .expect("ObjectStoreRegistry lock poisoned");
+            let mut cache_lock = self.active_stores.write().ok().expect_ok()?;
             cache_lock.insert(cache_key, Arc::downgrade(&store));
         }
 
@@ -268,7 +245,7 @@ impl Default for ObjectStoreRegistry {
 }
 
 impl ObjectStoreRegistry {
-    /// Add a new object store provider to the registry. This will be called
+    /// Add a new object store provider to the registry. The provider will be used
     /// in [`Self::get_store()`] when a URL is passed with a matching scheme.
     pub fn insert(&self, scheme: &str, provider: Arc<dyn ObjectStoreProvider>) {
         self.providers
