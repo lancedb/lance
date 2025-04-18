@@ -1488,7 +1488,7 @@ mod tests {
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use tempfile::tempdir;
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Notify};
 
     use crate::dataset::{builder::DatasetBuilder, InsertBuilder, WriteMode, WriteParams};
 
@@ -2201,6 +2201,110 @@ mod tests {
         let values = batches["value"].as_primitive::<UInt32Type>();
         assert!(
             values.values().iter().all(|&v| v == 1),
+            "All values should be 1 after merge insert. Got: {:?}",
+            values
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_large_concurrent() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let num_rows = 10;
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..num_rows)),
+                Arc::new(UInt32Array::from_iter_values(
+                    std::iter::repeat(0).take(num_rows as usize),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = InsertBuilder::new(test_uri)
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Start one merge insert, but don't commit it yet.
+        let new_data1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1])),
+                Arc::new(UInt32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let (transaction1, _stats) =
+            MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(RecordBatchIterator::new(
+                    vec![Ok(new_data1)],
+                    schema.clone(),
+                ))
+                .await
+                .unwrap();
+
+        // Setup a "large" merge insert, with many batches
+        let new_data2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..1000)),
+                Arc::new(UInt32Array::from_iter_values(
+                    std::iter::repeat(2).take(1000),
+                )),
+            ],
+        )
+        .unwrap();
+        let notify = Arc::new(Notify::new());
+        let source = RecordBatchIterator::new(
+            (0..10)
+                .map(|i| {
+                    let batch = new_data2.slice(i * 100, 100);
+                    if i == 9 {
+                        notify.notify_one();
+                    }
+                    Ok(batch)
+                })
+                .collect::<Vec<_>>(),
+            schema.clone(),
+        );
+        let dataset2 = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset2), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(source);
+        let task = tokio::task::spawn(job);
+
+        // Right as the large merge insert has finished reading the last batch,
+        // we will commit the first merge insert. This should trigger a conflict,
+        // but we should resolve it automatically.
+        notify.notified().await;
+        let mut dataset = CommitBuilder::new(dataset)
+            .execute(transaction1)
+            .await
+            .unwrap();
+
+        task.await.unwrap().unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        let batches = dataset.scan().try_into_batch().await.unwrap();
+        let values = batches["value"].as_primitive::<UInt32Type>();
+        assert!(
+            values.values().iter().all(|&v| v == 2),
             "All values should be 1 after merge insert. Got: {:?}",
             values
         );
