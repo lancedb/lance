@@ -643,7 +643,7 @@ impl NGramIndexBuilder {
 
         let tmpdir = Arc::new(tempdir()?);
         let spill_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local(),
+            Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(tmpdir.path())?,
             FileMetadataCache::no_cache(),
         ));
@@ -1249,7 +1249,7 @@ mod tests {
 
         let tmpdir = Arc::new(tempdir().unwrap());
         let test_store = LanceIndexStore::new(
-            ObjectStore::local(),
+            Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
             FileMetadataCache::no_cache(),
         );
@@ -1453,7 +1453,7 @@ mod tests {
 
         let new_tmpdir = Arc::new(tempdir().unwrap());
         let test_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local(),
+            Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
             FileMetadataCache::no_cache(),
         ));
@@ -1488,7 +1488,7 @@ mod tests {
 
         let new_tmpdir = Arc::new(tempdir().unwrap());
         let test_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local(),
+            Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
             FileMetadataCache::no_cache(),
         ));
@@ -1528,7 +1528,7 @@ mod tests {
 
         let new_tmpdir = Arc::new(tempdir().unwrap());
         let test_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local(),
+            Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
             FileMetadataCache::no_cache(),
         ));

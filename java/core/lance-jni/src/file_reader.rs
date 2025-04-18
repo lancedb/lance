@@ -89,7 +89,6 @@ fn inner_open<'local>(env: &mut JNIEnv<'local>, file_uri: JString) -> Result<JOb
 
     let reader = RT.block_on(async move {
         let (obj_store, path) = ObjectStore::from_uri(&file_uri_str).await?;
-        let obj_store = Arc::new(obj_store);
         let config = SchedulerConfig::max_bandwidth(&obj_store);
         let scan_scheduler = ScanScheduler::new(obj_store, config);
 

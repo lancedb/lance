@@ -16,7 +16,6 @@ use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use snafu::location;
 use std::borrow::Cow;
-use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::dataset::builder::DatasetBuilder;
@@ -90,7 +89,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
-            params.object_store_registry.clone(),
+            params.store_registry(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
         )
@@ -156,13 +155,13 @@ impl<'a> FragmentCreateBuilder<'a> {
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
-            params.object_store_registry.clone(),
+            params.store_registry(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
         )
         .await?;
         do_write_fragments(
-            Arc::new(object_store),
+            object_store,
             &base_path,
             &schema,
             stream,
@@ -192,7 +191,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
-            params.object_store_registry.clone(),
+            params.store_registry(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
         )

@@ -173,7 +173,7 @@ jobs:
           - nightly
     defaults:
       run:
-        working-directory: ./rust/lance
+        working-directory: ./rust
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -200,7 +200,7 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: rust/lance
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2

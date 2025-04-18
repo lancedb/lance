@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -17,12 +16,13 @@ use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
 use object_store::DynObjectStore;
-use object_store::{local::LocalFileSystem, Error as ObjectStoreError};
+use object_store::Error as ObjectStoreError;
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
@@ -35,7 +35,6 @@ use super::local::LocalObjectReader;
 mod list_retry;
 pub mod providers;
 mod tracing;
-use self::tracing::ObjectStoreTracingExt;
 use crate::object_writer::WriteResult;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
@@ -171,11 +170,107 @@ impl Default for ObjectStoreParams {
     }
 }
 
+// We implement hash for caching
+impl std::hash::Hash for ObjectStoreParams {
+    #[allow(deprecated)]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // For hashing, we use pointer values for ObjectStore, S3 credentials, and wrapper
+        self.block_size.hash(state);
+        if let Some((store, url)) = &self.object_store {
+            Arc::as_ptr(store).hash(state);
+            url.hash(state);
+        }
+        self.s3_credentials_refresh_offset.hash(state);
+        #[cfg(feature = "aws")]
+        if let Some(aws_credentials) = &self.aws_credentials {
+            Arc::as_ptr(aws_credentials).hash(state);
+        }
+        if let Some(wrapper) = &self.object_store_wrapper {
+            Arc::as_ptr(wrapper).hash(state);
+        }
+        if let Some(storage_options) = &self.storage_options {
+            for (key, value) in storage_options {
+                key.hash(state);
+                value.hash(state);
+            }
+        }
+        self.use_constant_size_upload_parts.hash(state);
+        self.list_is_lexically_ordered.hash(state);
+    }
+}
+
+// We implement eq for caching
+impl Eq for ObjectStoreParams {}
+impl PartialEq for ObjectStoreParams {
+    #[allow(deprecated)]
+    fn eq(&self, other: &Self) -> bool {
+        // For equality, we use pointer comparison for ObjectStore, S3 credentials, and wrapper
+        self.block_size == other.block_size
+            && self
+                .object_store
+                .as_ref()
+                .map(|(store, url)| (Arc::as_ptr(store), url))
+                == other
+                    .object_store
+                    .as_ref()
+                    .map(|(store, url)| (Arc::as_ptr(store), url))
+            && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
+            && self.aws_credentials.as_ref().map(Arc::as_ptr)
+                == other.aws_credentials.as_ref().map(Arc::as_ptr)
+            && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
+                == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
+            && self.storage_options == other.storage_options
+            && self.use_constant_size_upload_parts == other.use_constant_size_upload_parts
+            && self.list_is_lexically_ordered == other.list_is_lexically_ordered
+    }
+}
+
+fn uri_to_url(uri: &str) -> Result<Url> {
+    match Url::parse(uri) {
+        Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
+            // On Windows, the drive is parsed as a scheme
+            local_path_to_url(uri)
+        }
+        Ok(url) => Ok(url),
+        Err(_) => local_path_to_url(uri),
+    }
+}
+
+fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
+    let expanded = tilde(str_path.as_ref()).to_string();
+
+    let mut expanded_path = path_abs::PathAbs::new(expanded)
+        .unwrap()
+        .as_path()
+        .to_path_buf();
+    // path_abs::PathAbs::new(".") returns an empty string.
+    if let Some(s) = expanded_path.as_path().to_str() {
+        if s.is_empty() {
+            expanded_path = std::env::current_dir()?;
+        }
+    }
+
+    Ok(expanded_path)
+}
+
+fn local_path_to_url(str_path: &str) -> Result<Url> {
+    let expanded_path = expand_path(str_path)?;
+
+    Url::from_directory_path(expanded_path).map_err(|_| Error::InvalidInput {
+        source: format!("Invalid table location: '{}'", str_path).into(),
+        location: location!(),
+    })
+}
+
 impl ObjectStore {
     /// Parse from a string URI.
     ///
     /// Returns the ObjectStore instance and the absolute path to the object.
-    pub async fn from_uri(uri: &str) -> Result<(Self, Path)> {
+    ///
+    /// This uses the default [ObjectStoreRegistry] to find the object store. To
+    /// allow for potential re-use of object store instances, it's recommended to
+    /// create a shared [ObjectStoreRegistry] and pass that to [Self::from_uri_and_params].
+    pub async fn from_uri(uri: &str) -> Result<(Arc<Self>, Path)> {
         let registry = Arc::new(ObjectStoreRegistry::default());
 
         Self::from_uri_and_params(registry, uri, &ObjectStoreParams::default()).await
@@ -188,7 +283,7 @@ impl ObjectStore {
         registry: Arc<ObjectStoreRegistry>,
         uri: &str,
         params: &ObjectStoreParams,
-    ) -> Result<(Self, Path)> {
+    ) -> Result<(Arc<Self>, Path)> {
         #[allow(deprecated)]
         if let Some((store, path)) = params.object_store.as_ref() {
             let mut inner = store.clone();
@@ -205,79 +300,26 @@ impl ObjectStore {
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
             };
             let path = Path::from(path.path());
-            return Ok((store, path));
+            return Ok((Arc::new(store), path));
         }
-        let (object_store, path) = match Url::parse(uri) {
-            Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
-                // On Windows, the drive is parsed as a scheme
-                Self::from_path(uri)
-            }
-            Ok(url) => {
-                let store = Self::new_from_url(registry, url.clone(), params.clone()).await?;
-                Ok((store, Path::from(url.path())))
-            }
-            Err(_) => Self::from_path(uri),
-        }?;
+        let url = uri_to_url(uri)?;
+        let store = registry.get_store(url.clone(), params).await?;
+        // We know the scheme is valid if we got a store back.
+        let provider = registry.get_provider(url.scheme()).expect_ok()?;
+        let path = provider.extract_path(&url);
 
-        Ok((
-            Self {
-                inner: params
-                    .object_store_wrapper
-                    .as_ref()
-                    .map(|w| w.wrap(object_store.inner.clone()))
-                    .unwrap_or(object_store.inner),
-                ..object_store
-            },
-            path,
-        ))
+        Ok((store, path))
     }
 
-    pub fn from_path_with_scheme(str_path: &str, scheme: &str) -> Result<(Self, Path)> {
-        let expanded = tilde(str_path).to_string();
-
-        let mut expanded_path = path_abs::PathAbs::new(expanded)
-            .unwrap()
-            .as_path()
-            .to_path_buf();
-        // path_abs::PathAbs::new(".") returns an empty string.
-        if let Some(s) = expanded_path.as_path().to_str() {
-            if s.is_empty() {
-                expanded_path = std::env::current_dir()?;
-            }
-        }
-        Ok((
-            Self {
-                inner: Arc::new(LocalFileSystem::new()).traced(),
-                scheme: String::from(scheme),
-                block_size: 4 * 1024, // 4KB block size
-                use_constant_size_upload_parts: false,
-                list_is_lexically_ordered: false,
-                io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
-                download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
-            },
-            Path::from_absolute_path(expanded_path.as_path())?,
-        ))
-    }
-
-    pub fn from_path(str_path: &str) -> Result<(Self, Path)> {
-        Self::from_path_with_scheme(str_path, "file")
-    }
-
-    async fn new_from_url(
-        registry: Arc<ObjectStoreRegistry>,
-        url: Url,
-        params: ObjectStoreParams,
-    ) -> Result<Self> {
-        let url = ensure_table_uri(url)?;
-        let scheme = url.scheme();
-        if let Some(provider) = registry.get_provider(scheme) {
-            provider.new_store(url, &params).await
-        } else {
-            let err = lance_core::Error::from(object_store::Error::NotSupported {
-                source: format!("Unsupported URI scheme: {} in url {}", scheme, url).into(),
-            });
-            Err(err)
-        }
+    #[deprecated(note = "Use `from_uri` instead")]
+    pub fn from_path(str_path: &str) -> Result<(Arc<Self>, Path)> {
+        Self::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            str_path,
+            &Default::default(),
+        )
+        .now_or_never()
+        .unwrap()
     }
 
     /// Local object store.
@@ -311,14 +353,6 @@ impl ObjectStore {
 
     pub fn block_size(&self) -> usize {
         self.block_size
-    }
-
-    pub fn set_block_size(&mut self, new_size: usize) {
-        self.block_size = new_size;
-    }
-
-    pub fn set_io_parallelism(&mut self, io_parallelism: usize) {
-        self.io_parallelism = io_parallelism;
     }
 
     pub fn io_parallelism(&self) -> usize {
@@ -365,14 +399,16 @@ impl ObjectStore {
     /// Create an [ObjectWriter] from local [std::path::Path]
     pub async fn create_local_writer(path: &std::path::Path) -> Result<ObjectWriter> {
         let object_store = Self::local();
-        let os_path = Path::from(path.to_str().unwrap());
+        let absolute_path = expand_path(path.to_string_lossy())?;
+        let os_path = Path::from_absolute_path(absolute_path)?;
         object_store.create(&os_path).await
     }
 
     /// Open an [Reader] from local [std::path::Path]
     pub async fn open_local(path: &std::path::Path) -> Result<Box<dyn Reader>> {
         let object_store = Self::local();
-        let os_path = Path::from(path.to_str().unwrap());
+        let absolute_path = expand_path(path.to_string_lossy())?;
+        let os_path = Path::from_absolute_path(absolute_path)?;
         object_store.open(&os_path).await
     }
 
@@ -622,63 +658,6 @@ fn infer_block_size(scheme: &str) -> usize {
     }
 }
 
-/// Attempt to create a Url from given table location.
-///
-/// The location could be:
-///  * A valid URL, which will be parsed and returned
-///  * A path to a directory, which will be created and then converted to a URL.
-///
-/// If it is a local path, it will be created if it doesn't exist.
-///
-/// Extra slashes will be removed from the end path as well.
-///
-/// Will return an error if the location is not valid. For example,
-pub fn ensure_table_uri(table_uri: impl AsRef<str>) -> Result<Url> {
-    let table_uri = table_uri.as_ref();
-
-    enum UriType {
-        LocalPath(PathBuf),
-        Url(Url),
-    }
-    let uri_type: UriType = if let Ok(url) = Url::parse(table_uri) {
-        if url.scheme() == "file" {
-            UriType::LocalPath(url.to_file_path().map_err(|err| {
-                let msg = format!("Invalid table location: {}\nError: {:?}", table_uri, err);
-                Error::InvalidTableLocation { message: msg }
-            })?)
-        // NOTE this check is required to support absolute windows paths which may properly parse as url
-        } else {
-            UriType::Url(url)
-        }
-    } else {
-        UriType::LocalPath(PathBuf::from(table_uri))
-    };
-
-    // If it is a local path, we need to create it if it does not exist.
-    let mut url = match uri_type {
-        UriType::LocalPath(path) => {
-            let path = std::fs::canonicalize(path).map_err(|err| Error::DatasetNotFound {
-                path: table_uri.to_string(),
-                source: Box::new(err),
-                location: location!(),
-            })?;
-            Url::from_directory_path(path).map_err(|_| {
-                let msg = format!(
-                    "Could not construct a URL from canonicalized path: {}.\n\
-                  Something must be very wrong with the table path.",
-                    table_uri
-                );
-                Error::InvalidTableLocation { message: msg }
-            })?
-        }
-        UriType::Url(url) => url,
-    };
-
-    let trimmed_path = url.path().trim_end_matches('/').to_owned();
-    url.set_path(&trimmed_path);
-    Ok(url)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,7 +677,7 @@ mod tests {
         write(path, contents)
     }
 
-    async fn read_from_store(store: ObjectStore, path: &Path) -> Result<String> {
+    async fn read_from_store(store: &ObjectStore, path: &Path) -> Result<String> {
         let test_file_store = store.open(path).await.unwrap();
         let size = test_file_store.size().await.unwrap();
         let bytes = test_file_store.get_range(0..size).await.unwrap();
@@ -723,7 +702,7 @@ mod tests {
             format!("{tmp_path}/bar/foo.lance/../foo.lance"),
         ] {
             let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
-            let contents = read_from_store(store, &path.child("test_file"))
+            let contents = read_from_store(store.as_ref(), &path.child("test_file"))
                 .await
                 .unwrap();
             assert_eq!(contents, "TEST_CONTENT");
@@ -822,7 +801,7 @@ mod tests {
         set_current_dir(StdPath::new(&tmp_path)).expect("Error changing current dir");
         let (store, path) = ObjectStore::from_uri("./bar/foo.lance").await.unwrap();
 
-        let contents = read_from_store(store, &path.child("test_file"))
+        let contents = read_from_store(store.as_ref(), &path.child("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "RELATIVE_URL");
@@ -833,7 +812,7 @@ mod tests {
         let uri = "~/foo.lance";
         write_to_file(&format!("{uri}/test_file"), "TILDE").unwrap();
         let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
-        let contents = read_from_store(store, &path.child("test_file"))
+        let contents = read_from_store(store.as_ref(), &path.child("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "TILDE");
@@ -1008,7 +987,7 @@ mod tests {
             format!("{drive_letter}:\\test_folder\\test.lance"),
         ] {
             let (store, base) = ObjectStore::from_uri(uri).await.unwrap();
-            let contents = read_from_store(store, &base.child("test_file"))
+            let contents = read_from_store(store.as_ref(), &base.child("test_file"))
                 .await
                 .unwrap();
             assert_eq!(contents, "WINDOWS");

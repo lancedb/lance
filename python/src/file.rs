@@ -333,7 +333,7 @@ fn path_to_parent(path: &Path) -> PyResult<(Path, String)> {
 
 pub async fn object_store_from_uri_or_path_no_options(
     uri_or_path: impl AsRef<str>,
-) -> PyResult<(ObjectStore, Path)> {
+) -> PyResult<(Arc<ObjectStore>, Path)> {
     object_store_from_uri_or_path(uri_or_path, None).await
 }
 
@@ -344,7 +344,7 @@ pub async fn object_store_from_uri_or_path_no_options(
 pub async fn object_store_from_uri_or_path(
     uri_or_path: impl AsRef<str>,
     storage_options: Option<HashMap<String, String>>,
-) -> PyResult<(ObjectStore, Path)> {
+) -> PyResult<(Arc<ObjectStore>, Path)> {
     if let Ok(mut url) = Url::parse(uri_or_path.as_ref()) {
         if url.scheme().len() > 1 {
             let path = object_store::path::Path::parse(url.path()).map_err(|e| {
@@ -376,7 +376,7 @@ pub async fn object_store_from_uri_or_path(
     let path = Path::parse(uri_or_path.as_ref()).map_err(|e| {
         PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path.as_ref(), e))
     })?;
-    let object_store = ObjectStore::local();
+    let object_store = Arc::new(ObjectStore::local());
     Ok((object_store, path))
 }
 
@@ -393,7 +393,7 @@ impl LanceFileReader {
         let (object_store, path) =
             object_store_from_uri_or_path(uri_or_path, storage_options).await?;
         let scheduler = ScanScheduler::new(
-            Arc::new(object_store),
+            object_store,
             SchedulerConfig {
                 io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
             },

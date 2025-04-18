@@ -10,8 +10,8 @@ use object_store::{
 use url::Url;
 
 use crate::object_store::{
-    tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams, ObjectStoreProvider,
-    StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
+    DEFAULT_CLOUD_IO_PARALLELISM,
 };
 use lance_core::error::Result;
 
@@ -49,11 +49,10 @@ impl ObjectStoreProvider for GcsStoreProvider {
             let credential_provider = Arc::new(StaticCredentialProvider::new(credential)) as _;
             builder = builder.with_credentials(credential_provider);
         }
-        let store = builder.build()?;
-        let store = Arc::new(store).traced();
+        let inner = Arc::new(builder.build()?);
 
         Ok(ObjectStore {
-            inner: store,
+            inner,
             scheme: String::from("gs"),
             block_size,
             use_constant_size_upload_parts: false,
@@ -95,5 +94,20 @@ impl StorageOptions {
                 Some((gcs_key, value.clone()))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gcs_store_path() {
+        let provider = GcsStoreProvider;
+
+        let url = Url::parse("gs://bucket/path/to/file").unwrap();
+        let path = provider.extract_path(&url);
+        let expected_path = object_store::path::Path::from("path/to/file");
+        assert_eq!(path, expected_path);
     }
 }

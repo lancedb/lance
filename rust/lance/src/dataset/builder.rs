@@ -4,8 +4,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptions,
-    DEFAULT_CLOUD_IO_PARALLELISM,
+    ObjectStore, ObjectStoreParams, StorageOptions, DEFAULT_CLOUD_IO_PARALLELISM,
 };
 use lance_table::{
     format::Manifest,
@@ -39,7 +38,6 @@ pub struct DatasetBuilder {
     options: ObjectStoreParams,
     version: Option<Ref>,
     table_uri: String,
-    object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl DatasetBuilder {
@@ -53,7 +51,6 @@ impl DatasetBuilder {
             session: None,
             version: None,
             manifest: None,
-            object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
@@ -181,8 +178,6 @@ impl DatasetBuilder {
             self.commit_handler = Some(commit_handler);
         }
 
-        self.object_store_registry = read_params.object_store_registry.clone();
-
         self
     }
 
@@ -195,8 +190,6 @@ impl DatasetBuilder {
         if let Some(commit_handler) = write_params.commit_handler {
             self.commit_handler = Some(commit_handler);
         }
-
-        self.object_store_registry = write_params.object_store_registry.clone();
 
         self
     }
@@ -211,13 +204,10 @@ impl DatasetBuilder {
         self
     }
 
-    pub fn with_object_store_registry(mut self, registry: Arc<ObjectStoreRegistry>) -> Self {
-        self.object_store_registry = registry;
-        self
-    }
-
     /// Build a lance object store for the given config
-    pub async fn build_object_store(self) -> Result<(ObjectStore, Path, Arc<dyn CommitHandler>)> {
+    pub async fn build_object_store(
+        self,
+    ) -> Result<(Arc<ObjectStore>, Path, Arc<dyn CommitHandler>)> {
         let commit_handler = match self.commit_handler {
             Some(commit_handler) => Ok(commit_handler),
             None => commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await,
@@ -231,10 +221,16 @@ impl DatasetBuilder {
             .unwrap_or_default();
         let download_retry_count = storage_options.download_retry_count();
 
+        let store_registry = self
+            .session
+            .as_ref()
+            .map(|s| s.store_registry())
+            .unwrap_or_default();
+
         #[allow(deprecated)]
         match &self.options.object_store {
             Some(store) => Ok((
-                ObjectStore::new(
+                Arc::new(ObjectStore::new(
                     store.0.clone(),
                     store.1.clone(),
                     self.options.block_size,
@@ -245,13 +241,13 @@ impl DatasetBuilder {
                     // cloud-like
                     DEFAULT_CLOUD_IO_PARALLELISM,
                     download_retry_count,
-                ),
+                )),
                 Path::from(store.1.path()),
                 commit_handler,
             )),
             None => {
                 let (store, path) = ObjectStore::from_uri_and_params(
-                    self.object_store_registry.clone(),
+                    store_registry,
                     &self.table_uri,
                     &self.options,
                 )
@@ -263,11 +259,12 @@ impl DatasetBuilder {
 
     #[instrument(skip_all)]
     pub async fn load(mut self) -> Result<Dataset> {
-        let session = match self.session.take() {
-            Some(session) => session,
+        let session = match self.session.as_ref() {
+            Some(session) => session.clone(),
             None => Arc::new(Session::new(
                 self.index_cache_size,
                 self.metadata_cache_size,
+                Default::default(),
             )),
         };
 
@@ -286,7 +283,7 @@ impl DatasetBuilder {
                 Ref::Version(v) => Some(v),
                 Ref::Tag(t) => {
                     let tags = Tags::new(
-                        Arc::new(object_store.clone()),
+                        object_store.clone(),
                         commit_handler.clone(),
                         base_path.clone(),
                     );
@@ -326,7 +323,7 @@ impl DatasetBuilder {
         };
 
         Dataset::checkout_manifest(
-            Arc::new(object_store),
+            object_store,
             base_path,
             table_uri,
             manifest,

@@ -13,7 +13,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_datagen::{BatchCount, BatchGeneratorBuilder, ByteCount, RowCount};
 use lance_file::version::LanceFileVersion;
-use lance_io::object_store::{ObjectStoreRegistry, WrappingObjectStore};
+use lance_io::object_store::WrappingObjectStore;
 use lance_table::format::Fragment;
 use object_store::path::Path;
 use object_store::{
@@ -118,14 +118,13 @@ impl TestDatasetGenerator {
             config_upsert_values: None,
         };
 
-        let registry = Arc::new(ObjectStoreRegistry::default());
         Dataset::commit(
             uri,
             operation,
             None,
             Default::default(),
             None,
-            registry,
+            Default::default(),
             false,
         )
         .await

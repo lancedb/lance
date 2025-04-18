@@ -2196,11 +2196,7 @@ impl PyFullTextQuery {
 
     #[staticmethod]
     #[pyo3(signature = (positive, negative,negative_boost=None))]
-    fn boost_query(
-        positive: PyFullTextQuery,
-        negative: PyFullTextQuery,
-        negative_boost: Option<f32>,
-    ) -> PyResult<Self> {
+    fn boost_query(positive: Self, negative: Self, negative_boost: Option<f32>) -> PyResult<Self> {
         Ok(Self {
             inner: BoostQuery::new(positive.inner, negative.inner, negative_boost).into(),
         })
