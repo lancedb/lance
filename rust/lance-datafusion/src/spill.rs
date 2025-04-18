@@ -14,6 +14,7 @@ use datafusion::{
 };
 use datafusion_common::DataFusionError;
 use futures::TryStreamExt;
+use lance_core::error::LanceOptionExt;
 
 /// A spill of Arrow data to a temporary file. The file is an Arrow IPC stream
 /// file.
@@ -50,26 +51,67 @@ enum SpillState {
     Finished {
         batches_written: usize,
     },
+    Errored {
+        error: Arc<Mutex<SpillError>>,
+    },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct WriteStatus {
+    error: Option<Arc<Mutex<SpillError>>>,
     finished: bool,
     batches_written: usize,
 }
 
+/// A DataFusion error that be be emitted multiple times. We provide the
+/// Original error first, and subsequent conversions provide a copy with a
+/// string representation of the original error.
+#[derive(Debug)]
+enum SpillError {
+    Original(DataFusionError),
+    Copy(DataFusionError),
+}
+
+impl From<DataFusionError> for SpillError {
+    fn from(err: DataFusionError) -> Self {
+        Self::Original(err)
+    }
+}
+
+impl From<&mut SpillError> for DataFusionError {
+    fn from(err: &mut SpillError) -> Self {
+        match err {
+            SpillError::Original(inner) => {
+                let copy = DataFusionError::Execution(inner.to_string());
+                let original = std::mem::replace(err, SpillError::Copy(copy));
+                if let SpillError::Original(inner) = original {
+                    inner
+                } else {
+                    unreachable!()
+                }
+            }
+            SpillError::Copy(DataFusionError::Execution(message)) => {
+                DataFusionError::Execution(message.clone())
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
 impl From<&SpillState> for WriteStatus {
     fn from(state: &SpillState) -> Self {
-        let (finished, batches_written) = match state {
-            SpillState::Uninitialized => (false, 0),
+        let (finished, batches_written, error) = match state {
+            SpillState::Uninitialized => (false, 0, None),
             SpillState::Initialized {
                 batches_written, ..
-            } => (false, *batches_written),
-            SpillState::Finished { batches_written } => (true, *batches_written),
+            } => (false, *batches_written, None),
+            SpillState::Finished { batches_written } => (true, *batches_written, None),
+            SpillState::Errored { error } => (false, 0, Some(error.clone())),
         };
         WriteStatus {
             finished,
             batches_written,
+            error,
         }
     }
 }
@@ -83,6 +125,7 @@ impl Spill {
         let initial_status = WriteStatus {
             finished: false,
             batches_written: 0,
+            error: None,
         };
         let (status_sender, status_receiver) = tokio::sync::watch::channel(initial_status);
         Self {
@@ -101,6 +144,12 @@ impl Spill {
         if let SpillState::Finished { .. } = self.state {
             return Err(DataFusionError::Execution(
                 "Spill has already been finished".to_string(),
+            ));
+        }
+
+        if let SpillState::Errored { .. } = &self.state {
+            return Err(DataFusionError::Execution(
+                "Spill has sent an error".to_string(),
             ));
         }
 
@@ -137,6 +186,15 @@ impl Spill {
         Ok(())
     }
 
+    /// Send an error to the spill. This will be sent to all readers of the
+    /// spill.
+    pub fn send_error(&mut self, err: DataFusionError) {
+        let error = Arc::new(Mutex::new(err.into()));
+        self.state = SpillState::Errored { error };
+        self.status_sender
+            .send_replace(WriteStatus::from(&self.state));
+    }
+
     /// Complete the spill write. This will finalize the Arrow IPC stream file.
     /// The file will remain available for reading until [`Self::shutdown()`]
     /// or until the spill is dropped.
@@ -165,6 +223,11 @@ impl Spill {
                     "Spill has already been finished".to_string(),
                 ));
             }
+            SpillState::Errored { .. } => {
+                return Err(DataFusionError::Execution(
+                    "Spill has sent an error".to_string(),
+                ));
+            }
         };
 
         Ok(())
@@ -182,36 +245,41 @@ impl Spill {
         let batches_read = 0;
         let path = self.path.clone();
 
-        let stream = futures::stream::once(async move {
-            if !rx.borrow().finished && rx.borrow().batches_written == 0 {
-                // Wait for data to be written
-                rx.wait_for(|status| status.finished || status.batches_written > 0)
-                    .await
-                    .map_err(|_| {
-                        DataFusionError::Execution(
-                            "Spill has been dropped before reader has finish.".into(),
-                        )
-                    })?;
+        async fn wait_for_more_data(
+            rx: &mut tokio::sync::watch::Receiver<WriteStatus>,
+            batches_read: usize,
+        ) -> Result<(), DataFusionError> {
+            let status = rx
+                .wait_for(|status| {
+                    status.error.is_some()
+                        || status.finished
+                        || status.batches_written > batches_read
+                })
+                .await
+                .map_err(|_| {
+                    DataFusionError::Execution(
+                        "Spill has been dropped before reader has finish.".into(),
+                    )
+                })?;
+
+            if let Some(error) = &status.error {
+                let mut guard = error.lock().ok().expect_ok()?;
+                return Err(DataFusionError::from(&mut (*guard)));
             }
 
+            Ok(())
+        }
+
+        let stream = futures::stream::once(async move {
+            wait_for_more_data(&mut rx, 0).await?;
             let reader = AsyncStreamReader::open(path).await?;
 
             Ok::<_, DataFusionError>(futures::stream::try_unfold(
                 (rx, batches_read, reader),
                 move |(mut rx, mut batches_read, reader)| async move {
-                    if !rx.borrow().finished && batches_read >= rx.borrow().batches_written {
-                        // Wait for more data to be available
-                        println!("waiting for more data");
-                        rx.wait_for(|status| {
-                            status.finished || status.batches_written > batches_read
-                        })
-                        .await
-                        .map_err(|_| {
-                            DataFusionError::Execution(
-                                "Spill has been dropped before reader has finish.".into(),
-                            )
-                        })?;
-                    } else if rx.borrow().finished && batches_read >= rx.borrow().batches_written {
+                    wait_for_more_data(&mut rx, batches_read).await?;
+
+                    if rx.borrow().finished && batches_read >= rx.borrow().batches_written {
                         return Ok(None);
                     }
 
@@ -399,5 +467,65 @@ mod tests {
 
         // Once we close the spill, the file is deleted.
         spill.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_spill_error() {
+        // Create a spill
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let mut spill = Spill::new(tmp_dir, schema.clone());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        spill.write(batch.clone()).await.unwrap();
+
+        let mut stream = spill.read().unwrap();
+        let stream_batch = stream
+            .next()
+            .await
+            .expect("Expected a batch")
+            .expect("Expected no error");
+        assert_eq!(&stream_batch, &batch);
+
+        spill.send_error(DataFusionError::ResourcesExhausted("🥱".into()));
+        let stream_error = stream
+            .next()
+            .await
+            .expect("Expected an error")
+            .expect_err("Expected an error");
+        assert!(matches!(
+            stream_error,
+            DataFusionError::ResourcesExhausted(message) if message == "🥱"
+        ));
+
+        // If we try to write after sending an error, it should return an error.
+        let err = spill.write(batch).await;
+        assert!(matches!(
+            err,
+            Err(DataFusionError::Execution(message)) if message == "Spill has sent an error"
+        ));
+
+        // If we try to finish after sending an error, it should return an error.
+        let err = spill.finish().await;
+        assert!(matches!(
+            err,
+            Err(DataFusionError::Execution(message)) if message == "Spill has sent an error"
+        ));
+
+        // If we try to read after sending an error, it should return an error.
+        let mut stream = spill.read().unwrap();
+        let stream_error = stream
+            .next()
+            .await
+            .expect("Expected an error")
+            .expect_err("Expected an error");
+        assert!(matches!(
+            stream_error,
+            DataFusionError::Execution(message) if message.contains("🥱")
+        ));
     }
 }
