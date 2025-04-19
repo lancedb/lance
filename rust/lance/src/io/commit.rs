@@ -735,11 +735,17 @@ pub(crate) async fn commit_transaction(
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
     let mut dataset = dataset.clone();
-    // We need to checkout the latest version, because any fixes we apply
-    // (like computing the new row ids) needs to be done based on the most
-    // recent manifest.
-    dataset.checkout_latest().await?;
-    let num_attempts = commit_config.num_retries;
+    if matches!(transaction.operation, Operation::Overwrite { .. })
+        && commit_config.num_retries == 0
+    {
+        dataset.checkout_version(transaction.read_version).await?;
+    } else {
+        // We need to checkout the latest version, because any fixes we apply
+        // (like computing the new row ids) needs to be done based on the most
+        // recent manifest.
+        dataset.checkout_latest().await?;
+    }
+    let num_attempts = std::cmp::max(commit_config.num_retries, 1);
     for attempt_i in 0..num_attempts {
         // See if we can retry the commit. Try to account for all
         // transactions that have been committed since the read_version.
