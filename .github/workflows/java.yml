@@ -27,9 +27,6 @@ jobs:
   rust-clippy-fmt:
     runs-on: ubuntu-24.04
     name: Rust Clippy and Fmt Check
-    defaults:
-      run:
-        working-directory: ./java/core/lance-jni
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -50,8 +47,10 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run cargo fmt
+        working-directory: java/core/lance-jni
         run: cargo fmt --check
       - name: Rust Clippy
+        working-directory: java/core/lance-jni
         run: cargo clippy --all-targets -- -D warnings
 
   build-and-test-java:
