@@ -10,6 +10,7 @@ use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use crossbeam_queue::ArrayQueue;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use std::cell::RefCell;
 
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::DistanceType;
@@ -107,6 +108,15 @@ impl HnswBuildParams {
         ));
         HNSW::index_vectors(vec_store.as_ref(), self)
     }
+}
+
+/// Edge structure used for construction only
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Edge {
+    origin: u32,
+    level: u16,
+    distance: OrderedFloat,
+    destination: u32,
 }
 
 /// Build a HNSW graph.
@@ -385,13 +395,13 @@ impl HnswBuilder {
         )
     }
 
-    /// Insert one node.
-    fn insert(
+    /// Insert one node, forward edges only
+    fn insert_forward(
         &self,
         node: u32,
         visited_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
-    ) {
+    ) -> Vec<Edge> {
         let nodes = &self.nodes;
         let target_level = nodes[node as usize].read().unwrap().level_neighbors.len() as u16 - 1;
         let dist_calc = storage.dist_calculator_from_id(node);
@@ -412,9 +422,7 @@ impl HnswBuilder {
             let cur_level = HnswLevelView::new(level, nodes);
             ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
         }
-
-        let mut pruned_neighbors_per_level: Vec<Vec<_>> =
-            vec![Vec::new(); (target_level + 1) as usize];
+        let mut rev_edges: Vec<Edge> = Vec::new();
         {
             let mut current_node = nodes[node as usize].write().unwrap();
             for level in (0..=target_level).rev() {
@@ -425,34 +433,20 @@ impl HnswBuilder {
                     current_node.add_neighbor(neighbor.id, neighbor.dist, level);
                 }
                 self.prune(storage, &mut current_node, level);
-                pruned_neighbors_per_level[level as usize]
-                    .clone_from(&current_node.level_neighbors_ranked[level as usize]);
+
+                for ordered_node in &current_node.level_neighbors_ranked[level as usize] {
+                    rev_edges.push(Edge {
+                        origin: ordered_node.id,
+                        level,
+                        distance: ordered_node.dist,
+                        destination: node,
+                    });
+                }
 
                 ep = neighbors[0].clone();
             }
         }
-        for (level, pruned_neighbors) in pruned_neighbors_per_level.iter().enumerate() {
-            let _: Vec<_> = pruned_neighbors
-                .iter()
-                .map(|unpruned_edge| {
-                    let level = level as u16;
-                    let m_max = match level {
-                        0 => self.params.m * 2,
-                        _ => self.params.m,
-                    };
-                    if unpruned_edge.dist
-                        < nodes[unpruned_edge.id as usize]
-                            .read()
-                            .unwrap()
-                            .cutoff(level, m_max)
-                    {
-                        let mut chosen_node = nodes[unpruned_edge.id as usize].write().unwrap();
-                        chosen_node.add_neighbor(node, unpruned_edge.dist, level);
-                        self.prune(storage, &mut chosen_node, level);
-                    }
-                })
-                .collect();
-        }
+        rev_edges
     }
 
     fn search_level(
@@ -739,14 +733,121 @@ impl IvfSubIndex for HNSW {
             storage.distance_type(),
         );
 
+        let chunk_size = hnsw.inner.params.ef_construction;
+
+        let cpu_core_count = num_cpus::get();
+        if cpu_core_count > chunk_size {
+            log::warn!("ef_construction {} is set lower than available cpu cores {}. HNSW construction parallelism is limited.", chunk_size, cpu_core_count);
+        }
+
         let len = storage.len();
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
-        (1..len).into_par_iter().for_each_init(
-            || VisitedGenerator::new(len),
-            |visited_generator, node| {
-                hnsw.inner.insert(node as u32, visited_generator, storage);
-            },
-        );
+
+        thread_local! {
+            static VISITED_GENERATOR: RefCell<Option<VisitedGenerator>> = const { RefCell::new(None) };
+        }
+
+        let mut current_chunk_size = 1;
+        let mut start = 1;
+
+        while start < len {
+            let end = (start + current_chunk_size).min(len);
+
+            // Phase I: Obtain a clique of candidate edges within each chunk at each level
+            let local_levels: Vec<u16> = (start..end)
+                .into_par_iter()
+                .map(|node| hnsw.inner.nodes[node].read().unwrap().level_neighbors.len() as u16 - 1)
+                .collect();
+            (start..end)
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(index, node)| {
+                    let dist_calc = storage.dist_calculator_from_id(node as u32);
+                    let node_level = local_levels[index];
+                    let mut current_node = hnsw.inner.nodes[node].write().unwrap();
+                    (start..end)
+                        .enumerate()
+                        .for_each(|(other_index, other_node)| {
+                            if index != other_index {
+                                let distance: OrderedFloat =
+                                    dist_calc.distance(other_node as u32).into();
+                                let other_node_level = local_levels[other_index];
+                                let max_shared_level = node_level.min(other_node_level);
+
+                                (0..=max_shared_level).for_each(|level| {
+                                    current_node.add_neighbor(other_node as u32, distance, level);
+                                });
+                            }
+                        });
+                });
+
+            // Phase II: Perform queries on the structure before this chunk to get more
+            // candidate edges, and perform edge pruning
+            let forward_results: Vec<Vec<Edge>> = (start..end) // the returned edges are already reversed
+                .into_par_iter()
+                .map(|node| {
+                    VISITED_GENERATOR.with(|visited_gen| {
+                        let mut visited_gen = visited_gen.borrow_mut();
+                        if visited_gen.is_none() {
+                            *visited_gen = Some(VisitedGenerator::new(len));
+                        }
+                        hnsw.inner.insert_forward(
+                            node as u32,
+                            visited_gen.as_mut().unwrap(),
+                            storage,
+                        )
+                    })
+                })
+                .collect();
+
+            // Phase III: Flatten and perform a sort on the pruned and reversed edges
+            let mut edges: Vec<&Edge> = forward_results.iter().flatten().collect();
+
+            edges.par_sort_unstable();
+
+            // Phase IV: Identify contiguous subarrays of the sorted results
+            //let mut start_indices: Vec<usize> = edges
+            let origin_ranges: Vec<(usize, usize)> = edges
+                .par_iter()
+                .enumerate()
+                .filter_map(|(index, edge)| {
+                    if index == 0 || edge.origin != edges[index - 1].origin {
+                        Some(index)
+                    } else {
+                        None
+                    }
+                })
+                .chain(std::iter::once(edges.len()).par_bridge())
+                .collect::<Vec<_>>()
+                .par_windows(2)
+                .map(|window| (window[0], window[1]))
+                .collect();
+
+            // Phase V: Process each contiguous subarray in parallel
+            origin_ranges
+                .into_par_iter()
+                .for_each(|(start_index, end_index)| {
+                    let node = edges[start_index].origin;
+
+                    let mut current_node = hnsw.inner.nodes[node as usize].write().unwrap();
+
+                    for &&edge in &edges[start_index..end_index] {
+                        debug_assert!(edge.destination != edge.origin, "Bad edge generated");
+
+                        let m_max = match edge.level {
+                            0 => hnsw.inner.params.m * 2,
+                            _ => hnsw.inner.params.m,
+                        };
+                        if edge.distance < current_node.cutoff(edge.level, m_max) {
+                            current_node.add_neighbor(edge.destination, edge.distance, edge.level);
+                        }
+                        hnsw.inner.prune(storage, &mut current_node, edge.level);
+                    }
+                });
+
+            start = end;
+            current_chunk_size = (current_chunk_size * 2).min(chunk_size);
+        }
 
         assert_eq!(hnsw.inner.level_count[0].load(Ordering::Relaxed), len);
         Ok(hnsw)
