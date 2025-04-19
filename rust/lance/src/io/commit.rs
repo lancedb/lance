@@ -733,9 +733,16 @@ pub(crate) async fn commit_transaction(
     // has not necessarily. So for anything involving writing, use `object_store`.
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
     let mut dataset = dataset.clone();
-    dataset.checkout_version(transaction.read_version).await?;
+    if matches!(transaction.operation, Operation::Overwrite { .. }) && commit_config.num_retries == 0 {
+        dataset.checkout_version(transaction.read_version).await?;
+    } else {
+        // We need to checkout the latest version, because any fixes we apply
+        // (like computing the new row ids) needs to be done based on the most
+        // recent manifest.
+        dataset.checkout_latest().await?;
+    }
     let mut target_version = dataset.manifest.version + 1;
-    let num_attempts = commit_config.num_retries;
+    let num_attempts = max(commit_config.num_retries, 1);
     for attempt_i in 0..num_attempts {
         // See if we can retry the commit. Try to account for all
         // transactions that have been committed since the read_version.
