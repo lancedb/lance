@@ -716,6 +716,7 @@ impl MergeInsertJob {
                         &write_schema,
                         &dataset.base,
                         data_storage_version,
+                        None,
                     )
                     .await?;
 
