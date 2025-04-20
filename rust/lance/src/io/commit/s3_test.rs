@@ -359,13 +359,21 @@ async fn test_ddb_open_iops() {
 #[tokio::test]
 async fn test_path_exists_local() {
     let tmp_dir = tempdir().unwrap();
-    let tmp_path = tmp_dir.path();
-    
-    let object_store = ObjectStore::local();
+    let tmp_path = tmp_dir.path().canonicalize().unwrap();
+    // add schema
+    #[cfg(unix)]
+    let storage_path = format!("file://{}", tmp_path.display());
+    #[cfg(windows)]
+    let storage_path = {
+        let win_path = tmp_path.display().to_string().replace('\\', "/");
+        format!("file:///{}", win_path.trim_start_matches('/'))
+    };
 
-    let existing_path = Path::from_filesystem_path(tmp_path).unwrap();
+    let existing_path = Path::parse(&storage_path).unwrap();
+
+    let object_store = ObjectStore::local();
     let exists = object_store.path_exists(&existing_path).await.unwrap();
-    assert(exists);
+    assert!(exists);
 
     let non_existing_path = existing_path.child("non_existing");
     let exists = object_store.path_exists(&non_existing_path).await.unwrap();
