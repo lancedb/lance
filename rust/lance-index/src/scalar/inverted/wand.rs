@@ -43,7 +43,10 @@ impl PartialOrd for PostingIterator {
 impl Ord for PostingIterator {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self.doc(), other.doc()) {
-            (Some(doc1), Some(doc2)) => doc1.cmp(&doc2),
+            (Some(doc1), Some(doc2)) => doc1.cmp(&doc2).then(
+                self.approximate_upper_bound
+                    .total_cmp(&other.approximate_upper_bound),
+            ),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
@@ -126,7 +129,8 @@ impl Wand {
         operator: Operator,
         postings: impl Iterator<Item = PostingIterator>,
     ) -> Self {
-        let posting_lists = postings.collect::<Vec<_>>();
+        let mut posting_lists = postings.collect::<Vec<_>>();
+        posting_lists.sort_unstable();
         let threshold = match operator {
             Operator::Or => 0.0,
             Operator::And => posting_lists
@@ -162,12 +166,6 @@ impl Wand {
 
         while let Some(doc) = self.next().await? {
             if is_phrase_query {
-                if let Some(last) = self.postings.last() {
-                    if last.doc().unwrap().row_id != doc {
-                        continue;
-                    }
-                }
-
                 if !self.check_positions() {
                     continue;
                 }
@@ -209,7 +207,6 @@ impl Wand {
     // find the next doc candidate
     #[instrument(level = "debug", name = "wand_next", skip_all)]
     async fn next(&mut self) -> Result<Option<u64>> {
-        self.postings.sort_unstable();
         while let Some(pivot_posting) = self.find_pivot_term() {
             let doc = pivot_posting
                 .doc()
