@@ -1309,6 +1309,30 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(actual, expected);
+
+        let schema_with_list_struct = ArrowSchema::new(vec![ArrowField::new(
+            "struct_list",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                ])),
+                true,
+            ))),
+            true,
+        )]);
+        let schema_with_list_struct = Schema::try_from(&schema_with_list_struct).unwrap();
+
+        let with_missing_field = schema_with_list_struct.project_by_ids(&[1, 3], false);
+        let intersection = schema_with_list_struct
+            .intersection_ignore_types(&with_missing_field)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
+        let intersection = with_missing_field
+            .intersection_ignore_types(&schema_with_list_struct)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
     }
 
     #[test]

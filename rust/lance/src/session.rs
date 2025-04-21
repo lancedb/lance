@@ -8,6 +8,7 @@ use deepsize::DeepSizeOf;
 use lance_core::cache::FileMetadataCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
+use lance_io::object_store::ObjectStoreRegistry;
 use snafu::location;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
@@ -18,7 +19,7 @@ use self::index_extension::IndexExtension;
 pub mod index_extension;
 
 /// A user session tracks the runtime state.
-#[derive(Clone, DeepSizeOf)]
+#[derive(Clone)]
 pub struct Session {
     /// Cache for opened indices.
     pub(crate) index_cache: IndexCache,
@@ -27,6 +28,20 @@ pub struct Session {
     pub(crate) file_metadata_cache: FileMetadataCache,
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
+
+    store_registry: Arc<ObjectStoreRegistry>,
+}
+
+impl DeepSizeOf for Session {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        let mut size = 0;
+        size += self.index_cache.deep_size_of_children(context);
+        size += self.file_metadata_cache.deep_size_of_children(context);
+        for ext in self.index_extensions.values() {
+            size += ext.deep_size_of_children(context);
+        }
+        size
+    }
 }
 
 impl std::fmt::Debug for Session {
@@ -57,11 +72,20 @@ impl Session {
     /// Parameters:
     ///
     /// - ***index_cache_size***: the size of the index cache.
-    pub fn new(index_cache_size: usize, metadata_cache_size: usize) -> Self {
+    /// - ***metadata_cache_size***: the size of the metadata cache.
+    /// - ***store_registry***: the object store registry to use when opening
+    ///   datasets. This determines which schemes are available, and also allows
+    ///   re-using object stores.
+    pub fn new(
+        index_cache_size: usize,
+        metadata_cache_size: usize,
+        store_registry: Arc<ObjectStoreRegistry>,
+    ) -> Self {
         Self {
             index_cache: IndexCache::new(index_cache_size),
             file_metadata_cache: FileMetadataCache::new(metadata_cache_size),
             index_extensions: HashMap::new(),
+            store_registry,
         }
     }
 
@@ -126,6 +150,11 @@ impl Session {
             + self.file_metadata_cache.approx_size()
             + self.index_extensions.len()
     }
+
+    /// Get the object store registry.
+    pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
+        self.store_registry.clone()
+    }
 }
 
 impl Default for Session {
@@ -134,6 +163,7 @@ impl Default for Session {
             index_cache: IndexCache::new(DEFAULT_INDEX_CACHE_SIZE),
             file_metadata_cache: FileMetadataCache::new(DEFAULT_METADATA_CACHE_SIZE),
             index_extensions: HashMap::new(),
+            store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
@@ -152,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_disable_index_cache() {
-        let no_cache = Session::new(0, 0);
+        let no_cache = Session::new(0, 0, Default::default());
         assert!(no_cache.index_cache.get_vector("abc").is_none());
         let no_cache = Arc::new(no_cache);
 
@@ -173,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_basic() {
-        let session = Session::new(10, 1);
+        let session = Session::new(10, 1, Default::default());
         let session = Arc::new(session);
 
         let pq = ProductQuantizer::new(

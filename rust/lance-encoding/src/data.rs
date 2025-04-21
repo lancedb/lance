@@ -306,6 +306,41 @@ impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
 }
 
 #[derive(Debug)]
+struct BitmapDataBlockBuilder {
+    values: BooleanBufferBuilder,
+}
+
+impl BitmapDataBlockBuilder {
+    fn new(estimated_size_bytes: u64) -> Self {
+        Self {
+            values: BooleanBufferBuilder::new(estimated_size_bytes as usize * 8),
+        }
+    }
+}
+
+impl DataBlockBuilderImpl for BitmapDataBlockBuilder {
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+        let bitmap_blk = data_block.as_fixed_width_ref().unwrap();
+        self.values.append_packed_range(
+            selection.start as usize..selection.end as usize,
+            &bitmap_blk.data,
+        );
+    }
+
+    fn finish(mut self: Box<Self>) -> DataBlock {
+        let bool_buf = self.values.finish();
+        let num_values = bool_buf.len() as u64;
+        let bits_buf = bool_buf.into_inner();
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::from(bits_buf),
+            bits_per_value: 1,
+            num_values,
+            block_info: BlockInfo::new(),
+        })
+    }
+}
+
+#[derive(Debug)]
 struct FixedWidthDataBlockBuilder {
     bits_per_value: u64,
     bytes_per_value: u64,
@@ -1038,10 +1073,16 @@ impl DataBlock {
 
     pub fn make_builder(&self, estimated_size_bytes: u64) -> Box<dyn DataBlockBuilderImpl> {
         match self {
-            Self::FixedWidth(inner) => Box::new(FixedWidthDataBlockBuilder::new(
-                inner.bits_per_value,
-                estimated_size_bytes,
-            )),
+            Self::FixedWidth(inner) => {
+                if inner.bits_per_value == 1 {
+                    Box::new(BitmapDataBlockBuilder::new(estimated_size_bytes))
+                } else {
+                    Box::new(FixedWidthDataBlockBuilder::new(
+                        inner.bits_per_value,
+                        estimated_size_bytes,
+                    ))
+                }
+            }
             Self::VariableWidth(inner) => {
                 if inner.bits_per_offset == 32 {
                     Box::new(VariableWidthDataBlockBuilder::new(estimated_size_bytes))
@@ -1968,7 +2009,7 @@ mod tests {
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
         // the NullBuffer.len() returns the length in bits so we divide_round_up by 8
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
@@ -1976,7 +2017,7 @@ mod tests {
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let mut gen = array::rand::<Int32Type>().with_nulls(&[true, true, false]);
@@ -1985,7 +2026,7 @@ mod tests {
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
@@ -1993,7 +2034,7 @@ mod tests {
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
-        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
@@ -2015,7 +2056,7 @@ mod tests {
             .map(|buffer| buffer.len())
             .sum();
 
-        let total_nulls_size_in_bytes = (concatenated_array.nulls().unwrap().len() + 7) / 8;
+        let total_nulls_size_in_bytes = concatenated_array.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + total_nulls_size_in_bytes) as u64);
     }
 }

@@ -834,6 +834,11 @@ impl Index for IVFIndex {
         }
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: We should prewarm the IVF index by loading the partitions into memory
+        Ok(())
+    }
+
     fn statistics(&self) -> Result<serde_json::Value> {
         let partitions_statistics = (0..self.ivf.num_partitions())
             .map(|part_id| IvfIndexPartitionStatistics {
@@ -1841,7 +1846,7 @@ mod tests {
     use super::*;
 
     use std::collections::HashSet;
-    use std::iter::repeat;
+    use std::iter::repeat_n;
     use std::ops::Range;
 
     use arrow_array::types::UInt64Type;
@@ -2740,7 +2745,7 @@ mod tests {
             .scan()
             .nearest(
                 "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                &Float32Array::from_iter_values(repeat_n(0.5, DIM)),
                 5,
             )
             .unwrap()
@@ -2808,7 +2813,7 @@ mod tests {
             .scan()
             .nearest(
                 "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                &Float32Array::from_iter_values(repeat_n(0.5, DIM)),
                 5,
             )
             .unwrap()

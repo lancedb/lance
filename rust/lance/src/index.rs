@@ -381,6 +381,23 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
+    async fn prewarm_index(&self, name: &str) -> Result<()> {
+        let indices = self.load_indices_by_name(name).await?;
+        if indices.is_empty() {
+            return Err(Error::IndexNotFound {
+                identity: format!("name={}", name),
+                location: location!(),
+            });
+        }
+
+        let index = self
+            .open_generic_index(name, &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .await?;
+        index.prewarm().await?;
+
+        Ok(())
+    }
+
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let dataset_dir = self.base.to_string();
         if let Some(indices) = self

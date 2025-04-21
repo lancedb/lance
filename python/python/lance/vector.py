@@ -507,7 +507,7 @@ def compute_partitions(
                 assert vecs.shape[0] == ids.shape[0]
 
                 # Ignore any invalid vectors.
-                mask_gpu = partitions.isfinite()
+                mask_gpu = partitions.isfinite() & (partitions >= 0)
                 mask = mask_gpu.cpu()
                 ids = ids[mask]
                 partitions = partitions[mask_gpu]
@@ -516,7 +516,7 @@ def compute_partitions(
 
                 split_columns = []
                 if num_sub_vectors is not None:
-                    residual_vecs = vecs - kmeans.centroids[partitions]
+                    residual_vecs = vecs[mask_gpu] - kmeans.centroids[partitions]
                     for i in range(num_sub_vectors):
                         subvector_tensor = residual_vecs[
                             :, i * subvector_size : (i + 1) * subvector_size
@@ -685,7 +685,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
                 assert vecs.shape[0] == ids.shape[0]
 
                 # Ignore any invalid vectors.
-                mask_gpu = partitions.isfinite()
+                mask_gpu = partitions.isfinite() & (partitions >= 0)
                 ids = ids.to(ivf_kmeans.device)[mask_gpu].cpu().reshape(-1)
                 partitions = partitions[mask_gpu].cpu()
                 vecs = vecs[mask_gpu]
@@ -746,8 +746,6 @@ def one_pass_assign_ivf_pq_on_accelerator(
     LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
 
     shuffle_buffers = [
-        data_file.path()
-        for frag in ds.get_fragments()
-        for data_file in frag.data_files()
+        data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
     ]
     return dst_dataset_uri, shuffle_buffers

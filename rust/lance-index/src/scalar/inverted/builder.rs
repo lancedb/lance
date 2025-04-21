@@ -446,7 +446,7 @@ impl IndexWorker {
     async fn new(existing_tokens: HashMap<String, u32>, with_position: bool) -> Result<Self> {
         let tmpdir = tempdir()?;
         let store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local(),
+            Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(tmpdir.path())?,
             FileMetadataCache::no_cache(),
         ));

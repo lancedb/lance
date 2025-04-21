@@ -334,6 +334,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
         Ok(self)
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: We should prewarm the IVF index by loading the partitions into memory
+        Ok(())
+    }
+
     fn index_type(&self) -> IndexType {
         match self.sub_index_type() {
             (SubIndexType::Flat, QuantizationType::Flat) => IndexType::IvfFlat,
@@ -772,7 +777,7 @@ mod tests {
             ));
             let array = Arc::new(ListArray::new(
                 vector_field,
-                OffsetBuffer::from_lengths(std::iter::repeat(VECTOR_NUM_PER_ROW).take(num_rows)),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(VECTOR_NUM_PER_ROW, num_rows)),
                 Arc::new(fsl),
                 None,
             ));

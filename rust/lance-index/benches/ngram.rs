@@ -31,7 +31,7 @@ fn bench_ngram(c: &mut Criterion) {
     let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
     let store = rt.block_on(async {
         Arc::new(LanceIndexStore::new(
-            ObjectStore::local(),
+            Arc::new(ObjectStore::local()),
             index_dir,
             FileMetadataCache::no_cache(),
         ))
@@ -77,6 +77,7 @@ fn bench_ngram(c: &mut Criterion) {
             let mut builder =
                 NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
             let num_spill_files = builder.train(stream).await.unwrap();
+
             builder
                 .write_index(store.as_ref(), num_spill_files, None)
                 .await

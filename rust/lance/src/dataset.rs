@@ -22,7 +22,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
@@ -197,8 +197,6 @@ pub struct ReadParams {
     /// If a custom object store is provided (via store_params.object_store) then this
     /// must also be provided.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
-
-    pub object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl ReadParams {
@@ -220,15 +218,6 @@ impl ReadParams {
         self
     }
 
-    /// Provide an object store registry for custom object stores
-    pub fn with_object_store_registry(
-        &mut self,
-        object_store_registry: Arc<ObjectStoreRegistry>,
-    ) -> &mut Self {
-        self.object_store_registry = object_store_registry;
-        self
-    }
-
     /// Use the explicit locking to resolve the latest version
     pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
         self.commit_handler = Some(Arc::new(lock));
@@ -243,7 +232,6 @@ impl Default for ReadParams {
             session: None,
             store_options: None,
             commit_handler: None,
-            object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
@@ -677,7 +665,7 @@ impl Dataset {
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
-        object_store_registry: Arc<ObjectStoreRegistry>,
+        session: Arc<Session>,
         enable_v2_manifest_paths: bool,
         detached: bool,
     ) -> Result<Self> {
@@ -695,8 +683,8 @@ impl Dataset {
         let transaction = Transaction::new(read_version, operation, blobs_op, None);
 
         let mut builder = CommitBuilder::new(base_uri)
-            .with_object_store_registry(object_store_registry)
             .enable_v2_manifest_paths(enable_v2_manifest_paths)
+            .with_session(session)
             .with_detached(detached);
 
         if let Some(store_params) = store_params {
@@ -750,7 +738,7 @@ impl Dataset {
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
-        object_store_registry: Arc<ObjectStoreRegistry>,
+        session: Arc<Session>,
         enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
         Self::do_commit(
@@ -762,7 +750,7 @@ impl Dataset {
             read_version,
             store_params,
             commit_handler,
-            object_store_registry,
+            session,
             enable_v2_manifest_paths,
             /*detached=*/ false,
         )
@@ -783,7 +771,7 @@ impl Dataset {
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
-        object_store_registry: Arc<ObjectStoreRegistry>,
+        session: Arc<Session>,
         enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
         Self::do_commit(
@@ -795,7 +783,7 @@ impl Dataset {
             read_version,
             store_params,
             commit_handler,
-            object_store_registry,
+            session,
             enable_v2_manifest_paths,
             /*detached=*/ true,
         )
@@ -1765,21 +1753,20 @@ mod tests {
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
-    use lance_index::scalar::inverted::query::PhraseQuery;
+    use lance_index::scalar::inverted::query::{MatchQuery, Operator, PhraseQuery};
     use lance_index::scalar::inverted::TokenizerConfig;
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
-    use lance_table::io::commit::RenameCommitHandler;
+
     use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
-    use url::Url;
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -2019,6 +2006,8 @@ mod tests {
         // Need to use in-memory for accurate IOPS tracking.
         use crate::utils::test::IoTrackingStore;
 
+        // Use consistent session so memory store can be reused.
+        let session = Arc::new(Session::default());
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
             DataType::Int32,
@@ -2030,26 +2019,33 @@ mod tests {
         )
         .unwrap();
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let dataset = Dataset::write(batches, "memory://test", None)
-            .await
-            .unwrap();
-
-        // Then open with wrapping store.
-        let memory_store = dataset.object_store.inner.clone();
         let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let _original_ds = Dataset::write(
+            batches,
+            "memory://test",
+            Some(WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(io_stats_wrapper.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        io_stats.lock().unwrap().read_iops = 0;
+
         let _dataset = DatasetBuilder::from_uri("memory://test")
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
                     object_store_wrapper: Some(io_stats_wrapper),
                     ..Default::default()
                 }),
+                session: Some(session),
                 ..Default::default()
             })
-            .with_object_store(
-                memory_store,
-                Url::parse("memory://test").unwrap(),
-                Arc::new(RenameCommitHandler),
-            )
             .load()
             .await
             .unwrap();
@@ -2147,6 +2143,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
+                auto_cleanup: None,
                 ..Default::default()
             }),
         );
@@ -3159,7 +3156,7 @@ mod tests {
             None,
             None,
             None,
-            Arc::new(ObjectStoreRegistry::default()),
+            Default::default(),
             true, // enable_v2_manifest_paths
         )
         .await
@@ -3736,8 +3733,8 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
-        let mut desired_config = HashMap::new();
-        desired_config.insert("lance:test".to_string(), "value".to_string());
+        let mut desired_config = dataset.manifest.config.clone();
+        desired_config.insert("lance.test".to_string(), "value".to_string());
         desired_config.insert("other-key".to_string(), "other-value".to_string());
 
         dataset.update_config(desired_config.clone()).await.unwrap();
@@ -5150,12 +5147,29 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-
         assert_eq!(result.num_rows(), 3);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(ids.contains(&3));
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    MatchQuery::new("lance database".to_owned())
+                        .with_operator(Operator::And)
+                        .into(),
+                )
+                .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
 
         let result = ds
             .scan()
@@ -5223,8 +5237,8 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 2);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert_eq!(result.num_rows(), 2, "{:?}", ids);
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
 
@@ -6082,5 +6096,76 @@ mod tests {
         ds2.validate().await.unwrap();
         assert_eq!(ds.manifest.version, 1);
         assert_eq!(ds2.manifest.version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_session_store_registry() {
+        // Create a session
+        let session = Arc::new(Session::default());
+        let registry = session.store_registry();
+        assert!(registry.active_stores().is_empty());
+
+        // Create a dataset with memory store
+        let write_params = WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://test")
+            .with_params(&write_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+
+        // Assert there is one active store.
+        assert_eq!(registry.active_stores().len(), 1);
+
+        // If we create another dataset also in memory, it should re-use the
+        // existing store.
+        let dataset2 = InsertBuilder::new("memory://test2")
+            .with_params(&write_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(registry.active_stores().len(), 1);
+        assert_eq!(
+            Arc::as_ptr(&dataset.object_store().inner),
+            Arc::as_ptr(&dataset2.object_store().inner)
+        );
+
+        // If we create another with **different parameters**, it should create a new store.
+        let write_params2 = WriteParams {
+            session: Some(session.clone()),
+            store_params: Some(ObjectStoreParams {
+                block_size: Some(10_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset3 = InsertBuilder::new("memory://test3")
+            .with_params(&write_params2)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(registry.active_stores().len(), 2);
+        assert_ne!(
+            Arc::as_ptr(&dataset.object_store().inner),
+            Arc::as_ptr(&dataset3.object_store().inner)
+        );
+
+        // Remove both datasets
+        drop(dataset3);
+        assert_eq!(registry.active_stores().len(), 1);
+        drop(dataset2);
+        drop(dataset);
+        assert_eq!(registry.active_stores().len(), 0);
     }
 }

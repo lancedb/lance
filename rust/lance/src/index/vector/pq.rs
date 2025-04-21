@@ -168,6 +168,11 @@ impl Index for PQIndex {
         IndexType::Vector
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: Investigate
+        Ok(())
+    }
+
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(json!({
             "index_type": "PQ",

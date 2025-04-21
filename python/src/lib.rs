@@ -38,7 +38,7 @@ use dataset::cleanup::CleanupStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::MergeInsertBuilder;
+use dataset::{MergeInsertBuilder, PyFullTextQuery};
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
@@ -49,6 +49,7 @@ use lance_index::DatasetIndexExt;
 use log::Level;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
+use scanner::ScanStatistics;
 use session::Session;
 
 #[macro_use]
@@ -149,9 +150,11 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionPlan>()?;
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
+    m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
     m.add_class::<TraceGuard>()?;
     m.add_class::<schema::LanceSchema>()?;
+    m.add_class::<PyFullTextQuery>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
