@@ -6081,7 +6081,8 @@ mod tests {
             .await
             .unwrap();
 
-        ds.object_store().remove_dir_all(test_uri).await.unwrap();
+        let test_path = Path::from_filesystem_path(test_uri).unwrap();
+        ds.object_store().remove_dir_all(test_path).await.unwrap();
 
         let ds2 = InsertBuilder::new(test_uri)
             .execute(vec![data2.clone()])
