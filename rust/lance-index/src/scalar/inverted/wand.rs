@@ -165,10 +165,8 @@ impl Wand {
         let mut candidates = BinaryHeap::new();
 
         while let Some(doc) = self.next().await? {
-            if is_phrase_query {
-                if !self.check_positions() {
-                    continue;
-                }
+            if is_phrase_query && !self.check_positions() {
+                continue;
             }
             let score = self.score(doc, &scorer);
             if candidates.len() < limit {
