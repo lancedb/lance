@@ -10,9 +10,7 @@ on:
       - .github/workflows/docs-check.yml
 
 env:
-  # Disable full debug symbol generation to speed up CI build and keep memory down
-  # "1" means line tables only, which is useful for panic tracebacks.
-  RUSTFLAGS: "-C debuginfo=1"
+  RUSTFLAGS: "-C debuginfo=0"
   # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
   # CI builds are faster with incremental disabled.
   CARGO_INCREMENTAL: "0"
@@ -35,6 +33,8 @@ jobs:
           sudo apt install -y -qq doxygen pandoc
       - name: Build python wheel
         uses: ./.github/workflows/build_linux_wheel
+      - name: Free disk space
+        run: cargo clean
       - name: Build Python
         working-directory: docs
         run: |

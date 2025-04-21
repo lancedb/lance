@@ -7,10 +7,6 @@ on:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-  pull_request:
-    paths:
-      - ".github/workflows/docs-deploy.yml"
-
 # Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
   contents: read
@@ -23,9 +19,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Disable full debug symbol generation to speed up CI build and keep memory down
-  # "1" means line tables only, which is useful for panic tracebacks.
-  RUSTFLAGS: "-C debuginfo=1"
+  RUSTFLAGS: "-C debuginfo=0"
   # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
   # CI builds are faster with incremental disabled.
   CARGO_INCREMENTAL: "0"
@@ -48,7 +42,6 @@ jobs:
           cache-dependency-path: "docs/requirements.txt"
       - name: Install dependencies
         run: |
-          sudo apt update
           sudo apt install -y -qq doxygen pandoc
       - name: Build python wheel
         uses: ./.github/workflows/build_linux_wheel
@@ -65,14 +58,11 @@ jobs:
           make nbconvert
           make html
       - name: Setup Pages
-        if: ${{ github.event_name != 'pull_request' }}
         uses: actions/configure-pages@v5
       - name: Upload artifact
-        if: ${{ github.event_name != 'pull_request' }}
         uses: actions/upload-pages-artifact@v3
         with:
           path: 'docs/_build/html'
       - name: Deploy to GitHub Pages
-        if: ${{ github.event_name != 'pull_request' }}
         id: deployment
         uses: actions/deploy-pages@v4
