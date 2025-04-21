@@ -878,18 +878,6 @@ pub(crate) async fn commit_transaction(
     })
 }
 
-// fn backoff_time(attempt_i: u32) -> std::time::Duration {
-//     // Exponential base:
-//     // 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms
-//     let backoff = 2_i32.pow(attempt_i) * 100;
-//     // With +-100ms jitter
-//     let jitter = rand::thread_rng().gen_range(-100..100);
-//     let backoff = backoff + jitter;
-//     // No more than 5 seconds and less than 10ms.
-//     let backoff = backoff.clamp(10, 5_000) as u64;
-//     std::time::Duration::from_millis(backoff)
-// }
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;

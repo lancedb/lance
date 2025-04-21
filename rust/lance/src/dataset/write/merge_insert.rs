@@ -333,8 +333,9 @@ impl MergeInsertBuilder {
 
     /// Set number of times to retry the operation if there is contention.
     ///
-    /// values > 0 will collect all data into memory. If you want to stream out
-    /// the data, set this to 0.
+    /// If this is set > 0, then the operation will keep a copy of the input data
+    /// either in memory or on disk (depending on the size of the data) and will
+    /// retry the operation if there is contention.
     ///
     /// Default is 10.
     pub fn conflict_retries(&mut self, retries: u32) -> &mut Self {
