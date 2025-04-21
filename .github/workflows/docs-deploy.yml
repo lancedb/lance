@@ -47,7 +47,7 @@ jobs:
         uses: ./.github/workflows/build_linux_wheel
       - name: Free disk space
         working-directory: python
-        run: cargo clean
+        run: rm -r target/debug/
       - name: Build Python
         working-directory: python
         run: |
