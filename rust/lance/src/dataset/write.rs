@@ -674,6 +674,7 @@ async fn new_source_iter(
                 )) as SendableRecordBatchStream
             })))
         } else {
+            // TODO: allow buffering up to 100MB in memory before spilling to disk.
             Ok(Box::new(SpillStreamIter::try_new(source).await?))
         }
     } else {
