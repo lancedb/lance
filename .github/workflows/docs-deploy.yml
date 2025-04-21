@@ -7,6 +7,10 @@ on:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
+  pull_request:
+    paths:
+      - ".github/workflows/docs-deploy.yml"
+
 # Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
   contents: read
@@ -44,9 +48,12 @@ jobs:
           cache-dependency-path: "docs/requirements.txt"
       - name: Install dependencies
         run: |
+          sudo apt update
           sudo apt install -y -qq doxygen pandoc
       - name: Build python wheel
         uses: ./.github/workflows/build_linux_wheel
+      - name: Free disk space
+        run: cargo clean
       - name: Build Python
         working-directory: python
         run: |
@@ -58,11 +65,14 @@ jobs:
           make nbconvert
           make html
       - name: Setup Pages
+        if: ${{ github.event_name != 'pull_request' }}
         uses: actions/configure-pages@v5
       - name: Upload artifact
+        if: ${{ github.event_name != 'pull_request' }}
         uses: actions/upload-pages-artifact@v3
         with:
           path: 'docs/_build/html'
       - name: Deploy to GitHub Pages
+        if: ${{ github.event_name != 'pull_request' }}
         id: deployment
         uses: actions/deploy-pages@v4
