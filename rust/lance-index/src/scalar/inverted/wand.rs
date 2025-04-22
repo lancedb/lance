@@ -11,9 +11,9 @@ use lance_core::utils::mask::RowIdMask;
 use lance_core::Result;
 use tracing::instrument;
 
-use super::builder::OrderedDoc;
 use super::index::{idf, K1};
-use super::{DocInfo, PostingList};
+use super::DocInfo;
+use super::{builder::OrderedDoc, PostingList};
 
 #[derive(Clone)]
 pub struct PostingIterator {
@@ -100,7 +100,14 @@ impl PostingIterator {
     // move to the next row id that is greater than or equal to least_id
     #[instrument(level = "debug", name = "posting_iter_next", skip(self))]
     fn next(&mut self, least_id: u64) -> Option<(u64, usize)> {
-        self.index += self.list.row_ids[self.index..].partition_point(|&id| id < least_id);
+        match self.list {
+            PostingList::Plain(ref list) => {
+                self.index += list.row_ids[self.index..].partition_point(|&id| id < least_id);
+            }
+            PostingList::Compressed(ref list) => {
+                unimplemented!("Compressed posting list is not supported yet");
+            }
+        }
         while self.index < self.list.len() {
             let row_id = self.list.row_id(self.index);
             if self.mask.selected(self.list.row_id(self.index)) {

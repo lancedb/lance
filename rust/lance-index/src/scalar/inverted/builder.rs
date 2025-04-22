@@ -12,6 +12,7 @@ use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema, SchemaRef};
+use bitpacking::{BitPacker, BitPacker4x};
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::stream::BoxStream;
@@ -34,7 +35,7 @@ use super::index::*;
 // the number of elements in each block
 // each block contains 128 row ids and 128 frequencies
 // WARNING: changing this value will break the compatibility with existing indexes
-pub const BLOCK_SIZE: usize = 128;
+pub const BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
 lazy_static! {
     // the size threshold to trigger flush the posting lists while indexing FTS,
@@ -450,12 +451,11 @@ impl IndexWorker {
             .new_index_file(INVERT_LIST_FILE, schema.clone())
             .await?;
 
-        let (sender, receiver) =
-            tokio::sync::mpsc::channel::<HashMap<String, PostingListBuilder>>(1);
+        let (sender, receiver) = tokio::sync::mpsc::channel::<PostingListBuilder>(1);
         let flush_task = tokio::spawn(async move {
             let mut receiver = receiver;
             let mut writer = writer;
-            while let Some(posting_lists) = receiver.recv().await {
+            while let Some(posting_list) = receiver.recv().await {
                 let batch = posting_list.to_batch()?;
                 writer.write_record_batch(batch).await?;
             }

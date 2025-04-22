@@ -6,7 +6,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
     array::{
@@ -15,9 +14,10 @@ use arrow::{
     },
     buffer::OffsetBuffer,
 };
+use arrow::{buffer::ScalarBuffer, datatypes::UInt32Type};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Int32Array, ListArray, OffsetSizeTrait,
-    PrimitiveArray, RecordBatch, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float32Array, Int32Array, LargeBinaryArray, ListArray,
+    OffsetSizeTrait, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -40,7 +40,6 @@ use snafu::location;
 use tracing::{info, instrument};
 
 use super::builder::{legacy_inverted_list_schema, PositionRecorder};
-use super::compressor::ExLinkedList;
 use super::query::*;
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::PreFilter;
@@ -621,15 +620,14 @@ impl InvertedListReader {
                 metrics.record_part_load();
                 info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-                let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
-                Result::Ok(PostingList::new(
-                    row_ids.values().clone(),
-                    frequencies.values().clone(),
+                let (row_ids, frequencies) = Self::extract_columns(&batch);
+                Result::Ok(PostingList::Plain(PlainPostingList::new(
+                    row_ids,
+                    frequencies,
                     self.max_scores
                         .as_ref()
                         .map(|max_scores| max_scores[token_id as usize]),
-                ))
+                )))
             })
             .await
             .map_err(|e| Error::io(e.to_string(), location!()))?;
@@ -637,10 +635,16 @@ impl InvertedListReader {
         if is_phrase_query {
             // hit the cache and when the cache was populated, the positions column was not loaded
             let positions = self.read_positions(token_id).await?;
-            posting.positions = Some(positions);
+            posting.set_positions(positions);
         }
 
         Ok(posting)
+    }
+
+    fn extract_columns(batch: &RecordBatch) -> (ScalarBuffer<u64>, ScalarBuffer<f32>) {
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>();
+        (row_ids.values().clone(), frequencies.values().clone())
     }
 
     async fn read_positions(&self, token_id: u32) -> Result<ListArray> {
@@ -667,22 +671,85 @@ impl InvertedListReader {
     }
 }
 
+#[derive(Debug, Clone, DeepSizeOf)]
+pub enum PostingList {
+    Plain(PlainPostingList),
+    Compressed(CompressedPostingList),
+}
+
+impl PostingList {
+    pub fn set_positions(&mut self, positions: ListArray) {
+        match self {
+            PostingList::Plain(posting) => posting.positions = Some(positions),
+            PostingList::Compressed(posting) => {
+                posting.positions = Some(positions);
+            }
+        }
+    }
+
+    pub fn row_id(&self, i: usize) -> u64 {
+        match self {
+            PostingList::Plain(posting) => posting.row_id(i),
+            PostingList::Compressed(posting) => {
+                unimplemented!("compressed posting list does not support row_id")
+            }
+        }
+    }
+
+    pub fn doc(&self, i: usize) -> DocInfo {
+        match self {
+            PostingList::Plain(posting) => posting.doc(i),
+            PostingList::Compressed(posting) => {
+                unimplemented!("compressed posting list does not support doc")
+            }
+        }
+    }
+
+    pub fn positions(&self, row_id: u64) -> Option<PrimitiveArray<Int32Type>> {
+        match self {
+            PostingList::Plain(posting) => posting.positions(row_id),
+            PostingList::Compressed(posting) => {
+                unimplemented!("compressed posting list does not support positions")
+            }
+        }
+    }
+
+    pub fn max_score(&self) -> Option<f32> {
+        match self {
+            PostingList::Plain(posting) => posting.max_score,
+            PostingList::Compressed(posting) => Some(posting.header.max_score),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            PostingList::Plain(posting) => posting.len(),
+            PostingList::Compressed(posting) => posting.header.num_docs as usize,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
-pub struct PostingList {
+pub struct PlainPostingList {
     pub row_ids: ScalarBuffer<u64>,
     pub frequencies: ScalarBuffer<f32>,
     pub max_score: Option<f32>,
     pub positions: Option<ListArray>,
 }
 
-impl DeepSizeOf for PostingList {
+impl DeepSizeOf for PlainPostingList {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         self.row_ids.len() * std::mem::size_of::<u64>()
-            + self.frequencies.len() * std::mem::size_of::<f32>()
+            + self.frequencies.len() * std::mem::size_of::<u32>()
+            + self
+                .positions
+                .as_ref()
+                .map(|positions| positions.get_array_memory_size())
+                .unwrap_or(0)
     }
 }
 
-impl PostingList {
+impl PlainPostingList {
     pub fn new(
         row_ids: ScalarBuffer<u64>,
         frequencies: ScalarBuffer<f32>,
@@ -724,6 +791,33 @@ impl PostingList {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub struct CompressedPostingListHeader {
+    pub num_docs: u32,
+    pub max_score: f32,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct CompressedPostingList {
+    // the first binary is the header
+    // after that, each binary is a block of compressed data
+    // that contains `BLOCK_SIZE` doc ids and then `BLOCK_SIZE` frequencies
+    pub blocks: LargeBinaryArray,
+    pub header: CompressedPostingListHeader,
+    pub positions: Option<ListArray>,
+}
+
+impl DeepSizeOf for CompressedPostingList {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.blocks.get_array_memory_size()
+            + self
+                .positions
+                .as_ref()
+                .map(|positions| positions.get_array_memory_size())
+                .unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PostingListBuilder {
     pub row_ids: Vec<u64>,
@@ -760,7 +854,7 @@ impl PostingListBuilder {
             .iter()
             .flat_map(|batch| {
                 batch[FREQUENCY_COL]
-                    .as_primitive::<Float32Type>()
+                    .as_primitive::<UInt32Type>()
                     .values()
                     .iter()
             })
@@ -787,8 +881,8 @@ impl PostingListBuilder {
 
     pub fn empty(with_position: bool) -> Self {
         Self {
-            row_ids: ExLinkedList::new(),
-            frequencies: ExLinkedList::new(),
+            row_ids: Vec::new(),
+            frequencies: Vec::new(),
             positions: with_position.then(PositionBuilder::new),
         }
     }
@@ -803,7 +897,7 @@ impl PostingListBuilder {
 
     pub fn add(&mut self, row_id: u64, term_positions: PositionRecorder) {
         self.row_ids.push(row_id);
-        self.frequencies.push(term_positions.len() as f32);
+        self.frequencies.push(term_positions.len() as u32);
         if let Some(positions) = self.positions.as_mut() {
             positions.push(term_positions.into_vec());
         }
@@ -851,7 +945,7 @@ impl PostingListBuilder {
 
     pub fn to_batch(self) -> Result<RecordBatch> {
         let row_ids = UInt64Array::from_iter_values(self.row_ids.into_iter());
-        let frequencies = Float32Array::from_iter_values(self.frequencies.into_iter());
+        let frequencies = UInt32Array::from_iter_values(self.frequencies.into_iter());
         let mut columns = vec![
             Arc::new(row_ids) as ArrayRef,
             Arc::new(frequencies) as ArrayRef,
@@ -879,7 +973,7 @@ impl PostingListBuilder {
         let mut max_score = 0.0;
 
         let mut row_id_builder = UInt64Builder::with_capacity(length);
-        let mut freq_builder = Float32Builder::with_capacity(length);
+        let mut freq_builder = UInt32Builder::with_capacity(length);
         let mut position_builder = self.positions.as_mut().map(|positions| {
             ListBuilder::with_capacity(Int32Builder::with_capacity(positions.total_len()), length)
         });
@@ -896,6 +990,7 @@ impl PostingListBuilder {
             // calculate the max score
             if let Some(docs) = &docs {
                 let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(&row_id) as f32 / avgdl);
+                let freq = freq as f32;
                 let score = freq / (freq + doc_norm);
                 if score > max_score {
                     max_score = score;

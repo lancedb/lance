@@ -4136,6 +4136,7 @@ dependencies = [
  "async-channel 2.3.1",
  "async-recursion",
  "async-trait",
+ "bitpacking",
  "bitvec",
  "bytes",
  "clap",
