@@ -14,11 +14,16 @@ use datafusion::{
     execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
 };
 use datafusion_common::DataFusionError;
-use futures::TryStreamExt;
+use lance_arrow::memory::MemoryAccumulator;
 use lance_core::error::LanceOptionExt;
 
 /// Start a spill of Arrow data to a temporary file. The file is an Arrow IPC
 /// stream file.
+///
+/// Up to `memory_limit` bytes of data can be buffered in memory before a spill
+/// is created. If the memory limit is never reached before [`SpillSender::finish()`]
+/// is called, then the data will simply be kept in memory and no spill will be
+/// created.
 ///
 /// The [`SpillSender`] allows you to write batches to the spill.
 ///
@@ -28,17 +33,18 @@ use lance_core::error::LanceOptionExt;
 ///
 /// Once [`SpillSender`] is dropped, the temporary file is deleted. This will
 /// cause the [`SpillReceiver`] to return an error if it is still open.
-pub fn create_spill(path: std::path::PathBuf, schema: Arc<Schema>) -> (SpillSender, SpillReceiver) {
-    let initial_status = WriteStatus {
-        finished: false,
-        batches_written: 0,
-        error: None,
-    };
+pub fn create_spill(
+    path: std::path::PathBuf,
+    schema: Arc<Schema>,
+    memory_limit: usize,
+) -> (SpillSender, SpillReceiver) {
+    let initial_status = WriteStatus::default();
     let (status_sender, status_receiver) = tokio::sync::watch::channel(initial_status);
     let sender = SpillSender {
+        memory_limit,
         path: path.clone(),
         schema: schema.clone(),
-        state: SpillState::Uninitialized,
+        state: SpillState::default(),
         status_sender,
     };
 
@@ -67,63 +73,105 @@ impl SpillReceiver {
     ///
     /// If the spill has been dropped, an error will be returned.
     pub fn read(&self) -> SendableRecordBatchStream {
-        let mut rx = self.status_receiver.clone();
-        let batches_read = 0;
-        let path = self.path.clone();
+        let rx = self.status_receiver.clone();
+        let reader = SpillReader::new(rx, self.path.clone());
 
-        async fn wait_for_more_data(
-            rx: &mut tokio::sync::watch::Receiver<WriteStatus>,
-            batches_read: usize,
-        ) -> Result<(), DataFusionError> {
-            let status = rx
-                .wait_for(|status| {
-                    status.error.is_some()
-                        || status.finished
-                        || status.batches_written > batches_read
-                })
-                .await
-                .map_err(|_| {
-                    DataFusionError::Execution(
-                        "Spill has been dropped before reader has finish.".into(),
-                    )
-                })?;
-
-            if let Some(error) = &status.error {
-                let mut guard = error.lock().ok().expect_ok()?;
-                return Err(DataFusionError::from(&mut (*guard)));
+        let stream = futures::stream::try_unfold(reader, move |mut reader| async move {
+            match reader.read().await {
+                Ok(None) => Ok(None),
+                Ok(Some(batch)) => Ok(Some((batch, reader))),
+                Err(err) => Err(err),
             }
-
-            Ok(())
-        }
-
-        let stream = futures::stream::once(async move {
-            wait_for_more_data(&mut rx, 0).await?;
-            let reader = AsyncStreamReader::open(path).await?;
-
-            Ok::<_, DataFusionError>(futures::stream::try_unfold(
-                (rx, batches_read, reader),
-                move |(mut rx, mut batches_read, reader)| async move {
-                    wait_for_more_data(&mut rx, batches_read).await?;
-
-                    if rx.borrow().finished && batches_read >= rx.borrow().batches_written {
-                        return Ok(None);
-                    }
-
-                    let batch = reader.read().await?.ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "Got fewer than expected batches from spill".into(),
-                        )
-                    })?;
-
-                    batches_read += 1;
-
-                    Ok(Some((batch, (rx, batches_read, reader))))
-                },
-            ))
-        })
-        .try_flatten();
+        });
 
         Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream))
+    }
+}
+
+struct SpillReader {
+    pub batches_read: usize,
+    receiver: tokio::sync::watch::Receiver<WriteStatus>,
+    state: SpillReaderState,
+}
+
+enum SpillReaderState {
+    Buffered { spill_path: PathBuf },
+    Reader { reader: AsyncStreamReader },
+}
+
+impl SpillReader {
+    fn new(receiver: tokio::sync::watch::Receiver<WriteStatus>, spill_path: PathBuf) -> Self {
+        Self {
+            batches_read: 0,
+            receiver,
+            state: SpillReaderState::Buffered { spill_path },
+        }
+    }
+
+    async fn wait_for_more_data(&mut self) -> Result<(), DataFusionError> {
+        let status = self
+            .receiver
+            .wait_for(|status| {
+                status.error.is_some()
+                    || status.finished
+                    || status.batches_written() > self.batches_read
+            })
+            .await
+            .map_err(|_| {
+                DataFusionError::Execution(
+                    "Spill has been dropped before reader has finish.".into(),
+                )
+            })?;
+
+        if let Some(error) = &status.error {
+            let mut guard = error.lock().ok().expect_ok()?;
+            return Err(DataFusionError::from(&mut (*guard)));
+        }
+
+        Ok(())
+    }
+
+    async fn upgrade(&mut self) -> Result<(), ArrowError> {
+        if let SpillReaderState::Buffered { spill_path } = &self.state {
+            let reader = AsyncStreamReader::open(spill_path.clone()).await?;
+            // Skip batches we've already read.
+            for _ in 0..self.batches_read {
+                reader.read().await?;
+            }
+            self.state = SpillReaderState::Reader { reader };
+        }
+        Ok(())
+    }
+
+    async fn read(&mut self) -> Result<Option<RecordBatch>, DataFusionError> {
+        self.wait_for_more_data().await?;
+
+        if let SpillReaderState::Buffered { .. } = &self.state {
+            self.upgrade().await?;
+        }
+
+        match self.state {
+            SpillReaderState::Buffered { .. } => {
+                if let DataLocation::Buffered { batches } = &self.receiver.borrow().data_location {
+                    if self.batches_read < batches.len() {
+                        let batch = batches[self.batches_read].clone();
+                        self.batches_read += 1;
+                        Ok(Some(batch))
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    unreachable!("maybe")
+                }
+            }
+            SpillReaderState::Reader { ref mut reader } => {
+                let batch = reader.read().await?;
+                if batch.is_some() {
+                    self.batches_read += 1;
+                }
+                Ok(batch)
+            }
+        }
     }
 }
 
@@ -134,6 +182,7 @@ impl SpillReceiver {
 /// Use [`Self::finish()`] once all batches have been written to finalize the
 /// file.
 pub struct SpillSender {
+    memory_limit: usize,
     schema: Arc<Schema>,
     path: PathBuf,
     state: SpillState,
@@ -141,12 +190,16 @@ pub struct SpillSender {
 }
 
 enum SpillState {
-    Uninitialized,
-    Initialized {
+    Buffering {
+        batches: Vec<RecordBatch>,
+        memory_accumulator: MemoryAccumulator,
+    },
+    Spilling {
         writer: AsyncStreamWriter,
         batches_written: usize,
     },
     Finished {
+        batches: Option<Arc<[RecordBatch]>>,
         batches_written: usize,
     },
     Errored {
@@ -154,11 +207,45 @@ enum SpillState {
     },
 }
 
-#[derive(Clone, Debug)]
+impl Default for SpillState {
+    fn default() -> Self {
+        Self::Buffering {
+            batches: Vec::new(),
+            memory_accumulator: MemoryAccumulator::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 struct WriteStatus {
     error: Option<Arc<Mutex<SpillError>>>,
     finished: bool,
-    batches_written: usize,
+    data_location: DataLocation,
+}
+
+impl WriteStatus {
+    fn batches_written(&self) -> usize {
+        match &self.data_location {
+            DataLocation::Buffered { batches } => batches.len(),
+            DataLocation::Spilled {
+                batches_written, ..
+            } => *batches_written,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum DataLocation {
+    Buffered { batches: Arc<[RecordBatch]> },
+    Spilled { batches_written: usize },
+}
+
+impl Default for DataLocation {
+    fn default() -> Self {
+        Self::Buffered {
+            batches: Arc::new([]),
+        }
+    }
 }
 
 /// A DataFusion error that be be emitted multiple times. We provide the
@@ -196,18 +283,47 @@ impl From<&mut SpillError> for DataFusionError {
 
 impl From<&SpillState> for WriteStatus {
     fn from(state: &SpillState) -> Self {
-        let (finished, batches_written, error) = match state {
-            SpillState::Uninitialized => (false, 0, None),
-            SpillState::Initialized {
+        match state {
+            SpillState::Buffering { batches, .. } => Self {
+                finished: false,
+                data_location: DataLocation::Buffered {
+                    batches: batches.clone().into(),
+                },
+                error: None,
+            },
+            SpillState::Spilling {
                 batches_written, ..
-            } => (false, *batches_written, None),
-            SpillState::Finished { batches_written } => (true, *batches_written, None),
-            SpillState::Errored { error } => (false, 0, Some(error.clone())),
-        };
-        Self {
-            finished,
-            batches_written,
-            error,
+            } => Self {
+                finished: false,
+                data_location: DataLocation::Spilled {
+                    batches_written: *batches_written,
+                },
+                error: None,
+            },
+            SpillState::Finished {
+                batches_written,
+                batches,
+            } => {
+                let data_location = if let Some(batches) = batches {
+                    DataLocation::Buffered {
+                        batches: batches.clone(),
+                    }
+                } else {
+                    DataLocation::Spilled {
+                        batches_written: *batches_written,
+                    }
+                };
+                Self {
+                    finished: true,
+                    data_location,
+                    error: None,
+                }
+            }
+            SpillState::Errored { error } => Self {
+                finished: true,
+                data_location: DataLocation::default(), // Doesn't matter.
+                error: Some(error.clone()),
+            },
         }
     }
 }
@@ -229,24 +345,39 @@ impl SpillSender {
         }
 
         let (writer, batches_written) = match &mut self.state {
-            SpillState::Uninitialized => {
-                let writer =
-                    AsyncStreamWriter::open(self.path.clone(), self.schema.clone()).await?;
-                self.state = SpillState::Initialized {
-                    writer,
-                    batches_written: 0,
-                };
-                if let SpillState::Initialized {
-                    writer,
-                    batches_written,
-                } = &mut self.state
-                {
-                    (writer, batches_written)
+            SpillState::Buffering {
+                batches,
+                ref mut memory_accumulator,
+            } => {
+                memory_accumulator.record_batch(&batch);
+
+                if memory_accumulator.total() > self.memory_limit {
+                    let writer =
+                        AsyncStreamWriter::open(self.path.clone(), self.schema.clone()).await?;
+                    for batch in batches.drain(..) {
+                        writer.write(batch).await?;
+                    }
+                    self.state = SpillState::Spilling {
+                        writer,
+                        batches_written: batches.len(),
+                    };
+                    if let SpillState::Spilling {
+                        writer,
+                        batches_written,
+                    } = &mut self.state
+                    {
+                        (writer, batches_written)
+                    } else {
+                        unreachable!()
+                    }
                 } else {
-                    unreachable!()
+                    batches.push(batch);
+                    self.status_sender
+                        .send_replace(WriteStatus::from(&self.state));
+                    return Ok(());
                 }
             }
-            SpillState::Initialized {
+            SpillState::Spilling {
                 writer,
                 batches_written,
             } => (writer, batches_written),
@@ -277,19 +408,29 @@ impl SpillSender {
         // We create a temporary state to get an owned copy of current state.
         // Since we hold an exclusive reference to `self`, no one should be
         // able to see this temporary state.
-        let tmp_state = SpillState::Finished { batches_written: 0 };
+        let tmp_state = SpillState::Finished {
+            batches_written: 0,
+            batches: None,
+        };
         match std::mem::replace(&mut self.state, tmp_state) {
-            SpillState::Uninitialized => {
-                return Err(DataFusionError::Execution(
-                    "Spill has not been initialized".to_string(),
-                ));
+            SpillState::Buffering { batches, .. } => {
+                let batches_written = batches.len();
+                self.state = SpillState::Finished {
+                    batches_written,
+                    batches: Some(batches.into()),
+                };
+                self.status_sender
+                    .send_replace(WriteStatus::from(&self.state));
             }
-            SpillState::Initialized {
+            SpillState::Spilling {
                 writer,
                 batches_written,
             } => {
                 writer.finish().await?;
-                self.state = SpillState::Finished { batches_written };
+                self.state = SpillState::Finished {
+                    batches_written,
+                    batches: None,
+                };
                 self.status_sender
                     .send_replace(WriteStatus::from(&self.state));
             }
@@ -406,7 +547,7 @@ mod tests {
         // Create a stream
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join("spill.arrows");
-        let (mut spill, receiver) = create_spill(path.clone(), schema.clone());
+        let (mut spill, receiver) = create_spill(path.clone(), schema.clone(), 0);
 
         // We can open a reader prior to writing any data. No batches will be ready.
         let mut stream_before = receiver.read();
@@ -471,7 +612,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join("spill.arrows");
-        let (mut spill, receiver) = create_spill(path.clone(), schema.clone());
+        let (mut spill, receiver) = create_spill(path.clone(), schema.clone(), 0);
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -526,5 +667,12 @@ mod tests {
         ));
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_spill_buffered() {
+        todo!("test spill with less than memory limit.");
+
+        todo!("test spill starts under memory limit");
     }
 }

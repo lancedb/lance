@@ -674,8 +674,10 @@ async fn new_source_iter(
                 )) as SendableRecordBatchStream
             })))
         } else {
-            // TODO: allow buffering up to 100MB in memory before spilling to disk.
-            Ok(Box::new(SpillStreamIter::try_new(source).await?))
+            // Allow buffering up to 100MB in memory before spilling to disk.
+            Ok(Box::new(
+                SpillStreamIter::try_new(source, 100 * 1024 * 1024).await?,
+            ))
         }
     } else {
         Ok(Box::new(std::iter::once(source)))
@@ -691,7 +693,10 @@ struct SpillStreamIter {
 }
 
 impl SpillStreamIter {
-    pub async fn try_new(mut source: SendableRecordBatchStream) -> Result<Self> {
+    pub async fn try_new(
+        mut source: SendableRecordBatchStream,
+        memory_limit: usize,
+    ) -> Result<Self> {
         let tmp_dir = tokio::task::spawn_blocking(|| {
             tempfile::tempdir().map_err(|e| Error::InvalidInput {
                 source: format!("Failed to create temp dir: {}", e).into(),
@@ -703,7 +708,7 @@ impl SpillStreamIter {
         .expect_ok()??;
 
         let tmp_path = tmp_dir.path().join("spill.arrows");
-        let (mut sender, receiver) = create_spill(tmp_path, source.schema());
+        let (mut sender, receiver) = create_spill(tmp_path, source.schema(), memory_limit);
 
         let sender_handle = tokio::task::spawn(async move {
             while let Some(res) = source.next().await {

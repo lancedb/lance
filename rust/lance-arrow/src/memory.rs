@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashSet, ptr::NonNull};
+use std::collections::HashSet;
 
 use arrow_array::{Array, RecordBatch};
 use arrow_data::ArrayData;
@@ -18,7 +18,7 @@ use arrow_data::ArrayData;
 ///   Round-tripped data may use less memory because of this.
 #[derive(Default)]
 pub struct MemoryAccumulator {
-    seen: HashSet<NonNull<u8>>,
+    seen: HashSet<usize>,
     total: usize,
 }
 
@@ -30,16 +30,16 @@ impl MemoryAccumulator {
 
     fn record_array_data(&mut self, data: &ArrayData) {
         for buffer in data.buffers() {
-            let ptr = buffer.data_ptr();
-            if self.seen.insert(ptr) {
+            let ptr = buffer.as_ptr();
+            if self.seen.insert(ptr as usize) {
                 self.total += buffer.capacity();
             }
         }
 
         if let Some(nulls) = data.nulls() {
             let null_buf = nulls.inner().inner();
-            let ptr = null_buf.data_ptr();
-            if self.seen.insert(ptr) {
+            let ptr = null_buf.as_ptr();
+            if self.seen.insert(ptr as usize) {
                 self.total += null_buf.capacity();
             }
         }
