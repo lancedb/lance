@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
+    io::{BufReader, BufWriter},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -311,14 +312,15 @@ impl SpillSender {
 /// An async wrapper around [`StreamWriter`]. Each call uses [`tokio::task::spawn_blocking`]
 /// to spawn a blocking task to write the batch.
 struct AsyncStreamWriter {
-    writer: Arc<Mutex<StreamWriter<std::fs::File>>>,
+    writer: Arc<Mutex<StreamWriter<BufWriter<std::fs::File>>>>,
 }
 
 impl AsyncStreamWriter {
     pub async fn open(path: PathBuf, schema: Arc<Schema>) -> Result<Self, ArrowError> {
         let writer = tokio::task::spawn_blocking(move || {
             let file = std::fs::File::create(&path).map_err(ArrowError::from)?;
-            StreamWriter::try_new(file, &schema)
+            let writer = BufWriter::new(file);
+            StreamWriter::try_new(writer, &schema)
         })
         .await
         .unwrap()?;
@@ -349,14 +351,15 @@ impl AsyncStreamWriter {
 }
 
 struct AsyncStreamReader {
-    reader: Arc<Mutex<StreamReader<std::fs::File>>>,
+    reader: Arc<Mutex<StreamReader<BufReader<std::fs::File>>>>,
 }
 
 impl AsyncStreamReader {
     pub async fn open(path: PathBuf) -> Result<Self, ArrowError> {
         let reader = tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&path).map_err(ArrowError::from)?;
-            StreamReader::try_new(file, None)
+            let reader = BufReader::new(file);
+            StreamReader::try_new(reader, None)
         })
         .await
         .unwrap()?;
