@@ -15,8 +15,8 @@ pub struct ExpLinkedList<T> {
     len: usize,
     // The maximum capacity of single node in the list.
     // If the limit is 0, there is no limit.
-    // We use u16 to save memory because ExpLinkedList is used in
-    // such use cases.
+    // We use u16 to save memory because ExpLinkedList should not
+    // be used if the limit is that large.
     limit: u16,
 }
 
@@ -25,6 +25,16 @@ impl<T> ExpLinkedList<T> {
     pub fn new() -> Self {
         Self {
             inner: LinkedList::new(),
+            len: 0,
+            limit: 0,
+        }
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        let mut inner = LinkedList::new();
+        inner.push_back(Vec::with_capacity(capacity));
+        Self {
+            inner,
             len: 0,
             limit: 0,
         }
