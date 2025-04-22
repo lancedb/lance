@@ -15,11 +15,6 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use crate::dataset::{get_write_params, transforms_from_python, PyWriteDest};
-use crate::error::PythonErrorExt;
-use crate::schema::LanceSchema;
-use crate::utils::{export_vec, extract_vec, PyLance};
-use crate::{Dataset, Scanner, RT};
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
@@ -38,6 +33,12 @@ use pyo3::types::PyTuple;
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 use snafu::location;
+
+use crate::dataset::{get_write_params, transforms_from_python, PyWriteDest};
+use crate::error::PythonErrorExt;
+use crate::schema::LanceSchema;
+use crate::utils::{export_vec, extract_vec, PyLance};
+use crate::{Dataset, Scanner, RT};
 
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]

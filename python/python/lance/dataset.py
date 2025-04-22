@@ -514,8 +514,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.include_deleted_rows, include_deleted_rows)
         setopt(builder.scan_stats_callback, scan_stats_callback)
         setopt(builder.order_by, orderings)
-
-    # columns=None has a special meaning. we can't treat it as "user didn't specify"
+        # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
             # No defaults, use user-provided, if any
             builder = builder.columns(columns)
