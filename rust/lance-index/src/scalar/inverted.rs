@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod builder;
-mod compressor;
+mod encoding;
 mod index;
 pub mod query;
 mod tokenizer;

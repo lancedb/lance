@@ -31,6 +31,11 @@ use tracing::instrument;
 
 use super::index::*;
 
+// the number of elements in each block
+// each block contains 128 row ids and 128 frequencies
+// WARNING: changing this value will break the compatibility with existing indexes
+pub const BLOCK_SIZE: usize = 128;
+
 lazy_static! {
     // the size threshold to trigger flush the posting lists while indexing FTS,
     // lower value will result in slower indexing and less memory usage.
@@ -215,7 +220,7 @@ impl InvertedIndexBuilder {
         // since no row_id is stored in the TokenSet
         self.docs.remap(mapping);
         if let Some(inverted_list) = self.inverted_list.as_ref() {
-            let schema = inverted_list_schema(self.params.with_position);
+            let schema = legacy_inverted_list_schema(self.params.with_position);
             let mut writer = dest_store
                 .new_index_file(INVERT_LIST_FILE, schema.clone())
                 .await?;
@@ -277,7 +282,7 @@ impl InvertedIndexBuilder {
         let mut writer = store
             .new_index_file(
                 INVERT_LIST_FILE,
-                inverted_list_schema(self.params.with_position),
+                legacy_inverted_list_schema(self.params.with_position),
             )
             .await?;
 
@@ -440,18 +445,17 @@ impl IndexWorker {
             FileMetadataCache::no_cache(),
         ));
 
-        let schema = inverted_list_schema(with_position);
+        let schema = legacy_inverted_list_schema(with_position);
         let writer = store
             .new_index_file(INVERT_LIST_FILE, schema.clone())
             .await?;
 
-        let (sender, receiver) = tokio::sync::mpsc::channel::<PostingListBuilder>(
-            *LANCE_FTS_FLUSH_THRESHOLD / *LANCE_FTS_FLUSH_SIZE,
-        );
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel::<HashMap<String, PostingListBuilder>>(1);
         let flush_task = tokio::spawn(async move {
             let mut receiver = receiver;
             let mut writer = writer;
-            while let Some(posting_list) = receiver.recv().await {
+            while let Some(posting_lists) = receiver.recv().await {
                 let batch = posting_list.to_batch()?;
                 writer.write_record_batch(batch).await?;
             }
@@ -774,7 +778,7 @@ impl Ord for OrderedDoc {
     }
 }
 
-pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
+pub fn legacy_inverted_list_schema(with_position: bool) -> SchemaRef {
     let mut fields = vec![
         arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
         arrow_schema::Field::new(FREQUENCY_COL, arrow_schema::DataType::Float32, false),
@@ -785,6 +789,34 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
             arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
                 "item",
                 arrow_schema::DataType::Int32,
+                true,
+            ))),
+            false,
+        ));
+    }
+    Arc::new(arrow_schema::Schema::new(fields))
+}
+
+pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
+    let mut fields = vec![
+        // we compress the posting lists (including row ids and frequencies),
+        // and store the compressed posting lists, so it's a large binary array
+        arrow_schema::Field::new(
+            POSTING_COL,
+            datatypes::DataType::List(Arc::new(Field::new(
+                "item",
+                datatypes::DataType::LargeBinary,
+                true,
+            ))),
+            false,
+        ),
+    ];
+    if with_position {
+        fields.push(arrow_schema::Field::new(
+            COMPRESSED_POSITION_COL,
+            arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
+                "item",
+                arrow_schema::DataType::Binary,
                 true,
             ))),
             false,

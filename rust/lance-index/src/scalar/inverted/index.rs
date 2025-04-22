@@ -39,7 +39,7 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{info, instrument};
 
-use super::builder::{inverted_list_schema, PositionRecorder};
+use super::builder::{legacy_inverted_list_schema, PositionRecorder};
 use super::compressor::ExLinkedList;
 use super::query::*;
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
@@ -58,6 +58,8 @@ pub const TOKEN_COL: &str = "_token";
 pub const TOKEN_ID_COL: &str = "_token_id";
 pub const FREQUENCY_COL: &str = "_frequency";
 pub const POSITION_COL: &str = "_position";
+pub const COMPRESSED_POSITION_COL: &str = "_compressed_position";
+pub const POSTING_COL: &str = "_posting";
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 lazy_static! {
@@ -724,8 +726,8 @@ impl PostingList {
 
 #[derive(Debug, Clone)]
 pub struct PostingListBuilder {
-    pub row_ids: ExLinkedList<u64>,
-    pub frequencies: ExLinkedList<f32>,
+    pub row_ids: Vec<u64>,
+    pub frequencies: Vec<u32>,
     pub positions: Option<PositionBuilder>,
 }
 
@@ -854,7 +856,7 @@ impl PostingListBuilder {
             Arc::new(row_ids) as ArrayRef,
             Arc::new(frequencies) as ArrayRef,
         ];
-        let schema = inverted_list_schema(self.positions.is_some());
+        let schema = legacy_inverted_list_schema(self.positions.is_some());
         if let Some(positions) = self.positions {
             let list = ListArray::try_new(
                 Arc::new(Field::new("item", DataType::Int32, true)),
@@ -909,7 +911,7 @@ impl PostingListBuilder {
             Arc::new(row_id_col) as ArrayRef,
             Arc::new(freq_col) as ArrayRef,
         ];
-        let schema = inverted_list_schema(position_builder.is_some());
+        let schema = legacy_inverted_list_schema(position_builder.is_some());
         if let Some(mut position_builder) = position_builder {
             let position_col = position_builder.finish();
             columns.push(Arc::new(position_col));
