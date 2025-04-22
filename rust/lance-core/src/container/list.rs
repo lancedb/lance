@@ -69,21 +69,18 @@ impl<T> ExpLinkedList<T> {
 
     /// Removes the last element from the list.
     pub fn pop(&mut self) -> Option<T> {
-        let popped = match self.inner.back_mut() {
+        match self.inner.back_mut() {
             Some(last) => {
                 if last.is_empty() {
                     self.inner.pop_back();
                     self.pop()
                 } else {
+                    self.len -= 1;
                     last.pop()
                 }
             }
             None => None,
-        };
-        if popped.is_some() {
-            self.len -= 1;
         }
-        popped
     }
 
     /// Clears the list, removing all elements.
