@@ -143,7 +143,10 @@ impl<T: DeepSizeOf> DeepSizeOf for ExpLinkedList<T> {
 
 impl<T> FromIterator<T> for ExpLinkedList<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut list = Self::new();
+        let iter = iter.into_iter();
+        let size_hint = iter.size_hint().0;
+        let cap = if size_hint > 0 { size_hint } else { 1 };
+        let mut list = Self::with_capacity(cap);
         for item in iter {
             list.push(item);
         }
