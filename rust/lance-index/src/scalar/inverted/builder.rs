@@ -576,11 +576,10 @@ impl IndexWorker {
             flushed_size += self.emit_flush_posting_list(token);
         }
         log::debug!(
-            "flushed {} lists of {}MiB, posting_lists num: {}, posting_lists size: {}MiB",
+            "flushed {} lists of {}MiB, posting_lists num: {}",
             flush_count,
             flushed_size / 1024 / 1024,
             self.posting_lists.len(),
-            self.posting_lists.deep_size_of() / 1024 / 1024,
         );
 
         Ok(())
