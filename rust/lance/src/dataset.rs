@@ -3167,6 +3167,41 @@ mod tests {
         assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
     }
 
+    #[tokio::test]
+    async fn test_strict_overwrite() {
+        let schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap();
+        let operation = Operation::Overwrite {
+            fragments: vec![],
+            schema,
+            config_upsert_values: None,
+        };
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let read_version_0_transaction = Transaction::new(0, operation, None, None);
+        let strict_builder = CommitBuilder::new(test_uri).with_max_retries(0);
+        let unstrict_builder = CommitBuilder::new(test_uri).with_max_retries(1);
+        strict_builder
+            .clone()
+            .execute(read_version_0_transaction.clone())
+            .await
+            .expect("Strict overwrite should succeed when writing a new dataset");
+        strict_builder
+            .clone()
+            .execute(read_version_0_transaction.clone())
+            .await
+            .expect_err("Strict overwrite should fail when committing to a stale version");
+        unstrict_builder
+            .clone()
+            .execute(read_version_0_transaction.clone())
+            .await
+            .expect("Unstrict overwrite should succeed when committing to a stale version");
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_merge(
