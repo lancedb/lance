@@ -228,14 +228,14 @@ mod tests {
 
     fn test_exp_linked_list(list: &mut ExpLinkedList<usize>) {
         assert_eq!(list.len(), 100);
-        assert_eq!(list.is_empty(), false);
+        assert!(!list.is_empty());
 
         // removes the last 50 elements
         for i in 0..50 {
             assert_eq!(list.pop(), Some(99 - i));
         }
         assert_eq!(list.len(), 50);
-        assert_eq!(list.is_empty(), false);
+        assert!(!list.is_empty());
 
         // iterate over the list
         for (i, v) in list.iter().enumerate() {
@@ -245,7 +245,7 @@ mod tests {
         // clear the list
         list.clear();
         assert_eq!(list.len(), 0);
-        assert_eq!(list.is_empty(), true);
+        assert!(list.is_empty());
         assert_eq!(list.pop(), None);
     }
 
