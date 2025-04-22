@@ -42,7 +42,7 @@ impl<T> ExpLinkedList<T> {
     }
 
     /// Pushes a new element into the list. If the last element in the list
-    /// reaches its capacity, a new node is created with double the capacity.
+    /// reaches its capacity, a new node is created with double capacity.
     pub fn push(&mut self, v: T) {
         match self.inner.back() {
             Some(last) => {
@@ -136,7 +136,7 @@ impl<T: DeepSizeOf> DeepSizeOf for ExpLinkedList<T> {
 
 impl<T> FromIterator<T> for ExpLinkedList<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut list = ExpLinkedList::new();
+        let mut list = Self::new();
         for item in iter {
             list.push(item);
         }
