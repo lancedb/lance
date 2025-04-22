@@ -149,6 +149,13 @@ impl Index for BitmapIndex {
         })
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: Bitmap index essentially pre-warms on load right now.  This is a problem for some
+        // of the larger bitmap indices (e.g. label_list).  We should probably change it to behave
+        // like other indices and then we will need to implement this.
+        Ok(())
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::Bitmap
     }

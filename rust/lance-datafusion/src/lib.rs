@@ -3,6 +3,7 @@
 
 pub mod chunker;
 pub mod dataframe;
+pub mod datagen;
 pub mod exec;
 pub mod expr;
 pub mod logical_expr;

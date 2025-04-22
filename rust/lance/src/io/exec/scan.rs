@@ -13,6 +13,7 @@ use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
@@ -587,15 +588,23 @@ impl ExecutionPlan for LanceScanExec {
         partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        Ok(Box::pin(LanceStream::try_new(
-            self.dataset.clone(),
-            self.fragments.clone(),
-            self.range.clone(),
-            self.projection.clone(),
-            self.config.clone(),
-            &self.metrics,
-            partition,
-        )?))
+        let dataset = self.dataset.clone();
+        let fragments = self.fragments.clone();
+        let range = self.range.clone();
+        let projection = self.projection.clone();
+        let config = self.config.clone();
+        let metrics = self.metrics.clone();
+
+        let lance_fut_stream = stream::once(async move {
+            LanceStream::try_new(
+                dataset, fragments, range, projection, config, &metrics, partition,
+            )
+        });
+        let lance_stream = lance_fut_stream.try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            lance_stream,
+        )))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -627,5 +636,32 @@ impl ExecutionPlan for LanceScanExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::execution::TaskContext;
+
+    use crate::utils::test::NoContextTestFixture;
+
+    use super::*;
+
+    #[test]
+    fn no_context_scan() {
+        // These tests ensure we can create nodes and call execute without a tokio Runtime
+        // being active.  This is a requirement for proper implementation of a Datafusion foreign
+        // table provider.
+        let fixture = NoContextTestFixture::new();
+
+        let scan = LanceScanExec::new(
+            Arc::new(fixture.dataset.clone()),
+            fixture.dataset.fragments().clone(),
+            None,
+            Arc::new(fixture.dataset.schema().clone()),
+            LanceScanConfig::default(),
+        );
+
+        scan.execute(0, Arc::new(TaskContext::default())).unwrap();
     }
 }

@@ -793,8 +793,8 @@ mod tests {
             /*blob_dataset_version= */ None,
         );
 
-        let mut config = HashMap::new();
-        config.insert("lance:test".to_string(), "value".to_string());
+        let mut config = manifest.config.clone();
+        config.insert("lance.test".to_string(), "value".to_string());
         config.insert("other-key".to_string(), "other-value".to_string());
 
         manifest.update_config(config.clone());

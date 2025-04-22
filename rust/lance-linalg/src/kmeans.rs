@@ -23,6 +23,7 @@ use arrow_array::{ArrowNumericType, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{ArrowError, DataType};
 use bitvec::prelude::*;
+use lance_arrow::FixedSizeListArrayExt;
 use log::{info, warn};
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
@@ -720,6 +721,15 @@ pub fn compute_partitions_arrow_array(
             centroids.value_length(),
             distance_type,
         )),
+        (DataType::Float32, DataType::Int8) => Ok(compute_partitions::<
+            Float32Type,
+            KMeansAlgoFloat<Float32Type>,
+        >(
+            centroids.values().as_primitive(),
+            vectors.convert_to_floating_point()?.values().as_primitive(),
+            centroids.value_length(),
+            distance_type,
+        )),
         (DataType::Float64, DataType::Float64) => Ok(compute_partitions::<
             Float64Type,
             KMeansAlgoFloat<Float64Type>,
@@ -736,7 +746,7 @@ pub fn compute_partitions_arrow_array(
             distance_type,
         )),
         _ => Err(ArrowError::InvalidArgumentError(
-            "Centroids and vectors have different types".to_string(),
+            "Centroids and vectors have incompatible types".to_string(),
         )),
     }
 }
@@ -786,7 +796,7 @@ pub fn compute_partition<T: Float + L2 + Dot>(
 
 #[cfg(test)]
 mod tests {
-    use std::iter::repeat;
+    use std::iter::repeat_n;
 
     use lance_arrow::*;
     use lance_testing::datagen::generate_random_array;
@@ -858,7 +868,7 @@ mod tests {
         const K: usize = 32;
         const NUM_CENTROIDS: usize = 16 * 2048;
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
-        let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
+        let values = Float32Array::from_iter_values(repeat_n(f32::NAN, DIM * K));
 
         compute_partitions::<Float32Type, KMeansAlgoFloat<Float32Type>>(
             &centroids,
@@ -879,7 +889,7 @@ mod tests {
         const K: usize = 32;
         const NUM_CENTROIDS: usize = 16 * 2048;
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
-        let values = repeat(f32::NAN).take(DIM * K).collect::<Vec<_>>();
+        let values = repeat_n(f32::NAN, DIM * K).collect::<Vec<_>>();
 
         let (membership, _) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_loss(
             centroids.as_slice(),

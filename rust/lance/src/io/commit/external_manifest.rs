@@ -78,6 +78,7 @@ mod test {
             version: u64,
             path: &str,
             _size: u64,
+            _e_tag: Option<String>,
         ) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -104,6 +105,7 @@ mod test {
             version: u64,
             path: &str,
             _size: u64,
+            _e_tag: Option<String>,
         ) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
 

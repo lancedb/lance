@@ -13,6 +13,9 @@ use arrow_array::{
     GenericListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt32Array,
     UInt8Array,
 };
+use arrow_array::{
+    new_null_array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+};
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema};
@@ -235,6 +238,10 @@ pub trait FixedSizeListArrayExt {
     /// assert_eq!(sampled.values().len(), 160);
     /// ```
     fn sample(&self, n: usize) -> Result<FixedSizeListArray>;
+
+    /// Ensure the [FixedSizeListArray] of Float16, Float32, Float64,
+    /// Int8, Int16, Int32, Int64, UInt8, UInt32 type to its closest floating point type.
+    fn convert_to_floating_point(&self) -> Result<FixedSizeListArray>;
 }
 
 impl FixedSizeListArrayExt for FixedSizeListArray {
@@ -252,6 +259,136 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
         let mut rng = SmallRng::from_entropy();
         let chosen = (0..self.len() as u32).choose_multiple(&mut rng, n);
         take(self, &UInt32Array::from(chosen), None).map(|arr| arr.as_fixed_size_list().clone())
+    }
+
+    fn convert_to_floating_point(&self) -> Result<FixedSizeListArray> {
+        match self.data_type() {
+            DataType::FixedSizeList(field, size) => match field.data_type() {
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(self.clone()),
+                DataType::Int8 => Ok(Self::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float32,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float32Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<Int8Array>()
+                            .ok_or(ArrowError::ParseError(
+                                "Fail to cast primitive array to Int8Type".to_string(),
+                            ))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f32)),
+                    )),
+                    self.nulls().cloned(),
+                )),
+                DataType::Int16 => Ok(Self::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float32,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float32Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<Int16Array>()
+                            .ok_or(ArrowError::ParseError(
+                                "Fail to cast primitive array to Int8Type".to_string(),
+                            ))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f32)),
+                    )),
+                    self.nulls().cloned(),
+                )),
+                DataType::Int32 => Ok(Self::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float32,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float32Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .ok_or(ArrowError::ParseError(
+                                "Fail to cast primitive array to Int8Type".to_string(),
+                            ))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f32)),
+                    )),
+                    self.nulls().cloned(),
+                )),
+                DataType::Int64 => Ok(Self::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float64,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float64Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or(ArrowError::ParseError(
+                                "Fail to cast primitive array to Int8Type".to_string(),
+                            ))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f64)),
+                    )),
+                    self.nulls().cloned(),
+                )),
+                DataType::UInt8 => Ok(Self::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float64,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float64Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<UInt8Array>()
+                            .ok_or(ArrowError::ParseError(
+                                "Fail to cast primitive array to Int8Type".to_string(),
+                            ))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f64)),
+                    )),
+                    self.nulls().cloned(),
+                )),
+                DataType::UInt32 => Ok(Self::new(
+                    Arc::new(arrow_schema::Field::new(
+                        field.name(),
+                        DataType::Float64,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                    Arc::new(Float64Array::from_iter_values(
+                        self.values()
+                            .as_any()
+                            .downcast_ref::<UInt32Array>()
+                            .ok_or(ArrowError::ParseError(
+                                "Fail to cast primitive array to Int8Type".to_string(),
+                            ))?
+                            .into_iter()
+                            .filter_map(|x| x.map(|y| y as f64)),
+                    )),
+                    self.nulls().cloned(),
+                )),
+                data_type => Err(ArrowError::ParseError(format!(
+                    "Expect either floating type or integer got {:?}",
+                    data_type
+                ))),
+            },
+            data_type => Err(ArrowError::ParseError(format!(
+                "Expect either FixedSizeList got {:?}",
+                data_type
+            ))),
+        }
     }
 }
 
@@ -412,6 +549,14 @@ pub trait RecordBatchExt {
     /// Replace a column (specified by name) and return the new [`RecordBatch`].
     fn replace_column_by_name(&self, name: &str, column: Arc<dyn Array>) -> Result<RecordBatch>;
 
+    /// Replace a column schema (specified by name) and return the new [`RecordBatch`].
+    fn replace_column_schema_by_name(
+        &self,
+        name: &str,
+        new_data_type: DataType,
+        column: Arc<dyn Array>,
+    ) -> Result<RecordBatch>;
+
     /// Get (potentially nested) column by qualified name.
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef>;
 
@@ -519,6 +664,37 @@ impl RecordBatchExt for RecordBatch {
         Self::try_new(self.schema(), columns)
     }
 
+    fn replace_column_schema_by_name(
+        &self,
+        name: &str,
+        new_data_type: DataType,
+        column: Arc<dyn Array>,
+    ) -> Result<RecordBatch> {
+        let fields = self
+            .schema()
+            .fields()
+            .iter()
+            .map(|x| {
+                if x.name() != name {
+                    x.clone()
+                } else {
+                    let new_field = Field::new(name, new_data_type.clone(), x.is_nullable());
+                    Arc::new(new_field)
+                }
+            })
+            .collect::<Vec<_>>();
+        let schema = Schema::new_with_metadata(fields, self.schema().metadata.clone());
+        let mut columns = self.columns().to_vec();
+        let field_i = self
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == name)
+            .ok_or_else(|| ArrowError::SchemaError(format!("Field {} does not exist", name)))?;
+        columns[field_i] = column;
+        Self::try_new(Arc::new(schema), columns)
+    }
+
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef> {
         let split = name.split('.').collect::<Vec<_>>();
         if split.is_empty() {
@@ -581,6 +757,150 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
     StructArray::try_new(fields.clone(), columns, None)
 }
 
+fn lists_have_same_offsets_helper<T: OffsetSizeTrait>(left: &dyn Array, right: &dyn Array) -> bool {
+    let left_list: &GenericListArray<T> = left.as_list();
+    let right_list: &GenericListArray<T> = right.as_list();
+    left_list.offsets().inner() == right_list.offsets().inner()
+}
+
+fn merge_list_structs_helper<T: OffsetSizeTrait>(
+    left: &dyn Array,
+    right: &dyn Array,
+    items_field_name: impl Into<String>,
+    items_nullable: bool,
+) -> Arc<dyn Array> {
+    let left_list: &GenericListArray<T> = left.as_list();
+    let right_list: &GenericListArray<T> = right.as_list();
+    let left_struct = left_list.values();
+    let right_struct = right_list.values();
+    let left_struct_arr = left_struct.as_struct();
+    let right_struct_arr = right_struct.as_struct();
+    let merged_items = Arc::new(merge(left_struct_arr, right_struct_arr));
+    let items_field = Arc::new(Field::new(
+        items_field_name,
+        merged_items.data_type().clone(),
+        items_nullable,
+    ));
+    Arc::new(GenericListArray::<T>::new(
+        items_field,
+        left_list.offsets().clone(),
+        merged_items,
+        left_list.nulls().cloned(),
+    ))
+}
+
+fn merge_list_struct_null_helper<T: OffsetSizeTrait>(
+    left: &dyn Array,
+    right: &dyn Array,
+    not_null: &dyn Array,
+    items_field_name: impl Into<String>,
+) -> Arc<dyn Array> {
+    let left_list: &GenericListArray<T> = left.as_list::<T>();
+    let not_null_list = not_null.as_list::<T>();
+    let right_list = right.as_list::<T>();
+
+    let left_struct = left_list.values().as_struct();
+    let not_null_struct: &StructArray = not_null_list.values().as_struct();
+    let right_struct = right_list.values().as_struct();
+
+    let values_len = not_null_list.values().len();
+    let mut merged_fields =
+        Vec::with_capacity(not_null_struct.num_columns() + right_struct.num_columns());
+    let mut merged_columns =
+        Vec::with_capacity(not_null_struct.num_columns() + right_struct.num_columns());
+
+    for (_, field) in left_struct.columns().iter().zip(left_struct.fields()) {
+        merged_fields.push(field.clone());
+        if let Some(val) = not_null_struct.column_by_name(field.name()) {
+            merged_columns.push(val.clone());
+        } else {
+            merged_columns.push(new_null_array(field.data_type(), values_len))
+        }
+    }
+    for (_, field) in right_struct
+        .columns()
+        .iter()
+        .zip(right_struct.fields())
+        .filter(|(_, field)| left_struct.column_by_name(field.name()).is_none())
+    {
+        merged_fields.push(field.clone());
+        if let Some(val) = not_null_struct.column_by_name(field.name()) {
+            merged_columns.push(val.clone());
+        } else {
+            merged_columns.push(new_null_array(field.data_type(), values_len));
+        }
+    }
+
+    let merged_struct = Arc::new(StructArray::new(
+        Fields::from(merged_fields),
+        merged_columns,
+        not_null_struct.nulls().cloned(),
+    ));
+    let items_field = Arc::new(Field::new(
+        items_field_name,
+        merged_struct.data_type().clone(),
+        true,
+    ));
+    Arc::new(GenericListArray::<T>::new(
+        items_field,
+        not_null_list.offsets().clone(),
+        merged_struct,
+        not_null_list.nulls().cloned(),
+    ))
+}
+
+fn merge_list_struct_null(
+    left: &dyn Array,
+    right: &dyn Array,
+    not_null: &dyn Array,
+) -> Arc<dyn Array> {
+    match left.data_type() {
+        DataType::List(left_field) => {
+            merge_list_struct_null_helper::<i32>(left, right, not_null, left_field.name())
+        }
+        DataType::LargeList(left_field) => {
+            merge_list_struct_null_helper::<i64>(left, right, not_null, left_field.name())
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
+    // Merging fields into a list<struct<...>> is tricky and can only succeed
+    // in two ways.  First, if both lists have the same offsets.  Second, if
+    // one of the lists is all-null
+    if left.null_count() == left.len() {
+        return merge_list_struct_null(left, right, right);
+    } else if right.null_count() == right.len() {
+        return merge_list_struct_null(left, right, left);
+    }
+    match (left.data_type(), right.data_type()) {
+        (DataType::List(left_field), DataType::List(_)) => {
+            if !lists_have_same_offsets_helper::<i32>(left, right) {
+                panic!("Attempt to merge list struct arrays which do not have same offsets");
+            }
+            merge_list_structs_helper::<i32>(
+                left,
+                right,
+                left_field.name(),
+                left_field.is_nullable(),
+            )
+        }
+        (DataType::LargeList(left_field), DataType::LargeList(_)) => {
+            if !lists_have_same_offsets_helper::<i64>(left, right) {
+                panic!("Attempt to merge list struct arrays which do not have same offsets");
+            }
+            merge_list_structs_helper::<i64>(
+                left,
+                right,
+                left_field.name(),
+                left_field.is_nullable(),
+            )
+        }
+        _ => unreachable!(),
+    }
+}
+
 fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> StructArray {
     let mut fields: Vec<Field> = vec![];
     let mut columns: Vec<ArrayRef> = vec![];
@@ -613,6 +933,27 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                             left_field.is_nullable(),
                         ));
                         columns.push(Arc::new(merged_sub_array) as ArrayRef);
+                    }
+                    (DataType::List(left_list), DataType::List(right_list))
+                        if left_list.data_type().is_struct()
+                            && right_list.data_type().is_struct() =>
+                    {
+                        // If there is nothing to merge just use the left field
+                        if left_list.data_type() == right_list.data_type() {
+                            fields.push(left_field.as_ref().clone());
+                            columns.push(left_column.clone());
+                        }
+                        // If we have two List<Struct> and they have different sets of fields then
+                        // we can merge them if the offsets arrays are the same.  Otherwise, we
+                        // have to consider it an error.
+                        let merged_sub_array = merge_list_struct(&left_column, &right_column);
+
+                        fields.push(Field::new(
+                            left_field.name(),
+                            merged_sub_array.data_type().clone(),
+                            left_field.is_nullable(),
+                        ));
+                        columns.push(merged_sub_array);
                     }
                     // otherwise, just use the field on the left hand side
                     _ => {
@@ -822,7 +1163,7 @@ impl BufferExt for arrow_buffer::Buffer {
         let mut buf = MutableBuffer::with_capacity(size_bytes);
         let to_fill = size_bytes - bytes.len();
         buf.extend(bytes);
-        buf.extend(std::iter::repeat(0_u8).take(to_fill));
+        buf.extend(std::iter::repeat_n(0_u8, to_fill));
         Self::from(buf)
     }
 }
@@ -830,7 +1171,8 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{new_empty_array, Int32Array, StringArray};
+    use arrow_array::{new_empty_array, new_null_array, Int32Array, ListArray, StringArray};
+    use arrow_buffer::OffsetBuffer;
 
     #[test]
     fn test_merge_recursive() {
@@ -958,6 +1300,95 @@ mod tests {
         );
         let merged = left_batch.merge(&right_batch).unwrap();
         assert_eq!(merged.schema().as_ref(), &naive_schema);
+    }
+
+    #[test]
+    fn test_merge_list_struct() {
+        let x_field = Arc::new(Field::new("x", DataType::Int32, true));
+        let y_field = Arc::new(Field::new("y", DataType::Int32, true));
+        let x_struct_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![x_field.clone()])),
+            true,
+        ));
+        let y_struct_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![y_field.clone()])),
+            true,
+        ));
+        let both_struct_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![x_field.clone(), y_field.clone()])),
+            true,
+        ));
+        let left_schema = Schema::new(vec![Field::new(
+            "list_struct",
+            DataType::List(x_struct_field.clone()),
+            true,
+        )]);
+        let right_schema = Schema::new(vec![Field::new(
+            "list_struct",
+            DataType::List(y_struct_field.clone()),
+            true,
+        )]);
+        let both_schema = Schema::new(vec![Field::new(
+            "list_struct",
+            DataType::List(both_struct_field.clone()),
+            true,
+        )]);
+
+        let x = Arc::new(Int32Array::from(vec![1]));
+        let y = Arc::new(Int32Array::from(vec![2]));
+        let x_struct = Arc::new(StructArray::new(
+            Fields::from(vec![x_field.clone()]),
+            vec![x.clone()],
+            None,
+        ));
+        let y_struct = Arc::new(StructArray::new(
+            Fields::from(vec![y_field.clone()]),
+            vec![y.clone()],
+            None,
+        ));
+        let both_struct = Arc::new(StructArray::new(
+            Fields::from(vec![x_field.clone(), y_field.clone()]),
+            vec![x.clone(), y],
+            None,
+        ));
+        let both_null_struct = Arc::new(StructArray::new(
+            Fields::from(vec![x_field, y_field]),
+            vec![x, Arc::new(new_null_array(&DataType::Int32, 1))],
+            None,
+        ));
+        let offsets = OffsetBuffer::from_lengths([1]);
+        let x_s_list = ListArray::new(x_struct_field, offsets.clone(), x_struct, None);
+        let y_s_list = ListArray::new(y_struct_field, offsets.clone(), y_struct, None);
+        let both_list = ListArray::new(
+            both_struct_field.clone(),
+            offsets.clone(),
+            both_struct,
+            None,
+        );
+        let both_null_list = ListArray::new(both_struct_field, offsets, both_null_struct, None);
+        let x_batch =
+            RecordBatch::try_new(Arc::new(left_schema), vec![Arc::new(x_s_list)]).unwrap();
+        let y_batch = RecordBatch::try_new(
+            Arc::new(right_schema.clone()),
+            vec![Arc::new(y_s_list.clone())],
+        )
+        .unwrap();
+        let merged = x_batch.merge(&y_batch).unwrap();
+        let expected =
+            RecordBatch::try_new(Arc::new(both_schema.clone()), vec![Arc::new(both_list)]).unwrap();
+        assert_eq!(merged, expected);
+
+        let y_null_list = new_null_array(y_s_list.data_type(), 1);
+        let y_null_batch =
+            RecordBatch::try_new(Arc::new(right_schema), vec![Arc::new(y_null_list.clone())])
+                .unwrap();
+        let expected =
+            RecordBatch::try_new(Arc::new(both_schema), vec![Arc::new(both_null_list)]).unwrap();
+        let merged = x_batch.merge(&y_null_batch).unwrap();
+        assert_eq!(merged, expected);
     }
 
     #[test]

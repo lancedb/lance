@@ -6,7 +6,9 @@ use std::{collections::HashMap, iter, marker::PhantomData, sync::Arc};
 use arrow::{
     array::{ArrayData, AsArray},
     buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer},
-    datatypes::{ArrowPrimitiveType, Int32Type, Int64Type, IntervalDayTime, IntervalMonthDayNano},
+    datatypes::{
+        ArrowPrimitiveType, Int32Type, Int64Type, IntervalDayTime, IntervalMonthDayNano, UInt32Type,
+    },
 };
 use arrow_array::{
     make_array,
@@ -205,7 +207,7 @@ impl ArrayGenerator for NullGenerator {
             }
         } else {
             let array_len = array.len();
-            let num_validity_bytes = (array_len + 7) / 8;
+            let num_validity_bytes = array_len.div_ceil(8);
             let mut null_count = 0;
             // Sampling the RNG once per bit is kind of slow so we do this to sample once
             // per byte.  We only get 8 bits of RNG resolution but that should be good enough.
@@ -495,6 +497,64 @@ impl ArrayGenerator for CycleVectorGenerator {
     }
 }
 
+#[derive(Debug)]
+pub struct CycleListGenerator {
+    underlying_gen: Box<dyn ArrayGenerator>,
+    lengths_gen: Box<dyn ArrayGenerator>,
+    data_type: DataType,
+}
+
+impl CycleListGenerator {
+    pub fn new(
+        underlying_gen: Box<dyn ArrayGenerator>,
+        min_list_size: Dimension,
+        max_list_size: Dimension,
+    ) -> Self {
+        let data_type = DataType::List(Arc::new(Field::new(
+            "item",
+            underlying_gen.data_type().clone(),
+            true,
+        )));
+        let lengths_dist = Uniform::new(min_list_size.0, max_list_size.0);
+        let lengths_gen = rand_with_distribution::<UInt32Type, Uniform<u32>>(lengths_dist);
+        Self {
+            underlying_gen,
+            lengths_gen,
+            data_type,
+        }
+    }
+}
+
+impl ArrayGenerator for CycleListGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let lengths = self.lengths_gen.generate(length, rng)?;
+        let lengths = lengths.as_primitive::<UInt32Type>();
+        let total_length = lengths.values().iter().map(|i| *i as u64).sum::<u64>();
+        let offsets = OffsetBuffer::from_lengths(lengths.values().iter().map(|v| *v as usize));
+        let values = self
+            .underlying_gen
+            .generate(RowCount::from(total_length), rng)?;
+        let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+        let values = Arc::new(values);
+
+        let array = ListArray::try_new(field, offsets, values, None)?;
+
+        Ok(Arc::new(array))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        None
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PseudoUuidGenerator {}
 
@@ -558,7 +618,7 @@ impl ArrayGenerator for RandomBooleanGenerator {
         length: RowCount,
         rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
     ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
-        let num_bytes = (length.0 + 7) / 8;
+        let num_bytes = length.0.div_ceil(8);
         let mut bytes = vec![0; num_bytes as usize];
         rng.fill_bytes(&mut bytes);
         let bytes = BooleanBuffer::new(Buffer::from(bytes), 0, length.0 as usize);
@@ -762,9 +822,10 @@ impl ArrayGenerator for RandomBinaryGenerator {
         }
         let bytes = Buffer::from(bytes);
         if self.is_large {
-            let offsets = OffsetBuffer::from_lengths(
-                iter::repeat(self.bytes_per_element.0 as usize).take(length.0 as usize),
-            );
+            let offsets = OffsetBuffer::from_lengths(iter::repeat_n(
+                self.bytes_per_element.0 as usize,
+                length.0 as usize,
+            ));
             if self.scale_to_utf8 {
                 // This is safe because we are only using printable characters
                 unsafe {
@@ -780,9 +841,10 @@ impl ArrayGenerator for RandomBinaryGenerator {
                 }
             }
         } else {
-            let offsets = OffsetBuffer::from_lengths(
-                iter::repeat(self.bytes_per_element.0 as usize).take(length.0 as usize),
-            );
+            let offsets = OffsetBuffer::from_lengths(iter::repeat_n(
+                self.bytes_per_element.0 as usize,
+                length.0 as usize,
+            ));
             if self.scale_to_utf8 {
                 // This is safe because we are only using printable characters
                 unsafe {
@@ -987,7 +1049,7 @@ impl<T: ByteArrayType> ArrayGenerator for FixedBinaryGenerator<T> {
                 .copied(),
         ));
         let offsets =
-            OffsetBuffer::from_lengths(iter::repeat(self.value.len()).take(length.0 as usize));
+            OffsetBuffer::from_lengths(iter::repeat_n(self.value.len(), length.0 as usize));
         Ok(Arc::new(arrow_array::GenericByteArray::<T>::new(
             offsets, bytes, None,
         )))
@@ -1378,12 +1440,15 @@ impl BatchGeneratorBuilder {
         self,
         batch_size: RowCount,
         num_batches: BatchCount,
-    ) -> BoxStream<'static, Result<RecordBatch, ArrowError>> {
+    ) -> (
+        BoxStream<'static, Result<RecordBatch, ArrowError>>,
+        Arc<Schema>,
+    ) {
         // TODO: this is pretty lazy and could be optimized
-        let batches = self
-            .into_reader_rows(batch_size, num_batches)
-            .collect::<Vec<_>>();
-        futures::stream::iter(batches).boxed()
+        let reader = self.into_reader_rows(batch_size, num_batches);
+        let schema = reader.schema();
+        let batches = reader.collect::<Vec<_>>();
+        (futures::stream::iter(batches).boxed(), schema)
     }
 
     /// Create a RecordBatchReader that generates batches of the given size (in bytes)
@@ -1492,6 +1557,22 @@ pub mod array {
         dimension: Dimension,
     ) -> Box<dyn ArrayGenerator> {
         Box::new(CycleVectorGenerator::new(generator, dimension))
+    }
+
+    /// Create a generator of list vectors by continuously calling the given generator
+    ///
+    /// The lists will have lengths uniformly distributed between `min_list_size` (inclusive) and
+    /// `max_list_size` (exclusive).
+    pub fn cycle_vec_var(
+        generator: Box<dyn ArrayGenerator>,
+        min_list_size: Dimension,
+        max_list_size: Dimension,
+    ) -> Box<dyn ArrayGenerator> {
+        Box::new(CycleListGenerator::new(
+            generator,
+            min_list_size,
+            max_list_size,
+        ))
     }
 
     /// Create a generator from a vector of values

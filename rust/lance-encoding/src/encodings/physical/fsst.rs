@@ -385,7 +385,7 @@ impl FsstMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         // Step 1. decompress data use `BinaryMiniBlockDecompressor`
         let binary_decompressor =
             Box::new(BinaryMiniBlockDecompressor::default()) as Box<dyn MiniBlockDecompressor>;

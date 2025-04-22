@@ -17,8 +17,9 @@ pub fn get_num_compute_intensive_cpus() -> usize {
     let cpus = num_cpus::get();
 
     if cpus <= *IO_CORE_RESERVATION {
-        // on systems with only 1 CPU there is no point in warning
-        if cpus > 1 {
+        // If the user is not setting a custom value for LANCE_IO_CORE_RESERVATION then we don't emit
+        // a warning because they're just on a small machine and there isn't much they can do about it.
+        if cpus > 2 {
             log::warn!(
                 "Number of CPUs is less than or equal to the number of IO core reservations. \
                 This is not a supported configuration. using 1 CPU for compute intensive tasks."

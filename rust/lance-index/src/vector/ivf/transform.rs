@@ -72,6 +72,7 @@ impl Transformer for PartitionTransformer {
             // If the partition ID column is already present, we don't need to compute it again.
             return Ok(batch.clone());
         }
+
         let arr =
             batch
                 .column_by_name(&self.input_column)

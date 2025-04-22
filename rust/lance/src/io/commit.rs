@@ -37,10 +37,12 @@ use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::DatasetIndexExt;
+use log;
 use object_store::path::Path;
 use prost::Message;
 
 use super::ObjectStore;
+use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig, BLOB_DIR};
@@ -163,7 +165,7 @@ async fn do_commit_new_dataset(
     manifest_naming_scheme: ManifestNamingScheme,
     blob_version: Option<u64>,
     session: &Session,
-) -> Result<(Manifest, Path)> {
+) -> Result<(Manifest, Path, Option<String>)> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
     let (mut manifest, indices) =
@@ -189,12 +191,12 @@ async fn do_commit_new_dataset(
     // TODO: Allow Append or Overwrite mode to retry using `commit_transaction`
     // if there is a conflict.
     match result {
-        Ok(manifest_path) => {
+        Ok(manifest_location) => {
             session.file_metadata_cache.insert(
                 transaction_file_cache_path(base_path, manifest.version),
                 Arc::new(transaction.clone()),
             );
-            Ok((manifest, manifest_path))
+            Ok((manifest, manifest_location.path, manifest_location.e_tag))
         }
         Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
             uri: base_path.to_string(),
@@ -212,11 +214,11 @@ pub(crate) async fn commit_new_dataset(
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     session: &Session,
-) -> Result<(Manifest, Path)> {
+) -> Result<(Manifest, Path, Option<String>)> {
     let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blob_path = base_path.child(BLOB_DIR);
         let blob_tx = Transaction::new(0, blob_op.clone(), None, None);
-        let (blob_manifest, _) = do_commit_new_dataset(
+        let (blob_manifest, _, _) = do_commit_new_dataset(
             object_store,
             commit_handler,
             &blob_path,
@@ -571,7 +573,7 @@ pub(crate) async fn do_commit_detached_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
     new_blob_version: Option<u64>,
-) -> Result<(Manifest, Path)> {
+) -> Result<(Manifest, Path, Option<String>)> {
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
@@ -629,8 +631,8 @@ pub(crate) async fn do_commit_detached_transaction(
         .await;
 
         match result {
-            Ok(path) => {
-                return Ok((manifest, path));
+            Ok(location) => {
+                return Ok((manifest, location.path, location.e_tag));
             }
             Err(CommitError::CommitConflict) => {
                 // We pick a random u64 for the version, so it's possible (though extremely unlikely)
@@ -666,12 +668,12 @@ pub(crate) async fn commit_detached_transaction(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
-) -> Result<(Manifest, Path)> {
+) -> Result<(Manifest, Path, Option<String>)> {
     let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
         let blobs_tx =
             Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
-        let (blobs_manifest, _) = do_commit_detached_transaction(
+        let (blobs_manifest, _, _) = do_commit_detached_transaction(
             blobs_dataset.as_ref(),
             object_store,
             commit_handler,
@@ -707,12 +709,12 @@ pub(crate) async fn commit_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-) -> Result<(Manifest, Path)> {
+) -> Result<(Manifest, Path, Option<String>)> {
     let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
         let blobs_tx =
             Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
-        let (blobs_manifest, _) = do_commit_detached_transaction(
+        let (blobs_manifest, _, _) = do_commit_detached_transaction(
             blobs_dataset.as_ref(),
             object_store,
             commit_handler,
@@ -826,14 +828,19 @@ pub(crate) async fn commit_transaction(
         .await;
 
         match result {
-            Ok(manifest_path) => {
+            Ok(manifest_location) => {
                 let cache_path = transaction_file_cache_path(&dataset.base, target_version);
                 dataset
                     .session()
                     .file_metadata_cache
                     .insert(cache_path, Arc::new(transaction.clone()));
 
-                return Ok((manifest, manifest_path));
+                match auto_cleanup_hook(&dataset, &manifest).await {
+                    Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
+                    Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
+                    _ => {}
+                };
+                return Ok((manifest, manifest_location.path, manifest_location.e_tag));
             }
             Err(CommitError::CommitConflict) => {
                 // See if we can retry the commit. Try to account for all
@@ -1256,6 +1263,7 @@ mod tests {
     #[tokio::test]
     async fn test_good_concurrent_config_writes() {
         let (_tmpdir, dataset) = get_empty_dataset().await;
+        let original_num_config_keys = dataset.manifest.config.len();
 
         // Test successful concurrent insert config operations
         let futures: Vec<_> = ["key1", "key2", "key3", "key4", "key5"]
@@ -1277,7 +1285,7 @@ mod tests {
         }
 
         let dataset = dataset.checkout_version(6).await.unwrap();
-        assert_eq!(dataset.manifest.config.len(), 5);
+        assert_eq!(dataset.manifest.config.len(), 5 + original_num_config_keys);
 
         dataset.validate().await.unwrap();
 
@@ -1300,7 +1308,7 @@ mod tests {
         let dataset = dataset.checkout_version(11).await.unwrap();
 
         // There are now two fewer keys
-        assert_eq!(dataset.manifest.config.len(), 3);
+        assert_eq!(dataset.manifest.config.len(), 3 + original_num_config_keys);
 
         dataset.validate().await.unwrap()
     }

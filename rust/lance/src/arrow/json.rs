@@ -82,6 +82,13 @@ impl TryFrom<&DataType> for JsonDataType {
                     length: Some(*len as usize),
                 });
             }
+            DataType::FixedSizeBinary(len) => {
+                return Ok(Self {
+                    type_: "fixed_size_binary".to_string(),
+                    fields: None,
+                    length: Some(*len as usize),
+                });
+            }
             DataType::Struct(fields) => {
                 let fields = fields
                     .iter()
@@ -156,6 +163,13 @@ impl TryFrom<&JsonDataType> for DataType {
                     "struct" => Ok(Self::Struct(fields.into())),
                     _ => unreachable!(),
                 }
+            }
+            "fixed_size_binary" => {
+                let length = value.length.ok_or_else(|| Error::Arrow {
+                    message: "Json conversion: FixedSizeBinary type requires a length".to_string(),
+                    location: location!(),
+                })?;
+                Ok(Self::FixedSizeBinary(length as i32))
             }
             _ => Err(Error::Arrow {
                 message: format!("Json conversion: Unsupported type: {value:?}"),
@@ -373,6 +387,14 @@ mod test {
                     "length": 32
                 }
             ),
+        );
+
+        assert_type_json_str(
+            DataType::FixedSizeBinary(32),
+            json!({
+                "type": "fixed_size_binary",
+                "length": 32
+            }),
         );
 
         assert_type_json_str(

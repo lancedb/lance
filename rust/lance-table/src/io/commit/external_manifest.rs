@@ -52,6 +52,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             path,
             size: None,
             naming_scheme,
+            e_tag: None,
         })
     }
 
@@ -78,6 +79,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
                     path,
                     size: None,
                     naming_scheme,
+                    e_tag: None,
                 })
             })
             .transpose()
@@ -91,6 +93,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         version: u64,
         path: &str,
         size: u64,
+        e_tag: Option<String>,
     ) -> Result<()>;
 
     /// Put the manifest path for a given base_uri and version, should fail if the version **does not** already exist
@@ -100,6 +103,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         version: u64,
         path: &str,
         size: u64,
+        e_tag: Option<String>,
     ) -> Result<()>;
 
     /// Delete the manifest information for given base_uri from the store
@@ -141,33 +145,60 @@ impl ExternalManifestCommitHandler {
     /// by any number of readers or writers, so care should be taken to ensure
     /// that the manifest is not lost nor any errors occur due to duplicate
     /// operations.
+    #[allow(clippy::too_many_arguments)]
     async fn finalize_manifest(
         &self,
         base_path: &Path,
         staging_manifest_path: &Path,
         version: u64,
         size: u64,
+        e_tag: Option<String>,
         store: &dyn OSObjectStore,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<Path, Error> {
+    ) -> std::result::Result<ManifestLocation, Error> {
         // step 1: copy the manifest to the final location
         let final_manifest_path = naming_scheme.manifest_path(base_path, version);
-        match store
+
+        let copied = match store
             .copy(staging_manifest_path, &final_manifest_path)
             .await
         {
-            Ok(_) => {}
-            Err(ObjectStoreError::NotFound { .. }) => return Ok(final_manifest_path), // Another writer beat us to it.
+            Ok(_) => true,
+            Err(ObjectStoreError::NotFound { .. }) => false, // Another writer beat us to it.
             Err(e) => return Err(e.into()),
         };
+
+        // On S3, the etag can change if originally was MultipartUpload and later was Copy
+        // https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html#AmazonS3-Type-Object-ETag
+        // We only do MultipartUpload for > 5MB files, so we can skip this check
+        // if size < 5MB
+        let e_tag = if size < 5 * 1024 * 1024 {
+            e_tag
+        } else {
+            let meta = store.head(&final_manifest_path).await?;
+            meta.e_tag
+        };
+
+        let location = ManifestLocation {
+            version,
+            path: final_manifest_path,
+            size: Some(size),
+            naming_scheme,
+            e_tag,
+        };
+
+        if !copied {
+            return Ok(location);
+        }
 
         // step 2: flip the external store to point to the final location
         self.external_manifest_store
             .put_if_exists(
                 base_path.as_ref(),
                 version,
-                final_manifest_path.as_ref(),
+                location.path.as_ref(),
                 size,
+                location.e_tag.clone(),
             )
             .await?;
 
@@ -178,7 +209,7 @@ impl ExternalManifestCommitHandler {
             Err(e) => return Err(e.into()),
         }
 
-        Ok(final_manifest_path)
+        Ok(location)
     }
 }
 
@@ -200,6 +231,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 path,
                 size,
                 naming_scheme,
+                e_tag,
             }) => {
                 // The path is finalized, no need to check object store
                 if path.extension() == Some(MANIFEST_EXTENSION) {
@@ -208,78 +240,35 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         path,
                         size,
                         naming_scheme,
+                        e_tag,
                     });
                 }
 
-                let size = if let Some(size) = size {
-                    size
+                let (size, e_tag) = if let Some(size) = size {
+                    (size, e_tag)
                 } else {
-                    object_store.size(&path).await? as u64
+                    let meta = object_store.inner.head(&path).await?;
+                    (meta.size as u64, meta.e_tag)
                 };
 
-                let final_path = self
+                let final_location = self
                     .finalize_manifest(
                         base_path,
                         &path,
                         version,
                         size,
+                        e_tag.clone(),
                         &object_store.inner,
                         naming_scheme,
                     )
                     .await?;
 
-                Ok(ManifestLocation {
-                    version,
-                    path: final_path,
-                    size: Some(size),
-                    naming_scheme,
-                })
+                Ok(final_location)
             }
             // Dataset not found in the external store, this could be because the dataset did not
             // use external store for commit before. In this case, we search for the latest manifest
             None => current_manifest_path(object_store, base_path).await,
         }
-    }
-
-    /// Get the latest version of a dataset at the path
-    async fn resolve_latest_version(
-        &self,
-        base_path: &Path,
-        object_store: &ObjectStore,
-    ) -> std::result::Result<Path, Error> {
-        self.resolve_latest_location(base_path, object_store)
-            .await
-            .map(|l| l.path)
-    }
-
-    async fn resolve_latest_version_id(
-        &self,
-        base_path: &Path,
-        object_store: &ObjectStore,
-    ) -> std::result::Result<u64, Error> {
-        let version = self
-            .external_manifest_store
-            .get_latest_version(base_path.as_ref())
-            .await?;
-
-        match version {
-            Some((version, _)) => Ok(version),
-            None => Ok(current_manifest_path(object_store, base_path)
-                .await?
-                .version),
-        }
-    }
-
-    async fn resolve_version(
-        &self,
-        base_path: &Path,
-        version: u64,
-        object_store: &dyn OSObjectStore,
-    ) -> std::result::Result<Path, Error> {
-        Ok(self
-            .resolve_version_location(base_path, version, object_store)
-            .await?
-            .path)
     }
 
     async fn resolve_version_location(
@@ -305,7 +294,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     })?
                     .path;
                 match object_store.head(&path).await {
-                    Ok(ObjectMeta { size, .. }) => {
+                    Ok(ObjectMeta { size, e_tag, .. }) => {
                         let res = self
                             .external_manifest_store
                             .put_if_not_exists(
@@ -313,6 +302,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                                 version,
                                 path.as_ref(),
                                 size as u64,
+                                e_tag.clone(),
                             )
                             .await;
                         if let Err(e) = res {
@@ -328,6 +318,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                             path,
                             size: Some(size as u64),
                             naming_scheme,
+                            e_tag,
                         });
                     }
                     Err(ObjectStoreError::NotFound { .. }) => {
@@ -350,27 +341,23 @@ impl CommitHandler for ExternalManifestCommitHandler {
         let naming_scheme =
             ManifestNamingScheme::detect_scheme_staging(location.path.filename().unwrap());
 
-        let size = if let Some(size) = location.size {
-            size
+        let (size, e_tag) = if let Some(size) = location.size {
+            (size, location.e_tag.clone())
         } else {
-            object_store.head(&location.path).await?.size as u64
+            let meta = object_store.head(&location.path).await?;
+            (meta.size as u64, meta.e_tag)
         };
 
-        let new_path = self
-            .finalize_manifest(
-                base_path,
-                &location.path,
-                version,
-                size,
-                object_store,
-                naming_scheme,
-            )
-            .await?;
-
-        Ok(ManifestLocation {
-            path: new_path,
-            ..location
-        })
+        self.finalize_manifest(
+            base_path,
+            &location.path,
+            version,
+            size,
+            e_tag,
+            object_store,
+            naming_scheme,
+        )
+        .await
     }
 
     async fn commit(
@@ -381,14 +368,14 @@ impl CommitHandler for ExternalManifestCommitHandler {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<Path, CommitError> {
+    ) -> std::result::Result<ManifestLocation, CommitError> {
         // path we get here is the path to the manifest we want to write
         // use object_store.base_path.as_ref() for getting the root of the dataset
 
         // step 1: Write the manifest we want to commit to object store with a temporary name
         let path = naming_scheme.manifest_path(base_path, manifest.version);
         let staging_path = make_staging_manifest_path(&path)?;
-        let size = manifest_writer(object_store, manifest, indices, &staging_path).await?;
+        let write_res = manifest_writer(object_store, manifest, indices, &staging_path).await?;
 
         // step 2 & 3: Try to commit this version to external store, return err on failure
         let res = self
@@ -397,7 +384,8 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 base_path.as_ref(),
                 manifest.version,
                 staging_path.as_ref(),
-                size,
+                write_res.size as u64,
+                write_res.e_tag.clone(),
             )
             .await
             .map_err(|_| CommitError::CommitConflict {});
@@ -417,7 +405,8 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 base_path,
                 &staging_path,
                 manifest.version,
-                size,
+                write_res.size as u64,
+                write_res.e_tag,
                 &object_store.inner,
                 naming_scheme,
             )

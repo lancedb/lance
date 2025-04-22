@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
 use datafusion::execution::SendableRecordBatchStream;
+use humantime::format_duration;
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::datatypes::Schema;
 use lance_core::datatypes::SchemaCompareOptions;
@@ -119,7 +121,6 @@ impl<'a> InsertBuilder<'a> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_move_stable_row_ids(context.params.enable_move_stable_row_ids)
             .with_storage_format(context.storage_version)
-            .with_object_store_registry(context.params.object_store_registry.clone())
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
             .with_object_store(context.object_store.clone());
@@ -203,7 +204,44 @@ impl<'a> InsertBuilder<'a> {
         context: &WriteContext<'_>,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
+            WriteMode::Create => {
+                // Fetch auto_cleanup params from context
+                let config_upsert_values = match context.params.auto_cleanup.as_ref() {
+                    Some(auto_cleanup_params) => {
+                        let mut upsert_values = HashMap::new();
+
+                        upsert_values.insert(
+                            String::from("lance.auto_cleanup.interval"),
+                            auto_cleanup_params.interval.to_string(),
+                        );
+
+                        match auto_cleanup_params.older_than.to_std() {
+                            Ok(d) => {
+                                upsert_values.insert(
+                                    String::from("lance.auto_cleanup.older_than"),
+                                    format_duration(d).to_string(),
+                                );
+                            }
+                            Err(e) => {
+                                return Err(Error::InvalidInput {
+                                    source: e.into(),
+                                    location: location!(),
+                                })
+                            }
+                        };
+
+                        Some(upsert_values)
+                    }
+                    None => None,
+                };
+                Operation::Overwrite {
+                    // Use the full schema, not the written schema
+                    schema,
+                    fragments: written_frags.default.0,
+                    config_upsert_values,
+                }
+            }
+            WriteMode::Overwrite => Operation::Overwrite {
                 // Use the full schema, not the written schema
                 schema,
                 fragments: written_frags.default.0,
@@ -321,8 +359,13 @@ impl<'a> InsertBuilder<'a> {
                 dataset.commit_handler.clone(),
             ),
             WriteDestination::Uri(uri) => {
+                let registry = params
+                    .session
+                    .as_ref()
+                    .map(|s| s.store_registry())
+                    .unwrap_or_else(|| Arc::new(Default::default()));
                 let (object_store, base_path) = ObjectStore::from_uri_and_params(
-                    params.object_store_registry.clone(),
+                    registry,
                     uri,
                     &params.store_params.clone().unwrap_or_default(),
                 )
@@ -333,7 +376,7 @@ impl<'a> InsertBuilder<'a> {
                     &params.store_params,
                 )
                 .await?;
-                (Arc::new(object_store), base_path, commit_handler)
+                (object_store, base_path, commit_handler)
             }
         };
         let dest = match &self.dest {
@@ -343,7 +386,6 @@ impl<'a> InsertBuilder<'a> {
                 let builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
                     store_options: params.store_params.clone(),
                     commit_handler: params.commit_handler.clone(),
-                    object_store_registry: params.object_store_registry.clone(),
                     ..Default::default()
                 });
 

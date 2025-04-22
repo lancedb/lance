@@ -142,6 +142,7 @@ impl Transformer for KeepFiniteVectors {
                     DataType::Float32 => is_all_finite::<Float32Type>(&data),
                     DataType::Float64 => is_all_finite::<Float64Type>(&data),
                     DataType::UInt8 => data.null_count() == 0,
+                    DataType::Int8 => data.null_count() == 0,
                     _ => false,
                 };
                 if is_valid {
@@ -207,8 +208,10 @@ impl Transformer for Flatten {
 
                 let row_ids = row_ids.values().iter().zip(vectors.iter()).flat_map(
                     |(row_id, multivector)| {
-                        std::iter::repeat(*row_id)
-                            .take(multivector.map(|multivec| multivec.len()).unwrap_or(0))
+                        std::iter::repeat_n(
+                            *row_id,
+                            multivector.map(|multivec| multivec.len()).unwrap_or(0),
+                        )
                     },
                 );
                 let row_ids = UInt64Array::from_iter_values(row_ids);

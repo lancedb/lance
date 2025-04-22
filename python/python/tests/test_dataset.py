@@ -1790,6 +1790,82 @@ def test_merge_insert_large():
     )
 
 
+def test_merge_insert_empty_index():
+    # Reported in https://github.com/lancedb/lancedb/issues/2285
+    empty_table = pa.table({"id": pa.array([], type=pa.float64())})
+    empty_ds = lance.write_dataset(empty_table, "memory://")
+
+    empty_ds.create_scalar_index("id", "BTREE")
+
+    df = pa.table({"id": [1.0, 2.0, 3.0]})
+
+    empty_ds.merge_insert("id").when_not_matched_insert_all().execute(df)
+
+
+def test_add_null_columns(tmp_path: Path):
+    data = pa.table({"id": [1, 2, 4]})
+    ds = lance.write_dataset(data, tmp_path)
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+    assert len(fragments[0].data_files()) == 1
+
+    ds.add_columns(pa.field("f1", pa.float32()))
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+    assert len(fragments[0].data_files()) == 1
+    assert ds.schema == pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("f1", pa.float32()),
+        ]
+    )
+
+    ds.add_columns(
+        [pa.field("v2", pa.list_(pa.float32(), 32)), pa.field("v3", pa.int32())]
+    )
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+    assert len(fragments[0].data_files()) == 1
+    assert ds.schema == pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("f1", pa.float32()),
+            pa.field("v2", pa.list_(pa.float32(), 32)),
+            pa.field("v3", pa.int32()),
+        ]
+    )
+
+    ds.add_columns(
+        pa.schema([pa.field("s6", pa.struct([("a", pa.int32()), ("b", pa.bool_())]))])
+    )
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+    assert len(fragments[0].data_files()) == 1
+    assert ds.schema == pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("f1", pa.float32()),
+            pa.field("v2", pa.list_(pa.float32(), 32)),
+            pa.field("v3", pa.int32()),
+            pa.field("s6", pa.struct([("a", pa.int32()), ("b", pa.bool_())])),
+        ]
+    )
+
+
+def test_add_null_columns_with_conflict_names(tmp_path: Path):
+    data = pa.table({"id": [1, 2, 4]})
+    ds = lance.write_dataset(data, tmp_path)
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+    assert len(fragments[0].data_files()) == 1
+
+    with pytest.raises(Exception, match=".*Column id already exists in the dataset.*"):
+        ds.add_columns(pa.field("id", pa.float32()))
+
+    with pytest.raises(Exception, match=".*Column id already exists in the dataset.*"):
+        ds.add_columns([pa.field("id", pa.float32()), pa.field("good", pa.int32())])
+
+
 def check_update_stats(update_dict, expected):
     assert (update_dict["num_rows_updated"],) == expected
 

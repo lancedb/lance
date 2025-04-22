@@ -46,6 +46,7 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
+use lance_index::vector::utils::is_finite;
 use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
@@ -833,6 +834,11 @@ impl Index for IVFIndex {
         }
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: We should prewarm the IVF index by loading the partitions into memory
+        Ok(())
+    }
+
     fn statistics(&self) -> Result<serde_json::Value> {
         let partitions_statistics = (0..self.ivf.num_partitions())
             .map(|part_id| IvfIndexPartitionStatistics {
@@ -1222,9 +1228,13 @@ pub async fn build_ivf_model(
         (training_data, metric_type)
     };
 
+    // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
+    let training_data = arrow::compute::filter(&training_data, &is_finite(&training_data))?;
+    let training_data = training_data.as_fixed_size_list();
+
     info!("Start to train IVF model");
     let start = std::time::Instant::now();
-    let ivf = train_ivf_model(centroids, &training_data, mt, params).await?;
+    let ivf = train_ivf_model(centroids, training_data, mt, params).await?;
     info!(
         "Trained IVF model in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -1795,6 +1805,21 @@ async fn train_ivf_model(
             )
             .await
         }
+        (DataType::Int8, DistanceType::L2)
+        | (DataType::Int8, DistanceType::Dot)
+        | (DataType::Int8, DistanceType::Cosine) => {
+            do_train_ivf_model::<Float32Type>(
+                centroids,
+                data.convert_to_floating_point()?
+                    .values()
+                    .as_primitive::<Float32Type>()
+                    .values(),
+                dim,
+                distance_type,
+                params,
+            )
+            .await
+        }
         (DataType::UInt8, DistanceType::Hamming) => {
             do_train_ivf_model::<UInt8Type>(
                 centroids,
@@ -1821,7 +1846,7 @@ mod tests {
     use super::*;
 
     use std::collections::HashSet;
-    use std::iter::repeat;
+    use std::iter::repeat_n;
     use std::ops::Range;
 
     use arrow_array::types::UInt64Type;
@@ -2720,7 +2745,7 @@ mod tests {
             .scan()
             .nearest(
                 "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                &Float32Array::from_iter_values(repeat_n(0.5, DIM)),
                 5,
             )
             .unwrap()
@@ -2788,7 +2813,7 @@ mod tests {
             .scan()
             .nearest(
                 "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                &Float32Array::from_iter_values(repeat_n(0.5, DIM)),
                 5,
             )
             .unwrap()

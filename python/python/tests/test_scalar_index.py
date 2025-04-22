@@ -13,6 +13,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from lance.query import BoostQuery, MatchQuery, MultiMatchQuery, PhraseQuery
 from lance.vector import vec_to_table
 
 
@@ -110,7 +111,7 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
 
 
 def test_indexed_between(tmp_path):
-    dataset = lance.write_dataset(pa.table({"val": range(100)}), tmp_path)
+    dataset = lance.write_dataset(pa.table({"val": range(0, 10000)}), tmp_path)
     dataset.create_scalar_index("val", index_type="BTREE")
 
     scanner = dataset.scanner(filter="val BETWEEN 10 AND 20", prefilter=True)
@@ -126,6 +127,23 @@ def test_indexed_between(tmp_path):
 
     actual_data = scanner.to_table()
     assert actual_data.num_rows == 11
+
+    # The following cases are slightly ill-formed since end is before start
+    # but we should handle them gracefully and simply return an empty result
+    # (previously we panicked here)
+    scanner = dataset.scanner(filter="val >= 5000 AND val <= 0", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 0
+
+    scanner = dataset.scanner(filter="val BETWEEN 5000 AND 0", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 0
 
 
 def test_temporal_index(tmp_path):
@@ -212,6 +230,23 @@ def test_indexed_vector_scan_postfilter(
     )
 
     assert scanner.to_table().num_rows == 0
+
+
+def test_fixed_size_binary(tmp_path):
+    arr = pa.array([b"0123012301230123", b"2345234523452345"], pa.uuid())
+
+    ds = lance.write_dataset(pa.table({"uuid": arr}), tmp_path)
+
+    ds.create_scalar_index("uuid", "BTREE")
+
+    query = (
+        "uuid = arrow_cast(0x32333435323334353233343532333435, 'FixedSizeBinary(16)')"
+    )
+    assert "MaterializeIndex" in ds.scanner(filter=query).explain_plan()
+
+    table = ds.scanner(filter=query).to_table()
+    assert table.num_rows == 1
+    assert table.column("uuid").to_pylist() == arr.slice(1, 1).to_pylist()
 
 
 def test_index_take_batch_size(tmp_path):
@@ -351,6 +386,144 @@ def test_indexed_filter_with_fts_index(tmp_path):
         with_row_id=True,
     )
     assert results["_rowid"].to_pylist() == [2, 3]
+
+
+def test_fts_on_list(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                ["lance database", "the", "search"],
+                ["lance database"],
+                ["lance", "search"],
+                ["database", "search"],
+                ["unrelated", "doc"],
+            ]
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED", with_position=True)
+
+    results = ds.to_table(full_text_query="lance")
+    assert results.num_rows == 3
+
+    results = ds.to_table(full_text_query=PhraseQuery("lance database", "text"))
+    assert results.num_rows == 2
+
+
+def test_fts_fuzzy_query(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "fa",
+                "fo",  # spellchecker:disable-line
+                "fob",
+                "focus",
+                "foo",
+                "food",
+                "foul",
+            ]
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+
+    results = ds.to_table(
+        full_text_query=MatchQuery("foo", "text", fuzziness=1),
+    )
+    assert results.num_rows == 4
+    assert set(results["text"].to_pylist()) == {
+        "foo",
+        "fo",  # 1 deletion # spellchecker:disable-line
+        "fob",  # 1 substitution
+        "food",  # 1 insertion
+    }
+
+    results = ds.to_table(
+        full_text_query=MatchQuery("foo", "text", fuzziness=1, max_expansions=3),
+    )
+    assert results.num_rows == 3
+
+
+def test_fts_phrase_query(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "frodo was a puppy",
+                "frodo was a happy puppy",
+                "frodo was a very happy puppy",
+                "frodo was a puppy with a tail",
+            ]
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+
+    results = ds.to_table(
+        full_text_query='"frodo was a puppy"',
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+    }
+
+    results = ds.to_table(
+        full_text_query=PhraseQuery("frodo was a puppy", "text"),
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+    }
+
+
+def test_fts_boost_query(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "frodo was a puppy",
+                "frodo was a happy puppy",
+                "frodo was a puppy with a tail",
+            ]
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+    results = ds.to_table(
+        full_text_query=BoostQuery(
+            MatchQuery("puppy", "text"),
+            MatchQuery("happy", "text"),
+            negative_boost=0.5,
+        ),
+    )
+    assert results.num_rows == 3
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+        "frodo was a happy puppy",
+    }
+
+
+def test_fts_multi_match_query(tmp_path):
+    data = pa.table(
+        {
+            "title": ["title common", "title hello", "title vector"],
+            "content": ["content world", "content database", "content common"],
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("title", "INVERTED")
+    ds.create_scalar_index("content", "INVERTED")
+
+    results = ds.to_table(
+        full_text_query=MultiMatchQuery("common", ["title", "content"]),
+    )
+    assert set(results["title"].to_pylist()) == {"title common", "title vector"}
+    assert set(results["content"].to_pylist()) == {"content world", "content common"}
 
 
 def test_fts_with_postfilter(tmp_path):
@@ -633,6 +806,39 @@ def test_null_handling(tmp_path: Path):
     check(True)
 
 
+def test_nan_handling(tmp_path: Path):
+    tbl = pa.table(
+        {
+            "x": [
+                1.0,
+                float("-nan"),
+                float("infinity"),
+                float("-infinity"),
+                2.0,
+                float("nan"),
+                3.0,
+            ],
+        }
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    # There is no way, in DF, to query for NAN / INF, that I'm aware of.
+    # So the best we can do here is make sure that the presence of NAN / INF
+    # doesn't interfere with normal operation of the btree.
+    def check(has_index: bool):
+        assert dataset.to_table(filter="x IS NULL").num_rows == 0
+        assert dataset.to_table(filter="x IS NOT NULL").num_rows == 7
+        assert dataset.to_table(filter="x > 0").num_rows == 5
+        assert dataset.to_table(filter="x < 5").num_rows == 5
+        assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
+
+    check(False)
+    dataset.create_scalar_index("x", index_type="BITMAP")
+    check(True)
+    dataset.create_scalar_index("x", index_type="BTREE")
+    check(True)
+
+
 def test_scalar_index_with_nulls(tmp_path):
     # Create a test dataframe with 50% null values.
     test_table_size = 10_000
@@ -818,3 +1024,35 @@ def test_drop_index(tmp_path):
     assert ds.to_table(filter="bitmap = 1").num_rows == 1
     assert ds.to_table(filter="fts = 'a'").num_rows == test_table_size
     assert ds.to_table(filter="contains(ngram, 'a')").num_rows == test_table_size
+
+
+def test_index_prewarm(tmp_path: Path):
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table_size = 100
+    test_table = pa.table(
+        {
+            "fts": ["a" for _ in range(test_table_size)],
+        }
+    )
+
+    # Write index, cache should not be populated
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("fts", index_type="INVERTED")
+    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    assert scan_stats.parts_loaded > 0
+
+    # Fresh load, no prewarm, cache should not be populated
+    ds = lance.dataset(tmp_path)
+    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    assert scan_stats.parts_loaded > 0
+
+    # Prewarm index, cache should be populated
+    ds = lance.dataset(tmp_path)
+    ds.prewarm_index("fts_idx")
+    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    assert scan_stats.parts_loaded == 0
