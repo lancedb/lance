@@ -108,7 +108,7 @@ impl SpillReader {
         }
     }
 
-    async fn wait_for_more_data(&mut self) -> Result<(), DataFusionError> {
+    async fn wait_for_more_data(&mut self) -> Result<Option<Arc<[RecordBatch]>>, DataFusionError> {
         let status = self
             .receiver
             .wait_for(|status| {
@@ -128,10 +128,14 @@ impl SpillReader {
             return Err(DataFusionError::from(&mut (*guard)));
         }
 
-        Ok(())
+        if let DataLocation::Buffered { batches } = &status.data_location {
+            Ok(Some(batches.clone()))
+        } else {
+            Ok(None)
+        }
     }
 
-    async fn upgrade(&mut self) -> Result<(), ArrowError> {
+    async fn get_reader(&mut self) -> Result<&AsyncStreamReader, ArrowError> {
         if let SpillReaderState::Buffered { spill_path } = &self.state {
             let reader = AsyncStreamReader::open(spill_path.clone()).await?;
             // Skip batches we've already read.
@@ -140,37 +144,32 @@ impl SpillReader {
             }
             self.state = SpillReaderState::Reader { reader };
         }
-        Ok(())
+
+        if let SpillReaderState::Reader { reader } = &mut self.state {
+            Ok(reader)
+        } else {
+            unreachable!()
+        }
     }
 
     async fn read(&mut self) -> Result<Option<RecordBatch>, DataFusionError> {
-        self.wait_for_more_data().await?;
+        let maybe_data = self.wait_for_more_data().await?;
 
-        if let SpillReaderState::Buffered { .. } = &self.state {
-            self.upgrade().await?;
-        }
-
-        match self.state {
-            SpillReaderState::Buffered { .. } => {
-                if let DataLocation::Buffered { batches } = &self.receiver.borrow().data_location {
-                    if self.batches_read < batches.len() {
-                        let batch = batches[self.batches_read].clone();
-                        self.batches_read += 1;
-                        Ok(Some(batch))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    unreachable!("maybe")
-                }
+        if let Some(batches) = maybe_data {
+            if self.batches_read < batches.len() {
+                let batch = batches[self.batches_read].clone();
+                self.batches_read += 1;
+                Ok(Some(batch))
+            } else {
+                Ok(None)
             }
-            SpillReaderState::Reader { ref mut reader } => {
-                let batch = reader.read().await?;
-                if batch.is_some() {
-                    self.batches_read += 1;
-                }
-                Ok(batch)
+        } else {
+            let reader = self.get_reader().await?;
+            let batch = reader.read().await?;
+            if batch.is_some() {
+                self.batches_read += 1;
             }
+            Ok(batch)
         }
     }
 }
@@ -354,12 +353,13 @@ impl SpillSender {
                 if memory_accumulator.total() > self.memory_limit {
                     let writer =
                         AsyncStreamWriter::open(self.path.clone(), self.schema.clone()).await?;
+                    let batches_written = batches.len();
                     for batch in batches.drain(..) {
                         writer.write(batch).await?;
                     }
                     self.state = SpillState::Spilling {
                         writer,
-                        batches_written: batches.len(),
+                        batches_written,
                     };
                     if let SpillState::Spilling {
                         writer,
@@ -671,8 +671,83 @@ mod tests {
 
     #[tokio::test]
     async fn test_spill_buffered() {
-        todo!("test spill with less than memory limit.");
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("spill.arrows");
+        let memory_limit = 1024 * 1024; // 1 MiB
+        let (mut spill, receiver) = create_spill(path.clone(), schema.clone(), memory_limit);
 
-        todo!("test spill starts under memory limit");
+        // 0.5 MB batch
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1; (512 * 1024) / 4]))],
+        )
+        .unwrap();
+        spill.write(batch.clone()).await.unwrap();
+        assert!(!std::fs::exists(&path).unwrap());
+
+        spill.finish().await.unwrap();
+        assert!(!std::fs::exists(&path).unwrap());
+
+        let mut stream = receiver.read();
+        let stream_batch = stream
+            .next()
+            .await
+            .expect("Expected a batch")
+            .expect("Expected no error");
+        assert_eq!(&stream_batch, &batch);
+
+        assert!(!std::fs::exists(&path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_spill_buffered_transition() {
+        // Starts as buffered, then spills, then finished.
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("spill.arrows");
+        let memory_limit = 1024 * 1024; // 1 MiB
+        let (mut spill, receiver) = create_spill(path.clone(), schema.clone(), memory_limit);
+
+        // 0.7 MB batch
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1; (768 * 1024) / 4]))],
+        )
+        .unwrap();
+        spill.write(batch.clone()).await.unwrap();
+        assert!(!std::fs::exists(&path).unwrap());
+
+        let mut stream = receiver.read();
+        let stream_batch = stream
+            .next()
+            .await
+            .expect("Expected a batch")
+            .expect("Expected no error");
+        assert_eq!(&stream_batch, &batch);
+        assert!(!std::fs::exists(&path).unwrap());
+
+        // 0.5 MB batch
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1; (512 * 1024) / 4]))],
+        )
+        .unwrap();
+        spill.write(batch.clone()).await.unwrap();
+        assert!(std::fs::exists(&path).unwrap());
+
+        let stream_batch = stream
+            .next()
+            .await
+            .expect("Expected a batch")
+            .expect("Expected no error");
+        assert_eq!(&stream_batch, &batch);
+        assert!(std::fs::exists(&path).unwrap());
+
+        spill.finish().await.unwrap();
+
+        assert!(stream.next().await.is_none());
+
+        std::fs::remove_file(path).unwrap();
     }
 }
