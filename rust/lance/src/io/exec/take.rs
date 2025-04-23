@@ -463,6 +463,14 @@ impl ExecutionPlan for TakeExec {
         vec![&self.input]
     }
 
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // This is an I/O bound operation and wouldn't really benefit from partitioning
+        //
+        // Plus, if we did that, we would be creating multiple schedulers which could use
+        // a lot of RAM.
+        vec![false]
+    }
+
     /// This preserves the output schema.
     fn with_new_children(
         self: Arc<Self>,

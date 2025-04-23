@@ -14,7 +14,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use futures::stream::{self};
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
@@ -94,6 +94,14 @@ impl ExecutionPlan for MatchQueryExec {
             PreFilterSource::FilteredRowIds(src) => vec![&src],
             PreFilterSource::ScalarIndexQuery(src) => vec![&src],
         }
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // Prefilter inputs must be a single partition
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
     }
 
     fn with_new_children(
@@ -251,6 +259,7 @@ impl ExecutionPlan for MatchQueryExec {
     }
 }
 
+/// Calculates the FTS score for each row in the input
 #[derive(Debug)]
 pub struct FlatMatchQueryExec {
     dataset: Arc<Dataset>,
@@ -452,6 +461,14 @@ impl ExecutionPlan for PhraseQueryExec {
         }
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // Prefilter inputs must be a single partition
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -642,6 +659,15 @@ impl ExecutionPlan for BoostQueryExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.positive, &self.negative]
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // This node fully consumes and re-orders the input rows.
+        // It must be run on a single partition.
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
     }
 
     fn with_new_children(

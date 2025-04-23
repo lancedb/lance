@@ -28,7 +28,7 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     physical_plan::metrics::MetricsSet,
 };
-use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::{Distribution, EquivalenceProperties};
 use futures::stream::repeat_with;
 use futures::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
@@ -497,7 +497,7 @@ impl ANNIvfSubIndexExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
-            EmissionType::Incremental,
+            EmissionType::Final,
             Boundedness::Bounded,
         );
         Ok(Self {
@@ -547,6 +547,14 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             PreFilterSource::FilteredRowIds(src) => vec![&self.input, &src],
             PreFilterSource::ScalarIndexQuery(src) => vec![&self.input, &src],
         }
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // Prefilter inputs must be a single partition
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
     }
 
     fn with_new_children(
@@ -736,7 +744,7 @@ impl MultivectorScoringExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
-            EmissionType::Incremental,
+            EmissionType::Final,
             Boundedness::Bounded,
         );
 
@@ -773,6 +781,15 @@ impl ExecutionPlan for MultivectorScoringExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.inputs.iter().collect()
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // This node fully consumes and re-orders the input rows.  It must be
+        // run on a single partition.
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
     }
 
     fn with_new_children(
