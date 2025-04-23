@@ -326,6 +326,12 @@ impl ExecutionPlan for ReplayExec {
         unimplemented!()
     }
 
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // We aren't doing any work here, and it would be a little confusing
+        // to have multiple replay queues.
+        vec![false]
+    }
+
     fn execute(
         &self,
         partition: usize,
