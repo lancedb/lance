@@ -293,8 +293,14 @@ impl Display for IoTrackingStore {
     }
 }
 
-#[derive(Debug)]
-struct StatsHolder(Arc<Mutex<IoStats>>);
+#[derive(Debug, Default, Clone)]
+pub(crate) struct StatsHolder(Arc<Mutex<IoStats>>);
+
+impl StatsHolder {
+    pub fn incremental_stats(&self) -> IoStats {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
 
 impl WrappingObjectStore for StatsHolder {
     fn wrap(&self, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
