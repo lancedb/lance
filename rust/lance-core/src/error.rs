@@ -58,7 +58,7 @@ pub enum Error {
         location: Location,
     },
     #[snafu(display("Too many concurrent writers."))]
-    TooMuchContention { message: String, location: Location },
+    TooMuchWriteContention { message: String, location: Location },
     #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}, {location}"))]
     Internal { message: String, location: Location },
     #[snafu(display("A prerequisite task failed: {message}, {location}"))]

@@ -1036,9 +1036,9 @@ impl MergeInsertJob {
                 Err(e) => return Err(e),
             };
         }
-        Err(Error::TooMuchContention {
+        Err(Error::TooMuchWriteContention {
             message: format!(
-                "Attempted {} retries, but there is too much contention on the table.",
+                "Attempted {} retries, but there are too many concurrent writers to commit this change.",
                 max_retries
             ),
             location: location!(),
