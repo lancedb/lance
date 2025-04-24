@@ -430,7 +430,6 @@ impl Transaction {
         // added rows that would be deleted.
         match &self.operation {
             Operation::Append { .. } => match &other.operation {
-                // Append is compatible with anything that doesn't change the schema
                 Operation::Append { .. }
                 | Operation::Rewrite { .. }
                 | Operation::CreateIndex { .. }
@@ -438,15 +437,16 @@ impl Transaction {
                 | Operation::Update { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
+                | Operation::Merge { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::DataReplacement { .. } => Compatible,
-                _ => NotCompatible,
+                // Append is not compatible with any operation that completely
+                // overwrites the schema.
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
             },
             Operation::Rewrite { .. } => match &other.operation {
                 // Rewrite is only compatible with operations that don't touch
-                // existing fragments.
-                // TODO: it could also be compatible with operations that update
-                // fragments we don't touch.
+                // existing fragments or update fragments we don't touch.
                 Operation::Append { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
@@ -482,7 +482,7 @@ impl Transaction {
                         Compatible
                     }
                 }
-                _ => NotCompatible,
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
             },
             // Restore always succeeds
             Operation::Restore { .. } => Compatible,
@@ -492,27 +492,45 @@ impl Transaction {
                 Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
                 _ => Compatible,
             },
-            Operation::CreateIndex { .. } => match &other.operation {
+            Operation::CreateIndex { new_indices, .. } => match &other.operation {
                 Operation::Append { .. } => Compatible,
                 // Indices are identified by UUIDs, so they shouldn't conflict.
                 Operation::CreateIndex { .. } => Compatible,
                 // Although some of the rows we indexed may have been deleted / moved,
                 // row ids are still valid, so we allow this optimistically.
                 Operation::Delete { .. } | Operation::Update { .. } => Compatible,
-                // Merge & reserve don't change row ids, so this should be fine.
+                // Merge, reserve, and project don't change row ids, so this should be fine.
                 Operation::Merge { .. } => Compatible,
                 Operation::ReserveFragments { .. } => Compatible,
-                // Rewrite likely changed many of the row ids, so our index is
-                // likely useless. It should be rebuilt.
-                // TODO: we could be smarter here and only invalidate the index
-                // if the rewrite changed more than X% of row ids.
-                Operation::Rewrite { .. } => Retryable,
+                Operation::Project { .. } => Compatible,
+                // Should be compatible with rewrite if it didn't move the rows
+                // we indexed. If it did, we could retry.
+                // TODO: this will change with stable row ids.
+                Operation::Rewrite { .. } => {
+                    let mut affected_ids = HashSet::new();
+                    for index in new_indices {
+                        if let Some(frag_bitmap) = &index.fragment_bitmap {
+                            affected_ids.extend(frag_bitmap.iter());
+                        } else {
+                            return Retryable;
+                        }
+                    }
+                    if other
+                        .operation
+                        .modified_fragment_ids()
+                        .any(|id| affected_ids.contains(&(id as u32)))
+                    {
+                        Retryable
+                    } else {
+                        Compatible
+                    }
+                }
                 Operation::UpdateConfig { .. } => Compatible,
                 Operation::DataReplacement { .. } => {
                     // TODO(rmeng): check that the new indices isn't on the column being replaced
-                    NotCompatible
+                    Retryable
                 }
-                _ => NotCompatible,
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
             },
             Operation::Delete { .. } | Operation::Update { .. } => match &other.operation {
                 Operation::CreateIndex { .. }
@@ -520,7 +538,10 @@ impl Transaction {
                 | Operation::Project { .. }
                 | Operation::Append { .. }
                 | Operation::UpdateConfig { .. } => Compatible,
-                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
+                Operation::Delete { .. }
+                | Operation::Rewrite { .. }
+                | Operation::Update { .. }
+                | Operation::DataReplacement { .. } => {
                     // If we update the same fragments, we conflict.
                     if self.operation.modifies_same_ids(&other.operation) {
                         Retryable
@@ -528,7 +549,8 @@ impl Transaction {
                         Compatible
                     }
                 }
-                _ => NotCompatible,
+                Operation::Merge { .. } => Retryable,
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
             },
             Operation::Overwrite { .. } => match &other.operation {
                 // Overwrite only conflicts with another operation modifying the same update config
@@ -577,8 +599,11 @@ impl Transaction {
                 | Operation::Append { .. }
                 | Operation::Delete { .. }
                 | Operation::Rewrite { .. }
-                | Operation::Merge { .. } => Retryable,
-                _ => NotCompatible,
+                | Operation::Merge { .. }
+                | Operation::DataReplacement { .. } => Retryable,
+                Operation::Overwrite { .. }
+                | Operation::Restore { .. }
+                | Operation::Project { .. } => NotCompatible,
             },
             Operation::Project { .. } => match &other.operation {
                 // Project is compatible with anything that doesn't change the schema
@@ -587,15 +612,23 @@ impl Transaction {
                 | Operation::Delete { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::CreateIndex { .. }
-                | Operation::DataReplacement { .. } => Compatible,
-                _ => NotCompatible,
+                | Operation::DataReplacement { .. }
+                | Operation::Rewrite { .. }
+                | Operation::ReserveFragments { .. } => Compatible,
+                Operation::Merge { .. } | Operation::Project { .. } => {
+                    // Need to recompute the schema
+                    Retryable
+                }
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
             },
             Operation::DataReplacement { .. } => match &other.operation {
                 Operation::Append { .. }
                 | Operation::Delete { .. }
                 | Operation::Update { .. }
                 | Operation::Merge { .. }
-                | Operation::UpdateConfig { .. } => Compatible,
+                | Operation::UpdateConfig { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Project { .. } => Compatible,
                 Operation::CreateIndex { .. } => {
                     // TODO(rmeng): check that the new indices isn't on the column being replaced
                     NotCompatible
@@ -608,7 +641,7 @@ impl Transaction {
                     // TODO(rmeng): check cell conflicts
                     NotCompatible
                 }
-                _ => NotCompatible,
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
             },
         }
     }
@@ -1903,7 +1936,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Compatible,    // delete
-                    NotCompatible, // merge
+                    Compatible,    // merge
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -1922,7 +1955,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Compatible,    // delete
-                    NotCompatible, // merge
+                    Retryable,     // merge
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -1941,7 +1974,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Retryable,     // delete
-                    NotCompatible, // merge
+                    Retryable,     // merge
                     NotCompatible, // overwrite
                     Retryable,     // rewrite
                     Compatible,    // reserve
@@ -2063,7 +2096,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Retryable,     // delete
-                    NotCompatible, // merge
+                    Retryable,     // merge
                     NotCompatible, // overwrite
                     Retryable,     // rewrite
                     Compatible,    // reserve
