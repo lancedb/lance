@@ -25,6 +25,10 @@ use lance_core::error::LanceOptionExt;
 /// is called, then the data will simply be kept in memory and no spill will be
 /// created.
 ///
+/// `path` is the path to the file that may be created. It should not already
+/// exist. It is the responsibility of the caller to delete the file after it is
+/// no longer needed.
+///
 /// The [`SpillSender`] allows you to write batches to the spill.
 ///
 /// The [`SpillReceiver`] can open a [`SendableRecordBatchStream`] that reads
@@ -138,7 +142,9 @@ impl SpillReader {
     async fn get_reader(&mut self) -> Result<&AsyncStreamReader, ArrowError> {
         if let SpillReaderState::Buffered { spill_path } = &self.state {
             let reader = AsyncStreamReader::open(spill_path.clone()).await?;
-            // Skip batches we've already read.
+            // Skip batches we've already read before the writer started spilling.
+            // The read batches were spilled to the file for the benefit of
+            // future readers, as the spill is replay-able.
             for _ in 0..self.batches_read {
                 reader.read().await?;
             }
@@ -174,12 +180,10 @@ impl SpillReader {
     }
 }
 
-/// A spill of Arrow data to an IPC stream file.
+/// The sender side of the spill. This is used to write batches to the spill.
 ///
-/// Use [`Self::write()`] to write batches to the spill. They will immediately
-/// be flushed to the IPC stream file. The file is created on the first write.
-/// Use [`Self::finish()`] once all batches have been written to finalize the
-/// file.
+/// Note: this must be kept alive until after the readers are done reading the
+/// spill. Otherwise, they will return an error.
 pub struct SpillSender {
     memory_limit: usize,
     schema: Arc<Schema>,
@@ -328,8 +332,13 @@ impl From<&SpillState> for WriteStatus {
 }
 
 impl SpillSender {
-    /// Write a batch to the spill. The batch is immediately flushed to the
-    /// IPC stream file.
+    /// Write a batch to the spill.  
+    ///  
+    /// If there is room in the `memory_limit` then the batch is queued.  
+    /// If `memory_limit` is first encountered then all queued batches, and this one,  
+    /// will be written to disk as part of this call.  
+    /// If we are already spilling then the batch will be written to disk as part of this  
+    /// call.
     pub async fn write(&mut self, batch: RecordBatch) -> Result<(), DataFusionError> {
         if let SpillState::Finished { .. } = self.state {
             return Err(DataFusionError::Execution(

@@ -649,10 +649,11 @@ async fn resolve_commit_handler(
 
 /// Create an iterator of record batch streams from the given source.
 ///
-/// If `enable_retries` is true, the source will be collected, and the
-/// resulting iterator will be an infinite iterator that returns the same
-/// batches over and over again. Otherwise, the source will be yielded by a
-/// one-item iterator.
+/// If `enable_retries` is true, then the source will be saved either in memory
+/// or spilled to disk to allow replaying the source in case of a failure. The
+/// source will be kept in memory if either (1) the size hint shows that
+/// there is only one batch or (2) the stream contains less than 100MB of
+/// data. Otherwise, the source will be spilled to a temporary file on disk.
 ///
 /// This is used to support retries on write operations.
 async fn new_source_iter(

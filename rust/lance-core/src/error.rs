@@ -57,7 +57,7 @@ pub enum Error {
         source: BoxedError,
         location: Location,
     },
-    #[snafu(display("Too many concurrent writers."))]
+    #[snafu(display("Too many concurrent writers. {message}, {location}"))]
     TooMuchWriteContention { message: String, location: Location },
     #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}, {location}"))]
     Internal { message: String, location: Location },

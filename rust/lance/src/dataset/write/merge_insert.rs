@@ -1037,10 +1037,7 @@ impl MergeInsertJob {
             };
         }
         Err(Error::TooMuchWriteContention {
-            message: format!(
-                "Attempted {} retries, but there are too many concurrent writers to commit this change.",
-                max_retries
-            ),
+            message: format!("Attempted {} retries.", max_retries),
             location: location!(),
         })
     }
