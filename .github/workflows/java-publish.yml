@@ -34,16 +34,16 @@ jobs:
           if-no-files-found: error
   linux-arm64:
     name: Build on Linux Arm64
-    runs-on: ubuntu-2404-8x-arm64
-    container:
-      image: quay.io/pypa/manylinux2014_aarch64
+    runs-on: ubuntu-2204-8x-arm64
+    container: quay.io/pypa/manylinux_2_34_aarch64
     timeout-minutes: 60
     defaults:
       run:
         working-directory: ./java
+        shell: bash
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -67,9 +67,9 @@ jobs:
           retention-days: 1
           if-no-files-found: error
   linux-x86:
-    runs-on: ubuntu-2404-8x-x64
+    runs-on: ubuntu-2204-8x-x64
     container:
-      image: quay.io/pypa/manylinux2014_x86_64
+      image: quay.io/pypa/manylinux_2_34_x86_64
     timeout-minutes: 60
     needs: [macos-arm64, linux-arm64]
     defaults:
