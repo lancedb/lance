@@ -24,7 +24,6 @@ use lance_core::Result;
 use lance_core::{utils::mask::RowIdTreeMap, Error};
 use lance_io::object_store::ObjectStore;
 use log::info;
-use moka::future::Cache;
 use object_store::path::Path;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::Serialize;
@@ -34,7 +33,6 @@ use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
 use crate::metrics::NoOpMetricsCollector;
-use crate::scalar::inverted::CACHE_SIZE;
 use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 
@@ -172,20 +170,13 @@ impl NGramPostingList {
 struct NGramPostingListReader {
     reader: Arc<dyn IndexReader>,
     /// The cache key is the row_offset
-    cache: Cache<u32, Arc<NGramPostingList>>,
-}
-
-impl DeepSizeOf for NGramPostingListReader {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        self.cache.weighted_size() as usize
-    }
+    index_cache: LanceCache,
+    // cache: Cache<u32, Arc<NGramPostingList>>,
 }
 
 impl std::fmt::Debug for NGramPostingListReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NGramListReader")
-            .field("cache_entry_count", &self.cache.entry_count())
-            .finish()
+        f.debug_struct("NGramListReader").finish()
     }
 }
 
@@ -196,9 +187,8 @@ impl NGramPostingListReader {
         row_offset: u32,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<NGramPostingList>> {
-        self.cache
-            .try_get_with(row_offset, async move {
-                metrics.record_part_load();
+        self.index_cache.get_or_insert(format!("posting-list-{}", row_offset), |_| async move {
+            metrics.record_part_load();
                 tracing::info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="ngram", part_id=row_offset);
                 let batch = self
                     .reader
@@ -207,10 +197,8 @@ impl NGramPostingListReader {
                         Some(&[POSTING_LIST_COL]),
                     )
                     .await?;
-                Result::Ok(Arc::new(NGramPostingList::try_from_batch(batch)?))
-            })
-            .await
-            .map_err(|e| Error::io(e.to_string(), location!()))
+                Result::Ok(NGramPostingList::try_from_batch(batch)?)
+        }).await.map_err(|e| Error::io(e.to_string(), location!()))
     }
 }
 
@@ -254,12 +242,12 @@ impl std::fmt::Debug for NGramIndex {
 
 impl DeepSizeOf for NGramIndex {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.tokens.deep_size_of_children(context) + self.list_reader.deep_size_of_children(context)
+        self.tokens.deep_size_of_children(context)
     }
 }
 
 impl NGramIndex {
-    async fn from_store(store: Arc<dyn IndexStore>) -> Result<Self> {
+    async fn from_store(store: Arc<dyn IndexStore>, index_cache: LanceCache) -> Result<Self> {
         let tokens = store.open_index_file(POSTINGS_FILENAME).await?;
         let tokens = tokens
             .read_range(0..tokens.num_rows(), Some(&[TOKENS_COL]))
@@ -278,10 +266,7 @@ impl NGramIndex {
 
         let posting_reader = Arc::new(NGramPostingListReader {
             reader: store.open_index_file(POSTINGS_FILENAME).await?,
-            cache: Cache::builder()
-                .max_capacity(*CACHE_SIZE as u64)
-                .weigher(|_, posting: &Arc<NGramPostingList>| posting.deep_size_of() as u32)
-                .build(),
+            index_cache,
         });
 
         Ok(Self {
@@ -438,11 +423,11 @@ impl ScalarIndex for NGramIndex {
         false
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
+    async fn load(store: Arc<dyn IndexStore>, index_cache: LanceCache) -> Result<Arc<Self>>
     where
         Self: Sized,
     {
-        Ok(Arc::new(Self::from_store(store).await?))
+        Ok(Arc::new(Self::from_store(store, index_cache).await?))
     }
 
     async fn remap(
@@ -1245,7 +1230,9 @@ mod tests {
             .unwrap();
 
         (
-            NGramIndex::from_store(Arc::new(test_store)).await.unwrap(),
+            NGramIndex::from_store(Arc::new(test_store), LanceCache::no_cache())
+                .await
+                .unwrap(),
             tmpdir,
         )
     }
@@ -1445,7 +1432,9 @@ mod tests {
 
         index.update(data, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let index = NGramIndex::from_store(test_store, LanceCache::no_cache())
+            .await
+            .unwrap();
         assert_eq!(index.tokens.len(), 3);
     }
 
@@ -1481,7 +1470,9 @@ mod tests {
         let remapping = HashMap::from([(2, Some(100)), (3, None), (4, Some(101))]);
         index.remap(&remapping, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let index = NGramIndex::from_store(test_store, LanceCache::no_cache())
+            .await
+            .unwrap();
         let row_ids = row_ids_in_index(&index).await;
         assert_eq!(row_ids, vec![0, 1, 100, 101]);
 
@@ -1520,7 +1511,9 @@ mod tests {
 
         index.update(data, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let index = NGramIndex::from_store(test_store, LanceCache::no_cache())
+            .await
+            .unwrap();
         let row_ids = row_ids_in_index(&index).await;
         assert_eq!(row_ids, vec![0, 1, 2, 3, 4, 100, 101, 102]);
 

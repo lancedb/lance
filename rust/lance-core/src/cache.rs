@@ -40,12 +40,10 @@ impl SizedRecord {
     }
 }
 
-type KeyMapper = Arc<dyn Fn(&str) -> String + Send + Sync>;
-
 #[derive(Clone)]
 pub struct LanceCache {
     cache: Arc<Cache<(String, TypeId), SizedRecord>>,
-    key_mapper: Option<KeyMapper>,
+    prefix: String,
 }
 
 impl std::fmt::Debug for LanceCache {
@@ -72,28 +70,52 @@ impl LanceCache {
             .weigher(|_, v: &SizedRecord| {
                 (v.size_accessor)(&v.record).try_into().unwrap_or(u32::MAX)
             })
+            .support_invalidation_closures()
             .build();
         Self {
             cache: Arc::new(cache),
-            key_mapper: None,
+            prefix: String::new(),
         }
     }
 
     pub fn no_cache() -> Self {
         Self {
             cache: Arc::new(Cache::new(0)),
-            key_mapper: None,
+            prefix: String::new(),
         }
     }
 
-    pub fn with_key_mapper(
-        &self,
-        key_mapper: impl Fn(&str) -> String + Send + Sync + 'static,
-    ) -> Self {
+    /// Appends a prefix to the cache key
+    ///
+    /// If this cache already has a prefix, the new prefix will be appended to
+    /// the existing one.
+    ///
+    /// Prefixes are used to create a namespace for the cache keys to avoid
+    /// collisions between different caches.
+    pub fn with_key_prefix(&self, prefix: &str) -> Self {
         Self {
             cache: self.cache.clone(),
-            key_mapper: Some(Arc::new(key_mapper)),
+            prefix: format!("{}{}/", self.prefix, prefix),
         }
+    }
+
+    fn get_key(&self, key: &str) -> String {
+        if self.prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}/{}", self.prefix, key)
+        }
+    }
+
+    /// Invalidate all entries in the cache that start with the given prefix
+    ///
+    /// The given prefix is appended to the existing prefix of the cache. If you
+    /// want to invalidate all at the current prefix, pass an empty string.
+    pub fn invalidate_prefix(&self, prefix: &str) {
+        let full_prefix = format!("{}{}", self.prefix, prefix);
+        self.cache
+            .invalidate_entries_if(move |(key, _typeid), _value| key.starts_with(&full_prefix))
+            .expect("Cache configured correctly");
     }
 
     pub fn size(&self) -> usize {
@@ -114,19 +136,15 @@ impl LanceCache {
         self.cache.weighted_size() as usize
     }
 
-    pub fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, key: String, metadata: Arc<T>) {
-        let key = if let Some(key_mapper) = &self.key_mapper {
-            key_mapper(&key)
-        } else {
-            key
-        };
+    pub fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str, metadata: Arc<T>) {
+        let key = self.get_key(key);
         self.cache
             .insert((key, TypeId::of::<T>()), SizedRecord::new(metadata));
     }
 
     pub fn insert_unsized<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
         &self,
-        key: String,
+        key: &str,
         metadata: Arc<T>,
     ) {
         // In order to make the data Sized, we wrap in another pointer.
@@ -134,11 +152,7 @@ impl LanceCache {
     }
 
     pub fn get<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
-        let key = if let Some(key_mapper) = &self.key_mapper {
-            key_mapper(key)
-        } else {
-            key.to_string()
-        };
+        let key = self.get_key(key);
         self.cache
             .get(&(key, TypeId::of::<T>()))
             .map(|metadata| metadata.record.clone().downcast::<T>().unwrap())
@@ -163,7 +177,7 @@ impl LanceCache {
         loader: F,
     ) -> Result<Arc<T>>
     where
-        F: Fn(&str) -> Fut,
+        F: FnOnce(&str) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
         if let Some(metadata) = self.get::<T>(&key) {
@@ -171,7 +185,7 @@ impl LanceCache {
         }
 
         let metadata = Arc::new(loader(&key).await?);
-        self.insert(key, metadata.clone());
+        self.insert(&key, metadata.clone());
         Ok(metadata)
     }
 }
@@ -191,7 +205,7 @@ mod tests {
         assert_eq!(cache.approx_size_bytes(), 0);
 
         let item = Arc::new(vec![1, 2, 3]);
-        cache.insert("key".to_string(), item.clone());
+        cache.insert("key", item.clone());
         assert_eq!(cache.size(), 1);
         assert_eq!(cache.size_bytes(), item_size);
         assert_eq!(cache.approx_size_bytes(), item_size);
@@ -201,7 +215,7 @@ mod tests {
 
         // Test eviction based on size
         for i in 0..20 {
-            cache.insert(format!("key_{}", i), Arc::new(vec![i, i, i]));
+            cache.insert(&format!("key_{}", i), Arc::new(vec![i, i, i]));
         }
         assert_eq!(cache.size_bytes(), capacity);
         assert_eq!(cache.size(), 10);
@@ -226,7 +240,7 @@ mod tests {
         let item_dyn: Arc<dyn MyTrait> = item;
 
         let cache = LanceCache::with_capacity(1000);
-        cache.insert_unsized("test".to_string(), item_dyn);
+        cache.insert_unsized("test", item_dyn);
 
         let retrieved = cache.get_unsized::<dyn MyTrait>("test").unwrap();
         let retrieved = retrieved.as_any().downcast_ref::<MyType>().unwrap();

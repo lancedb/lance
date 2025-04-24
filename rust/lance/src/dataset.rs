@@ -12,6 +12,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 use itertools::Itertools;
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
@@ -130,6 +131,10 @@ pub struct Dataset {
     pub tags: Tags,
     pub manifest_naming_scheme: ManifestNamingScheme,
     pub manifest_e_tag: Option<String>,
+
+    // These are references to session caches, but with the dataset URI as a prefix.
+    pub(crate) index_cache: Arc<LanceCache>,
+    pub(crate) metadata_cache: Arc<LanceCache>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -472,6 +477,8 @@ impl Dataset {
             commit_handler.clone(),
             base_path.clone(),
         );
+        let metadata_cache = Arc::new(session.file_metadata_cache.with_key_prefix(&uri));
+        let index_cache = Arc::new(session.index_cache.with_key_prefix(&uri));
         Ok(Self {
             object_store,
             base: base_path,
@@ -483,6 +490,8 @@ impl Dataset {
             tags,
             manifest_naming_scheme,
             manifest_e_tag: e_tag,
+            index_cache,
+            metadata_cache,
         })
     }
 

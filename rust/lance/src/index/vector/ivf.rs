@@ -226,7 +226,7 @@ impl IVFIndex {
                     .await?;
                 let idx: Arc<dyn VectorIndex> = idx.into();
                 if write_cache {
-                    session.index_cache.insert_unsized(cache_key, idx.clone());
+                    session.index_cache.insert_unsized(&cache_key, idx.clone());
                 }
                 idx
             }

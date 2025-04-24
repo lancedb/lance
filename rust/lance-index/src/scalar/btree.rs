@@ -13,19 +13,22 @@ use std::{
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion::physical_plan::{
-    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-    union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+use datafusion::{
+    physical_plan::{
+        sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+        union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+    },
 };
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_physical_expr::{expressions::Column, LexOrdering, PhysicalSortExpr};
-use deepsize::{Context, DeepSizeOf};
+use deepsize::DeepSizeOf;
 use futures::{
     future::BoxFuture,
     stream::{self},
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
+    cache::LanceCache,
     utils::{
         mask::RowIdTreeMap,
         tokio::get_num_compute_intensive_cpus,
@@ -38,7 +41,6 @@ use lance_datafusion::{
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
 };
 use log::debug;
-use moka::sync::Cache;
 use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
 use snafu::location;
@@ -670,16 +672,6 @@ impl BTreeLookup {
     }
 }
 
-// Caches btree pages in memory
-#[derive(Debug)]
-struct BTreeCache(Cache<u32, Arc<dyn ScalarIndex>>);
-
-impl DeepSizeOf for BTreeCache {
-    fn deep_size_of_children(&self, _: &mut Context) -> usize {
-        self.0.iter().map(|(_, v)| v.deep_size_of()).sum()
-    }
-}
-
 // We only need to open a file reader for pages if we need to load a page.  If all
 // pages are cached we don't open it.  If we do open it we should only open it once.
 #[derive(Clone)]
@@ -724,7 +716,7 @@ impl LazyIndexReader {
 #[derive(Clone, Debug, DeepSizeOf)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
-    page_cache: Arc<BTreeCache>,
+    index_cache: LanceCache,
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
     batch_size: u64,
@@ -735,19 +727,15 @@ impl BTreeIndex {
         tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
         null_pages: Vec<u32>,
         store: Arc<dyn IndexStore>,
+        index_cache: LanceCache,
         sub_index: Arc<dyn BTreeSubIndex>,
         batch_size: u64,
     ) -> Self {
         let page_lookup = Arc::new(BTreeLookup::new(tree, null_pages));
-        let page_cache = Arc::new(BTreeCache(
-            Cache::builder()
-                .max_capacity(*CACHE_SIZE)
-                .weigher(|_, v: &Arc<dyn ScalarIndex>| v.deep_size_of() as u32)
-                .build(),
-        ));
+
         Self {
             page_lookup,
-            page_cache,
+            index_cache,
             store,
             sub_index,
             batch_size,
@@ -760,18 +748,15 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        if let Some(cached) = self.page_cache.0.get(&page_number) {
-            return Ok(cached);
-        }
-        metrics.record_part_load();
-        info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
-        let index_reader = index_reader.get().await?;
-        let serialized_page = index_reader
-            .read_record_batch(page_number as u64, self.batch_size)
-            .await?;
-        let subindex = self.sub_index.load_subindex(serialized_page).await?;
-        self.page_cache.0.insert(page_number, subindex.clone());
-        Ok(subindex)
+        self.index_cache.get_or_insert(format!("page-{}", page_number), move |_| async move {
+            metrics.record_part_load();
+            info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
+            let index_reader = index_reader.get().await?;
+            let serialized_page = index_reader
+                .read_record_batch(page_number as u64, self.batch_size)
+                .await?;
+            self.sub_index.load_subindex(serialized_page).await
+        }).await.map(|v| v.as_ref().clone())
     }
 
     async fn search_page(
@@ -798,6 +783,7 @@ impl BTreeIndex {
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
+        index_cache: LanceCache,
         batch_size: u64,
     ) -> Result<Self> {
         let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
@@ -806,7 +792,14 @@ impl BTreeIndex {
         if data.num_rows() == 0 {
             let data_type = data.column(0).data_type().clone();
             let sub_index = Arc::new(FlatIndexMetadata::new(data_type));
-            return Ok(Self::new(map, null_pages, store, sub_index, batch_size));
+            return Ok(Self::new(
+                map,
+                null_pages,
+                store,
+                index_cache,
+                sub_index,
+                batch_size,
+            ));
         }
 
         let mins = data.column(0);
@@ -848,7 +841,14 @@ impl BTreeIndex {
         // TODO: Support other page types?
         let sub_index = Arc::new(FlatIndexMetadata::new(data_type.clone()));
 
-        Ok(Self::new(map, null_pages, store, sub_index, batch_size))
+        Ok(Self::new(
+            map,
+            null_pages,
+            store,
+            index_cache,
+            sub_index,
+            batch_size,
+        ))
     }
 
     /// Create a stream of all the data in the index, in the same format used to train the index
@@ -998,7 +998,7 @@ impl ScalarIndex for BTreeIndex {
         true
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
+    async fn load(store: Arc<dyn IndexStore>, index_cache: LanceCache) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BTREE_LOOKUP_NAME).await?;
         let num_rows_in_lookup = page_lookup_file.num_rows();
         let serialized_lookup = page_lookup_file
@@ -1013,6 +1013,7 @@ impl ScalarIndex for BTreeIndex {
         Ok(Arc::new(Self::try_from_serialized(
             serialized_lookup,
             store,
+            index_cache,
             batch_size,
         )?))
     }
@@ -1443,7 +1444,7 @@ mod tests {
             .await
             .unwrap();
 
-        let index = BTreeIndex::load(test_store).await.unwrap();
+        let index = BTreeIndex::load(test_store, LanceCache::no_cache()).await.unwrap();
 
         for (idx, value) in values.into_iter().enumerate() {
             let query = SargableQuery::Equals(ScalarValue::Float64(Some(value)));

@@ -283,7 +283,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 if write_cache {
                     session
                         .index_cache
-                        .insert_unsized(cache_key, partition_entry.clone());
+                        .insert_unsized(&cache_key, partition_entry.clone());
                 }
 
                 partition_entry

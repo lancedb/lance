@@ -26,11 +26,11 @@ use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
+use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
-use moka::future::Cache;
 use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{info, instrument};
@@ -267,7 +267,7 @@ impl ScalarIndex for InvertedIndex {
         true
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
+    async fn load(store: Arc<dyn IndexStore>, index_cache: LanceCache) -> Result<Arc<Self>>
     where
         Self: Sized,
     {
@@ -290,7 +290,7 @@ impl ScalarIndex for InvertedIndex {
             let store = store.clone();
             async move {
                 let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
-                let invert_list = InvertedListReader::new(invert_list_reader)?;
+                let invert_list = InvertedListReader::new(invert_list_reader, index_cache)?;
                 Result::Ok(Arc::new(invert_list))
             }
         });
@@ -510,9 +510,7 @@ pub struct InvertedListReader {
 
     has_position: bool,
 
-    // cache
-    posting_cache: Cache<u32, PostingList>,
-    position_cache: Cache<u32, ListArray>,
+    index_cache: LanceCache,
 }
 
 impl std::fmt::Debug for InvertedListReader {
@@ -527,13 +525,11 @@ impl std::fmt::Debug for InvertedListReader {
 impl DeepSizeOf for InvertedListReader {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.offsets.deep_size_of_children(context)
-            // + self.lengths.deep_size_of_children(context)
-            + self.posting_cache.weighted_size() as usize
     }
 }
 
 impl InvertedListReader {
-    pub(crate) fn new(reader: Arc<dyn IndexReader>) -> Result<Self> {
+    pub(crate) fn new(reader: Arc<dyn IndexReader>, index_cache: LanceCache) -> Result<Self> {
         let offsets = reader
             .schema()
             .metadata
@@ -548,21 +544,12 @@ impl InvertedListReader {
 
         let has_position = reader.schema().field(POSITION_COL).is_some();
 
-        let posting_cache = Cache::builder()
-            .max_capacity(*CACHE_SIZE as u64)
-            .weigher(|_, posting: &PostingList| posting.deep_size_of() as u32)
-            .build();
-        let position_cache = Cache::builder()
-            .max_capacity(*CACHE_SIZE as u64)
-            .weigher(|_, positions: &ListArray| positions.get_array_memory_size() as u32)
-            .build();
         Ok(Self {
             reader,
             offsets,
             max_scores,
             has_position,
-            posting_cache,
-            position_cache,
+            index_cache,
         })
     }
 
@@ -608,8 +595,8 @@ impl InvertedListReader {
         metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
         let mut posting = self
-            .posting_cache
-            .try_get_with(token_id, async move {
+            .index_cache
+            .get_or_insert(format!("postings-{}", token_id), |_| async move {
                 metrics.record_part_load();
                 info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
@@ -624,7 +611,9 @@ impl InvertedListReader {
                 ))
             })
             .await
-            .map_err(|e| Error::io(e.to_string(), location!()))?;
+            .map_err(|e| Error::io(e.to_string(), location!()))?
+            .as_ref()
+            .clone();
 
         if is_phrase_query {
             // hit the cache and when the cache was populated, the positions column was not loaded
@@ -636,8 +625,9 @@ impl InvertedListReader {
     }
 
     async fn read_positions(&self, token_id: u32) -> Result<ListArray> {
-        self.position_cache.try_get_with(token_id, async move {
-            let length = self.posting_len(token_id);
+        Ok(self.index_cache
+            .get_or_insert(format!("positions-{}", token_id), |_| async move {
+                let length = self.posting_len(token_id);
             let token_id = token_id as usize;
             let offset = self.offsets[token_id];
             let batch = self
@@ -652,10 +642,31 @@ impl InvertedListReader {
                         e => e
                     }
                 })?;
-            Result::Ok(batch[POSITION_COL]
+            Result::Ok(Positions(batch[POSITION_COL]
                 .as_list::<i32>()
-                .clone())
-        }).await.map_err(|e| Error::io(e.to_string(), location!()))
+                .clone()))
+            })
+            .await
+            .map_err(|e| Error::io(e.to_string(), location!()))?
+            .as_ref()
+            .clone()
+            .0)
+
+    }
+}
+
+/// New type just to allow Positions implement DeepSizeOf so it can be put
+/// in the cache.
+#[derive(Clone)]
+struct Positions(ListArray);
+
+impl DeepSizeOf for Positions {
+    fn deep_size_of(&self) -> usize {
+        self.0.get_array_memory_size()
+    }
+
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.0.get_buffer_memory_size()
     }
 }
 

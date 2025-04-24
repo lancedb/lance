@@ -400,7 +400,7 @@ impl DatasetIndexExt for Dataset {
         let metadata_key = format!("{}-{}", dataset_dir, self.version().version);
         self.session
             .index_cache
-            .insert(metadata_key, loaded_indices.clone());
+            .insert(&metadata_key, loaded_indices.clone());
         Ok(loaded_indices)
     }
 
@@ -802,9 +802,8 @@ impl DatasetIndexInternalExt for Dataset {
         info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_SCALAR, index_type=index.index_type().to_string());
         metrics.record_index_load();
 
-        self.session
-            .index_cache
-            .insert_unsized(uuid.to_string(), index.clone());
+        self.index_cache
+            .insert_unsized(uuid, index.clone());
         Ok(index)
     }
 
@@ -977,9 +976,8 @@ impl DatasetIndexInternalExt for Dataset {
         };
         let index = index?;
         metrics.record_index_load();
-        self.session
-            .index_cache
-            .insert_unsized(uuid.to_string(), index.clone());
+        self.index_cache
+            .insert_unsized(uuid, index.clone());
         Ok(index)
     }
 

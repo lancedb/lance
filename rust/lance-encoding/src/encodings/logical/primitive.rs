@@ -2908,7 +2908,7 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
         async move {
             let page_data = page_data.try_collect::<Vec<_>>().await?;
             let cached_data = Arc::new(CachedFieldData { pages: page_data });
-            cache.insert::<CachedFieldData>(cache_key, cached_data);
+            cache.insert::<CachedFieldData>(&cache_key, cached_data);
             Ok(())
         }
         .boxed()

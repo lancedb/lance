@@ -17,7 +17,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
-use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
+use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap, Error, Result};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::location;
@@ -245,7 +245,7 @@ impl ScalarIndex for BitmapIndex {
         true
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
+    async fn load(store: Arc<dyn IndexStore>, _index_cache: LanceCache) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         let serialized_lookup = page_lookup_file
             .read_range(0..page_lookup_file.num_rows(), None)

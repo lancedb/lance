@@ -33,7 +33,6 @@ use snafu::location;
 use lance_core::{
     cache::LanceCache,
     datatypes::{Field, Schema},
-    utils::path::LancePathExt,
     Error, Result,
 };
 use lance_encoding::format::pb as pbenc;
@@ -766,9 +765,9 @@ impl FileReader {
         cache: &LanceCache,
         options: FileReaderOptions,
     ) -> Result<Self> {
-        let cache = Arc::new(
-            cache.with_key_mapper(move |key| path.child_path(&Path::from(key)).to_string()),
-        );
+        // TODO: is this path relative or absolute? Should we prefix also with base_uri?
+        dbg!(&path);
+        let cache = Arc::new(cache.with_key_prefix(&path.to_string()));
 
         if let Some(base_projection) = base_projection.as_ref() {
             Self::validate_projection(base_projection, &file_metadata)?;

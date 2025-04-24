@@ -19,10 +19,18 @@ pub mod index_extension;
 /// A user session tracks the runtime state.
 #[derive(Clone, DeepSizeOf)]
 pub struct Session {
-    /// Cache for opened indices.
+    /// Global cache for opened indices.
+    /// 
+    /// Sub-caches are created from this cache for each dataset by adding the
+    /// URI and index UUID as a key prefix. This prevents collisions
+    /// between different datasets.
     pub(crate) index_cache: LanceCache,
 
-    /// Cache for file metadata
+    /// Global cache for file metadata.
+    /// 
+    /// Sub-caches are created from this cache for each dataset by adding the
+    /// URI as a key prefix. See the [`LanceDataset::metadata_cache`] field.
+    /// This prevents collisions between different datasets.
     pub(crate) file_metadata_cache: LanceCache,
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
@@ -173,7 +181,7 @@ mod tests {
         let idx = Arc::new(PQIndex::new(pq, DistanceType::L2));
         no_cache
             .index_cache
-            .insert_unsized::<dyn VectorIndex>("abc".to_string(), idx);
+            .insert_unsized::<dyn VectorIndex>("abc", idx);
 
         assert!(no_cache
             .index_cache

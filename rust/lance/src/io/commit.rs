@@ -22,6 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use lance_core::cache::LanceCache;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::{
@@ -68,21 +69,18 @@ async fn read_transaction_file(
     transaction.try_into()
 }
 
-fn transaction_file_cache_path(base_path: &Path, version: u64) -> Path {
-    base_path
-        .child("_transactions")
-        .child(format!("{}.txn", version))
+fn transaction_file_cache_key(version: u64) -> String {
+    format!("txn/{version}")
 }
 
 async fn read_dataset_transaction_file(
     dataset: &Dataset,
     version: u64,
 ) -> Result<Arc<Transaction>> {
-    let cache_path = transaction_file_cache_path(&dataset.base, version);
+    let cache_key = transaction_file_cache_key(version);
     dataset
-        .session
-        .file_metadata_cache
-        .get_or_insert(cache_path.to_string(), |_| async move {
+        .metadata_cache
+        .get_or_insert(cache_key, |_| async move {
             let dataset_version = dataset.checkout_version(version).await?;
             let object_store = dataset_version.object_store();
             let path = dataset_version
@@ -162,7 +160,8 @@ async fn do_commit_new_dataset(
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     blob_version: Option<u64>,
-    session: &Session,
+    file_metadata_cache: &LanceCache,
+
 ) -> Result<(Manifest, Path, Option<String>)> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
@@ -190,8 +189,8 @@ async fn do_commit_new_dataset(
     // if there is a conflict.
     match result {
         Ok(manifest_location) => {
-            session.file_metadata_cache.insert(
-                transaction_file_cache_path(base_path, manifest.version).to_string(),
+            file_metadata_cache.insert(
+                &transaction_file_cache_key(manifest.version),
                 Arc::new(transaction.clone()),
             );
             Ok((manifest, manifest_location.path, manifest_location.e_tag))
@@ -211,7 +210,7 @@ pub(crate) async fn commit_new_dataset(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-    session: &Session,
+    file_metadata_cache: &LanceCache
 ) -> Result<(Manifest, Path, Option<String>)> {
     let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blob_path = base_path.child(BLOB_DIR);
@@ -224,7 +223,7 @@ pub(crate) async fn commit_new_dataset(
             write_config,
             manifest_naming_scheme,
             None,
-            session,
+            file_metadata_cache,
         )
         .await?;
         Some(blob_manifest.version)
@@ -240,7 +239,7 @@ pub(crate) async fn commit_new_dataset(
         write_config,
         manifest_naming_scheme,
         blob_version,
-        session,
+        file_metadata_cache,
     )
     .await
 }
@@ -827,11 +826,10 @@ pub(crate) async fn commit_transaction(
 
         match result {
             Ok(manifest_location) => {
-                let cache_path = transaction_file_cache_path(&dataset.base, target_version);
+                let cache_path = transaction_file_cache_key(target_version);
                 dataset
-                    .session()
-                    .file_metadata_cache
-                    .insert(cache_path.to_string(), Arc::new(transaction.clone()));
+                    .metadata_cache
+                    .insert(&cache_path, Arc::new(transaction.clone()));
 
                 return Ok((manifest, manifest_location.path, manifest_location.e_tag));
             }

@@ -1291,9 +1291,9 @@ impl FileFragment {
             return Ok(None);
         };
 
-        let cache = &self.dataset.session.file_metadata_cache;
-        let path = deletion_file_path(&self.dataset.base, self.metadata.id, deletion_file);
-        if let Some(deletion_vector) = cache.get::<DeletionVector>(path.as_ref()) {
+        let cache = &self.dataset.metadata_cache;
+        let cache_key = format!("frag-{}/dv-{}-{}", self.metadata.id, deletion_file.read_version, deletion_file.id);
+        if let Some(deletion_vector) = cache.get::<DeletionVector>(&cache_key) {
             Ok(Some(deletion_vector))
         } else {
             let deletion_vector = read_deletion_file(
@@ -1305,7 +1305,7 @@ impl FileFragment {
             match deletion_vector {
                 Some(deletion_vector) => {
                     let deletion_vector = Arc::new(deletion_vector);
-                    cache.insert(path.to_string(), deletion_vector.clone());
+                    cache.insert(&cache_key, deletion_vector.clone());
                     Ok(Some(deletion_vector))
                 }
                 None => Ok(None),

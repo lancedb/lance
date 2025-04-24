@@ -12,6 +12,7 @@ use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecord
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
+use lance_core::cache::LanceCache;
 use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -164,8 +165,8 @@ impl ScalarIndex for LabelListIndex {
         true
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
-        BitmapIndex::load(store)
+    async fn load(store: Arc<dyn IndexStore>, index_cache: LanceCache) -> Result<Arc<Self>> {
+        BitmapIndex::load(store, index_cache)
             .await
             .map(|index| Arc::new(Self::new(index)))
     }
