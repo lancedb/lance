@@ -22,6 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use lance_core::utils::backoff::Backoff;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::{
@@ -44,7 +45,7 @@ use prost::Message;
 use super::ObjectStore;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::transaction::{ConflictResult, Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig, BLOB_DIR};
 use crate::index::DatasetIndexInternalExt;
 use crate::session::Session;
@@ -127,7 +128,7 @@ fn check_transaction(
     other_version: u64,
     other_transaction: Option<&Transaction>,
 ) -> Result<()> {
-    if other_transaction.is_none() {
+    let Some(other_transaction) = other_transaction else {
         return Err(crate::Error::Internal {
             message: format!(
                 "There was a conflicting transaction at version {}, \
@@ -136,23 +137,28 @@ fn check_transaction(
             ),
             location: location!(),
         });
-    }
+    };
 
-    if transaction.conflicts_with(other_transaction.as_ref().unwrap()) {
-        return Err(crate::Error::CommitConflict {
-            version: other_version,
-            source: format!(
-                "There was a concurrent commit that conflicts with this one and it \
-                cannot be automatically resolved. Please rerun the operation off the latest version \
-                of the table.\n Transaction: {:?}\n Conflicting Transaction: {:?}",
-                transaction, other_transaction
-            )
-            .into(),
-            location: location!(),
-        });
+    match transaction.conflicts_with(other_transaction) {
+        ConflictResult::Compatible => Ok(()),
+        ConflictResult::NotCompatible => {
+            Err(crate::Error::CommitConflict {
+                version: other_version,
+                source: format!(
+                    "This {} transaction is incompatible with concurrent transaction {} at version {}.",
+                    transaction.operation, other_transaction.operation, other_version).into(),
+                location: location!(),
+            })
+        },
+        ConflictResult::Retryable => {
+            Err(crate::Error::RetryableCommitConflict {
+                version: other_version,
+                source: format!(
+                    "This {} transaction was preempted by concurrent transaction {} at version {}. Please retry.",
+                    transaction.operation, other_transaction.operation, other_version).into(),
+                location: location!() })
+        }
     }
-
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -579,7 +585,8 @@ pub(crate) async fn do_commit_detached_transaction(
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
 
     // We still do a loop since we may have conflicts in the random version we pick
-    for attempt_i in 0..commit_config.num_retries {
+    let mut backoff = Backoff::default();
+    while backoff.attempt() < commit_config.num_retries {
         // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = thread_rng().gen::<u64>() | DETACHED_VERSION_MASK;
 
@@ -637,9 +644,7 @@ pub(crate) async fn do_commit_detached_transaction(
             Err(CommitError::CommitConflict) => {
                 // We pick a random u64 for the version, so it's possible (though extremely unlikely)
                 // that we have a conflict. In that case, we just try again.
-
-                let backoff_time = backoff_time(attempt_i);
-                tokio::time::sleep(backoff_time).await;
+                tokio::time::sleep(backoff.next_backoff()).await;
             }
             Err(CommitError::OtherError(err)) => {
                 // If other error, return
@@ -746,7 +751,8 @@ pub(crate) async fn commit_transaction(
         dataset.checkout_latest().await?;
     }
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
-    for attempt_i in 0..num_attempts {
+    let mut backoff = Backoff::default();
+    while backoff.attempt() < num_attempts {
         // See if we can retry the commit. Try to account for all
         // transactions that have been committed since the read_version.
         // Use small amount of backoff to handle transactions that all
@@ -759,7 +765,7 @@ pub(crate) async fn commit_transaction(
             .buffer_unordered(dataset.object_store().io_parallelism())
             .take_while(|res| {
                 futures::future::ready(
-                    attempt_i > 0
+                    backoff.attempt() > 0
                         || !matches!(
                             res,
                             Err(crate::Error::NotFound { .. })
@@ -848,9 +854,9 @@ pub(crate) async fn commit_transaction(
                 return Ok((manifest, manifest_location.path, manifest_location.e_tag));
             }
             Err(CommitError::CommitConflict) => {
-                let next_attempt_i = attempt_i + 1;
+                let next_attempt_i = backoff.attempt() + 1;
                 if next_attempt_i < num_attempts {
-                    tokio::time::sleep(backoff_time(next_attempt_i)).await;
+                    tokio::time::sleep(backoff.next_backoff()).await;
                     dataset.checkout_latest().await?;
                 }
             }
@@ -870,18 +876,6 @@ pub(crate) async fn commit_transaction(
         .into(),
         location: location!(),
     })
-}
-
-fn backoff_time(attempt_i: u32) -> std::time::Duration {
-    // Exponential base:
-    // 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms
-    let backoff = 2_i32.pow(attempt_i) * 100;
-    // With +-100ms jitter
-    let jitter = rand::thread_rng().gen_range(-100..100);
-    let backoff = backoff + jitter;
-    // No more than 5 seconds and less than 10ms.
-    let backoff = backoff.clamp(10, 5_000) as u64;
-    std::time::Duration::from_millis(backoff)
 }
 
 #[cfg(test)]

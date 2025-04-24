@@ -199,6 +199,25 @@ pub enum Operation {
     },
 }
 
+impl std::fmt::Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Append { .. } => write!(f, "Append"),
+            Self::Delete { .. } => write!(f, "Delete"),
+            Self::Overwrite { .. } => write!(f, "Overwrite"),
+            Self::CreateIndex { .. } => write!(f, "CreateIndex"),
+            Self::Rewrite { .. } => write!(f, "Rewrite"),
+            Self::Merge { .. } => write!(f, "Merge"),
+            Self::Restore { .. } => write!(f, "Restore"),
+            Self::ReserveFragments { .. } => write!(f, "ReserveFragments"),
+            Self::Update { .. } => write!(f, "Update"),
+            Self::Project { .. } => write!(f, "Project"),
+            Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
+            Self::DataReplacement { .. } => write!(f, "DataReplacement"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RewrittenIndex {
     pub old_id: Uuid,
@@ -366,6 +385,24 @@ impl Operation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictResult {
+    /// The operation is compatible with the other operation
+    ///
+    /// For example, two operations that modify different fragments are compatible.
+    Compatible,
+    /// The operation is not compatible with the other operation
+    ///
+    /// For example, an Overwrite with a change in schema and an Append are
+    /// not compatible.
+    NotCompatible,
+    /// The operation is not compatible, but the current operation can be
+    /// retried on top of the others changes.
+    ///
+    /// For example, two operations that modify the same fragment.
+    Retryable,
+}
+
 impl Transaction {
     pub fn new(
         read_version: u64,
@@ -385,91 +422,144 @@ impl Transaction {
 
     /// Returns true if the transaction cannot be committed if the other
     /// transaction is committed first.
-    pub fn conflicts_with(&self, other: &Self) -> bool {
+    pub fn conflicts_with(&self, other: &Self) -> ConflictResult {
+        use ConflictResult::*;
         // This assumes IsolationLevel is Snapshot Isolation, which is more
         // permissive than Serializable. In particular, it allows a Delete
         // transaction to succeed after a concurrent Append, even if the Append
         // added rows that would be deleted.
         match &self.operation {
             Operation::Append { .. } => match &other.operation {
-                // Append is compatible with anything that doesn't change the schema
-                Operation::Append { .. } => false,
-                Operation::Rewrite { .. } => false,
-                Operation::CreateIndex { .. } => false,
-                Operation::Delete { .. } | Operation::Update { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                Operation::Project { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                Operation::DataReplacement { .. } => false,
-                _ => true,
+                Operation::Append { .. }
+                | Operation::Rewrite { .. }
+                | Operation::CreateIndex { .. }
+                | Operation::Delete { .. }
+                | Operation::Update { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Project { .. }
+                | Operation::Merge { .. }
+                | Operation::UpdateConfig { .. }
+                | Operation::DataReplacement { .. } => Compatible,
+                // Append is not compatible with any operation that completely
+                // overwrites the schema.
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
             },
             Operation::Rewrite { .. } => match &other.operation {
                 // Rewrite is only compatible with operations that don't touch
-                // existing fragments.
-                // TODO: it could also be compatible with operations that update
-                // fragments we don't touch.
-                Operation::Append { .. } => false,
-                Operation::ReserveFragments { .. } => false,
+                // existing fragments or update fragments we don't touch.
+                Operation::Append { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Project { .. }
+                | Operation::UpdateConfig { .. } => Compatible,
                 Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
                     // As long as they rewrite disjoint fragments they shouldn't conflict.
-                    self.operation.modifies_same_ids(&other.operation)
+                    if self.operation.modifies_same_ids(&other.operation) {
+                        Retryable
+                    } else {
+                        Compatible
+                    }
                 }
-                Operation::Project { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                Operation::DataReplacement { .. } => {
+                Operation::DataReplacement { .. } | Operation::Merge { .. } => {
                     // TODO(rmeng): check that the fragments being replaced are not part of the groups
-                    true
+                    Retryable
                 }
-                _ => true,
+                Operation::CreateIndex { new_indices, .. } => {
+                    let mut affected_ids = HashSet::new();
+                    for index in new_indices {
+                        if let Some(frag_bitmap) = &index.fragment_bitmap {
+                            affected_ids.extend(frag_bitmap.iter());
+                        } else {
+                            return Retryable;
+                        }
+                    }
+                    if self
+                        .operation
+                        .modified_fragment_ids()
+                        .any(|id| affected_ids.contains(&(id as u32)))
+                    {
+                        Retryable
+                    } else {
+                        Compatible
+                    }
+                }
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
             },
             // Restore always succeeds
-            Operation::Restore { .. } => false,
+            Operation::Restore { .. } => Compatible,
             // ReserveFragments is compatible with anything that doesn't reset the
             // max fragment id.
-            Operation::ReserveFragments { .. } => matches!(
-                &other.operation,
-                Operation::Overwrite { .. } | Operation::Restore { .. }
-            ),
-            Operation::CreateIndex { .. } => match &other.operation {
-                Operation::Append { .. } => false,
+            Operation::ReserveFragments { .. } => match &other.operation {
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
+                _ => Compatible,
+            },
+            Operation::CreateIndex { new_indices, .. } => match &other.operation {
+                Operation::Append { .. } => Compatible,
                 // Indices are identified by UUIDs, so they shouldn't conflict.
-                Operation::CreateIndex { .. } => false,
+                Operation::CreateIndex { .. } => Compatible,
                 // Although some of the rows we indexed may have been deleted / moved,
                 // row ids are still valid, so we allow this optimistically.
-                Operation::Delete { .. } | Operation::Update { .. } => false,
-                // Merge & reserve don't change row ids, so this should be fine.
-                Operation::Merge { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                // Rewrite likely changed many of the row ids, so our index is
-                // likely useless. It should be rebuilt.
-                // TODO: we could be smarter here and only invalidate the index
-                // if the rewrite changed more than X% of row ids.
-                Operation::Rewrite { .. } => true,
-                Operation::UpdateConfig { .. } => false,
+                Operation::Delete { .. } | Operation::Update { .. } => Compatible,
+                // Merge, reserve, and project don't change row ids, so this should be fine.
+                Operation::Merge { .. } => Compatible,
+                Operation::ReserveFragments { .. } => Compatible,
+                Operation::Project { .. } => Compatible,
+                // Should be compatible with rewrite if it didn't move the rows
+                // we indexed. If it did, we could retry.
+                // TODO: this will change with stable row ids.
+                Operation::Rewrite { .. } => {
+                    let mut affected_ids = HashSet::new();
+                    for index in new_indices {
+                        if let Some(frag_bitmap) = &index.fragment_bitmap {
+                            affected_ids.extend(frag_bitmap.iter());
+                        } else {
+                            return Retryable;
+                        }
+                    }
+                    if other
+                        .operation
+                        .modified_fragment_ids()
+                        .any(|id| affected_ids.contains(&(id as u32)))
+                    {
+                        Retryable
+                    } else {
+                        Compatible
+                    }
+                }
+                Operation::UpdateConfig { .. } => Compatible,
                 Operation::DataReplacement { .. } => {
                     // TODO(rmeng): check that the new indices isn't on the column being replaced
-                    true
+                    Retryable
                 }
-                _ => true,
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
             },
             Operation::Delete { .. } | Operation::Update { .. } => match &other.operation {
-                Operation::CreateIndex { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
+                Operation::CreateIndex { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Project { .. }
+                | Operation::Append { .. }
+                | Operation::UpdateConfig { .. } => Compatible,
+                Operation::Delete { .. }
+                | Operation::Rewrite { .. }
+                | Operation::Update { .. }
+                | Operation::DataReplacement { .. } => {
                     // If we update the same fragments, we conflict.
-                    self.operation.modifies_same_ids(&other.operation)
+                    if self.operation.modifies_same_ids(&other.operation) {
+                        Retryable
+                    } else {
+                        Compatible
+                    }
                 }
-                Operation::Project { .. } => false,
-                Operation::Append { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
+                Operation::Merge { .. } => Retryable,
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
             },
             Operation::Overwrite { .. } => match &other.operation {
                 // Overwrite only conflicts with another operation modifying the same update config
-                Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
-                    self.operation.upsert_key_conflict(&other.operation)
+                Operation::Overwrite { .. } | Operation::UpdateConfig { .. }
+                    if self.operation.upsert_key_conflict(&other.operation) =>
+                {
+                    NotCompatible
                 }
-                _ => false,
+                _ => Compatible,
             },
             Operation::UpdateConfig {
                 schema_metadata,
@@ -479,52 +569,79 @@ impl Transaction {
                 Operation::Overwrite { .. } => {
                     // Updates to schema metadata or field metadata conflict with any kind
                     // of overwrite.
-                    if schema_metadata.is_some() || field_metadata.is_some() {
-                        true
+                    if schema_metadata.is_some()
+                        || field_metadata.is_some()
+                        || self.operation.upsert_key_conflict(&other.operation)
+                    {
+                        NotCompatible
                     } else {
-                        self.operation.upsert_key_conflict(&other.operation)
+                        Compatible
                     }
                 }
                 Operation::UpdateConfig { .. } => {
-                    self.operation.upsert_key_conflict(&other.operation)
+                    if self.operation.upsert_key_conflict(&other.operation)
                         | self.operation.modifies_same_metadata(&other.operation)
+                    {
+                        NotCompatible
+                    } else {
+                        Compatible
+                    }
                 }
-                _ => false,
+                _ => Compatible,
             },
             // Merge changes the schema, but preserves row ids, so the only operations
             // it's compatible with is CreateIndex, ReserveFragments, SetMetadata and DeleteMetadata.
-            Operation::Merge { .. } => !matches!(
-                &other.operation,
+            Operation::Merge { .. } => match &other.operation {
                 Operation::CreateIndex { .. }
-                    | Operation::ReserveFragments { .. }
-                    | Operation::UpdateConfig { .. }
-            ),
+                | Operation::ReserveFragments { .. }
+                | Operation::UpdateConfig { .. } => Compatible,
+                Operation::Update { .. }
+                | Operation::Append { .. }
+                | Operation::Delete { .. }
+                | Operation::Rewrite { .. }
+                | Operation::Merge { .. }
+                | Operation::DataReplacement { .. } => Retryable,
+                Operation::Overwrite { .. }
+                | Operation::Restore { .. }
+                | Operation::Project { .. } => NotCompatible,
+            },
             Operation::Project { .. } => match &other.operation {
                 // Project is compatible with anything that doesn't change the schema
-                Operation::CreateIndex { .. } => false,
-                Operation::Overwrite { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
+                Operation::Append { .. }
+                | Operation::Update { .. }
+                | Operation::Delete { .. }
+                | Operation::UpdateConfig { .. }
+                | Operation::CreateIndex { .. }
+                | Operation::DataReplacement { .. }
+                | Operation::Rewrite { .. }
+                | Operation::ReserveFragments { .. } => Compatible,
+                Operation::Merge { .. } | Operation::Project { .. } => {
+                    // Need to recompute the schema
+                    Retryable
+                }
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
             },
             Operation::DataReplacement { .. } => match &other.operation {
                 Operation::Append { .. }
                 | Operation::Delete { .. }
                 | Operation::Update { .. }
                 | Operation::Merge { .. }
-                | Operation::UpdateConfig { .. } => false,
+                | Operation::UpdateConfig { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Project { .. } => Compatible,
                 Operation::CreateIndex { .. } => {
                     // TODO(rmeng): check that the new indices isn't on the column being replaced
-                    true
+                    NotCompatible
                 }
                 Operation::Rewrite { .. } => {
                     // TODO(rmeng): check that the fragments being replaced are not part of the groups
-                    true
+                    NotCompatible
                 }
                 Operation::DataReplacement { .. } => {
                     // TODO(rmeng): check cell conflicts
-                    true
+                    NotCompatible
                 }
-                _ => true,
+                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
             },
         }
     }
@@ -1735,6 +1852,8 @@ mod tests {
 
     #[test]
     fn test_conflicts() {
+        use ConflictResult::*;
+
         let index0 = Index {
             uuid: uuid::Uuid::new_v4(),
             name: "test".to_string(),
@@ -1813,7 +1932,17 @@ mod tests {
                 Operation::Append {
                     fragments: vec![fragment0.clone()],
                 },
-                [false, false, false, true, true, false, false, false, false],
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Compatible,    // delete
+                    Compatible,    // merge
+                    NotCompatible, // overwrite
+                    Compatible,    // rewrite
+                    Compatible,    // reserve
+                    Compatible,    // update
+                    Compatible,    // update config
+                ],
             ),
             (
                 Operation::Delete {
@@ -1822,7 +1951,17 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [false, false, false, true, true, false, false, true, false],
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Compatible,    // delete
+                    Retryable,     // merge
+                    NotCompatible, // overwrite
+                    Compatible,    // rewrite
+                    Compatible,    // reserve
+                    Retryable,     // update
+                    Compatible,    // update config
+                ],
             ),
             (
                 Operation::Delete {
@@ -1831,7 +1970,17 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [false, false, true, true, true, true, false, true, false],
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Retryable,     // delete
+                    Retryable,     // merge
+                    NotCompatible, // overwrite
+                    Retryable,     // rewrite
+                    Compatible,    // reserve
+                    Retryable,     // update
+                    Compatible,    // update config
+                ],
             ),
             (
                 Operation::Overwrite {
@@ -1841,9 +1990,7 @@ mod tests {
                 },
                 // No conflicts: overwrite can always happen since it doesn't
                 // depend on previous state of the table.
-                [
-                    false, false, false, false, false, false, false, false, false,
-                ],
+                [Compatible; 9],
             ),
             (
                 Operation::CreateIndex {
@@ -1851,7 +1998,17 @@ mod tests {
                     removed_indices: vec![index0],
                 },
                 // Will only conflict with operations that modify row ids.
-                [false, false, false, false, true, true, false, false, false],
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Compatible,    // delete
+                    Compatible,    // merge
+                    NotCompatible, // overwrite
+                    Retryable,     // rewrite
+                    Compatible,    // reserve
+                    Compatible,    // update
+                    Compatible,    // update config
+                ],
             ),
             (
                 // Rewrite that affects different fragments
@@ -1862,7 +2019,17 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                 },
-                [false, true, false, true, true, false, false, true, false],
+                [
+                    Compatible,    // append
+                    Retryable,     // create index
+                    Compatible,    // delete
+                    Retryable,     // merge
+                    NotCompatible, // overwrite
+                    Compatible,    // rewrite
+                    Compatible,    // reserve
+                    Retryable,     // update
+                    Compatible,    // update config
+                ],
             ),
             (
                 // Rewrite that affects the same fragments
@@ -1873,7 +2040,17 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                 },
-                [false, true, true, true, true, true, false, true, false],
+                [
+                    Compatible,    // append
+                    Retryable,     // create index
+                    Retryable,     // delete
+                    Retryable,     // merge
+                    NotCompatible, // overwrite
+                    Retryable,     // rewrite
+                    Compatible,    // reserve
+                    Retryable,     // update
+                    Compatible,    // update config
+                ],
             ),
             (
                 Operation::Merge {
@@ -1881,12 +2058,32 @@ mod tests {
                     schema: Schema::default(),
                 },
                 // Merge conflicts with everything except CreateIndex and ReserveFragments.
-                [true, false, true, true, true, true, false, true, false],
+                [
+                    Retryable,     // append
+                    Compatible,    // create index
+                    Retryable,     // delete
+                    Retryable,     // merge
+                    NotCompatible, // overwrite
+                    Retryable,     // rewrite
+                    Compatible,    // reserve
+                    Retryable,     // update
+                    Compatible,    // update config
+                ],
             ),
             (
                 Operation::ReserveFragments { num_fragments: 2 },
                 // ReserveFragments only conflicts with Overwrite and Restore.
-                [false, false, false, false, true, false, false, false, false],
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Compatible,    // delete
+                    Compatible,    // merge
+                    NotCompatible, // overwrite
+                    Compatible,    // rewrite
+                    Compatible,    // reserve
+                    Compatible,    // update
+                    Compatible,    // update config
+                ],
             ),
             (
                 Operation::Update {
@@ -1895,7 +2092,17 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2],
                 },
-                [false, false, true, true, true, true, false, true, false],
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Retryable,     // delete
+                    Retryable,     // merge
+                    NotCompatible, // overwrite
+                    Retryable,     // rewrite
+                    Compatible,    // reserve
+                    Retryable,     // update
+                    Compatible,    // update config
+                ],
             ),
             (
                 // Update config that should not conflict with anything
@@ -1908,9 +2115,7 @@ mod tests {
                     schema_metadata: None,
                     field_metadata: None,
                 },
-                [
-                    false, false, false, false, false, false, false, false, false,
-                ],
+                [Compatible; 9],
             ),
             (
                 // Update config that conflicts with key being upserted by other UpdateConfig operation
@@ -1923,7 +2128,17 @@ mod tests {
                     schema_metadata: None,
                     field_metadata: None,
                 },
-                [false, false, false, false, false, false, false, false, true],
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Compatible,    // delete
+                    Compatible,    // merge
+                    Compatible,    // overwrite
+                    Compatible,    // rewrite
+                    Compatible,    // reserve
+                    Compatible,    // update
+                    NotCompatible, // update config
+                ],
             ),
             (
                 // Update config that conflicts with key being deleted by other UpdateConfig operation
@@ -1936,7 +2151,17 @@ mod tests {
                     schema_metadata: None,
                     field_metadata: None,
                 },
-                [false, false, false, false, false, false, false, false, true],
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Compatible,    // delete
+                    Compatible,    // merge
+                    Compatible,    // overwrite
+                    Compatible,    // rewrite
+                    Compatible,    // reserve
+                    Compatible,    // update
+                    NotCompatible, // update config
+                ],
             ),
             (
                 // Delete config keys currently being deleted by other UpdateConfig operation
@@ -1946,9 +2171,7 @@ mod tests {
                     schema_metadata: None,
                     field_metadata: None,
                 },
-                [
-                    false, false, false, false, false, false, false, false, false,
-                ],
+                [Compatible; 9],
             ),
             (
                 // Delete config keys currently being upserted by other UpdateConfig operation
@@ -1958,7 +2181,17 @@ mod tests {
                     schema_metadata: None,
                     field_metadata: None,
                 },
-                [false, false, false, false, false, false, false, false, true],
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Compatible,    // delete
+                    Compatible,    // merge
+                    Compatible,    // overwrite
+                    Compatible,    // rewrite
+                    Compatible,    // reserve
+                    Compatible,    // update
+                    NotCompatible, // update config
+                ],
             ),
             (
                 // Changing schema metadata conflicts with another update changing schema
@@ -1972,7 +2205,17 @@ mod tests {
                     )])),
                     field_metadata: None,
                 },
-                [false, false, false, false, true, false, false, false, true],
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Compatible,    // delete
+                    Compatible,    // merge
+                    NotCompatible, // overwrite
+                    Compatible,    // rewrite
+                    Compatible,    // reserve
+                    Compatible,    // update
+                    NotCompatible, // update config
+                ],
             ),
             (
                 // Changing field metadata conflicts with another update changing same field
@@ -1989,7 +2232,17 @@ mod tests {
                         )]),
                     )])),
                 },
-                [false, false, false, false, true, false, false, false, true],
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Compatible,    // delete
+                    Compatible,    // merge
+                    NotCompatible, // overwrite
+                    Compatible,    // rewrite
+                    Compatible,    // reserve
+                    Compatible,    // update
+                    NotCompatible, // update config
+                ],
             ),
             (
                 // Updates to different field metadata are allowed
@@ -2005,7 +2258,17 @@ mod tests {
                         )]),
                     )])),
                 },
-                [false, false, false, false, true, false, false, false, false],
+                [
+                    Compatible,    // append
+                    Compatible,    // create index
+                    Compatible,    // delete
+                    Compatible,    // merge
+                    NotCompatible, // overwrite
+                    Compatible,    // rewrite
+                    Compatible,    // reserve
+                    Compatible,    // update
+                    Compatible,    // update config
+                ],
             ),
         ];
 
@@ -2015,13 +2278,9 @@ mod tests {
                 assert_eq!(
                     transaction.conflicts_with(other),
                     *expected_conflict,
-                    "Transaction {:?} should {} with {:?}",
+                    "Transaction {:?} should {:?} with {:?}",
                     transaction,
-                    if *expected_conflict {
-                        "conflict"
-                    } else {
-                        "not conflict"
-                    },
+                    expected_conflict,
                     other
                 );
             }

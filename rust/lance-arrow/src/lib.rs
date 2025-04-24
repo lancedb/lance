@@ -30,6 +30,7 @@ pub mod floats;
 pub use floats::*;
 pub mod cast;
 pub mod list;
+pub mod memory;
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
