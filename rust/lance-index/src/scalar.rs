@@ -23,6 +23,7 @@ use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchPa
 use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
+use serde::{Deserialize, Serialize};
 use snafu::location;
 
 use crate::metrics::MetricsCollector;
@@ -100,7 +101,7 @@ impl IndexParams for ScalarIndexParams {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct InvertedIndexParams {
     /// If true, store the position of the term in the document
     /// This can significantly increase the size of the index
@@ -108,6 +109,7 @@ pub struct InvertedIndexParams {
     /// Default is true
     pub with_position: bool,
 
+    #[serde(flatten)]
     pub tokenizer_config: TokenizerConfig,
 }
 
