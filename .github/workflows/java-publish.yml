@@ -65,7 +65,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
   linux-x86:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     needs: [macos-arm64, linux-arm64]
     defaults:
@@ -86,6 +86,9 @@ jobs:
           server-password: SONATYPE_TOKEN
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
           gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "stable"
       - name: Install dependencies
         run: |
           sudo apt -y -qq update

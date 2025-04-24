@@ -25,7 +25,7 @@ env:
 
 jobs:
   rust-clippy-fmt:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     name: Rust Clippy and Fmt Check
     steps:
       - name: Checkout repository
@@ -54,7 +54,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   build-and-test-java:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     strategy:
       matrix:
