@@ -8,10 +8,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
-    array::{
-        AsArray, Float32Builder, Int32Builder, ListBuilder, StringBuilder, UInt32Builder,
-        UInt64Builder,
-    },
+    array::{AsArray, ListBuilder, StringBuilder, UInt32Builder},
     buffer::OffsetBuffer,
 };
 use arrow::{buffer::ScalarBuffer, datatypes::UInt32Type};
@@ -39,19 +36,22 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{info, instrument};
 
-use super::builder::{legacy_inverted_list_schema, PositionRecorder};
 use super::query::*;
+use super::{
+    builder::{legacy_inverted_list_schema, PositionRecorder},
+    encoding::CompressedPostingListHeader,
+};
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::PreFilter;
 use crate::scalar::{
-    AnyQuery, IndexReader, IndexStore, InvertedIndexParams, MetricsCollector, SargableQuery,
-    ScalarIndex, SearchResult,
+    AnyQuery, IndexReader, IndexStore, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
 };
 use crate::Index;
 
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
+pub const METADATA_FILE: &str = "metadata.json";
 
 pub const TOKEN_COL: &str = "_token";
 pub const TOKEN_ID_COL: &str = "_token_id";
@@ -80,7 +80,7 @@ lazy_static! {
 
 #[derive(Clone)]
 pub struct InvertedIndex {
-    params: InvertedIndexParams,
+    params: TokenizerConfig,
     tokenizer: tantivy::tokenizer::TextAnalyzer,
     tokens: TokenSet,
     inverted_list: Arc<InvertedListReader>,
@@ -240,8 +240,9 @@ impl Index for InvertedIndex {
 
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
+            "params": self.params,
             "num_tokens": self.tokens.tokens.len(),
-            "num_docs": self.docs.token_count.len(),
+            "num_docs": self.docs.len(),
         }))
     }
 
@@ -315,12 +316,8 @@ impl ScalarIndex for InvertedIndex {
         let docs = docs_fut.await??;
 
         let tokenizer = tokenizer_config.build()?;
-        let params = InvertedIndexParams {
-            with_position: inverted_list.has_positions(),
-            tokenizer_config,
-        };
         Ok(Arc::new(Self {
-            params,
+            params: tokenizer_config,
             tokenizer,
             tokens,
             inverted_list,
@@ -412,7 +409,7 @@ impl TokenSet {
         }
     }
 
-    pub fn num_tokens(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.tokens.len()
     }
 
@@ -678,6 +675,18 @@ pub enum PostingList {
 }
 
 impl PostingList {
+    pub fn try_from_batch(batch: &RecordBatch) -> Result<Self> {
+        match batch.column_by_name(POSTING_COL) {
+            Some(_) => {
+                unimplemented!("TODO")
+            }
+            None => {
+                let posting = PlainPostingList::from_batch(batch)?;
+                Ok(Self::Plain(posting))
+            }
+        }
+    }
+
     pub fn set_positions(&mut self, positions: ListArray) {
         match self {
             PostingList::Plain(posting) => posting.positions = Some(positions),
@@ -729,6 +738,15 @@ impl PostingList {
     }
 }
 
+impl Into<PostingListBuilder> for PostingList {
+    fn into(self) -> PostingListBuilder {
+        match self {
+            PostingList::Plain(posting) => unimplemented!(),
+            PostingList::Compressed(_) => unimplemented!(),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct PlainPostingList {
     pub row_ids: ScalarBuffer<u64>,
@@ -763,6 +781,30 @@ impl PlainPostingList {
         }
     }
 
+    pub fn from_batch(batch: &RecordBatch) -> Result<Self> {
+        let max_score = batch
+            .metadata()
+            .get("max_score")
+            .map(|s| serde_json::from_str(s))
+            .transpose()?;
+
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().clone();
+        let frequencies = batch[FREQUENCY_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .clone();
+        let positions = batch
+            .column_by_name(POSITION_COL)
+            .map(|col| col.as_list::<i32>().clone());
+
+        Ok(Self {
+            row_ids,
+            frequencies,
+            max_score,
+            positions,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.row_ids.len()
     }
@@ -792,12 +834,6 @@ impl PlainPostingList {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct CompressedPostingListHeader {
-    pub num_docs: u32,
-    pub max_score: f32,
-}
-
-#[derive(Debug, PartialEq, Clone)]
 pub struct CompressedPostingList {
     // the first binary is the header
     // after that, each binary is a block of compressed data
@@ -820,22 +856,14 @@ impl DeepSizeOf for CompressedPostingList {
 
 #[derive(Debug, Clone)]
 pub struct PostingListBuilder {
-    pub row_ids: Vec<u64>,
+    pub doc_ids: Vec<u32>,
     pub frequencies: Vec<u32>,
     pub positions: Option<PositionBuilder>,
 }
 
 impl PostingListBuilder {
-    // pub fn new(row_ids: Vec<u64>, frequencies: Vec<f32>, positions: Option<Vec<Vec<i32>>>) -> Self {
-    //     Self {
-    //         row_ids,
-    //         frequencies,
-    //         positions: positions.map(PositionBuilder::from),
-    //     }
-    // }
-
     pub fn size(&self) -> usize {
-        std::mem::size_of::<u64>() * self.row_ids.len()
+        std::mem::size_of::<u32>() * self.doc_ids.len()
             + std::mem::size_of::<f32>() * self.frequencies.len()
             + self
                 .positions
@@ -844,72 +872,54 @@ impl PostingListBuilder {
                 .unwrap_or(0)
     }
 
-    pub fn from_batches(batches: &[RecordBatch]) -> Self {
-        let row_ids = batches
-            .iter()
-            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values().iter())
-            .cloned()
-            .collect();
-        let frequencies = batches
-            .iter()
-            .flat_map(|batch| {
-                batch[FREQUENCY_COL]
-                    .as_primitive::<UInt32Type>()
-                    .values()
-                    .iter()
-            })
-            .cloned()
-            .collect();
-        let mut positions = None;
-        if batches[0].column_by_name(POSITION_COL).is_some() {
-            let mut position_builder = PositionBuilder::new();
-            batches.iter().for_each(|batch| {
-                let positions = batch[POSITION_COL].as_list::<i32>();
-                for i in 0..positions.len() {
-                    let pos = positions.value(i);
-                    position_builder.push(pos.as_primitive::<Int32Type>().values().to_vec());
-                }
-            });
-            positions = Some(position_builder);
+    pub fn try_from_batches(batches: &[RecordBatch]) -> Result<Self> {
+        for batch in batches {
+            let posting_list = PostingList::try_from_batch(batch)?;
         }
-        Self {
-            row_ids,
-            frequencies,
-            positions,
-        }
+        unimplemented!()
+        // Self {
+        //     doc_ids: row_ids,
+        //     frequencies,
+        //     positions,
+        // }
+    }
+
+    pub fn has_positions(&self) -> bool {
+        self.positions.is_some()
     }
 
     pub fn empty(with_position: bool) -> Self {
         Self {
-            row_ids: Vec::new(),
+            doc_ids: Vec::new(),
             frequencies: Vec::new(),
             positions: with_position.then(PositionBuilder::new),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.row_ids.len()
+        self.doc_ids.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub fn add(&mut self, row_id: u64, term_positions: PositionRecorder) {
-        self.row_ids.push(row_id);
+    pub fn add(&mut self, doc_id: u32, term_positions: PositionRecorder) {
+        self.doc_ids.push(doc_id);
         self.frequencies.push(term_positions.len() as u32);
         if let Some(positions) = self.positions.as_mut() {
             positions.push(term_positions.into_vec());
         }
     }
 
-    pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
-        let mut new_row_ids = Vec::with_capacity(self.len());
+    pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>, docs: &DocSet) {
+        let mut new_doc_ids = Vec::with_capacity(self.len());
         let mut new_freqs = Vec::with_capacity(self.len());
         let mut new_positions = self.positions.as_mut().map(|_| PositionBuilder::new());
 
         for i in 0..self.len() {
-            let row_id = self.row_ids[i];
+            let doc_id = self.doc_ids[i];
+            let row_id = docs.row_id(doc_id);
             let freq = self.frequencies[i];
             let positions = self
                 .positions
@@ -917,19 +927,16 @@ impl PostingListBuilder {
                 .map(|positions| positions.get(i).to_vec());
 
             match mapping.get(&row_id) {
-                Some(Some(new_row_id)) => {
-                    new_row_ids.push(*new_row_id);
-                    new_freqs.push(freq);
-                    if let Some(new_positions) = new_positions.as_mut() {
-                        new_positions.push(positions.unwrap());
-                    }
+                Some(Some(_)) => {
+                    // the doc_id -> row_id mapping will be done in `DocSet`
+                    new_doc_ids.push(doc_id);
                 }
                 Some(None) => {
-                    // remove the row_id
+                    // remove this doc
                     // do nothing
                 }
                 None => {
-                    new_row_ids.push(row_id);
+                    new_doc_ids.push(doc_id);
                     new_freqs.push(freq);
                     if let Some(new_positions) = new_positions.as_mut() {
                         new_positions.push(positions.unwrap());
@@ -938,49 +945,28 @@ impl PostingListBuilder {
             }
         }
 
-        self.row_ids = new_row_ids;
+        self.doc_ids = new_doc_ids;
         self.frequencies = new_freqs;
         self.positions = new_positions;
     }
 
-    pub fn to_batch(self) -> Result<RecordBatch> {
-        let row_ids = UInt64Array::from_iter_values(self.row_ids.into_iter());
-        let frequencies = UInt32Array::from_iter_values(self.frequencies.into_iter());
-        let mut columns = vec![
-            Arc::new(row_ids) as ArrayRef,
-            Arc::new(frequencies) as ArrayRef,
-        ];
-        let schema = legacy_inverted_list_schema(self.positions.is_some());
-        if let Some(positions) = self.positions {
-            let list = ListArray::try_new(
-                Arc::new(Field::new("item", DataType::Int32, true)),
-                OffsetBuffer::<i32>::new(positions.offsets.into()),
-                Arc::new(Int32Array::from(positions.positions)),
-                None,
-            )?;
-            columns.push(Arc::new(list) as ArrayRef);
-        }
-        let batch = RecordBatch::try_new(schema, columns)?;
-        Ok(batch)
-    }
-
     // convert the posting list to a record batch
     // with docs, it would calculate the max score to accelerate the search
-    pub fn to_sorted_batch(mut self, docs: Option<&DocSet>) -> Result<(RecordBatch, f32)> {
+    pub fn to_batch(mut self, docs: Option<&DocSet>) -> Result<RecordBatch> {
         let length = self.len();
         let num_docs = docs.as_ref().map(|docs| docs.len()).unwrap_or(0);
         let avgdl = docs.map(|docs| docs.average_length()).unwrap_or(0.0);
         let mut max_score = 0.0;
 
-        let mut row_id_builder = UInt64Builder::with_capacity(length);
+        let mut doc_id_builder = UInt32Builder::with_capacity(length);
         let mut freq_builder = UInt32Builder::with_capacity(length);
         let mut position_builder = self.positions.as_mut().map(|positions| {
-            ListBuilder::with_capacity(Int32Builder::with_capacity(positions.total_len()), length)
+            ListBuilder::with_capacity(UInt32Builder::with_capacity(positions.total_len()), length)
         });
-        for index in (0..length).sorted_unstable_by_key(|&i| self.row_ids[i]) {
-            let (row_id, freq) = (self.row_ids[index], self.frequencies[index]);
+        for index in (0..length).sorted_unstable_by_key(|&i| self.doc_ids[i]) {
+            let (doc_id, freq) = (self.doc_ids[index], self.frequencies[index]);
             // reorder the posting list by row id
-            row_id_builder.append_value(row_id);
+            doc_id_builder.append_value(doc_id);
             freq_builder.append_value(freq);
             if let Some(position_builder) = position_builder.as_mut() {
                 let inner_builder = position_builder.values();
@@ -989,7 +975,7 @@ impl PostingListBuilder {
             }
             // calculate the max score
             if let Some(docs) = &docs {
-                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(&row_id) as f32 / avgdl);
+                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id) as f32 / avgdl);
                 let freq = freq as f32;
                 let score = freq / (freq + doc_norm);
                 if score > max_score {
@@ -999,7 +985,7 @@ impl PostingListBuilder {
         }
         max_score *= idf(self.len(), num_docs) * (K1 + 1.0);
 
-        let row_id_col = row_id_builder.finish();
+        let row_id_col = doc_id_builder.finish();
         let freq_col = freq_builder.finish();
 
         let mut columns = vec![
@@ -1012,13 +998,13 @@ impl PostingListBuilder {
             columns.push(Arc::new(position_col));
         }
         let batch = RecordBatch::try_new(schema, columns)?;
-        Ok((batch, max_score))
+        Ok(batch)
     }
 }
 
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct PositionBuilder {
-    positions: Vec<i32>,
+    positions: Vec<u32>,
     offsets: Vec<i32>,
 }
 
@@ -1037,7 +1023,7 @@ impl PositionBuilder {
     }
 
     pub fn size(&self) -> usize {
-        std::mem::size_of::<i32>() * self.positions.len()
+        std::mem::size_of::<u32>() * self.positions.len()
             + std::mem::size_of::<i32>() * (self.offsets.len() - 1)
     }
 
@@ -1045,20 +1031,20 @@ impl PositionBuilder {
         self.positions.len()
     }
 
-    pub fn push(&mut self, positions: Vec<i32>) {
+    pub fn push(&mut self, positions: Vec<u32>) {
         self.positions.extend(positions);
         self.offsets.push(self.positions.len() as i32);
     }
 
-    pub fn get(&self, i: usize) -> &[i32] {
+    pub fn get(&self, i: usize) -> &[u32] {
         let start = self.offsets[i] as usize;
         let end = self.offsets[i + 1] as usize;
         &self.positions[start..end]
     }
 }
 
-impl From<Vec<Vec<i32>>> for PositionBuilder {
-    fn from(positions: Vec<Vec<i32>>) -> Self {
+impl From<Vec<Vec<u32>>> for PositionBuilder {
+    fn from(positions: Vec<Vec<u32>>) -> Self {
         let mut builder = Self::new();
         builder.offsets.reserve(positions.len());
         for pos in positions {
@@ -1104,19 +1090,27 @@ impl Ord for DocInfo {
 // It's used to sort the documents by the bm25 score
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct DocSet {
-    // row id -> num tokens
-    token_count: HashMap<u64, u32>,
+    row_ids: Vec<u64>,
+    num_tokens: Vec<u32>,
     total_tokens: u64,
 }
 
 impl DocSet {
     #[inline]
     pub fn len(&self) -> usize {
-        self.token_count.len()
+        self.row_ids.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn row_id(&self, doc_id: u32) -> u64 {
+        self.row_ids[doc_id as usize]
+    }
+
+    pub fn total_tokens_num(&self) -> u64 {
+        self.total_tokens
     }
 
     #[inline]
@@ -1125,8 +1119,8 @@ impl DocSet {
     }
 
     pub fn to_batch(&self) -> Result<RecordBatch> {
-        let row_id_col = UInt64Array::from_iter_values(self.token_count.keys().cloned());
-        let num_tokens_col = UInt32Array::from_iter_values(self.token_count.values().cloned());
+        let row_id_col = UInt64Array::from(self.row_ids.clone());
+        let num_tokens_col = UInt32Array::from(self.num_tokens.clone());
 
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
@@ -1144,50 +1138,46 @@ impl DocSet {
     }
 
     pub async fn load(reader: Arc<dyn IndexReader>) -> Result<Self> {
-        let mut token_count = HashMap::new();
         let mut total_tokens = 0;
 
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
-        for (&row_id, &num_tokens) in row_id_col
-            .values()
-            .iter()
-            .zip(num_tokens_col.values().iter())
-        {
-            token_count.insert(row_id, num_tokens);
+        for &num_tokens in num_tokens_col.values() {
             total_tokens += num_tokens as u64;
         }
 
         Ok(Self {
-            token_count,
+            row_ids: row_id_col.values().to_vec(),
+            num_tokens: num_tokens_col.values().to_vec(),
             total_tokens,
         })
     }
 
     pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
-        for (old_row_id, new_row_id) in mapping {
-            match new_row_id {
-                Some(new_row_id) => {
-                    if let Some(num_tokens) = self.token_count.remove(old_row_id) {
-                        self.token_count.insert(*new_row_id, num_tokens);
-                    }
+        for row_id in self.row_ids.iter_mut() {
+            match mapping.get(row_id) {
+                Some(Some(new_row_id)) => *row_id = *new_row_id,
+                Some(None) => {
+                    unimplemented!("TODO: handle the deletion case")
                 }
-                None => {
-                    self.token_count.remove(old_row_id);
-                }
+                None => {}
             }
         }
     }
 
     #[inline]
-    pub fn num_tokens(&self, row_id: &u64) -> u32 {
-        self.token_count.get(row_id).cloned().unwrap_or_default()
+    pub fn num_tokens(&self, doc_id: u32) -> u32 {
+        self.num_tokens[doc_id as usize]
     }
 
-    pub fn add(&mut self, row_id: u64, num_tokens: u32) {
-        self.token_count.insert(row_id, num_tokens);
+    // append a new document to the doc set
+    // returns the doc_id (the number of documents before appending)
+    pub fn append(&mut self, row_id: u64, num_tokens: u32) -> u32 {
+        self.row_ids.push(row_id);
+        self.num_tokens.push(num_tokens);
         self.total_tokens += num_tokens as u64;
+        self.row_ids.len() as u32 - 1
     }
 }
 

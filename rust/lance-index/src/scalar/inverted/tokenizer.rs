@@ -3,6 +3,7 @@
 
 use std::{env, path::PathBuf};
 
+use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -24,28 +25,43 @@ pub struct TokenizerConfig {
     /// - `jieba/*`: Jieba tokenizer
     ///
     /// `simple` is recommended for most cases and the default value
-    base_tokenizer: String,
+    pub(crate) base_tokenizer: String,
 
     /// language for stemming and stop words
     /// this is only used when `stem` or `remove_stop_words` is true
-    language: tantivy::tokenizer::Language,
+    pub(crate) language: tantivy::tokenizer::Language,
+
+    /// If true, store the position of the term in the document
+    /// This can significantly increase the size of the index
+    /// If false, only store the frequency of the term in the document
+    /// Default is true
+    #[serde(default)]
+    pub(crate) with_position: bool,
 
     /// maximum token length
     /// - `None`: no limit
     /// - `Some(n)`: remove tokens longer than `n`
-    max_token_length: Option<usize>,
+    pub(crate) max_token_length: Option<usize>,
 
     /// whether lower case tokens
-    lower_case: bool,
+    #[serde(default = "bool_true")]
+    pub(crate) lower_case: bool,
 
     /// whether apply stemming
-    stem: bool,
+    #[serde(default = "bool_true")]
+    pub(crate) stem: bool,
 
     /// whether remove stop words
-    remove_stop_words: bool,
+    #[serde(default = "bool_true")]
+    pub(crate) remove_stop_words: bool,
 
     /// ascii folding
-    ascii_folding: bool,
+    #[serde(default = "bool_true")]
+    pub(crate) ascii_folding: bool,
+}
+
+fn bool_true() -> bool {
+    true
 }
 
 impl Default for TokenizerConfig {
@@ -59,11 +75,12 @@ impl TokenizerConfig {
         Self {
             base_tokenizer,
             language,
+            with_position: false,
             max_token_length: Some(40),
             lower_case: true,
-            stem: false,
-            remove_stop_words: false,
-            ascii_folding: false,
+            stem: true,
+            remove_stop_words: true,
+            ascii_folding: true,
         }
     }
 
@@ -77,6 +94,11 @@ impl TokenizerConfig {
         let language = serde_json::from_str(format!("\"{}\"", language).as_str())?;
         self.language = language;
         Ok(self)
+    }
+
+    pub fn with_position(mut self, with_position: bool) -> Self {
+        self.with_position = with_position;
+        self
     }
 
     pub fn max_token_length(mut self, max_token_length: Option<usize>) -> Self {

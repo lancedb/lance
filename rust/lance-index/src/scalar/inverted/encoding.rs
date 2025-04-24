@@ -1,26 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{io::Write, sync::Arc};
-
-use arrow::{
-    array::{AsArray, LargeBinaryBuilder},
-    buffer::Buffer,
-    datatypes::UInt32Type,
-};
-use bitpacking::{BitPacker, BitPacker4x};
-use bytes::Buf;
-use delta::delta_encode;
-use lance_core::Result;
-use lance_encoding::{
-    data::{BlockInfo, DataBlock, FixedWidthDataBlock},
-    encoder::BlockCompressor,
-    encodings::physical::bitpack_fastlanes::InlineBitpacking,
-};
+use std::io::Write;
 
 use super::builder::BLOCK_SIZE;
+use arrow::array::LargeBinaryBuilder;
+use bitpacking::{BitPacker, BitPacker4x};
+use lance_core::Result;
 
 pub mod delta;
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(u8)]
+enum Compression {
+    // delta-encode + bitpack for doc ids
+    // bitpack for frequencies
+    // and plain for the remainder
+    Bitpack,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct CompressedPostingListHeader {
+    pub compression: Compression,
+    pub num_docs: u32,
+    pub max_score: f32,
+}
+
+impl CompressedPostingListHeader {
+    pub fn num_bytes() -> usize {
+        std::mem::size_of::<Compression>() + std::mem::size_of::<u32>() + std::mem::size_of::<f32>()
+    }
+}
 
 // compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies),
@@ -28,7 +38,7 @@ pub mod delta;
 pub fn compress_posting_list(
     doc_ids: &[u32],
     frequencies: &[u32],
-    mut builder: &mut LargeBinaryBuilder,
+    builder: &mut LargeBinaryBuilder,
 ) -> Result<arrow::array::LargeBinaryArray> {
     let compressor = BitPacker4x::new();
     let doc_id_chunks = doc_ids.chunks_exact(BLOCK_SIZE);
@@ -56,26 +66,6 @@ pub fn compress_posting_list(
     if remainder > 0 {
         let row_id_chunk = &doc_ids[length - remainder..];
         let freq_chunk = &frequencies[length - remainder..];
-
-        // let batch = arrow::record_batch::RecordBatch::try_new(
-        //     Arc::new(arrow::datatypes::Schema::new(vec![
-        //         arrow::datatypes::Field::new("doc_ids", arrow::datatypes::DataType::UInt32, false),
-        //         arrow::datatypes::Field::new(
-        //             "frequencies",
-        //             arrow::datatypes::DataType::UInt32,
-        //             false,
-        //         ),
-        //     ])),
-        //     vec![
-        //         Arc::new(arrow::array::UInt32Array::from(row_id_chunk.to_vec())),
-        //         Arc::new(arrow::array::UInt32Array::from(freq_chunk.to_vec())),
-        //     ],
-        // )?;
-
-        // let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut builder, batch.schema_ref())?;
-        // writer.write(&batch)?;
-        // writer.finish()?;
-        // builder.append_value("");
         for i in 0..remainder {
             let doc_id = row_id_chunk[i];
             let freq = freq_chunk[i];
