@@ -35,6 +35,8 @@ jobs:
   linux-arm64:
     name: Build on Linux Arm64
     runs-on: ubuntu-2404-8x-arm64
+    container:
+      image: quay.io/pypa/manylinux2014_aarch64
     timeout-minutes: 60
     defaults:
       run:
@@ -65,7 +67,9 @@ jobs:
           retention-days: 1
           if-no-files-found: error
   linux-x86:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-2404-8x-x64
+    container:
+      image: quay.io/pypa/manylinux2014_x86_64
     timeout-minutes: 60
     needs: [macos-arm64, linux-arm64]
     defaults:
