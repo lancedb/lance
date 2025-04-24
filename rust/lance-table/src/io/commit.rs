@@ -37,7 +37,6 @@ use log::warn;
 use object_store::PutOptions;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
 use snafu::location;
-use tracing::instrument;
 use url::Url;
 
 #[cfg(feature = "dynamodb")]
