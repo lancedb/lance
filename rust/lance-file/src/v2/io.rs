@@ -16,4 +16,8 @@ impl EncodingsIo for LanceEncodingsIo {
     ) -> BoxFuture<'static, lance_core::Result<Vec<bytes::Bytes>>> {
         self.0.submit_request(range, priority).boxed()
     }
+
+    fn coalesce_pending(&self) {
+        self.0.coalesce_pending();
+    }
 }

@@ -1996,6 +1996,8 @@ fn create_scheduler_decoder(
                 decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
             }
         }
+
+        todo!("coalesce ranges")
     });
 
     Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))

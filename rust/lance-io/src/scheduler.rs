@@ -462,6 +462,31 @@ impl IoTask {
         self.to_read.end - self.to_read.start
     }
 
+    fn close_to(&self, other: &Self) -> bool {
+        // Must be reading the same file.
+        if !Arc::ptr_eq(&self.reader, &other.reader) {
+            return false;
+        }
+
+        // Other is after self, but two are within the same block size
+        //    |-- self --|
+        //                |-- other --|
+        //    |--         block size     ---|
+        if self.to_read.start <= other.to_read.start && 
+            other.to_read.end <= self.to_read.start + self.reader.block_size() as u64 {
+            true
+        } else if self.to_read.start >= other.to_read.start &&
+        // Other is before self, but two are within the same block size
+        //   |-- other --|
+        //               |-- self --|
+        //  |--         block size     ---|
+            self.to_read.end <= other.to_read.start + self.reader.block_size() as u64 {
+            true
+        } else {
+            false
+        }
+    }
+
     async fn run(self) {
         let bytes = if self.to_read.start == self.to_read.end {
             Ok(Bytes::new())
@@ -772,6 +797,8 @@ impl FileScheduler {
 
         let mut updated_requests = Vec::with_capacity(request.len());
 
+        dbg!(request.as_slice());
+
         if !request.is_empty() {
             let mut curr_interval = request[0].clone();
 
@@ -786,6 +813,8 @@ impl FileScheduler {
 
             updated_requests.push(curr_interval);
         }
+
+        dbg!(&updated_requests.as_slice());
 
         let bytes_vec_fut =
             self.root
@@ -819,6 +848,10 @@ impl FileScheduler {
 
             Ok(final_bytes)
         }
+    }
+
+    pub fn coalesce_pending(&self) {
+        self.root.coalesce_pending();
     }
 
     pub fn with_priority(&self, priority: u64) -> Self {

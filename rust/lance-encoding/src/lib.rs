@@ -72,6 +72,8 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
             .map_ok(|mut v| v.pop().unwrap())
             .boxed()
     }
+
+    fn coalesce_pending(&self);
 }
 
 /// An implementation of EncodingsIo that serves data from an in-memory buffer
