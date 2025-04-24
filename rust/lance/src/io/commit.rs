@@ -37,10 +37,12 @@ use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::DatasetIndexExt;
+use log;
 use object_store::path::Path;
 use prost::Message;
 
 use super::ObjectStore;
+use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig, BLOB_DIR};
@@ -730,46 +732,51 @@ pub(crate) async fn commit_transaction(
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
-
-    // First, get all transactions since read_version
     let read_version = transaction.read_version;
+    let mut target_version = read_version + 1;
     let mut dataset = dataset.clone();
-    // We need to checkout the latest version, because any fixes we apply
-    // (like computing the new row ids) needs to be done based on the most
-    // recent manifest.
-    dataset.checkout_latest().await?;
-    let latest_version = dataset.manifest.version;
-    let other_transactions = futures::stream::iter((read_version + 1)..=latest_version)
-        .map(|version| {
-            read_dataset_transaction_file(&dataset, version)
-                .map(move |res| res.map(|tx| (version, tx)))
-        })
-        .buffer_unordered(dataset.object_store().io_parallelism())
-        .take_while(|res| {
-            futures::future::ready(!matches!(
-                res,
-                Err(crate::Error::NotFound { .. }) | Err(crate::Error::DatasetNotFound { .. })
-            ))
-        })
-        .try_collect::<Vec<_>>()
-        .await?;
-
-    let mut target_version = latest_version + 1;
-
-    if is_detached_version(target_version) {
-        return Err(Error::Internal { message: "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.".into(), location: location!() });
+    if matches!(transaction.operation, Operation::Overwrite { .. })
+        && commit_config.num_retries == 0
+    {
+        dataset.checkout_version(transaction.read_version).await?;
+    } else {
+        // We need to checkout the latest version, because any fixes we apply
+        // (like computing the new row ids) needs to be done based on the most
+        // recent manifest.
+        dataset.checkout_latest().await?;
     }
-
-    // If any of them conflict with the transaction, return an error
-    for (other_version, other_transaction) in other_transactions.iter() {
-        check_transaction(
-            transaction,
-            *other_version,
-            Some(other_transaction.as_ref()),
-        )?;
-    }
-
-    for attempt_i in 0..commit_config.num_retries {
+    let num_attempts = std::cmp::max(commit_config.num_retries, 1);
+    for attempt_i in 0..num_attempts {
+        // See if we can retry the commit. Try to account for all
+        // transactions that have been committed since the read_version.
+        // Use small amount of backoff to handle transactions that all
+        // started at exact same time better.
+        futures::stream::iter(target_version..=dataset.manifest.version)
+            .map(|version| {
+                read_dataset_transaction_file(&dataset, version)
+                    .map(move |res| res.map(|tx| (version, tx)))
+            })
+            .buffer_unordered(dataset.object_store().io_parallelism())
+            .take_while(|res| {
+                futures::future::ready(
+                    attempt_i > 0
+                        || !matches!(
+                            res,
+                            Err(crate::Error::NotFound { .. })
+                                | Err(crate::Error::DatasetNotFound { .. })
+                        ),
+                )
+            })
+            .try_for_each(|(other_version, other_transaction)| {
+                let res =
+                    check_transaction(transaction, other_version, Some(other_transaction.as_ref()));
+                futures::future::ready(res)
+            })
+            .await?;
+        target_version = dataset.manifest.version + 1;
+        if is_detached_version(target_version) {
+            return Err(Error::Internal { message: "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.".into(), location: location!() });
+        }
         // Build an up-to-date manifest from the transaction and current manifest
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
@@ -833,35 +840,19 @@ pub(crate) async fn commit_transaction(
                     .file_metadata_cache
                     .insert(cache_path, Arc::new(transaction.clone()));
 
+                match auto_cleanup_hook(&dataset, &manifest).await {
+                    Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
+                    Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
+                    _ => {}
+                };
                 return Ok((manifest, manifest_location.path, manifest_location.e_tag));
             }
             Err(CommitError::CommitConflict) => {
-                // See if we can retry the commit. Try to account for all
-                // transactions that have been committed since the read_version.
-                // Use small amount of backoff to handle transactions that all
-                // started at exact same time better.
-
-                let backoff_time = backoff_time(attempt_i);
-                tokio::time::sleep(backoff_time).await;
-
-                dataset.checkout_latest().await?;
-                let latest_version = dataset.manifest.version;
-                futures::stream::iter(target_version..=latest_version)
-                    .map(|version| {
-                        read_dataset_transaction_file(&dataset, version)
-                            .map(move |res| res.map(|tx| (version, tx)))
-                    })
-                    .buffer_unordered(dataset.object_store().io_parallelism())
-                    .try_for_each(|(version, other_transaction)| {
-                        let res = check_transaction(
-                            transaction,
-                            version,
-                            Some(other_transaction.as_ref()),
-                        );
-                        futures::future::ready(res)
-                    })
-                    .await?;
-                target_version = latest_version + 1;
+                let next_attempt_i = attempt_i + 1;
+                if next_attempt_i < num_attempts {
+                    tokio::time::sleep(backoff_time(next_attempt_i)).await;
+                    dataset.checkout_latest().await?;
+                }
             }
             Err(CommitError::OtherError(err)) => {
                 // If other error, return
@@ -1256,6 +1247,7 @@ mod tests {
     #[tokio::test]
     async fn test_good_concurrent_config_writes() {
         let (_tmpdir, dataset) = get_empty_dataset().await;
+        let original_num_config_keys = dataset.manifest.config.len();
 
         // Test successful concurrent insert config operations
         let futures: Vec<_> = ["key1", "key2", "key3", "key4", "key5"]
@@ -1277,7 +1269,7 @@ mod tests {
         }
 
         let dataset = dataset.checkout_version(6).await.unwrap();
-        assert_eq!(dataset.manifest.config.len(), 5);
+        assert_eq!(dataset.manifest.config.len(), 5 + original_num_config_keys);
 
         dataset.validate().await.unwrap();
 
@@ -1300,7 +1292,7 @@ mod tests {
         let dataset = dataset.checkout_version(11).await.unwrap();
 
         // There are now two fewer keys
-        assert_eq!(dataset.manifest.config.len(), 3);
+        assert_eq!(dataset.manifest.config.len(), 3 + original_num_config_keys);
 
         dataset.validate().await.unwrap()
     }

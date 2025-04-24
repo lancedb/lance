@@ -187,6 +187,11 @@ impl ExecutionPlan for AddRowAddrExec {
         vec![&self.input]
     }
 
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // We aren't doing much work here, best to avoid the thread overhead
+        vec![false]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,

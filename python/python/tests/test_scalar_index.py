@@ -111,7 +111,7 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
 
 
 def test_indexed_between(tmp_path):
-    dataset = lance.write_dataset(pa.table({"val": range(100)}), tmp_path)
+    dataset = lance.write_dataset(pa.table({"val": range(0, 10000)}), tmp_path)
     dataset.create_scalar_index("val", index_type="BTREE")
 
     scanner = dataset.scanner(filter="val BETWEEN 10 AND 20", prefilter=True)
@@ -127,6 +127,23 @@ def test_indexed_between(tmp_path):
 
     actual_data = scanner.to_table()
     assert actual_data.num_rows == 11
+
+    # The following cases are slightly ill-formed since end is before start
+    # but we should handle them gracefully and simply return an empty result
+    # (previously we panicked here)
+    scanner = dataset.scanner(filter="val >= 5000 AND val <= 0", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 0
+
+    scanner = dataset.scanner(filter="val BETWEEN 5000 AND 0", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 0
 
 
 def test_temporal_index(tmp_path):
@@ -1007,3 +1024,35 @@ def test_drop_index(tmp_path):
     assert ds.to_table(filter="bitmap = 1").num_rows == 1
     assert ds.to_table(filter="fts = 'a'").num_rows == test_table_size
     assert ds.to_table(filter="contains(ngram, 'a')").num_rows == test_table_size
+
+
+def test_index_prewarm(tmp_path: Path):
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table_size = 100
+    test_table = pa.table(
+        {
+            "fts": ["a" for _ in range(test_table_size)],
+        }
+    )
+
+    # Write index, cache should not be populated
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("fts", index_type="INVERTED")
+    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    assert scan_stats.parts_loaded > 0
+
+    # Fresh load, no prewarm, cache should not be populated
+    ds = lance.dataset(tmp_path)
+    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    assert scan_stats.parts_loaded > 0
+
+    # Prewarm index, cache should be populated
+    ds = lance.dataset(tmp_path)
+    ds.prewarm_index("fts_idx")
+    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    assert scan_stats.parts_loaded == 0

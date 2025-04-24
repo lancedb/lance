@@ -46,7 +46,7 @@ async fn create_data(num_bytes: u64) -> (Arc<ObjectStore>, Path) {
     rand::thread_rng().fill_bytes(&mut some_data);
     obj_store.put(&tmp_file, &some_data).await.unwrap();
 
-    (Arc::new(obj_store), tmp_file)
+    (obj_store, tmp_file)
 }
 
 const DATA_SIZE: u64 = 128 * 1024 * 1024;

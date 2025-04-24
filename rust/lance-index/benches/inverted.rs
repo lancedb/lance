@@ -15,7 +15,7 @@ use itertools::Itertools;
 use lance_core::cache::FileMetadataCache;
 use lance_core::ROW_ID;
 use lance_index::prefilter::NoFilter;
-use lance_index::scalar::inverted::query::FtsSearchParams;
+use lance_index::scalar::inverted::query::{FtsSearchParams, Operator};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
@@ -34,7 +34,7 @@ fn bench_inverted(c: &mut Criterion) {
     let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
     let store = rt.block_on(async {
         Arc::new(LanceIndexStore::new(
-            ObjectStore::local(),
+            Arc::new(ObjectStore::local()),
             index_dir,
             FileMetadataCache::no_cache(),
         ))
@@ -91,6 +91,7 @@ fn bench_inverted(c: &mut Criterion) {
                     .bm25_search(
                         &[tokens[rand::random::<usize>() % tokens.len()].to_owned()],
                         &params,
+                        Operator::Or,
                         false,
                         no_filter.clone(),
                         &NoOpMetricsCollector,

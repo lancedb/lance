@@ -766,6 +766,7 @@ mod tests {
     };
     use arrow_array::{BooleanArray, Int32Array};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
+    use lance_io::object_store::ObjectStoreParams;
 
     #[tokio::test]
     async fn test_take() {
@@ -1364,8 +1365,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_take_boolean_beyond_chunk() {
-        let mut store = ObjectStore::memory();
-        store.set_block_size(256);
+        let store = ObjectStore::from_uri_and_params(
+            Arc::new(Default::default()),
+            "memory://",
+            &ObjectStoreParams {
+                block_size: Some(256),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .0;
         let path = Path::from("/take_bools");
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(

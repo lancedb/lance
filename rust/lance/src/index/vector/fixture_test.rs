@@ -74,6 +74,10 @@ mod test {
             Ok(self)
         }
 
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
         /// Retrieve index statistics as a JSON Value
         fn statistics(&self) -> Result<serde_json::Value> {
             Ok(serde_json::Value::Null)
