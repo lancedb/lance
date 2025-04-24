@@ -15,7 +15,7 @@ use lance_core::error::LanceOptionExt;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
-use lance_datafusion::spill::{create_spill, SpillReceiver, SpillSender};
+use lance_datafusion::spill::{create_replay_spill, SpillReceiver, SpillSender};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
@@ -712,7 +712,7 @@ impl SpillStreamIter {
         .expect_ok()??;
 
         let tmp_path = tmp_dir.path().join("spill.arrows");
-        let (mut sender, receiver) = create_spill(tmp_path, source.schema(), memory_limit);
+        let (mut sender, receiver) = create_replay_spill(tmp_path, source.schema(), memory_limit);
 
         let sender_handle = tokio::task::spawn(async move {
             while let Some(res) = source.next().await {

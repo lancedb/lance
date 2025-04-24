@@ -17,8 +17,7 @@ use datafusion_common::DataFusionError;
 use lance_arrow::memory::MemoryAccumulator;
 use lance_core::error::LanceOptionExt;
 
-/// Start a spill of Arrow data to a temporary file. The file is an Arrow IPC
-/// stream file.
+/// Start a spill of Arrow data to a file that can be read later multiple times.
 ///
 /// Up to `memory_limit` bytes of data can be buffered in memory before a spill
 /// is created. If the memory limit is never reached before [`SpillSender::finish()`]
@@ -37,7 +36,7 @@ use lance_core::error::LanceOptionExt;
 ///
 /// Once [`SpillSender`] is dropped, the temporary file is deleted. This will
 /// cause the [`SpillReceiver`] to return an error if it is still open.
-pub fn create_spill(
+pub fn create_replay_spill(
     path: std::path::PathBuf,
     schema: Arc<Schema>,
     memory_limit: usize,
@@ -556,7 +555,7 @@ mod tests {
         // Create a stream
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join("spill.arrows");
-        let (mut spill, receiver) = create_spill(path.clone(), schema.clone(), 0);
+        let (mut spill, receiver) = create_replay_spill(path.clone(), schema.clone(), 0);
 
         // We can open a reader prior to writing any data. No batches will be ready.
         let mut stream_before = receiver.read();
@@ -621,7 +620,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join("spill.arrows");
-        let (mut spill, receiver) = create_spill(path.clone(), schema.clone(), 0);
+        let (mut spill, receiver) = create_replay_spill(path.clone(), schema.clone(), 0);
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -684,7 +683,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join("spill.arrows");
         let memory_limit = 1024 * 1024; // 1 MiB
-        let (mut spill, receiver) = create_spill(path.clone(), schema.clone(), memory_limit);
+        let (mut spill, receiver) = create_replay_spill(path.clone(), schema.clone(), memory_limit);
 
         // 0.5 MB batch
         let batch = RecordBatch::try_new(
@@ -716,7 +715,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join("spill.arrows");
         let memory_limit = 1024 * 1024; // 1 MiB
-        let (mut spill, receiver) = create_spill(path.clone(), schema.clone(), memory_limit);
+        let (mut spill, receiver) = create_replay_spill(path.clone(), schema.clone(), memory_limit);
 
         // 0.7 MB batch
         let batch = RecordBatch::try_new(
