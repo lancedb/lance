@@ -31,6 +31,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
 use snafu::location;
+use tracing::Instrument;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::scanner::{
@@ -246,33 +247,36 @@ impl LanceStream {
                 #[allow(clippy::type_complexity)]
                 let frag_task: BoxFuture<
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
-                > = tokio::spawn(async move {
-                    let reader = open_file(
-                        file_fragment.fragment,
-                        project_schema,
-                        FragReadConfig::default()
-                            .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address),
-                        config.with_make_deletions_null,
-                        Some((scan_scheduler, priority as u32)),
-                    )
-                    .await?;
-                    let batch_stream = if let Some(range) = file_fragment.range {
-                        reader.read_range(range, config.batch_size as u32)?.boxed()
-                    } else {
-                        reader.read_all(config.batch_size as u32)?.boxed()
-                    };
-                    let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
-                        batch_stream
-                            .map(|fut| {
-                                Result::Ok(
-                                    fut.map_err(|e| DataFusionError::External(Box::new(e)))
-                                        .boxed(),
-                                )
-                            })
-                            .boxed();
-                    Result::Ok(batch_stream)
-                })
+                > = tokio::spawn(
+                    (async move {
+                        let reader = open_file(
+                            file_fragment.fragment,
+                            project_schema,
+                            FragReadConfig::default()
+                                .with_row_id(config.with_row_id)
+                                .with_row_address(config.with_row_address),
+                            config.with_make_deletions_null,
+                            Some((scan_scheduler, priority as u32)),
+                        )
+                        .await?;
+                        let batch_stream = if let Some(range) = file_fragment.range {
+                            reader.read_range(range, config.batch_size as u32)?.boxed()
+                        } else {
+                            reader.read_all(config.batch_size as u32)?.boxed()
+                        };
+                        let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
+                            batch_stream
+                                .map(|fut| {
+                                    Result::Ok(
+                                        fut.map_err(|e| DataFusionError::External(Box::new(e)))
+                                            .boxed(),
+                                    )
+                                })
+                                .boxed();
+                        Result::Ok(batch_stream)
+                    })
+                    .in_current_span(),
+                )
                 .map(|res_res| res_res.unwrap())
                 .boxed();
                 Ok(frag_task)

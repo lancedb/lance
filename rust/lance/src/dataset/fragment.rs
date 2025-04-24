@@ -2103,6 +2103,10 @@ impl FragmentReader {
                         })
                         .boxed()
                 })
+                .stream_in_span(tracing::debug_span!(
+                    "ReadBatchFutStream",
+                    id = self.fragment_id,
+                ))
                 .boxed(),
         )
     }
