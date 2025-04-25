@@ -939,8 +939,9 @@ impl FileFragment {
             }
         }
 
-        // This should return immediately on modern datasets.
-        let num_rows = self.count_rows(None).await?;
+        // This should return immediately on modern datasets.  Need to use physical_rows because
+        // deletions will be applied later
+        let num_rows = self.physical_rows().await?;
 
         // Check if there are any fields that are not in any data files
         let field_ids_in_files = opened_files
