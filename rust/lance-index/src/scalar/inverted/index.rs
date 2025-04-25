@@ -234,6 +234,7 @@ impl Index for InvertedIndex {
 
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
+            "params": self.params,
             "num_tokens": self.tokens.tokens.len(),
             "num_docs": self.docs.token_count.len(),
         }))

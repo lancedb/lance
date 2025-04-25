@@ -388,6 +388,25 @@ def test_indexed_filter_with_fts_index(tmp_path):
     assert results["_rowid"].to_pylist() == [2, 3]
 
 
+def test_fts_stats(dataset):
+    dataset.create_scalar_index(
+        "doc", index_type="INVERTED", with_position=False, remove_stop_words=True
+    )
+    stats = dataset.stats.index_stats("doc_idx")
+    assert stats["index_type"] == "Inverted"
+    stats = stats["indices"][0]
+    params = stats["params"]
+
+    assert params["with_position"] is False
+    assert params["base_tokenizer"] == "simple"
+    assert params["language"] == "English"
+    assert params["max_token_length"] == 40
+    assert params["lower_case"] is True
+    assert params["stem"] is False
+    assert params["remove_stop_words"] is True
+    assert params["ascii_folding"] is False
+
+
 def test_fts_on_list(tmp_path):
     data = pa.table(
         {
