@@ -13,7 +13,6 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
-use lance_index::scalar::{btree::DEFAULT_BTREE_BATCH_SIZE, inverted::tokenizer::InvertedIndexParams};
 use lance_index::scalar::ngram::{train_ngram_index, NGramIndex};
 use lance_index::scalar::{
     bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
@@ -23,6 +22,9 @@ use lance_index::scalar::{
     label_list::{train_label_list_index, LabelListIndex},
     lance_format::LanceIndexStore,
     ScalarIndex, ScalarIndexParams, ScalarIndexType,
+};
+use lance_index::scalar::{
+    btree::DEFAULT_BTREE_BATCH_SIZE, inverted::tokenizer::InvertedIndexParams,
 };
 use lance_table::format::Index;
 use log::info;

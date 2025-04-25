@@ -19,10 +19,7 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
-use inverted::{
-    query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery},
-    tokenizer::InvertedIndexParams,
-};
+use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use snafu::location;
@@ -38,6 +35,8 @@ pub mod inverted;
 pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
+
+pub use inverted::tokenizer::InvertedIndexParams;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 

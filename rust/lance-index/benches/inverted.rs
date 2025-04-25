@@ -14,12 +14,14 @@ use futures::stream;
 use itertools::Itertools;
 use lance_core::cache::FileMetadataCache;
 use lance_core::ROW_ID;
-use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::tokenizer::InvertedIndexParams};
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Operator};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
+use lance_index::{
+    metrics::NoOpMetricsCollector, scalar::inverted::tokenizer::InvertedIndexParams,
+};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]

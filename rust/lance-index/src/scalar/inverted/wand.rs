@@ -12,7 +12,7 @@ use lance_core::Result;
 use tracing::instrument;
 
 use super::DocInfo;
-use super::{builder::OrderedDoc, scorer::Scorer, DocSet, PostingList};
+use super::{builder::OrderedDoc, DocSet, PostingList};
 use super::{
     query::Operator,
     scorer::{idf, K1},
@@ -103,7 +103,7 @@ impl PostingIterator {
         self.list.positions(row_id)
     }
 
-    // move to the next row id that is greater than or equal to least_id
+    // move to the next doc id that is greater than or equal to least_id
     #[instrument(level = "debug", name = "posting_iter_next", skip(self))]
     fn next(&mut self, least_id: u64) -> Option<(u64, usize)> {
         match self.list {
@@ -181,12 +181,20 @@ impl<'a> Wand<'a> {
             if is_phrase_query && !self.check_positions() {
                 continue;
             }
-            let score = self.score(doc, &scorer);
+            let score = self.score(doc.doc_id(), &scorer);
+            let row_id = match doc {
+                DocInfo::Located(doc) => doc.row_id,
+                DocInfo::Raw(doc) => {
+                    // if the doc is not located, we need to find the row id
+                    // in the doc set. This is a bit slow, but it should be rare.
+                    self.docs.row_id(doc.doc_id as u32)
+                }
+            };
             if candidates.len() < limit {
-                candidates.push(Reverse(OrderedDoc::new(doc, score)));
+                candidates.push(Reverse(OrderedDoc::new(row_id, score)));
             } else if score > candidates.peek().unwrap().0.score.0 {
                 candidates.pop();
-                candidates.push(Reverse(OrderedDoc::new(doc, score)));
+                candidates.push(Reverse(OrderedDoc::new(row_id, score)));
                 self.threshold = candidates.peek().unwrap().0.score.0 * factor;
             }
         }
@@ -209,14 +217,15 @@ impl<'a> Wand<'a> {
                 break;
             }
             debug_assert!(cur_doc.doc_id() == doc_id);
-            score += scorer(doc_id, cur_doc.frequency() as f32);
+            let idf = idf(posting.list.len(), self.docs.len());
+            score += idf * scorer(doc_id, cur_doc.frequency() as f32);
         }
         score
     }
 
     // find the next doc candidate
     #[instrument(level = "debug", name = "wand_next", skip_all)]
-    fn next(&mut self) -> Result<Option<u64>> {
+    fn next(&mut self) -> Result<Option<DocInfo>> {
         while let Some(pivot_posting) = self.find_pivot_term() {
             let doc = pivot_posting
                 .doc()
@@ -230,7 +239,7 @@ impl<'a> Wand<'a> {
                 // so that means the sum of upper bound of all terms is not less than the threshold,
                 // this document is a candidate
                 self.cur_doc = Some(doc.doc_id());
-                return Ok(Some(doc.doc_id()));
+                return Ok(Some(doc));
             } else {
                 // some posting iterators haven't reached this doc id,
                 // so move such terms to the doc id

@@ -203,6 +203,11 @@ impl InvertedIndexBuilder {
         for worker in workers {
             self.partitions.extend(worker.finish().await?);
         }
+        log::info!(
+            "FTS indexing elapsed {:?}, partition num: {}",
+            start.elapsed(),
+            self.partitions.len()
+        );
         Ok(())
     }
 
@@ -324,12 +329,12 @@ impl InnerBuilder {
         let mut writer = store
             .new_index_file(
                 &posting_file_path(self.id),
-                legacy_inverted_list_schema(self.posting_lists[0].has_positions()),
+                inverted_list_schema(self.posting_lists[0].has_positions()),
             )
             .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
         for posting_list in posting_lists {
-            let batch = posting_list.to_batch(Some(&self.docs))?;
+            let batch = posting_list.to_batch(&self.docs)?;
             writer.write_record_batch(batch).await?;
         }
         writer.finish().await?;
@@ -381,7 +386,7 @@ impl IndexWorker {
         with_position: bool,
         id_alloc: Arc<AtomicU64>,
     ) -> Result<Self> {
-        let schema = legacy_inverted_list_schema(with_position);
+        let schema = inverted_list_schema(with_position);
 
         let (sender, receiver) = tokio::sync::mpsc::channel::<InnerBuilder>(1);
         let flush_task = tokio::spawn(async move {
@@ -466,13 +471,6 @@ impl IndexWorker {
         Ok(())
     }
 
-    fn predict_doc_token_num(&self, doc: &str) -> usize {
-        match self.total_doc_length {
-            0 => doc.len() / 5,
-            _ => self.builder.docs.total_tokens_num() as usize * doc.len() / self.total_doc_length,
-        }
-    }
-
     #[instrument(level = "debug", skip_all)]
     fn flush(&mut self) -> Result<()> {
         if self.builder.tokens.len() == 0 {
@@ -480,7 +478,13 @@ impl IndexWorker {
         }
 
         self.estimated_size = 0;
-        let builder = std::mem::replace(&mut self.builder, InnerBuilder::new(0));
+        let builder = std::mem::replace(
+            &mut self.builder,
+            InnerBuilder::new(
+                self.id_alloc
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ),
+        );
         self.partitions.push(builder.id);
         self.flush_channel
             .blocking_send(builder)
@@ -684,13 +688,15 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
             ))),
             false,
         ),
+        arrow_schema::Field::new(MAX_SCORE_COL, datatypes::DataType::Float32, false),
+        arrow_schema::Field::new(LENGTH_COL, datatypes::DataType::UInt32, false),
     ];
     if with_position {
         fields.push(arrow_schema::Field::new(
-            COMPRESSED_POSITION_COL,
+            POSITION_COL,
             arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
                 "item",
-                arrow_schema::DataType::Binary,
+                arrow_schema::DataType::Int32,
                 true,
             ))),
             false,

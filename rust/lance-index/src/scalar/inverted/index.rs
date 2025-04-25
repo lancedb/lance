@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::{
@@ -9,8 +8,15 @@ use std::{
     collections::BinaryHeap,
     ops::RangeInclusive,
 };
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
-use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
+use arrow::{
+    array::LargeBinaryBuilder,
+    datatypes::{self, Float32Type, Int32Type, UInt64Type},
+};
 use arrow::{
     array::{AsArray, ListBuilder, StringBuilder, UInt32Builder},
     buffer::OffsetBuffer,
@@ -22,8 +28,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::{execution::SendableRecordBatchStream, parquet::column};
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{IntoStreamer, Streamer};
@@ -43,13 +49,17 @@ use snafu::location;
 use tracing::{info, instrument};
 
 use super::{
-    builder::{doc_file_path, posting_file_path, token_file_path, OrderedDoc},
-    query::*,
-    scorer::{idf, BM25Scorer, Scorer, B, K1},
+    builder::PositionRecorder,
+    encoding::{decompress_posting_list, CompressedPostingListHeader},
 };
 use super::{
-    builder::{legacy_inverted_list_schema, PositionRecorder},
-    encoding::CompressedPostingListHeader,
+    builder::{
+        doc_file_path, inverted_list_schema, posting_file_path, token_file_path, OrderedDoc,
+        BLOCK_SIZE,
+    },
+    encoding::{compress_posting_list, Compression},
+    query::*,
+    scorer::{idf, BM25Scorer, Scorer, B, K1},
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::prefilter::PreFilter;
@@ -69,6 +79,8 @@ pub const FREQUENCY_COL: &str = "_frequency";
 pub const POSITION_COL: &str = "_position";
 pub const COMPRESSED_POSITION_COL: &str = "_compressed_position";
 pub const POSTING_COL: &str = "_posting";
+pub const MAX_SCORE_COL: &str = "_max_score";
+pub const LENGTH_COL: &str = "_length";
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 lazy_static! {
@@ -139,8 +151,6 @@ impl InvertedIndex {
             return Ok((Vec::new(), Vec::new()));
         }
         let mask = prefilter.mask();
-        let searcher = BM25Scorer::new(self);
-
         let mut candidates = BinaryHeap::new();
         for partition in self.partitions.iter() {
             let (row_ids, scores) = partition
@@ -190,7 +200,7 @@ impl InvertedIndex {
             let store = store.clone();
             async move {
                 let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
-                let invert_list = PostingListReader::new(invert_list_reader)?;
+                let invert_list = PostingListReader::try_new(invert_list_reader).await?;
                 Result::Ok(Arc::new(invert_list))
             }
         });
@@ -375,7 +385,7 @@ impl InvertedPartition {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
-        let inverted_list = PostingListReader::new(invert_list_file)?;
+        let inverted_list = PostingListReader::try_new(invert_list_file).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
         let docs = DocSet::load(docs_file).await?;
 
@@ -458,6 +468,8 @@ impl InvertedPartition {
             return Ok((Vec::new(), Vec::new()));
         }
 
+        let num_docs = self.docs.len() as u32;
+        let row_ids = &self.docs.row_ids;
         let postings = stream::iter(token_ids)
             .enumerate()
             .zip(repeat_with(|| mask.clone()))
@@ -466,6 +478,29 @@ impl InvertedPartition {
                     .inverted_list
                     .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
+
+                // TODO: search on compressed posting list
+                // now we just decompress the entire posting list
+                let posting = match posting {
+                    PostingList::Compressed(compressed) => {
+                        let (doc_ids, freqs) =
+                            decompress_posting_list(num_docs, &compressed.blocks)?;
+                        let row_ids = doc_ids
+                            .into_iter()
+                            .map(|doc_id| row_ids[doc_id as usize])
+                            .collect();
+                        let freqs = freqs.into_iter().map(|freq| freq as f32).collect();
+
+                        PostingList::Plain(PlainPostingList::new(
+                            row_ids,
+                            freqs,
+                            Some(compressed.max_score),
+                            compressed.positions,
+                        ))
+                    }
+                    _ => posting,
+                };
+
                 Result::Ok(PostingIterator::new(
                     token_id,
                     position as u32,
@@ -659,8 +694,16 @@ impl TokenSet {
 
 pub struct PostingListReader {
     reader: Arc<dyn IndexReader>,
-    offsets: Vec<usize>,
+
+    // legacy format only
+    offsets: Option<Vec<usize>>,
+
+    // from metadata for legacy format
+    // from column for new format
     max_scores: Option<Vec<f32>>,
+
+    // new format only
+    lengths: Option<Vec<u32>>,
 
     has_position: bool,
 
@@ -687,18 +730,25 @@ impl DeepSizeOf for PostingListReader {
 }
 
 impl PostingListReader {
-    pub(crate) fn new(reader: Arc<dyn IndexReader>) -> Result<Self> {
-        let offsets: Vec<usize> = match reader.schema().metadata.get("offsets") {
-            Some(offsets) => serde_json::from_str(offsets)?,
-            None => (0..reader.num_rows()).collect::<Vec<_>>(),
-        };
-
-        let max_scores = match reader.schema().metadata.get("max_scores") {
-            Some(max_scores) => serde_json::from_str(max_scores)?,
-            None => None,
-        };
-
+    pub(crate) async fn try_new(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let has_position = reader.schema().field(POSITION_COL).is_some();
+        let (offsets, max_scores, lengths) = if reader.schema().field(POSTING_COL).is_none() {
+            let (offsets, max_scores) = Self::load_metadata(reader.schema())?;
+            (Some(offsets), max_scores, None)
+        } else {
+            let metadata = reader
+                .read_range(0..reader.num_rows(), Some(&[MAX_SCORE_COL, LENGTH_COL]))
+                .await?;
+            let max_scores = metadata[MAX_SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec();
+            let lengths = metadata[LENGTH_COL]
+                .as_primitive::<UInt32Type>()
+                .values()
+                .to_vec();
+            (None, Some(max_scores), Some(lengths))
+        };
 
         let posting_cache = Cache::builder()
             .max_capacity(*CACHE_SIZE as u64)
@@ -708,14 +758,43 @@ impl PostingListReader {
             .max_capacity(*CACHE_SIZE as u64)
             .weigher(|_, positions: &ListArray| positions.get_array_memory_size() as u32)
             .build();
+
         Ok(Self {
             reader,
             offsets,
             max_scores,
+            lengths,
             has_position,
             posting_cache,
             position_cache,
         })
+    }
+
+    // for legacy format
+    // returns the offsets and max scores
+    fn load_metadata(
+        schema: &lance_core::datatypes::Schema,
+    ) -> Result<(Vec<usize>, Option<Vec<f32>>)> {
+        let offsets = schema.metadata.get("offsets").ok_or(Error::Index {
+            message: "offsets not found in metadata".to_owned(),
+            location: location!(),
+        })?;
+        let offsets = serde_json::from_str(offsets)?;
+
+        let max_scores = schema
+            .metadata
+            .get("max_scores")
+            .map(|max_scores| serde_json::from_str(max_scores))
+            .transpose()?;
+        Ok((offsets, max_scores))
+    }
+
+    // the number of posting lists
+    pub fn len(&self) -> usize {
+        match self.offsets {
+            Some(ref offsets) => offsets.len(),
+            None => self.reader.num_rows(),
+        }
     }
 
     pub(crate) fn has_positions(&self) -> bool {
@@ -724,15 +803,44 @@ impl PostingListReader {
 
     pub(crate) fn posting_len(&self, token_id: u32) -> usize {
         let token_id = token_id as usize;
-        let next_offset = self
-            .offsets
-            .get(token_id + 1)
-            .copied()
-            .unwrap_or(self.reader.num_rows());
-        next_offset - self.offsets[token_id]
+
+        match self.offsets {
+            Some(ref offsets) => {
+                let next_offset = offsets
+                    .get(token_id + 1)
+                    .copied()
+                    .unwrap_or(self.reader.num_rows());
+                next_offset - offsets[token_id]
+            }
+            None => {
+                if let Some(lengths) = &self.lengths {
+                    lengths[token_id] as usize
+                } else {
+                    panic!("posting list reader is not initialized")
+                }
+            }
+        }
     }
 
-    pub(crate) async fn posting_batch(
+    async fn posting_batch(&self, token_id: u32, with_position: bool) -> Result<RecordBatch> {
+        if self.offsets.is_some() {
+            self.posting_batch_legacy(token_id, with_position).await
+        } else {
+            let token_id = token_id as usize;
+            let columns = if with_position {
+                vec![POSTING_COL, POSITION_COL]
+            } else {
+                vec![POSTING_COL]
+            };
+            let batch = self
+                .reader
+                .read_range(token_id..token_id + 1, Some(&columns))
+                .await?;
+            Ok(batch)
+        }
+    }
+
+    async fn posting_batch_legacy(
         &self,
         token_id: u32,
         with_position: bool,
@@ -744,7 +852,7 @@ impl PostingListReader {
 
         let length = self.posting_len(token_id);
         let token_id = token_id as usize;
-        let offset = self.offsets[token_id];
+        let offset = self.offsets.as_ref().unwrap()[token_id];
         let batch = self
             .reader
             .read_range(offset..offset + length, Some(&columns))
@@ -765,14 +873,8 @@ impl PostingListReader {
                 metrics.record_part_load();
                 info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
-                let (row_ids, frequencies) = Self::extract_columns(&batch);
-                Result::Ok(PostingList::Plain(PlainPostingList::new(
-                    row_ids,
-                    frequencies,
-                    self.max_scores
-                        .as_ref()
-                        .map(|max_scores| max_scores[token_id as usize]),
-                )))
+                let posting_list = PostingList::from_batch(&batch, self.max_scores.as_ref().map(|max_scores| max_scores[token_id as usize]), self.lengths.as_ref().map(|lengths| lengths[token_id as usize]))?;
+                Result::Ok(posting_list)
             })
             .await
             .map_err(|e| Error::io(e.to_string(), location!()))?;
@@ -787,27 +889,23 @@ impl PostingListReader {
     }
 
     async fn prewarm(&self) -> Result<()> {
+        let columns = self.posting_columns(false);
         let batch = self
             .reader
-            .read_range(0..self.reader.num_rows(), Some(&[ROW_ID, FREQUENCY_COL]))
+            .read_range(0..self.reader.num_rows(), Some(&columns))
             .await?;
-        for token_id in 0..self.offsets.len() {
-            let offset = self.offsets[token_id];
-            let length = self.posting_len(token_id as u32);
-            let batch = batch.slice(offset, length);
-            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-            let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>();
+        for token_id in 0..self.len() {
+            let posting_range = self.posting_list_range(token_id as u32);
+            let batch = batch.slice(posting_range.start, posting_range.end - posting_range.start);
+            let posting_list = PostingList::from_batch(
+                &batch,
+                self.max_scores
+                    .as_ref()
+                    .map(|max_scores| max_scores[token_id]),
+                self.lengths.as_ref().map(|lengths| lengths[token_id]),
+            )?;
             self.posting_cache
-                .insert(
-                    token_id as u32,
-                    PostingList::Plain(PlainPostingList::new(
-                        row_ids.values().clone(),
-                        frequencies.values().clone(),
-                        self.max_scores
-                            .as_ref()
-                            .map(|max_scores| max_scores[token_id]),
-                    )),
-                )
+                .insert(token_id as u32, posting_list)
                 .await;
         }
 
@@ -822,12 +920,9 @@ impl PostingListReader {
 
     async fn read_positions(&self, token_id: u32) -> Result<ListArray> {
         self.position_cache.try_get_with(token_id, async move {
-            let length = self.posting_len(token_id);
-            let token_id = token_id as usize;
-            let offset = self.offsets[token_id];
             let batch = self
                 .reader
-                .read_range(offset..offset + length, Some(&[POSITION_COL]))
+                .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
                 .await.map_err(|e| {
                     match e {
                         Error::Schema { .. } => Error::Index {
@@ -842,6 +937,31 @@ impl PostingListReader {
                 .clone())
         }).await.map_err(|e| Error::io(e.to_string(), location!()))
     }
+
+    fn posting_list_range(&self, token_id: u32) -> Range<usize> {
+        match self.offsets {
+            Some(ref offsets) => {
+                let offset = offsets[token_id as usize];
+                let postsing_len = self.posting_len(token_id);
+                offset..offset + postsing_len
+            }
+            None => {
+                let token_id = token_id as usize;
+                token_id..token_id + 1
+            }
+        }
+    }
+
+    fn posting_columns(&self, with_position: bool) -> Vec<&'static str> {
+        let mut base_columns = match self.offsets {
+            Some(_) => vec![ROW_ID, FREQUENCY_COL],
+            None => vec![POSTING_COL],
+        };
+        if with_position {
+            base_columns.push(POSITION_COL);
+        }
+        base_columns
+    }
 }
 
 #[derive(Debug, Clone, DeepSizeOf)]
@@ -851,13 +971,20 @@ pub enum PostingList {
 }
 
 impl PostingList {
-    pub fn try_from_batch(batch: &RecordBatch) -> Result<Self> {
+    pub fn from_batch(
+        batch: &RecordBatch,
+        max_score: Option<f32>,
+        length: Option<u32>,
+    ) -> Result<Self> {
         match batch.column_by_name(POSTING_COL) {
             Some(_) => {
-                unimplemented!("TODO")
+                debug_assert!(max_score.is_some() && length.is_some());
+                let posting =
+                    CompressedPostingList::from_batch(batch, max_score.unwrap(), length.unwrap());
+                Ok(Self::Compressed(posting))
             }
             None => {
-                let posting = PlainPostingList::from_batch(batch)?;
+                let posting = PlainPostingList::from_batch(batch, max_score);
                 Ok(Self::Plain(posting))
             }
         }
@@ -902,14 +1029,14 @@ impl PostingList {
     pub fn max_score(&self) -> Option<f32> {
         match self {
             PostingList::Plain(posting) => posting.max_score,
-            PostingList::Compressed(posting) => Some(posting.header.max_score),
+            PostingList::Compressed(posting) => Some(posting.max_score),
         }
     }
 
     pub fn len(&self) -> usize {
         match self {
             PostingList::Plain(posting) => posting.len(),
-            PostingList::Compressed(posting) => posting.header.num_docs as usize,
+            PostingList::Compressed(posting) => posting.length as usize,
         }
     }
 }
@@ -948,22 +1075,17 @@ impl PlainPostingList {
         row_ids: ScalarBuffer<u64>,
         frequencies: ScalarBuffer<f32>,
         max_score: Option<f32>,
+        positions: Option<ListArray>,
     ) -> Self {
         Self {
             row_ids,
             frequencies,
             max_score,
-            positions: None,
+            positions,
         }
     }
 
-    pub fn from_batch(batch: &RecordBatch) -> Result<Self> {
-        let max_score = batch
-            .metadata()
-            .get("max_score")
-            .map(|s| serde_json::from_str(s))
-            .transpose()?;
-
+    pub fn from_batch(batch: &RecordBatch, max_score: Option<f32>) -> Self {
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().clone();
         let frequencies = batch[FREQUENCY_COL]
             .as_primitive::<Float32Type>()
@@ -973,12 +1095,7 @@ impl PlainPostingList {
             .column_by_name(POSITION_COL)
             .map(|col| col.as_list::<i32>().clone());
 
-        Ok(Self {
-            row_ids,
-            frequencies,
-            max_score,
-            positions,
-        })
+        Self::new(row_ids, frequencies, max_score, positions)
     }
 
     pub fn len(&self) -> usize {
@@ -1011,11 +1128,11 @@ impl PlainPostingList {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct CompressedPostingList {
-    // the first binary is the header
-    // after that, each binary is a block of compressed data
+    pub max_score: f32,
+    pub length: u32,
+    // each binary is a block of compressed data
     // that contains `BLOCK_SIZE` doc ids and then `BLOCK_SIZE` frequencies
     pub blocks: LargeBinaryArray,
-    pub header: CompressedPostingListHeader,
     pub positions: Option<ListArray>,
 }
 
@@ -1027,6 +1144,27 @@ impl DeepSizeOf for CompressedPostingList {
                 .as_ref()
                 .map(|positions| positions.get_array_memory_size())
                 .unwrap_or(0)
+    }
+}
+
+impl CompressedPostingList {
+    pub fn from_batch(batch: &RecordBatch, max_score: f32, length: u32) -> Self {
+        debug_assert_eq!(batch.num_rows(), 1);
+        let blocks = batch[POSTING_COL]
+            .as_list::<i32>()
+            .value(0)
+            .as_binary::<i64>()
+            .clone();
+        let positions = batch
+            .column_by_name(POSITION_COL)
+            .map(|col| col.as_list::<i32>().clone());
+
+        Self {
+            max_score,
+            length,
+            blocks,
+            positions,
+        }
     }
 }
 
@@ -1048,17 +1186,17 @@ impl PostingListBuilder {
                 .unwrap_or(0)
     }
 
-    pub fn try_from_batches(batches: &[RecordBatch]) -> Result<Self> {
-        for batch in batches {
-            let posting_list = PostingList::try_from_batch(batch)?;
-        }
-        unimplemented!()
-        // Self {
-        //     doc_ids: row_ids,
-        //     frequencies,
-        //     positions,
-        // }
-    }
+    // pub fn try_from_batches(batches: &[RecordBatch]) -> Result<Self> {
+    //     for batch in batches {
+    //         let posting_list = PostingList::from_batch(batch);
+    //     }
+    //     unimplemented!()
+    //     // Self {
+    //     //     doc_ids: row_ids,
+    //     //     frequencies,
+    //     //     positions,
+    //     // }
+    // }
 
     pub fn has_positions(&self) -> bool {
         self.positions.is_some()
@@ -1127,48 +1265,53 @@ impl PostingListBuilder {
     }
 
     // convert the posting list to a record batch
-    // with docs, it would calculate the max score to accelerate the search
-    pub fn to_batch(mut self, docs: Option<&DocSet>) -> Result<RecordBatch> {
+    pub fn to_batch(mut self, docs: &DocSet) -> Result<RecordBatch> {
         let length = self.len();
-        let num_docs = docs.as_ref().map(|docs| docs.len()).unwrap_or(0);
-        let avgdl = docs.map(|docs| docs.average_length()).unwrap_or(0.0);
+        let num_docs = docs.len();
+        let avgdl = docs.average_length();
         let mut max_score = 0.0;
 
-        let mut doc_id_builder = UInt32Builder::with_capacity(length);
-        let mut freq_builder = UInt32Builder::with_capacity(length);
+        let mut doc_ids = Vec::with_capacity(length);
+        let mut freqs = Vec::with_capacity(length);
         let mut position_builder = self.positions.as_mut().map(|positions| {
             ListBuilder::with_capacity(UInt32Builder::with_capacity(positions.total_len()), length)
         });
         for index in (0..length).sorted_unstable_by_key(|&i| self.doc_ids[i]) {
             let (doc_id, freq) = (self.doc_ids[index], self.frequencies[index]);
             // reorder the posting list by doc id
-            doc_id_builder.append_value(doc_id);
-            freq_builder.append_value(freq);
+            doc_ids.push(doc_id);
+            freqs.push(freq);
             if let Some(position_builder) = position_builder.as_mut() {
                 let inner_builder = position_builder.values();
                 inner_builder.append_slice(self.positions.as_ref().unwrap().get(index));
                 position_builder.append(true);
             }
             // calculate the max score
-            if let Some(docs) = &docs {
-                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id as u64) as f32 / avgdl);
-                let freq = freq as f32;
-                let score = freq / (freq + doc_norm);
-                if score > max_score {
-                    max_score = score;
-                }
+
+            let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id as u64) as f32 / avgdl);
+            let freq = freq as f32;
+            let score = freq / (freq + doc_norm);
+            if score > max_score {
+                max_score = score;
             }
         }
         max_score *= idf(self.len(), num_docs) * (K1 + 1.0);
+        let compressed = compress_posting_list(&doc_ids, &freqs)?;
 
-        let row_id_col = doc_id_builder.finish();
-        let freq_col = freq_builder.finish();
-
+        let schema = inverted_list_schema(position_builder.is_some());
         let mut columns = vec![
-            Arc::new(row_id_col) as ArrayRef,
-            Arc::new(freq_col) as ArrayRef,
+            Arc::new(ListArray::try_new(
+                Arc::new(Field::new("item", datatypes::DataType::LargeBinary, true)),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32])),
+                Arc::new(compressed),
+                None,
+            )?) as ArrayRef,
+            Arc::new(Float32Array::from_iter_values(std::iter::once(max_score))) as ArrayRef,
+            Arc::new(UInt32Array::from_iter_values(std::iter::once(
+                self.len() as u32
+            ))) as ArrayRef,
         ];
-        let schema = legacy_inverted_list_schema(position_builder.is_some());
+
         if let Some(mut position_builder) = position_builder {
             let position_col = position_builder.finish();
             columns.push(Arc::new(position_col));

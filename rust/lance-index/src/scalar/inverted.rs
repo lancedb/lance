@@ -5,8 +5,8 @@ pub mod builder;
 mod encoding;
 mod index;
 pub mod query;
-pub mod tokenizer;
 mod scorer;
+pub mod tokenizer;
 mod wand;
 
 pub use builder::InvertedIndexBuilder;

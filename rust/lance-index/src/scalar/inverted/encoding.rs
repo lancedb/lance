@@ -4,13 +4,16 @@
 use std::io::Write;
 
 use super::builder::BLOCK_SIZE;
-use arrow::array::LargeBinaryBuilder;
+use arrow::{
+    array::{AsArray, LargeBinaryBuilder},
+    ipc::LargeBinary,
+};
 use bitpacking::{BitPacker, BitPacker4x};
 use lance_core::Result;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
-enum Compression {
+pub(crate) enum Compression {
     // delta-encode + bitpack for doc ids
     // bitpack for frequencies
     // and plain for the remainder
@@ -19,14 +22,30 @@ enum Compression {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct CompressedPostingListHeader {
-    pub compression: Compression,
+    pub(crate) compression: Compression,
     pub num_docs: u32,
     pub max_score: f32,
 }
 
 impl CompressedPostingListHeader {
+    pub(crate) fn new(compression: Compression, num_docs: u32, max_score: f32) -> Self {
+        Self {
+            compression,
+            num_docs,
+            max_score,
+        }
+    }
+
     pub fn num_bytes() -> usize {
         std::mem::size_of::<Compression>() + std::mem::size_of::<u32>() + std::mem::size_of::<f32>()
+    }
+
+    pub fn write(&self, builder: &mut LargeBinaryBuilder) -> Result<()> {
+        builder.write(&[self.compression as u8])?;
+        builder.write(&self.num_docs.to_le_bytes())?;
+        builder.write(&self.max_score.to_le_bytes())?;
+        builder.append_value("");
+        Ok(())
     }
 }
 
@@ -36,8 +55,11 @@ impl CompressedPostingListHeader {
 pub fn compress_posting_list(
     doc_ids: &[u32],
     frequencies: &[u32],
-    builder: &mut LargeBinaryBuilder,
 ) -> Result<arrow::array::LargeBinaryArray> {
+    let mut builder = LargeBinaryBuilder::with_capacity(
+        doc_ids.len().div_ceil(BLOCK_SIZE) + 1,
+        doc_ids.len() * 4,
+    );
     let compressor = BitPacker4x::new();
     let doc_id_chunks = doc_ids.chunks_exact(BLOCK_SIZE);
     let frequency_chunks = frequencies.chunks_exact(BLOCK_SIZE);
@@ -153,8 +175,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let doc_ids: Vec<u32> = (0..num_rows).map(|_| rng.gen()).sorted_unstable().collect();
         let frequencies: Vec<u32> = (0..num_rows).map(|_| rng.gen_range(1..255)).collect();
-        let mut builder = LargeBinaryBuilder::new();
-        let posting_list = compress_posting_list(&doc_ids, &frequencies, &mut builder)?;
+        let posting_list = compress_posting_list(&doc_ids, &frequencies)?;
         assert_eq!(posting_list.len(), num_rows.div_ceil(BLOCK_SIZE));
         let compressed_size =
             posting_list.value_data().len() + posting_list.value_offsets().len() * 8;
