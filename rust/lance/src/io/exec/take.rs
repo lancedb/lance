@@ -439,8 +439,6 @@ impl TakeExec {
     }
 
     /// Get the dataset.
-    ///
-    /// WARNING: Internal API with no stability guarantees.
     pub fn dataset(&self) -> &Arc<Dataset> {
         &self.dataset
     }

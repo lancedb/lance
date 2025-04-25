@@ -550,6 +550,26 @@ impl LanceScanExec {
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
+
+    /// Get the dataset for this scan.
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    /// Get the fragments for this scan.
+    pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
+        &self.fragments
+    }
+
+    /// Get the range for this scan.
+    pub fn range(&self) -> &Option<Range<u64>> {
+        &self.range
+    }
+
+    /// Get the projection for this scan.
+    pub fn projection(&self) -> &Arc<Schema> {
+        &self.projection
+    }
 }
 
 impl ExecutionPlan for LanceScanExec {
