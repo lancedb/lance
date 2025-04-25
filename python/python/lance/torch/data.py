@@ -29,7 +29,7 @@ from ..sampler import (
 )
 from .dist import get_global_rank, get_global_world_size
 
-__all__ = ["LanceDataset"]
+__all__ = ["LanceDataset", "SafeLanceDataset", "get_safe_loader"]
 
 
 # Convert an Arrow FSL array into a 2D torch tensor
@@ -375,3 +375,76 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 logging.debug("Column %s is a Large Blob column", col)
                 blob_cols.append(col)
         return blob_cols
+
+
+class SafeLanceDataset(torch.utils.data.Dataset):
+    def __init__(self, uri):
+        self.uri = uri
+        self._len = self._safe_preload()
+        self._ds = None  # Deferred initialization
+
+    def _safe_preload(self):
+        """Main-process safe metadata loading"""
+        ds = lance.dataset(self.uri)
+        length = ds.count_rows()
+        del ds  # Critical: release before spawning
+        return length
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx):
+        return self.get_items([idx])[0]
+
+    def get_items(self, indices):
+        """Batch data fetching with worker-safe initialization
+
+        Args:
+            indices: List[int] - batch indices to retrieve
+
+        Returns:
+            List[dict] - samples in original data format
+        """
+        if self._ds is None:
+            # Worker-process initialization
+            import os
+
+            self._ds = lance.dataset(self.uri)
+            print(f"Worker {os.getpid()} initialized dataset")
+
+        # Leverage native batch reading
+        batch = self._ds.take(indices)
+
+        # Convert to python-native format
+        return batch.to_pylist()
+
+
+def get_safe_loader(dataset, batch_size=32, num_workers=4, **kwargs):
+    """Create a DataLoader with safe multiprocessing defaults
+
+    Args:
+        dataset: Input dataset object
+        batch_size: Number of samples per batch (default=32)
+        num_workers: Number of parallel data workers (default=4)
+        **kwargs: Additional DataLoader arguments. Note:
+                 - Forces 'spawn' context for Windows compatibility
+                 - Sets persistent_workers=True by default
+                 - User-provided args override defaults
+
+    Returns:
+        Configured DataLoader instance with process-safe settings
+    """
+
+    # Force spawn context for Windows/multiprocessing compatibility
+    ctx = torch.multiprocessing.get_context("spawn")
+
+    # Configure default parameters with process safety
+    loader_args = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "persistent_workers": kwargs.pop("persistent_workers", True),
+        "multiprocessing_context": ctx,
+        **kwargs,  # User-provided arguments take priority
+    }
+
+    return torch.utils.data.DataLoader(dataset, **loader_args)
