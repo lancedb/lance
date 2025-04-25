@@ -395,8 +395,16 @@ def test_fts_stats(dataset):
     stats = dataset.stats.index_stats("doc_idx")
     assert stats["index_type"] == "Inverted"
     stats = stats["indices"][0]
-    assert stats["params"]["remove_stop_words"] is True
-    assert stats["params"]["with_position"] is False
+    params = stats["params"]
+
+    assert params["with_position"] is False
+    assert params["base_tokenizer"] == "simple"
+    assert params["language"] == "English"
+    assert params["max_token_length"] == 40
+    assert params["lower_case"] is True
+    assert params["stem"] is False
+    assert params["remove_stop_words"] is True
+    assert params["ascii_folding"] is False
 
 
 def test_fts_on_list(tmp_path):
