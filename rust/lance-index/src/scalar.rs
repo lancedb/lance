@@ -19,11 +19,12 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
-use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
-use inverted::TokenizerConfig;
+use inverted::{
+    query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery},
+    tokenizer::InvertedIndexParams,
+};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
-use serde::{Deserialize, Serialize};
 use snafu::location;
 
 use crate::metrics::MetricsCollector;
@@ -98,30 +99,6 @@ impl IndexParams for ScalarIndexParams {
 
     fn index_name(&self) -> &str {
         LANCE_SCALAR_INDEX
-    }
-}
-
-impl Debug for InvertedIndexParams {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InvertedIndexParams")
-            .field("with_position", &self.with_position)
-            .finish()
-    }
-}
-
-impl Default for InvertedIndexParams {
-    fn default() -> Self {
-        Self {
-            with_position: true,
-            tokenizer_config: TokenizerConfig::default(),
-        }
-    }
-}
-
-impl InvertedIndexParams {
-    pub fn with_position(mut self, with_position: bool) -> Self {
-        self.with_position = with_position;
-        self
     }
 }
 
@@ -311,10 +288,9 @@ impl FullTextSearchQuery {
     }
 
     pub fn params(&self) -> FtsSearchParams {
-        FtsSearchParams {
-            limit: self.limit.map(|limit| limit as usize),
-            wand_factor: self.wand_factor.unwrap_or(1.0),
-        }
+        FtsSearchParams::new()
+            .with_limit(self.limit.map(|limit| limit as usize))
+            .with_wand_factor(self.wand_factor.unwrap_or(1.0))
     }
 }
 

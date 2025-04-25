@@ -203,6 +203,9 @@ impl ExecutionPlan for MatchQueryExec {
                 })?;
 
             let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
+            let params = params
+                .with_fuzziness(query.fuzziness)
+                .with_max_expansions(query.max_expansions);
             let mut tokenizer = match is_fuzzy {
                 false => inverted_idx.tokenizer(),
                 true => tantivy::tokenizer::TextAnalyzer::from(
@@ -210,10 +213,6 @@ impl ExecutionPlan for MatchQueryExec {
                 ),
             };
             let mut tokens = collect_tokens(&query.terms, &mut tokenizer, None);
-            if is_fuzzy {
-                tokens =
-                    inverted_idx.expand_fuzzy(tokens, query.fuzziness, query.max_expansions)?;
-            }
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, mut scores) = inverted_idx

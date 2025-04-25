@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::{
+    cmp::{min, Reverse},
+    collections::BinaryHeap,
+    ops::RangeInclusive,
+};
 
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
@@ -27,7 +31,10 @@ use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
-use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
+use lance_core::utils::{
+    mask::RowIdMask,
+    tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
+};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
 use moka::future::Cache;
@@ -35,12 +42,16 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{info, instrument};
 
-use super::query::*;
+use super::{
+    builder::{doc_file_path, posting_file_path, token_file_path, OrderedDoc},
+    query::*,
+    scorer::{idf, BM25Scorer, Scorer, B, K1},
+};
 use super::{
     builder::{legacy_inverted_list_schema, PositionRecorder},
     encoding::CompressedPostingListHeader,
 };
-use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
+use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::prefilter::PreFilter;
 use crate::scalar::{
     AnyQuery, IndexReader, IndexStore, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
@@ -66,10 +77,6 @@ lazy_static! {
         Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()]));
 }
 
-// BM25 parameters
-pub const K1: f32 = 1.2;
-pub const B: f32 = 0.75;
-
 lazy_static! {
     pub static ref CACHE_SIZE: usize = std::env::var("LANCE_INVERTED_CACHE_SIZE")
         .ok()
@@ -79,51 +86,315 @@ lazy_static! {
 
 #[derive(Clone)]
 pub struct InvertedIndex {
-    params: TokenizerConfig,
+    params: InvertedIndexParams,
+    store: Arc<dyn IndexStore>,
     tokenizer: tantivy::tokenizer::TextAnalyzer,
-    tokens: TokenSet,
-    inverted_list: Arc<InvertedListReader>,
-    docs: DocSet,
+    pub(crate) partitions: Vec<InvertedPartition>,
 }
 
 impl Debug for InvertedIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InvertedIndex")
-            .field("tokens", &self.tokens)
-            .field("inverted_list", &self.inverted_list)
-            .field("docs", &self.docs)
+            .field("params", &self.params)
+            .field("partitions", &self.partitions)
             .finish()
     }
 }
 
 impl DeepSizeOf for InvertedIndex {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.tokens.deep_size_of_children(context)
-            + self.inverted_list.deep_size_of_children(context)
-            + self.docs.deep_size_of_children(context)
+        self.partitions.deep_size_of_children(context)
     }
 }
 
 impl InvertedIndex {
+    fn to_builder(&self) -> InvertedIndexBuilder {
+        InvertedIndexBuilder::from_existing_index(
+            self.params.clone(),
+            self.partitions.iter().map(|part| part.id).collect(),
+        )
+    }
+
+    pub fn tokenizer(&self) -> tantivy::tokenizer::TextAnalyzer {
+        self.tokenizer.clone()
+    }
+
+    // search the documents that contain the query
+    // return the row ids of the documents sorted by bm25 score
+    // ref: https://en.wikipedia.org/wiki/Okapi_BM25
+    // we first calculate in-partition BM25 scores, then finally merge the scores
+    #[instrument(level = "debug", skip_all)]
+    pub async fn bm25_search(
+        &self,
+        tokens: &[String],
+        params: &FtsSearchParams,
+        operator: Operator,
+        is_phrase_query: bool,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
+        metrics.record_comparisons(tokens.len());
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mask = prefilter.mask();
+        let searcher = BM25Scorer::new(self);
+
+        let mut candidates = BinaryHeap::new();
+        for partition in self.partitions.iter() {
+            let (row_ids, scores) = partition
+                .bm25_search(
+                    tokens,
+                    params,
+                    operator,
+                    is_phrase_query,
+                    mask.clone(),
+                    metrics,
+                )
+                .await?;
+            for (row_id, score) in row_ids.into_iter().zip(scores.into_iter()) {
+                if candidates.len() < limit {
+                    candidates.push(Reverse(OrderedDoc::new(row_id, score)));
+                } else if candidates.peek().unwrap().0.score.0 < score {
+                    candidates.pop();
+                    candidates.push(Reverse(OrderedDoc::new(row_id, score)));
+                }
+            }
+        }
+
+        Ok(candidates
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse(doc)| (doc.row_id, doc.score.0))
+            .unzip())
+    }
+
+    async fn load_legacy_index(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
+        let tokens_fut = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let token_reader = store.open_index_file(TOKENS_FILE).await?;
+                let tokenizer = token_reader
+                    .schema()
+                    .metadata
+                    .get("tokenizer")
+                    .map(|s| serde_json::from_str::<InvertedIndexParams>(s))
+                    .transpose()?
+                    .unwrap_or_default();
+                let tokens = TokenSet::load(token_reader).await?;
+                Result::Ok((tokenizer, tokens))
+            }
+        });
+        let invert_list_fut = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
+                let invert_list = PostingListReader::new(invert_list_reader)?;
+                Result::Ok(Arc::new(invert_list))
+            }
+        });
+        let docs_fut = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let docs_reader = store.open_index_file(DOCS_FILE).await?;
+                let docs = DocSet::load(docs_reader).await?;
+                Result::Ok(docs)
+            }
+        });
+
+        let (tokenizer_config, tokens) = tokens_fut.await??;
+        let inverted_list = invert_list_fut.await??;
+        let docs = docs_fut.await??;
+
+        let tokenizer = tokenizer_config.build()?;
+
+        Ok(Arc::new(Self {
+            params: tokenizer_config,
+            store: store.clone(),
+            tokenizer,
+            partitions: vec![InvertedPartition {
+                id: 0,
+                store,
+                tokens,
+                inverted_list,
+                docs,
+            }],
+        }))
+    }
+}
+
+#[async_trait]
+impl Index for InvertedIndex {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
+        Err(Error::invalid_input(
+            "inverted index cannot be cast to vector index",
+            location!(),
+        ))
+    }
+
+    fn statistics(&self) -> Result<serde_json::Value> {
+        let mut num_tokens = self
+            .partitions
+            .iter()
+            .map(|part| part.tokens.len())
+            .sum::<usize>();
+        let mut num_docs = self
+            .partitions
+            .iter()
+            .map(|part| part.docs.len())
+            .sum::<usize>();
+        Ok(serde_json::json!({
+            "params": self.params,
+            "num_tokens": num_tokens,
+            "num_docs": num_docs,
+        }))
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        for part in &self.partitions {
+            part.inverted_list.prewarm().await?;
+        }
+        Ok(())
+    }
+
+    fn index_type(&self) -> crate::IndexType {
+        crate::IndexType::Inverted
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        unimplemented!()
+    }
+}
+
+#[async_trait]
+impl ScalarIndex for InvertedIndex {
+    // return the row ids of the documents that contain the query
+    #[instrument(level = "debug", skip_all)]
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+        return Err(Error::invalid_input(
+            format!("unsupported query {:?} for inverted index", query),
+            location!(),
+        ));
+    }
+
+    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+        true
+    }
+
+    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
+    where
+        Self: Sized,
+    {
+        // for new index format, there is a metadata file and multiple partitions,
+        // each partition is a separate index containing tokens, inverted list and docs.
+        // for old index format, there is no metadata file, and it's just like a single partition
+
+        match store.open_index_file(METADATA_FILE).await {
+            Ok(reader) => {
+                let params = reader.schema().metadata.get("params").ok_or(Error::Index {
+                    message: "params not found in metadata".to_owned(),
+                    location: location!(),
+                })?;
+                let params = serde_json::from_str::<InvertedIndexParams>(params)?;
+                let partitions =
+                    reader
+                        .schema()
+                        .metadata
+                        .get("partitions")
+                        .ok_or(Error::Index {
+                            message: "partitions not found in metadata".to_owned(),
+                            location: location!(),
+                        })?;
+                let partitions: Vec<u64> = serde_json::from_str(partitions)?;
+
+                let partitions = partitions.into_iter().map(|id| {
+                    let store = store.clone();
+                    async move { InvertedPartition::load(store, id).await }
+                });
+                let partitions = stream::iter(partitions)
+                    .buffer_unordered(store.io_parallelism())
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                let tokenizer = params.build()?;
+                Ok(Arc::new(Self {
+                    params,
+                    store,
+                    tokenizer,
+                    partitions,
+                }))
+            }
+            Err(_) => {
+                // old index format
+                Self::load_legacy_index(store).await
+            }
+        }
+    }
+
+    async fn remap(
+        &self,
+        mapping: &HashMap<u64, Option<u64>>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<()> {
+        self.to_builder().remap(mapping, dest_store).await
+    }
+
+    async fn update(
+        &self,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
+    ) -> Result<()> {
+        self.to_builder().update(new_data, dest_store).await
+    }
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
+pub(crate) struct InvertedPartition {
+    id: u64,
+    store: Arc<dyn IndexStore>,
+    pub(crate) tokens: TokenSet,
+    pub(crate) inverted_list: Arc<PostingListReader>,
+    pub(crate) docs: DocSet,
+}
+
+impl InvertedPartition {
+    pub async fn load(store: Arc<dyn IndexStore>, id: u64) -> Result<Self> {
+        let token_file = store.open_index_file(&token_file_path(id)).await?;
+        let tokens = TokenSet::load(token_file).await?;
+        let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
+        let inverted_list = PostingListReader::new(invert_list_file)?;
+        let docs_file = store.open_index_file(&doc_file_path(id)).await?;
+        let docs = DocSet::load(docs_file).await?;
+
+        Ok(Self {
+            id,
+            store,
+            tokens,
+            inverted_list: Arc::new(inverted_list),
+            docs,
+        })
+    }
+
     // map tokens to token ids
     // ignore tokens that are not in the index cause they won't contribute to the search
-    #[instrument(level = "debug", skip_all)]
     fn map(&self, texts: &[String]) -> Vec<u32> {
         texts
             .iter()
             .filter_map(|text| self.tokens.get(text))
             .collect()
-    }
-
-    fn to_builder(&self) -> InvertedIndexBuilder {
-        let tokens = self.tokens.clone().into_mut();
-        let inverted_list = self.inverted_list.clone();
-        let docs = self.docs.clone();
-        InvertedIndexBuilder::from_existing_index(self.params.clone(), tokens, inverted_list, docs)
-    }
-
-    pub fn tokenizer(&self) -> tantivy::tokenizer::TextAnalyzer {
-        self.tokenizer.clone()
     }
 
     pub fn expand_fuzzy(
@@ -171,13 +442,15 @@ impl InvertedIndex {
         params: &FtsSearchParams,
         operator: Operator,
         is_phrase_query: bool,
-        prefilter: Arc<dyn PreFilter>,
+        mask: Arc<RowIdMask>,
         metrics: &dyn MetricsCollector,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
-        metrics.record_comparisons(tokens.len());
-
-        let mask = prefilter.mask();
-        let token_ids = self.map(tokens);
+        let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
+        let tokens = match is_fuzzy {
+            true => self.expand_fuzzy(tokens.to_vec(), params.fuzziness, params.max_expansions)?,
+            false => tokens.to_vec(),
+        };
+        let token_ids = self.map(&tokens);
         if token_ids.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -195,154 +468,27 @@ impl InvertedIndex {
                     .await?;
                 Result::Ok(PostingIterator::new(
                     token_id,
-                    position as i32,
+                    position as u32,
                     posting,
                     self.docs.len(),
                     mask,
                 ))
             })
-            .buffer_unordered(self.io_parallelism)
+            .buffer_unordered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut wand = Wand::new(self.docs.len(), operator, postings.into_iter());
+        let mut wand = Wand::new(operator, postings.into_iter(), &self.docs);
         wand.search(
             is_phrase_query,
             params.limit.unwrap_or(usize::MAX),
             params.wand_factor,
             |doc, freq| {
                 let doc_norm = K1
-                    * (1.0 - B
-                        + B * self.docs.num_tokens(&doc) as f32 / self.docs.average_length());
+                    * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / self.docs.average_length());
                 freq / (freq + doc_norm)
             },
         )
-        .await
-    }
-}
-
-#[async_trait]
-impl Index for InvertedIndex {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
-        self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::invalid_input(
-            "inverted index cannot be cast to vector index",
-            location!(),
-        ))
-    }
-
-    fn statistics(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::json!({
-            "params": self.params,
-            "num_tokens": self.tokens.tokens.len(),
-            "num_docs": self.docs.len(),
-        }))
-    }
-
-    async fn prewarm(&self) -> Result<()> {
-        self.inverted_list.prewarm().await
-    }
-
-    fn index_type(&self) -> crate::IndexType {
-        crate::IndexType::Inverted
-    }
-
-    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        unimplemented!()
-    }
-}
-
-#[async_trait]
-impl ScalarIndex for InvertedIndex {
-    // return the row ids of the documents that contain the query
-    #[instrument(level = "debug", skip_all)]
-    async fn search(
-        &self,
-        query: &dyn AnyQuery,
-        _metrics: &dyn MetricsCollector,
-    ) -> Result<SearchResult> {
-        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        return Err(Error::invalid_input(
-            format!("unsupported query {:?} for inverted index", query),
-            location!(),
-        ));
-    }
-
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
-        true
-    }
-
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
-    where
-        Self: Sized,
-    {
-        let tokens_fut = tokio::spawn({
-            let store = store.clone();
-            async move {
-                let token_reader = store.open_index_file(TOKENS_FILE).await?;
-                let tokenizer = token_reader
-                    .schema()
-                    .metadata
-                    .get("tokenizer")
-                    .map(|s| serde_json::from_str::<TokenizerConfig>(s))
-                    .transpose()?
-                    .unwrap_or_default();
-                let tokens = TokenSet::load(token_reader).await?;
-                Result::Ok((tokenizer, tokens))
-            }
-        });
-        let invert_list_fut = tokio::spawn({
-            let store = store.clone();
-            async move {
-                let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
-                let invert_list = InvertedListReader::new(invert_list_reader)?;
-                Result::Ok(Arc::new(invert_list))
-            }
-        });
-        let docs_fut = tokio::spawn({
-            let store = store.clone();
-            async move {
-                let docs_reader = store.open_index_file(DOCS_FILE).await?;
-                let docs = DocSet::load(docs_reader).await?;
-                Result::Ok(docs)
-            }
-        });
-
-        let (tokenizer_config, tokens) = tokens_fut.await??;
-        let inverted_list = invert_list_fut.await??;
-        let docs = docs_fut.await??;
-
-        let tokenizer = tokenizer_config.build()?;
-        Ok(Arc::new(Self {
-            params: tokenizer_config,
-            tokenizer,
-            tokens,
-            inverted_list,
-            docs,
-        }))
-    }
-
-    async fn remap(
-        &self,
-        mapping: &HashMap<u64, Option<u64>>,
-        dest_store: &dyn IndexStore,
-    ) -> Result<()> {
-        self.to_builder().remap(mapping, dest_store).await
-    }
-
-    async fn update(
-        &self,
-        new_data: SendableRecordBatchStream,
-        dest_store: &dyn IndexStore,
-    ) -> Result<()> {
-        self.to_builder().update(new_data, dest_store).await
     }
 }
 
@@ -511,7 +657,7 @@ impl TokenSet {
     }
 }
 
-pub struct InvertedListReader {
+pub struct PostingListReader {
     reader: Arc<dyn IndexReader>,
     offsets: Vec<usize>,
     max_scores: Option<Vec<f32>>,
@@ -523,7 +669,7 @@ pub struct InvertedListReader {
     position_cache: Cache<u32, ListArray>,
 }
 
-impl std::fmt::Debug for InvertedListReader {
+impl std::fmt::Debug for PostingListReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InvertedListReader")
             .field("offsets", &self.offsets)
@@ -532,7 +678,7 @@ impl std::fmt::Debug for InvertedListReader {
     }
 }
 
-impl DeepSizeOf for InvertedListReader {
+impl DeepSizeOf for PostingListReader {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.offsets.deep_size_of_children(context)
             // + self.lengths.deep_size_of_children(context)
@@ -540,14 +686,12 @@ impl DeepSizeOf for InvertedListReader {
     }
 }
 
-impl InvertedListReader {
+impl PostingListReader {
     pub(crate) fn new(reader: Arc<dyn IndexReader>) -> Result<Self> {
-        let offsets = reader
-            .schema()
-            .metadata
-            .get("offsets")
-            .ok_or_else(|| Error::io("offsets not found".to_string(), location!()))?;
-        let offsets: Vec<usize> = serde_json::from_str(offsets)?;
+        let offsets: Vec<usize> = match reader.schema().metadata.get("offsets") {
+            Some(offsets) => serde_json::from_str(offsets)?,
+            None => (0..reader.num_rows()).collect::<Vec<_>>(),
+        };
 
         let max_scores = match reader.schema().metadata.get("max_scores") {
             Some(max_scores) => serde_json::from_str(max_scores)?,
@@ -642,6 +786,34 @@ impl InvertedListReader {
         Ok(posting)
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        let batch = self
+            .reader
+            .read_range(0..self.reader.num_rows(), Some(&[ROW_ID, FREQUENCY_COL]))
+            .await?;
+        for token_id in 0..self.offsets.len() {
+            let offset = self.offsets[token_id];
+            let length = self.posting_len(token_id as u32);
+            let batch = batch.slice(offset, length);
+            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>();
+            self.posting_cache
+                .insert(
+                    token_id as u32,
+                    PostingList::Plain(PlainPostingList::new(
+                        row_ids.values().clone(),
+                        frequencies.values().clone(),
+                        self.max_scores
+                            .as_ref()
+                            .map(|max_scores| max_scores[token_id]),
+                    )),
+                )
+                .await;
+        }
+
+        Ok(())
+    }
+
     fn extract_columns(batch: &RecordBatch) -> (ScalarBuffer<u64>, ScalarBuffer<f32>) {
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
         let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>();
@@ -711,7 +883,7 @@ impl PostingList {
 
     pub fn doc(&self, i: usize) -> DocInfo {
         match self {
-            PostingList::Plain(posting) => posting.doc(i),
+            PostingList::Plain(posting) => DocInfo::Located(posting.doc(i)),
             PostingList::Compressed(posting) => {
                 unimplemented!("compressed posting list does not support doc")
             }
@@ -817,8 +989,8 @@ impl PlainPostingList {
         self.len() == 0
     }
 
-    pub fn doc(&self, i: usize) -> DocInfo {
-        DocInfo::new(self.row_ids[i], self.frequencies[i])
+    pub fn doc(&self, i: usize) -> LocatedDocInfo {
+        LocatedDocInfo::new(self.row_ids[i], self.frequencies[i])
     }
 
     pub fn positions(&self, row_id: u64) -> Option<PrimitiveArray<Int32Type>> {
@@ -969,7 +1141,7 @@ impl PostingListBuilder {
         });
         for index in (0..length).sorted_unstable_by_key(|&i| self.doc_ids[i]) {
             let (doc_id, freq) = (self.doc_ids[index], self.frequencies[index]);
-            // reorder the posting list by row id
+            // reorder the posting list by doc id
             doc_id_builder.append_value(doc_id);
             freq_builder.append_value(freq);
             if let Some(position_builder) = position_builder.as_mut() {
@@ -979,7 +1151,7 @@ impl PostingListBuilder {
             }
             // calculate the max score
             if let Some(docs) = &docs {
-                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id) as f32 / avgdl);
+                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id as u64) as f32 / avgdl);
                 let freq = freq as f32;
                 let score = freq / (freq + doc_norm);
                 if score > max_score {
@@ -1058,15 +1230,25 @@ impl From<Vec<Vec<u32>>> for PositionBuilder {
     }
 }
 
-#[derive(Debug, Clone, Default, DeepSizeOf)]
-pub struct DocInfo {
-    pub row_id: u64,
-    pub frequency: f32,
+#[derive(Debug, Clone, DeepSizeOf)]
+pub enum DocInfo {
+    Located(LocatedDocInfo),
+    Raw(RawDocInfo),
 }
 
 impl DocInfo {
-    pub fn new(row_id: u64, frequency: f32) -> Self {
-        Self { row_id, frequency }
+    pub fn doc_id(&self) -> u64 {
+        match self {
+            DocInfo::Located(info) => info.row_id,
+            DocInfo::Raw(info) => info.doc_id as u64,
+        }
+    }
+
+    pub fn frequency(&self) -> u32 {
+        match self {
+            DocInfo::Located(info) => info.frequency as u32,
+            DocInfo::Raw(info) => info.frequency,
+        }
     }
 }
 
@@ -1074,7 +1256,7 @@ impl Eq for DocInfo {}
 
 impl PartialEq for DocInfo {
     fn eq(&self, other: &Self) -> bool {
-        self.row_id == other.row_id
+        self.doc_id() == other.doc_id()
     }
 }
 
@@ -1086,7 +1268,71 @@ impl PartialOrd for DocInfo {
 
 impl Ord for DocInfo {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.doc_id().cmp(&other.doc_id())
+    }
+}
+
+#[derive(Debug, Clone, Default, DeepSizeOf)]
+pub struct LocatedDocInfo {
+    pub row_id: u64,
+    pub frequency: f32,
+}
+
+impl LocatedDocInfo {
+    pub fn new(row_id: u64, frequency: f32) -> Self {
+        Self { row_id, frequency }
+    }
+}
+
+impl Eq for LocatedDocInfo {}
+
+impl PartialEq for LocatedDocInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.row_id == other.row_id
+    }
+}
+
+impl PartialOrd for LocatedDocInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LocatedDocInfo {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.row_id.cmp(&other.row_id)
+    }
+}
+
+#[derive(Debug, Clone, Default, DeepSizeOf)]
+pub struct RawDocInfo {
+    pub doc_id: u32,
+    pub frequency: u32,
+}
+
+impl RawDocInfo {
+    pub fn new(doc_id: u32, frequency: u32) -> Self {
+        Self { doc_id, frequency }
+    }
+}
+
+impl Eq for RawDocInfo {}
+
+impl PartialEq for RawDocInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.doc_id == other.doc_id
+    }
+}
+
+impl PartialOrd for RawDocInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RawDocInfo {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.doc_id.cmp(&other.doc_id)
     }
 }
 
@@ -1111,6 +1357,10 @@ impl DocSet {
 
     pub fn row_id(&self, doc_id: u32) -> u64 {
         self.row_ids[doc_id as usize]
+    }
+
+    pub fn row_range(&self) -> RangeInclusive<u64> {
+        self.row_ids[0]..=self.row_ids[self.len() - 1]
     }
 
     pub fn total_tokens_num(&self) -> u64 {
@@ -1171,7 +1421,7 @@ impl DocSet {
     }
 
     #[inline]
-    pub fn num_tokens(&self, doc_id: u32) -> u32 {
+    pub fn num_tokens(&self, doc_id: u64) -> u32 {
         self.num_tokens[doc_id as usize]
     }
 
@@ -1183,12 +1433,6 @@ impl DocSet {
         self.total_tokens += num_tokens as u64;
         self.row_ids.len() as u32 - 1
     }
-}
-
-#[inline]
-pub fn idf(nq: usize, num_docs: usize) -> f32 {
-    let num_docs = num_docs as f32;
-    ((num_docs - nq as f32 + 0.5) / (nq as f32 + 0.5) + 1.0).ln()
 }
 
 pub fn flat_full_text_search(
@@ -1225,7 +1469,8 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     tokenizer: Option<tantivy::tokenizer::TextAnalyzer>,
 ) -> Result<Vec<u64>> {
     let mut results = Vec::new();
-    let mut tokenizer = tokenizer.unwrap_or_else(|| TokenizerConfig::default().build().unwrap());
+    let mut tokenizer =
+        tokenizer.unwrap_or_else(|| InvertedIndexParams::default().build().unwrap());
     let query_tokens = collect_tokens(query, &mut tokenizer, None)
         .into_iter()
         .collect::<HashSet<_>>();
@@ -1250,9 +1495,8 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
 pub fn flat_bm25_search(
     batch: RecordBatch,
     doc_col: &str,
-    inverted_list: &InvertedListReader,
     query_tokens: &HashSet<String>,
-    query_token_ids: &HashMap<String, Option<u32>>,
+    nq: &HashMap<String, usize>,
     tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
     avgdl: f32,
     num_docs: usize,
@@ -1275,18 +1519,10 @@ pub fn flat_bm25_search(
                 .or_insert(1);
         }
         let mut score = 0.0;
-        for (token, token_id) in query_token_ids.iter() {
+        for token in query_tokens.iter() {
             let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
 
-            let idf = if let Some(token_id) = token_id {
-                // for known token, we just use the index's metadata to calculate the score
-                // it's not accurate but it's good enough for ranking
-                idf(inverted_list.posting_len(*token_id), num_docs)
-            } else {
-                // for unknown token, we set the idf to a very high value
-                // so that the new token will significantly effect the score
-                idf(1, num_docs)
-            };
+            let idf = idf(nq[token], num_docs);
             score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
         }
         scores.push(score);
@@ -1306,40 +1542,39 @@ pub fn flat_bm25_search_stream(
     index: &InvertedIndex,
 ) -> SendableRecordBatchStream {
     let mut tokenizer = index.tokenizer.clone();
-    let query_token_ids = collect_tokens(&query, &mut tokenizer, None)
+    let tokens = collect_tokens(&query, &mut tokenizer, None)
         .into_iter()
-        .dedup()
-        .map(|token| {
-            let token_id = index.tokens.get(&token);
-            (token, token_id)
-        })
-        .collect::<HashMap<_, _>>();
-    let query_tokens = query_token_ids.keys().cloned().collect::<HashSet<_>>();
-    let inverted_list = index.inverted_list.clone();
-    let num_docs = index.docs.len();
-    let avgdl = index.docs.average_length();
+        .sorted_unstable()
+        .collect::<HashSet<_>>();
 
+    let bm25_scorer = BM25Scorer::new(index);
+    let num_docs = bm25_scorer.num_docs();
+    let avgdl = bm25_scorer.avgdl();
+    let mut nq = HashMap::with_capacity(tokens.len());
+    for token in &tokens {
+        let token_nq = bm25_scorer.nq(token).max(1);
+        nq.insert(token.clone(), token_nq);
+    }
     let stream = input.map(move |batch| {
         let batch = batch?;
-        let scored_batch = flat_bm25_search(
+        let batch = flat_bm25_search(
             batch,
             &doc_col,
-            inverted_list.as_ref(),
-            &query_tokens,
-            &query_token_ids,
+            &tokens,
+            &nq,
             &mut tokenizer,
             avgdl,
             num_docs,
         )?;
 
         // filter out rows with score 0
-        let score_col = scored_batch[SCORE_COL].as_primitive::<Float32Type>();
+        let score_col = batch[SCORE_COL].as_primitive::<Float32Type>();
         let mask = score_col
             .iter()
             .map(|score| score.is_some_and(|score| score > 0.0))
             .collect::<Vec<_>>();
         let mask = BooleanArray::from(mask);
-        let batch = arrow::compute::filter_record_batch(&scored_batch, &mask)?;
+        let batch = arrow::compute::filter_record_batch(&batch, &mask)?;
         Ok(batch)
     });
 

@@ -8,8 +8,6 @@ use arrow::array::LargeBinaryBuilder;
 use bitpacking::{BitPacker, BitPacker4x};
 use lance_core::Result;
 
-pub mod delta;
-
 #[derive(Debug, Clone, PartialEq)]
 #[repr(u8)]
 enum Compression {

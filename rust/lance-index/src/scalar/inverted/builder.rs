@@ -29,7 +29,7 @@ use snafu::location;
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
-use super::{index::*, TokenizerConfig};
+use super::{index::*, InvertedIndexParams};
 
 // the number of elements in each block
 // each block contains 128 row ids and 128 frequencies
@@ -73,7 +73,7 @@ lazy_static! {
 
 #[derive(Debug)]
 pub struct InvertedIndexBuilder {
-    params: TokenizerConfig,
+    params: InvertedIndexParams,
     partitions: Vec<u64>,
 
     tmpdir: TempDir,
@@ -81,14 +81,14 @@ pub struct InvertedIndexBuilder {
 }
 
 impl InvertedIndexBuilder {
-    pub fn new(params: TokenizerConfig) -> Self {
+    pub fn new(params: InvertedIndexParams) -> Self {
         Self::from_existing_index(params, Vec::new())
     }
 
-    pub fn from_existing_index(params: TokenizerConfig, partitions: Vec<u64>) -> Self {
+    pub fn from_existing_index(params: InvertedIndexParams, partitions: Vec<u64>) -> Self {
         let tmpdir = tempdir().unwrap();
         let store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local(),
+            ObjectStore::local().into(),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
             FileMetadataCache::no_cache(),
         ));
@@ -260,34 +260,38 @@ impl InvertedIndexBuilder {
     async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
         for &partition_id in &self.partitions {
             self.local_store
-                .copy_index_file(&InnerBuilder::token_file_path(partition_id), dest_store)
+                .copy_index_file(&token_file_path(partition_id), dest_store)
                 .await?;
             self.local_store
-                .copy_index_file(&InnerBuilder::posting_file_path(partition_id), dest_store)
+                .copy_index_file(&posting_file_path(partition_id), dest_store)
                 .await?;
             self.local_store
-                .copy_index_file(&InnerBuilder::doc_file_path(partition_id), dest_store)
+                .copy_index_file(&doc_file_path(partition_id), dest_store)
                 .await?;
         }
-        let metadata = serde_json::json!({
-            "params": self.params,
-            "partitions": self.partitions,
-        });
-        dest_store.new_index_file(, Arc::new())
+        let metadata = HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&self.partitions)?,
+            ),
+            ("params".to_owned(), serde_json::to_string(&self.params)?),
+        ]);
+        let mut writer = dest_store
+            .new_index_file(METADATA_FILE, Arc::new(Schema::empty()))
+            .await?;
+        writer.finish_with_metadata(metadata).await?;
         Ok(())
     }
 }
 
 impl Default for InvertedIndexBuilder {
     fn default() -> Self {
-        let params = TokenizerConfig::default();
+        let params = InvertedIndexParams::default();
         Self::new(params)
     }
 }
 
-struct Metadata {
-
-}
+struct Metadata {}
 
 // builder for single partition
 #[derive(Debug)]
@@ -319,7 +323,7 @@ impl InnerBuilder {
     async fn write_posting_lists(&mut self, store: &dyn IndexStore) -> Result<()> {
         let mut writer = store
             .new_index_file(
-                &Self::posting_file_path(self.id),
+                &posting_file_path(self.id),
                 legacy_inverted_list_schema(self.posting_lists[0].has_positions()),
             )
             .await?;
@@ -338,7 +342,7 @@ impl InnerBuilder {
         let tokens = std::mem::take(&mut self.tokens);
         let batch = tokens.to_batch()?;
         let mut writer = store
-            .new_index_file(&Self::token_file_path(self.id), batch.schema())
+            .new_index_file(&token_file_path(self.id), batch.schema())
             .await?;
         writer.write_record_batch(batch).await?;
         writer.finish().await?;
@@ -350,23 +354,11 @@ impl InnerBuilder {
         let docs = Arc::new(std::mem::take(&mut self.docs));
         let batch = docs.to_batch()?;
         let mut writer = store
-            .new_index_file(&Self::doc_file_path(self.id), batch.schema())
+            .new_index_file(&doc_file_path(self.id), batch.schema())
             .await?;
         writer.write_record_batch(batch).await?;
         writer.finish().await?;
         Ok(())
-    }
-
-    fn token_file_path(partition_id: u64) -> String {
-        format!("part_{}_{}", partition_id, TOKENS_FILE)
-    }
-
-    fn posting_file_path(partition_id: u64) -> String {
-        format!("part_{}_{}", partition_id, INVERT_LIST_FILE)
-    }
-
-    fn doc_file_path(partition_id: u64) -> String {
-        format!("part_{}_{}", partition_id, DOCS_FILE)
     }
 }
 
@@ -744,4 +736,16 @@ fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
     ]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![docs, row_ids])?;
     Ok(batch)
+}
+
+pub(crate) fn token_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, TOKENS_FILE)
+}
+
+pub(crate) fn posting_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, INVERT_LIST_FILE)
+}
+
+pub(crate) fn doc_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, DOCS_FILE)
 }

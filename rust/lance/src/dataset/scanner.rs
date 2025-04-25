@@ -2592,8 +2592,7 @@ pub mod test_dataset {
     use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::ArrowError;
     use lance_file::version::LanceFileVersion;
-    use lance_index::scalar::InvertedIndexParams;
-    use lance_index::{scalar::ScalarIndexParams, IndexType};
+    use lance_index::{scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams}, IndexType};
     use tempfile::{tempdir, TempDir};
 
     use crate::arrow::*;
@@ -2778,7 +2777,6 @@ mod test {
     use lance_datagen::{array, gen, BatchCount, ByteCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
-    use lance_index::scalar::InvertedIndexParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -5869,6 +5867,8 @@ mod test {
     ) {
         // Create a large dataset with a scalar indexed column and a sorted but not scalar
         // indexed column
+
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
         let data = gen()
             .col(
                 "vector",

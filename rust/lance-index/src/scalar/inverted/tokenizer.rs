@@ -3,7 +3,6 @@
 
 use std::{env, path::PathBuf};
 
-use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -16,7 +15,7 @@ mod jieba;
 
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenizerConfig {
+pub struct InvertedIndexParams {
     /// base tokenizer:
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
@@ -64,13 +63,13 @@ fn bool_true() -> bool {
     true
 }
 
-impl Default for TokenizerConfig {
+impl Default for InvertedIndexParams {
     fn default() -> Self {
         Self::new("simple".to_owned(), tantivy::tokenizer::Language::English)
     }
 }
 
-impl TokenizerConfig {
+impl InvertedIndexParams {
     pub fn new(base_tokenizer: String, language: tantivy::tokenizer::Language) -> Self {
         Self {
             base_tokenizer,
