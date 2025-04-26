@@ -1,12 +1,12 @@
 name: Build and publish Java packages
-on: [push, pull_request]
-#  release:
-#    # Use released instead of published, since we don't publish preview/beta
-#    # versions
-#    types: [released]
-#  pull_request:
-#    paths:
-#      - .github/workflows/java-publish.yml
+on:
+  release:
+    # Use released instead of published, since we don't publish preview/beta
+    # versions
+    types: [released]
+  pull_request:
+    paths:
+      - .github/workflows/java-publish.yml
 
 jobs:
   macos-arm64:
@@ -40,10 +40,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
+#      - name: Set up QEMU
+#        uses: docker/setup-qemu-action@v3
+#        with:
+#          platforms: arm64
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build and run in ARM64 container
