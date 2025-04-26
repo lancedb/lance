@@ -80,9 +80,9 @@ jobs:
               zip \
               unzip
             
-            # require manual download due to --experimental_allow_proto3_optional
-            PROTOC_ZIP=protoc-3.12.0-linux-aarch_64.zip
-            curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.12.0/\$PROTOC_ZIP
+            # https://github.com/databendlabs/databend/issues/8035
+            PROTOC_ZIP=protoc-3.21.12-linux-aarch_64.zip
+            curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.21.12/\$PROTOC_ZIP
             unzip -o \$PROTOC_ZIP -d /usr/local bin/protoc
             unzip -o \$PROTOC_ZIP -d /usr/local include/*
             rm -f \$PROTOC_ZIP
