@@ -85,7 +85,7 @@ jobs:
             curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.14.0/\$PROTOC_ZIP
             unzip -o \$PROTOC_ZIP -d /usr/local
             rm -f \$PROTOC_ZIP
-            cd ..
+            protoc --version
           
             curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
             source \$HOME/.cargo/env
