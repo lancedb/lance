@@ -11,7 +11,7 @@ fn main() -> Result<()> {
     std::env::set_var("PROTOC", protobuf_src::protoc());
 
     let mut prost_build = prost_build::Config::new();
-    prost_build.protoc_arg("--experimental_allow_proto3_optional");
+    // prost_build.protoc_arg("--experimental_allow_proto3_optional");
     prost_build.enable_type_names();
     prost_build.bytes(["."]); // Enable Bytes type for all messages to avoid Vec clones.
     prost_build.compile_protos(&["./protos/encodings.proto"], &["./protos"])?;

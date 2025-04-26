@@ -88,8 +88,6 @@ jobs:
             # https://github.com/rustls/rustls/issues/1967
             export CC=clang
             export CXX=clang++
-          
-            protoc --version
 
             cargo build --release
             cp ../target/release/liblance_jni.so liblance_jni.so
