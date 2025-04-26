@@ -34,7 +34,7 @@ jobs:
           if-no-files-found: error
   linux-arm64:
     name: Build on Linux Arm64
-    runs-on: ubuntu-2004-8x-arm64
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     defaults:
       run:
@@ -42,22 +42,25 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
         with:
-          toolchain: "stable"
-          cache-workspaces: "src/rust"
-          # Disable full debug symbol generation to speed up CI build and keep memory down
-          # "1" means line tables only, which is useful for panic tracebacks.
-          rustflags: "-C debuginfo=1"
-      - name: Install dependencies
+          platforms: arm64
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build and run in ARM64 container
         run: |
-          sudo apt -y -qq update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
-      - name: Build release
-        run: |
-          cargo build --release
-          cp ../target/release/liblance_jni.so liblance_jni.so
+          docker run --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace ubuntu:20.04 bash -c "
+            set -ex
+            apt-get update
+            apt-get install -y git protobuf-compiler libssl-dev pkg-config
+          
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+            source \$HOME/.cargo/env
+          
+            cargo build --release
+            cp ../target/release/liblance_jni.so liblance_jni.so
+          "
       - uses: actions/upload-artifact@v4
         with:
           name: liblance_jni_linux_aarch64.zip
