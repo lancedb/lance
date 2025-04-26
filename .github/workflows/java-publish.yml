@@ -78,8 +78,13 @@ jobs:
               libudev-dev \
               libhidapi-dev \
               zip
-          
-            apt-get install --no-install-recommends --assume-yes protobuf-compiler=3.12
+            
+            # require manual download due to --experimental_allow_proto3_optional
+            PROTOC_ZIP=protoc-3.12.0-linux-aarch_64.zip
+            curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.12.0/\$PROTOC_ZIP
+            unzip -o \$PROTOC_ZIP -d /usr/local bin/protoc
+            unzip -o \$PROTOC_ZIP -d /usr/local include/*
+            rm -f \$PROTOC_ZIP
             protoc --version
           
             curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
