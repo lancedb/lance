@@ -1,12 +1,12 @@
 name: Build and publish Java packages
-on:
+on: [push]
 #  release:
 #    # Use released instead of published, since we don't publish preview/beta
 #    # versions
 #    types: [released]
-  pull_request:
-    paths:
-      - .github/workflows/java-publish.yml
+#  pull_request:
+#    paths:
+#      - .github/workflows/java-publish.yml
 
 jobs:
   macos-arm64:
