@@ -37,8 +37,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     defaults:
-      run:
-        working-directory: ./java
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -51,13 +49,43 @@ jobs:
       - name: Build and run in ARM64 container
         run: |
           docker run --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace ubuntu:20.04 bash -c "
+            ls
             set -ex
             apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y git curl build-essential protobuf-compiler libssl-dev pkg-config
           
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes \
+              apt-transport-https \
+              ca-certificates \
+              curl \
+              gpg \
+              bash \
+              less \
+              openssl \
+              libssl-dev \
+              pkg-config \
+              libsqlite3-dev \
+              libsqlite3-0 \
+              libreadline-dev \
+              git \
+              cmake \
+              dh-autoreconf \
+              clang \
+              g++ \
+              gcc-10 \
+              libc++-dev \
+              libc++abi-dev \
+              libprotobuf-dev \
+              protobuf-compiler \
+              libncurses5-dev \
+              libncursesw5-dev \
+              libudev-dev \
+              libhidapi-dev \
+              zip
+
             curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
             source \$HOME/.cargo/env
-          
+            
+            cd java
             cargo build --release
             cp ../target/release/liblance_jni.so liblance_jni.so
           "
