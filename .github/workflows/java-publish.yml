@@ -34,7 +34,7 @@ jobs:
           if-no-files-found: error
   linux-arm64:
     name: Build on Linux Arm64
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     defaults:
     steps:
@@ -96,7 +96,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
   linux-x86:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     needs: [macos-arm64, linux-arm64]
     defaults:
