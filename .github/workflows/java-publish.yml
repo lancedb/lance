@@ -5,6 +5,11 @@ on:
     # versions
     types: [released]
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - ready_for_review
+      - reopened
     paths:
       - .github/workflows/java-publish.yml
 
@@ -40,10 +45,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-#      - name: Set up QEMU
-#        uses: docker/setup-qemu-action@v3
-#        with:
-#          platforms: arm64
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build and run in ARM64 container
