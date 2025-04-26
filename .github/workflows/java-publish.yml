@@ -81,13 +81,10 @@ jobs:
               unzip
             
             # https://github.com/databendlabs/databend/issues/8035
-            curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.21.12/protobuf-all-3.21.12.tar.gz
-            tar -xzf protobuf-all-3.21.12.tar.gz
-            cd protobuf-3.21.12
-            ./configure
-            make
-            make install
-            ldconfig
+            PROTOC_ZIP=protoc-3.14.0-linux-aarch_64.zip
+            curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.14.0/\$PROTOC_ZIP
+            unzip -o \$PROTOC_ZIP -d /usr/local
+            rm -f \$PROTOC_ZIP
             cd ..
           
             curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
