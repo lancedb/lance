@@ -1,5 +1,5 @@
 name: Build and publish Java packages
-on: [push]
+on: [push, pull_request]
 #  release:
 #    # Use released instead of published, since we don't publish preview/beta
 #    # versions
