@@ -48,7 +48,6 @@ jobs:
       - name: Build and run in ARM64 container
         run: |
           docker run --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace ubuntu:20.04 bash -c "
-            ls
             set -ex
             apt-get update
           
@@ -85,6 +84,9 @@ jobs:
             source \$HOME/.cargo/env
             
             cd java
+          
+            export CC=clang
+            export CXX=clang++
             cargo build --release
             cp ../target/release/liblance_jni.so liblance_jni.so
           "
