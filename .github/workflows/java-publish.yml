@@ -34,15 +34,15 @@ jobs:
           if-no-files-found: error
   linux-arm64:
     name: Build on Linux Arm64
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    runs-on: ubuntu-2404-8x-arm64
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
+#      - name: Set up QEMU
+#        uses: docker/setup-qemu-action@v3
+#        with:
+#          platforms: arm64
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build and run in ARM64 container
@@ -84,9 +84,11 @@ jobs:
             source \$HOME/.cargo/env
             
             cd java
-          
+            
+            # https://github.com/rustls/rustls/issues/1967
             export CC=clang
             export CXX=clang++
+
             cargo build --release
             cp ../target/release/liblance_jni.so liblance_jni.so
           "
