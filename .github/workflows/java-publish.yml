@@ -73,13 +73,15 @@ jobs:
               libc++-dev \
               libc++abi-dev \
               libprotobuf-dev \
-              protobuf-compiler \
               libncurses5-dev \
               libncursesw5-dev \
               libudev-dev \
               libhidapi-dev \
               zip
-
+          
+            apt-get install --no-install-recommends --assume-yes protobuf-compiler=3.12
+            protoc --version
+          
             curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
             source \$HOME/.cargo/env
             
