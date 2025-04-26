@@ -1,9 +1,9 @@
 name: Build and publish Java packages
 on:
-  release:
-    # Use released instead of published, since we don't publish preview/beta
-    # versions
-    types: [released]
+#  release:
+#    # Use released instead of published, since we don't publish preview/beta
+#    # versions
+#    types: [released]
   pull_request:
     paths:
       - .github/workflows/java-publish.yml
@@ -136,13 +136,13 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           mvn --batch-mode -DskipTests -Drust.release.build=true package
-      - name: Publish with Java 8
-        if: github.event_name == 'release'
-        run: |
-          echo "use-agent" >> ~/.gnupg/gpg.conf
-          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
-          export GPG_TTY=$(tty)
-          mvn --batch-mode -DskipTests -Drust.release.build=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh -P shade-jar
-        env:
-          SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
-          SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
+#      - name: Publish with Java 8
+#        if: github.event_name == 'release'
+#        run: |
+#          echo "use-agent" >> ~/.gnupg/gpg.conf
+#          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+#          export GPG_TTY=$(tty)
+#          mvn --batch-mode -DskipTests -Drust.release.build=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh -P shade-jar
+#        env:
+#          SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
+#          SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
