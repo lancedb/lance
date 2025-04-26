@@ -53,7 +53,7 @@ jobs:
           docker run --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace ubuntu:20.04 bash -c "
             set -ex
             apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y git protobuf-compiler libssl-dev pkg-config
+            DEBIAN_FRONTEND=noninteractive apt-get install -y git curl protobuf-compiler libssl-dev pkg-config
           
             curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
             source \$HOME/.cargo/env
