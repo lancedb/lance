@@ -5,11 +5,6 @@ on:
     # versions
     types: [released]
   pull_request:
-    types:
-      - opened
-      - synchronize
-      - ready_for_review
-      - reopened
     paths:
       - .github/workflows/java-publish.yml
 
@@ -41,7 +36,6 @@ jobs:
     name: Build on Linux Arm64
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    defaults:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
