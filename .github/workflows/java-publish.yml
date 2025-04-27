@@ -176,8 +176,10 @@ jobs:
               libhidapi-dev \
               zip \
               unzip \
-              openjdk-8-jdk \
               maven
+
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes openjdk-8-jdk
+            java -version
           
             # https://github.com/databendlabs/databend/issues/8035
             PROTOC_ZIP=protoc-3.15.0-linux-aarch_64.zip
