@@ -35,7 +35,7 @@ jobs:
   linux-arm64:
     name: Build on Linux Arm64
     runs-on: ubuntu-2404-8x-arm64
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
