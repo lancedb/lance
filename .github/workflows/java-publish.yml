@@ -189,8 +189,8 @@ jobs:
             protoc --version
           
             # set Github
-            git config --global user.email "Lance Github Runner"
-            git config --global user.name "dev+gha@lancedb.com"
+            git config --global user.email \"Lance Github Runner\"
+            git config --global user.name \"dev+gha@lancedb.com\"
           
             curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
             source \$HOME/.cargo/env
