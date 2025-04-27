@@ -28,8 +28,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::{execution::SendableRecordBatchStream, parquet::column};
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{IntoStreamer, Streamer};
@@ -455,6 +455,7 @@ impl InvertedPartition {
         mask: Arc<RowIdMask>,
         metrics: &dyn MetricsCollector,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
+        println!("debug: search tokens {:?}", tokens);
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let tokens = match is_fuzzy {
             true => self.expand_fuzzy(tokens.to_vec(), params.fuzziness, params.max_expansions)?,
@@ -500,6 +501,11 @@ impl InvertedPartition {
                     }
                     _ => posting,
                 };
+
+                println!(
+                    "debug: search token_id {:?} posting {:?}",
+                    token_id, posting
+                );
 
                 Result::Ok(PostingIterator::new(
                     token_id,

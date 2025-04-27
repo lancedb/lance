@@ -6,6 +6,7 @@ use std::io::Write;
 use super::builder::BLOCK_SIZE;
 use arrow::{
     array::{AsArray, LargeBinaryBuilder},
+    datatypes::ToByteSlice,
     ipc::LargeBinary,
 };
 use bitpacking::{BitPacker, BitPacker4x};
@@ -86,11 +87,8 @@ pub fn compress_posting_list(
     if remainder > 0 {
         let row_id_chunk = &doc_ids[length - remainder..];
         let freq_chunk = &frequencies[length - remainder..];
-        for i in 0..remainder {
-            let doc_id = row_id_chunk[i];
-            let freq = freq_chunk[i];
-            builder.write(doc_id.to_le_bytes().as_ref())?;
-            builder.write(freq.to_le_bytes().as_ref())?;
+        for value in row_id_chunk.iter().chain(freq_chunk) {
+            builder.write(value.to_le_bytes().as_ref())?;
         }
         builder.append_value("");
     }
@@ -171,7 +169,7 @@ mod tests {
 
     #[test]
     fn test_compress_posting_list() -> Result<()> {
-        let num_rows: usize = BLOCK_SIZE * 1024 + 1;
+        let num_rows: usize = BLOCK_SIZE * 4 - 1;
         let mut rng = rand::thread_rng();
         let doc_ids: Vec<u32> = (0..num_rows).map(|_| rng.gen()).sorted_unstable().collect();
         let frequencies: Vec<u32> = (0..num_rows).map(|_| rng.gen_range(1..255)).collect();

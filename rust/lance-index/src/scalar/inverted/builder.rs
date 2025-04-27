@@ -333,7 +333,11 @@ impl InnerBuilder {
             )
             .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
-        for posting_list in posting_lists {
+        for (id, posting_list) in posting_lists.into_iter().enumerate() {
+            println!(
+                "writing posting list of token={}, doc_ids={:?}, freqs={:?}",
+                id, posting_list.doc_ids, posting_list.frequencies
+            );
             let batch = posting_list.to_batch(&self.docs)?;
             writer.write_record_batch(batch).await?;
         }
@@ -455,6 +459,9 @@ impl IndexWorker {
                 .into_iter()
                 .enumerate()
                 .for_each(|(token_id, term_positions)| {
+                    if term_positions.is_empty() {
+                        return;
+                    }
                     let posting_list = &mut self.builder.posting_lists[token_id];
 
                     let old_size = posting_list.size();
