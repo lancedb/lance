@@ -176,7 +176,7 @@ jobs:
               libhidapi-dev \
               zip \
               unzip \
-              openjdk-8-jdk \ 
+              openjdk-8-jdk \
               maven
           
             # https://github.com/databendlabs/databend/issues/8035
