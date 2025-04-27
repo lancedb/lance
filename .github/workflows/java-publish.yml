@@ -39,13 +39,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-#      - name: Set up QEMU
-#        uses: docker/setup-qemu-action@v3
-#        with:
-#          platforms: arm64
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Build and run in ARM64 container
+      - name: Check glibc version outside docker
+        run: ldd --version
+      - name: Build and run in Ubuntu 20.04 container
         run: |
           docker run --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace ubuntu:20.04 bash -c "
             set -ex
@@ -95,6 +93,7 @@ jobs:
             # https://github.com/rustls/rustls/issues/1967
             export CC=clang
             export CXX=clang++
+            ldd --version
 
             cargo build --release
             cp ../target/release/liblance_jni.so liblance_jni.so
@@ -138,21 +137,134 @@ jobs:
           mkdir -p ./core/target/classes/nativelib/darwin-aarch64 ./core/target/classes/nativelib/linux-aarch64
           cp ../liblance_jni_darwin_aarch64.zip/liblance_jni.dylib ./core/target/classes/nativelib/darwin-aarch64/liblance_jni.dylib
           cp ../liblance_jni_linux_aarch64.zip/liblance_jni.so ./core/target/classes/nativelib/linux-aarch64/liblance_jni.so
-      - name: Set github
-        run: |
-          git config --global user.email "Lance Github Runner"
-          git config --global user.name "dev+gha@lancedb.com"
-      - name: Dry run
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Check glibc version outside docker
+        run: ldd --version
+      - name: Build and run in Ubuntu 20.04 container (Dry Run)
         if: github.event_name == 'pull_request'
         run: |
-          mvn --batch-mode -DskipTests -Drust.release.build=true package
-#      - name: Publish with Java 8
-#        if: github.event_name == 'release'
-#        run: |
-#          echo "use-agent" >> ~/.gnupg/gpg.conf
-#          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
-#          export GPG_TTY=$(tty)
-#          mvn --batch-mode -DskipTests -Drust.release.build=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh -P shade-jar
-#        env:
-#          SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
-#          SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
+          docker run --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace ubuntu:20.04 bash -c "
+            set -ex
+            apt-get update
+          
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes \
+              apt-transport-https \
+              ca-certificates \
+              curl \
+              gpg \
+              bash \
+              less \
+              openssl \
+              libssl-dev \
+              pkg-config \
+              libsqlite3-dev \
+              libsqlite3-0 \
+              libreadline-dev \
+              git \
+              cmake \
+              dh-autoreconf \
+              clang \
+              g++ \
+              gcc-10 \
+              libc++-dev \
+              libc++abi-dev \
+              libprotobuf-dev \
+              libncurses5-dev \
+              libncursesw5-dev \
+              libudev-dev \
+              libhidapi-dev \
+              zip \
+              unzip \
+              openjdk-8-jdk \ 
+              maven
+          
+            # https://github.com/databendlabs/databend/issues/8035
+            PROTOC_ZIP=protoc-3.15.0-linux-aarch_64.zip
+            curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.15.0/\$PROTOC_ZIP
+            unzip -o \$PROTOC_ZIP -d /usr/local
+            rm -f \$PROTOC_ZIP
+            protoc --version
+          
+            # set Github
+            git config --global user.email "Lance Github Runner"
+            git config --global user.name "dev+gha@lancedb.com"
+          
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+            source \$HOME/.cargo/env
+          
+            cd java
+          
+            # https://github.com/rustls/rustls/issues/1967
+            export CC=clang
+            export CXX=clang++
+            ldd --version
+
+            mvn --batch-mode -DskipTests -Drust.release.build=true package
+          "
+      - name: Build and run in Ubuntu 20.04 container (Publish to Sonatype)
+        if: github.event_name == 'release'
+        run: |
+          docker run --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace ubuntu:20.04 bash -c "
+            set -ex
+            apt-get update
+
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes \
+              apt-transport-https \
+              ca-certificates \
+              curl \
+              gpg \
+              bash \
+              less \
+              openssl \
+              libssl-dev \
+              pkg-config \
+              libsqlite3-dev \
+              libsqlite3-0 \
+              libreadline-dev \
+              git \
+              cmake \
+              dh-autoreconf \
+              clang \
+              g++ \
+              gcc-10 \
+              libc++-dev \
+              libc++abi-dev \
+              libprotobuf-dev \
+              libncurses5-dev \
+              libncursesw5-dev \
+              libudev-dev \
+              libhidapi-dev \
+              zip \
+              unzip \
+              openjdk-8-jdk \
+              maven
+
+            # https://github.com/databendlabs/databend/issues/8035
+            PROTOC_ZIP=protoc-3.15.0-linux-aarch_64.zip
+            curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.15.0/\$PROTOC_ZIP
+            unzip -o \$PROTOC_ZIP -d /usr/local
+            rm -f \$PROTOC_ZIP
+            protoc --version
+
+            # set Github
+            git config --global user.email "Lance Github Runner"
+            git config --global user.name "dev+gha@lancedb.com"
+
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+            source \$HOME/.cargo/env
+
+            cd java
+
+            # https://github.com/rustls/rustls/issues/1967
+            export CC=clang
+            export CXX=clang++
+            ldd --version
+            
+            export SONATYPE_USER=${{ secrets.SONATYPE_USER }}
+            export SONATYPE_TOKEN=${{ secrets.SONATYPE_TOKEN }}
+            echo "use-agent" >> ~/.gnupg/gpg.conf
+            echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+            export GPG_TTY=$(tty)
+            mvn --batch-mode -DskipTests -Drust.release.build=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh -P shade-jar
+          "
