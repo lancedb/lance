@@ -5,6 +5,7 @@
 //!
 //! WARNING: Internal API with no stability guarantees.
 
+pub mod filtered_read;
 pub mod fts;
 pub(crate) mod knn;
 mod optimizer;

@@ -112,7 +112,11 @@ pub fn merge_streams(streams: Vec<ReadBatchTaskStream>) -> ReadBatchTaskStream {
 }
 
 /// Apply a mask to the batch, where rows are "deleted" by the _rowid column null.
-/// This is used as a performance optimization to avoid copying data.
+///
+/// This is used partly as a performance optimization (cheaper to null than to filter)
+/// but also because there are cases where we want to load the physical rows.  For example,
+/// we may be replacing a column based on some UDF and we want to provide a value for the
+/// deleted rows to ensure the fragments are aligned.
 fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<RecordBatch> {
     // Transform mask into null buffer. Null means deleted, though note that
     // null buffers are actually validity buffers, so True means not null
@@ -120,8 +124,6 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
     let mask_buffer = NullBuffer::new(mask.values().clone());
 
     match mask_buffer.null_count() {
-        // All rows are deleted
-        n if n == mask_buffer.len() => return Ok(RecordBatch::new_empty(batch.schema())),
         // No rows are deleted
         0 => return Ok(batch),
         _ => {}
@@ -237,12 +239,6 @@ pub fn apply_row_id_and_deletes(
         None
     };
 
-    // TODO: This is a minor cop out. Pushing deletion vector in to the decoders is hard
-    // so I'm going to just leave deletion filter at this layer for now.
-    // We should push this down futurther when we get to statistics-based predicate pushdown
-
-    // This function is meant to be IO bound, but we are doing CPU-bound work here
-    // We should try to move this to later.
     let span = tracing::span!(tracing::Level::DEBUG, "apply_deletions");
     let _enter = span.enter();
     let deletion_mask = deletion_vector.and_then(|v| {

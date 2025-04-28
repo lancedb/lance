@@ -3210,6 +3210,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-functions",
  "datafusion-physical-expr",
+ "datafusion-physical-plan",
  "deepsize",
  "either",
  "futures",
