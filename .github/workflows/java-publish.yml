@@ -107,7 +107,7 @@ jobs:
   linux-x86:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-#    needs: [macos-arm64, linux-arm64]
+    needs: [macos-arm64, linux-arm64]
     defaults:
       run:
         working-directory: ./java
@@ -130,13 +130,13 @@ jobs:
         run: |
           sudo apt -y -qq update
           sudo apt install -y protobuf-compiler libssl-dev pkg-config
-#      - name: Download artifact
-#        uses: actions/download-artifact@v4
-#      - name: Copy native libs
-#        run: |
-#          mkdir -p ./core/target/classes/nativelib/darwin-aarch64 ./core/target/classes/nativelib/linux-aarch64
-#          cp ../liblance_jni_darwin_aarch64.zip/liblance_jni.dylib ./core/target/classes/nativelib/darwin-aarch64/liblance_jni.dylib
-#          cp ../liblance_jni_linux_aarch64.zip/liblance_jni.so ./core/target/classes/nativelib/linux-aarch64/liblance_jni.so
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+      - name: Copy native libs
+        run: |
+          mkdir -p ./core/target/classes/nativelib/darwin-aarch64 ./core/target/classes/nativelib/linux-aarch64
+          cp ../liblance_jni_darwin_aarch64.zip/liblance_jni.dylib ./core/target/classes/nativelib/darwin-aarch64/liblance_jni.dylib
+          cp ../liblance_jni_linux_aarch64.zip/liblance_jni.so ./core/target/classes/nativelib/linux-aarch64/liblance_jni.so
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Check glibc version outside docker
@@ -204,7 +204,7 @@ jobs:
             export CXX=clang++
             ldd --version
 
-            mvn --batch-mode -Drust.release.build=true package
+            mvn --batch-mode -DskipTests -Drust.release.build=true package
           "
       - name: Build and run in Ubuntu 20.04 container (Publish to Sonatype)
         if: github.event_name == 'release'
