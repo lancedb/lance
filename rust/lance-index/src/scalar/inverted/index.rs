@@ -34,9 +34,10 @@ use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{IntoStreamer, Streamer};
 use futures::stream::repeat_with;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::{
     mask::RowIdMask,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
@@ -48,6 +49,7 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{info, instrument};
 
+use super::encoding::{compress_positions, decompress_positions_list};
 use super::{
     builder::PositionRecorder,
     encoding::{decompress_posting_list, CompressedPostingListHeader},
@@ -152,9 +154,11 @@ impl InvertedIndex {
         }
         let mask = prefilter.mask();
         let mut candidates = BinaryHeap::new();
-        for partition in self.partitions.iter() {
-            let (row_ids, scores) = partition
-                .bm25_search(
+        let parts = self
+            .partitions
+            .iter()
+            .map(|part| {
+                part.bm25_search(
                     tokens,
                     params,
                     operator,
@@ -162,7 +166,11 @@ impl InvertedIndex {
                     mask.clone(),
                     metrics,
                 )
-                .await?;
+                .boxed()
+            })
+            .collect::<Vec<_>>();
+        let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
+        while let Some((row_ids, scores)) = parts.try_next().await? {
             for (row_id, score) in row_ids.into_iter().zip(scores.into_iter()) {
                 if candidates.len() < limit {
                     candidates.push(Reverse(OrderedDoc::new(row_id, score)));
@@ -172,6 +180,7 @@ impl InvertedIndex {
                 }
             }
         }
+        std::mem::drop(parts);
 
         Ok(candidates
             .into_sorted_vec()
@@ -455,7 +464,6 @@ impl InvertedPartition {
         mask: Arc<RowIdMask>,
         metrics: &dyn MetricsCollector,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
-        println!("debug: search tokens {:?}", tokens);
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let tokens = match is_fuzzy {
             true => self.expand_fuzzy(tokens.to_vec(), params.fuzziness, params.max_expansions)?,
@@ -469,7 +477,6 @@ impl InvertedPartition {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let num_docs = self.docs.len() as u32;
         let row_ids = &self.docs.row_ids;
         let postings = stream::iter(token_ids)
             .enumerate()
@@ -485,27 +492,26 @@ impl InvertedPartition {
                 let posting = match posting {
                     PostingList::Compressed(compressed) => {
                         let (doc_ids, freqs) =
-                            decompress_posting_list(num_docs, &compressed.blocks)?;
+                            decompress_posting_list(compressed.length, &compressed.blocks)?;
                         let row_ids = doc_ids
                             .into_iter()
                             .map(|doc_id| row_ids[doc_id as usize])
                             .collect();
                         let freqs = freqs.into_iter().map(|freq| freq as f32).collect();
+                        let positions = compressed
+                            .positions
+                            .map(|positions| decompress_positions_list(&positions))
+                            .transpose()?;
 
                         PostingList::Plain(PlainPostingList::new(
                             row_ids,
                             freqs,
                             Some(compressed.max_score),
-                            compressed.positions,
+                            positions,
                         ))
                     }
                     _ => posting,
                 };
-
-                println!(
-                    "debug: search token_id {:?} posting {:?}",
-                    token_id, posting
-                );
 
                 Result::Ok(PostingIterator::new(
                     token_id,
@@ -524,9 +530,11 @@ impl InvertedPartition {
             is_phrase_query,
             params.limit.unwrap_or(usize::MAX),
             params.wand_factor,
-            |doc, freq| {
+            |row_id, freq| {
                 let doc_norm = K1
-                    * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / self.docs.average_length());
+                    * (1.0 - B
+                        + B * self.docs.num_tokens_by_row_id(row_id) as f32
+                            / self.docs.average_length());
                 freq / (freq + doc_norm)
             },
         )
@@ -759,6 +767,14 @@ impl PostingListReader {
         let posting_cache = Cache::builder()
             .max_capacity(*CACHE_SIZE as u64)
             .weigher(|_, posting: &PostingList| posting.deep_size_of() as u32)
+            .eviction_listener(|token_id, posting_list, reason| {
+                log::info!(
+                    "Evicted posting list {}: {}KiB ({:?})",
+                    token_id,
+                    posting_list.deep_size_of() / 1024,
+                    reason
+                );
+            })
             .build();
         let position_cache = Cache::builder()
             .max_capacity(*CACHE_SIZE as u64)
@@ -1000,7 +1016,7 @@ impl PostingList {
         match self {
             PostingList::Plain(posting) => posting.positions = Some(positions),
             PostingList::Compressed(posting) => {
-                posting.positions = Some(positions);
+                posting.positions = Some(positions.value(0).as_list::<i32>().clone());
             }
         }
     }
@@ -1023,7 +1039,7 @@ impl PostingList {
         }
     }
 
-    pub fn positions(&self, row_id: u64) -> Option<PrimitiveArray<Int32Type>> {
+    pub fn positions(&self, row_id: u64) -> Option<Arc<dyn Array>> {
         match self {
             PostingList::Plain(posting) => posting.positions(row_id),
             PostingList::Compressed(posting) => {
@@ -1061,7 +1077,7 @@ pub struct PlainPostingList {
     pub row_ids: ScalarBuffer<u64>,
     pub frequencies: ScalarBuffer<f32>,
     pub max_score: Option<f32>,
-    pub positions: Option<ListArray>,
+    pub positions: Option<ListArray>, // List of Int32
 }
 
 impl DeepSizeOf for PlainPostingList {
@@ -1116,11 +1132,11 @@ impl PlainPostingList {
         LocatedDocInfo::new(self.row_ids[i], self.frequencies[i])
     }
 
-    pub fn positions(&self, row_id: u64) -> Option<PrimitiveArray<Int32Type>> {
+    pub fn positions(&self, row_id: u64) -> Option<Arc<dyn Array>> {
         let pos = self.row_ids.binary_search(&row_id).ok()?;
         self.positions
             .as_ref()
-            .map(|positions| positions.value(pos).as_primitive::<Int32Type>().clone())
+            .map(|positions| positions.value(pos))
     }
 
     pub fn max_score(&self) -> Option<f32> {
@@ -1163,7 +1179,7 @@ impl CompressedPostingList {
             .clone();
         let positions = batch
             .column_by_name(POSITION_COL)
-            .map(|col| col.as_list::<i32>().clone());
+            .map(|col| col.as_list::<i32>().value(0).as_list::<i32>().clone());
 
         Self {
             max_score,
@@ -1279,8 +1295,11 @@ impl PostingListBuilder {
 
         let mut doc_ids = Vec::with_capacity(length);
         let mut freqs = Vec::with_capacity(length);
-        let mut position_builder = self.positions.as_mut().map(|positions| {
-            ListBuilder::with_capacity(UInt32Builder::with_capacity(positions.total_len()), length)
+        let mut position_builder = self.positions.as_mut().map(|_| {
+            ListBuilder::new(ListBuilder::with_capacity(
+                LargeBinaryBuilder::new(),
+                length,
+            ))
         });
         for index in (0..length).sorted_unstable_by_key(|&i| self.doc_ids[i]) {
             let (doc_id, freq) = (self.doc_ids[index], self.frequencies[index]);
@@ -1288,12 +1307,12 @@ impl PostingListBuilder {
             doc_ids.push(doc_id);
             freqs.push(freq);
             if let Some(position_builder) = position_builder.as_mut() {
+                let positions = self.positions.as_ref().unwrap().get(index);
+                let compressed = compress_positions(positions)?;
                 let inner_builder = position_builder.values();
-                inner_builder.append_slice(self.positions.as_ref().unwrap().get(index));
-                position_builder.append(true);
+                inner_builder.append_value(compressed.into_iter());
             }
             // calculate the max score
-
             let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id as u64) as f32 / avgdl);
             let freq = freq as f32;
             let score = freq / (freq + doc_norm);
@@ -1319,6 +1338,7 @@ impl PostingListBuilder {
         ];
 
         if let Some(mut position_builder) = position_builder {
+            position_builder.append(true);
             let position_col = position_builder.finish();
             columns.push(Arc::new(position_col));
         }
@@ -1572,6 +1592,12 @@ impl DocSet {
     #[inline]
     pub fn num_tokens(&self, doc_id: u64) -> u32 {
         self.num_tokens[doc_id as usize]
+    }
+
+    #[inline]
+    pub fn num_tokens_by_row_id(&self, row_id: u64) -> u32 {
+        let doc_id = self.row_ids.binary_search(&row_id).unwrap();
+        self.num_tokens[doc_id]
     }
 
     // append a new document to the doc set

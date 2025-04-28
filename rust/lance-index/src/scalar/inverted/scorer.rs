@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{HashMap, HashSet};
-
-use super::{InvertedIndex, InvertedPartition};
+use super::InvertedIndex;
 
 pub trait Scorer {
     // calculate the contribution of the token in the document

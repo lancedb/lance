@@ -16,7 +16,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use futures::stream::{self};
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_index::prefilter::PreFilter;
@@ -224,6 +224,7 @@ impl ExecutionPlan for MatchQueryExec {
                     pre_filter,
                     metrics.as_ref(),
                 )
+                .boxed()
                 .await?;
             scores.iter_mut().for_each(|s| {
                 *s *= query.boost;
@@ -569,6 +570,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     pre_filter,
                     metrics.as_ref(),
                 )
+                .boxed()
                 .await?;
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),

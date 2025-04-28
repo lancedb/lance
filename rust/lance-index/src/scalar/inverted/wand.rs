@@ -5,8 +5,10 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
-use arrow::datatypes::Int32Type;
-use arrow_array::PrimitiveArray;
+use arrow::array::AsArray;
+use arrow::datatypes::{Int32Type, UInt32Type};
+use arrow_array::Array;
+use arrow_schema::DataType;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::Result;
 use tracing::instrument;
@@ -99,7 +101,7 @@ impl PostingIterator {
         }
     }
 
-    fn positions(&self, row_id: u64) -> Option<PrimitiveArray<Int32Type>> {
+    fn positions(&self, row_id: u64) -> Option<Arc<dyn Array>> {
         self.list.positions(row_id)
     }
 
@@ -316,7 +318,7 @@ impl<'a> Wand<'a> {
             let mut max_pos = None;
             let mut all_same = true;
             for iter in &position_iters {
-                match (iter.position(), max_pos) {
+                match (iter.relative_position(), max_pos) {
                     (Some(pos), None) => {
                         max_pos = Some(pos);
                     }
@@ -343,35 +345,64 @@ impl<'a> Wand<'a> {
     }
 }
 
+#[derive(Debug)]
 struct PositionIterator {
-    positions: PrimitiveArray<Int32Type>,
+    // It's Int32Array for legacy index,
+    // UInt32Array for new index
+    positions: Arc<dyn Array>,
     pub position_in_query: u32,
     index: usize,
 }
 
 impl PositionIterator {
-    fn new(positions: PrimitiveArray<Int32Type>, position_in_query: u32) -> Self {
-        Self {
+    fn new(positions: Arc<dyn Array>, position_in_query: u32) -> Self {
+        let mut iter = Self {
             positions,
             position_in_query,
             index: 0,
-        }
+        };
+        iter.next(0);
+        iter
     }
 
-    fn position(&self) -> Option<u32> {
+    // get the current relative position
+    fn relative_position(&self) -> Option<u32> {
         if self.index < self.positions.len() {
-            Some(self.positions.value(self.index) as u32 - self.position_in_query)
+            match self.positions.data_type() {
+                &DataType::Int32 => Some(
+                    self.positions.as_primitive::<Int32Type>().value(self.index) as u32
+                        - self.position_in_query,
+                ),
+                &DataType::UInt32 => Some(
+                    self.positions
+                        .as_primitive::<UInt32Type>()
+                        .value(self.index)
+                        - self.position_in_query,
+                ),
+                _ => {
+                    unreachable!("position iterator only supports Int32 and UInt32");
+                }
+            }
         } else {
             None
         }
     }
 
-    fn next(&mut self, least_pos: u32) -> Option<u32> {
-        let least_pos = least_pos + self.position_in_query;
-        self.index = self
-            .positions
-            .values()
-            .partition_point(|&pos| (pos as u32) < least_pos);
-        self.position()
+    // move to the next position that the relative position is greater than or equal to least_pos
+    fn next(&mut self, least_relative_pos: u32) {
+        let least_pos = least_relative_pos + self.position_in_query;
+        self.index = match self.positions.data_type() {
+            &DataType::Int32 => self
+                .positions
+                .as_primitive::<Int32Type>()
+                .values()
+                .partition_point(|&pos| (pos as u32) < least_pos),
+            &DataType::UInt32 => self
+                .positions
+                .as_primitive::<UInt32Type>()
+                .values()
+                .partition_point(|&pos| pos < least_pos),
+            _ => unreachable!("position iterator only supports Int32 and UInt32"),
+        };
     }
 }

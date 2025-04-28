@@ -134,7 +134,7 @@ impl InvertedIndexBuilder {
 
         // spawn `num_workers` workers to build the index,
         // this thread will consume the stream and send the tokens to the workers.
-        let num_workers = 1;
+        let num_workers = get_num_compute_intensive_cpus();
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
         let next_id = self.partitions.iter().map(|id| id + 1).max().unwrap_or(0);
@@ -177,12 +177,12 @@ impl InvertedIndexBuilder {
         let start = std::time::Instant::now();
         while let Some(num_rows) = stream.try_next().await? {
             total_num_rows += num_rows;
-            if total_num_rows >= last_num_rows + 100_000 {
+            if total_num_rows >= last_num_rows + 1_000_000 {
                 log::debug!(
                     "indexed {} documents, elapsed: {:?}, speed: {}rows/s",
-                    num_rows,
+                    total_num_rows,
                     start.elapsed(),
-                    num_rows as f32 / start.elapsed().as_secs_f32()
+                    total_num_rows as f32 / start.elapsed().as_secs_f32()
                 );
                 last_num_rows = total_num_rows;
             }
@@ -197,17 +197,17 @@ impl InvertedIndexBuilder {
         // wait for the workers to finish
         let start = std::time::Instant::now();
         let workers = futures::future::try_join_all(index_tasks).await?;
+        let mut partitions = stream::iter(workers)
+            .map(|worker| async move {
+                let parts = worker.finish().await?;
+                Result::Ok(parts)
+            })
+            .buffer_unordered(self.local_store.io_parallelism());
+        while let Some(partition) = partitions.try_next().await? {
+            self.partitions.extend(partition);
+        }
         let duration = std::time::Instant::now() - start;
         log::info!("wait workers indexing elapsed: {:?}", duration);
-
-        for worker in workers {
-            self.partitions.extend(worker.finish().await?);
-        }
-        log::info!(
-            "FTS indexing elapsed {:?}, partition num: {}",
-            start.elapsed(),
-            self.partitions.len()
-        );
         Ok(())
     }
 
@@ -296,8 +296,6 @@ impl Default for InvertedIndexBuilder {
     }
 }
 
-struct Metadata {}
-
 // builder for single partition
 #[derive(Debug)]
 struct InnerBuilder {
@@ -333,11 +331,7 @@ impl InnerBuilder {
             )
             .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
-        for (id, posting_list) in posting_lists.into_iter().enumerate() {
-            println!(
-                "writing posting list of token={}, doc_ids={:?}, freqs={:?}",
-                id, posting_list.doc_ids, posting_list.frequencies
-            );
+        for posting_list in posting_lists.into_iter() {
             let batch = posting_list.to_batch(&self.docs)?;
             writer.write_record_batch(batch).await?;
         }
@@ -429,8 +423,7 @@ impl IndexWorker {
 
         let with_position = self.has_position();
         for (doc, row_id) in docs {
-            let mut token_occurrences =
-                vec![PositionRecorder::new(with_position); self.builder.tokens.len()];
+            let mut token_occurrences = HashMap::new();
             let mut token_num = 0;
             {
                 let mut token_stream = self.tokenizer.token_stream(doc);
@@ -438,12 +431,10 @@ impl IndexWorker {
                     let token = token_stream.token_mut();
                     let token_text = std::mem::take(&mut token.text);
                     let token_id = self.builder.tokens.add(token_text) as usize;
-                    if token_id >= token_occurrences.len() {
-                        // this is a new token
-                        token_occurrences.push(PositionRecorder::new(with_position));
-                    }
-
-                    token_occurrences[token_id].push(token.position as u32);
+                    token_occurrences
+                        .entry(token_id as u32)
+                        .or_insert_with(|| PositionRecorder::new(with_position))
+                        .push(token.position as u32);
                     token_num += 1;
                 }
             }
@@ -457,22 +448,18 @@ impl IndexWorker {
 
             token_occurrences
                 .into_iter()
-                .enumerate()
                 .for_each(|(token_id, term_positions)| {
-                    if term_positions.is_empty() {
-                        return;
-                    }
-                    let posting_list = &mut self.builder.posting_lists[token_id];
+                    let posting_list = &mut self.builder.posting_lists[token_id as usize];
 
                     let old_size = posting_list.size();
                     posting_list.add(doc_id, term_positions);
                     let new_size = posting_list.size();
                     self.estimated_size += new_size - old_size;
                 });
-        }
 
-        if self.estimated_size > *LANCE_FTS_FLUSH_THRESHOLD * 1024 * 1024 {
-            self.flush()?;
+            if doc_id == u32::MAX || self.estimated_size >= *LANCE_FTS_PARTITION_SIZE << 30 {
+                self.flush()?;
+            }
         }
 
         Ok(())
@@ -484,6 +471,10 @@ impl IndexWorker {
             return Ok(());
         }
 
+        log::info!(
+            "flushing posting lists, estimated size: {} MiB",
+            self.estimated_size / (1024 * 1024)
+        );
         self.estimated_size = 0;
         let builder = std::mem::replace(
             &mut self.builder,
@@ -703,7 +694,11 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
             POSITION_COL,
             arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
                 "item",
-                arrow_schema::DataType::Int32,
+                arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    arrow_schema::DataType::LargeBinary,
+                    true,
+                ))),
                 true,
             ))),
             false,
