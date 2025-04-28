@@ -24,7 +24,7 @@ public class DataFile implements Serializable {
   private final int[] columnIndices;
   private final int fileMajorVersion;
   private final int fileMinorVersion;
-  private final long fileSizeBytes;
+  private final Long fileSizeBytes;
 
   public DataFile(
       String path,
@@ -32,7 +32,7 @@ public class DataFile implements Serializable {
       int[] columnIndices,
       int fileMajorVersion,
       int fileMinorVersion,
-      long fileSizeBytes) {
+      Long fileSizeBytes) {
     this.path = path;
     this.fields = fields;
     this.columnIndices = columnIndices;
@@ -61,7 +61,7 @@ public class DataFile implements Serializable {
     return fileMinorVersion;
   }
 
-  public long getFileSizeBytes() {
+  public Long getFileSizeBytes() {
     return fileSizeBytes;
   }
 
