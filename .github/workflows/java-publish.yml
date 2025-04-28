@@ -47,8 +47,6 @@ jobs:
         run: |
           docker run --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace debian:10 bash -c "
             
-            deb http://ftp.cz.debian.org/debian buster main
-
             set -ex
             apt-get update
           
@@ -70,7 +68,6 @@ jobs:
               dh-autoreconf \
               clang \
               g++ \
-              gcc-10 \
               libc++-dev \
               libc++abi-dev \
               libprotobuf-dev \
