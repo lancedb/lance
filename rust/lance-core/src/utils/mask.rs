@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::ops::RangeBounds;
+use std::ops::{Range, RangeBounds};
 use std::{collections::BTreeMap, io::Read};
 
 use arrow_array::{Array, BinaryArray, GenericBinaryArray};
@@ -573,6 +573,35 @@ impl RowIdTreeMap {
 
         Self { inner: new_map }
     }
+
+    pub fn mask(&mut self, mask: &RowIdMask) {
+        if let Some(allow_list) = &mask.allow_list {
+            *self &= allow_list;
+        }
+        if let Some(block_list) = &mask.block_list {
+            *self -= block_list;
+        }
+    }
+
+    /// Convert the set into an iterator of row ids
+    ///
+    /// # Safety
+    ///
+    /// This is unsafe because if any of the inner RowIdSelection elements
+    /// is not a Partial then the iterator will panic because we don't know
+    /// the size of the bitmap.
+    pub unsafe fn into_id_iter(self) -> impl Iterator<Item = u64> {
+        self.inner
+            .into_iter()
+            .flat_map(|(fragment, selection)| match selection {
+                RowIdSelection::Full => panic!("Size of full fragment is unknown"),
+                RowIdSelection::Partial(bitmap) => bitmap.into_iter().map(move |val| {
+                    let fragment = fragment as u64;
+                    let row_offset = val as u64;
+                    (fragment << 32) | row_offset
+                }),
+            })
+    }
 }
 
 impl std::ops::BitOr<Self> for RowIdTreeMap {
@@ -608,13 +637,13 @@ impl std::ops::BitAnd<Self> for RowIdTreeMap {
     type Output = Self;
 
     fn bitand(mut self, rhs: Self) -> Self::Output {
-        self &= rhs;
+        self &= &rhs;
         self
     }
 }
 
-impl std::ops::BitAndAssign<Self> for RowIdTreeMap {
-    fn bitand_assign(&mut self, rhs: Self) {
+impl std::ops::BitAndAssign<&Self> for RowIdTreeMap {
+    fn bitand_assign(&mut self, rhs: &Self) {
         // Remove fragment that aren't on the RHS
         self.inner
             .retain(|fragment, _| rhs.inner.contains_key(fragment));
@@ -704,6 +733,14 @@ impl FromIterator<u64> for RowIdTreeMap {
 impl<'a> FromIterator<&'a u64> for RowIdTreeMap {
     fn from_iter<T: IntoIterator<Item = &'a u64>>(iter: T) -> Self {
         Self::from_iter(iter.into_iter().copied())
+    }
+}
+
+impl From<Range<u64>> for RowIdTreeMap {
+    fn from(range: Range<u64>) -> Self {
+        let mut map = Self::default();
+        map.insert_range(range);
+        map
     }
 }
 

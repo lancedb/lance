@@ -25,7 +25,10 @@ mod serde;
 use deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::RowIdIndex;
-use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
+use lance_core::{
+    utils::mask::{RowIdMask, RowIdTreeMap},
+    Error, Result,
+};
 use lance_io::ReadBatchParams;
 pub use serde::{read_row_ids, write_row_ids};
 
@@ -294,6 +297,142 @@ impl RowIdSequence {
             offset += segment_len;
         }
         None
+    }
+
+    /// Given a mask of row ids, calculate the offset ranges of the row ids that are present
+    /// in the sequence.
+    ///
+    /// For example, given a mask that selects all even ids and a sequence that is
+    /// [80..85, 86..90, 14]
+    ///
+    /// this will return [0, 2, 4, 5, 7, 9]
+    /// because the range expands to
+    ///
+    /// [80, 81, 82, 83, 84, 86, 87, 88, 89, 14] with offsets
+    /// [ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9]
+    ///
+    /// This function is useful when determining which row offsets to read from a fragment given
+    /// a mask.
+    pub fn mask_to_offset_ranges(&self, mask: &RowIdMask) -> Vec<Range<u64>> {
+        let mut offset = 0;
+        let mut ranges = Vec::new();
+        for segment in &self.0 {
+            match segment {
+                U64Segment::Range(range) => {
+                    let mut ids = RowIdTreeMap::from(range.clone());
+                    ids.mask(mask);
+                    ranges.extend(GroupingIterator::new(
+                        unsafe { ids.into_id_iter() }.map(|id| id - range.start + offset),
+                    ));
+                    offset += range.end - range.start;
+                }
+                U64Segment::RangeWithHoles { range, holes } => {
+                    let offset_start = offset;
+                    let mut ids = RowIdTreeMap::from(range.clone());
+                    offset += range.end - range.start;
+                    for hole in holes.iter() {
+                        if ids.remove(hole) {
+                            offset -= 1;
+                        }
+                    }
+                    ids.mask(mask);
+
+                    // Sadly we can't just subtract the offset because of the holes
+                    let mut sorted_holes = holes.clone().into_iter().collect::<Vec<_>>();
+                    sorted_holes.sort_unstable();
+                    let mut next_holes_iter = sorted_holes.into_iter().peekable();
+                    let mut holes_passed = 0;
+                    ranges.extend(GroupingIterator::new(unsafe { ids.into_id_iter() }.map(
+                        |id| {
+                            while let Some(next_hole) = next_holes_iter.peek() {
+                                if *next_hole < id {
+                                    next_holes_iter.next();
+                                    holes_passed += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            id - range.start + offset_start - holes_passed
+                        },
+                    )));
+                }
+                U64Segment::RangeWithBitmap { range, bitmap } => {
+                    let mut ids = RowIdTreeMap::from(range.clone());
+                    let offset_start = offset;
+                    offset += range.end - range.start;
+                    for (i, val) in range.clone().enumerate() {
+                        if !bitmap.get(i) && ids.remove(val) {
+                            offset -= 1;
+                        }
+                    }
+                    ids.mask(mask);
+                    let mut bitmap_iter = bitmap.iter();
+                    let mut bitmap_iter_pos = 0;
+                    let mut holes_passed = 0;
+                    ranges.extend(GroupingIterator::new(unsafe { ids.into_id_iter() }.map(
+                        |id| {
+                            let offset_no_holes = id - range.start + offset_start;
+                            while bitmap_iter_pos < offset_no_holes {
+                                if !bitmap_iter.next().unwrap() {
+                                    holes_passed += 1;
+                                }
+                                bitmap_iter_pos += 1;
+                            }
+                            offset_no_holes - holes_passed
+                        },
+                    )));
+                }
+                U64Segment::SortedArray(array) | U64Segment::Array(array) => {
+                    // TODO: Could probably optimize the sorted array case to be O(N) instead of O(N log N)
+                    ranges.extend(GroupingIterator::new(array.iter().enumerate().filter_map(
+                        |(off, id)| {
+                            if mask.selected(id) {
+                                Some(off as u64 + offset)
+                            } else {
+                                None
+                            }
+                        },
+                    )));
+                    offset += array.len() as u64;
+                }
+            }
+        }
+        ranges
+    }
+}
+
+struct GroupingIterator<I: Iterator<Item = u64>> {
+    iter: I,
+    cur_range: Option<Range<u64>>,
+}
+
+impl<I: Iterator<Item = u64>> GroupingIterator<I> {
+    fn new(iter: I) -> Self {
+        Self {
+            iter,
+            cur_range: None,
+        }
+    }
+}
+
+impl<I: Iterator<Item = u64>> Iterator for GroupingIterator<I> {
+    type Item = Range<u64>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for id in self.iter.by_ref() {
+            if let Some(range) = self.cur_range.as_mut() {
+                if range.end == id {
+                    range.end = id + 1;
+                } else {
+                    let ret = Some(range.clone());
+                    self.cur_range = Some(id..id + 1);
+                    return ret;
+                }
+            } else {
+                self.cur_range = Some(id..id + 1);
+            }
+        }
+        self.cur_range.take()
     }
 }
 
@@ -826,5 +965,119 @@ mod test {
         sequence.mask(0..sequence.len() as u32).unwrap();
         let expected = RowIdSequence(vec![]);
         assert_eq!(sequence, expected);
+    }
+
+    #[test]
+    fn test_mask_to_offset_ranges() {
+        // Tests with a simple range segment
+        let sequence = RowIdSequence(vec![U64Segment::Range(0..10)]);
+        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 2, 4, 6, 8]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![0..1, 2..3, 4..5, 6..7, 8..9]);
+
+        let sequence = RowIdSequence(vec![U64Segment::Range(40..60)]);
+        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[54]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![14..15]);
+
+        let sequence = RowIdSequence(vec![U64Segment::Range(40..60)]);
+        let mask = RowIdMask::from_block(RowIdTreeMap::from_iter(&[54]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![0..14, 15..20]);
+
+        // Test with a range segment with holes
+        // 0, 1, 3, 4, 5, 7, 8, 9
+        let sequence = RowIdSequence(vec![U64Segment::RangeWithHoles {
+            range: 0..10,
+            holes: vec![2, 6].into(),
+        }]);
+        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 2, 4, 6, 8]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![0..1, 3..4, 6..7]);
+
+        let sequence = RowIdSequence(vec![U64Segment::RangeWithHoles {
+            range: 40..60,
+            holes: vec![47, 43].into(),
+        }]);
+        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[44]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![3..4]);
+
+        let sequence = RowIdSequence(vec![U64Segment::RangeWithHoles {
+            range: 40..60,
+            holes: vec![47, 43].into(),
+        }]);
+        let mask = RowIdMask::from_block(RowIdTreeMap::from_iter(&[44]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![0..3, 4..18]);
+
+        // Test with a range segment with bitmap
+        // 0, 1, 4, 5, 6, 7
+        let sequence = RowIdSequence(vec![U64Segment::RangeWithBitmap {
+            range: 0..10,
+            bitmap: [
+                true, true, false, false, true, true, true, true, false, false,
+            ]
+            .as_slice()
+            .into(),
+        }]);
+        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 2, 4, 6, 8]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![0..1, 2..3, 4..5]);
+
+        let sequence = RowIdSequence(vec![U64Segment::RangeWithBitmap {
+            range: 40..45,
+            bitmap: [true, true, false, false, true].as_slice().into(),
+        }]);
+        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[44]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![2..3]);
+
+        let sequence = RowIdSequence(vec![U64Segment::RangeWithBitmap {
+            range: 40..45,
+            bitmap: [true, true, false, false, true].as_slice().into(),
+        }]);
+        let mask = RowIdMask::from_block(RowIdTreeMap::from_iter(&[44]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![0..2]);
+
+        // Test with a sorted array segment
+        let sequence = RowIdSequence(vec![U64Segment::SortedArray(vec![0, 2, 4, 6, 8].into())]);
+        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 6, 8]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![0..1, 3..5]);
+
+        let sequence = RowIdSequence(vec![U64Segment::Array(vec![8, 2, 6, 0, 4].into())]);
+        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 6, 8]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![0..1, 2..4]);
+
+        // Test with multiple segments
+        // 0, 1, 2, 3, 4, 100, 101, 102, 104, 44, 46, 78
+        // *, -, *, -, -, ***, ---, ---, ***, --, **, --
+        // 0, 1, 2, 3, 4,   5,   6,   7,   8,  9, 10, 11
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::RangeWithHoles {
+                range: 100..105,
+                holes: vec![103].into(),
+            },
+            U64Segment::SortedArray(vec![44, 46, 78].into()),
+        ]);
+        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 2, 46, 100, 104]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![0..1, 2..3, 5..6, 8..9, 10..11]);
+
+        // Test with empty mask (should select everything)
+        let sequence = RowIdSequence(vec![U64Segment::Range(0..10)]);
+        let mask = RowIdMask::default();
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![0..10]);
+
+        // Test with allow nothing mask
+        let sequence = RowIdSequence(vec![U64Segment::Range(0..10)]);
+        let mask = RowIdMask::allow_nothing();
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        assert_eq!(ranges, vec![]);
     }
 }
