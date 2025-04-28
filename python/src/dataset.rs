@@ -1254,45 +1254,35 @@ impl Dataset {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
                     if let Some(with_position) = kwargs.get_item("with_position")? {
-                        params.with_position = with_position.extract()?;
+                        params = params.with_position(with_position.extract()?);
                     }
                     if let Some(base_tokenizer) = kwargs.get_item("base_tokenizer")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .base_tokenizer(base_tokenizer.extract()?);
+                        params = params.base_tokenizer(base_tokenizer.extract()?);
                     }
                     if let Some(language) = kwargs.get_item("language")? {
                         let language: PyBackedStr =
                             language.downcast::<PyString>()?.clone().try_into()?;
-                        params.tokenizer_config =
-                            params.tokenizer_config.language(&language).map_err(|e| {
-                                PyValueError::new_err(format!(
-                                    "can't set tokenizer language to {}: {:?}",
-                                    language, e
-                                ))
-                            })?;
+                        params = params.language(&language).map_err(|e| {
+                            PyValueError::new_err(format!(
+                                "can't set tokenizer language to {}: {:?}",
+                                language, e
+                            ))
+                        })?;
                     }
                     if let Some(max_token_length) = kwargs.get_item("max_token_length")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .max_token_length(max_token_length.extract()?);
+                        params = params.max_token_length(max_token_length.extract()?);
                     }
                     if let Some(lower_case) = kwargs.get_item("lower_case")? {
-                        params.tokenizer_config =
-                            params.tokenizer_config.lower_case(lower_case.extract()?);
+                        params = params.lower_case(lower_case.extract()?);
                     }
                     if let Some(stem) = kwargs.get_item("stem")? {
-                        params.tokenizer_config = params.tokenizer_config.stem(stem.extract()?);
+                        params = params.stem(stem.extract()?);
                     }
                     if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .remove_stop_words(remove_stop_words.extract()?);
+                        params = params.remove_stop_words(remove_stop_words.extract()?);
                     }
                     if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .ascii_folding(ascii_folding.extract()?);
+                        params = params.ascii_folding(ascii_folding.extract()?);
                     }
                 }
                 Box::new(params)
