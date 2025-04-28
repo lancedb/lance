@@ -30,6 +30,7 @@ from ..sampler import (
 from .dist import get_global_rank, get_global_world_size
 
 __all__ = ["LanceDataset", "SafeLanceDataset", "get_safe_loader"]
+logger = logging.getLogger(__name__)
 
 
 # Convert an Arrow FSL array into a 2D torch tensor
@@ -114,6 +115,8 @@ def _to_tensor(
 try:
     # When available, subclass from the newer torchdata DataPipes
     # instead of torch Datasets.
+    import os
+
     import torchdata
 
     MAP_DATASET_CLASS = torchdata.datapipes.map.MapDataPipe
@@ -123,6 +126,16 @@ try:
         "TorchData integration is still in BETA phase. "
         "APIs may change without backward compatibility."
     )
+
+    if "LANCE_TORCH_DATAPIPES" not in os.environ:
+        logger.warning(
+            "The torchdata version is old enough to utilize the DataPipe "
+            "API but LANCE_TORCH_DATAPIPES is not set. We recommend "
+            "either upgrading torchdata or setting the LANCE_TORCH_DATAPIPES "
+            "environment variable in order to utilize torchdata"
+        )
+        raise ImportError("avoid deprecated data pipes API unless requested")
+
 
 except ImportError:
     try:
