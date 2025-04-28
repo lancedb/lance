@@ -524,14 +524,15 @@ impl GenericWriter for V2WriterAdapter {
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
         let (major, minor) = self.writer.version().to_numbers();
+        let num_rows = self.writer.finish().await? as u32;
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
             column_indices,
             major,
             minor,
+            Some(self.writer.tell().await? as u64),
         );
-        let num_rows = self.writer.finish().await? as u32;
         Ok((num_rows, data_file))
     }
 }

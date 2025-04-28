@@ -94,7 +94,7 @@ pub async fn read_lance_file(
     decoder_middleware: Arc<DecoderPlugins>,
     filter: FilterExpression,
 ) -> Vec<RecordBatch> {
-    let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+    let file_scheduler = fs.scheduler.open_file(&fs.tmp_path, None).await.unwrap();
     let file_reader = FileReader::try_open(
         file_scheduler,
         None,

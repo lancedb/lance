@@ -35,6 +35,9 @@ pub struct DataFile {
     /// The minor version of the file format used to write this file.
     #[serde(default)]
     pub file_minor_version: u32,
+
+    /// The size of the file in bytes, if known.
+    pub file_size_bytes: Option<u64>,
 }
 
 impl DataFile {
@@ -44,6 +47,7 @@ impl DataFile {
         column_indices: Vec<i32>,
         file_major_version: u32,
         file_minor_version: u32,
+        file_size_bytes: Option<u64>,
     ) -> Self {
         Self {
             path: path.into(),
@@ -51,6 +55,7 @@ impl DataFile {
             column_indices,
             file_major_version,
             file_minor_version,
+            file_size_bytes,
         }
     }
 
@@ -66,6 +71,7 @@ impl DataFile {
             column_indices: vec![],
             file_major_version,
             file_minor_version,
+            file_size_bytes: None,
         }
     }
 
@@ -76,6 +82,7 @@ impl DataFile {
             vec![],
             MAJOR_VERSION as u32,
             MINOR_VERSION as u32,
+            None,
         )
     }
 
@@ -88,6 +95,7 @@ impl DataFile {
             vec![],
             MAJOR_VERSION as u32,
             MINOR_VERSION as u32,
+            None,
         )
     }
 
@@ -127,6 +135,7 @@ impl From<&DataFile> for pb::DataFile {
             column_indices: df.column_indices.clone(),
             file_major_version: df.file_major_version,
             file_minor_version: df.file_minor_version,
+            file_size_bytes: df.file_size_bytes.unwrap_or_default(),
         }
     }
 }
@@ -141,6 +150,11 @@ impl TryFrom<pb::DataFile> for DataFile {
             column_indices: proto.column_indices,
             file_major_version: proto.file_major_version,
             file_minor_version: proto.file_minor_version,
+            file_size_bytes: if proto.file_size_bytes > 0 {
+                Some(proto.file_size_bytes)
+            } else {
+                None
+            },
         })
     }
 }
@@ -311,10 +325,17 @@ impl Fragment {
         field_ids: Vec<i32>,
         column_indices: Vec<i32>,
         version: &LanceFileVersion,
+        file_size_bytes: Option<u64>,
     ) {
         let (major, minor) = version.to_numbers();
-        self.files
-            .push(DataFile::new(path, field_ids, column_indices, major, minor));
+        self.files.push(DataFile::new(
+            path,
+            field_ids,
+            column_indices,
+            major,
+            minor,
+            file_size_bytes,
+        ));
     }
 
     /// Add a new [`DataFile`] to this fragment.

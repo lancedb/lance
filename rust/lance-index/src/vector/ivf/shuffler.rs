@@ -507,7 +507,7 @@ impl IvfShuffler {
             } else {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
                 let scheduler = ScanScheduler::new(object_store.into(), scheduler_config);
-                let file = scheduler.open_file(&path).await?;
+                let file = scheduler.open_file(&path, None).await?;
                 let cache =
                     FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
 
@@ -565,7 +565,7 @@ impl IvfShuffler {
                     });
                 }
             } else {
-                let file = scheduler.open_file(&path).await?;
+                let file = scheduler.open_file(&path, None).await?;
                 let reader = Lancev2FileReader::try_open(
                     file,
                     None,
@@ -637,7 +637,7 @@ impl IvfShuffler {
             } else {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
                 let scheduler = ScanScheduler::new(Arc::new(object_store), scheduler_config);
-                let file = scheduler.open_file(&path).await?;
+                let file = scheduler.open_file(&path, None).await?;
                 let reader = Lancev2FileReader::try_open(
                     file,
                     None,
@@ -808,7 +808,7 @@ impl IvfShuffler {
             let path = basedir.child(file);
             let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
             let scan_scheduler = ScanScheduler::new(object_store, scheduler_config);
-            let file_scheduler = scan_scheduler.open_file(&path).await?;
+            let file_scheduler = scan_scheduler.open_file(&path, None).await?;
             let reader = lance_file::v2::reader::FileReader::try_open(
                 file_scheduler,
                 None,

@@ -453,12 +453,17 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
         let file_minor_version = env
             .call_method(self, "getFileMinorVersion", "()I", &[])?
             .i()? as u32;
+        let file_size_bytes: Option<i64> = env
+            .call_method(self, "getFileSizeBytes", "()Ljava/lang/Long;", &[])?
+            .l()?
+            .extract_object(env)?;
         Ok(DataFile {
             path,
             fields,
             column_indices,
             file_major_version,
             file_minor_version,
+            file_size_bytes: file_size_bytes.map(|r| r as u64),
         })
     }
 }

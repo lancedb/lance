@@ -264,7 +264,7 @@ def test_fragment_meta():
         "column_indices=[], file_major_version=0, file_minor_version=0), "
         "DataFile(path='1.lance', fields=[1], column_indices=[], "
         "file_major_version=0, file_minor_version=0)], physical_rows=100, "
-        "deletion_file=None, row_id_meta=None)"
+        "deletion_file=None, row_id_meta=None, file_size_bytes=None)"
     )
 
 
