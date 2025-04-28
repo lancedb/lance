@@ -46,6 +46,9 @@ jobs:
       - name: Build and run in Ubuntu 20.04 container
         run: |
           docker run --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace debian:10 bash -c "
+            
+            deb http://ftp.cz.debian.org/debian buster main
+
             set -ex
             apt-get update
           
