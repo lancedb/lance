@@ -96,3 +96,6 @@ test_data/venv
 
 **/*.profraw
 *.lance
+
+# Pytest benchmarks
+.benchmarks/
