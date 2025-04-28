@@ -487,9 +487,10 @@ impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String
         Ok(self.0.tell().await? as u64)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        let size_bytes = self.0.tell().await?;
         Ok((
             self.0.finish().await? as u32,
-            DataFile::new_legacy(self.1.clone(), self.0.schema()),
+            DataFile::new_legacy(self.1.clone(), self.0.schema(), Some(size_bytes as u64)),
         ))
     }
 }
