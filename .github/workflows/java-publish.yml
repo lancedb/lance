@@ -204,12 +204,12 @@ jobs:
             export CXX=clang++
             ldd --version
 
-            mvn --batch-mode -DskipTests -Drust.release.build=true package
+            mvn --batch-mode -Drust.release.build=true package
           "
       - name: Build and run in Ubuntu 20.04 container (Publish to Sonatype)
         if: github.event_name == 'release'
         run: |
-          docker run --platform linux/amd64 -v ${{ github.workspace }}:/workspace -w /workspace debian:10 bash -c "
+          docker run --platform linux/amd64 -v ${{ github.workspace }}:/workspace -w /workspace openjdk:8-jdk-buster bash -c "
             set -ex
             apt-get update
 
@@ -239,13 +239,14 @@ jobs:
               libudev-dev \
               libhidapi-dev \
               zip \
-              unzip \
-              maven
+              unzip
 
-            # https://github.com/mlflow/mlflow/issues/11801
-            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes openjdk-8-jdk
-            java -version
-            export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+            # manually install maven, apt will use java11
+            MAVEN_VERSION=3.9.6
+            curl -OL https://dlcdn.apache.org/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz
+            tar -xzf apache-maven-3.9.9-bin.tar.gz
+            mv apache-maven-3.9.9 /opt/maven
+            ln -s /opt/maven/bin/mvn /usr/bin/mvn
           
             # https://github.com/databendlabs/databend/issues/8035
             PROTOC_ZIP=protoc-3.15.0-linux-x86_64.zip
