@@ -531,7 +531,7 @@ impl GenericWriter for V2WriterAdapter {
             column_indices,
             major,
             minor,
-            Some(self.writer.tell().await? as u64),
+            Some(self.writer.tell().await?),
         );
         Ok((num_rows, data_file))
     }

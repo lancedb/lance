@@ -27,7 +27,12 @@ public class DataFile implements Serializable {
   private final long fileSizeBytes;
 
   public DataFile(
-      String path, int[] fields, int[] columnIndices, int fileMajorVersion, int fileMinorVersion, long fileSizeBytes) {
+      String path,
+      int[] fields,
+      int[] columnIndices,
+      int fileMajorVersion,
+      int fileMinorVersion,
+      long fileSizeBytes) {
     this.path = path;
     this.fields = fields;
     this.columnIndices = columnIndices;
