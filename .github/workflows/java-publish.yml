@@ -144,7 +144,7 @@ jobs:
       - name: Build and run in Ubuntu 20.04 container (Dry Run)
         if: github.event_name == 'pull_request'
         run: |
-          docker run --platform linux/amd64 -v ${{ github.workspace }}:/workspace -w /workspace openjdk:8-jre-buster bash -c "
+          docker run --platform linux/amd64 -v ${{ github.workspace }}:/workspace -w /workspace openjdk:8-jdk-buster bash -c "
             set -ex
             apt-get update
           
