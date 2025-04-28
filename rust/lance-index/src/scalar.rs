@@ -22,6 +22,7 @@ use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
+use serde::{Deserialize, Serialize};
 use snafu::location;
 
 use crate::metrics::MetricsCollector;

@@ -8,6 +8,7 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
 use async_trait::async_trait;
+use background_iterator::BackgroundIterator;
 use datafusion::{
     execution::RecordBatchStream,
     physical_plan::{
@@ -21,18 +22,9 @@ use futures::stream::BoxStream;
 use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::datatypes::Schema;
 use lance_core::Result;
-use tokio::task::{spawn, spawn_blocking};
+use tokio::task::spawn;
 
-fn background_iterator<I: Iterator + Send + 'static>(iter: I) -> impl Stream<Item = I::Item>
-where
-    I::Item: Send,
-{
-    stream::unfold(iter, |mut iter| {
-        spawn_blocking(|| iter.next().map(|val| (val, iter)))
-            .unwrap_or_else(|err| panic!("{}", err))
-    })
-    .fuse()
-}
+pub mod background_iterator;
 
 /// A trait for [BatchRecord] iterators, readers and streams
 /// that can be converted to a concrete stream type [SendableRecordBatchStream].
@@ -153,7 +145,9 @@ pub fn reader_to_stream(batches: Box<dyn RecordBatchReader + Send>) -> SendableR
     let arrow_schema = batches.arrow_schema();
     let stream = RecordBatchStreamAdapter::new(
         arrow_schema,
-        background_iterator(batches).map_err(DataFusionError::from),
+        BackgroundIterator::new(batches)
+            .fuse()
+            .map_err(DataFusionError::from),
     );
     Box::pin(stream)
 }

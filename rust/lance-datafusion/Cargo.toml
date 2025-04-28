@@ -28,8 +28,10 @@ lance-core = { workspace = true, features = ["datafusion"] }
 lance-datagen.workspace = true
 lazy_static.workspace = true
 log.workspace = true
+pin-project.workspace = true
 prost.workspace = true
 snafu.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

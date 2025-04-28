@@ -1578,6 +1578,19 @@ def test_flat_vector_search_with_delete(tmp_path: Path):
     )
 
 
+def test_null_reader_with_deletes(tmp_path: Path):
+    full_schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("other", pa.int64()),
+        ]
+    )
+    ds = lance.write_dataset([], tmp_path, schema=full_schema, mode="create")
+    ds.insert(pa.table({"id": [1, 2, 3, 4, 5]}))
+    ds.delete("id in (1, 2)")
+    ds.to_table()
+
+
 def test_merge_insert_conditional_upsert_example(tmp_path: Path):
     table = pa.Table.from_pydict(
         {
