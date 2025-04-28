@@ -166,7 +166,6 @@ jobs:
               dh-autoreconf \
               clang \
               g++ \
-              gcc-10 \
               libc++-dev \
               libc++abi-dev \
               libprotobuf-dev \
@@ -231,7 +230,6 @@ jobs:
               dh-autoreconf \
               clang \
               g++ \
-              gcc-10 \
               libc++-dev \
               libc++abi-dev \
               libprotobuf-dev \
