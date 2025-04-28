@@ -637,13 +637,15 @@ impl ScanScheduler {
         base_priority: u64,
         file_size_bytes: Option<u64>,
     ) -> Result<FileScheduler> {
-        let reader = if let Some(size) = file_size_bytes {
-            self.object_store
-                .open_with_size(path, size as usize)
-                .await?
+        let file_size_bytes = if let Some(size) = file_size_bytes {
+            size as usize
         } else {
-            self.object_store.open(path).await?
+            self.object_store.size(path).await?
         };
+        let reader = self
+            .object_store
+            .open_with_size(path, file_size_bytes)
+            .await?;
         let block_size = self.object_store.block_size() as u64;
         Ok(FileScheduler {
             reader: reader.into(),
