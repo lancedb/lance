@@ -166,7 +166,6 @@ impl InvertedIndex {
                     mask.clone(),
                     metrics,
                 )
-                .boxed()
             })
             .collect::<Vec<_>>();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
@@ -261,12 +260,12 @@ impl Index for InvertedIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        let mut num_tokens = self
+        let num_tokens = self
             .partitions
             .iter()
             .map(|part| part.tokens.len())
             .sum::<usize>();
-        let mut num_docs = self
+        let num_docs = self
             .partitions
             .iter()
             .map(|part| part.docs.len())
@@ -418,7 +417,7 @@ impl InvertedPartition {
 
     pub fn expand_fuzzy(
         &self,
-        tokens: Vec<String>,
+        tokens: &[String],
         fuzziness: Option<u32>,
         max_expansions: usize,
     ) -> Result<Vec<String>> {
@@ -429,7 +428,7 @@ impl InvertedPartition {
                 None => MatchQuery::auto_fuzziness(&token),
             };
             let lev =
-                fst::automaton::Levenshtein::new(&token, fuzziness).map_err(|e| Error::Index {
+                fst::automaton::Levenshtein::new(token, fuzziness).map_err(|e| Error::Index {
                     message: format!("failed to construct the fuzzy query: {}", e),
                     location: location!(),
                 })?;
@@ -466,7 +465,7 @@ impl InvertedPartition {
     ) -> Result<(Vec<u64>, Vec<f32>)> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let tokens = match is_fuzzy {
-            true => self.expand_fuzzy(tokens.to_vec(), params.fuzziness, params.max_expansions)?,
+            true => self.expand_fuzzy(tokens, params.fuzziness, params.max_expansions)?,
             false => tokens.to_vec(),
         };
         let token_ids = self.map(&tokens);

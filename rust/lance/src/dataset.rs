@@ -5369,7 +5369,9 @@ mod tests {
         let ds = create_fts_dataset::<i32, i32>(
             false,
             false,
-            InvertedIndexParams::default().ascii_folding(true),
+            InvertedIndexParams::default()
+                .stem(false)
+                .ascii_folding(true),
         )
         .await;
         let result = ds
