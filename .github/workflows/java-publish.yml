@@ -175,10 +175,13 @@ jobs:
               libhidapi-dev \
               zip \
               unzip \
-
-            # https://github.com/mlflow/mlflow/issues/11801
-            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes openjdk-8-jdk
+          
+            wget -qO - https://adoptopenjdk.jfrog.io/adoptopenjdk/api/gpg/key/public | apt-key add -
+            add-apt-repository --yes https://adoptopenjdk.jfrog.io/adoptopenjdk/deb/
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes adoptopenjdk-8-hotspot
             java -version
+            ls /usr/lib/jvm
             export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
             
             # manually install maven, apt will use java11
