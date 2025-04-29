@@ -64,7 +64,7 @@ use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
 use pyo3::{
-    exceptions::{PyIOError, PyKeyError, PyValueError},
+    exceptions::{PyFileNotFoundError, PyIOError, PyKeyError, PyValueError},
     pybacked::PyBackedStr,
     pyclass,
     types::{IntoPyDict, PyDict},
@@ -1383,15 +1383,40 @@ impl Dataset {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (dest, storage_options = None))]
-    fn drop(dest: String, storage_options: Option<HashMap<String, String>>) -> PyResult<()> {
+    #[pyo3(signature = (dest, storage_options = None, ignore_not_found = None))]
+    fn drop(
+        dest: String,
+        storage_options: Option<HashMap<String, String>>,
+        ignore_not_found: Option<bool>,
+    ) -> PyResult<()> {
         RT.spawn(None, async move {
             let (object_store, path) =
                 object_store_from_uri_or_path(&dest, storage_options).await?;
-            object_store
-                .remove_dir_all(path)
-                .await
-                .map_err(|e| PyIOError::new_err(e.to_string()))
+            let result = object_store.remove_dir_all(path).await;
+
+            match result {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let is_not_found = matches!(&e, lance_core::Error::NotFound { .. });
+
+                    if let Some(true) = ignore_not_found {
+                        if is_not_found {
+                            Ok(())
+                        } else {
+                            Err(PyIOError::new_err(e.to_string()))
+                        }
+                    } else if is_not_found
+                        && (ignore_not_found.is_none() || !ignore_not_found.unwrap())
+                    {
+                        Err(PyFileNotFoundError::new_err(format!(
+                            "Path not found: {}",
+                            dest
+                        )))
+                    } else {
+                        Err(PyIOError::new_err(e.to_string()))
+                    }
+                }
+            }
         })?
     }
 
