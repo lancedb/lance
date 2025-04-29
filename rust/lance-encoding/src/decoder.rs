@@ -232,7 +232,7 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
 use lance_core::{ArrowResult, Error, Result};
-use tracing::instrument;
+use tracing::{instrument, Instrument};
 
 use crate::buffer::LanceBuffer;
 use crate::data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock};
@@ -1495,10 +1495,13 @@ impl BatchDecodeStream {
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
-                let task = tokio::spawn(async move {
-                    let next_task = next_task?;
-                    next_task.into_batch(emitted_batch_size_warning)
-                });
+                let task = tokio::spawn(
+                    (async move {
+                        let next_task = next_task?;
+                        next_task.into_batch(emitted_batch_size_warning)
+                    })
+                    .in_current_span(),
+                );
                 (task, num_rows)
             });
             next_task.map(|(task, num_rows)| {
