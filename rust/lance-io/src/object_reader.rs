@@ -180,7 +180,6 @@ impl Reader for CloudObjectReader {
 #[derive(Debug)]
 pub struct SmallReader {
     path: Path,
-    block_size: usize,
     state: Arc<std::sync::Mutex<SmallReaderState>>,
 }
 
@@ -221,7 +220,6 @@ impl SmallReader {
         );
         Self {
             path,
-            block_size: 64 * 1024,
             state: Arc::new(std::sync::Mutex::new(state)),
         }
     }
@@ -254,7 +252,7 @@ impl Reader for SmallReader {
     }
 
     fn block_size(&self) -> usize {
-        self.block_size
+        64 * 1024
     }
 
     fn io_parallelism(&self) -> usize {
