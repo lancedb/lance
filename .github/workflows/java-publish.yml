@@ -282,13 +282,20 @@ jobs:
             
             export SONATYPE_USER=${{ secrets.SONATYPE_USER }}
             export SONATYPE_TOKEN=${{ secrets.SONATYPE_TOKEN }}
+
             mkdir -p /root/.gnupg
             touch /root/.gnupg/gpg.conf
-            echo \"use-agent\" >> /root/.gnupg/gpg.conf
-            echo \"pinentry-mode loopback\" >> /root/.gnupg/gpg.conf
-            export GPG_TTY=\$(tty)
+            cat <<EOF > /root/.gnupg/gpg.conf
+            use-agent
+            pinentry-mode loopback
+            EOF
+            cat /root/.gnupg/gpg.conf
+          
+            export GPG_TTY=\$TTY
             
-            echo \"${{ secrets.GPG_PRIVATE_KEY }}\" > private.key
+            cat <<EOF > private.key
+            ${{ secrets.GPG_PRIVATE_KEY }}
+            EOF
             cat private.key
             gpg --import private.key
             
