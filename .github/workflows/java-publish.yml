@@ -285,17 +285,14 @@ jobs:
 
             mkdir -p /root/.gnupg
             touch /root/.gnupg/gpg.conf
-            cat <<EOF > /root/.gnupg/gpg.conf
-            use-agent
-            pinentry-mode loopback
-            EOF
+            echo "use-agent" >> /root/.gnupg/gpg.conf
+            echo "pinentry-mode loopback" >> /root/.gnupg/gpg.conf
             cat /root/.gnupg/gpg.conf
           
             export GPG_TTY=\$TTY
             
-            cat <<EOF > signing.key
-            ${{ secrets.GPG_PRIVATE_KEY }}
-            EOF
+            touch signing.key
+            echo \"${{ secrets.GPG_PRIVATE_KEY }}\" >> signing.key
             cat signing.key
             gpg --import signing.key
             
