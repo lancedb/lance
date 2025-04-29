@@ -917,6 +917,7 @@ class LanceDataset(pa.dataset.Dataset):
         this API allows you to open binary blob data as a regular Python file-like
         object. For more details, see :py:class:`lance.BlobFile`.
 
+        Exactly one of ids, addresses, or indices must be specified.
         Parameters
         ----------
         blob_column : str
