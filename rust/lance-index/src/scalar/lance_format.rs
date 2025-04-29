@@ -223,7 +223,7 @@ impl IndexStore for LanceIndexStore {
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
-        let file_scheduler = self.scheduler.open_file(&path).await?;
+        let file_scheduler = self.scheduler.open_file(&path, None).await?;
         match v2::reader::FileReader::try_open(
             file_scheduler,
             None,

@@ -635,8 +635,15 @@ impl ScanScheduler {
         self: &Arc<Self>,
         path: &Path,
         base_priority: u64,
+        file_size_bytes: Option<u64>,
     ) -> Result<FileScheduler> {
-        let reader = self.object_store.open(path).await?;
+        let reader = if let Some(size) = file_size_bytes {
+            self.object_store
+                .open_with_size(path, size as usize)
+                .await?
+        } else {
+            self.object_store.open(path).await?
+        };
         let block_size = self.object_store.block_size() as u64;
         Ok(FileScheduler {
             reader: reader.into(),
@@ -649,8 +656,12 @@ impl ScanScheduler {
     /// Open a file with a default priority of 0
     ///
     /// See [`Self::open_file_with_priority`] for more information on the priority
-    pub async fn open_file(self: &Arc<Self>, path: &Path) -> Result<FileScheduler> {
-        self.open_file_with_priority(path, 0).await
+    pub async fn open_file(
+        self: &Arc<Self>,
+        path: &Path,
+        file_size_bytes: Option<u64>,
+    ) -> Result<FileScheduler> {
+        self.open_file_with_priority(path, 0, file_size_bytes).await
     }
 
     fn do_submit_request(
@@ -890,7 +901,7 @@ mod tests {
 
         let scheduler = ScanScheduler::new(obj_store, config);
 
-        let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
+        let file_scheduler = scheduler.open_file(&tmp_file, None).await.unwrap();
 
         // Read it back 4KiB at a time
         const READ_SIZE: u64 = 4 * 1024;
@@ -960,7 +971,7 @@ mod tests {
         let scan_scheduler = ScanScheduler::new(obj_store, config);
 
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap())
+            .open_file(&Path::parse("foo").unwrap(), None)
             .await
             .unwrap();
 
@@ -1049,7 +1060,7 @@ mod tests {
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
 
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap())
+            .open_file(&Path::parse("foo").unwrap(), None)
             .await
             .unwrap();
 
@@ -1122,7 +1133,7 @@ mod tests {
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap())
+            .open_file(&Path::parse("foo").unwrap(), None)
             .await
             .unwrap();
 
@@ -1151,7 +1162,7 @@ mod tests {
             io_buffer_size_bytes: 1,
         };
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
-        let file_scheduler = scan_scheduler.open_file(&some_path).await.unwrap();
+        let file_scheduler = scan_scheduler.open_file(&some_path, None).await.unwrap();
 
         let mut futs = Vec::with_capacity(10000);
         for idx in 0..10000 {

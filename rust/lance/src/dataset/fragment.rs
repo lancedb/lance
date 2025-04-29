@@ -665,7 +665,7 @@ impl FileFragment {
                 dataset.object_store.clone(),
                 SchedulerConfig::max_bandwidth(&dataset.object_store),
             );
-            let file_scheduler = scheduler.open_file(&filepath).await?;
+            let file_scheduler = scheduler.open_file(&filepath, None).await?;
             let reader = v2::reader::FileReader::try_open(
                 file_scheduler,
                 None,
@@ -697,6 +697,7 @@ impl FileFragment {
                 dataset.schema().field_ids(),
                 column_indices,
                 &file_version,
+                None,
             );
             Ok(frag)
         }
@@ -883,7 +884,7 @@ impl FileFragment {
                     )
                 };
             let file_scheduler = store_scheduler
-                .open_file_with_priority(&path, reader_priority as u64)
+                .open_file_with_priority(&path, reader_priority as u64, data_file.file_size_bytes)
                 .await?;
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let path = file_scheduler.reader().path().clone();

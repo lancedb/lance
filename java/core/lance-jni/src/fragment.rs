@@ -223,7 +223,7 @@ fn create_fragment<'a>(
 }
 
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/fragment/DataFile";
-const DATA_FILE_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;[I[III)V";
+const DATA_FILE_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;[I[IIILjava/lang/Long;)V";
 const DELETE_FILE_CLASS: &str = "com/lancedb/lance/fragment/DeletionFile";
 const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFileType;)V";
@@ -238,6 +238,10 @@ impl IntoJava for &DataFile {
         let path = env.new_string(self.path.clone())?.into();
         let fields = JLance(self.fields.clone()).into_java(env)?;
         let column_indices = JLance(self.column_indices.clone()).into_java(env)?;
+        let file_size_bytes = match self.file_size_bytes {
+            Some(f) => JLance(f as i64).into_java(env)?,
+            None => JObject::null(),
+        };
         Ok(env.new_object(
             DATA_FILE_CLASS,
             DATA_FILE_CONSTRUCTOR_SIG,
@@ -247,6 +251,7 @@ impl IntoJava for &DataFile {
                 JValueGen::Object(&column_indices),
                 JValueGen::Int(self.file_major_version as i32),
                 JValueGen::Int(self.file_minor_version as i32),
+                JValueGen::Object(&file_size_bytes),
             ],
         )?)
     }
@@ -453,12 +458,17 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
         let file_minor_version = env
             .call_method(self, "getFileMinorVersion", "()I", &[])?
             .i()? as u32;
+        let file_size_bytes: Option<i64> = env
+            .call_method(self, "getFileSizeBytes", "()Ljava/lang/Long;", &[])?
+            .l()?
+            .extract_object(env)?;
         Ok(DataFile {
             path,
             fields,
             column_indices,
             file_major_version,
             file_minor_version,
+            file_size_bytes: file_size_bytes.map(|r| r as u64),
         })
     }
 }

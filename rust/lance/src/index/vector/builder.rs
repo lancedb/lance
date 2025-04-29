@@ -725,7 +725,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             } else {
                 let storage_part_path = self.temp_dir.child(format!("storage_part{}", part_id));
                 let reader = FileReader::try_open(
-                    scheduler.open_file(&storage_part_path).await?,
+                    scheduler.open_file(&storage_part_path, None).await?,
                     None,
                     Arc::<DecoderPlugins>::default(),
                     &FileMetadataCache::no_cache(),
@@ -759,7 +759,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             } else {
                 let index_part_path = self.temp_dir.child(format!("index_part{}", part_id));
                 let reader = FileReader::try_open(
-                    scheduler.open_file(&index_part_path).await?,
+                    scheduler.open_file(&index_part_path, None).await?,
                     None,
                     Arc::<DecoderPlugins>::default(),
                     &FileMetadataCache::no_cache(),
