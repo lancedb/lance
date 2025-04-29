@@ -296,7 +296,7 @@ pub(super) async fn add_columns(
     transforms: NewColumnTransform,
     read_columns: Option<Vec<String>>,
     batch_size: Option<u32>,
-) -> Result<()> {
+) -> Result<u64> {
     let (fragments, schema) = add_columns_to_fragments(
         dataset,
         transforms,
@@ -314,11 +314,11 @@ pub(super) async fn add_columns(
         /*blob_op= */ None,
         None,
     );
-    dataset
+    let version = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await?;
 
-    Ok(())
+    Ok(version)
 }
 
 #[allow(clippy::type_complexity)]
@@ -456,7 +456,7 @@ async fn add_columns_from_stream(
 pub(super) async fn alter_columns(
     dataset: &mut Dataset,
     alterations: &[ColumnAlteration],
-) -> Result<()> {
+) -> Result<u64> {
     // Validate we aren't making nullable columns non-nullable and that all
     // the referenced columns actually exist.
     let mut new_schema = dataset.schema().clone();
@@ -626,11 +626,11 @@ pub(super) async fn alter_columns(
 
     // TODO: adjust the indices here for the new schema
 
-    dataset
+    let version = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await?;
 
-    Ok(())
+    Ok(version)
 }
 
 /// Remove columns from the dataset.
@@ -639,7 +639,7 @@ pub(super) async fn alter_columns(
 /// underlying storage. In order to remove the data, you must subsequently
 /// call `compact_files` to rewrite the data without the removed columns and
 /// then call `cleanup_old_versions` to remove the old files.
-pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Result<()> {
+pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Result<u64> {
     // Check if columns are present in the dataset and construct the new schema.
     for col in columns {
         if let Some(field) = dataset.schema().field(col) {
@@ -678,11 +678,11 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         None,
     );
 
-    dataset
+    let version = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await?;
 
-    Ok(())
+    Ok(version)
 }
 
 #[cfg(test)]

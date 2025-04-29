@@ -795,7 +795,7 @@ impl Dataset {
         transaction: Transaction,
         write_config: &ManifestWriteConfig,
         commit_config: &CommitConfig,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let (manifest, manifest_path, manifest_e_tag) = commit_transaction(
             self,
             self.object_store(),
@@ -811,7 +811,7 @@ impl Dataset {
         self.manifest_file = manifest_path;
         self.manifest_e_tag = manifest_e_tag;
 
-        Ok(())
+        Ok(self.manifest.version)
     }
 
     /// Create a Scanner to scan the dataset.
@@ -939,7 +939,7 @@ impl Dataset {
     }
 
     /// Delete rows based on a predicate.
-    pub async fn delete(&mut self, predicate: &str) -> Result<()> {
+    pub async fn delete(&mut self, predicate: &str) -> Result<u64> {
         let mut updated_fragments: Vec<Fragment> = Vec::new();
         let mut deleted_fragment_ids: Vec<u64> = Vec::new();
         stream::iter(self.get_fragments())
@@ -976,10 +976,11 @@ impl Dataset {
             None,
         );
 
-        self.apply_commit(transaction, &Default::default(), &Default::default())
+        let version = self
+            .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
-        Ok(())
+        Ok(version)
     }
 
     pub async fn count_deleted_rows(&self) -> Result<usize> {
@@ -1430,12 +1431,13 @@ impl Dataset {
 /// when no other write operations are being run.
 impl Dataset {
     /// Append new columns to the dataset.
+    /// Returns: The dataset version number after this write operation completes successfully.
     pub async fn add_columns(
         &mut self,
         transforms: NewColumnTransform,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         schema_evolution::add_columns(self, transforms, read_columns, batch_size).await
     }
 
@@ -1447,7 +1449,8 @@ impl Dataset {
     /// be dropped. The old column data will not be immediately deleted. To remove
     /// it, call [optimize::compact_files()] and then
     /// [cleanup::cleanup_old_versions()] on the dataset.
-    pub async fn alter_columns(&mut self, alterations: &[ColumnAlteration]) -> Result<()> {
+    /// Returns: The dataset version number after this write operation completes successfully.
+    pub async fn alter_columns(&mut self, alterations: &[ColumnAlteration]) -> Result<u64> {
         schema_evolution::alter_columns(self, alterations).await
     }
 
@@ -1457,7 +1460,8 @@ impl Dataset {
     /// underlying storage. In order to remove the data, you must subsequently
     /// call [optimize::compact_files()] to rewrite the data without the removed columns and
     /// then call [cleanup::cleanup_old_versions()] to remove the old files.
-    pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
+    /// Returns: The dataset version number after this write operation completes successfully.
+    pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<u64> {
         schema_evolution::drop_columns(self, columns).await
     }
 
@@ -1468,7 +1472,8 @@ impl Dataset {
     /// - `columns`: the list of column names to drop.
     #[deprecated(since = "0.9.12", note = "Please use `drop_columns` instead.")]
     pub async fn drop(&mut self, columns: &[&str]) -> Result<()> {
-        self.drop_columns(columns).await
+        self.drop_columns(columns).await?;
+        Ok(())
     }
 
     async fn merge_impl(
@@ -3517,7 +3522,9 @@ mod tests {
         }
 
         // Delete nothing
-        dataset.delete("i < 0").await.unwrap();
+        let version_before = dataset.version().version;
+        let version_after = dataset.delete("i < 0").await.unwrap();
+        assert_eq!(version_before + 1, version_after);
         dataset.validate().await.unwrap();
 
         // We should not have any deletion file still
@@ -3530,7 +3537,8 @@ mod tests {
         assert!(fragments[1].metadata.deletion_file.is_none());
 
         // Delete rows
-        dataset.delete("i < 10 OR i >= 90").await.unwrap();
+        let version_after_new = dataset.delete("i < 10 OR i >= 90").await.unwrap();
+        assert_eq!(version_after + 1, version_after_new);
         dataset.validate().await.unwrap();
 
         // Verify result:
