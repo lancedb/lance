@@ -293,11 +293,11 @@ jobs:
           
             export GPG_TTY=\$TTY
             
-            cat <<EOF > private.key
+            cat <<EOF > signing.key
             ${{ secrets.GPG_PRIVATE_KEY }}
             EOF
-            cat private.key
-            gpg --import private.key
+            cat signing.key
+            gpg --import signing.key
             
             mvn --batch-mode -DskipTests -Drust.release.build=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh -P shade-jar
           "
