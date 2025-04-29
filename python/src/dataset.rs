@@ -60,7 +60,7 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::{
     optimize::OptimizeOptions,
-    scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType, InvertedIndexParams},
+    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams, ScalarIndexType},
     vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
         sq::builder::SQBuildParams,
