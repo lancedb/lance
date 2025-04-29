@@ -922,11 +922,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         blob_column : str
             The name of the blob column to select.
-        ids : List Array or array-like
+        ids : Integer Array or array-like
             row IDs to select in the dataset.
-        addresses: List Array or array-like
+        addresses: Integer Array or array-like
             The (unstable) row addresses to select in the dataset.
-        indices : List Array or array-like
+        indices : Integer Array or array-like
             The offset / indices of the row in the dataset.
 
         Returns
