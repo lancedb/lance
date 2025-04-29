@@ -459,3 +459,15 @@ def test_fragment_metadata_pickle(tmp_path: Path, enable_move_stable_row_ids: bo
     round_trip = pickle.loads(pickle.dumps(frag_meta))
 
     assert frag_meta == round_trip
+
+
+def test_write_fragment_with_file_writer_option(tmp_path: Path):
+    df = pd.DataFrame({"a": [1, 2, 3, 4, 5]})
+    file_writer_options = {"data_cache_bytes": "4096", "max_page_bytes": "4096"}
+    frag = LanceFragment.create(tmp_path, df, file_writer_options=file_writer_options)
+
+    assert len(frag.files) == 1
+    assert frag.files[0].fields == [0]
+    assert frag.physical_rows == 5
+    assert frag.row_id_meta is None
+    assert frag.deletion_file is None

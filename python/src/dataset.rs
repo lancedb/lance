@@ -41,6 +41,7 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
+use lance_file::v2::writer::FileWriterOptions;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::inverted::query::{
     BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
@@ -59,7 +60,7 @@ use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
-use log::error;
+use log::{error, warn};
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
@@ -1818,6 +1819,31 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                 storage_options: Some(storage_options),
                 ..Default::default()
             });
+        }
+
+        if let Some(writer_options) =
+            get_dict_opt::<HashMap<String, String>>(options, "file_writer_options")?
+        {
+            let mut file_writer_options = FileWriterOptions::default();
+            if let Some(max_page_bytes) = writer_options.get("max_page_bytes") {
+                file_writer_options.max_page_bytes = match max_page_bytes.parse::<u64>() {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!("Failed to parse max_page_bytes: {}, using default", e);
+                        None
+                    }
+                }
+            }
+            if let Some(data_cache_bytes) = writer_options.get("data_cache_bytes") {
+                file_writer_options.data_cache_bytes = match data_cache_bytes.parse::<u64>() {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!("Failed to parse data_cache_bytes: {}, using default", e);
+                        None
+                    }
+                }
+            }
+            p.file_writer_options = Some(file_writer_options);
         }
 
         if let Some(enable_move_stable_row_ids) =
