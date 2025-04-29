@@ -7,6 +7,13 @@ on:
   pull_request:
     paths:
       - .github/workflows/java-publish.yml
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Directly publish the Java artifact under the current version'
+        required: true
+        default: false
+
 
 jobs:
   macos-arm64:
@@ -142,7 +149,9 @@ jobs:
       - name: Check glibc version outside docker
         run: ldd --version
       - name: Build and run in Ubuntu 20.04 container (Dry Run)
-        if: github.event_name == 'pull_request'
+        if: |
+          github.event_name == 'pull_request' ||
+          inputs.dry_run == 'true'
         run: |
           docker run --platform linux/amd64 -v ${{ github.workspace }}:/workspace -w /workspace openjdk:8-jdk-buster bash -c "
             set -ex
@@ -207,7 +216,9 @@ jobs:
             mvn --batch-mode -DskipTests -Drust.release.build=true package
           "
       - name: Build and run in Ubuntu 20.04 container (Publish to Sonatype)
-        if: github.event_name == 'release'
+        if: |
+          github.event_name == 'release' ||
+          inputs.dry_run == 'false'
         run: |
           docker run --platform linux/amd64 -v ${{ github.workspace }}:/workspace -w /workspace openjdk:8-jdk-buster bash -c "
             set -ex
@@ -271,8 +282,19 @@ jobs:
             
             export SONATYPE_USER=${{ secrets.SONATYPE_USER }}
             export SONATYPE_TOKEN=${{ secrets.SONATYPE_TOKEN }}
-            echo "use-agent" >> ~/.gnupg/gpg.conf
-            echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
-            export GPG_TTY=$(tty)
+
+            mkdir -p /root/.gnupg
+            touch /root/.gnupg/gpg.conf
+            echo 'use-agent' >> /root/.gnupg/gpg.conf
+            echo 'pinentry-mode loopback' >> /root/.gnupg/gpg.conf
+            cat /root/.gnupg/gpg.conf
+          
+            export GPG_TTY=\$TTY
+            
+            touch signing.key
+            echo '${{ secrets.GPG_PRIVATE_KEY }}' >> signing.key
+            cat signing.key
+            gpg --import signing.key
+            
             mvn --batch-mode -DskipTests -Drust.release.build=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh -P shade-jar
           "

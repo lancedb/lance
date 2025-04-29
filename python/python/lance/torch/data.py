@@ -349,7 +349,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     dict_batch[col] = batch[col]
                 for col in self._blob_columns:
                     dict_batch[col] = self.dataset.take_blobs(
-                        row_ids=row_ids.to_pylist(), blob_column=col
+                        ids=row_ids.to_pylist(), blob_column=col
                     )
                 batch = dict_batch
             if self._to_tensor_fn is not None:

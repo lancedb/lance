@@ -570,6 +570,11 @@ impl LanceScanExec {
     pub fn projection(&self) -> &Arc<Schema> {
         &self.projection
     }
+
+    // Get the scan config for this scan.
+    pub fn config(&self) -> &LanceScanConfig {
+        &self.config
+    }
 }
 
 impl ExecutionPlan for LanceScanExec {
