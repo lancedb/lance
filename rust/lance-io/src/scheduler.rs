@@ -637,13 +637,15 @@ impl ScanScheduler {
         base_priority: u64,
         file_size_bytes: Option<u64>,
     ) -> Result<FileScheduler> {
-        let reader = if let Some(size) = file_size_bytes {
-            self.object_store
-                .open_with_size(path, size as usize)
-                .await?
+        let file_size_bytes = if let Some(size) = file_size_bytes {
+            size as usize
         } else {
-            self.object_store.open(path).await?
+            self.object_store.size(path).await?
         };
+        let reader = self
+            .object_store
+            .open_with_size(path, file_size_bytes)
+            .await?;
         let block_size = self.object_store.block_size() as u64;
         Ok(FileScheduler {
             reader: reader.into(),
@@ -956,7 +958,7 @@ mod tests {
         let obj_store = Arc::new(ObjectStore::new(
             Arc::new(obj_store),
             Url::parse("mem://").unwrap(),
-            None,
+            Some(500),
             None,
             false,
             false,
@@ -971,7 +973,7 @@ mod tests {
         let scan_scheduler = ScanScheduler::new(obj_store, config);
 
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap(), None)
+            .open_file(&Path::parse("foo").unwrap(), Some(1000))
             .await
             .unwrap();
 
@@ -1045,7 +1047,7 @@ mod tests {
         let obj_store = Arc::new(ObjectStore::new(
             Arc::new(obj_store),
             Url::parse("mem://").unwrap(),
-            None,
+            Some(500),
             None,
             false,
             false,
@@ -1060,7 +1062,7 @@ mod tests {
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
 
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap(), None)
+            .open_file(&Path::parse("foo").unwrap(), Some(100000))
             .await
             .unwrap();
 
@@ -1133,7 +1135,7 @@ mod tests {
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap(), None)
+            .open_file(&Path::parse("foo").unwrap(), Some(100000))
             .await
             .unwrap();
 

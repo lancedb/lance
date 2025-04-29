@@ -2240,13 +2240,18 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen, RowCount};
     use lance_file::version::LanceFileVersion;
+    use lance_io::object_store::ObjectStoreParams;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use tempfile::tempdir;
     use v2::writer::FileWriterOptions;
 
     use super::*;
-    use crate::{dataset::transaction::Operation, utils::test::TestDatasetGenerator};
+    use crate::{
+        dataset::{transaction::Operation, InsertBuilder},
+        session::Session,
+        utils::test::{StatsHolder, TestDatasetGenerator},
+    };
 
     async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -3316,5 +3321,71 @@ mod tests {
                 .unwrap(),
             256
         );
+    }
+
+    #[tokio::test]
+    async fn test_iops_read_small() {
+        // Create a file that has 10 columns.
+        let schema = Arc::new(ArrowSchema::new(
+            (0..10)
+                .map(|i| ArrowField::new(format!("col_{}", i), DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ));
+
+        // Single row batch
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            (0..10)
+                .map(|i| Arc::new(Int32Array::from(vec![i])) as ArrayRef)
+                .collect(),
+        )
+        .unwrap();
+        let session = Arc::new(Session::default());
+        let io_stats = Arc::new(StatsHolder::default());
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(io_stats.clone()),
+                ..Default::default()
+            }),
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://test")
+            .with_params(&write_params)
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        let fragment = dataset.get_fragments().pop().unwrap();
+
+        // Assert file is small (< 4kb)
+        {
+            let stats = io_stats.incremental_stats();
+            assert_eq!(stats.write_iops, 3);
+            assert!(stats.write_bytes < 4096);
+        }
+
+        // Measure IOPS needed to scan all data first time.
+        let projection = Schema::try_from(schema.as_ref())
+            .unwrap()
+            .project_by_ids(&[0, 1, 2, 3, 4, 6, 7, 8, 9], true);
+        let reader = fragment
+            .open(&projection, Default::default())
+            .await
+            .unwrap();
+        let mut data = reader
+            .read_all(1024)
+            .unwrap()
+            .buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(data.len(), 1);
+        let data = data.pop().unwrap();
+        assert_eq!(data.num_rows(), 1);
+        assert_eq!(data.num_columns(), 9);
+
+        let stats = io_stats.incremental_stats();
+        assert_eq!(stats.read_iops, 1);
+        assert!(stats.read_bytes < 4096);
     }
 }
