@@ -934,7 +934,7 @@ class LanceDataset(pa.dataset.Dataset):
         blob_files : List[BlobFile]
         """
         if sum([bool(v is not None) for v in [ids, addresses, indices]]) != 1:
-            raise ValueError("Exactly one of ids or indices must be specified")
+            raise ValueError("Exactly one of ids, indices, or addresses must be specified")
 
         if ids is not None:
             lance_blob_files = self._ds.take_blobs(ids, blob_column)
