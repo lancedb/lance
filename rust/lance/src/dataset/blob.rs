@@ -8,6 +8,12 @@ use arrow::datatypes::UInt64Type;
 use arrow_schema::DataType;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
+use object_store::path::Path;
+use snafu::location;
+use tokio::sync::Mutex;
+
+use super::Dataset;
+use crate::io::exec::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};
 use lance_core::{
     datatypes::{Schema, StorageClass, BLOB_META_KEY},
     error::CloneableResult,
@@ -18,13 +24,6 @@ use lance_core::{
     Error, Result,
 };
 use lance_io::traits::Reader;
-use object_store::path::Path;
-use snafu::location;
-use tokio::sync::Mutex;
-
-use crate::io::exec::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};
-
-use super::Dataset;
 
 /// Current state of the reader.  Held in a mutex for easy sharing
 ///
@@ -292,10 +291,11 @@ mod tests {
 
     use arrow::{array::AsArray, datatypes::UInt64Type};
     use arrow_array::RecordBatch;
+    use tempfile::{tempdir, TempDir};
+
     use lance_core::{Error, Result};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_file::version::LanceFileVersion;
-    use tempfile::{tempdir, TempDir};
 
     use crate::{utils::test::TestDatasetGenerator, Dataset};
 
@@ -362,6 +362,43 @@ mod tests {
                 .value(*expected_row_idx);
 
             assert_eq!(&val, expected);
+        }
+    }
+
+    #[tokio::test]
+    pub async fn test_take_blobs_by_indices() {
+        let fixture = BlobTestFixture::new().await;
+
+        let fragments = fixture.dataset.fragments();
+        assert!(fragments.len() >= 2);
+        let mut indices = Vec::with_capacity(fragments.len());
+        let mut last = 2;
+
+        for frag in fragments.iter() {
+            indices.push(last as u64);
+            last += frag.num_rows().unwrap_or(0);
+        }
+        indices.pop();
+
+        // Row indices
+        assert_eq!(indices, [2, 12, 22, 32, 42, 52, 62, 72, 82]);
+        let blobs = fixture
+            .dataset
+            .take_blobs_by_indices(&indices, "blobs")
+            .await
+            .unwrap();
+
+        // Row IDs
+        let row_ids = fragments
+            .iter()
+            .map(|frag| (frag.id << 32) + 2)
+            .collect::<Vec<_>>();
+        let blobs2 = fixture.dataset.take_blobs(&row_ids, "blobs").await.unwrap();
+
+        for (blob1, blob2) in blobs.iter().zip(blobs2.iter()) {
+            assert_eq!(blob1.position, blob2.position);
+            assert_eq!(blob1.size, blob2.size);
+            assert_eq!(blob1.data_file, blob2.data_file);
         }
     }
 

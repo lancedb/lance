@@ -17,6 +17,19 @@ use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::Duration;
 use futures::{StreamExt, TryFutureExt};
+use log::error;
+use object_store::path::Path;
+use pyo3::exceptions::{PyStopIteration, PyTypeError};
+use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
+use pyo3::{
+    exceptions::{PyIOError, PyKeyError, PyValueError},
+    pybacked::PyBackedStr,
+    pyclass,
+    types::{IntoPyDict, PyDict},
+    PyObject, PyResult,
+};
+use pyo3::{prelude::*, IntoPyObjectExt};
+use snafu::location;
 
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
@@ -45,10 +58,9 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::inverted::query::{
     BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
-use lance_index::scalar::InvertedIndexParams;
 use lance_index::{
     optimize::OptimizeOptions,
-    scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType},
+    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams, ScalarIndexType},
     vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
         sq::builder::SQBuildParams,
@@ -59,19 +71,6 @@ use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
-use log::error;
-use object_store::path::Path;
-use pyo3::exceptions::{PyStopIteration, PyTypeError};
-use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
-use pyo3::{
-    exceptions::{PyIOError, PyKeyError, PyValueError},
-    pybacked::PyBackedStr,
-    pyclass,
-    types::{IntoPyDict, PyDict},
-    PyObject, PyResult,
-};
-use pyo3::{prelude::*, IntoPyObjectExt};
-use snafu::location;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
@@ -875,6 +874,20 @@ impl Dataset {
             .block_on(
                 Some(self_.py()),
                 self_.ds.take_blobs(&row_indices, blob_column),
+            )?
+            .infer_error()?;
+        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+    }
+
+    fn take_blobs_by_indices(
+        self_: PyRef<'_, Self>,
+        row_indices: Vec<u64>,
+        blob_column: &str,
+    ) -> PyResult<Vec<LanceBlobFile>> {
+        let blobs = RT
+            .block_on(
+                Some(self_.py()),
+                self_.ds.take_blobs_by_indices(&row_indices, blob_column),
             )?
             .infer_error()?;
         Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
