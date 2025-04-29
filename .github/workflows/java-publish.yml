@@ -7,6 +7,13 @@ on:
   pull_request:
     paths:
       - .github/workflows/java-publish.yml
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Directly publish the Java artifact under the current version'
+        required: true
+        default: false
+
 
 jobs:
   macos-arm64:
