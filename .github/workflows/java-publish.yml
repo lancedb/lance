@@ -142,8 +142,9 @@ jobs:
       - name: Check glibc version outside docker
         run: ldd --version
       - name: Build and run in Ubuntu 20.04 container (Dry Run)
-        if: github.event_name == 'release'
-#        if: github.event_name == 'pull_request'
+        if: |
+          github.event_name == 'pull_request' ||
+          inputs.dry_run == 'true'
         run: |
           docker run --platform linux/amd64 -v ${{ github.workspace }}:/workspace -w /workspace openjdk:8-jdk-buster bash -c "
             set -ex
@@ -208,7 +209,9 @@ jobs:
             mvn --batch-mode -DskipTests -Drust.release.build=true package
           "
       - name: Build and run in Ubuntu 20.04 container (Publish to Sonatype)
-#        if: github.event_name == 'release'
+        if: |
+          github.event_name == 'release' ||
+          inputs.dry_run == 'false'
         run: |
           docker run --platform linux/amd64 -v ${{ github.workspace }}:/workspace -w /workspace openjdk:8-jdk-buster bash -c "
             set -ex
