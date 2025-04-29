@@ -5173,9 +5173,9 @@ mod tests {
             .unwrap();
         assert_eq!(result.num_rows(), 3, "{:?}", result);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert!(ids.contains(&0));
-        assert!(ids.contains(&1));
-        assert!(ids.contains(&2));
+        assert!(ids.contains(&0), "{:?}", result);
+        assert!(ids.contains(&1), "{:?}", result);
+        assert!(ids.contains(&2), "{:?}", result);
 
         let result = ds
             .scan()
@@ -5208,7 +5208,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_rows(), 2, "{:?}", result);
 
         let result = ds
             .scan()

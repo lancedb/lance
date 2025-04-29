@@ -29,7 +29,11 @@ use snafu::location;
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
-use super::{index::*, InvertedIndexParams};
+use super::{
+    index::*,
+    merger::{Merger, SizeBasedMerger},
+    InvertedIndexParams,
+};
 
 // the number of elements in each block
 // each block contains 128 row ids and 128 frequencies
@@ -63,9 +67,9 @@ lazy_static! {
         .unwrap_or_else(|_| "8".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_NUM_SHARDS");
-    // the partition size limit in GiB (compressed format), larger for better performance,
+    // the partition size limit in GiB (uncompressed format), larger for better performance,
     // but more memory footprint while indexing, this counts only posting lists size
-    pub static ref LANCE_FTS_PARTITION_SIZE: usize = std::env::var("LANCE_FTS_PARTITION_SIZE")
+    pub static ref LANCE_FTS_PARTITION_SIZE: u64 = std::env::var("LANCE_FTS_PARTITION_SIZE")
         .unwrap_or_else(|_| "2".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_PARTITION_SIZE");
@@ -263,22 +267,32 @@ impl InvertedIndexBuilder {
     }
 
     async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
-        for &partition_id in &self.partitions {
-            self.local_store
-                .copy_index_file(&token_file_path(partition_id), dest_store)
-                .await?;
-            self.local_store
-                .copy_index_file(&posting_file_path(partition_id), dest_store)
-                .await?;
-            self.local_store
-                .copy_index_file(&doc_file_path(partition_id), dest_store)
-                .await?;
-        }
+        let partitions = futures::future::try_join_all(
+            self.partitions
+                .iter()
+                .map(|part| InvertedPartition::load(self.local_store.clone(), *part)),
+        )
+        .await?;
+        let mut merger = SizeBasedMerger::new(
+            self.local_store.clone(),
+            dest_store,
+            partitions.iter(),
+            (*LANCE_FTS_PARTITION_SIZE << 30) * 8,
+        );
+        let partitions = merger.merge().await?;
+        // for partition_id in partitions {
+        //     self.local_store
+        //         .copy_index_file(&token_file_path(partition_id), dest_store)
+        //         .await?;
+        //     self.local_store
+        //         .copy_index_file(&posting_file_path(partition_id), dest_store)
+        //         .await?;
+        //     self.local_store
+        //         .copy_index_file(&doc_file_path(partition_id), dest_store)
+        //         .await?;
+        // }
         let metadata = HashMap::from_iter(vec![
-            (
-                "partitions".to_owned(),
-                serde_json::to_string(&self.partitions)?,
-            ),
+            ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
         ]);
         let mut writer = dest_store
@@ -298,11 +312,11 @@ impl Default for InvertedIndexBuilder {
 
 // builder for single partition
 #[derive(Debug)]
-struct InnerBuilder {
+pub(crate) struct InnerBuilder {
     id: u64,
-    tokens: TokenSet,
-    posting_lists: Vec<PostingListBuilder>,
-    docs: DocSet,
+    pub(crate) tokens: TokenSet,
+    pub(crate) posting_lists: Vec<PostingListBuilder>,
+    pub(crate) docs: DocSet,
 }
 
 impl InnerBuilder {
@@ -313,6 +327,10 @@ impl InnerBuilder {
             posting_lists: Vec::new(),
             docs: DocSet::default(),
         }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub async fn write(&mut self, store: &dyn IndexStore) -> Result<()> {
@@ -373,7 +391,7 @@ struct IndexWorker {
     flush_channel: tokio::sync::mpsc::Sender<InnerBuilder>,
     flush_task: tokio::task::JoinHandle<Result<()>>,
     schema: SchemaRef,
-    estimated_size: usize,
+    estimated_size: u64,
     total_doc_length: usize,
 }
 
@@ -443,7 +461,7 @@ impl IndexWorker {
                 .resize_with(self.builder.tokens.len(), || {
                     PostingListBuilder::empty(with_position)
                 });
-            let doc_id = self.builder.docs.append(row_id, token_num);
+            let doc_id = self.builder.docs.add(row_id, token_num);
             self.total_doc_length += doc.len();
 
             token_occurrences
@@ -457,7 +475,9 @@ impl IndexWorker {
                     self.estimated_size += new_size - old_size;
                 });
 
-            if doc_id == u32::MAX || self.estimated_size >= *LANCE_FTS_PARTITION_SIZE << 30 {
+            if self.builder.docs.len() as u32 == u32::MAX
+                || self.estimated_size >= *LANCE_FTS_PARTITION_SIZE << 30
+            {
                 self.flush()?;
             }
         }
@@ -514,7 +534,7 @@ impl IndexWorker {
 #[derive(Debug, Clone)]
 pub enum PositionRecorder {
     Position(Vec<u32>),
-    Count(usize),
+    Count(u32),
 }
 
 impl PositionRecorder {
@@ -533,9 +553,9 @@ impl PositionRecorder {
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(&self) -> u32 {
         match self {
-            Self::Position(positions) => positions.len(),
+            Self::Position(positions) => positions.len() as u32,
             Self::Count(count) => *count,
         }
     }

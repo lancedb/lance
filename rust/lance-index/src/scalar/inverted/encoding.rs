@@ -157,8 +157,7 @@ pub fn decompress_posting_list(
     let remainder = num_docs as usize % BLOCK_SIZE;
     if remainder > 0 {
         let compressed = posting_list.value(bitpacking_blocks);
-        decompress_remainder(compressed, remainder, &mut doc_ids);
-        decompress_remainder(&compressed[remainder * 4..], remainder, &mut frequencies);
+        decompress_posting_remainder(compressed, remainder, &mut doc_ids, &mut frequencies);
     }
 
     Ok((doc_ids, frequencies))
@@ -210,6 +209,16 @@ pub fn decompress_posting_block(
 ) {
     let num_bytes = decompress_sorted_block(block, buffer, doc_ids);
     decompress_block(&block[num_bytes..], buffer, frequencies);
+}
+
+pub fn decompress_posting_remainder(
+    block: &[u8],
+    n: usize,
+    doc_ids: &mut Vec<u32>,
+    frequencies: &mut Vec<u32>,
+) {
+    decompress_remainder(block, n, doc_ids);
+    decompress_remainder(&block[n * 4..], n, frequencies);
 }
 
 pub fn decompress_sorted_block(

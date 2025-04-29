@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::fmt::Debug;
-use std::sync::Arc;
 use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
     ops::RangeInclusive,
 };
+use std::{collections::hash_map, fmt::Debug};
+use std::{collections::BTreeMap, sync::Arc};
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
@@ -64,11 +64,16 @@ use super::{
     scorer::{idf, BM25Scorer, Scorer, B, K1},
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
-use crate::prefilter::PreFilter;
 use crate::scalar::{
     AnyQuery, IndexReader, IndexStore, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
 };
 use crate::Index;
+use crate::{
+    prefilter::PreFilter,
+    scalar::inverted::encoding::{
+        decompress_posting_block, decompress_posting_remainder, decompress_remainder,
+    },
+};
 
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
@@ -389,6 +394,21 @@ pub(crate) struct InvertedPartition {
 }
 
 impl InvertedPartition {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+    pub fn num_docs(&self) -> usize {
+        self.docs.len()
+    }
+
+    pub fn num_tokens(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn size(&self) -> u64 {
+        self.inverted_list.size()
+    }
+
     pub async fn load(store: Arc<dyn IndexStore>, id: u64) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file).await?;
@@ -611,6 +631,13 @@ impl TokenSet {
         self.tokens.len()
     }
 
+    pub fn iter(&self) -> TokenIterator {
+        TokenIterator::new(match &self.tokens {
+            TokenMap::HashMap(map) => TokenSource::HashMap(map.iter()),
+            TokenMap::Fst(map) => TokenSource::Fst(map.stream()),
+        })
+    }
+
     pub fn to_batch(self) -> Result<RecordBatch> {
         let mut token_builder = StringBuilder::with_capacity(self.tokens.len(), self.total_length);
         let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
@@ -705,6 +732,35 @@ impl TokenSet {
     }
 }
 
+enum TokenSource<'a> {
+    HashMap(hash_map::Iter<'a, String, u32>),
+    Fst(fst::map::Stream<'a>),
+}
+pub struct TokenIterator<'a> {
+    source: TokenSource<'a>,
+}
+
+impl<'a> TokenIterator<'a> {
+    pub fn new(source: TokenSource<'a>) -> Self {
+        Self { source }
+    }
+}
+
+impl<'a> Iterator for TokenIterator<'a> {
+    type Item = (String, u32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.source {
+            TokenSource::HashMap(iter) => iter
+                .next()
+                .map(|(token, token_id)| (token.clone(), *token_id)),
+            TokenSource::Fst(iter) => iter.next().map(|(token, token_id)| {
+                (String::from_utf8_lossy(token).into_owned(), token_id as u32)
+            }),
+        }
+    }
+}
+
 pub struct PostingListReader {
     reader: Arc<dyn IndexReader>,
 
@@ -737,8 +793,10 @@ impl std::fmt::Debug for PostingListReader {
 impl DeepSizeOf for PostingListReader {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.offsets.deep_size_of_children(context)
-            // + self.lengths.deep_size_of_children(context)
+            + self.max_scores.deep_size_of_children(context)
+            + self.lengths.deep_size_of_children(context)
             + self.posting_cache.weighted_size() as usize
+            + self.position_cache.weighted_size() as usize
     }
 }
 
@@ -818,6 +876,11 @@ impl PostingListReader {
         }
     }
 
+    // the file size of the posting lists
+    pub fn size(&self) -> u64 {
+        self.reader.size()
+    }
+
     pub(crate) fn has_positions(&self) -> bool {
         self.has_position
     }
@@ -843,7 +906,11 @@ impl PostingListReader {
         }
     }
 
-    async fn posting_batch(&self, token_id: u32, with_position: bool) -> Result<RecordBatch> {
+    pub(crate) async fn posting_batch(
+        &self,
+        token_id: u32,
+        with_position: bool,
+    ) -> Result<RecordBatch> {
         if self.offsets.is_some() {
             self.posting_batch_legacy(token_id, with_position).await
         } else {
@@ -1011,6 +1078,10 @@ impl PostingList {
         }
     }
 
+    pub fn iter(&self) -> PostingListIterator {
+        PostingListIterator::new(self)
+    }
+
     pub fn set_positions(&mut self, positions: ListArray) {
         match self {
             PostingList::Plain(posting) => posting.positions = Some(positions),
@@ -1071,6 +1142,39 @@ impl Into<PostingListBuilder> for PostingList {
     }
 }
 
+pub enum PostingListIterator<'a> {
+    Plain(PlainPostingListIterator<'a>),
+    Compressed(CompressedPostingListIterator),
+}
+
+impl<'a> PostingListIterator<'a> {
+    pub fn new(posting: &'a PostingList) -> Self {
+        match posting {
+            PostingList::Plain(posting) => Self::Plain(std::iter::zip(
+                posting.row_ids.iter(),
+                posting.frequencies.iter(),
+            )),
+            PostingList::Compressed(posting) => Self::Compressed(
+                CompressedPostingListIterator::new(posting.length as usize, posting.blocks.clone()),
+            ),
+        }
+    }
+}
+
+impl Iterator for PostingListIterator<'_> {
+    type Item = (u64, u32, Some(&[u32]));
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            PostingListIterator::Plain(iter) => {
+                iter.next().map(|(doc_id, freq)| (*doc_id, *freq as u32))
+            }
+            PostingListIterator::Compressed(iter) => {
+                iter.next().map(|(doc_id, freq)| (doc_id as u64, freq))
+            }
+        }
+    }
+}
 #[derive(Debug, PartialEq, Clone)]
 pub struct PlainPostingList {
     pub row_ids: ScalarBuffer<u64>,
@@ -1078,6 +1182,9 @@ pub struct PlainPostingList {
     pub max_score: Option<f32>,
     pub positions: Option<ListArray>, // List of Int32
 }
+
+type PlainPostingListIterator<'a> =
+    std::iter::Zip<std::slice::Iter<'a, u64>, std::slice::Iter<'a, f32>>;
 
 impl DeepSizeOf for PlainPostingList {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
@@ -1189,6 +1296,63 @@ impl CompressedPostingList {
     }
 }
 
+pub struct CompressedPostingListIterator {
+    remainder: usize,
+    blocks: LargeBinaryArray,
+    next_block_idx: usize,
+    iter: InnerIterator,
+    buffer: [u32; BLOCK_SIZE],
+}
+
+type InnerIterator = std::iter::Zip<std::vec::IntoIter<u32>, std::vec::IntoIter<u32>>;
+
+impl CompressedPostingListIterator {
+    pub fn new(length: usize, blocks: LargeBinaryArray) -> Self {
+        debug_assert!(length > 0);
+        debug_assert_eq!(blocks.len(), length.div_ceil(BLOCK_SIZE));
+
+        Self {
+            remainder: length % BLOCK_SIZE,
+            blocks,
+            next_block_idx: 0,
+            buffer: [0; BLOCK_SIZE],
+            iter: std::iter::zip(Vec::new(), Vec::new()),
+        }
+    }
+}
+
+impl Iterator for CompressedPostingListIterator {
+    type Item = (u32, u32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some((doc_id, freq)) = self.iter.next() {
+            return Some((doc_id, freq));
+        }
+
+        // move to the next block
+        if self.next_block_idx >= self.blocks.len() {
+            return None;
+        }
+        let compressed = self.blocks.value(self.next_block_idx);
+        self.next_block_idx += 1;
+
+        let mut doc_ids = Vec::with_capacity(BLOCK_SIZE);
+        let mut frequencies = Vec::with_capacity(BLOCK_SIZE);
+        if self.next_block_idx == self.blocks.len() && self.remainder > 0 {
+            decompress_posting_remainder(
+                compressed,
+                self.remainder,
+                &mut doc_ids,
+                &mut frequencies,
+            );
+        } else {
+            decompress_posting_block(compressed, &mut self.buffer, &mut doc_ids, &mut frequencies);
+        }
+        self.iter = std::iter::zip(doc_ids, frequencies);
+        self.next()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PostingListBuilder {
     pub doc_ids: Vec<u32>,
@@ -1197,14 +1361,14 @@ pub struct PostingListBuilder {
 }
 
 impl PostingListBuilder {
-    pub fn size(&self) -> usize {
-        std::mem::size_of::<u32>() * self.doc_ids.len()
+    pub fn size(&self) -> u64 {
+        (std::mem::size_of::<u32>() * self.doc_ids.len()
             + std::mem::size_of::<f32>() * self.frequencies.len()
             + self
                 .positions
                 .as_ref()
                 .map(|positions| positions.size())
-                .unwrap_or(0)
+                .unwrap_or(0)) as u64
     }
 
     // pub fn try_from_batches(batches: &[RecordBatch]) -> Result<Self> {
@@ -1509,7 +1673,7 @@ impl Ord for RawDocInfo {
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct DocSet {
     row_ids: Vec<u64>,
-    num_tokens: Vec<u32>,
+    num_tokens: BTreeMap<u64, u32>, // row_id -> num_tokens
     total_tokens: u64,
 }
 
@@ -1521,6 +1685,10 @@ impl DocSet {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&u64, &u32)> {
+        self.num_tokens.iter()
     }
 
     pub fn row_id(&self, doc_id: u32) -> u64 {
@@ -1541,8 +1709,10 @@ impl DocSet {
     }
 
     pub fn to_batch(&self) -> Result<RecordBatch> {
-        let row_id_col = UInt64Array::from(self.row_ids.clone());
-        let num_tokens_col = UInt32Array::from(self.num_tokens.clone());
+        let row_id_col = UInt64Array::from_iter_values(self.row_ids.iter().cloned());
+        let num_tokens_col = UInt32Array::from_iter_values(
+            self.row_ids.iter().map(|row_id| self.num_tokens[row_id]),
+        );
 
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
@@ -1565,13 +1735,15 @@ impl DocSet {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
-        for &num_tokens in num_tokens_col.values() {
+        let mut mapping = BTreeMap::new();
+        for (&row_id, &num_tokens) in row_id_col.values().iter().zip(num_tokens_col.values()) {
             total_tokens += num_tokens as u64;
+            mapping.insert(row_id, num_tokens);
         }
 
         Ok(Self {
             row_ids: row_id_col.values().to_vec(),
-            num_tokens: num_tokens_col.values().to_vec(),
+            num_tokens: mapping,
             total_tokens,
         })
     }
@@ -1590,20 +1762,23 @@ impl DocSet {
 
     #[inline]
     pub fn num_tokens(&self, doc_id: u64) -> u32 {
-        self.num_tokens[doc_id as usize]
+        let row_id = self.row_ids[doc_id as usize];
+        self.num_tokens[&row_id]
     }
 
     #[inline]
     pub fn num_tokens_by_row_id(&self, row_id: u64) -> u32 {
-        let doc_id = self.row_ids.binary_search(&row_id).unwrap();
-        self.num_tokens[doc_id]
+        self.num_tokens[&row_id]
     }
 
-    // append a new document to the doc set
-    // returns the doc_id (the number of documents before appending)
-    pub fn append(&mut self, row_id: u64, num_tokens: u32) -> u32 {
-        self.row_ids.push(row_id);
-        self.num_tokens.push(num_tokens);
+    // add a document to the doc set
+    // returns the doc_id (the number of documents before adding)
+    pub fn add(&mut self, row_id: u64, num_tokens: u32) -> u32 {
+        let value = self.num_tokens.entry(row_id).or_insert_with(|| {
+            self.row_ids.push(row_id);
+            0
+        });
+        *value += num_tokens;
         self.total_tokens += num_tokens as u64;
         self.row_ids.len() as u32 - 1
     }

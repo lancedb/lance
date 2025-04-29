@@ -4,6 +4,7 @@
 pub mod builder;
 mod encoding;
 mod index;
+mod merger;
 pub mod query;
 mod scorer;
 pub mod tokenizer;
@@ -15,7 +16,7 @@ use lance_core::Result;
 pub use tokenizer::*;
 
 use super::btree::TrainingSource;
-use super::{IndexStore, InvertedIndexParams};
+use super::IndexStore;
 
 pub async fn train_inverted_index(
     data_source: Box<dyn TrainingSource>,

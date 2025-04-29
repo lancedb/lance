@@ -22,7 +22,6 @@ use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
-use serde::{Deserialize, Serialize};
 use snafu::location;
 
 use crate::metrics::MetricsCollector;
@@ -149,6 +148,8 @@ pub trait IndexReader: Send + Sync {
     fn num_rows(&self) -> usize;
     /// Return the metadata of the file
     fn schema(&self) -> &lance_core::datatypes::Schema;
+    /// Return the size of the file
+    fn size(&self) -> u64;
 }
 
 /// Trait abstracting I/O away from index logic
