@@ -958,7 +958,7 @@ mod tests {
         let obj_store = Arc::new(ObjectStore::new(
             Arc::new(obj_store),
             Url::parse("mem://").unwrap(),
-            None,
+            Some(500),
             None,
             false,
             false,
@@ -973,7 +973,7 @@ mod tests {
         let scan_scheduler = ScanScheduler::new(obj_store, config);
 
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap(), None)
+            .open_file(&Path::parse("foo").unwrap(), Some(1000))
             .await
             .unwrap();
 
