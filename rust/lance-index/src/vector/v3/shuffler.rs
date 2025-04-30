@@ -272,7 +272,7 @@ impl ShuffleReader for IvfShufflerReader {
         let partition_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
 
         let reader = FileReader::try_open(
-            self.scheduler.open_file(&partition_path).await?,
+            self.scheduler.open_file(&partition_path, None).await?,
             None,
             Arc::<DecoderPlugins>::default(),
             &FileMetadataCache::no_cache(),

@@ -95,7 +95,7 @@ fn bench_full_read(c: &mut Criterion) {
                     runtime.block_on(async {
                         let scheduler =
                             ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
-                        let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
+                        let file_scheduler = scheduler.open_file(&tmp_file, None).await.unwrap();
 
                         let (tx, rx) = mpsc::channel(1024);
                         let drainer = tokio::spawn(drain_task(rx));
@@ -185,7 +185,8 @@ fn bench_random_read(c: &mut Criterion) {
                                 obj_store,
                                 SchedulerConfig::default_for_testing(),
                             );
-                            let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
+                            let file_scheduler =
+                                scheduler.open_file(&tmp_file, None).await.unwrap();
 
                             let (tx, rx) = mpsc::channel(1024);
                             let drainer = tokio::spawn(drain_task(rx));

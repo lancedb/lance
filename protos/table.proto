@@ -308,6 +308,13 @@ message DataFile {
   // If both `file_major_version` and `file_minor_version` are set to 0,
   // then this is a version 0.1 or version 0.2 file.
   uint32 file_minor_version = 5;
+
+  // The known size of the file on disk in bytes.
+  //
+  // This is used to quickly find the footer of the file.
+  //
+  // When this is zero, it should be interpreted as "unknown".
+  uint64 file_size_bytes = 6;
 } // DataFile
 
 // Deletion File

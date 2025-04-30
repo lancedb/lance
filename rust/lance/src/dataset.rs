@@ -5963,6 +5963,7 @@ mod tests {
             column_indices: vec![0],
             file_major_version: 2,
             file_minor_version: 0,
+            file_size_bytes: None,
         };
 
         let dataset = Dataset::commit(
@@ -6016,6 +6017,7 @@ mod tests {
             column_indices: vec![0],
             file_major_version: 2,
             file_minor_version: 0,
+            file_size_bytes: None,
         };
 
         let dataset = Dataset::commit(
@@ -6113,6 +6115,7 @@ mod tests {
             column_indices: vec![0],
             file_major_version: 2,
             file_minor_version: 0,
+            file_size_bytes: None,
         };
 
         let new_data_file = DataFile {

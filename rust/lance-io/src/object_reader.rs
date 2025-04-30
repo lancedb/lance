@@ -7,8 +7,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
-use futures::future::BoxFuture;
-use lance_core::Result;
+use futures::{
+    future::{BoxFuture, Shared},
+    FutureExt,
+};
+use lance_core::{error::CloneableError, Error, Result};
 use object_store::{path::Path, GetOptions, GetResult, ObjectStore, Result as OSResult};
 use tokio::sync::OnceCell;
 use tracing::instrument;
@@ -164,5 +167,138 @@ impl Reader for CloudObjectReader {
             || "read_all".to_string(),
         )
         .await
+    }
+}
+
+/// A reader for a file so small, we just eagerly read it all into memory.
+///
+/// When created, it represents a future that will read the whole file into memory.
+///
+/// On the first read call, it will start the read. Multiple threads can call read at the same time.
+///
+/// Once the read is complete, any thread can call read again to get the result.
+#[derive(Debug)]
+pub struct SmallReader {
+    path: Path,
+    state: Arc<std::sync::Mutex<SmallReaderState>>,
+}
+
+enum SmallReaderState {
+    Loading(Shared<BoxFuture<'static, std::result::Result<Bytes, CloneableError>>>),
+    Finished(std::result::Result<Bytes, CloneableError>),
+}
+
+impl std::fmt::Debug for SmallReaderState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loading(_) => write!(f, "Loading"),
+            Self::Finished(Ok(data)) => {
+                write!(f, "Finished({} bytes)", data.len())
+            }
+            Self::Finished(Err(err)) => {
+                write!(f, "Finished({})", err.0)
+            }
+        }
+    }
+}
+
+impl SmallReader {
+    pub fn new(store: Arc<dyn ObjectStore>, path: Path, download_retry_count: usize) -> Self {
+        let path_ref = path.clone();
+        let state = SmallReaderState::Loading(
+            Box::pin(async move {
+                let object_reader =
+                    CloudObjectReader::new(store, path_ref, 0, None, download_retry_count)
+                        .map_err(CloneableError)?;
+                object_reader
+                    .get_all()
+                    .await
+                    .map_err(|err| CloneableError(Error::from(err)))
+            })
+            .boxed()
+            .shared(),
+        );
+        Self {
+            path,
+            state: Arc::new(std::sync::Mutex::new(state)),
+        }
+    }
+
+    async fn wait(&self) -> OSResult<Bytes> {
+        let future = {
+            let state = self.state.lock().unwrap();
+            match &*state {
+                SmallReaderState::Loading(future) => future.clone(),
+                SmallReaderState::Finished(result) => {
+                    return result.clone().map_err(|err| err.0.into());
+                }
+            }
+        };
+
+        let result = future.await;
+        let result_to_return = result.clone().map_err(|err| err.0.into());
+        let mut state = self.state.lock().unwrap();
+        if matches!(*state, SmallReaderState::Loading(_)) {
+            *state = SmallReaderState::Finished(result);
+        }
+        result_to_return
+    }
+}
+
+#[async_trait]
+impl Reader for SmallReader {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn block_size(&self) -> usize {
+        64 * 1024
+    }
+
+    fn io_parallelism(&self) -> usize {
+        1024
+    }
+
+    /// Object/File Size.
+    async fn size(&self) -> OSResult<usize> {
+        self.wait().await.map(|bytes| bytes.len())
+    }
+
+    async fn get_range(&self, range: Range<usize>) -> OSResult<Bytes> {
+        self.wait().await.and_then(|bytes| {
+            let start = range.start;
+            let end = range.end;
+            if start >= bytes.len() || end > bytes.len() {
+                return Err(object_store::Error::Generic {
+                    store: "memory",
+                    source: format!(
+                        "Invalid range {}..{} for object of size {} bytes",
+                        start,
+                        end,
+                        bytes.len()
+                    )
+                    .into(),
+                });
+            }
+            Ok(bytes.slice(range))
+        })
+    }
+
+    async fn get_all(&self) -> OSResult<Bytes> {
+        self.wait().await
+    }
+}
+
+impl DeepSizeOf for SmallReader {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        let mut size = self.path.as_ref().deep_size_of_children(context);
+
+        if let Ok(guard) = self.state.try_lock() {
+            if let SmallReaderState::Finished(Ok(data)) = &*guard {
+                size += data.len();
+            }
+        }
+
+        size
     }
 }
