@@ -26,6 +26,7 @@ use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
+    utils::CachedFileSize,
 };
 use object_store::path::Path;
 use snafu::location;
@@ -272,7 +273,9 @@ impl ShuffleReader for IvfShufflerReader {
         let partition_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
 
         let reader = FileReader::try_open(
-            self.scheduler.open_file(&partition_path, None).await?,
+            self.scheduler
+                .open_file(&partition_path, &CachedFileSize::unknown())
+                .await?,
             None,
             Arc::<DecoderPlugins>::default(),
             &FileMetadataCache::no_cache(),

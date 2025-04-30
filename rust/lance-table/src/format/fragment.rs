@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::num::NonZero;
+
 use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
 use lance_file::version::LanceFileVersion;
+use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -37,7 +40,7 @@ pub struct DataFile {
     pub file_minor_version: u32,
 
     /// The size of the file in bytes, if known.
-    pub file_size_bytes: Option<u64>,
+    pub file_size_bytes: CachedFileSize,
 }
 
 impl DataFile {
@@ -47,7 +50,7 @@ impl DataFile {
         column_indices: Vec<i32>,
         file_major_version: u32,
         file_minor_version: u32,
-        file_size_bytes: Option<u64>,
+        file_size_bytes: Option<NonZero<u64>>,
     ) -> Self {
         Self {
             path: path.into(),
@@ -55,7 +58,7 @@ impl DataFile {
             column_indices,
             file_major_version,
             file_minor_version,
-            file_size_bytes,
+            file_size_bytes: file_size_bytes.into(),
         }
     }
 
@@ -71,7 +74,7 @@ impl DataFile {
             column_indices: vec![],
             file_major_version,
             file_minor_version,
-            file_size_bytes: None,
+            file_size_bytes: Default::default(),
         }
     }
 
@@ -89,7 +92,7 @@ impl DataFile {
     pub fn new_legacy(
         path: impl Into<String>,
         schema: &Schema,
-        file_size_bytes: Option<u64>,
+        file_size_bytes: Option<NonZero<u64>>,
     ) -> Self {
         let mut field_ids = schema.field_ids();
         field_ids.sort();
@@ -139,7 +142,7 @@ impl From<&DataFile> for pb::DataFile {
             column_indices: df.column_indices.clone(),
             file_major_version: df.file_major_version,
             file_minor_version: df.file_minor_version,
-            file_size_bytes: df.file_size_bytes.unwrap_or_default(),
+            file_size_bytes: df.file_size_bytes.get().map_or(0, |v| v.get()),
         }
     }
 }
@@ -154,11 +157,7 @@ impl TryFrom<pb::DataFile> for DataFile {
             column_indices: proto.column_indices,
             file_major_version: proto.file_major_version,
             file_minor_version: proto.file_minor_version,
-            file_size_bytes: if proto.file_size_bytes > 0 {
-                Some(proto.file_size_bytes)
-            } else {
-                None
-            },
+            file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
         })
     }
 }
@@ -329,7 +328,7 @@ impl Fragment {
         field_ids: Vec<i32>,
         column_indices: Vec<i32>,
         version: &LanceFileVersion,
-        file_size_bytes: Option<u64>,
+        file_size_bytes: Option<NonZero<u64>>,
     ) {
         let (major, minor) = version.to_numbers();
         self.files.push(DataFile::new(

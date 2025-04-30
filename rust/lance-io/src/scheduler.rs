@@ -9,6 +9,7 @@ use snafu::location;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;
+use std::num::NonZero;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,7 @@ use lance_core::{Error, Result};
 
 use crate::object_store::ObjectStore;
 use crate::traits::Reader;
+use crate::utils::CachedFileSize;
 
 // Don't log backpressure warnings until at least this many seconds have passed
 const BACKPRESSURE_MIN: u64 = 5;
@@ -637,12 +639,16 @@ impl ScanScheduler {
         self: &Arc<Self>,
         path: &Path,
         base_priority: u64,
-        file_size_bytes: Option<u64>,
+        file_size_bytes: &CachedFileSize,
     ) -> Result<FileScheduler> {
-        let file_size_bytes = if let Some(size) = file_size_bytes {
-            size as usize
+        let file_size_bytes = if let Some(size) = file_size_bytes.get() {
+            u64::from(size) as usize
         } else {
-            self.object_store.size(path).await?
+            let size = self.object_store.size(path).await?;
+            if let Some(size) = NonZero::new(size as u64) {
+                file_size_bytes.set(size);
+            }
+            size as usize
         };
         let reader = self
             .object_store
@@ -663,7 +669,7 @@ impl ScanScheduler {
     pub async fn open_file(
         self: &Arc<Self>,
         path: &Path,
-        file_size_bytes: Option<u64>,
+        file_size_bytes: &CachedFileSize,
     ) -> Result<FileScheduler> {
         self.open_file_with_priority(path, 0, file_size_bytes).await
     }
@@ -905,7 +911,10 @@ mod tests {
 
         let scheduler = ScanScheduler::new(obj_store, config);
 
-        let file_scheduler = scheduler.open_file(&tmp_file, None).await.unwrap();
+        let file_scheduler = scheduler
+            .open_file(&tmp_file, &CachedFileSize::unknown())
+            .await
+            .unwrap();
 
         // Read it back 4KiB at a time
         const READ_SIZE: u64 = 4 * 1024;
@@ -975,7 +984,7 @@ mod tests {
         let scan_scheduler = ScanScheduler::new(obj_store, config);
 
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap(), Some(1000))
+            .open_file(&Path::parse("foo").unwrap(), &CachedFileSize::new(1000))
             .await
             .unwrap();
 
@@ -1064,7 +1073,7 @@ mod tests {
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
 
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap(), Some(100000))
+            .open_file(&Path::parse("foo").unwrap(), &CachedFileSize::new(100000))
             .await
             .unwrap();
 
@@ -1137,7 +1146,7 @@ mod tests {
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap(), Some(100000))
+            .open_file(&Path::parse("foo").unwrap(), &CachedFileSize::new(100000))
             .await
             .unwrap();
 
@@ -1166,7 +1175,10 @@ mod tests {
             io_buffer_size_bytes: 1,
         };
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
-        let file_scheduler = scan_scheduler.open_file(&some_path, None).await.unwrap();
+        let file_scheduler = scan_scheduler
+            .open_file(&some_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
 
         let mut futs = Vec::with_capacity(10000);
         for idx in 0..10000 {

@@ -43,6 +43,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{
     read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
+    CachedFileSize,
 };
 use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
@@ -868,7 +869,9 @@ impl DatasetIndexInternalExt for Dataset {
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
-                let file = scheduler.open_file(&index_file, None).await?;
+                let file = scheduler
+                    .open_file(&index_file, &CachedFileSize::unknown())
+                    .await?;
                 let reader = v2::reader::FileReader::try_open(
                     file,
                     None,

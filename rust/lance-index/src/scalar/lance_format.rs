@@ -21,6 +21,7 @@ use lance_file::{
     writer::{FileWriter, ManifestProvider},
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
@@ -223,7 +224,10 @@ impl IndexStore for LanceIndexStore {
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
-        let file_scheduler = self.scheduler.open_file(&path, None).await?;
+        let file_scheduler = self
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await?;
         match v2::reader::FileReader::try_open(
             file_scheduler,
             None,

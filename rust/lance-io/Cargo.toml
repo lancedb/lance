@@ -37,6 +37,7 @@ lazy_static.workspace = true
 log.workspace = true
 pin-project.workspace = true
 prost.workspace = true
+serde.workspace = true
 shellexpand.workspace = true
 snafu.workspace = true
 tokio.workspace = true

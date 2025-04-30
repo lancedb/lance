@@ -49,6 +49,7 @@ use lance_index::{
 use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::local::to_local_path;
 use lance_io::scheduler::SchedulerConfig;
+use lance_io::utils::CachedFileSize;
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader, ReadBatchParams,
 };
@@ -133,7 +134,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .unwrap_or_else(FileMetadataCache::no_cache);
         let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
         let index_reader = FileReader::try_open(
-            scheduler.open_file(&uri, None).await?,
+            scheduler
+                .open_file(&uri, &CachedFileSize::unknown())
+                .await?,
             None,
             Arc::<DecoderPlugins>::default(),
             &file_metadata_cache,
@@ -185,7 +188,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     &index_dir
                         .child(uuid.as_str())
                         .child(INDEX_AUXILIARY_FILE_NAME),
-                    None,
+                    &CachedFileSize::unknown(),
                 )
                 .await?,
             None,

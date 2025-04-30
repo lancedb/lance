@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::cmp::min;
+use std::{cmp::min, num::NonZero, sync::atomic::AtomicU64};
 
 use arrow_array::{
     types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
@@ -10,8 +10,10 @@ use arrow_array::{
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
+use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use prost::Message;
+use serde::{Deserialize, Serialize};
 use snafu::location;
 
 use crate::{
@@ -169,6 +171,66 @@ pub fn read_struct_from_buf<
 ) -> Result<T> {
     let msg: M = read_message_from_buf(buf)?;
     T::try_from(msg)
+}
+
+/// A cached file size.
+///
+/// This wraps an atomic u64 to allow setting the cached file size without
+/// needed a mutable reference.
+///
+/// Zero is interpreted as unknown.
+#[derive(Debug, Deserialize, DeepSizeOf, Serialize)]
+pub struct CachedFileSize(AtomicU64);
+
+impl From<Option<NonZero<u64>>> for CachedFileSize {
+    fn from(size: Option<NonZero<u64>>) -> Self {
+        match size {
+            Some(size) => Self(AtomicU64::new(size.into())),
+            None => Self(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Default for CachedFileSize {
+    fn default() -> Self {
+        Self(AtomicU64::new(0))
+    }
+}
+
+impl Clone for CachedFileSize {
+    fn clone(&self) -> Self {
+        Self(AtomicU64::new(
+            self.0.load(std::sync::atomic::Ordering::Relaxed),
+        ))
+    }
+}
+
+impl PartialEq for CachedFileSize {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+            == other.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Eq for CachedFileSize {}
+
+impl CachedFileSize {
+    pub fn new(size: u64) -> Self {
+        Self(AtomicU64::new(size))
+    }
+
+    pub fn unknown() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    pub fn get(&self) -> Option<NonZero<u64>> {
+        NonZero::new(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn set(&self, size: NonZero<u64>) {
+        self.0
+            .store(size.into(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

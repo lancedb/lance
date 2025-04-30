@@ -46,6 +46,7 @@ use lance_index::{
 use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::scheduler::SchedulerConfig;
 use lance_io::stream::RecordBatchStream;
+use lance_io::utils::CachedFileSize;
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, stream::RecordBatchStreamAdapter,
     ReadBatchParams,
@@ -725,7 +726,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             } else {
                 let storage_part_path = self.temp_dir.child(format!("storage_part{}", part_id));
                 let reader = FileReader::try_open(
-                    scheduler.open_file(&storage_part_path, None).await?,
+                    scheduler
+                        .open_file(&storage_part_path, &CachedFileSize::unknown())
+                        .await?,
                     None,
                     Arc::<DecoderPlugins>::default(),
                     &FileMetadataCache::no_cache(),
@@ -759,7 +762,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             } else {
                 let index_part_path = self.temp_dir.child(format!("index_part{}", part_id));
                 let reader = FileReader::try_open(
-                    scheduler.open_file(&index_part_path, None).await?,
+                    scheduler
+                        .open_file(&index_part_path, &CachedFileSize::unknown())
+                        .await?,
                     None,
                     Arc::<DecoderPlugins>::default(),
                     &FileMetadataCache::no_cache(),

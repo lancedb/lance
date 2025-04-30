@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::num::NonZero;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -490,7 +491,11 @@ impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String
         let size_bytes = self.0.tell().await?;
         Ok((
             self.0.finish().await? as u32,
-            DataFile::new_legacy(self.1.clone(), self.0.schema(), Some(size_bytes as u64)),
+            DataFile::new_legacy(
+                self.1.clone(),
+                self.0.schema(),
+                NonZero::new(size_bytes as u64),
+            ),
         ))
     }
 }
@@ -532,7 +537,7 @@ impl GenericWriter for V2WriterAdapter {
             column_indices,
             major,
             minor,
-            Some(self.writer.tell().await?),
+            NonZero::new(self.writer.tell().await?),
         );
         Ok((num_rows, data_file))
     }

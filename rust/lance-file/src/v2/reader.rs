@@ -1401,7 +1401,7 @@ pub mod tests {
         encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodingOptions},
         version::LanceFileVersion,
     };
-    use lance_io::stream::RecordBatchStream;
+    use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
     use log::debug;
     use tokio::sync::mpsc;
 
@@ -1498,7 +1498,11 @@ pub mod tests {
         let WrittenFile { data, .. } = create_some_file(&fs, LanceFileVersion::V2_0).await;
 
         for read_size in [32, 1024, 1024 * 1024] {
-            let file_scheduler = fs.scheduler.open_file(&fs.tmp_path, None).await.unwrap();
+            let file_scheduler = fs
+                .scheduler
+                .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
             let file_reader = FileReader::try_open(
                 file_scheduler,
                 None,
@@ -1592,7 +1596,11 @@ pub mod tests {
         let fs = FsFixture::default();
 
         let written_file = create_some_file(&fs, LanceFileVersion::V2_0).await;
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path, None).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
 
         let field_id_mapping = written_file
             .field_id_mapping
@@ -1735,7 +1743,11 @@ pub mod tests {
         let fs = FsFixture::default();
 
         let written_file = create_some_file(&fs, LanceFileVersion::V2_0).await;
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path, None).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
 
         // We can specify the projection as part of the read operation via read_stream_projected
         let file_reader = FileReader::try_open(
@@ -1787,7 +1799,11 @@ pub mod tests {
         let WrittenFile { data, .. } = create_some_file(&fs, LanceFileVersion::V2_0).await;
         let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path, None).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
@@ -1819,7 +1835,11 @@ pub mod tests {
         let WrittenFile { data, schema, .. } = create_some_file(&fs, LanceFileVersion::V2_1).await;
         let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path, None).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             Some(ReaderProjection::from_column_names(&schema, &["score"]).unwrap()),
@@ -1856,7 +1876,11 @@ pub mod tests {
         let WrittenFile { data, .. } = create_some_file(&fs, LanceFileVersion::V2_0).await;
         let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path, None).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
@@ -1904,7 +1928,11 @@ pub mod tests {
             .map(|batch| batch.num_rows())
             .sum::<usize>();
 
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path, None).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
@@ -1980,7 +2008,11 @@ pub mod tests {
 
         file_writer.finish().await.unwrap();
 
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path, None).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,

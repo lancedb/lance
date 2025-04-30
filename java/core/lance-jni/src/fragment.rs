@@ -23,6 +23,7 @@ use jni::{
     JNIEnv,
 };
 use lance::table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
+use lance_io::utils::CachedFileSize;
 use std::iter::once;
 
 use lance::dataset::fragment::FileFragment;
@@ -238,8 +239,8 @@ impl IntoJava for &DataFile {
         let path = env.new_string(self.path.clone())?.into();
         let fields = JLance(self.fields.clone()).into_java(env)?;
         let column_indices = JLance(self.column_indices.clone()).into_java(env)?;
-        let file_size_bytes = match self.file_size_bytes {
-            Some(f) => JLance(f as i64).into_java(env)?,
+        let file_size_bytes = match self.file_size_bytes.get() {
+            Some(f) => JLance(u64::from(f) as i64).into_java(env)?,
             None => JObject::null(),
         };
         Ok(env.new_object(
@@ -462,13 +463,15 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             .call_method(self, "getFileSizeBytes", "()Ljava/lang/Long;", &[])?
             .l()?
             .extract_object(env)?;
+        let file_size_bytes =
+            file_size_bytes.map_or(Default::default(), |r| CachedFileSize::new(r as u64));
         Ok(DataFile {
             path,
             fields,
             column_indices,
             file_major_version,
             file_minor_version,
-            file_size_bytes: file_size_bytes.map(|r| r as u64),
+            file_size_bytes,
         })
     }
 }

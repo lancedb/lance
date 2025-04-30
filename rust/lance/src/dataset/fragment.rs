@@ -35,6 +35,7 @@ use lance_file::version::LanceFileVersion;
 use lance_file::{determine_file_version, v2};
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
@@ -666,7 +667,9 @@ impl FileFragment {
                 dataset.object_store.clone(),
                 SchedulerConfig::max_bandwidth(&dataset.object_store),
             );
-            let file_scheduler = scheduler.open_file(&filepath, None).await?;
+            let file_scheduler = scheduler
+                .open_file(&filepath, &CachedFileSize::unknown())
+                .await?;
             let reader = v2::reader::FileReader::try_open(
                 file_scheduler,
                 None,
@@ -885,7 +888,7 @@ impl FileFragment {
                     )
                 };
             let file_scheduler = store_scheduler
-                .open_file_with_priority(&path, reader_priority as u64, data_file.file_size_bytes)
+                .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
                 .await?;
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let path = file_scheduler.reader().path().clone();

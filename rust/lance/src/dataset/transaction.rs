@@ -996,7 +996,7 @@ impl Transaction {
                                 new_file.file_minor_version,
                             )
                             .expect("Expected valid file version"),
-                            new_file.file_size_bytes,
+                            new_file.file_size_bytes.get(),
                         );
                     }
 

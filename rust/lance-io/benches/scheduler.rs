@@ -7,6 +7,7 @@ use lance_core::Result;
 use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
+    utils::CachedFileSize,
 };
 use object_store::path::Path;
 use rand::{seq::SliceRandom, RngCore};
@@ -95,7 +96,10 @@ fn bench_full_read(c: &mut Criterion) {
                     runtime.block_on(async {
                         let scheduler =
                             ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
-                        let file_scheduler = scheduler.open_file(&tmp_file, None).await.unwrap();
+                        let file_scheduler = scheduler
+                            .open_file(&tmp_file, &CachedFileSize::unknown())
+                            .await
+                            .unwrap();
 
                         let (tx, rx) = mpsc::channel(1024);
                         let drainer = tokio::spawn(drain_task(rx));
@@ -185,8 +189,10 @@ fn bench_random_read(c: &mut Criterion) {
                                 obj_store,
                                 SchedulerConfig::default_for_testing(),
                             );
-                            let file_scheduler =
-                                scheduler.open_file(&tmp_file, None).await.unwrap();
+                            let file_scheduler = scheduler
+                                .open_file(&tmp_file, &CachedFileSize::unknown())
+                                .await
+                                .unwrap();
 
                             let (tx, rx) = mpsc::channel(1024);
                             let drainer = tokio::spawn(drain_task(rx));

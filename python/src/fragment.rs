@@ -24,6 +24,7 @@ use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform};
 use lance::Error;
+use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
@@ -652,13 +653,15 @@ impl<'py> IntoPyObject<'py> for PyLance<Fragment> {
 
 impl FromPyObject<'_> for PyLance<DataFile> {
     fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
+        let file_size_bytes: Option<u64> = ob.getattr("file_size_bytes")?.extract()?;
+        let file_size_bytes = CachedFileSize::new(file_size_bytes.unwrap_or(0));
         Ok(Self(DataFile {
             path: ob.getattr("path")?.extract()?,
             fields: ob.getattr("fields")?.extract()?,
             column_indices: ob.getattr("column_indices")?.extract()?,
             file_major_version: ob.getattr("file_major_version")?.extract()?,
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
-            file_size_bytes: ob.getattr("file_size_bytes")?.extract()?,
+            file_size_bytes,
         }))
     }
 }
@@ -674,13 +677,14 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             .and_then(|m| m.getattr("DataFile"))
             .expect("DataFile class not found");
 
+        let file_size_bytes = self.0.file_size_bytes.get().map(u64::from);
         cls.call1((
             &self.0.path,
             self.0.fields.clone(),
             self.0.column_indices.clone(),
             self.0.file_major_version,
             self.0.file_minor_version,
-            self.0.file_size_bytes,
+            file_size_bytes,
         ))
     }
 }
