@@ -758,6 +758,31 @@ def test_bitmap_index(tmp_path: Path):
     assert indices[0]["type"] == "Bitmap"
 
 
+def test_bitmap_remap(tmp_path: Path):
+    # Make one full fragment
+    tbl = pa.Table.from_arrays(
+        [pa.array([["a", "b"][i % 2] for i in range(10)])], names=["a"]
+    )
+    ds = lance.write_dataset(tbl, tmp_path, max_rows_per_file=10)
+
+    # Make two half fragments
+    tbl = pa.Table.from_arrays(
+        [pa.array([["a", "b"][i % 2] for i in range(10)])], names=["a"]
+    )
+    ds = lance.write_dataset(tbl, tmp_path, max_rows_per_file=5, mode="append")
+
+    # Create scalar index
+    ds.create_scalar_index("a", index_type="BITMAP")
+
+    # Run compaction (two partials will be remapped, full will not)
+    compaction = ds.optimize.compact_files(target_rows_per_fragment=10)
+    assert compaction.fragments_removed == 2
+
+    for category in ["a", "b"]:
+        # All rows should still be in index
+        assert ds.count_rows(f"a = '{category}'") == 10
+
+
 def test_ngram_index(tmp_path: Path):
     """Test create ngram index"""
     tbl = pa.Table.from_arrays(
