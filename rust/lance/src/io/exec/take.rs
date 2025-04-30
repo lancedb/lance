@@ -29,8 +29,10 @@ use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use tracing::instrument;
 
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
 use crate::dataset::rowids::get_row_id_index;
@@ -492,6 +494,7 @@ impl ExecutionPlan for TakeExec {
         }
     }
 
+    #[instrument(level = "debug", skip(self, context))]
     fn execute(
         &self,
         partition: usize,
@@ -524,7 +527,7 @@ impl ExecutionPlan for TakeExec {
         let output_schema = self.output_schema.clone();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
-            lazy_take_stream.flatten(),
+            lazy_take_stream.flatten().stream_in_current_span(),
         )))
     }
 
