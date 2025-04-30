@@ -352,7 +352,13 @@ impl Dataset {
             return Ok(self.clone());
         }
 
-        let manifest = Self::load_manifest(self.object_store.as_ref(), &manifest_location).await?;
+        let manifest = Self::load_manifest(
+            self.object_store.as_ref(),
+            &manifest_location,
+            &base_path,
+            self.session.as_ref(),
+        )
+        .await?;
         Self::checkout_manifest(
             self.object_store.clone(),
             base_path,
@@ -373,6 +379,8 @@ impl Dataset {
     async fn load_manifest(
         object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
+        base_path: &Path,
+        session: &Session,
     ) -> Result<Manifest> {
         let object_reader = if let Some(size) = manifest_location.size {
             object_store
@@ -441,7 +449,17 @@ impl Dataset {
                         as usize;
                 let message_data =
                     &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-                todo!("Decode indices from last block")
+                let section = lance_table::format::pb::IndexSection::decode(message_data)?;
+                let indices = section
+                    .indices
+                    .into_iter()
+                    .map(Index::try_from)
+                    .collect::<Result<Vec<_>>>()?;
+                session.index_cache.insert_metadata(
+                    base_path.as_ref(),
+                    manifest_location.version,
+                    Arc::new(indices),
+                );
             }
         }
 

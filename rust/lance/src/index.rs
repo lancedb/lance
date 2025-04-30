@@ -404,11 +404,9 @@ impl DatasetIndexExt for Dataset {
             .index_cache
             .get_metadata(self.base.as_ref(), self.version().version)
         {
-            println!("hit");
             return Ok(indices);
         }
 
-        println!("miss");
         let loaded_indices: Arc<Vec<IndexMetadata>> =
             read_manifest_indexes(&self.object_store, &self.manifest_location, &self.manifest)
                 .await?
@@ -1897,7 +1895,6 @@ mod tests {
 
         // Because the manifest is so small, we should have opportunistically
         // cached the indices in memory already.
-        println!("loading");
         let indices2 = dataset2.load_indices().await.unwrap();
         let stats = io_stats.incremental_stats();
         assert_eq!(stats.read_iops, 0);

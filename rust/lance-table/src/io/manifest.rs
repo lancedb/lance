@@ -117,7 +117,6 @@ pub async fn read_manifest_indexes(
     manifest: &Manifest,
 ) -> Result<Vec<Index>> {
     if let Some(pos) = manifest.index_section.as_ref() {
-        println!("Reading index section at {}", pos);
         let reader = if let Some(size) = location.size {
             object_store
                 .open_with_size(&location.path, size as usize)

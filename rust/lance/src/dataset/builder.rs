@@ -318,7 +318,13 @@ impl DatasetBuilder {
                     })?,
             };
 
-            let manifest = Dataset::load_manifest(&object_store, &manifest_location).await?;
+            let manifest = Dataset::load_manifest(
+                &object_store,
+                &manifest_location,
+                &base_path,
+                session.as_ref(),
+            )
+            .await?;
             (manifest, manifest_location)
         };
 
