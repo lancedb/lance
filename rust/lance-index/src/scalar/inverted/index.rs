@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::fmt::Debug;
 use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
     ops::RangeInclusive,
 };
-use std::{collections::hash_map, fmt::Debug};
 use std::{collections::BTreeMap, sync::Arc};
 use std::{
     collections::{HashMap, HashSet},
@@ -23,8 +23,8 @@ use arrow::{
 };
 use arrow::{buffer::ScalarBuffer, datatypes::UInt32Type};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Int32Array, LargeBinaryArray, ListArray,
-    OffsetSizeTrait, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float32Array, LargeBinaryArray, ListArray, OffsetSizeTrait,
+    RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -49,7 +49,6 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{info, instrument};
 
-use super::encoding::{compress_positions, decompress_positions_list};
 use super::{
     builder::PositionRecorder,
     encoding::{decompress_posting_list, CompressedPostingListHeader},
@@ -62,6 +61,10 @@ use super::{
     encoding::{compress_posting_list, Compression},
     query::*,
     scorer::{idf, BM25Scorer, Scorer, B, K1},
+};
+use super::{
+    encoding::{compress_positions, decompress_positions_list},
+    iter::{PostingListIterator, TokenIterator, TokenSource},
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::scalar::{
@@ -732,35 +735,6 @@ impl TokenSet {
     }
 }
 
-enum TokenSource<'a> {
-    HashMap(hash_map::Iter<'a, String, u32>),
-    Fst(fst::map::Stream<'a>),
-}
-pub struct TokenIterator<'a> {
-    source: TokenSource<'a>,
-}
-
-impl<'a> TokenIterator<'a> {
-    pub fn new(source: TokenSource<'a>) -> Self {
-        Self { source }
-    }
-}
-
-impl<'a> Iterator for TokenIterator<'a> {
-    type Item = (String, u32);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.source {
-            TokenSource::HashMap(iter) => iter
-                .next()
-                .map(|(token, token_id)| (token.clone(), *token_id)),
-            TokenSource::Fst(iter) => iter.next().map(|(token, token_id)| {
-                (String::from_utf8_lossy(token).into_owned(), token_id as u32)
-            }),
-        }
-    }
-}
-
 pub struct PostingListReader {
     reader: Arc<dyn IndexReader>,
 
@@ -1142,39 +1116,6 @@ impl Into<PostingListBuilder> for PostingList {
     }
 }
 
-pub enum PostingListIterator<'a> {
-    Plain(PlainPostingListIterator<'a>),
-    Compressed(CompressedPostingListIterator),
-}
-
-impl<'a> PostingListIterator<'a> {
-    pub fn new(posting: &'a PostingList) -> Self {
-        match posting {
-            PostingList::Plain(posting) => Self::Plain(std::iter::zip(
-                posting.row_ids.iter(),
-                posting.frequencies.iter(),
-            )),
-            PostingList::Compressed(posting) => Self::Compressed(
-                CompressedPostingListIterator::new(posting.length as usize, posting.blocks.clone()),
-            ),
-        }
-    }
-}
-
-impl Iterator for PostingListIterator<'_> {
-    type Item = (u64, u32, Some(&[u32]));
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            PostingListIterator::Plain(iter) => {
-                iter.next().map(|(doc_id, freq)| (*doc_id, *freq as u32))
-            }
-            PostingListIterator::Compressed(iter) => {
-                iter.next().map(|(doc_id, freq)| (doc_id as u64, freq))
-            }
-        }
-    }
-}
 #[derive(Debug, PartialEq, Clone)]
 pub struct PlainPostingList {
     pub row_ids: ScalarBuffer<u64>,
@@ -1182,9 +1123,6 @@ pub struct PlainPostingList {
     pub max_score: Option<f32>,
     pub positions: Option<ListArray>, // List of Int32
 }
-
-type PlainPostingListIterator<'a> =
-    std::iter::Zip<std::slice::Iter<'a, u64>, std::slice::Iter<'a, f32>>;
 
 impl DeepSizeOf for PlainPostingList {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
@@ -1296,63 +1234,6 @@ impl CompressedPostingList {
     }
 }
 
-pub struct CompressedPostingListIterator {
-    remainder: usize,
-    blocks: LargeBinaryArray,
-    next_block_idx: usize,
-    iter: InnerIterator,
-    buffer: [u32; BLOCK_SIZE],
-}
-
-type InnerIterator = std::iter::Zip<std::vec::IntoIter<u32>, std::vec::IntoIter<u32>>;
-
-impl CompressedPostingListIterator {
-    pub fn new(length: usize, blocks: LargeBinaryArray) -> Self {
-        debug_assert!(length > 0);
-        debug_assert_eq!(blocks.len(), length.div_ceil(BLOCK_SIZE));
-
-        Self {
-            remainder: length % BLOCK_SIZE,
-            blocks,
-            next_block_idx: 0,
-            buffer: [0; BLOCK_SIZE],
-            iter: std::iter::zip(Vec::new(), Vec::new()),
-        }
-    }
-}
-
-impl Iterator for CompressedPostingListIterator {
-    type Item = (u32, u32);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some((doc_id, freq)) = self.iter.next() {
-            return Some((doc_id, freq));
-        }
-
-        // move to the next block
-        if self.next_block_idx >= self.blocks.len() {
-            return None;
-        }
-        let compressed = self.blocks.value(self.next_block_idx);
-        self.next_block_idx += 1;
-
-        let mut doc_ids = Vec::with_capacity(BLOCK_SIZE);
-        let mut frequencies = Vec::with_capacity(BLOCK_SIZE);
-        if self.next_block_idx == self.blocks.len() && self.remainder > 0 {
-            decompress_posting_remainder(
-                compressed,
-                self.remainder,
-                &mut doc_ids,
-                &mut frequencies,
-            );
-        } else {
-            decompress_posting_block(compressed, &mut self.buffer, &mut doc_ids, &mut frequencies);
-        }
-        self.iter = std::iter::zip(doc_ids, frequencies);
-        self.next()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct PostingListBuilder {
     pub doc_ids: Vec<u32>,
@@ -1387,7 +1268,7 @@ impl PostingListBuilder {
         self.positions.is_some()
     }
 
-    pub fn empty(with_position: bool) -> Self {
+    pub fn new(with_position: bool) -> Self {
         Self {
             doc_ids: Vec::new(),
             frequencies: Vec::new(),
@@ -1476,7 +1357,7 @@ impl PostingListBuilder {
                 inner_builder.append_value(compressed.into_iter());
             }
             // calculate the max score
-            let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id as u64) as f32 / avgdl);
+            let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id) as f32 / avgdl);
             let freq = freq as f32;
             let score = freq / (freq + doc_norm);
             if score > max_score {
@@ -1761,7 +1642,7 @@ impl DocSet {
     }
 
     #[inline]
-    pub fn num_tokens(&self, doc_id: u64) -> u32 {
+    pub fn num_tokens(&self, doc_id: u32) -> u32 {
         let row_id = self.row_ids[doc_id as usize];
         self.num_tokens[&row_id]
     }

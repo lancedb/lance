@@ -9,6 +9,7 @@ pub mod query;
 mod scorer;
 pub mod tokenizer;
 mod wand;
+mod iter;
 
 pub use builder::InvertedIndexBuilder;
 pub use index::*;

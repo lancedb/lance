@@ -8,8 +8,8 @@ use std::{fmt::Debug, sync::atomic::AtomicU64};
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::{IndexReader, IndexStore};
 use crate::vector::graph::OrderedFloat;
-use arrow::array::AsArray;
 use arrow::datatypes;
+use arrow::{array::AsArray, compute::concat_batches};
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
@@ -80,7 +80,7 @@ pub struct InvertedIndexBuilder {
     params: InvertedIndexParams,
     partitions: Vec<u64>,
 
-    tmpdir: TempDir,
+    _tmpdir: TempDir,
     local_store: Arc<dyn IndexStore>,
 }
 
@@ -99,7 +99,7 @@ impl InvertedIndexBuilder {
         Self {
             params,
             partitions,
-            tmpdir,
+            _tmpdir: tmpdir,
             local_store: store,
         }
     }
@@ -138,7 +138,7 @@ impl InvertedIndexBuilder {
 
         // spawn `num_workers` workers to build the index,
         // this thread will consume the stream and send the tokens to the workers.
-        let num_workers = get_num_compute_intensive_cpus();
+        let num_workers = 8;
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
         let next_id = self.partitions.iter().map(|id| id + 1).max().unwrap_or(0);
@@ -342,6 +342,7 @@ impl InnerBuilder {
 
     #[instrument(level = "debug", skip_all)]
     async fn write_posting_lists(&mut self, store: &dyn IndexStore) -> Result<()> {
+        log::info!("writing posting lists of partition {}", self.id);
         let mut writer = store
             .new_index_file(
                 &posting_file_path(self.id),
@@ -349,10 +350,16 @@ impl InnerBuilder {
             )
             .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
+        log::info!("compressing {} posting lists", posting_lists.len());
+        let mut batches = Vec::with_capacity(posting_lists.len());
         for posting_list in posting_lists.into_iter() {
             let batch = posting_list.to_batch(&self.docs)?;
-            writer.write_record_batch(batch).await?;
+            batches.push(batch);
         }
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
+        std::mem::drop(batches);
+        log::info!("writing {} posting lists", batch.num_rows());
+        writer.write_record_batch(batch).await?;
         writer.finish().await?;
 
         Ok(())
@@ -360,6 +367,7 @@ impl InnerBuilder {
 
     #[instrument(level = "debug", skip_all)]
     async fn write_tokens(&mut self, store: &dyn IndexStore) -> Result<()> {
+        log::info!("writing tokens of partition {}", self.id);
         let tokens = std::mem::take(&mut self.tokens);
         let batch = tokens.to_batch()?;
         let mut writer = store
@@ -372,6 +380,7 @@ impl InnerBuilder {
 
     #[instrument(level = "debug", skip_all)]
     async fn write_docs(&mut self, store: &dyn IndexStore) -> Result<()> {
+        log::info!("writing docs of partition {}", self.id);
         let docs = Arc::new(std::mem::take(&mut self.docs));
         let batch = docs.to_batch()?;
         let mut writer = store
@@ -459,7 +468,7 @@ impl IndexWorker {
             self.builder
                 .posting_lists
                 .resize_with(self.builder.tokens.len(), || {
-                    PostingListBuilder::empty(with_position)
+                    PostingListBuilder::new(with_position)
                 });
             let doc_id = self.builder.docs.add(row_id, token_num);
             self.total_doc_length += doc.len();
@@ -569,81 +578,6 @@ impl PositionRecorder {
             Self::Position(positions) => positions,
             Self::Count(_) => vec![0],
         }
-    }
-}
-
-pub struct PostingReader {
-    tmpdir: Option<TempDir>,
-    store: Arc<dyn IndexStore>,
-    reader: Arc<dyn IndexReader>,
-    token_offsets: Vec<(String, Vec<(usize, usize)>)>,
-}
-
-impl Debug for PostingReader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PostingReader")
-            .field("tmpdir", &self.tmpdir)
-            .field("token_offsets", &self.token_offsets)
-            .finish()
-    }
-}
-
-impl DeepSizeOf for PostingReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.store.deep_size_of_children(context)
-            + self.token_offsets.deep_size_of_children(context)
-    }
-}
-
-impl PostingReader {
-    async fn new(
-        tmpdir: Option<TempDir>,
-        store: Arc<dyn IndexStore>,
-        token_offsets: impl IntoIterator<Item = (String, Vec<(usize, usize)>)>,
-    ) -> Result<Self> {
-        let reader = store.open_index_file(INVERT_LIST_FILE).await?;
-
-        Ok(Self {
-            tmpdir,
-            store,
-            reader,
-            token_offsets: token_offsets
-                .into_iter()
-                .sorted_unstable_by(|(a, _), (b, _)| a.cmp(b))
-                .collect_vec(),
-        })
-    }
-
-    // returns a stream of (token, batch)
-    fn into_stream(mut self) -> BoxStream<'static, Result<(String, Vec<RecordBatch>)>> {
-        let io_parallelism = self.store.io_parallelism();
-        let token_offsets = std::mem::take(&mut self.token_offsets);
-        let schema: Arc<arrow_schema::Schema> = Arc::new(self.reader.schema().into());
-        let posting_reader = Arc::new(self);
-
-        let inverted_batches = token_offsets.into_iter().map(move |(token, offsets)| {
-            let posting_reader = posting_reader.clone();
-            let schema = schema.clone();
-            async move {
-                let batches = offsets.into_iter().map(|(offset, length)| {
-                    let reader = posting_reader.reader.clone();
-                    let schema = schema.clone();
-                    async move {
-                        if length == 0 {
-                            Ok(RecordBatch::new_empty(schema))
-                        } else {
-                            reader.read_range(offset..offset + length, None).await
-                        }
-                    }
-                });
-                let batches = futures::future::try_join_all(batches).await?;
-
-                Ok((token, batches))
-            }
-        });
-
-        let stream = stream::iter(inverted_batches).buffer_unordered(io_parallelism);
-        Box::pin(stream)
     }
 }
 

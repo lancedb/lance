@@ -56,7 +56,7 @@ pub fn compress_posting_list(
     frequencies: &[u32],
 ) -> Result<arrow::array::LargeBinaryArray> {
     let mut builder = LargeBinaryBuilder::with_capacity(
-        doc_ids.len().div_ceil(BLOCK_SIZE) + 1,
+        doc_ids.len().div_ceil(BLOCK_SIZE),
         doc_ids.len() * 4,
     );
     let doc_id_chunks = doc_ids.chunks_exact(BLOCK_SIZE);
@@ -163,7 +163,7 @@ pub fn decompress_posting_list(
     Ok((doc_ids, frequencies))
 }
 
-pub fn decompress_positions(compressed: &arrow::array::LargeBinaryArray) -> Result<Vec<u32>> {
+pub fn decompress_positions(compressed: &arrow::array::LargeBinaryArray) -> Vec<u32> {
     let num_positions = read_num_positions(compressed);
     let mut positions: Vec<u32> = Vec::with_capacity(num_positions as usize);
 
@@ -180,7 +180,7 @@ pub fn decompress_positions(compressed: &arrow::array::LargeBinaryArray) -> Resu
         decompress_remainder(compressed, remainder, &mut positions);
     }
 
-    Ok(positions)
+    positions
 }
 
 // decompress the positions list from a ListArray of binary
@@ -190,7 +190,7 @@ pub fn decompress_positions_list(compressed: &ListArray) -> Result<ListArray> {
     for i in 0..compressed.len() {
         let compressed = compressed.value(i);
         let compressed = compressed.as_binary::<i64>();
-        let positions = decompress_positions(compressed)?;
+        let positions = decompress_positions(compressed);
         builder.values().append_slice(&positions);
         builder.append(true);
     }
@@ -299,7 +299,7 @@ mod tests {
             original_size
         );
 
-        let decompressed_positions = decompress_positions(&compressed)?;
+        let decompressed_positions = decompress_positions(&compressed);
         assert_eq!(positions, decompressed_positions);
         assert_eq!(positions.len(), num_positions);
         Ok(())

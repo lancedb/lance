@@ -30,7 +30,7 @@ pub(crate) trait Merger {
 pub(crate) struct SizeBasedMerger<'a> {
     src_store: Arc<dyn IndexStore>,
     dest_store: &'a dyn IndexStore,
-    input: HashMap<u64, &'a InvertedPartition>,
+    input: Vec<&'a InvertedPartition>,
     target_size: u64,
     builder: InnerBuilder,
     partitions: Vec<u64>,
@@ -47,11 +47,8 @@ impl<'a> SizeBasedMerger<'a> {
         input: impl IntoIterator<Item = &'a InvertedPartition>,
         target_size: u64,
     ) -> Self {
-        let input = input
-            .into_iter()
-            .map(|p| (p.id(), p))
-            .collect::<HashMap<_, _>>();
-        let max_id = input.keys().copied().max().unwrap_or(0);
+        let input = input.into_iter().collect::<Vec<_>>();
+        let max_id = input.iter().map(|p| p.id()).max().unwrap_or(0);
         Self {
             src_store,
             dest_store,
@@ -64,7 +61,14 @@ impl<'a> SizeBasedMerger<'a> {
 
     async fn flush(&mut self) -> Result<()> {
         if self.builder.tokens.len() > 0 {
+            log::info!("flushing partition {}", self.builder.id());
+            let start = std::time::Instant::now();
             self.builder.write(self.dest_store).await?;
+            log::info!(
+                "flushed partition {} in {:?}",
+                self.builder.id(),
+                start.elapsed()
+            );
             self.partitions.push(self.builder.id());
             self.builder = InnerBuilder::new(self.builder.id() + 1);
         }
@@ -74,24 +78,28 @@ impl<'a> SizeBasedMerger<'a> {
 
 impl<'a> Merger for SizeBasedMerger<'a> {
     async fn merge(&mut self) -> Result<Vec<u64>> {
-        // if self.input.len() == 1 {
-        //     let part_id = self.input.keys().next().unwrap().clone();
-        //     self.src_store
-        //         .copy_index_file(&token_file_path(part_id), self.dest_store)
-        //         .await?;
-        //     self.src_store
-        //         .copy_index_file(&posting_file_path(part_id), self.dest_store)
-        //         .await?;
-        //     self.src_store
-        //         .copy_index_file(&doc_file_path(part_id), self.dest_store)
-        //         .await?;
-        //     return Ok(vec![part_id]);
-        // }
+        if self.input.len() == 1 {
+            let part_id = self.input.iter().next().unwrap().id();
+            self.src_store
+                .copy_index_file(&token_file_path(part_id), self.dest_store)
+                .await?;
+            self.src_store
+                .copy_index_file(&posting_file_path(part_id), self.dest_store)
+                .await?;
+            self.src_store
+                .copy_index_file(&doc_file_path(part_id), self.dest_store)
+                .await?;
+            return Ok(vec![part_id]);
+        }
 
         // for token set, union the tokens,
         // for doc set, concatenate the row ids, assign the doc id to offset + doc_id
         // for posting list, concatenate the posting lists
-        for (part_id, part) in self.input.iter() {
+        log::info!("merging {} partitions", self.input.len());
+        let start = std::time::Instant::now();
+        for idx in 0..self.input.len() {
+            let part = self.input[idx];
+            log::info!("merging partition {}", part.id());
             let doc_id_offset = self.builder.docs.len() as u32;
             // single partition can index up to u32::MAX documents
             if self.builder.docs.len() + part.docs.len() > u32::MAX as usize {
@@ -112,7 +120,7 @@ impl<'a> Merger for SizeBasedMerger<'a> {
             self.builder
                 .posting_lists
                 .resize_with(self.builder.tokens.len(), || {
-                    PostingListBuilder::empty(part.inverted_list.has_positions())
+                    PostingListBuilder::new(part.inverted_list.has_positions())
                 });
             for token_id in 0..part.tokens.len() as u32 {
                 let posting_list = part
@@ -126,81 +134,24 @@ impl<'a> Merger for SizeBasedMerger<'a> {
 
                 let new_token_id = self.builder.tokens.get(&inv_token[&token_id]).unwrap();
                 let builder = &mut self.builder.posting_lists[new_token_id as usize];
-                posting_list.positions(row_id)
-                for (doc_id, freq) in posting_list.iter() {
+                for (doc_id, freq, positions) in posting_list.iter() {
                     let new_doc_id = doc_id_offset + doc_id as u32;
-                    builder.add(new_doc_id, term_positions);
+                    let positions = match positions {
+                        Some(positions) => PositionRecorder::Position(positions.collect()),
+                        None => PositionRecorder::Count(freq),
+                    };
+                    builder.add(new_doc_id, positions);
                 }
             }
-        }
-        while let Some(location) = heap.pop() {
-            let (token, locations) = (location.token, location.locations);
-            self.builder.tokens.add(token);
-            let mut posting_builder = PostingListBuilder::empty(with_position);
-
-            let posting_lists = locations.iter().map(|(id, token_id)| {
-                let part = self.input[id];
-                part.inverted_list.posting_list(
-                    *token_id,
-                    part.inverted_list.has_positions(),
-                    &NoOpMetricsCollector,
-                )
-            });
-            let posting_lists = futures::future::try_join_all(posting_lists).await?;
-            for (posting_list, (part_id, _)) in std::iter::zip(posting_lists, locations) {
-                let part = self.input[&part_id];
-                for (doc_id, freq) in posting_list.iter() {
-                    let row_id = part.docs.row_id(doc_id as u32);
-                    let positions = PositionRecorder::Count(freq);
-                    let new_doc_id = self.builder.docs.add(row_id, positions.len());
-                    // the new doc id is not guaranteed to be correct if the row id has been added,
-                    // so must use `doc_ids` to check if the row id is already added.
-                    let new_doc_id = doc_ids.entry(row_id).or_insert(new_doc_id).clone();
-
-                    posting_builder.add(new_doc_id, positions);
-                }
-            }
-
-            // add the posting list to the builder
-            total_size += posting_builder.size();
-            self.builder.posting_lists.push(posting_builder);
-            if total_size > self.target_size {
-                self.builder.write(self.dest_store).await?;
-                new_partitions.push(self.builder.id());
-                self.builder = InnerBuilder::new(self.builder.id() + 1);
-                doc_ids.clear();
-                total_size = 0;
-            }
-            assert_eq!(self.builder.posting_lists.len(), self.builder.tokens.len());
+            log::info!(
+                "merged {}/{} partitions in {:?}",
+                idx + 1,
+                self.input.len(),
+                start.elapsed()
+            );
         }
 
-        if self.builder.tokens.len() > 0 {
-            self.builder.write(self.dest_store).await?;
-            new_partitions.push(self.builder.id());
-        }
-
-        Ok(new_partitions)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TokenLocation {
-    token: String,
-    // the partition id and the token id in the partition
-    locations: Vec<(u64, u32)>,
-}
-
-impl PartialOrd for TokenLocation {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for TokenLocation {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.locations
-            .len()
-            .cmp(&other.locations.len())
-            .then(self.token.cmp(&other.token))
+        self.flush().await?;
+        Ok(self.partitions.clone())
     }
 }
