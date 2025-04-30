@@ -398,7 +398,7 @@ impl LanceFileReader {
                 io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
             },
         );
-        let file = scheduler.open_file(&path, None).await.infer_error()?;
+        let file = scheduler.open_file(&path).await.infer_error()?;
         let inner = FileReader::try_open(
             file,
             None,

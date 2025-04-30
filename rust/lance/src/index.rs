@@ -870,7 +870,7 @@ impl DatasetIndexInternalExt for Dataset {
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
-                let file = scheduler.open_file(&index_file, None).await?;
+                let file = scheduler.open_file(&index_file).await?;
                 let reader = v2::reader::FileReader::try_open(
                     file,
                     None,

@@ -92,7 +92,7 @@ fn inner_open<'local>(env: &mut JNIEnv<'local>, file_uri: JString) -> Result<JOb
         let config = SchedulerConfig::max_bandwidth(&obj_store);
         let scan_scheduler = ScanScheduler::new(obj_store, config);
 
-        let file_scheduler = scan_scheduler.open_file(&Path::parse(&path)?, None).await?;
+        let file_scheduler = scan_scheduler.open_file(&Path::parse(&path)?).await?;
         FileReader::try_open(
             file_scheduler,
             None,
