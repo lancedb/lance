@@ -658,7 +658,6 @@ impl FromPyObject<'_> for PyLance<DataFile> {
             column_indices: ob.getattr("column_indices")?.extract()?,
             file_major_version: ob.getattr("file_major_version")?.extract()?,
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
-            file_size_bytes: ob.getattr("file_size_bytes")?.extract()?,
         }))
     }
 }
@@ -680,7 +679,6 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             self.0.column_indices.clone(),
             self.0.file_major_version,
             self.0.file_minor_version,
-            self.0.file_size_bytes,
         ))
     }
 }

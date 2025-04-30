@@ -424,7 +424,6 @@ mod tests {
                 column_indices: vec![0],
                 file_major_version: 2,
                 file_minor_version: 0,
-                file_size_bytes: Some(100),
             }],
             deletion_file: None,
             row_id_meta: None,

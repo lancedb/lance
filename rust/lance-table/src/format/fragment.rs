@@ -35,9 +35,6 @@ pub struct DataFile {
     /// The minor version of the file format used to write this file.
     #[serde(default)]
     pub file_minor_version: u32,
-
-    /// The size of the file in bytes, if known.
-    pub file_size_bytes: Option<u64>,
 }
 
 impl DataFile {
@@ -47,7 +44,6 @@ impl DataFile {
         column_indices: Vec<i32>,
         file_major_version: u32,
         file_minor_version: u32,
-        file_size_bytes: Option<u64>,
     ) -> Self {
         Self {
             path: path.into(),
@@ -55,7 +51,6 @@ impl DataFile {
             column_indices,
             file_major_version,
             file_minor_version,
-            file_size_bytes,
         }
     }
 
@@ -71,7 +66,6 @@ impl DataFile {
             column_indices: vec![],
             file_major_version,
             file_minor_version,
-            file_size_bytes: None,
         }
     }
 
@@ -82,15 +76,10 @@ impl DataFile {
             vec![],
             MAJOR_VERSION as u32,
             MINOR_VERSION as u32,
-            None,
         )
     }
 
-    pub fn new_legacy(
-        path: impl Into<String>,
-        schema: &Schema,
-        file_size_bytes: Option<u64>,
-    ) -> Self {
+    pub fn new_legacy(path: impl Into<String>, schema: &Schema) -> Self {
         let mut field_ids = schema.field_ids();
         field_ids.sort();
         Self::new(
@@ -99,7 +88,6 @@ impl DataFile {
             vec![],
             MAJOR_VERSION as u32,
             MINOR_VERSION as u32,
-            file_size_bytes,
         )
     }
 
@@ -139,7 +127,6 @@ impl From<&DataFile> for pb::DataFile {
             column_indices: df.column_indices.clone(),
             file_major_version: df.file_major_version,
             file_minor_version: df.file_minor_version,
-            file_size_bytes: df.file_size_bytes.unwrap_or_default(),
         }
     }
 }
@@ -154,11 +141,6 @@ impl TryFrom<pb::DataFile> for DataFile {
             column_indices: proto.column_indices,
             file_major_version: proto.file_major_version,
             file_minor_version: proto.file_minor_version,
-            file_size_bytes: if proto.file_size_bytes > 0 {
-                Some(proto.file_size_bytes)
-            } else {
-                None
-            },
         })
     }
 }
@@ -316,7 +298,7 @@ impl Fragment {
     ) -> Self {
         Self {
             id,
-            files: vec![DataFile::new_legacy(path, schema, None)],
+            files: vec![DataFile::new_legacy(path, schema)],
             deletion_file: None,
             physical_rows,
             row_id_meta: None,
@@ -329,22 +311,15 @@ impl Fragment {
         field_ids: Vec<i32>,
         column_indices: Vec<i32>,
         version: &LanceFileVersion,
-        file_size_bytes: Option<u64>,
     ) {
         let (major, minor) = version.to_numbers();
-        self.files.push(DataFile::new(
-            path,
-            field_ids,
-            column_indices,
-            major,
-            minor,
-            file_size_bytes,
-        ));
+        self.files
+            .push(DataFile::new(path, field_ids, column_indices, major, minor));
     }
 
     /// Add a new [`DataFile`] to this fragment.
     pub fn add_file_legacy(&mut self, path: &str, schema: &Schema) {
-        self.files.push(DataFile::new_legacy(path, schema, None));
+        self.files.push(DataFile::new_legacy(path, schema));
     }
 
     // True if this fragment is made up of legacy v1 files, false otherwise
@@ -530,12 +505,9 @@ mod tests {
             json!({
                 "id": 123,
                 "files":[
-                    {"path": "foobar.lance", "fields": [0], "column_indices": [], 
-                     "file_major_version": MAJOR_VERSION, "file_minor_version": MINOR_VERSION,
-                     "file_size_bytes": null }
-                ],
-                "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
-                                  "num_deleted_rows": 10},
+                    {"path": "foobar.lance", "fields": [0], "column_indices": [], "file_major_version": MAJOR_VERSION, "file_minor_version": MINOR_VERSION}],
+                     "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
+                                       "num_deleted_rows": 10},
                 "physical_rows": None::<usize>}),
         );
 
