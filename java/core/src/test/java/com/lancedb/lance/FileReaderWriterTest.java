@@ -151,12 +151,16 @@ public class FileReaderWriterTest {
       LanceFileReader.open("/tmp/does_not_exist.lance", allocator);
       fail("Expected LanceException to be thrown");
     } catch (IOException e) {
-      assertTrue(e.getMessage().contains("Object at location /tmp/does_not_exist.lance not found"));
+      assertTrue(e.getMessage().contains("Not found: tmp/does_not_exist.lance"));
     }
     try {
       LanceFileReader.open("", allocator);
       fail("Expected LanceException to be thrown");
+    } catch (RuntimeException e) {
+      // expected, would be nice if it was an IOException, but it's not because
+      // lance throws a wrapped error :(
     } catch (IOException e) {
+      fail("Expected RuntimeException to be thrown");
     }
   }
 }
