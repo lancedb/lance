@@ -55,10 +55,8 @@ pub fn compress_posting_list(
     doc_ids: &[u32],
     frequencies: &[u32],
 ) -> Result<arrow::array::LargeBinaryArray> {
-    let mut builder = LargeBinaryBuilder::with_capacity(
-        doc_ids.len().div_ceil(BLOCK_SIZE),
-        doc_ids.len() * 4,
-    );
+    let mut builder =
+        LargeBinaryBuilder::with_capacity(doc_ids.len().div_ceil(BLOCK_SIZE), doc_ids.len() * 4);
     let doc_id_chunks = doc_ids.chunks_exact(BLOCK_SIZE);
     let frequency_chunks = frequencies.chunks_exact(BLOCK_SIZE);
     let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
