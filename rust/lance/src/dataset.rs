@@ -121,11 +121,9 @@ pub struct Dataset {
     pub(crate) manifest: Arc<Manifest>,
     // Path for the manifest that is loaded. Used to get additional information,
     // such as the index metadata.
-    pub(crate) manifest_file: Path,
+    pub(crate) manifest_location: ManifestLocation,
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
-    pub manifest_naming_scheme: ManifestNamingScheme,
-    pub manifest_e_tag: Option<String>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -325,9 +323,9 @@ impl Dataset {
 
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
-        let (manifest, path) = self.latest_manifest().await?;
+        let (manifest, manifest_location) = self.latest_manifest().await?;
         self.manifest = Arc::new(manifest);
-        self.manifest_file = path;
+        self.manifest_location = manifest_location;
         Ok(())
     }
 
@@ -336,7 +334,8 @@ impl Dataset {
         // happen if the table has been dropped then re-created recently.
         self.manifest.version == location.version
             && location.e_tag.as_ref().is_some_and(|e_tag| {
-                self.manifest_e_tag
+                self.manifest_location
+                    .e_tag
                     .as_ref()
                     .is_some_and(|current_e_tag| e_tag == current_e_tag)
             })
@@ -359,11 +358,9 @@ impl Dataset {
             base_path,
             self.uri.clone(),
             manifest,
-            manifest_location.path,
+            manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
-            manifest_location.naming_scheme,
-            manifest_location.e_tag,
         )
         .await
     }
@@ -434,6 +431,20 @@ impl Dataset {
             });
         }
 
+        // If indices were also the last block, we can take the opportunity to
+        // decode them now and cache them.
+        if let Some(index_offset) = manifest.index_section {
+            if manifest_size - index_offset <= last_block.len() {
+                let offset_in_block = last_block.len() - (manifest_size - index_offset);
+                let message_len =
+                    LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4])
+                        as usize;
+                let message_data =
+                    &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
+                todo!("Decode indices from last block")
+            }
+        }
+
         populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
 
         Ok(manifest)
@@ -445,11 +456,9 @@ impl Dataset {
         base_path: Path,
         uri: String,
         manifest: Manifest,
-        manifest_file: Path,
+        manifest_location: ManifestLocation,
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
-        manifest_naming_scheme: ManifestNamingScheme,
-        e_tag: Option<String>,
     ) -> Result<Self> {
         let tags = Tags::new(
             object_store.clone(),
@@ -461,12 +470,10 @@ impl Dataset {
             base: base_path,
             uri,
             manifest: Arc::new(manifest),
-            manifest_file,
+            manifest_location,
             commit_handler,
             session,
             tags,
-            manifest_naming_scheme,
-            manifest_e_tag: e_tag,
         })
     }
 
@@ -543,11 +550,9 @@ impl Dataset {
                 blobs_path,
                 format!("{}/{}", self.uri, BLOB_DIR),
                 manifest,
-                blob_manifest_location.path,
+                blob_manifest_location,
                 self.session.clone(),
                 self.commit_handler.clone(),
-                ManifestNamingScheme::V2,
-                blob_manifest_location.e_tag,
             )
             .await?;
             Ok(Some(Arc::new(blobs_dataset)))
@@ -564,14 +569,17 @@ impl Dataset {
             == LanceFileVersion::Legacy
     }
 
-    pub async fn latest_manifest(&self) -> Result<(Manifest, Path)> {
+    pub async fn latest_manifest(&self) -> Result<(Manifest, ManifestLocation)> {
         let location = self
             .commit_handler
             .resolve_latest_location(&self.base, &self.object_store)
             .await?;
 
         if self.already_checked_out(&location) {
-            return Ok((self.manifest.as_ref().clone(), self.manifest_file.clone()));
+            return Ok((
+                self.manifest.as_ref().clone(),
+                self.manifest_location.clone(),
+            ));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
         if manifest.schema.has_dictionary_types() {
@@ -584,7 +592,7 @@ impl Dataset {
             };
             populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         }
-        Ok((manifest, location.path))
+        Ok((manifest, location))
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -797,20 +805,19 @@ impl Dataset {
         write_config: &ManifestWriteConfig,
         commit_config: &CommitConfig,
     ) -> Result<()> {
-        let (manifest, manifest_path, manifest_e_tag) = commit_transaction(
+        let (manifest, manifest_location) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
             &transaction,
             write_config,
             commit_config,
-            self.manifest_naming_scheme,
+            self.manifest_location.naming_scheme,
         )
         .await?;
 
         self.manifest = Arc::new(manifest);
-        self.manifest_file = manifest_path;
-        self.manifest_e_tag = manifest_e_tag;
+        self.manifest_location = manifest_location;
 
         Ok(())
     }
@@ -1005,10 +1012,6 @@ impl Dataset {
 
     pub(crate) fn object_store(&self) -> &ObjectStore {
         &self.object_store
-    }
-
-    pub(crate) async fn manifest_file(&self) -> Result<Path> {
-        Ok(self.manifest_file.clone())
     }
 
     pub(crate) fn data_dir(&self) -> Path {
@@ -1358,7 +1361,7 @@ impl Dataset {
         for index in indices.iter() {
             if !index_ids.insert(&index.uuid) {
                 return Err(Error::corrupt_file(
-                    self.manifest_file.clone(),
+                    self.manifest_location.path.clone(),
                     format!(
                         "Duplicate index id {} found in dataset {:?}",
                         &index.uuid, self.base
@@ -1378,7 +1381,7 @@ impl Dataset {
                 ));
             }
             return Err(Error::corrupt_file(
-                self.manifest_file.clone(),
+                self.manifest_location.path.clone(),
                 message,
                 location!(),
             ));
@@ -2226,7 +2229,7 @@ mod tests {
                 use_legacy_format: None,
                 storage_format: None,
             },
-            dataset.manifest_naming_scheme,
+            dataset.manifest_location.naming_scheme,
         )
         .await
         .unwrap();
@@ -3175,7 +3178,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(dataset.manifest_naming_scheme == ManifestNamingScheme::V2);
+        assert!(dataset.manifest_location.naming_scheme == ManifestNamingScheme::V2);
 
         assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
     }

@@ -24,6 +24,8 @@ use lance_io::{
 
 use crate::format::{pb, DataStorageFormat, Index, Manifest, MAGIC};
 
+use super::commit::ManifestLocation;
+
 /// Read Manifest on URI.
 ///
 /// This only reads manifest files. It does not read data files.
@@ -111,11 +113,18 @@ pub async fn read_manifest(
 #[instrument(level = "debug", skip(object_store, manifest))]
 pub async fn read_manifest_indexes(
     object_store: &ObjectStore,
-    path: &Path,
+    location: &ManifestLocation,
     manifest: &Manifest,
 ) -> Result<Vec<Index>> {
     if let Some(pos) = manifest.index_section.as_ref() {
-        let reader = object_store.open(path).await?;
+        println!("Reading index section at {}", pos);
+        let reader = if let Some(size) = location.size {
+            object_store
+                .open_with_size(&location.path, size as usize)
+                .await?
+        } else {
+            object_store.open(&location.path).await?
+        };
         let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
 
         Ok(section

@@ -597,14 +597,14 @@ async fn reserve_fragment_ids(
         None,
     );
 
-    let (manifest, _, _) = commit_transaction(
+    let (manifest, _) = commit_transaction(
         dataset,
         dataset.object_store(),
         dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),
-        dataset.manifest_naming_scheme,
+        dataset.manifest_location.naming_scheme,
     )
     .await?;
 

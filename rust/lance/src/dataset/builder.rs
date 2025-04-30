@@ -327,11 +327,9 @@ impl DatasetBuilder {
             base_path,
             table_uri,
             manifest,
-            location.path,
+            location,
             session,
             commit_handler,
-            location.naming_scheme,
-            location.e_tag,
         )
         .await
     }
