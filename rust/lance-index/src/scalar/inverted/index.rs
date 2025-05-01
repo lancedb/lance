@@ -15,7 +15,7 @@ use std::{
 
 use arrow::{
     array::LargeBinaryBuilder,
-    datatypes::{self, Float32Type, Int32Type, UInt64Type},
+    datatypes::{self, Float32Type, UInt64Type},
 };
 use arrow::{
     array::{AsArray, ListBuilder, StringBuilder, UInt32Builder},
@@ -34,14 +34,14 @@ use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{IntoStreamer, Streamer};
 use futures::stream::repeat_with;
-use futures::{stream, FutureExt, StreamExt, TryStreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::{
     mask::RowIdMask,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
 };
+use lance_core::{container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
 use moka::future::Cache;
@@ -51,37 +51,31 @@ use tracing::{info, instrument};
 
 use super::{
     builder::PositionRecorder,
-    encoding::{decompress_posting_list, CompressedPostingListHeader},
+    encoding::{compress_posting_slices, decompress_posting_list},
 };
 use super::{
     builder::{
         doc_file_path, inverted_list_schema, posting_file_path, token_file_path, OrderedDoc,
-        BLOCK_SIZE,
     },
-    encoding::{compress_posting_list, Compression},
+    encoding::compress_posting_list,
     query::*,
-    scorer::{idf, BM25Scorer, Scorer, B, K1},
+    scorer::{idf, BM25Scorer, B, K1},
 };
 use super::{
     encoding::{compress_positions, decompress_positions_list},
     iter::{PostingListIterator, TokenIterator, TokenSource},
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
+use crate::prefilter::PreFilter;
 use crate::scalar::{
     AnyQuery, IndexReader, IndexStore, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
 };
 use crate::Index;
-use crate::{
-    prefilter::PreFilter,
-    scalar::inverted::encoding::{
-        decompress_posting_block, decompress_posting_remainder, decompress_remainder,
-    },
-};
 
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
-pub const METADATA_FILE: &str = "metadata.json";
+pub const METADATA_FILE: &str = "metadata.lance";
 
 pub const TOKEN_COL: &str = "_token";
 pub const TOKEN_ID_COL: &str = "_token_id";
@@ -935,8 +929,7 @@ impl PostingListReader {
                 metrics.record_part_load();
                 info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
-                let posting_list = PostingList::from_batch(&batch, self.max_scores.as_ref().map(|max_scores| max_scores[token_id as usize]), self.lengths.as_ref().map(|lengths| lengths[token_id as usize]))?;
-                Result::Ok(posting_list)
+               self.posting_list_from_batch(&batch, token_id)
             })
             .await
             .map_err(|e| Error::io(e.to_string(), location!()))?;
@@ -950,22 +943,29 @@ impl PostingListReader {
         Ok(posting)
     }
 
+    pub(crate) fn posting_list_from_batch(
+        &self,
+        batch: &RecordBatch,
+        token_id: u32,
+    ) -> Result<PostingList> {
+        let posting_list = PostingList::from_batch(
+            batch,
+            self.max_scores
+                .as_ref()
+                .map(|max_scores| max_scores[token_id as usize]),
+            self.lengths
+                .as_ref()
+                .map(|lengths| lengths[token_id as usize]),
+        )?;
+        Ok(posting_list)
+    }
+
     async fn prewarm(&self) -> Result<()> {
-        let columns = self.posting_columns(false);
-        let batch = self
-            .reader
-            .read_range(0..self.reader.num_rows(), Some(&columns))
-            .await?;
+        let batch = self.read_batch(false).await?;
         for token_id in 0..self.len() {
             let posting_range = self.posting_list_range(token_id as u32);
             let batch = batch.slice(posting_range.start, posting_range.end - posting_range.start);
-            let posting_list = PostingList::from_batch(
-                &batch,
-                self.max_scores
-                    .as_ref()
-                    .map(|max_scores| max_scores[token_id]),
-                self.lengths.as_ref().map(|lengths| lengths[token_id]),
-            )?;
+            let posting_list = self.posting_list_from_batch(&batch, token_id as u32)?;
             self.posting_cache
                 .insert(token_id as u32, posting_list)
                 .await;
@@ -974,10 +974,13 @@ impl PostingListReader {
         Ok(())
     }
 
-    fn extract_columns(batch: &RecordBatch) -> (ScalarBuffer<u64>, ScalarBuffer<f32>) {
-        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-        let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>();
-        (row_ids.values().clone(), frequencies.values().clone())
+    pub(crate) async fn read_batch(&self, with_position: bool) -> Result<RecordBatch> {
+        let columns = self.posting_columns(with_position);
+        let batch = self
+            .reader
+            .read_range(0..self.reader.num_rows(), Some(&columns))
+            .await?;
+        Ok(batch)
     }
 
     async fn read_positions(&self, token_id: u32) -> Result<ListArray> {
@@ -1234,10 +1237,10 @@ impl CompressedPostingList {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PostingListBuilder {
-    pub doc_ids: Vec<u32>,
-    pub frequencies: Vec<u32>,
+    pub doc_ids: ExpLinkedList<u32>,
+    pub frequencies: ExpLinkedList<u32>,
     pub positions: Option<PositionBuilder>,
 }
 
@@ -1252,26 +1255,14 @@ impl PostingListBuilder {
                 .unwrap_or(0)) as u64
     }
 
-    // pub fn try_from_batches(batches: &[RecordBatch]) -> Result<Self> {
-    //     for batch in batches {
-    //         let posting_list = PostingList::from_batch(batch);
-    //     }
-    //     unimplemented!()
-    //     // Self {
-    //     //     doc_ids: row_ids,
-    //     //     frequencies,
-    //     //     positions,
-    //     // }
-    // }
-
     pub fn has_positions(&self) -> bool {
         self.positions.is_some()
     }
 
     pub fn new(with_position: bool) -> Self {
         Self {
-            doc_ids: Vec::new(),
-            frequencies: Vec::new(),
+            doc_ids: ExpLinkedList::new().with_capacity_limit(128),
+            frequencies: ExpLinkedList::new().with_capacity_limit(128),
             positions: with_position.then(PositionBuilder::new),
         }
     }
@@ -1293,18 +1284,17 @@ impl PostingListBuilder {
     }
 
     pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>, docs: &DocSet) {
-        let mut new_doc_ids = Vec::with_capacity(self.len());
-        let mut new_freqs = Vec::with_capacity(self.len());
+        let mut new_doc_ids = ExpLinkedList::with_capacity(self.len());
+        let mut new_freqs = ExpLinkedList::with_capacity(self.len());
         let mut new_positions = self.positions.as_mut().map(|_| PositionBuilder::new());
 
-        for i in 0..self.len() {
-            let doc_id = self.doc_ids[i];
+        for (idx, (&doc_id, &freq)) in self.doc_ids.iter().zip(self.frequencies.iter()).enumerate()
+        {
             let row_id = docs.row_id(doc_id);
-            let freq = self.frequencies[i];
             let positions = self
                 .positions
                 .as_ref()
-                .map(|positions| positions.get(i).to_vec());
+                .map(|positions| positions.get(idx).to_vec());
 
             match mapping.get(&row_id) {
                 Some(Some(_)) => {
@@ -1330,44 +1320,43 @@ impl PostingListBuilder {
         self.positions = new_positions;
     }
 
-    // convert the posting list to a record batch
+    // assume the posting list is sorted by doc id
     pub fn to_batch(mut self, docs: &DocSet) -> Result<RecordBatch> {
         let length = self.len();
         let num_docs = docs.len();
         let avgdl = docs.average_length();
         let mut max_score = 0.0;
 
-        let mut doc_ids = Vec::with_capacity(length);
-        let mut freqs = Vec::with_capacity(length);
         let mut position_builder = self.positions.as_mut().map(|_| {
             ListBuilder::new(ListBuilder::with_capacity(
                 LargeBinaryBuilder::new(),
                 length,
             ))
         });
-        for index in (0..length).sorted_unstable_by_key(|&i| self.doc_ids[i]) {
-            let (doc_id, freq) = (self.doc_ids[index], self.frequencies[index]);
-            // reorder the posting list by doc id
-            doc_ids.push(doc_id);
-            freqs.push(freq);
+        for (index, (doc_id, freq)) in self.doc_ids.iter().zip(self.frequencies.iter()).enumerate()
+        {
+            // calculate the max score
+            let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(*doc_id) as f32 / avgdl);
+            let freq = *freq as f32;
+            let score = freq / (freq + doc_norm);
+            if score > max_score {
+                max_score = score;
+            }
+
             if let Some(position_builder) = position_builder.as_mut() {
                 let positions = self.positions.as_ref().unwrap().get(index);
                 let compressed = compress_positions(positions)?;
                 let inner_builder = position_builder.values();
                 inner_builder.append_value(compressed.into_iter());
             }
-            // calculate the max score
-            let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id) as f32 / avgdl);
-            let freq = freq as f32;
-            let score = freq / (freq + doc_norm);
-            if score > max_score {
-                max_score = score;
-            }
         }
         max_score *= idf(self.len(), num_docs) * (K1 + 1.0);
-        let compressed = compress_posting_list(&doc_ids, &freqs)?;
-
-        let schema = inverted_list_schema(position_builder.is_some());
+        let compressed = compress_posting_slices(
+            self.doc_ids.len(),
+            self.doc_ids.block_iter(),
+            self.frequencies.block_iter(),
+        )?;
+        let schema = inverted_list_schema(self.has_positions());
         let mut columns = vec![
             Arc::new(ListArray::try_new(
                 Arc::new(Field::new("item", datatypes::DataType::LargeBinary, true)),

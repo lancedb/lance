@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::{fmt::Debug, sync::atomic::AtomicU64};
 
 use crate::scalar::lance_format::LanceIndexStore;
-use crate::scalar::{IndexReader, IndexStore};
+use crate::scalar::IndexStore;
 use crate::vector::graph::OrderedFloat;
 use arrow::datatypes;
 use arrow::{array::AsArray, compute::concat_batches};
@@ -15,9 +15,7 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
-use futures::stream::BoxStream;
 use futures::{stream, StreamExt, TryStreamExt};
-use itertools::Itertools;
 use lance_arrow::iter_str_array;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{cache::FileMetadataCache, utils::tokio::spawn_cpu};
@@ -41,36 +39,26 @@ use super::{
 pub const BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
 lazy_static! {
-    // the size threshold to trigger flush the posting lists while indexing FTS,
-    // lower value will result in slower indexing and less memory usage.
-    // This means the indexing process would eat up to `LANCE_FTS_FLUSH_THRESHOLD * num_cpus * 2` MiB of memory,
-    // it's in 512GiB by default
-    static ref LANCE_FTS_FLUSH_THRESHOLD: usize = std::env::var("LANCE_FTS_FLUSH_THRESHOLD")
-        .unwrap_or_else(|_| "512".to_string())
-        .parse()
-        .expect("failed to parse LANCE_FTS_FLUSH_THRESHOLD");
-    // the size of each flush, lower value will result in more frequent flushes, but better IO locality
+    // the (compressed) size of each flush for posting lists in MiB,
     // when the `LANCE_FTS_FLUSH_THRESHOLD` is reached, the flush will be triggered,
-    // and then flush posting lists until the size of the flushed posting lists reaches `LANCE_FTS_FLUSH_SIZE`
-    // it's in 64MiB by default
+    // higher for better indexing performance, but more memory usage,
+    // it's in 16 MiB by default
     static ref LANCE_FTS_FLUSH_SIZE: usize = std::env::var("LANCE_FTS_FLUSH_SIZE")
         .unwrap_or_else(|_| "16".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_FLUSH_SIZE");
     // the number of shards to split the indexing work,
     // the indexing process would spawn `LANCE_FTS_NUM_SHARDS` workers to build FTS,
-    // higher value will result in better parallelism, but more memory usage,
-    // it doesn't mean higher value will result in better performance,
-    // because the bottleneck can be the IO once the number of shards is large enough,
-    // it's 8 by default
+    // higher for faster indexing performance, but more memory usage,
+    // it's `the number of compute intensive CPUs` by default
     pub static ref LANCE_FTS_NUM_SHARDS: usize = std::env::var("LANCE_FTS_NUM_SHARDS")
-        .unwrap_or_else(|_| "8".to_string())
+        .unwrap_or_else(|_|  get_num_compute_intensive_cpus().to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_NUM_SHARDS");
-    // the partition size limit in GiB (uncompressed format), larger for better performance,
-    // but more memory footprint while indexing, this counts only posting lists size
+    // the partition size limit in MiB (uncompressed format)
+    // higher for better indexing & query performance, but more memory usage,
     pub static ref LANCE_FTS_PARTITION_SIZE: u64 = std::env::var("LANCE_FTS_PARTITION_SIZE")
-        .unwrap_or_else(|_| "2".to_string())
+        .unwrap_or_else(|_| "256".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_PARTITION_SIZE");
 }
@@ -136,9 +124,7 @@ impl InvertedIndexBuilder {
             }
         });
 
-        // spawn `num_workers` workers to build the index,
-        // this thread will consume the stream and send the tokens to the workers.
-        let num_workers = 8;
+        let num_workers = *LANCE_FTS_NUM_SHARDS;
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
         let next_id = self.partitions.iter().map(|id| id + 1).max().unwrap_or(0);
@@ -206,7 +192,7 @@ impl InvertedIndexBuilder {
                 let parts = worker.finish().await?;
                 Result::Ok(parts)
             })
-            .buffer_unordered(self.local_store.io_parallelism());
+            .buffer_unordered(num_workers);
         while let Some(partition) = partitions.try_next().await? {
             self.partitions.extend(partition);
         }
@@ -277,20 +263,9 @@ impl InvertedIndexBuilder {
             self.local_store.clone(),
             dest_store,
             partitions.iter(),
-            (*LANCE_FTS_PARTITION_SIZE << 30) * 8,
+            (*LANCE_FTS_PARTITION_SIZE << 20) * 8,
         );
         let partitions = merger.merge().await?;
-        // for partition_id in partitions {
-        //     self.local_store
-        //         .copy_index_file(&token_file_path(partition_id), dest_store)
-        //         .await?;
-        //     self.local_store
-        //         .copy_index_file(&posting_file_path(partition_id), dest_store)
-        //         .await?;
-        //     self.local_store
-        //         .copy_index_file(&doc_file_path(partition_id), dest_store)
-        //         .await?;
-        // }
         let metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
@@ -334,15 +309,28 @@ impl InnerBuilder {
     }
 
     pub async fn write(&mut self, store: &dyn IndexStore) -> Result<()> {
-        self.write_posting_lists(store).await?;
+        log::info!(
+            "partition {} in-memory size: tokens: {} MiB, posting lists: {} MiB, docs: {} MiB",
+            self.id,
+            self.tokens.deep_size_of() / (1024 * 1024),
+            self.posting_lists.iter().map(|p| p.size()).sum::<u64>() / (1024 * 1024),
+            self.docs.deep_size_of() / (1024 * 1024),
+        );
+
+        let docs = Arc::new(std::mem::take(&mut self.docs));
+        self.write_posting_lists(store, docs.clone()).await?;
         self.write_tokens(store).await?;
-        self.write_docs(store).await?;
+        self.write_docs(store, docs).await?;
         Ok(())
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn write_posting_lists(&mut self, store: &dyn IndexStore) -> Result<()> {
-        log::info!("writing posting lists of partition {}", self.id);
+    async fn write_posting_lists(
+        &mut self,
+        store: &dyn IndexStore,
+        docs: Arc<DocSet>,
+    ) -> Result<()> {
+        let id = self.id;
         let mut writer = store
             .new_index_file(
                 &posting_file_path(self.id),
@@ -350,16 +338,75 @@ impl InnerBuilder {
             )
             .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
-        log::info!("compressing {} posting lists", posting_lists.len());
-        let mut batches = Vec::with_capacity(posting_lists.len());
-        for posting_list in posting_lists.into_iter() {
-            let batch = posting_list.to_batch(&self.docs)?;
-            batches.push(batch);
+
+        log::info!(
+            "writing {} posting lists of partition {}, with position {}",
+            posting_lists.len(),
+            id,
+            posting_lists[0].has_positions()
+        );
+        let schema = inverted_list_schema(posting_lists[0].has_positions());
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let compress_task = spawn_cpu(move || {
+            let mut buffer = Vec::new();
+            let mut size_sum = 0;
+            let mut num_posting_lists = 0;
+            let mut compress_duration = std::time::Duration::ZERO;
+            for posting_list in posting_lists {
+                debug_assert!(posting_list.len() > 0);
+                num_posting_lists += 1;
+                let start = std::time::Instant::now();
+                let batch = posting_list.to_batch(&docs)?;
+                compress_duration += start.elapsed();
+
+                size_sum += batch.get_array_memory_size();
+                buffer.push(batch);
+                if size_sum >= *LANCE_FTS_FLUSH_SIZE << 20 {
+                    let batch = concat_batches(&schema, buffer.iter())?;
+                    buffer.clear();
+                    size_sum = 0;
+                    sender.blocking_send(batch).expect("failed to send batch");
+                }
+
+                if num_posting_lists % 50000 == 0 {
+                    log::info!(
+                        "compressed {} posting lists of partition {}, compressing elapsed: {:?}",
+                        num_posting_lists,
+                        id,
+                        compress_duration,
+                    );
+                }
+            }
+            if buffer.len() > 0 {
+                let batch = concat_batches(&schema, buffer.iter())?;
+                sender.blocking_send(batch).expect("failed to send batch");
+            }
+            std::mem::drop(sender);
+            Result::Ok(())
+        });
+
+        let mut write_duration = std::time::Duration::ZERO;
+        let mut num_posting_lists = 0;
+        let mut last_num = 0;
+        while let Some(batch) = receiver.recv().await {
+            num_posting_lists += batch.num_rows();
+            let start = std::time::Instant::now();
+            writer.write_record_batch(batch).await?;
+            write_duration += start.elapsed();
+
+            if num_posting_lists - last_num > 100_000 {
+                last_num = num_posting_lists;
+                log::info!(
+                    "wrote {} posting lists of partition {}, writing elapsed: {:?}",
+                    num_posting_lists,
+                    id,
+                    write_duration,
+                );
+            }
         }
-        let batch = concat_batches(&batches[0].schema(), &batches)?;
-        std::mem::drop(batches);
-        log::info!("writing {} posting lists", batch.num_rows());
-        writer.write_record_batch(batch).await?;
+
+        compress_task.await?;
         writer.finish().await?;
 
         Ok(())
@@ -379,9 +426,8 @@ impl InnerBuilder {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn write_docs(&mut self, store: &dyn IndexStore) -> Result<()> {
+    async fn write_docs(&mut self, store: &dyn IndexStore, docs: Arc<DocSet>) -> Result<()> {
         log::info!("writing docs of partition {}", self.id);
-        let docs = Arc::new(std::mem::take(&mut self.docs));
         let batch = docs.to_batch()?;
         let mut writer = store
             .new_index_file(&doc_file_path(self.id), batch.schema())
@@ -485,7 +531,7 @@ impl IndexWorker {
                 });
 
             if self.builder.docs.len() as u32 == u32::MAX
-                || self.estimated_size >= *LANCE_FTS_PARTITION_SIZE << 30
+                || self.estimated_size >= *LANCE_FTS_PARTITION_SIZE << 20
             {
                 self.flush()?;
             }

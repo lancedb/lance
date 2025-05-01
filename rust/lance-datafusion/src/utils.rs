@@ -19,7 +19,7 @@ use datafusion::{
 };
 use datafusion_common::DataFusionError;
 use futures::stream::BoxStream;
-use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_core::datatypes::Schema;
 use lance_core::Result;
 use tokio::task::spawn;

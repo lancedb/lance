@@ -8,7 +8,10 @@ use std::{
 
 use lance_core::Result;
 
-use crate::{metrics::NoOpMetricsCollector, scalar::IndexStore};
+use crate::{
+    metrics::NoOpMetricsCollector,
+    scalar::{inverted::PostingList, IndexStore},
+};
 
 use super::{
     builder::{doc_file_path, posting_file_path, token_file_path, InnerBuilder, PositionRecorder},
@@ -38,7 +41,7 @@ pub(crate) struct SizeBasedMerger<'a> {
 
 impl<'a> SizeBasedMerger<'a> {
     // Create a new SizeBasedMerger with the target size,
-    // the size is uncompressed size in byte.
+    // the size is compressed size in byte.
     // Typically, just set the size to the memory limit,
     // because less partitions means faster query.
     pub fn new(
@@ -78,18 +81,21 @@ impl<'a> SizeBasedMerger<'a> {
 
 impl<'a> Merger for SizeBasedMerger<'a> {
     async fn merge(&mut self) -> Result<Vec<u64>> {
-        if self.input.len() == 1 {
-            let part_id = self.input.iter().next().unwrap().id();
-            self.src_store
-                .copy_index_file(&token_file_path(part_id), self.dest_store)
-                .await?;
-            self.src_store
-                .copy_index_file(&posting_file_path(part_id), self.dest_store)
-                .await?;
-            self.src_store
-                .copy_index_file(&doc_file_path(part_id), self.dest_store)
-                .await?;
-            return Ok(vec![part_id]);
+        if self.input.len() <= 1 {
+            let part_ids = self.input.iter().map(|p| p.id()).collect::<Vec<_>>();
+            for &part_id in part_ids.iter() {
+                self.src_store
+                    .copy_index_file(&token_file_path(part_id), self.dest_store)
+                    .await?;
+                self.src_store
+                    .copy_index_file(&posting_file_path(part_id), self.dest_store)
+                    .await?;
+                self.src_store
+                    .copy_index_file(&doc_file_path(part_id), self.dest_store)
+                    .await?;
+            }
+
+            return Ok(part_ids);
         }
 
         // for token set, union the tokens,
@@ -99,7 +105,6 @@ impl<'a> Merger for SizeBasedMerger<'a> {
         let start = std::time::Instant::now();
         for idx in 0..self.input.len() {
             let part = self.input[idx];
-            log::info!("merging partition {}", part.id());
             let doc_id_offset = self.builder.docs.len() as u32;
             // single partition can index up to u32::MAX documents
             if self.builder.docs.len() + part.docs.len() > u32::MAX as usize {
@@ -122,15 +127,15 @@ impl<'a> Merger for SizeBasedMerger<'a> {
                 .resize_with(self.builder.tokens.len(), || {
                     PostingListBuilder::new(part.inverted_list.has_positions())
                 });
+
+            let postings = part
+                .inverted_list
+                .read_batch(part.inverted_list.has_positions())
+                .await?;
             for token_id in 0..part.tokens.len() as u32 {
                 let posting_list = part
                     .inverted_list
-                    .posting_list(
-                        token_id,
-                        part.inverted_list.has_positions(),
-                        &NoOpMetricsCollector,
-                    )
-                    .await?;
+                    .posting_list_from_batch(&postings.slice(token_id as usize, 1), token_id)?;
 
                 let new_token_id = self.builder.tokens.get(&inv_token[&token_id]).unwrap();
                 let builder = &mut self.builder.posting_lists[new_token_id as usize];

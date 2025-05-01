@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::io::Write;
+use std::{borrow::Cow, io::Write};
 
 use super::builder::BLOCK_SIZE;
 use arrow::array::{AsArray, LargeBinaryBuilder};
@@ -19,35 +19,6 @@ pub(crate) enum Compression {
     Bitpack,
 }
 
-#[derive(Debug, PartialEq, Clone)]
-pub struct CompressedPostingListHeader {
-    pub(crate) compression: Compression,
-    pub num_docs: u32,
-    pub max_score: f32,
-}
-
-impl CompressedPostingListHeader {
-    pub(crate) fn new(compression: Compression, num_docs: u32, max_score: f32) -> Self {
-        Self {
-            compression,
-            num_docs,
-            max_score,
-        }
-    }
-
-    pub fn num_bytes() -> usize {
-        std::mem::size_of::<Compression>() + std::mem::size_of::<u32>() + std::mem::size_of::<f32>()
-    }
-
-    pub fn write(&self, builder: &mut LargeBinaryBuilder) -> Result<()> {
-        builder.write(&[self.compression as u8])?;
-        builder.write(&self.num_docs.to_le_bytes())?;
-        builder.write(&self.max_score.to_le_bytes())?;
-        builder.append_value("");
-        Ok(())
-    }
-}
-
 // compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies),
 // the first binary is
@@ -55,11 +26,21 @@ pub fn compress_posting_list(
     doc_ids: &[u32],
     frequencies: &[u32],
 ) -> Result<arrow::array::LargeBinaryArray> {
+    let length = doc_ids.len();
+    if length < BLOCK_SIZE {
+        // directly do remainder compression to avoid overhead of creating buffer
+        let mut builder = LargeBinaryBuilder::with_capacity(1, length * 4 * 2);
+        compress_remainder(doc_ids, &mut builder)?;
+        compress_remainder(frequencies, &mut builder)?;
+        builder.append_value("");
+        return Ok(builder.finish());
+    }
+
     let mut builder =
-        LargeBinaryBuilder::with_capacity(doc_ids.len().div_ceil(BLOCK_SIZE), doc_ids.len() * 4);
+        LargeBinaryBuilder::with_capacity(doc_ids.len().div_ceil(BLOCK_SIZE), length * 3);
     let doc_id_chunks = doc_ids.chunks_exact(BLOCK_SIZE);
     let frequency_chunks = frequencies.chunks_exact(BLOCK_SIZE);
-    let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
+    let mut buffer: [u8; BLOCK_SIZE * 4 + 5] = [0u8; BLOCK_SIZE * 4 + 5];
     for (doc_id_chunk, freq_chunk) in std::iter::zip(doc_id_chunks, frequency_chunks) {
         // delta encoding + bitpacking for doc ids
         compress_sorted_block(doc_id_chunk, &mut buffer, &mut builder)?;
@@ -69,7 +50,6 @@ pub fn compress_posting_list(
     }
 
     // we don't compress the last block if it is not full
-    let length = doc_ids.len();
     let remainder = length % BLOCK_SIZE;
     if remainder > 0 {
         compress_remainder(&doc_ids[length - remainder..], &mut builder)?;
@@ -79,6 +59,70 @@ pub fn compress_posting_list(
     Ok(builder.finish())
 }
 
+pub fn compress_posting_slices<'a>(
+    length: usize,
+    doc_ids: impl Iterator<Item = &'a [u32]>,
+    frequencies: impl Iterator<Item = &'a [u32]>,
+) -> Result<arrow::array::LargeBinaryArray> {
+    if length < BLOCK_SIZE {
+        // directly do remainder compression to avoid overhead of creating buffer
+        let mut builder = LargeBinaryBuilder::with_capacity(1, length * 4 * 2);
+        compress_remainder(
+            doc_ids.flatten().copied().collect::<Vec<_>>().as_slice(),
+            &mut builder,
+        )?;
+        compress_remainder(
+            frequencies
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+                .as_slice(),
+            &mut builder,
+        )?;
+        builder.append_value("");
+        return Ok(builder.finish());
+    }
+
+    let mut builder = LargeBinaryBuilder::with_capacity(length.div_ceil(BLOCK_SIZE), length * 3);
+    let mut buffer: [u8; BLOCK_SIZE * 4 + 5] = [0u8; BLOCK_SIZE * 4 + 5];
+    let mut doc_id_buffer = Vec::with_capacity(BLOCK_SIZE);
+    let mut freq_buffer = Vec::with_capacity(BLOCK_SIZE);
+    for (doc_id_chunk, freq_chunk) in std::iter::zip(doc_ids, frequencies) {
+        let (doc_id_chunk, freq_chunk) =
+            if doc_id_buffer.len() == 0 && doc_id_chunk.len() == BLOCK_SIZE {
+                (doc_id_chunk, freq_chunk) // no need to copy
+            } else {
+                doc_id_buffer.extend_from_slice(doc_id_chunk);
+                freq_buffer.extend_from_slice(freq_chunk);
+                (doc_id_buffer.as_slice(), freq_buffer.as_slice())
+            };
+
+        // this is a hack, that the ExpLinkedList would always return a slice of BLOCK_SIZE
+        // after consuming the first blocks that cap is less than BLOCK_SIZE
+        if doc_id_chunk.len() < BLOCK_SIZE {
+            continue;
+        }
+        assert_eq!(doc_id_chunk.len(), BLOCK_SIZE);
+
+        // delta encoding + bitpacking for doc ids
+        compress_sorted_block(doc_id_chunk, &mut buffer, &mut builder)?;
+        // bitpacking for frequencies
+        compress_block(freq_chunk, &mut buffer, &mut builder)?;
+        builder.append_value("");
+        doc_id_buffer.clear();
+        freq_buffer.clear();
+    }
+
+    // we don't compress the last block if it is not full
+    if doc_id_buffer.len() > 0 {
+        compress_remainder(&doc_id_buffer, &mut builder)?;
+        compress_remainder(&freq_buffer, &mut builder)?;
+        builder.append_value("");
+    }
+    Ok(builder.finish())
+}
+
+#[inline]
 fn compress_sorted_block(
     data: &[u32],
     buffer: &mut [u8],
@@ -93,6 +137,7 @@ fn compress_sorted_block(
     Ok(())
 }
 
+#[inline]
 fn compress_block(data: &[u32], buffer: &mut [u8], builder: &mut LargeBinaryBuilder) -> Result<()> {
     let compressor = BitPacker4x::new();
     let num_bits = compressor.num_bits(data);
@@ -102,6 +147,7 @@ fn compress_block(data: &[u32], buffer: &mut [u8], builder: &mut LargeBinaryBuil
     Ok(())
 }
 
+#[inline]
 fn compress_remainder(data: &[u32], builder: &mut LargeBinaryBuilder) -> Result<()> {
     for value in data.iter() {
         builder.write(value.to_le_bytes().as_ref())?;
