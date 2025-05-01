@@ -2631,10 +2631,20 @@ impl Scanner {
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             } // Should be index_scan -> filter
             (Some(index_query), None, true, true) => {
-                // The filter is completely satisfied by the index.  If it also covers all fragments we might
-                // be able to use a faster version that doesn't even require materialization
-                self.prefilter_scalar_indexed_query(index_query, filter_plan, required_frags)
-                    .await?
+                if self.is_fragment_scan() {
+                    let filtered_row_ids = self
+                        .scalar_indexed_scan(
+                            self.dataset.empty_projection().with_row_id(),
+                            filter_plan,
+                        )
+                        .await?;
+                    PreFilterSource::FilteredRowIds(filtered_row_ids)
+                } else {
+                    // The filter is completely satisfied by the index.  If it also covers all fragments we might
+                    // be able to use a faster version that doesn't even require materialization
+                    self.prefilter_scalar_indexed_query(index_query, filter_plan, required_frags)
+                        .await?
+                }
             }
             (None, Some(refine_expr), true, _) => {
                 // No indices match the filter.  We need to do a full scan

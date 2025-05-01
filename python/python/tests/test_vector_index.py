@@ -1097,24 +1097,33 @@ def test_fragment_scan_allowed_on_ann_with_file_scan_prefilter(dataset):
 
 def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
     tbl = create_table()
-    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = lance.write_dataset(tbl, tmp_path, max_rows_per_file=250)
     dataset.create_index(
         "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
     dataset.create_scalar_index("id", index_type="BTREE")
 
+    assert len(dataset.get_fragments()) == 4
+
     q = np.random.randn(128)
-    with pytest.raises(
-        ValueError, match="This operation is not supported for fragment scan"
-    ):
-        scanner = dataset.scanner(
-            prefilter=True,
-            filter="id=1234",
-            columns=["id"],
-            nearest={"column": "vector", "q": q, "use_index": True},
-            fragments=[LanceFragment(dataset, 0)],
-        )
-        scanner.explain_plan(True)
+    results = dataset.scanner(
+        prefilter=True,
+        filter="id > 50",
+        columns=["id"],
+        nearest={"column": "vector", "q": q, "use_index": True},
+        fragments=[dataset.get_fragment(1)],
+    ).to_table()
+
+    results_no_scalar_index = dataset.scanner(
+        prefilter=True,
+        filter="id > 50",
+        columns=["id"],
+        nearest={"column": "vector", "q": q, "use_index": True},
+        fragments=[dataset.get_fragment(1)],
+        use_scalar_index=False,
+    ).to_table()
+
+    assert results == results_no_scalar_index
 
 
 def test_load_indices(dataset):
