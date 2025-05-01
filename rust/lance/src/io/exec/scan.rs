@@ -99,6 +99,8 @@ pub struct LanceStream {
     ///
     /// Only set on v2 scans.  Used to record scan metrics.
     scan_scheduler: Option<Arc<ScanScheduler>>,
+
+    span: tracing::Span,
 }
 
 impl LanceStream {
@@ -300,7 +302,7 @@ impl LanceStream {
             // us fully fuse decode into the first half of the plan.  Currently there is likely to be a thread
             // transfer between the two steps.
             .try_buffered_with_ordering(get_num_compute_intensive_cpus(), config.ordered_output)
-            .stream_in_span(span)
+            .stream_in_span(span.clone())
             .boxed();
 
         timer.done();
@@ -310,6 +312,7 @@ impl LanceStream {
             config,
             scan_metrics,
             scan_scheduler: Some(scan_scheduler_clone),
+            span,
         })
     }
 
@@ -366,7 +369,7 @@ impl LanceStream {
                 .try_flatten()
                 // We buffer up to `batch_readahead` batches across all streams.
                 .try_buffered_with_ordering(fragment_readahead, config.ordered_output)
-                .stream_in_span(span)
+                .stream_in_span(span.clone())
                 .boxed()
         };
 
@@ -381,6 +384,7 @@ impl LanceStream {
             config,
             scan_metrics,
             scan_scheduler: None,
+            span,
         })
     }
 }
@@ -419,6 +423,11 @@ impl Stream for LanceStream {
         if matches!(poll, Poll::Ready(None)) {
             if let Some(scan_scheduler) = this.scan_scheduler.as_ref() {
                 this.scan_metrics.io_metrics.record_final(scan_scheduler);
+
+                let scan_stats = scan_scheduler.stats();
+                this.span.record("iops", scan_stats.iops);
+                this.span.record("requests", scan_stats.requests);
+                this.span.record("bytes_read", scan_stats.bytes_read);
             }
         }
         this.scan_metrics.baseline_metrics.record_poll(poll)
@@ -605,7 +614,10 @@ impl ExecutionPlan for LanceScanExec {
             projection = ?projection,
             range = ?range,
             num_fragments = fragments.len(),
-            partition
+            partition,
+            iops = tracing::field::Empty,
+            requests = tracing::field::Empty,
+            bytes_read = tracing::field::Empty,
         );
 
         let lance_fut_stream = stream::once(async move {
