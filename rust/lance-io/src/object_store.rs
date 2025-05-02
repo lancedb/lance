@@ -392,6 +392,7 @@ impl ObjectStore {
                 self.inner.clone(),
                 path.clone(),
                 self.download_retry_count,
+                known_size,
             )));
         }
 

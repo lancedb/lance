@@ -180,6 +180,7 @@ impl Reader for CloudObjectReader {
 #[derive(Debug)]
 pub struct SmallReader {
     path: Path,
+    size: usize,
     state: Arc<std::sync::Mutex<SmallReaderState>>,
 }
 
@@ -203,7 +204,12 @@ impl std::fmt::Debug for SmallReaderState {
 }
 
 impl SmallReader {
-    pub fn new(store: Arc<dyn ObjectStore>, path: Path, download_retry_count: usize) -> Self {
+    pub fn new(
+        store: Arc<dyn ObjectStore>,
+        path: Path,
+        download_retry_count: usize,
+        size: usize,
+    ) -> Self {
         let path_ref = path.clone();
         let state = SmallReaderState::Loading(
             Box::pin(async move {
@@ -220,6 +226,7 @@ impl SmallReader {
         );
         Self {
             path,
+            size,
             state: Arc::new(std::sync::Mutex::new(state)),
         }
     }
@@ -261,7 +268,7 @@ impl Reader for SmallReader {
 
     /// Object/File Size.
     async fn size(&self) -> OSResult<usize> {
-        self.wait().await.map(|bytes| bytes.len())
+        Ok(self.size)
     }
 
     async fn get_range(&self, range: Range<usize>) -> OSResult<Bytes> {
