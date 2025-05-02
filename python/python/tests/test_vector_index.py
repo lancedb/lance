@@ -1247,6 +1247,7 @@ def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
 
     raw_table = create_table()
     ds = lance.write_dataset(raw_table, uri, mode="append")
+    ds.optimize.optimize_indices(num_indices_to_merge=0, index_names=["vector_idx"])
 
     res = ds.to_table(
         nearest={
