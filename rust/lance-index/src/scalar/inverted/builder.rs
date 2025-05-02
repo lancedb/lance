@@ -131,25 +131,19 @@ impl InvertedIndexBuilder {
         let id_alloc = Arc::new(AtomicU64::new(next_id));
         let (sender, receiver) = async_channel::bounded(num_workers);
         let mut index_tasks = Vec::with_capacity(num_workers);
-        let workers = futures::future::try_join_all((0..num_workers).map(|_| async {
-            let worker = IndexWorker::new(
-                self.local_store.clone(),
-                tokenizer.clone(),
-                with_position,
-                id_alloc.clone(),
-            )
-            .await?;
-            Result::Ok(worker)
-        }))
-        .await?;
-        for worker in workers {
+        for _ in 0..num_workers {
+            let store = self.local_store.clone();
+            let tokenizer = tokenizer.clone();
             let receiver = receiver.clone();
-            let task = spawn_cpu(move || {
-                let mut worker = worker;
-                while let Ok(batch) = receiver.recv_blocking() {
-                    worker.process_batch(batch)?;
+            let id_alloc = id_alloc.clone();
+            let task = tokio::task::spawn(async move {
+                let mut worker =
+                    IndexWorker::new(store, tokenizer, with_position, id_alloc).await?;
+                while let Ok(batch) = receiver.recv().await {
+                    worker.process_batch(batch).await?;
                 }
-                Result::Ok(worker)
+                let partitions = worker.finish().await?;
+                Result::Ok(partitions)
             });
             index_tasks.push(task);
         }
@@ -181,74 +175,32 @@ impl InvertedIndexBuilder {
         drop(stream);
         debug_assert_eq!(sender.sender_count(), 1);
         drop(sender);
-        let duration = std::time::Instant::now() - start;
-        log::info!("dispatching elapsed: {:?}", duration);
+        log::info!("dispatching elapsed: {:?}", start.elapsed());
 
         // wait for the workers to finish
         let start = std::time::Instant::now();
-        let workers = futures::future::try_join_all(index_tasks).await?;
-        let mut partitions = stream::iter(workers)
-            .map(|worker| async move {
-                let parts = worker.finish().await?;
-                Result::Ok(parts)
-            })
-            .buffer_unordered(num_workers);
-        while let Some(partition) = partitions.try_next().await? {
-            self.partitions.extend(partition);
+        for index_task in index_tasks {
+            self.partitions.extend(index_task.await??);
         }
-        let duration = std::time::Instant::now() - start;
-        log::info!("wait workers indexing elapsed: {:?}", duration);
+        log::info!("wait workers indexing elapsed: {:?}", start.elapsed());
         Ok(())
     }
 
     pub async fn remap(
         &mut self,
         mapping: &HashMap<u64, Option<u64>>,
+        src_store: Arc<dyn IndexStore>,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         // no need to remap the TokenSet,
         // since no row_id is stored in the TokenSet
-        // self.docs.remap(mapping);
-        // if let Some(inverted_list) = self.inverted_list.as_ref() {
-        //     let schema = legacy_inverted_list_schema(self.params.with_position);
-        //     let mut writer = dest_store
-        //         .new_index_file(INVERT_LIST_FILE, schema.clone())
-        //         .await?;
 
-        //     let docs = Arc::new(self.docs.clone());
-        //     let batches = (0..self.tokens.next_id()).map(|token_id| {
-        //         let inverted_list = inverted_list.clone();
-        //         let docs = docs.clone();
-        //         async move {
-        //             let batch = inverted_list
-        //                 .posting_batch(token_id, inverted_list.has_positions())
-        //                 .await?;
-        //             let mut posting_builder = PostingListBuilder::try_from_batches(&[batch]);
-        //             posting_builder.remap(mapping);
-        //             let (batch, max_score) = posting_builder.to_sorted_batch(Some(&docs))?;
+        for part in self.partitions.iter() {
+            let part = InvertedPartition::load(src_store.clone(), *part).await?;
+            let builder = part.into_builder().await?;
+        }
 
-        //             Result::Ok((batch, max_score))
-        //         }
-        //     });
-        //     let mut stream = stream::iter(batches).buffered(get_num_compute_intensive_cpus());
-        //     let mut offsets = Vec::new();
-        //     let mut max_scores = Vec::new();
-        //     let mut num_rows = 0;
-        //     while let Some((batch, max_score)) = stream.try_next().await? {
-        //         offsets.push(num_rows);
-        //         max_scores.push(max_score);
-        //         num_rows += batch.num_rows();
-        //         writer.write_record_batch(batch).await?;
-        //     }
-
-        //     let metadata = HashMap::from_iter(vec![
-        //         ("offsets".to_owned(), serde_json::to_string(&offsets)?),
-        //         ("max_scores".to_owned(), serde_json::to_string(&max_scores)?),
-        //     ]);
-        //     writer.finish_with_metadata(metadata).await?;
-        // }
-
-        // self.write(dest_store).await?;
+        self.write(dest_store).await?;
         Ok(())
     }
 
@@ -308,6 +260,10 @@ impl InnerBuilder {
         self.id
     }
 
+    pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        unimplemented!("TODO")
+    }
+
     pub async fn write(&mut self, store: &dyn IndexStore) -> Result<()> {
         log::info!(
             "partition {} in-memory size: tokens: {} MiB, posting lists: {} MiB, docs: {} MiB",
@@ -347,56 +303,34 @@ impl InnerBuilder {
         );
         let schema = inverted_list_schema(posting_lists[0].has_positions());
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        let compress_task = spawn_cpu(move || {
-            let mut buffer = Vec::new();
-            let mut size_sum = 0;
-            let mut num_posting_lists = 0;
-            let mut compress_duration = std::time::Duration::ZERO;
-            for posting_list in posting_lists {
-                debug_assert!(posting_list.len() > 0);
-                num_posting_lists += 1;
-                let start = std::time::Instant::now();
-                let batch = posting_list.to_batch(&docs)?;
-                compress_duration += start.elapsed();
-
-                size_sum += batch.get_array_memory_size();
-                buffer.push(batch);
-                if size_sum >= *LANCE_FTS_FLUSH_SIZE << 20 {
-                    let batch = concat_batches(&schema, buffer.iter())?;
-                    buffer.clear();
-                    size_sum = 0;
-                    sender.blocking_send(batch).expect("failed to send batch");
-                }
-
-                if num_posting_lists % 50000 == 0 {
-                    log::info!(
-                        "compressed {} posting lists of partition {}, compressing elapsed: {:?}",
-                        num_posting_lists,
-                        id,
-                        compress_duration,
-                    );
-                }
-            }
-            if buffer.len() > 0 {
-                let batch = concat_batches(&schema, buffer.iter())?;
-                sender.blocking_send(batch).expect("failed to send batch");
-            }
-            std::mem::drop(sender);
-            Result::Ok(())
-        });
+        let mut batches = stream::iter(posting_lists)
+            .map(|posting_list| {
+                let max_score = docs.calculate_max_score(
+                    posting_list.doc_ids.iter(),
+                    posting_list.frequencies.iter(),
+                );
+                spawn_cpu(move || posting_list.to_batch(max_score))
+            })
+            .buffered(get_num_compute_intensive_cpus());
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
-        let mut last_num = 0;
-        while let Some(batch) = receiver.recv().await {
-            num_posting_lists += batch.num_rows();
-            let start = std::time::Instant::now();
-            writer.write_record_batch(batch).await?;
-            write_duration += start.elapsed();
+        let mut buffer = Vec::new();
+        let mut size_sum = 0;
+        while let Some(batch) = batches.try_next().await? {
+            num_posting_lists += 1;
+            size_sum += batch.get_array_memory_size();
+            buffer.push(batch);
+            if size_sum >= *LANCE_FTS_FLUSH_SIZE << 20 {
+                let batch = concat_batches(&schema, buffer.iter())?;
+                buffer.clear();
+                size_sum = 0;
+                let start = std::time::Instant::now();
+                writer.write_record_batch(batch).await?;
+                write_duration += start.elapsed();
+            }
 
-            if num_posting_lists - last_num > 100_000 {
-                last_num = num_posting_lists;
+            if num_posting_lists % 500_000 == 0 {
                 log::info!(
                     "wrote {} posting lists of partition {}, writing elapsed: {:?}",
                     num_posting_lists,
@@ -405,8 +339,11 @@ impl InnerBuilder {
                 );
             }
         }
+        if buffer.len() > 0 {
+            let batch = concat_batches(&schema, buffer.iter())?;
+            writer.write_record_batch(batch).await?;
+        }
 
-        compress_task.await?;
         writer.finish().await?;
 
         Ok(())
@@ -439,12 +376,11 @@ impl InnerBuilder {
 }
 
 struct IndexWorker {
+    store: Arc<dyn IndexStore>,
     tokenizer: tantivy::tokenizer::TextAnalyzer,
     id_alloc: Arc<AtomicU64>,
     builder: InnerBuilder,
     partitions: Vec<u64>,
-    flush_channel: tokio::sync::mpsc::Sender<InnerBuilder>,
-    flush_task: tokio::task::JoinHandle<Result<()>>,
     schema: SchemaRef,
     estimated_size: u64,
     total_doc_length: usize,
@@ -459,23 +395,12 @@ impl IndexWorker {
     ) -> Result<Self> {
         let schema = inverted_list_schema(with_position);
 
-        let (sender, receiver) = tokio::sync::mpsc::channel::<InnerBuilder>(1);
-        let flush_task = tokio::spawn(async move {
-            let mut receiver = receiver;
-            let store = store;
-            while let Some(mut inner) = receiver.recv().await {
-                inner.write(store.as_ref()).await?;
-            }
-            Result::Ok(())
-        });
-
         Ok(Self {
+            store,
             tokenizer,
             builder: InnerBuilder::new(id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
             partitions: Vec::new(),
             id_alloc,
-            flush_channel: sender,
-            flush_task,
             schema,
             estimated_size: 0,
             total_doc_length: 0,
@@ -486,7 +411,7 @@ impl IndexWorker {
         self.schema.column_with_name(POSITION_COL).is_some()
     }
 
-    fn process_batch(&mut self, batch: RecordBatch) -> Result<()> {
+    async fn process_batch(&mut self, batch: RecordBatch) -> Result<()> {
         let doc_col = batch.column(0);
         let doc_iter = iter_str_array(doc_col);
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
@@ -516,7 +441,7 @@ impl IndexWorker {
                 .resize_with(self.builder.tokens.len(), || {
                     PostingListBuilder::new(with_position)
                 });
-            let doc_id = self.builder.docs.add(row_id, token_num);
+            let doc_id = self.builder.docs.append(row_id, token_num);
             self.total_doc_length += doc.len();
 
             token_occurrences
@@ -533,7 +458,7 @@ impl IndexWorker {
             if self.builder.docs.len() as u32 == u32::MAX
                 || self.estimated_size >= *LANCE_FTS_PARTITION_SIZE << 20
             {
-                self.flush()?;
+                self.flush().await?;
             }
         }
 
@@ -541,7 +466,7 @@ impl IndexWorker {
     }
 
     #[instrument(level = "debug", skip_all)]
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         if self.builder.tokens.len() == 0 {
             return Ok(());
         }
@@ -551,37 +476,23 @@ impl IndexWorker {
             self.estimated_size / (1024 * 1024)
         );
         self.estimated_size = 0;
-        let builder = std::mem::replace(
+        let mut builder = std::mem::replace(
             &mut self.builder,
             InnerBuilder::new(
                 self.id_alloc
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
         );
+        builder.write(self.store.as_ref()).await?;
         self.partitions.push(builder.id);
-        self.flush_channel
-            .blocking_send(builder)
-            .map_err(|e| Error::Index {
-                message: format!("failed to send posting list: {}", e),
-                location: location!(),
-            })?;
 
         Ok(())
     }
 
     async fn finish(mut self) -> Result<Vec<u64>> {
         if self.builder.tokens.len() > 0 {
-            self.partitions.push(self.builder.id);
-            self.flush_channel
-                .send(self.builder)
-                .await
-                .map_err(|e| Error::Index {
-                    message: format!("failed to send posting list: {}", e),
-                    location: location!(),
-                })?;
+            self.flush().await?;
         }
-        std::mem::drop(self.flush_channel);
-        self.flush_task.await??;
         Ok(self.partitions)
     }
 }

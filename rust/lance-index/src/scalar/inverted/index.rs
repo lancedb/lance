@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::fmt::Debug;
 use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
@@ -12,14 +11,15 @@ use std::{
     collections::{HashMap, HashSet},
     ops::Range,
 };
+use std::{fmt::Debug, ops::IndexMut};
 
-use arrow::{
-    array::LargeBinaryBuilder,
-    datatypes::{self, Float32Type, UInt64Type},
-};
 use arrow::{
     array::{AsArray, ListBuilder, StringBuilder, UInt32Builder},
     buffer::OffsetBuffer,
+};
+use arrow::{
+    array::{Int32Builder, LargeBinaryBuilder},
+    datatypes::{self, Float32Type, Int32Type, UInt64Type},
 };
 use arrow::{buffer::ScalarBuffer, datatypes::UInt32Type};
 use arrow_array::{
@@ -39,6 +39,7 @@ use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::utils::{
     mask::RowIdMask,
+    tokio::spawn_cpu,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
 };
 use lance_core::{container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus};
@@ -50,16 +51,18 @@ use snafu::location;
 use tracing::{info, instrument};
 
 use super::{
-    builder::PositionRecorder,
-    encoding::{compress_posting_slices, decompress_posting_list},
-};
-use super::{
     builder::{
         doc_file_path, inverted_list_schema, posting_file_path, token_file_path, OrderedDoc,
+        BLOCK_SIZE,
     },
-    encoding::compress_posting_list,
+    encoding::{compress_posting_list, decompress_posting_block},
     query::*,
     scorer::{idf, BM25Scorer, B, K1},
+};
+use super::{
+    builder::{InnerBuilder, PositionRecorder},
+    encoding::{compress_posting_slices, decompress_posting_list},
+    iter::CompressedPostingListIterator,
 };
 use super::{
     encoding::{compress_positions, decompress_positions_list},
@@ -218,7 +221,7 @@ impl InvertedIndex {
             let store = store.clone();
             async move {
                 let docs_reader = store.open_index_file(DOCS_FILE).await?;
-                let docs = DocSet::load(docs_reader).await?;
+                let docs = DocSet::load(docs_reader, true).await?;
                 Result::Ok(docs)
             }
         });
@@ -369,7 +372,9 @@ impl ScalarIndex for InvertedIndex {
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        self.to_builder().remap(mapping, dest_store).await
+        self.to_builder()
+            .remap(mapping, self.store.clone(), dest_store)
+            .await
     }
 
     async fn update(
@@ -412,7 +417,7 @@ impl InvertedPartition {
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
         let inverted_list = PostingListReader::try_new(invert_list_file).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
-        let docs = DocSet::load(docs_file).await?;
+        let docs = DocSet::load(docs_file, false).await?;
 
         Ok(Self {
             id,
@@ -493,67 +498,90 @@ impl InvertedPartition {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let row_ids = &self.docs.row_ids;
+        let num_docs = self.docs.len();
         let postings = stream::iter(token_ids)
             .enumerate()
-            .zip(repeat_with(|| mask.clone()))
-            .map(|((position, token_id), mask)| async move {
+            .map(|(position, token_id)| async move {
                 let posting = self
                     .inverted_list
                     .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
+                // let posting = match posting {
+                //     PostingList::Compressed(compressed) => {
+                //         let (doc_ids, freqs) =
+                //             decompress_posting_list(compressed.length, &compressed.blocks)?;
+                //         let row_ids = doc_ids
+                //             .into_iter()
+                //             .map(|doc_id| row_ids[doc_id as usize])
+                //             .collect();
+                //         let freqs = freqs.into_iter().map(|freq| freq as f32).collect();
+                //         let positions = compressed
+                //             .positions
+                //             .map(|positions| decompress_positions_list(&positions))
+                //             .transpose()?;
 
-                // TODO: search on compressed posting list
-                // now we just decompress the entire posting list
-                let posting = match posting {
-                    PostingList::Compressed(compressed) => {
-                        let (doc_ids, freqs) =
-                            decompress_posting_list(compressed.length, &compressed.blocks)?;
-                        let row_ids = doc_ids
-                            .into_iter()
-                            .map(|doc_id| row_ids[doc_id as usize])
-                            .collect();
-                        let freqs = freqs.into_iter().map(|freq| freq as f32).collect();
-                        let positions = compressed
-                            .positions
-                            .map(|positions| decompress_positions_list(&positions))
-                            .transpose()?;
-
-                        PostingList::Plain(PlainPostingList::new(
-                            row_ids,
-                            freqs,
-                            Some(compressed.max_score),
-                            positions,
-                        ))
-                    }
-                    _ => posting,
-                };
+                //         PostingList::Plain(PlainPostingList::new(
+                //             row_ids,
+                //             freqs,
+                //             Some(compressed.max_score),
+                //             positions,
+                //         ))
+                //     }
+                //     _ => posting,
+                // };
 
                 Result::Ok(PostingIterator::new(
                     token_id,
                     position as u32,
                     posting,
-                    self.docs.len(),
-                    mask,
+                    num_docs,
                 ))
             })
-            .buffer_unordered(self.store.io_parallelism())
+            .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
 
         let mut wand = Wand::new(operator, postings.into_iter(), &self.docs);
+        let avgdl = self.docs.average_length();
         wand.search(
             is_phrase_query,
             params.limit.unwrap_or(usize::MAX),
+            mask,
             params.wand_factor,
-            |row_id, freq| {
-                let doc_norm = K1
-                    * (1.0 - B
-                        + B * self.docs.num_tokens_by_row_id(row_id) as f32
-                            / self.docs.average_length());
+            |doc| {
+                let num_tokens = match doc {
+                    DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
+                    DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                } as f32;
+                let doc_norm = K1 * (1.0 - B + B * num_tokens / avgdl);
+                let freq = doc.frequency() as f32;
                 freq / (freq + doc_norm)
             },
         )
+    }
+
+    pub async fn into_builder(self) -> Result<InnerBuilder> {
+        let mut builder = InnerBuilder::new(self.id);
+        builder.tokens = self.tokens;
+        builder.docs = self.docs;
+
+        builder
+            .posting_lists
+            .reserve_exact(self.inverted_list.len());
+        for posting_list in self.inverted_list.read_all().await? {
+            let posting_list = posting_list?;
+            builder.posting_lists.push(posting_list.into());
+        }
+        Ok(builder)
+    }
+
+    pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        let removed = self.docs.remap(mapping);
+        for posting_list in self.inverted_list.read_all().await? {
+            let mut posting_list = posting_list?;
+            posting_list.remap(mapping, &self.docs, &removed);
+        }
+        Ok(())
     }
 }
 
@@ -983,6 +1011,15 @@ impl PostingListReader {
         Ok(batch)
     }
 
+    pub(crate) async fn read_all(&self) -> Result<impl Iterator<Item = Result<PostingList>> + '_> {
+        let batch = self.read_batch(false).await?;
+        Ok((0..batch.num_rows()).map(move |i| {
+            let batch = batch.slice(i, 1);
+            let token_id = batch[ROW_ID].as_primitive::<UInt32Type>().value(0);
+            self.posting_list_from_batch(&batch, token_id)
+        }))
+    }
+
     async fn read_positions(&self, token_id: u32) -> Result<ListArray> {
         self.position_cache.try_get_with(token_id, async move {
             let batch = self
@@ -1059,6 +1096,13 @@ impl PostingList {
         PostingListIterator::new(self)
     }
 
+    pub fn has_position(&self) -> bool {
+        match self {
+            PostingList::Plain(posting) => posting.positions.is_some(),
+            PostingList::Compressed(posting) => posting.positions.is_some(),
+        }
+    }
+
     pub fn set_positions(&mut self, positions: ListArray) {
         match self {
             PostingList::Plain(posting) => posting.positions = Some(positions),
@@ -1077,24 +1121,6 @@ impl PostingList {
         }
     }
 
-    pub fn doc(&self, i: usize) -> DocInfo {
-        match self {
-            PostingList::Plain(posting) => DocInfo::Located(posting.doc(i)),
-            PostingList::Compressed(posting) => {
-                unimplemented!("compressed posting list does not support doc")
-            }
-        }
-    }
-
-    pub fn positions(&self, row_id: u64) -> Option<Arc<dyn Array>> {
-        match self {
-            PostingList::Plain(posting) => posting.positions(row_id),
-            PostingList::Compressed(posting) => {
-                unimplemented!("compressed posting list does not support positions")
-            }
-        }
-    }
-
     pub fn max_score(&self) -> Option<f32> {
         match self {
             PostingList::Plain(posting) => posting.max_score,
@@ -1108,13 +1134,20 @@ impl PostingList {
             PostingList::Compressed(posting) => posting.length as usize,
         }
     }
-}
 
-impl Into<PostingListBuilder> for PostingList {
-    fn into(self) -> PostingListBuilder {
+    pub fn remap(
+        &mut self,
+        mapping: &HashMap<u64, Option<u64>>,
+        docs: &DocSet,
+        removed: &Vec<u32>,
+    ) {
         match self {
-            PostingList::Plain(posting) => unimplemented!(),
-            PostingList::Compressed(_) => unimplemented!(),
+            PostingList::Plain(posting) => {
+                posting.remap(mapping);
+            }
+            PostingList::Compressed(posting) => {
+                posting.remap(docs, removed);
+            }
         }
     }
 }
@@ -1179,11 +1212,10 @@ impl PlainPostingList {
         LocatedDocInfo::new(self.row_ids[i], self.frequencies[i])
     }
 
-    pub fn positions(&self, row_id: u64) -> Option<Arc<dyn Array>> {
-        let pos = self.row_ids.binary_search(&row_id).ok()?;
+    pub fn positions(&self, index: usize) -> Option<Arc<dyn Array>> {
         self.positions
             .as_ref()
-            .map(|positions| positions.value(pos))
+            .map(|positions| positions.value(index))
     }
 
     pub fn max_score(&self) -> Option<f32> {
@@ -1192,6 +1224,54 @@ impl PlainPostingList {
 
     pub fn row_id(&self, i: usize) -> u64 {
         self.row_ids[i]
+    }
+
+    pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
+        let mut new_row_ids = Vec::with_capacity(self.len());
+        let mut new_frequencies = Vec::with_capacity(self.len());
+        let mut new_positions = self.positions.as_mut().map(|positions| {
+            ListBuilder::with_capacity(
+                Int32Builder::with_capacity(positions.values().len()),
+                positions.len(),
+            )
+        });
+
+        for (idx, (&row_id, &freq)) in self.row_ids.iter().zip(self.frequencies.iter()).enumerate()
+        {
+            let positions = self.positions.as_ref().map(|positions| {
+                let offset = positions.offsets()[idx];
+                let length = positions.value_length(idx);
+                positions
+                    .values()
+                    .as_primitive::<Int32Type>()
+                    .slice(offset as usize, length as usize)
+            });
+
+            match mapping.get(&row_id) {
+                Some(Some(new_row_id)) => {
+                    new_row_ids.push(*new_row_id);
+                    new_frequencies.push(freq);
+                    if let Some(new_positions) = new_positions.as_mut() {
+                        new_positions.append_value(positions.unwrap().iter());
+                    }
+                }
+                Some(None) => {
+                    // this doc is removed
+                    // do nothing
+                }
+                None => {
+                    new_row_ids.push(row_id);
+                    new_frequencies.push(freq);
+                    if let Some(new_positions) = new_positions.as_mut() {
+                        new_positions.append_value(positions.unwrap().iter());
+                    }
+                }
+            }
+        }
+
+        self.row_ids = ScalarBuffer::from(new_row_ids);
+        self.frequencies = ScalarBuffer::from(new_frequencies);
+        self.positions = new_positions.map(|mut builder| builder.finish());
     }
 }
 
@@ -1234,6 +1314,56 @@ impl CompressedPostingList {
             blocks,
             positions,
         }
+    }
+
+    pub fn iter(&self) -> CompressedPostingListIterator {
+        CompressedPostingListIterator::new(
+            self.length as usize,
+            self.blocks.clone(),
+            self.positions.clone(),
+        )
+    }
+
+    fn remap(&mut self, docs: &DocSet, removed: &Vec<u32>) -> Result<()> {
+        let mut cursor = 0;
+        let length = self.length as usize;
+        let mut new_doc_ids = Vec::with_capacity(length);
+        let mut new_frequencies = Vec::with_capacity(length);
+        let mut new_positions = self
+            .positions
+            .as_ref()
+            .map(|_| ListBuilder::with_capacity(LargeBinaryBuilder::new(), length));
+        for (doc_id, freq, positions) in self.iter() {
+            while cursor < removed.len() && removed[cursor] < doc_id {
+                cursor += 1;
+            }
+            if cursor < removed.len() && removed[cursor] == doc_id {
+                // this doc is removed
+                continue;
+            }
+            // there are cursor removed docs before this doc
+            // so we need to shift the doc id
+            new_doc_ids.push(doc_id - cursor as u32);
+            new_frequencies.push(freq);
+            if let Some(new_positions) = new_positions.as_mut() {
+                let positions = positions.unwrap().collect::<Vec<_>>();
+                let compressed = compress_positions(&positions)?;
+                new_positions.append_value(compressed.into_iter());
+            }
+        }
+
+        self.max_score = docs.calculate_max_score(new_doc_ids.iter(), new_frequencies.iter());
+        self.length = new_doc_ids.len() as u32;
+        let compressed = compress_posting_list(&new_doc_ids, &new_frequencies)?;
+        self.blocks = compressed;
+        self.positions = new_positions.map(|mut builder| builder.finish());
+
+        Ok(())
+    }
+
+    pub fn block_least_doc_id(&self, block_idx: usize) -> u32 {
+        let block = self.blocks.value(block_idx);
+        block[0..4].try_into().map(u32::from_le_bytes).unwrap()
     }
 }
 
@@ -1283,50 +1413,9 @@ impl PostingListBuilder {
         }
     }
 
-    pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>, docs: &DocSet) {
-        let mut new_doc_ids = ExpLinkedList::with_capacity(self.len());
-        let mut new_freqs = ExpLinkedList::with_capacity(self.len());
-        let mut new_positions = self.positions.as_mut().map(|_| PositionBuilder::new());
-
-        for (idx, (&doc_id, &freq)) in self.doc_ids.iter().zip(self.frequencies.iter()).enumerate()
-        {
-            let row_id = docs.row_id(doc_id);
-            let positions = self
-                .positions
-                .as_ref()
-                .map(|positions| positions.get(idx).to_vec());
-
-            match mapping.get(&row_id) {
-                Some(Some(_)) => {
-                    // the doc_id -> row_id mapping will be done in `DocSet`
-                    new_doc_ids.push(doc_id);
-                }
-                Some(None) => {
-                    // remove this doc
-                    // do nothing
-                }
-                None => {
-                    new_doc_ids.push(doc_id);
-                    new_freqs.push(freq);
-                    if let Some(new_positions) = new_positions.as_mut() {
-                        new_positions.push(positions.unwrap());
-                    }
-                }
-            }
-        }
-
-        self.doc_ids = new_doc_ids;
-        self.frequencies = new_freqs;
-        self.positions = new_positions;
-    }
-
     // assume the posting list is sorted by doc id
-    pub fn to_batch(mut self, docs: &DocSet) -> Result<RecordBatch> {
+    pub fn to_batch(mut self, max_score: f32) -> Result<RecordBatch> {
         let length = self.len();
-        let num_docs = docs.len();
-        let avgdl = docs.average_length();
-        let mut max_score = 0.0;
-
         let mut position_builder = self.positions.as_mut().map(|_| {
             ListBuilder::new(ListBuilder::with_capacity(
                 LargeBinaryBuilder::new(),
@@ -1335,14 +1424,6 @@ impl PostingListBuilder {
         });
         for (index, (doc_id, freq)) in self.doc_ids.iter().zip(self.frequencies.iter()).enumerate()
         {
-            // calculate the max score
-            let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(*doc_id) as f32 / avgdl);
-            let freq = *freq as f32;
-            let score = freq / (freq + doc_norm);
-            if score > max_score {
-                max_score = score;
-            }
-
             if let Some(position_builder) = position_builder.as_mut() {
                 let positions = self.positions.as_ref().unwrap().get(index);
                 let compressed = compress_positions(positions)?;
@@ -1350,7 +1431,6 @@ impl PostingListBuilder {
                 inner_builder.append_value(compressed.into_iter());
             }
         }
-        max_score *= idf(self.len(), num_docs) * (K1 + 1.0);
         let compressed = compress_posting_slices(
             self.doc_ids.len(),
             self.doc_ids.block_iter(),
@@ -1377,6 +1457,20 @@ impl PostingListBuilder {
         }
         let batch = RecordBatch::try_new(schema, columns)?;
         Ok(batch)
+    }
+}
+
+impl From<PostingList> for PostingListBuilder {
+    fn from(posting_list: PostingList) -> Self {
+        let mut builder = Self::new(posting_list.has_position());
+        for (doc_id, freq, positions) in posting_list.iter() {
+            let positions = match positions {
+                Some(positions) => PositionRecorder::Position(positions.collect::<Vec<_>>()),
+                None => PositionRecorder::Count(freq),
+            };
+            builder.add(doc_id as u32, positions);
+        }
+        builder
     }
 }
 
@@ -1543,7 +1637,7 @@ impl Ord for RawDocInfo {
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct DocSet {
     row_ids: Vec<u64>,
-    num_tokens: BTreeMap<u64, u32>, // row_id -> num_tokens
+    num_tokens: Vec<u32>,
     total_tokens: u64,
 }
 
@@ -1558,7 +1652,7 @@ impl DocSet {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&u64, &u32)> {
-        self.num_tokens.iter()
+        self.row_ids.iter().zip(self.num_tokens.iter())
     }
 
     pub fn row_id(&self, doc_id: u32) -> u64 {
@@ -1578,11 +1672,30 @@ impl DocSet {
         self.total_tokens as f32 / self.len() as f32
     }
 
+    pub fn calculate_max_score<'a>(
+        &self,
+        doc_ids: impl Iterator<Item = &'a u32>,
+        freqs: impl Iterator<Item = &'a u32>,
+    ) -> f32 {
+        let avgdl = self.average_length();
+        let mut length = 0;
+        let mut max_score = 0.0;
+        for (doc_id, freq) in doc_ids.zip(freqs) {
+            length += 1;
+            let doc_norm = K1 * (1.0 - B + B * self.num_tokens(*doc_id) as f32 / avgdl);
+            let freq = *freq as f32;
+            let score = freq / (freq + doc_norm);
+            if score > max_score {
+                max_score = score;
+            }
+        }
+        max_score *= idf(length, self.len()) * (K1 + 1.0);
+        max_score
+    }
+
     pub fn to_batch(&self) -> Result<RecordBatch> {
         let row_id_col = UInt64Array::from_iter_values(self.row_ids.iter().cloned());
-        let num_tokens_col = UInt32Array::from_iter_values(
-            self.row_ids.iter().map(|row_id| self.num_tokens[row_id]),
-        );
+        let num_tokens_col = UInt32Array::from_iter_values(self.num_tokens.iter().cloned());
 
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
@@ -1599,56 +1712,79 @@ impl DocSet {
         Ok(batch)
     }
 
-    pub async fn load(reader: Arc<dyn IndexReader>) -> Result<Self> {
-        let mut total_tokens = 0;
-
+    pub async fn load(reader: Arc<dyn IndexReader>, is_legacy: bool) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
-        let mut mapping = BTreeMap::new();
-        for (&row_id, &num_tokens) in row_id_col.values().iter().zip(num_tokens_col.values()) {
-            total_tokens += num_tokens as u64;
-            mapping.insert(row_id, num_tokens);
-        }
 
+        let (row_ids, num_tokens) = match is_legacy {
+            // for legacy format, the row id is doc id,
+            // in order to support efficient search, we need to sort the row ids,
+            // so that we can use binary search to get num_tokens
+            true => row_id_col
+                .values()
+                .iter()
+                .zip(num_tokens_col.values().iter())
+                .sorted_unstable_by_key(|x| x.0)
+                .unzip(),
+            false => {
+                let row_ids = row_id_col.values().to_vec();
+                let num_tokens = num_tokens_col.values().to_vec();
+                (row_ids, num_tokens)
+            }
+        };
+
+        let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
         Ok(Self {
-            row_ids: row_id_col.values().to_vec(),
-            num_tokens: mapping,
+            row_ids,
+            num_tokens,
             total_tokens,
         })
     }
 
-    pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
-        for row_id in self.row_ids.iter_mut() {
-            match mapping.get(row_id) {
-                Some(Some(new_row_id)) => *row_id = *new_row_id,
-                Some(None) => {
-                    unimplemented!("TODO: handle the deletion case")
+    // remap the row ids to the new row ids
+    // returns the removed doc ids
+    pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Vec<u32> {
+        let mut removed = Vec::new();
+        let len = self.len();
+        let row_ids = std::mem::replace(&mut self.row_ids, Vec::with_capacity(len));
+        let num_tokens = std::mem::replace(&mut self.num_tokens, Vec::with_capacity(len));
+        for (doc_id, (row_id, num_token)) in std::iter::zip(row_ids, num_tokens).enumerate() {
+            match mapping.get(&row_id) {
+                Some(Some(new_row_id)) => {
+                    self.row_ids.push(*new_row_id);
+                    self.num_tokens.push(num_token);
                 }
-                None => {}
+                Some(None) => {
+                    removed.push(doc_id as u32);
+                }
+                None => {
+                    self.row_ids.push(row_id);
+                    self.num_tokens.push(num_token);
+                }
             }
         }
+        removed
     }
 
     #[inline]
     pub fn num_tokens(&self, doc_id: u32) -> u32 {
-        let row_id = self.row_ids[doc_id as usize];
-        self.num_tokens[&row_id]
+        self.num_tokens[doc_id as usize]
     }
 
     #[inline]
     pub fn num_tokens_by_row_id(&self, row_id: u64) -> u32 {
-        self.num_tokens[&row_id]
+        self.row_ids
+            .binary_search(&row_id)
+            .map(|idx| self.num_tokens[idx])
+            .unwrap_or(0)
     }
 
-    // add a document to the doc set
-    // returns the doc_id (the number of documents before adding)
-    pub fn add(&mut self, row_id: u64, num_tokens: u32) -> u32 {
-        let value = self.num_tokens.entry(row_id).or_insert_with(|| {
-            self.row_ids.push(row_id);
-            0
-        });
-        *value += num_tokens;
+    // append a document to the doc set
+    // returns the doc_id (the number of documents before appending)
+    pub fn append(&mut self, row_id: u64, num_tokens: u32) -> u32 {
+        self.row_ids.push(row_id);
+        self.num_tokens.push(num_tokens);
         self.total_tokens += num_tokens as u64;
         self.row_ids.len() as u32 - 1
     }

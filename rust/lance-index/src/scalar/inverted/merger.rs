@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    collections::{BinaryHeap, HashMap},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
+use deepsize::DeepSizeOf;
 use lance_core::Result;
 
-use crate::{
-    metrics::NoOpMetricsCollector,
-    scalar::{inverted::PostingList, IndexStore},
-};
+use crate::scalar::IndexStore;
 
 use super::{
     builder::{doc_file_path, posting_file_path, token_file_path, InnerBuilder, PositionRecorder},
@@ -101,14 +96,23 @@ impl<'a> Merger for SizeBasedMerger<'a> {
         // for token set, union the tokens,
         // for doc set, concatenate the row ids, assign the doc id to offset + doc_id
         // for posting list, concatenate the posting lists
-        log::info!("merging {} partitions", self.input.len());
+        log::info!(
+            "merging {} partitions with target size {} MiB",
+            self.input.len(),
+            self.target_size / 1024 / 1024
+        );
+        let mut estimated_size = 0;
         let start = std::time::Instant::now();
         for idx in 0..self.input.len() {
             let part = self.input[idx];
-            let doc_id_offset = self.builder.docs.len() as u32;
-            // single partition can index up to u32::MAX documents
-            if self.builder.docs.len() + part.docs.len() > u32::MAX as usize {
+
+            // single partition can index up to u32::MAX documents,
+            // or target size is reached
+            if self.builder.docs.len() + part.docs.len() > u32::MAX as usize
+                || estimated_size >= self.target_size
+            {
                 self.flush().await?;
+                estimated_size = 0;
             }
 
             let mut inv_token = HashMap::with_capacity(part.tokens.len());
@@ -118,8 +122,9 @@ impl<'a> Merger for SizeBasedMerger<'a> {
                 inv_token.insert(token_id, token);
             }
             // merge doc set
+            let doc_id_offset = self.builder.docs.len() as u32;
             for (row_id, num_tokens) in part.docs.iter() {
-                self.builder.docs.add(*row_id, *num_tokens);
+                self.builder.docs.append(*row_id, *num_tokens);
             }
             // merge posting lists
             self.builder
@@ -136,9 +141,9 @@ impl<'a> Merger for SizeBasedMerger<'a> {
                 let posting_list = part
                     .inverted_list
                     .posting_list_from_batch(&postings.slice(token_id as usize, 1), token_id)?;
-
                 let new_token_id = self.builder.tokens.get(&inv_token[&token_id]).unwrap();
                 let builder = &mut self.builder.posting_lists[new_token_id as usize];
+                let old_size = builder.size();
                 for (doc_id, freq, positions) in posting_list.iter() {
                     let new_doc_id = doc_id_offset + doc_id as u32;
                     let positions = match positions {
@@ -147,6 +152,8 @@ impl<'a> Merger for SizeBasedMerger<'a> {
                     };
                     builder.add(new_doc_id, positions);
                 }
+                let new_size = builder.size();
+                estimated_size += new_size - old_size;
             }
             log::info!(
                 "merged {}/{} partitions in {:?}",

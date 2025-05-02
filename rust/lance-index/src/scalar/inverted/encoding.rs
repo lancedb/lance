@@ -40,7 +40,7 @@ pub fn compress_posting_list(
         LargeBinaryBuilder::with_capacity(doc_ids.len().div_ceil(BLOCK_SIZE), length * 3);
     let doc_id_chunks = doc_ids.chunks_exact(BLOCK_SIZE);
     let frequency_chunks = frequencies.chunks_exact(BLOCK_SIZE);
-    let mut buffer: [u8; BLOCK_SIZE * 4 + 5] = [0u8; BLOCK_SIZE * 4 + 5];
+    let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
     for (doc_id_chunk, freq_chunk) in std::iter::zip(doc_id_chunks, frequency_chunks) {
         // delta encoding + bitpacking for doc ids
         compress_sorted_block(doc_id_chunk, &mut buffer, &mut builder)?;
@@ -84,7 +84,7 @@ pub fn compress_posting_slices<'a>(
     }
 
     let mut builder = LargeBinaryBuilder::with_capacity(length.div_ceil(BLOCK_SIZE), length * 3);
-    let mut buffer: [u8; BLOCK_SIZE * 4 + 5] = [0u8; BLOCK_SIZE * 4 + 5];
+    let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
     let mut doc_id_buffer = Vec::with_capacity(BLOCK_SIZE);
     let mut freq_buffer = Vec::with_capacity(BLOCK_SIZE);
     for (doc_id_chunk, freq_chunk) in std::iter::zip(doc_ids, frequencies) {
