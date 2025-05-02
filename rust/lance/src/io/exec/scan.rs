@@ -302,7 +302,6 @@ impl LanceStream {
             // us fully fuse decode into the first half of the plan.  Currently there is likely to be a thread
             // transfer between the two steps.
             .try_buffered_with_ordering(get_num_compute_intensive_cpus(), config.ordered_output)
-            .stream_in_span(span.clone())
             .boxed();
 
         timer.done();
@@ -369,7 +368,6 @@ impl LanceStream {
                 .try_flatten()
                 // We buffer up to `batch_readahead` batches across all streams.
                 .try_buffered_with_ordering(fragment_readahead, config.ordered_output)
-                .stream_in_span(span.clone())
                 .boxed()
         };
 
@@ -611,7 +609,7 @@ impl ExecutionPlan for LanceScanExec {
 
         let span = tracing::debug_span!(
             "LanceScanExec::execute",
-            projection = ?projection,
+            num_fields = self.projection.fields_pre_order().count(),
             range = ?range,
             num_fragments = fragments.len(),
             partition,
@@ -620,12 +618,13 @@ impl ExecutionPlan for LanceScanExec {
             bytes_read = tracing::field::Empty,
         );
 
+        let span_copy = span.clone(); // Send one to record metrics.
         let lance_fut_stream = stream::once(async move {
             LanceStream::try_new(
-                dataset, fragments, range, projection, config, &metrics, partition, span,
+                dataset, fragments, range, projection, config, &metrics, partition, span_copy,
             )
         });
-        let lance_stream = lance_fut_stream.try_flatten();
+        let lance_stream = lance_fut_stream.try_flatten().stream_in_span(span);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
             lance_stream,

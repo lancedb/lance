@@ -85,7 +85,7 @@ impl LocalObjectReader {
     }
 
     /// Open a local object reader, with default prefetch size.
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip(path), fields(path = path.as_ref()))]
     pub async fn open(
         path: &Path,
         block_size: usize,

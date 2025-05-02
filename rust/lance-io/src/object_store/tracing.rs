@@ -61,12 +61,12 @@ impl std::fmt::Display for TracedObjectStore {
 impl object_store::ObjectStore for TracedObjectStore {
     // Instead of using Path in trace span, use use Path.as_ref() -> &str which
     // is cleaner.
-    #[instrument(level = "debug", skip(self, bytes, location), fields(path = location.as_ref()))]
+    #[instrument(level = "debug", skip(self, bytes, location), fields(path = location.as_ref(), size = bytes.content_length()))]
     async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
         self.target.put(location, bytes).await
     }
 
-    #[instrument(level = "debug", skip(self, bytes, location), fields(path = location.as_ref()))]
+    #[instrument(level = "debug", skip(self, bytes, location), fields(path = location.as_ref(), size = bytes.content_length()))]
     async fn put_opts(
         &self,
         location: &Path,
@@ -99,17 +99,27 @@ impl object_store::ObjectStore for TracedObjectStore {
         }))
     }
 
-    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref()))]
+    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref(), size = tracing::field::Empty))]
     async fn get(&self, location: &Path) -> OSResult<GetResult> {
-        self.target.get(location).await
+        let res = self.target.get(location).await?;
+
+        let span = tracing::Span::current();
+        span.record("size", res.meta.size);
+
+        Ok(res)
     }
 
-    #[instrument(level = "debug", skip(self, options, location), fields(path = location.as_ref()))]
+    #[instrument(level = "debug", skip(self, options, location), fields(path = location.as_ref(), size = tracing::field::Empty))]
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
-        self.target.get_opts(location, options).await
+        let res = self.target.get_opts(location, options).await?;
+
+        let span = tracing::Span::current();
+        span.record("size", res.range.len());
+
+        Ok(res)
     }
 
-    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref()))]
+    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref(), size = range.len()))]
     async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
         self.target.get_range(location, range).await
     }
