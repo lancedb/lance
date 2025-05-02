@@ -129,9 +129,9 @@ pub async fn maybe_sample_training_data(
             // but each multivector is a list of vectors, but we don't know how many
             // vectors are in each multivector. For now we just assume there are 1030 vectors
             // in each multivector (Copali case).
-            // Set a minimum sample size of 64 to avoid too small samples,
-            // it's not a problem because 64 multivectors is just about 32 MiB
-            sample_size_hint.div_ceil(1030).max(64)
+            // Set a minimum sample size of 128 to avoid too small samples,
+            // it's not a problem because 128 multivectors is just about 64 MiB
+            sample_size_hint.div_ceil(1030).max(128)
         }
         _ => sample_size_hint,
     };
