@@ -629,11 +629,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             .try_flatten();
         let prefilter_loader = match &prefilter_source {
             PreFilterSource::FilteredRowIds(src_node) => {
-                let stream = src_node.execute(partition, context.clone())?;
+                let stream = src_node.execute(partition, context)?;
                 Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
             }
             PreFilterSource::ScalarIndexQuery(src_node) => {
-                let stream = src_node.execute(partition, context.clone())?;
+                let stream = src_node.execute(partition, context)?;
                 Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
             }
             PreFilterSource::None => None,
