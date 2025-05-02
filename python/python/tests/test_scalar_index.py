@@ -213,6 +213,93 @@ def test_indexed_vector_scan(indexed_dataset: lance.LanceDataset, data_table: pa
     check_result(scanner.to_table())
 
 
+def test_partly_indexed_prefiltered_search(tmp_path):
+    # Regresses a case where the vector index is ahead of a scalar index.  The scalar
+    # index wants to be used as a prefilter but we have to make sure to scan the
+    # unindexed fragments and feed those into the prefilter
+
+    # Create initial dataset
+    table = pa.table(
+        {
+            "vec": pa.array([[i, i] for i in range(1000)], pa.list_(pa.float32(), 2)),
+            "text": ["book" for _ in range(1000)],
+            "id": range(1000),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path)
+    ds = ds.create_index(
+        "vec",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=2,
+    )
+    ds.create_scalar_index("id", "BTREE")
+    ds.create_scalar_index("text", index_type="INVERTED", with_position=False)
+
+    def make_vec_search(ds):
+        return ds.scanner(
+            nearest={"column": "vec", "q": [5, 5], "k": 1000},
+            prefilter=True,
+            filter="id in (5, 10, 15, 20, 25, 30)",
+        )
+
+    def make_fts_search(ds):
+        return ds.scanner(
+            full_text_query="book",
+            prefilter=True,
+            filter="id in (5, 10, 15, 20, 25, 30)",
+        )
+
+    # Sanity test, no new data, should get 6 results
+    plan = make_vec_search(ds).explain_plan()
+    assert "ScalarIndexQuery" in plan
+    assert "KNNVectorDistance" not in plan
+    assert "LanceScan" not in plan
+    assert make_vec_search(ds).to_table().num_rows == 6
+
+    plan = make_fts_search(ds).explain_plan()
+    assert "ScalarIndexQuery" in plan
+    assert "KNNVectorDistance" not in plan
+    assert "LanceScan" not in plan
+    assert make_fts_search(ds).to_table().num_rows == 6
+
+    # Add new data (including 6 more results)
+    ds.insert(table)
+
+    # Basic ann combined search, should get 12 results
+    plan = make_vec_search(ds).explain_plan()
+    assert "ScalarIndexQuery" in plan
+    assert "MaterializeIndex" not in plan
+    assert "KNNVectorDistance" in plan
+    assert "LanceScan" in plan
+    assert make_vec_search(ds).to_table().num_rows == 12
+
+    plan = make_fts_search(ds).explain_plan()
+    assert "ScalarIndexQuery" in plan
+    assert "MaterializeIndex" not in plan
+    assert "FlatMatchQuery" in plan
+    assert "LanceScan" in plan
+    assert make_fts_search(ds).to_table().num_rows == 12
+
+    # Update vector index but NOT scalar index
+    ds.optimize.optimize_indices(index_names=["vec_idx", "text_idx"])
+
+    # Ann search but with combined prefilter, should get 12 results
+    plan = make_vec_search(ds).explain_plan()
+    assert "ScalarIndexQuery" not in plan
+    assert "MaterializeIndex" in plan
+    assert "KNNVectorDistance" not in plan
+    assert "LanceScan" in plan
+    assert make_vec_search(ds).to_table().num_rows == 12
+
+    plan = make_fts_search(ds).explain_plan()
+    assert "ScalarIndexQuery" not in plan
+    assert "MaterializeIndex" in plan
+    assert "FlatMatchQuery" not in plan
+    assert "LanceScan" in plan
+    assert make_fts_search(ds).to_table().num_rows == 12
+
+
 # Post filtering does not use scalar indices.  This test merely confirms
 # that post filtering is still being applied even if the query could be
 # satisfied with scalar indices
