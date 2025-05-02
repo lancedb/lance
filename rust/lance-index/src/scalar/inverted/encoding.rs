@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{borrow::Cow, io::Write};
+use std::io::Write;
 
 use super::builder::BLOCK_SIZE;
 use arrow::array::{AsArray, LargeBinaryBuilder};
@@ -9,6 +9,7 @@ use arrow::array::{ListBuilder, UInt32Builder};
 use arrow_array::{Array, ListArray};
 use bitpacking::{BitPacker, BitPacker4x};
 use lance_core::Result;
+use tracing::instrument;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
@@ -245,6 +246,7 @@ pub fn read_num_positions(posting_list: &arrow::array::LargeBinaryArray) -> u32 
     u32::from_le_bytes(posting_list.values().as_ref()[..4].try_into().unwrap())
 }
 
+#[instrument(level = "info", name = "decompress_posting_block", skip_all)]
 pub fn decompress_posting_block(
     block: &[u8],
     buffer: &mut [u32; BLOCK_SIZE],
@@ -255,6 +257,7 @@ pub fn decompress_posting_block(
     decompress_block(&block[num_bytes..], buffer, frequencies);
 }
 
+#[instrument(level = "info", name = "decompress_posting_remainder", skip_all)]
 pub fn decompress_posting_remainder(
     block: &[u8],
     n: usize,

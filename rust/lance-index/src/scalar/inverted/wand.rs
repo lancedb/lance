@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::BinaryHeap;
 use std::{
     cell::{Cell, RefCell},
     sync::Arc,
 };
-use std::{cmp::Reverse, sync::Mutex};
-use std::{collections::BinaryHeap, rc::Rc};
+use std::{cmp::Reverse, rc::Rc};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Int32Type, UInt32Type};
@@ -108,6 +108,7 @@ impl PostingIterator {
         self.approximate_upper_bound
     }
 
+    #[instrument(level = "info", name = "posting_iter_doc", skip_all)]
     fn doc(&self) -> Option<DocInfo> {
         if self.index >= self.list.len() {
             return None;
@@ -289,7 +290,7 @@ impl<'a> Wand<'a> {
     }
 
     // find the next doc candidate
-    #[instrument(level = "debug", name = "wand_next", skip_all)]
+    #[instrument(level = "info", name = "wand_next", skip_all)]
     fn next(&mut self) -> Result<Option<DocInfo>> {
         while let Some(pivot_posting) = self.find_pivot_term() {
             let doc = pivot_posting

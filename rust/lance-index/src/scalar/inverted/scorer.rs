@@ -8,6 +8,7 @@ pub trait Scorer {
     // token: the token to score
     // freq: the frequency of the token in the document
     // doc_tokens: the number of tokens in the document
+    #[allow(dead_code)]
     fn score(&self, token: &str, freq: u32, doc_tokens: u32) -> f32;
 }
 

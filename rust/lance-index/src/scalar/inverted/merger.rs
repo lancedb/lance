@@ -3,7 +3,6 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use deepsize::DeepSizeOf;
 use lance_core::Result;
 
 use crate::scalar::IndexStore;

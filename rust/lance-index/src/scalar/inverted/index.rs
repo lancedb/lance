@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::fmt::Debug;
+use std::sync::Arc;
 use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
     ops::RangeInclusive,
 };
-use std::{collections::BTreeMap, sync::Arc};
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
 };
-use std::{fmt::Debug, ops::IndexMut};
 
 use arrow::{
     array::{AsArray, ListBuilder, StringBuilder, UInt32Builder},
