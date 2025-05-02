@@ -1236,3 +1236,27 @@ def test_read_partition(indexed_dataset):
     with pytest.raises(ValueError, match="not vector index"):
         indexed_dataset.create_scalar_index("id", index_type="BTREE")
         VectorIndexReader(indexed_dataset, "id_idx")
+
+
+def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
+    uri = indexed_dataset.uri
+    new_table = create_table()
+    ds = lance.write_dataset(new_table, uri, mode="append")
+    ds.optimize.optimize_indices(num_indices_to_merge=0)
+    ds.create_scalar_index("id", index_type="BTREE")
+
+    raw_table = create_table()
+    ds = lance.write_dataset(raw_table, uri, mode="append")
+    ds.optimize.optimize_indices(num_indices_to_merge=0, index_names=["vector_idx"])
+
+    res = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+        },
+        filter="id > 0",
+        with_row_id=True,
+        prefilter=True,
+    )
+    assert len(res) == 10
