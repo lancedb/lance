@@ -627,6 +627,23 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 async move { Ok(stream::iter(plan)) }
             })
             .try_flatten();
+        let prefilter_loader = match &prefilter_source {
+            PreFilterSource::FilteredRowIds(src_node) => {
+                let stream = src_node.execute(partition, context.clone())?;
+                Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+            }
+            PreFilterSource::ScalarIndexQuery(src_node) => {
+                let stream = src_node.execute(partition, context.clone())?;
+                Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
+            }
+            PreFilterSource::None => None,
+        };
+
+        let pre_filter = Arc::new(DatasetPreFilter::new(
+            ds.clone(),
+            &indices,
+            prefilter_loader,
+        ));
 
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             schema,
@@ -634,36 +651,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 .and_then(move |(part_ids, index_uuid)| {
                     let ds = ds.clone();
                     let column = column.clone();
-                    let indices = indices.clone();
-                    let context = context.clone();
-                    let prefilter_source = prefilter_source.clone();
                     let metrics = metrics.clone();
-                    let index_meta = indices
-                        .iter()
-                        .find(|idx| idx.uuid.to_string() == index_uuid)
-                        .unwrap()
-                        .clone();
+                    let pre_filter = pre_filter.clone();
 
                     async move {
-                        let prefilter_loader = match &prefilter_source {
-                            PreFilterSource::FilteredRowIds(src_node) => {
-                                let stream = src_node.execute(partition, context.clone())?;
-                                Some(Box::new(FilteredRowIdsToPrefilter(stream))
-                                    as Box<dyn FilterLoader>)
-                            }
-                            PreFilterSource::ScalarIndexQuery(src_node) => {
-                                let stream = src_node.execute(partition, context.clone())?;
-                                Some(Box::new(SelectionVectorToPrefilter(stream))
-                                    as Box<dyn FilterLoader>)
-                            }
-                            PreFilterSource::None => None,
-                        };
-                        let pre_filter = Arc::new(DatasetPreFilter::new(
-                            ds.clone(),
-                            &[index_meta],
-                            prefilter_loader,
-                        ));
-
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
                             .await?;
