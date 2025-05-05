@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use futures::StreamExt;
+use lance_core::utils::tracing::StreamTracingExt;
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOpts, PutOptions,
@@ -130,12 +132,15 @@ impl object_store::ObjectStore for TracedObjectStore {
         &'a self,
         locations: BoxStream<'a, OSResult<Path>>,
     ) -> BoxStream<'a, OSResult<Path>> {
-        self.target.delete_stream(locations)
+        self.target
+            .delete_stream(locations)
+            .stream_in_current_span()
+            .boxed()
     }
 
     #[instrument(level = "debug", skip(self))]
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
-        self.target.list(prefix)
+        self.target.list(prefix).stream_in_current_span().boxed()
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -144,7 +149,10 @@ impl object_store::ObjectStore for TracedObjectStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'_, OSResult<ObjectMeta>> {
-        self.target.list_with_offset(prefix, offset)
+        self.target
+            .list_with_offset(prefix, offset)
+            .stream_in_current_span()
+            .boxed()
     }
 
     #[instrument(level = "debug", skip(self))]

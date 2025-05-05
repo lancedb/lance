@@ -858,6 +858,8 @@ pub(crate) async fn commit_transaction(
                 if next_attempt_i < num_attempts {
                     tokio::time::sleep(backoff.next_backoff()).await;
                     dataset.checkout_latest().await?;
+                } else {
+                    break;
                 }
             }
             Err(CommitError::OtherError(err)) => {

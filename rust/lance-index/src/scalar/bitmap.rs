@@ -274,12 +274,14 @@ impl ScalarIndex for BitmapIndex {
             .index_map
             .iter()
             .map(|(key, bitmap)| {
-                let bitmap = RowIdTreeMap::from_iter(
-                    bitmap
-                        .row_ids()
-                        .unwrap()
-                        .filter_map(|addr| *mapping.get(&u64::from(addr))?),
-                );
+                let bitmap =
+                    RowIdTreeMap::from_iter(bitmap.row_ids().unwrap().filter_map(|addr| {
+                        let addr_as_u64 = u64::from(addr);
+                        mapping
+                            .get(&addr_as_u64)
+                            .copied()
+                            .unwrap_or(Some(addr_as_u64))
+                    }));
                 (key.0.clone(), bitmap)
             })
             .collect::<HashMap<_, _>>();

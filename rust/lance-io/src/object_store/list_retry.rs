@@ -6,6 +6,7 @@ use std::{pin::Pin, sync::Arc, task::Poll};
 use futures::{Stream, StreamExt};
 use object_store::{path::Path, ObjectMeta, ObjectStore};
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 /// ObjectStore::list() and ObjectStore::list_with_offset() return a stream
 /// where the lifetime is tied to the object store. This makes it hard to wrap.
@@ -18,18 +19,21 @@ struct StaticListStream {
 impl StaticListStream {
     fn new(object_store: Arc<dyn ObjectStore>, prefix: Option<Path>, offset: Option<Path>) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
-        let handle = tokio::spawn(async move {
-            let mut stream = if let Some(offset) = offset {
-                object_store.list_with_offset(prefix.as_ref(), &offset)
-            } else {
-                object_store.list(prefix.as_ref())
-            };
-            while let Some(item) = stream.next().await {
-                if tx.send(item).await.is_err() {
-                    break;
+        let handle = tokio::spawn(
+            (async move {
+                let mut stream = if let Some(offset) = offset {
+                    object_store.list_with_offset(prefix.as_ref(), &offset)
+                } else {
+                    object_store.list(prefix.as_ref())
+                };
+                while let Some(item) = stream.next().await {
+                    if tx.send(item).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            })
+            .in_current_span(),
+        );
         Self { rx, handle }
     }
 

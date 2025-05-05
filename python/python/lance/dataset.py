@@ -905,8 +905,10 @@ class LanceDataset(pa.dataset.Dataset):
 
     def take_blobs(
         self,
-        row_ids: Union[List[int], pa.Array],
         blob_column: str,
+        ids: Optional[Union[List[int], pa.Array]] = None,
+        addresses: Optional[Union[List[int], pa.Array]] = None,
+        indices: Optional[Union[List[int], pa.Array]] = None,
     ) -> List[BlobFile]:
         """
         Select blobs by row IDs.
@@ -915,18 +917,36 @@ class LanceDataset(pa.dataset.Dataset):
         this API allows you to open binary blob data as a regular Python file-like
         object. For more details, see :py:class:`lance.BlobFile`.
 
+        Exactly one of ids, addresses, or indices must be specified.
         Parameters
         ----------
-        row_ids : List Array or array-like
-            row IDs to select in the dataset.
         blob_column : str
             The name of the blob column to select.
+        ids : Integer Array or array-like
+            row IDs to select in the dataset.
+        addresses: Integer Array or array-like
+            The (unstable) row addresses to select in the dataset.
+        indices : Integer Array or array-like
+            The offset / indices of the row in the dataset.
 
         Returns
         -------
         blob_files : List[BlobFile]
         """
-        lance_blob_files = self._ds.take_blobs(row_ids, blob_column)
+        if sum([bool(v is not None) for v in [ids, addresses, indices]]) != 1:
+            raise ValueError(
+                "Exactly one of ids, indices, or addresses must be specified"
+            )
+
+        if ids is not None:
+            lance_blob_files = self._ds.take_blobs(ids, blob_column)
+        elif addresses is not None:
+            # ROW ids and Row address are the same until stable ROW ID is implemented.
+            lance_blob_files = self._ds.take_blobs(addresses, blob_column)
+        elif indices is not None:
+            lance_blob_files = self._ds.take_blobs_by_indices(indices, blob_column)
+        else:
+            raise ValueError("Either ids or indices must be specified")
         return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
 
     def head(self, num_rows, **kwargs):

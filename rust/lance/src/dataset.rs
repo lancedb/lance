@@ -44,6 +44,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
+use take::row_indices_to_row_addresses;
 use tracing::{info, instrument};
 
 mod blob;
@@ -910,12 +911,24 @@ impl Dataset {
         TakeBuilder::try_new_from_ids(self.clone(), row_ids.to_vec(), projection.into())
     }
 
+    /// Take [BlobFile] by row ids (row address).
     pub async fn take_blobs(
         self: &Arc<Self>,
         row_ids: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<BlobFile>> {
         blob::take_blobs(self, row_ids, column.as_ref()).await
+    }
+
+    /// Take [BlobFile] by row indices.
+    ///
+    pub async fn take_blobs_by_indices(
+        self: &Arc<Self>,
+        row_indices: &[u64],
+        column: impl AsRef<str>,
+    ) -> Result<Vec<BlobFile>> {
+        let row_addrs = row_indices_to_row_addresses(self, row_indices).await?;
+        blob::take_blobs(self, &row_addrs, column.as_ref()).await
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.

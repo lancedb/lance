@@ -16,11 +16,13 @@ env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
   # key, so we set it to make sure it is always consistent.
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-C debuginfo=0"
 
 jobs:
   build:
     # Needs additional disk space for the full build.
-    runs-on: ubuntu-2404-4x-x64
+    runs-on: ubuntu-2404-8x-x64
     timeout-minutes: 60
     env:
       # Need up-to-date compilers for kernels

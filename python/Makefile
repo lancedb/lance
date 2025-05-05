@@ -38,3 +38,8 @@ lint-rust:
 	cargo fmt -- --check
 	cargo clippy -- -D warnings
 .PHONY: lint-rust
+
+clean:
+	cargo clean
+	rm -rf target
+.PHONY: clean

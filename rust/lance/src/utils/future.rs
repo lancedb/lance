@@ -5,6 +5,7 @@ use async_cell::sync::AsyncCell;
 use futures::Future;
 use snafu::location;
 use std::sync::Arc;
+use tracing::Instrument;
 
 /// An async background task whose output can be shared across threads (via cloning)
 ///
@@ -64,10 +65,13 @@ impl<T: Clone> SharedPrerequisite<T> {
     {
         let cell = AsyncCell::<std::result::Result<T, String>>::shared();
         let dst = cell.clone();
-        tokio::spawn(async move {
-            let res = future.await;
-            dst.set(res.map_err(|err| err.to_string()));
-        });
+        tokio::spawn(
+            (async move {
+                let res = future.await;
+                dst.set(res.map_err(|err| err.to_string()));
+            })
+            .in_current_span(),
+        );
         Arc::new(Self(cell))
     }
 }

@@ -23,6 +23,7 @@ use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::utils::StreamingWriteSource;
@@ -2104,6 +2105,10 @@ impl FragmentReader {
                         })
                         .boxed()
                 })
+                .stream_in_span(tracing::debug_span!(
+                    "ReadBatchFutStream",
+                    id = self.fragment_id,
+                ))
                 .boxed(),
         )
     }
