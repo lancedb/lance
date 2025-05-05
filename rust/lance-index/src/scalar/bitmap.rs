@@ -9,9 +9,11 @@ use std::{
     sync::Arc,
 };
 
-use arrow::array::BinaryBuilder;
+use arrow::array::{ArrayBuilder, BinaryBuilder};
+use arrow::compute::concat;
 use arrow_array::{new_empty_array, new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use arrow_select::concat;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
@@ -329,13 +331,77 @@ where
     I: Iterator<Item = RowIdTreeMap>,
 {
     let mut builder = BinaryBuilder::new();
+    // For chunking, use a conservative limit (here still half of i32::MAX).
+    const MAX_BITMAP_SIZE: usize = std::i32::MAX as usize;
+    let mut chunks = Vec::new();
+    let mut cur_total: usize = 0;
+
+    // Build individual BinaryArray chunks.
     iter.for_each(|bitmap| {
         let mut bytes = Vec::new();
         bitmap.serialize_into(&mut bytes).unwrap();
+        if cur_total + bytes.len() > MAX_BITMAP_SIZE {
+            println!(
+                "TRIGGER OVERFLOW: cur_total {} + bytes.len() {}",
+                cur_total,
+                bytes.len()
+            );
+            // Finish the current builder and push the chunk.
+            chunks.push(builder.finish());
+            builder = BinaryBuilder::new();
+            cur_total = 0;
+        }
         builder.append_value(&bytes);
+        cur_total += bytes.len();
     });
 
-    Arc::new(builder.finish())
+    if builder.len() > 0 {
+        chunks.push(builder.finish());
+    }
+
+    println!("DEBUG: finish building; produced {} chunk(s)", chunks.len());
+
+    // Instead of concatenating all chunks into one array,
+    // group them so that the total offset stays below the maximum.
+    // Here we define a GROUP_LIMIT with an extra safety margin.
+    const GROUP_LIMIT: usize = (std::i32::MAX as usize) - 4096;
+    let mut groups: Vec<arrow_array::ArrayRef> = Vec::new();
+    let mut current_group: Vec<&dyn Array> = Vec::new();
+    let mut group_total: usize = 0;
+    for chunk in &chunks {
+        let chunk_size = chunk.value_data().len();
+        if group_total + chunk_size > GROUP_LIMIT && !current_group.is_empty() {
+            let concatenated = concat(&current_group).unwrap();
+            groups.push(concatenated);
+            current_group.clear();
+            group_total = 0;
+        }
+        current_group.push(chunk as &dyn Array);
+        group_total += chunk_size;
+    }
+    if !current_group.is_empty() {
+        let concatenated = concat(&current_group).unwrap();
+        groups.push(concatenated);
+    }
+
+    if groups.len() == 1 {
+        Arc::new(groups.pop().unwrap())
+    } else {
+        use arrow_array::builder::ListBuilder;
+        use arrow_array::{BinaryArray, ListArray};
+        let mut list_builder = ListBuilder::new(BinaryBuilder::new());
+        for group_array in groups.iter() {
+            let binary_array = group_array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("Expected a BinaryArray");
+            for i in 0..binary_array.len() {
+                list_builder.values().append_value(binary_array.value(i));
+                list_builder.append(true);
+            }
+        }
+        Arc::new(list_builder.finish())
+    }
 }
 
 async fn write_bitmap_index(
@@ -350,10 +416,20 @@ async fn write_bitmap_index(
         ScalarValue::iter_to_array(keys_iter)?
     };
 
+    println!("write_bitmap_index: DEBUG: state size {}", state.len());
+
     let values_iter = state.into_values();
+    println!(
+        "write_bitmap_index: DEBUG: values_iter size {}",
+        values_iter.len()
+    );
     let binary_bitmap_array = get_bitmaps_from_iter(values_iter);
 
     let record_batch = get_batch_from_arrays(keys_array, binary_bitmap_array)?;
+    println!(
+        "DEBUG: Writing bitmap index with {} rows",
+        record_batch.num_rows()
+    );
 
     let mut bitmap_index_file = index_store
         .new_index_file(BITMAP_LOOKUP_NAME, record_batch.schema())
@@ -400,4 +476,76 @@ pub async fn train_bitmap_index(
     let dictionary: HashMap<ScalarValue, RowIdTreeMap> = HashMap::new();
 
     do_train_bitmap_index(batches_source, dictionary, index_store).await
+}
+
+#[cfg(test)]
+pub mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use arrow_schema::DataType;
+    use datafusion_common::ScalarValue;
+    use lance_core::{cache::FileMetadataCache, utils::mask::RowIdTreeMap};
+    use lance_io::object_store::ObjectStore;
+    use object_store::path::Path;
+    use tempfile::tempdir;
+
+    use crate::scalar::{bitmap::write_bitmap_index, lance_format::LanceIndexStore};
+
+    #[tokio::test]
+    async fn test_big_value() {
+        // WARNING: This test allocates a huge state to force overflow.
+        // You must run it only on a machine with enough resources (or skip it normally).
+        use crate::scalar::lance_format::LanceIndexStore;
+        use arrow_schema::DataType;
+        use datafusion_common::ScalarValue;
+        use lance_core::cache::FileMetadataCache;
+        use lance_core::utils::mask::RowIdTreeMap;
+        use lance_io::object_store::ObjectStore;
+        use object_store::path::Path;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        // Adjust these numbers so that:
+        //     m * (serialized size per bitmap) > 2^31 bytes.
+        //
+        // For example, if we assume each bitmap serializes to ~1000 bytes,
+        // you need m > 2.1e6. (Here we use a much lower value for illustration,
+        // but in practice you’d need to upscale these numbers.)
+        let m: u32 = 2_500_000;
+        //let m: u32 = 2_500;
+        let per_bitmap_size = 1000; // assumed bytes per bitmap
+
+        let mut state = HashMap::new();
+        for i in 0..m {
+            // Create a bitmap that contains, say, 1000 row IDs.
+            // (The actual serialized size will depend on the internal representation.)
+            let bitmap = RowIdTreeMap::from_iter(0..1000);
+            // Use i as the key.
+            let key = ScalarValue::UInt32(Some(i));
+            state.insert(key, bitmap);
+        }
+
+        // Create a temporary store.
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            FileMetadataCache::no_cache(),
+        );
+
+        // This call should trigger a "byte array offset overflow" error
+        // when BinaryBuilder in `get_bitmaps_from_iter` tries to append all these entries.
+        let result =
+            crate::scalar::bitmap::write_bitmap_index(state, &test_store, &DataType::UInt32).await;
+
+        if m < 2_500_000 {
+            return;
+        }
+        assert!(result.is_err());
+        if let Err(e) = result {
+            let err_str = format!("{:?}", e);
+            assert!(err_str.contains("byte array offset overflow"));
+        }
+    }
 }
