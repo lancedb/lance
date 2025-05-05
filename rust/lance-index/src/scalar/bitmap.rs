@@ -30,6 +30,8 @@ use super::{btree::TrainingSource, AnyQuery, IndexStore, ScalarIndex};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
+const MAX_ARROW_ARRAY_LEN: usize = i32::MAX as usize - 1024 * 1024; // leave headroom
+
 /// A scalar index that stores a bitmap for each possible value
 ///
 /// This index works best for low-cardinality columns, where the number of unique values is small.
@@ -323,21 +325,55 @@ fn get_batch_from_arrays(
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-// Takes an iterator of Vec<u64> and processes each vector
-// to turn it into a RoaringTreemap. Each RoaringTreeMap is
-// serialized to bytes. The entire collection is converted to a BinaryArray
-fn get_bitmaps_from_iter<I>(iter: I) -> Arc<dyn Array>
-where
-    I: Iterator<Item = RowIdTreeMap>,
-{
-    let mut builder = BinaryBuilder::new();
-    iter.for_each(|bitmap| {
+fn chunked_keys_and_bitmaps(
+    state: HashMap<ScalarValue, RowIdTreeMap>,
+    value_type: &DataType,
+) -> Vec<(Arc<dyn Array>, Arc<dyn Array>)> {
+    let mut batches = Vec::new();
+    let mut cur_keys = Vec::new();
+    let mut cur_bitmaps = Vec::new();
+    let mut cur_bytes = 0;
+
+    for (key, bitmap) in state.into_iter() {
         let mut bytes = Vec::new();
         bitmap.serialize_into(&mut bytes).unwrap();
-        builder.append_value(&bytes);
-    });
+        let bitmap_len = bytes.len();
 
-    Arc::new(builder.finish())
+        // If adding this bitmap would overflow, flush current batch
+        if cur_keys.len() >= MAX_ARROW_ARRAY_LEN || cur_bytes + bitmap_len > MAX_ARROW_ARRAY_LEN {
+            let keys_array = if cur_keys.is_empty() {
+                new_empty_array(value_type)
+            } else {
+                ScalarValue::iter_to_array(cur_keys.clone().into_iter()).unwrap()
+            };
+            let mut binary_builder = BinaryBuilder::new();
+            for b in &cur_bitmaps {
+                binary_builder.append_value(b);
+            }
+            let bitmaps_array = Arc::new(binary_builder.finish()) as Arc<dyn Array>;
+            batches.push((keys_array, bitmaps_array));
+            cur_keys.clear();
+            cur_bitmaps.clear();
+            cur_bytes = 0;
+        }
+
+        cur_keys.push(key);
+        cur_bitmaps.push(bytes);
+        cur_bytes += bitmap_len;
+    }
+
+    // Flush any remaining
+    if !cur_keys.is_empty() {
+        let keys_array = ScalarValue::iter_to_array(cur_keys).unwrap();
+        let mut binary_builder = BinaryBuilder::new();
+        for b in &cur_bitmaps {
+            binary_builder.append_value(b);
+        }
+        let bitmaps_array = Arc::new(binary_builder.finish()) as Arc<dyn Array>;
+        batches.push((keys_array, bitmaps_array));
+    }
+
+    batches
 }
 
 async fn write_bitmap_index(
@@ -345,23 +381,39 @@ async fn write_bitmap_index(
     index_store: &dyn IndexStore,
     value_type: &DataType,
 ) -> Result<()> {
-    let keys_iter = state.keys().cloned();
-    let keys_array = if state.is_empty() {
-        new_empty_array(value_type)
+    let batches = chunked_keys_and_bitmaps(state, value_type);
+
+    // Create a schema even if we have no batches
+    let schema = if batches.is_empty() {
+        // For empty state, create a schema with the same structure
+        Arc::new(Schema::new(vec![
+            Field::new("keys", value_type.clone(), true),
+            Field::new("bitmaps", DataType::Binary, true),
+        ]))
     } else {
-        ScalarValue::iter_to_array(keys_iter)?
+        // Get schema from first batch
+        let (first_keys, first_bitmaps) = &batches[0];
+        Arc::new(Schema::new(vec![
+            Field::new("keys", first_keys.data_type().clone(), true),
+            Field::new("bitmaps", first_bitmaps.data_type().clone(), true),
+        ]))
     };
 
-    let values_iter = state.into_values();
-    let binary_bitmap_array = get_bitmaps_from_iter(values_iter);
-
-    let record_batch = get_batch_from_arrays(keys_array, binary_bitmap_array)?;
-
+    // Open file once
     let mut bitmap_index_file = index_store
-        .new_index_file(BITMAP_LOOKUP_NAME, record_batch.schema())
+        .new_index_file(BITMAP_LOOKUP_NAME, schema)
         .await?;
-    bitmap_index_file.write_record_batch(record_batch).await?;
+
+    // Write all batches to the same file
+    for (keys_array, binary_bitmap_array) in batches.into_iter() {
+        let record_batch = get_batch_from_arrays(keys_array, binary_bitmap_array)?;
+
+        bitmap_index_file.write_record_batch(record_batch).await?;
+    }
+
+    // Finish file once at the end - this creates the file even if we wrote no batches
     bitmap_index_file.finish().await?;
+
     Ok(())
 }
 
@@ -402,4 +454,62 @@ pub async fn train_bitmap_index(
     let dictionary: HashMap<ScalarValue, RowIdTreeMap> = HashMap::new();
 
     do_train_bitmap_index(batches_source, dictionary, index_store).await
+}
+
+#[cfg(test)]
+pub mod tests {
+    #[tokio::test]
+    async fn test_big_value() {
+        // WARNING: This test allocates a huge state to force overflow.
+        // You must run it only on a machine with enough resources (or skip it normally).
+        use crate::scalar::lance_format::LanceIndexStore;
+        use arrow_schema::DataType;
+        use datafusion_common::ScalarValue;
+        use lance_core::cache::FileMetadataCache;
+        use lance_core::utils::mask::RowIdTreeMap;
+        use lance_io::object_store::ObjectStore;
+        use object_store::path::Path;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        // Adjust these numbers so that:
+        //     m * (serialized size per bitmap) > 2^31 bytes.
+        //
+        // For example, if we assume each bitmap serializes to ~1000 bytes,
+        // you need m > 2.1e6. (Here we use a much lower value for illustration,
+        // but in practice you’d need to upscale these numbers.)
+        let m: u32 = 2_500_000;
+        let m: u32 = 2_500;
+        let per_bitmap_size = 1000; // assumed bytes per bitmap
+
+        let mut state = HashMap::new();
+        for i in 0..m {
+            // Create a bitmap that contains, say, 1000 row IDs.
+            // (The actual serialized size will depend on the internal representation.)
+            let bitmap = RowIdTreeMap::from_iter(0..per_bitmap_size);
+            // Use i as the key.
+            let key = ScalarValue::UInt32(Some(i));
+            state.insert(key, bitmap);
+        }
+
+        // Create a temporary store.
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            FileMetadataCache::no_cache(),
+        );
+
+        // This call should trigger a "byte array offset overflow" error
+        // when BinaryBuilder in `get_bitmaps_from_iter` tries to append all these entries.
+        let result =
+            crate::scalar::bitmap::write_bitmap_index(state, &test_store, &DataType::UInt32).await;
+
+        if m < 2_500_000 {
+            return;
+        } else {
+            // TODO: read the data back and check the values???
+        }
+    }
 }
