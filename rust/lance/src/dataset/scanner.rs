@@ -4186,7 +4186,7 @@ mod test {
 
             assert_eq!(
                 dataset.index_cache_entry_count(),
-                1, // 1 for index metadata
+                2, // 2 for index metadata at version 1 and 2.
             );
             let results = scan
                 .try_into_stream()
