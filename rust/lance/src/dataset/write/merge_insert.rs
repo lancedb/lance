@@ -19,6 +19,7 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use arrow_array::{
@@ -226,6 +227,7 @@ struct MergeInsertParams {
     // Controls whether data that is not matched by the source is deleted or not
     delete_not_matched_by_source: WhenNotMatchedBySource,
     conflict_retries: u32,
+    retry_timeout: Duration,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -303,6 +305,7 @@ impl MergeInsertBuilder {
                 insert_not_matched: true,
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
                 conflict_retries: 10,
+                retry_timeout: Duration::from_secs(30),
             },
         })
     }
@@ -341,6 +344,18 @@ impl MergeInsertBuilder {
     /// Default is 10.
     pub fn conflict_retries(&mut self, retries: u32) -> &mut Self {
         self.params.conflict_retries = retries;
+        self
+    }
+
+    /// Set the timeout used to limit retries.
+    ///
+    /// This is the maximum time to spend on the operation before giving up. At
+    /// least one attempt will be made, regardless of how long it takes to complete.
+    /// Subsequent attempts will be cancelled once this timeout is reached. If
+    /// the timeout has been reached during the first attempt, the operation
+    /// will be cancelled immediately.
+    pub fn retry_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.params.retry_timeout = timeout;
         self
     }
 
@@ -1012,6 +1027,7 @@ impl MergeInsertJob {
         mut self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
+        let start = Instant::now();
         let mut source_iter =
             super::new_source_iter(source, self.params.conflict_retries > 0).await?;
 
@@ -1027,6 +1043,21 @@ impl MergeInsertJob {
             match CommitBuilder::new(ds).execute(transaction).await {
                 Ok(ds) => return Ok((Arc::new(ds), stats)),
                 Err(Error::RetryableCommitConflict { .. }) => {
+                    // Check whether we have exhausted our retries *before*
+                    // we sleep.
+                    if backoff.attempt() >= max_retries {
+                        break;
+                    }
+                    if start.elapsed() > self.params.retry_timeout {
+                        return Err(Error::TooMuchWriteContention {
+                            message: format!(
+                                "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
+                                backoff.attempt() + 1,
+                                self.params.retry_timeout.as_secs_f32()
+                            ),
+                            location: location!(),
+                        });
+                    }
                     tokio::time::sleep(backoff.next_backoff()).await;
                     let mut ds = dataset_ref.as_ref().clone();
                     ds.checkout_latest().await?;
@@ -2313,5 +2344,15 @@ mod tests {
             "All values should be 1 after merge insert. Got: {:?}",
             values
         );
+    }
+
+    #[tokio::test]
+    async fn test_too_much_contention_attempts() {
+        todo!("Test when we run out of attempts we give good error");
+    }
+
+    #[tokio::test]
+    async fn test_too_much_contention_timeout() {
+        todo!("Test when we run out of time retrying we give good error");
     }
 }
