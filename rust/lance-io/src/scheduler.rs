@@ -648,7 +648,7 @@ impl ScanScheduler {
             if let Some(size) = NonZero::new(size as u64) {
                 file_size_bytes.set(size);
             }
-            size as usize
+            size
         };
         let reader = self
             .object_store

@@ -179,8 +179,32 @@ pub fn read_struct_from_buf<
 /// needed a mutable reference.
 ///
 /// Zero is interpreted as unknown.
-#[derive(Debug, Deserialize, DeepSizeOf, Serialize)]
+#[derive(Debug, DeepSizeOf)]
 pub struct CachedFileSize(AtomicU64);
+
+impl<'de> Deserialize<'de> for CachedFileSize {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let size = Option::<u64>::deserialize(deserializer)?.unwrap_or(0);
+        Ok(Self::new(size))
+    }
+}
+
+impl Serialize for CachedFileSize {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let size = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        if size == 0 {
+            serializer.serialize_none()
+        } else {
+            serializer.serialize_u64(size)
+        }
+    }
+}
 
 impl From<Option<NonZero<u64>>> for CachedFileSize {
     fn from(size: Option<NonZero<u64>>) -> Self {
