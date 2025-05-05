@@ -1058,6 +1058,15 @@ impl MergeInsertJob {
                             location: location!(),
                         });
                     }
+
+                    // We going to configure the backoff time based on how long
+                    // the operation took. This becomes the unit.
+                    // If the op took 5s, then the backoff will be 5s, 10s, 20s, 40s, etc.
+                    // If the op took 0.5s, then the backoff will be 0.5s, 1s, 2s, 4s, etc.
+                    if backoff.attempt() == 0 {
+                        backoff = backoff.with_unit(start.elapsed().as_millis() as u32);
+                    }
+
                     tokio::time::sleep(backoff.next_backoff()).await;
                     let mut ds = dataset_ref.as_ref().clone();
                     ds.checkout_latest().await?;

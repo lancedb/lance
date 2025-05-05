@@ -41,6 +41,10 @@ impl Backoff {
         Self { base, ..self }
     }
 
+    pub fn with_unit(self, unit: u32) -> Self {
+        Self { unit, ..self }
+    }
+
     pub fn with_jitter(self, jitter: i32) -> Self {
         Self { jitter, ..self }
     }
