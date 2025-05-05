@@ -241,15 +241,6 @@ pub fn apply_row_id_and_deletes(
     // so I'm going to just leave deletion filter at this layer for now.
     // We should push this down futurther when we get to statistics-based predicate pushdown
 
-    // This function is meant to be IO bound, but we are doing CPU-bound work here
-    // We should try to move this to later.
-    let span = tracing::span!(tracing::Level::DEBUG, "apply_deletions");
-    let _enter = span.enter();
-    let deletion_mask = deletion_vector.and_then(|v| {
-        let row_addrs: &[u64] = row_addrs.as_ref().unwrap().values();
-        v.build_predicate(row_addrs.iter())
-    });
-
     let batch = if config.with_row_id {
         let row_id_arr = row_ids.unwrap();
         batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?
@@ -258,16 +249,32 @@ pub fn apply_row_id_and_deletes(
     };
 
     let batch = if config.with_row_addr {
-        let row_addr_arr = row_addrs.unwrap();
+        let row_addr_arr = row_addrs.clone().unwrap();
         batch.try_with_column(ROW_ADDR_FIELD.clone(), row_addr_arr)?
     } else {
         batch
     };
 
-    match (deletion_mask, config.make_deletions_null) {
-        (None, _) => Ok(batch),
-        (Some(mask), false) => Ok(arrow::compute::filter_record_batch(&batch, &mask)?),
-        (Some(mask), true) => Ok(apply_deletions_as_nulls(batch, &mask)?),
+    if let Some(deletion_vector) = deletion_vector {
+        // We only enter this span if there are deletions to apply
+        let span = tracing::span!(tracing::Level::DEBUG, "apply_deletions");
+        let _enter = span.enter();
+
+        // This function is meant to be IO bound, but we are doing CPU-bound work here
+        // We should try to move this to later.
+        let row_addrs = row_addrs.as_ref().unwrap().values();
+        if let Some(deletion_mask) = deletion_vector.build_predicate(row_addrs.iter()) {
+            if config.make_deletions_null {
+                apply_deletions_as_nulls(batch, &deletion_mask)
+            } else {
+                Ok(arrow::compute::filter_record_batch(&batch, &deletion_mask)?)
+            }
+        } else {
+            // No rows are deleted, so just return the batch
+            Ok(batch)
+        }
+    } else {
+        Ok(batch)
     }
 }
 

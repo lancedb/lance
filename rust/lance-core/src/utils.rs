@@ -11,6 +11,7 @@ pub mod hash;
 pub mod mask;
 pub mod parse;
 pub mod path;
+pub mod stream;
 pub mod testing;
 pub mod tokio;
 pub mod tracing;

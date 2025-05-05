@@ -72,6 +72,7 @@ use log::info;
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
 use tokio::task::JoinSet;
+use tracing::instrument;
 
 use crate::{
     datafusion::dataframe::SessionContextExt,
@@ -1053,6 +1054,11 @@ impl MergeInsertJob {
         self.execute_uncommitted_impl(stream).await
     }
 
+    #[instrument(
+        name = "MergeInsertJob::execute_uncommitted_impl",
+        level = "debug",
+        skip_all
+    )]
     async fn execute_uncommitted_impl(
         self,
         source: SendableRecordBatchStream,
