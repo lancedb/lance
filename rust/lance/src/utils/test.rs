@@ -29,6 +29,10 @@ use crate::dataset::transaction::Operation;
 use crate::dataset::WriteParams;
 use crate::Dataset;
 
+mod throttle_store;
+
+pub use throttle_store::ThrottledStoreWrapper;
+
 /// A dataset generator that can generate random layouts. This is used to test
 /// dataset operations are robust to different layouts.
 ///

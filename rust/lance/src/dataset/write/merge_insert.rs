@@ -59,7 +59,7 @@ use futures::{
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::{backoff::Backoff, futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::{backoff::SlotBackoff, futures::Capacity, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -1033,13 +1033,14 @@ impl MergeInsertJob {
 
         let mut dataset_ref = self.dataset.clone();
         let max_retries = self.params.conflict_retries;
-        let mut backoff = Backoff::default();
+        let mut backoff = SlotBackoff::default();
         while backoff.attempt() <= max_retries {
             let ds = dataset_ref.clone();
-            let (transaction, stats) = self
+            let (transaction, mut stats) = self
                 .clone()
                 .execute_uncommitted_impl(source_iter.next().unwrap())
                 .await?;
+            stats.num_attempts = backoff.attempt() + 1;
             match CommitBuilder::new(ds).execute(transaction).await {
                 Ok(ds) => return Ok((Arc::new(ds), stats)),
                 Err(Error::RetryableCommitConflict { .. }) => {
@@ -1064,7 +1065,7 @@ impl MergeInsertJob {
                     // If the op took 5s, then the backoff will be 5s, 10s, 20s, 40s, etc.
                     // If the op took 0.5s, then the backoff will be 0.5s, 1s, 2s, 4s, etc.
                     if backoff.attempt() == 0 {
-                        backoff = backoff.with_unit(start.elapsed().as_millis() as u32);
+                        backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
                     }
 
                     tokio::time::sleep(backoff.next_backoff()).await;
@@ -1246,6 +1247,10 @@ pub struct MergeStats {
     /// Note: This is different from internal references to 'deleted_rows', since we technically "delete" updated rows during processing.
     /// However those rows are not shared with the user.
     pub num_deleted_rows: u64,
+    /// Number of attempts performed.
+    ///
+    /// See [`MergeInsertBuilder::conflict_retries`] for more information.
+    pub num_attempts: u32,
 }
 
 // A sync-safe structure that is shared by all of the "process batch" tasks.
@@ -1532,10 +1537,16 @@ mod tests {
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::{scalar::ScalarIndexParams, IndexType};
+    use lance_io::object_store::ObjectStoreParams;
+    use object_store::throttle::ThrottleConfig;
     use tempfile::tempdir;
     use tokio::sync::{Barrier, Notify};
 
-    use crate::dataset::{builder::DatasetBuilder, InsertBuilder, WriteMode, WriteParams};
+    use crate::{
+        dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
+        session::Session,
+        utils::test::ThrottledStoreWrapper,
+    };
 
     use super::*;
 
@@ -2182,22 +2193,38 @@ mod tests {
             Field::new("id", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
         ]));
-        let num_rows = 10;
+        let concurrency = 10;
         let initial_data = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt32Array::from_iter_values(0..num_rows)),
+                Arc::new(UInt32Array::from_iter_values(0..concurrency)),
                 Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(
                     0,
-                    num_rows as usize,
+                    concurrency as usize,
                 ))),
             ],
         )
         .unwrap();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = InsertBuilder::new(test_uri)
+        // Increase likelihood of contention by throttling the store
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: Duration::from_millis(40),
+                wait_get_per_call: Duration::from_millis(40),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
             .execute(vec![initial_data])
             .await
             .unwrap();
@@ -2206,14 +2233,26 @@ mod tests {
         // they have opened, and then wait for a signal to proceed. Once the signal
         // is received, they will do a merge insert and close the dataset.
 
-        let barrier = Arc::new(Barrier::new(10));
+        let barrier = Arc::new(Barrier::new(concurrency as usize));
         let mut handles = Vec::new();
-        for i in 0..10 {
-            let uri_ref = test_uri.to_string();
+        for i in 0..concurrency {
+            let session_ref = session.clone();
             let schema_ref = schema.clone();
             let barrier_ref = barrier.clone();
+            let throttled_ref = throttled.clone();
             let handle = tokio::task::spawn(async move {
-                let dataset = DatasetBuilder::from_uri(&uri_ref).load().await.unwrap();
+                let dataset = DatasetBuilder::from_uri("memory://")
+                    .with_read_params(ReadParams {
+                        store_options: Some(ObjectStoreParams {
+                            object_store_wrapper: Some(throttled_ref.clone()),
+                            ..Default::default()
+                        }),
+                        session: Some(session_ref.clone()),
+                        ..Default::default()
+                    })
+                    .load()
+                    .await
+                    .unwrap();
                 let dataset = Arc::new(dataset);
 
                 let new_data = RecordBatch::try_new(
@@ -2230,16 +2269,18 @@ mod tests {
                     .unwrap()
                     .when_matched(WhenMatched::UpdateAll)
                     .when_not_matched(WhenNotMatched::InsertAll)
+                    .conflict_retries(100)
+                    .retry_timeout(Duration::from_secs(100_000))
                     .try_build()
                     .unwrap();
                 barrier_ref.wait().await;
-
-                job.execute_reader(source).await.unwrap();
+                job.execute_reader(source).await.unwrap().1.num_attempts
             });
             handles.push(handle);
         }
 
-        try_join_all(handles).await.unwrap();
+        let attempts = try_join_all(handles).await.unwrap();
+        assert!(attempts.iter().all(|&attempt| attempt <= 10));
 
         dataset.checkout_latest().await.unwrap();
         let batches = dataset.scan().try_into_batch().await.unwrap();
@@ -2353,15 +2394,5 @@ mod tests {
             "All values should be 1 after merge insert. Got: {:?}",
             values
         );
-    }
-
-    #[tokio::test]
-    async fn test_too_much_contention_attempts() {
-        todo!("Test when we run out of attempts we give good error");
-    }
-
-    #[tokio::test]
-    async fn test_too_much_contention_timeout() {
-        todo!("Test when we run out of time retrying we give good error");
     }
 }

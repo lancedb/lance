@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use std::time::Duration;
 
 // SPDX-License-Identifier: Apache-2.0
@@ -77,6 +77,64 @@ impl Backoff {
     }
 }
 
+/// SlotBackoff is a backoff strategy that uses a slot-based approach.
+///
+/// This is for when the cause of the failure is concurrency itself and that
+/// the attempts take about the same amount of time.
+///
+/// Say you have N attempts to do something. We don't know there are N ahead of
+/// time. We start guessing with 4 slots:
+///
+/// | 1, 2, 3 | 4, 5, 6 | 7, 8, 9 | 10 |
+///
+/// Each slot can have one success, so we can eliminate 3, 6, 9, and 10. In the
+/// next round, we will use twice as many slots (8):
+///
+/// | 1 | 2 | 4 | 5 | 7 | 8 | ... |
+///
+/// Optimally, that should be 16 total attempts. For a 1s unit, the retry times
+/// are:
+/// * Round 1: 0 - 3s
+/// * Round 2: 0 - 7s
+/// * Round 3: 0 - 15s
+/// * ...
+pub struct SlotBackoff {
+    base: u32,
+    unit: u32,
+    starting_i: u32,
+    attempt: u32,
+    rng: rand::rngs::SmallRng,
+}
+
+impl Default for SlotBackoff {
+    fn default() -> Self {
+        Self {
+            base: 2,
+            unit: 50,
+            starting_i: 2, // start with 4 slots
+            attempt: 0,
+            rng: rand::rngs::SmallRng::from_entropy(),
+        }
+    }
+}
+
+impl SlotBackoff {
+    pub fn with_unit(self, unit: u32) -> Self {
+        Self { unit, ..self }
+    }
+
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    pub fn next_backoff(&mut self) -> Duration {
+        let num_slots = self.base.saturating_pow(self.attempt + self.starting_i);
+        let slot_i = self.rng.gen_range(0..num_slots);
+        self.attempt += 1;
+        Duration::from_millis((slot_i * self.unit) as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +150,33 @@ mod tests {
         assert_eq!(backoff.attempt(), 3);
         assert_eq!(backoff.next_backoff().as_millis(), 400);
         assert_eq!(backoff.attempt(), 4);
+    }
+
+    #[test]
+    fn test_slot_backoff() {
+        fn assert_in(value: u128, expected: &[u128]) {
+            assert!(
+                expected.iter().any(|&x| x == value),
+                "value {} not in {:?}",
+                value,
+                expected
+            );
+        }
+
+        for _ in 0..10 {
+            let mut backoff = SlotBackoff::default().with_unit(100);
+            assert_in(backoff.next_backoff().as_millis(), &[0, 100, 200, 300]);
+            assert_eq!(backoff.attempt(), 1);
+            assert_in(
+                backoff.next_backoff().as_millis(),
+                &[0, 100, 200, 300, 400, 500, 600, 700],
+            );
+            assert_eq!(backoff.attempt(), 2);
+            assert_in(
+                backoff.next_backoff().as_millis(),
+                &(0..16).map(|i| i * 100).collect::<Vec<_>>(),
+            );
+            assert_eq!(backoff.attempt(), 3);
+        }
     }
 }
