@@ -9,11 +9,10 @@ use std::{
     sync::Arc,
 };
 
-use arrow::array::{ArrayBuilder, BinaryBuilder};
-use arrow::compute::concat;
+use arrow::array::BinaryBuilder;
+use arrow_array::builder::ListBuilder;
 use arrow_array::{new_empty_array, new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use arrow_select::concat;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
@@ -325,83 +324,43 @@ fn get_batch_from_arrays(
 
 // Takes an iterator of Vec<u64> and processes each vector
 // to turn it into a RoaringTreemap. Each RoaringTreeMap is
-// serialized to bytes. The entire collection is converted to a BinaryArray
+// serialized to bytes. The entire collection is converted to a ListArray
+// as BinaryArray can only hold 2^31 bytes
 fn get_bitmaps_from_iter<I>(iter: I) -> Arc<dyn Array>
 where
     I: Iterator<Item = RowIdTreeMap>,
 {
-    let mut builder = BinaryBuilder::new();
-    // For chunking, use a conservative limit (here still half of i32::MAX).
-    const MAX_BITMAP_SIZE: usize = std::i32::MAX as usize;
-    let mut chunks = Vec::new();
-    let mut cur_total: usize = 0;
+    // Instead of adding each serialized bitmap as an individual value,
+    // accumulate raw bytes into chunks. Each chunk will remain below the 32-bit limit.
+    const MAX_CHUNK_SIZE: usize = std::i32::MAX as usize;
+    let mut chunks_data: Vec<Vec<u8>> = Vec::new();
+    let mut current_chunk = Vec::new();
 
-    // Build individual BinaryArray chunks.
-    iter.for_each(|bitmap| {
+    // For each bitmap, serialize into bytes and accumulate into current_chunk.
+    for bitmap in iter {
         let mut bytes = Vec::new();
         bitmap.serialize_into(&mut bytes).unwrap();
-        if cur_total + bytes.len() > MAX_BITMAP_SIZE {
-            println!(
-                "TRIGGER OVERFLOW: cur_total {} + bytes.len() {}",
-                cur_total,
-                bytes.len()
-            );
-            // Finish the current builder and push the chunk.
-            chunks.push(builder.finish());
-            builder = BinaryBuilder::new();
-            cur_total = 0;
+        if current_chunk.len() + bytes.len() > MAX_CHUNK_SIZE {
+            // If adding these bytes would exceed the limit, finish the current chunk.
+            chunks_data.push(current_chunk);
+            current_chunk = Vec::new();
         }
-        builder.append_value(&bytes);
-        cur_total += bytes.len();
-    });
-
-    if builder.len() > 0 {
-        chunks.push(builder.finish());
+        current_chunk.extend(bytes);
     }
-
-    println!("DEBUG: finish building; produced {} chunk(s)", chunks.len());
-
-    // Instead of concatenating all chunks into one array,
-    // group them so that the total offset stays below the maximum.
-    // Here we define a GROUP_LIMIT with an extra safety margin.
-    const GROUP_LIMIT: usize = (std::i32::MAX as usize) - 4096;
-    let mut groups: Vec<arrow_array::ArrayRef> = Vec::new();
-    let mut current_group: Vec<&dyn Array> = Vec::new();
-    let mut group_total: usize = 0;
-    for chunk in &chunks {
-        let chunk_size = chunk.value_data().len();
-        if group_total + chunk_size > GROUP_LIMIT && !current_group.is_empty() {
-            let concatenated = concat(&current_group).unwrap();
-            groups.push(concatenated);
-            current_group.clear();
-            group_total = 0;
-        }
-        current_group.push(chunk as &dyn Array);
-        group_total += chunk_size;
+    if !current_chunk.is_empty() {
+        chunks_data.push(current_chunk);
     }
-    if !current_group.is_empty() {
-        let concatenated = concat(&current_group).unwrap();
-        groups.push(concatenated);
-    }
+    println!("DEBUG: produced {} chunk(s)", chunks_data.len());
 
-    if groups.len() == 1 {
-        Arc::new(groups.pop().unwrap())
-    } else {
-        use arrow_array::builder::ListBuilder;
-        use arrow_array::{BinaryArray, ListArray};
-        let mut list_builder = ListBuilder::new(BinaryBuilder::new());
-        for group_array in groups.iter() {
-            let binary_array = group_array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .expect("Expected a BinaryArray");
-            for i in 0..binary_array.len() {
-                list_builder.values().append_value(binary_array.value(i));
-                list_builder.append(true);
-            }
-        }
-        Arc::new(list_builder.finish())
+    // Wrap each chunk as one element in a ListArray.
+    // Each element is built using a BinaryBuilder.
+    let mut list_builder = ListBuilder::new(BinaryBuilder::new());
+    for chunk in chunks_data.into_iter() {
+        // Append the chunk as one binary value in the list element.
+        list_builder.values().append_value(&chunk);
+        list_builder.append(true);
     }
+    Arc::new(list_builder.finish()) as Arc<dyn arrow_array::Array>
 }
 
 async fn write_bitmap_index(
@@ -513,7 +472,7 @@ pub mod tests {
         // you need m > 2.1e6. (Here we use a much lower value for illustration,
         // but in practice you’d need to upscale these numbers.)
         let m: u32 = 2_500_000;
-        //let m: u32 = 2_500;
+        // let m: u32 = 2_500;
         let per_bitmap_size = 1000; // assumed bytes per bitmap
 
         let mut state = HashMap::new();
