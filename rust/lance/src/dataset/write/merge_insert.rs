@@ -1061,12 +1061,9 @@ impl MergeInsertJob {
                             location: location!(),
                         });
                     }
-
-                    // We going to configure the backoff time based on how long
-                    // the operation took. This becomes the unit.
-                    // If the op took 5s, then the backoff will be 5s, 10s, 20s, 40s, etc.
-                    // If the op took 0.5s, then the backoff will be 0.5s, 1s, 2s, 4s, etc.
                     if backoff.attempt() == 0 {
+                        // We add 10% buffer here, to allow concurrent writes to complete.
+                        // See SlotBackoff implementation for more details on how this works.
                         backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
                     }
 
