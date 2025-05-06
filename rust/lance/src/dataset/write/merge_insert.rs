@@ -354,6 +354,8 @@ impl MergeInsertBuilder {
     /// Subsequent attempts will be cancelled once this timeout is reached. If
     /// the timeout has been reached during the first attempt, the operation
     /// will be cancelled immediately.
+    ///
+    /// The default is 30 seconds.
     pub fn retry_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.params.retry_timeout = timeout;
         self

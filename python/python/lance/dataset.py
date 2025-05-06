@@ -179,6 +179,32 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_not_matched_by_source_delete(expr)
 
+    def conflict_retries(self, max_retries: int) -> "MergeInsertBuilder":
+        """
+        Set number of times to retry the operation if there is contention.
+
+        If this is set > 0, then the operation will keep a copy of the input data
+        either in memory or on disk (depending on the size of the data) and will
+        retry the operation if there is contention.
+
+        Default is 10.
+        """
+        return super(MergeInsertBuilder, self).conflict_retries(max_retries)
+
+    def retry_timeout(self, timeout: timedelta) -> "MergeInsertBuilder":
+        """
+        Set the timeout used to limit retries.
+
+        This is the maximum time to spend on the operation before giving up. At
+        least one attempt will be made, regardless of how long it takes to complete.
+        Subsequent attempts will be cancelled once this timeout is reached. If
+        the timeout has been reached during the first attempt, the operation
+        will be cancelled immediately.
+
+        The default is 30 seconds.
+        """
+        return super(MergeInsertBuilder, self).retry_timeout(timeout)
+
 
 class LanceDataset(pa.dataset.Dataset):
     """A Lance Dataset in Lance format where the data is stored at the given uri."""
@@ -1320,7 +1346,7 @@ class LanceDataset(pa.dataset.Dataset):
     def merge_insert(
         self,
         on: Union[str, Iterable[str]],
-    ):
+    ) -> MergeInsertBuilder:
         """
         Returns a builder that can be used to create a "merge insert" operation
 
