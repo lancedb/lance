@@ -549,6 +549,10 @@ impl Dataset {
         &self.manifest
     }
 
+    pub fn manifest_location(&self) -> &ManifestLocation {
+        &self.manifest_location
+    }
+
     // TODO: Cache this
     pub async fn blobs_dataset(&self) -> Result<Option<Arc<Self>>> {
         if let Some(blobs_version) = self.manifest.blob_dataset_version {
@@ -1430,10 +1434,10 @@ impl Dataset {
     /// #  .into_reader_rows(RowCount::from(10), BatchCount::from(1));
     /// # let fut = async {
     /// let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
-    /// assert_eq!(dataset.manifest_naming_scheme, ManifestNamingScheme::V1);
+    /// assert_eq!(dataset.manifest_location().naming_scheme, ManifestNamingScheme::V1);
     ///
     /// dataset.migrate_manifest_paths_v2().await.unwrap();
-    /// assert_eq!(dataset.manifest_naming_scheme, ManifestNamingScheme::V2);
+    /// assert_eq!(dataset.manifest_location().naming_scheme, ManifestNamingScheme::V2);
     /// # };
     /// # tokio::runtime::Runtime::new().unwrap().block_on(fut);
     /// ```
