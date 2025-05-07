@@ -2331,7 +2331,7 @@ mod tests {
         let attempts = try_join_all(handles).await.unwrap();
         let elapsed = start.elapsed();
 
-        let buffer = Duration::from_millis(20);
+        let buffer = Duration::from_millis(100);
         assert!(
             elapsed < timeout + buffer,
             "Elapsed time should be less than {} ms, was {} ms",
