@@ -37,12 +37,13 @@ use lance_arrow::SchemaExt;
 use lance_core::{
     utils::{
         futures::FinallyStreamExt,
-        tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION},
+        tracing::{StreamTracingExt, EXECUTION_PLAN_RUN, TRACE_EXECUTION},
     },
     Error, Result,
 };
 use log::{debug, info, warn};
 use snafu::location;
+use tracing::Span;
 
 use crate::utils::{
     MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
@@ -184,6 +185,82 @@ impl ExecutionPlan for OneShotExec {
 
     fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
         &self.properties
+    }
+}
+
+struct TracedExec {
+    input: Arc<dyn ExecutionPlan>,
+    properties: PlanProperties,
+    span: Span,
+}
+
+impl TracedExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, span: Span) -> Self {
+        Self {
+            properties: input.properties().clone(),
+            input,
+            span,
+        }
+    }
+}
+
+impl DisplayAs for TracedExec {
+    fn fmt_as(
+        &self,
+        t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "TracedExec")
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for TracedExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "TracedExec")
+    }
+}
+impl ExecutionPlan for TracedExec {
+    fn name(&self) -> &str {
+        "TracedExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(TracedExec {
+            input: children[0].clone(),
+            properties: self.properties.clone(),
+            span: self.span.clone(),
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let _guard = self.span.enter();
+        let stream = self.input.execute(partition, context)?;
+        let schema = stream.schema();
+        let stream = stream.stream_in_span(self.span.clone());
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
@@ -393,6 +470,10 @@ pub async fn analyze_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<String> {
+    // This is needed as AnalyzeExec launches a thread task per
+    // partition, and we want these to be connected to the parent span
+    let plan = Arc::new(TracedExec::new(plan, Span::current()));
+
     let schema = plan.schema();
     let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
 
