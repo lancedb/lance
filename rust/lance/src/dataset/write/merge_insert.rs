@@ -16,6 +16,7 @@
 //! key columns are identical in both the source and the target.  This means that you will need some kind of
 //! meaningful key column to be able to perform a merge insert.
 
+use aws_sdk_dynamodb::types::error::TransactionCanceledException;
 use futures::FutureExt;
 use std::{
     collections::BTreeMap,
@@ -62,7 +63,10 @@ use futures::{
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::{backoff::SlotBackoff, futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::{
+        backoff::SlotBackoff, futures::Capacity, mask::RowIdTreeMap,
+        tokio::get_num_compute_intensive_cpus,
+    },
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -1084,10 +1088,18 @@ impl MergeInsertJob {
                 .execute_uncommitted_impl(source_iter.next().unwrap());
             let execute_fut =
                 maybe_timeout(&backoff, start, self.params.retry_timeout, execute_fut);
-            let (transaction, mut stats) = execute_fut.await??;
+            let UncommittedMergeInsert {
+                transaction,
+                mut stats,
+                affected_rows,
+            } = execute_fut.await??;
             stats.num_attempts = backoff.attempt() + 1;
 
-            let commit_future = CommitBuilder::new(ds.clone()).execute(transaction);
+            let mut commit_builder = CommitBuilder::new(ds.clone());
+            if let Some(affected_rows) = affected_rows {
+                commit_builder = commit_builder.with_affected_rows(affected_rows);
+            }
+            let commit_future = commit_builder.execute(transaction);
             let commit_future =
                 maybe_timeout(&backoff, start, self.params.retry_timeout, commit_future);
             match commit_future.await? {
@@ -1139,7 +1151,7 @@ impl MergeInsertJob {
     pub async fn execute_uncommitted(
         self,
         source: impl StreamingWriteSource,
-    ) -> Result<(Transaction, MergeStats)> {
+    ) -> Result<UncommittedMergeInsert> {
         let stream = source.into_stream();
         self.execute_uncommitted_impl(stream).await
     }
@@ -1147,7 +1159,7 @@ impl MergeInsertJob {
     async fn execute_uncommitted_impl(
         self,
         source: SendableRecordBatchStream,
-    ) -> Result<(Transaction, MergeStats)> {
+    ) -> Result<UncommittedMergeInsert> {
         // Erase metadata on source / dataset schemas to avoid comparing metadata
         let schema = lance_core::datatypes::Schema::try_from(source.schema().as_ref())?;
         let full_schema = self.dataset.local_schema();
@@ -1229,7 +1241,11 @@ impl MergeInsertJob {
             None,
         );
 
-        Ok((transaction, stats))
+        Ok(UncommittedMergeInsert {
+            transaction,
+            affected_rows: todo!("Compute affected rows"),
+            stats,
+        })
     }
 
     // Delete a batch of rows by id, returns the fragments modified and the fragments removed
@@ -1295,6 +1311,12 @@ pub struct MergeStats {
     ///
     /// See [`MergeInsertBuilder::conflict_retries`] for more information.
     pub num_attempts: u32,
+}
+
+pub struct UncommittedMergeInsert {
+    pub transaction: Transaction,
+    pub affected_rows: Option<RowIdTreeMap>,
+    pub stats: MergeStats,
 }
 
 // A sync-safe structure that is shared by all of the "process batch" tasks.
@@ -2417,19 +2439,21 @@ mod tests {
             ],
         )
         .unwrap();
-        let (transaction1, _stats) =
-            MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
-                .unwrap()
-                .when_matched(WhenMatched::UpdateAll)
-                .when_not_matched(WhenNotMatched::InsertAll)
-                .try_build()
-                .unwrap()
-                .execute_uncommitted(RecordBatchIterator::new(
-                    vec![Ok(new_data1)],
-                    schema.clone(),
-                ))
-                .await
-                .unwrap();
+        let UncommittedMergeInsert {
+            transaction: transaction1,
+            ..
+        } = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted(RecordBatchIterator::new(
+                vec![Ok(new_data1)],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
 
         // Setup a "large" merge insert, with many batches
         let new_data2 = RecordBatch::try_new(

@@ -3,12 +3,14 @@
 
 use std::sync::Arc;
 
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::{
     format::{is_detached_version, DataStorageFormat},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
+use roaring::RoaringTreemap;
 use snafu::location;
 
 use crate::{
@@ -40,6 +42,7 @@ pub struct CommitBuilder<'a> {
     session: Option<Arc<Session>>,
     detached: bool,
     commit_config: CommitConfig,
+    affected_rows: Option<RowIdTreeMap>,
 }
 
 impl<'a> CommitBuilder<'a> {
@@ -55,6 +58,7 @@ impl<'a> CommitBuilder<'a> {
             session: None,
             detached: false,
             commit_config: Default::default(),
+            affected_rows: None,
         }
     }
 
@@ -145,6 +149,13 @@ impl<'a> CommitBuilder<'a> {
     /// If a commit operation fails, it will be retried up to `max_retries` times.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.commit_config.num_retries = max_retries;
+        self
+    }
+
+    /// Provide the set of row addresses that were deleted or updated. This is
+    /// used to perform fast conflict resolution.
+    pub fn with_affected_rows(mut self, affected_rows: RowIdTreeMap) -> Self {
+        self.affected_rows = Some(affected_rows);
         self
     }
 
@@ -285,6 +296,7 @@ impl<'a> CommitBuilder<'a> {
                     &manifest_config,
                     &self.commit_config,
                     manifest_naming_scheme,
+                    self.affected_rows.as_ref(),
                 )
                 .await?
             }
