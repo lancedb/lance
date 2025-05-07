@@ -1182,7 +1182,7 @@ impl MergeInsertJob {
             .try_flatten();
         let stream = RecordBatchStreamAdapter::new(merger_schema, stream);
 
-        let operation = if !is_full_schema {
+        let (operation, affected_rows) = if !is_full_schema {
             if !matches!(
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
@@ -1196,11 +1196,14 @@ impl MergeInsertJob {
             let (updated_fragments, new_fragments) =
                 Self::update_fragments(self.dataset.clone(), Box::pin(stream)).await?;
 
-            Operation::Update {
+            let operation = Operation::Update {
                 removed_fragment_ids: Vec::new(),
                 updated_fragments,
                 new_fragments,
-            }
+            };
+            // We have rewritten the fragments, not just the deletion files, so
+            // we can't use affected rows here.
+            (operation, None)
         } else {
             let written = write_fragments_internal(
                 Some(&self.dataset),
@@ -1222,11 +1225,14 @@ impl MergeInsertJob {
                 Self::apply_deletions(&self.dataset, &removed_row_ids).await?;
 
             // Commit updated and new fragments
-            Operation::Update {
+            let operation = Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: old_fragments,
                 new_fragments,
-            }
+            };
+
+            let affected_rows = Some(RowIdTreeMap::from(removed_row_ids));
+            (operation, affected_rows)
         };
 
         let stats = Arc::into_inner(merge_statistics)
@@ -1243,7 +1249,7 @@ impl MergeInsertJob {
 
         Ok(UncommittedMergeInsert {
             transaction,
-            affected_rows: todo!("Compute affected rows"),
+            affected_rows,
             stats,
         })
     }

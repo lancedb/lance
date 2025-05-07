@@ -128,12 +128,13 @@ async fn write_transaction_file(
     Ok(file_name)
 }
 
+// Return true
 fn check_transaction(
     transaction: &Transaction,
     other_version: u64,
     other_transaction: Option<&Transaction>,
     affected_rows: Option<&RowIdTreeMap>,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(other_transaction) = other_transaction else {
         return Err(crate::Error::Internal {
             message: format!(
@@ -146,6 +147,16 @@ fn check_transaction(
     };
 
     todo!("Use affected_rows to see if we can merge the deletion files.");
+
+    // TODO: What do we do when the other transaction was an upsert that rewrote
+    // fragments rather than just touched the deletion file? This would generally
+    // be easier to handle if the transaction was simply a diff.
+    // Maybe what we can do, is:
+    // (1) We grab the fragments as they are at read_version
+    // (2) We keep around the data files that were (a) present at read_version
+    //     and (b) are in fragments this transaction is touching.
+    // (3) We can use those sets of data files to check if the other transaction
+    //     modified the data files we are touching, and not just the deletion files.
 
     match transaction.conflicts_with(other_transaction) {
         ConflictResult::Compatible => Ok(()),
@@ -797,7 +808,7 @@ pub(crate) async fn commit_transaction(
         // transactions that have been committed since the read_version.
         // Use small amount of backoff to handle transactions that all
         // started at exact same time better.
-        futures::stream::iter(target_version..=dataset.manifest.version)
+        let check_deletion_files = futures::stream::iter(target_version..=dataset.manifest.version)
             .map(|version| {
                 read_dataset_transaction_file(&dataset, version)
                     .map(move |res| res.map(|tx| (version, tx)))
@@ -813,16 +824,21 @@ pub(crate) async fn commit_transaction(
                         ),
                 )
             })
-            .try_for_each(|(other_version, other_transaction)| {
-                let res = check_transaction(
-                    transaction,
-                    other_version,
-                    Some(other_transaction.as_ref()),
-                    affected_rows,
-                );
+            .map_ok(|(other_version, other_transaction)| {
+                let res =
+                    check_transaction(transaction, other_version, Some(other_transaction.as_ref()));
                 futures::future::ready(res)
             })
+            .try_fold(false, |acc, res| async move {
+                if let Ok(res) = res {
+                    if res {
+                        return Ok(true);
+                    }
+                }
+                Ok(acc)
+            })
             .await?;
+
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
             return Err(Error::Internal { message: "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.".into(), location: location!() });
