@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use lance_core::utils::backoff::Backoff;
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::{
@@ -129,6 +130,7 @@ fn check_transaction(
     transaction: &Transaction,
     other_version: u64,
     other_transaction: Option<&Transaction>,
+    affected_rows: Option<&RowIdTreeMap>,
 ) -> Result<()> {
     let Some(other_transaction) = other_transaction else {
         return Err(crate::Error::Internal {
@@ -140,6 +142,8 @@ fn check_transaction(
             location: location!(),
         });
     };
+
+    todo!("Use affected_rows to see if we can merge the deletion files.");
 
     match transaction.conflicts_with(other_transaction) {
         ConflictResult::Compatible => Ok(()),
@@ -716,6 +720,7 @@ pub(crate) async fn commit_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
     manifest_naming_scheme: ManifestNamingScheme,
+    affected_rows: Option<&RowIdTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
@@ -776,8 +781,12 @@ pub(crate) async fn commit_transaction(
                 )
             })
             .try_for_each(|(other_version, other_transaction)| {
-                let res =
-                    check_transaction(transaction, other_version, Some(other_transaction.as_ref()));
+                let res = check_transaction(
+                    transaction,
+                    other_version,
+                    Some(other_transaction.as_ref()),
+                    affected_rows,
+                );
                 futures::future::ready(res)
             })
             .await?;
