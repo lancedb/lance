@@ -4186,7 +4186,7 @@ mod test {
 
             assert_eq!(
                 dataset.index_cache_entry_count(),
-                1, // 1 for index metadata
+                2, // 2 for index metadata at version 1 and 2.
             );
             let results = scan
                 .try_into_stream()
@@ -5190,17 +5190,20 @@ mod test {
         assert!(filtered_scan_bytes < full_scan_bytes);
 
         // Now do a scan with pushdown, the benefit should be even greater
-        let start_bytes = get_bytes();
-        dataset
-            .scan()
-            .filter("not_indexed = 50")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let pushdown_scan_bytes = get_bytes() - start_bytes;
+        // Pushdown only works with the legacy format for now.
+        if data_storage_version == LanceFileVersion::Legacy {
+            let start_bytes = get_bytes();
+            dataset
+                .scan()
+                .filter("not_indexed = 50")
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let pushdown_scan_bytes = get_bytes() - start_bytes;
 
-        assert!(pushdown_scan_bytes < filtered_scan_bytes);
+            assert!(pushdown_scan_bytes < filtered_scan_bytes);
+        }
 
         // Now do a scalar index scan, this should be better than a
         // full scan but since we have to load the index might be more

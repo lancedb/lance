@@ -88,6 +88,25 @@ impl IndexCache {
         }
     }
 
+    /// Clear the cache
+    #[cfg(test)]
+    pub fn clear(&self) {
+        self.scalar_cache.invalidate_all();
+        self.scalar_cache.run_pending_tasks();
+
+        self.vector_cache.invalidate_all();
+        self.vector_cache.run_pending_tasks();
+
+        self.vector_partition_cache.invalidate_all();
+        self.vector_partition_cache.run_pending_tasks();
+
+        self.metadata_cache.invalidate_all();
+        self.metadata_cache.run_pending_tasks();
+
+        self.type_cache.invalidate_all();
+        self.type_cache.run_pending_tasks();
+    }
+
     #[allow(dead_code)]
     pub(crate) fn len_vector(&self) -> usize {
         self.vector_cache.run_pending_tasks();

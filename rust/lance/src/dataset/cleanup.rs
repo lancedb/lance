@@ -192,7 +192,7 @@ impl<'a> CleanupTask<'a> {
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || manifest.timestamp() >= self.before || is_tagged;
         let indexes =
-            read_manifest_indexes(&self.dataset.object_store, &location.path, &manifest).await?;
+            read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
 
         let mut inspection = inspection.lock().unwrap();
 

@@ -180,7 +180,7 @@ pub type ManifestWriter = for<'a> fn(
     path: &'a Path,
 ) -> BoxFuture<'a, Result<WriteResult>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ManifestLocation {
     /// The version the manifest corresponds to.
     pub version: u64,
