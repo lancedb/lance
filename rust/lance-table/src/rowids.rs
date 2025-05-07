@@ -401,6 +401,10 @@ impl RowIdSequence {
     }
 }
 
+/// An iterator that groups row ids into ranges
+///
+/// For example, given an input iterator of [1, 2, 3, 5, 6, 7, 10, 11, 12]
+/// this will return an iterator of [(1..4), (5..8), (10..13)]
 struct GroupingIterator<I: Iterator<Item = u64>> {
     iter: I,
     cur_range: Option<Range<u64>>,

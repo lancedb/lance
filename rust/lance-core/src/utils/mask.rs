@@ -574,6 +574,10 @@ impl RowIdTreeMap {
         Self { inner: new_map }
     }
 
+    /// Apply a mask to the row ids
+    ///
+    /// If there is an allow list then this will intersect the set with the allow list
+    /// If there is a block list then this will subtract the block list from the set
     pub fn mask(&mut self, mask: &RowIdMask) {
         if let Some(allow_list) = &mask.allow_list {
             *self &= allow_list;
