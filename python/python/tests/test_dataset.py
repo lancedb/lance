@@ -1416,7 +1416,11 @@ def test_merge_insert(tmp_path: Path):
     is_new = pc.field("b") == 2
 
     merge_dict = (
-        dataset.merge_insert("a").when_not_matched_insert_all().execute(new_table)
+        dataset.merge_insert("a")
+        .when_not_matched_insert_all()
+        .retry_timeout(timedelta(seconds=5))
+        .conflict_retries(0)
+        .execute(new_table)
     )
     table = dataset.to_table()
     assert table.num_rows == 1300

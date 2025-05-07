@@ -16,9 +16,12 @@
 //! key columns are identical in both the source and the target.  This means that you will need some kind of
 //! meaningful key column to be able to perform a merge insert.
 
+use futures::FutureExt;
 use std::{
     collections::BTreeMap,
+    future::Future,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use arrow_array::{
@@ -52,13 +55,14 @@ use lance_datafusion::{
 
 use datafusion_physical_expr::expressions::Column;
 use futures::{
+    future::Either,
     stream::{self},
-    Stream, StreamExt, TryStreamExt,
+    Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::{backoff::Backoff, futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::{backoff::SlotBackoff, futures::Capacity, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -226,6 +230,7 @@ struct MergeInsertParams {
     // Controls whether data that is not matched by the source is deleted or not
     delete_not_matched_by_source: WhenNotMatchedBySource,
     conflict_retries: u32,
+    retry_timeout: Duration,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -303,6 +308,7 @@ impl MergeInsertBuilder {
                 insert_not_matched: true,
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
                 conflict_retries: 10,
+                retry_timeout: Duration::from_secs(30),
             },
         })
     }
@@ -341,6 +347,20 @@ impl MergeInsertBuilder {
     /// Default is 10.
     pub fn conflict_retries(&mut self, retries: u32) -> &mut Self {
         self.params.conflict_retries = retries;
+        self
+    }
+
+    /// Set the timeout used to limit retries.
+    ///
+    /// This is the maximum time to spend on the operation before giving up. At
+    /// least one attempt will be made, regardless of how long it takes to complete.
+    /// Subsequent attempts will be cancelled once this timeout is reached. If
+    /// the timeout has been reached during the first attempt, the operation
+    /// will be cancelled immediately.
+    ///
+    /// The default is 30 seconds.
+    pub fn retry_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.params.retry_timeout = timeout;
         self
     }
 
@@ -1012,24 +1032,87 @@ impl MergeInsertJob {
         mut self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
+        let start = Instant::now();
         let mut source_iter =
             super::new_source_iter(source, self.params.conflict_retries > 0).await?;
 
         let mut dataset_ref = self.dataset.clone();
         let max_retries = self.params.conflict_retries;
-        let mut backoff = Backoff::default();
+        let mut backoff = SlotBackoff::default();
+
+        fn timeout_error(retry_timeout: Duration, attempts: u32) -> Error {
+            Error::TooMuchWriteContention {
+                message: format!(
+                    "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
+                    attempts,
+                    retry_timeout.as_secs_f32()
+                ),
+                location: location!(),
+            }
+        }
+
+        fn maybe_timeout<T>(
+            backoff: &SlotBackoff,
+            start: Instant,
+            retry_timeout: Duration,
+            future: impl Future<Output = T>,
+        ) -> impl Future<Output = Result<T>> {
+            let attempt = backoff.attempt();
+            if attempt == 0 {
+                // No timeout on first attempt
+                Either::Left(future.map(|res| Ok(res)))
+            } else {
+                let remaining = retry_timeout.saturating_sub(start.elapsed());
+                Either::Right(
+                    tokio::time::timeout(remaining, future)
+                        .map_err(move |_| timeout_error(retry_timeout, attempt + 1)),
+                )
+            }
+        }
+
         while backoff.attempt() <= max_retries {
             let ds = dataset_ref.clone();
-            let (transaction, stats) = self
+            let execute_fut = self
                 .clone()
-                .execute_uncommitted_impl(source_iter.next().unwrap())
-                .await?;
-            match CommitBuilder::new(ds).execute(transaction).await {
+                .execute_uncommitted_impl(source_iter.next().unwrap());
+            let execute_fut =
+                maybe_timeout(&backoff, start, self.params.retry_timeout, execute_fut);
+            let (transaction, mut stats) = execute_fut.await??;
+            stats.num_attempts = backoff.attempt() + 1;
+
+            let commit_future = CommitBuilder::new(ds.clone()).execute(transaction);
+            let commit_future =
+                maybe_timeout(&backoff, start, self.params.retry_timeout, commit_future);
+            match commit_future.await? {
                 Ok(ds) => return Ok((Arc::new(ds), stats)),
                 Err(Error::RetryableCommitConflict { .. }) => {
-                    tokio::time::sleep(backoff.next_backoff()).await;
+                    // Check whether we have exhausted our retries *before*
+                    // we sleep.
+                    if backoff.attempt() >= max_retries {
+                        break;
+                    }
+                    if start.elapsed() > self.params.retry_timeout {
+                        return Err(timeout_error(
+                            self.params.retry_timeout,
+                            backoff.attempt() + 1,
+                        ));
+                    }
+                    if backoff.attempt() == 0 {
+                        // We add 10% buffer here, to allow concurrent writes to complete.
+                        // We pass the first attempt's time to the backoff so it's used
+                        // as the unit for backoff time slots.
+                        // See SlotBackoff implementation for more details on how this works.
+                        backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
+                    }
+
+                    let sleep_fut = tokio::time::sleep(backoff.next_backoff());
+                    let sleep_fut =
+                        maybe_timeout(&backoff, start, self.params.retry_timeout, sleep_fut);
+                    sleep_fut.await?;
+
                     let mut ds = dataset_ref.as_ref().clone();
                     ds.checkout_latest().await?;
+
                     dataset_ref = Arc::new(ds);
                     self.dataset = dataset_ref.clone();
                     continue;
@@ -1206,6 +1289,10 @@ pub struct MergeStats {
     /// Note: This is different from internal references to 'deleted_rows', since we technically "delete" updated rows during processing.
     /// However those rows are not shared with the user.
     pub num_deleted_rows: u64,
+    /// Number of attempts performed.
+    ///
+    /// See [`MergeInsertBuilder::conflict_retries`] for more information.
+    pub num_attempts: u32,
 }
 
 // A sync-safe structure that is shared by all of the "process batch" tasks.
@@ -1492,10 +1579,16 @@ mod tests {
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::{scalar::ScalarIndexParams, IndexType};
+    use lance_io::object_store::ObjectStoreParams;
+    use object_store::throttle::ThrottleConfig;
     use tempfile::tempdir;
     use tokio::sync::{Barrier, Notify};
 
-    use crate::dataset::{builder::DatasetBuilder, InsertBuilder, WriteMode, WriteParams};
+    use crate::{
+        dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
+        session::Session,
+        utils::test::ThrottledStoreWrapper,
+    };
 
     use super::*;
 
@@ -2136,28 +2229,50 @@ mod tests {
         }
     }
 
+    // For some reason, Windows isn't able to handle the timeout test. Possibly
+    // a performance bug in their timer implementation?
+    #[cfg(not(windows))]
+    #[rstest::rstest]
+    #[case::all_success(Duration::from_secs(100_000))]
+    #[case::timeout(Duration::from_millis(200))]
     #[tokio::test]
-    async fn test_merge_insert_concurrency() {
+    async fn test_merge_insert_concurrency(#[case] timeout: Duration) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
         ]));
-        let num_rows = 10;
+        let concurrency = 10;
         let initial_data = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt32Array::from_iter_values(0..num_rows)),
+                Arc::new(UInt32Array::from_iter_values(0..concurrency)),
                 Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(
                     0,
-                    num_rows as usize,
+                    concurrency as usize,
                 ))),
             ],
         )
         .unwrap();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = InsertBuilder::new(test_uri)
+        // Increase likelihood of contention by throttling the store
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: Duration::from_millis(1),
+                wait_get_per_call: Duration::from_millis(1),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
             .execute(vec![initial_data])
             .await
             .unwrap();
@@ -2166,14 +2281,26 @@ mod tests {
         // they have opened, and then wait for a signal to proceed. Once the signal
         // is received, they will do a merge insert and close the dataset.
 
-        let barrier = Arc::new(Barrier::new(10));
+        let barrier = Arc::new(Barrier::new(concurrency as usize));
         let mut handles = Vec::new();
-        for i in 0..10 {
-            let uri_ref = test_uri.to_string();
+        for i in 0..concurrency {
+            let session_ref = session.clone();
             let schema_ref = schema.clone();
             let barrier_ref = barrier.clone();
+            let throttled_ref = throttled.clone();
             let handle = tokio::task::spawn(async move {
-                let dataset = DatasetBuilder::from_uri(&uri_ref).load().await.unwrap();
+                let dataset = DatasetBuilder::from_uri("memory://")
+                    .with_read_params(ReadParams {
+                        store_options: Some(ObjectStoreParams {
+                            object_store_wrapper: Some(throttled_ref.clone()),
+                            ..Default::default()
+                        }),
+                        session: Some(session_ref.clone()),
+                        ..Default::default()
+                    })
+                    .load()
+                    .await
+                    .unwrap();
                 let dataset = Arc::new(dataset);
 
                 let new_data = RecordBatch::try_new(
@@ -2190,26 +2317,62 @@ mod tests {
                     .unwrap()
                     .when_matched(WhenMatched::UpdateAll)
                     .when_not_matched(WhenNotMatched::InsertAll)
+                    .conflict_retries(100)
+                    .retry_timeout(timeout)
                     .try_build()
                     .unwrap();
                 barrier_ref.wait().await;
 
-                job.execute_reader(source).await.unwrap();
+                let start = Instant::now();
+                let res = job
+                    .execute_reader(source)
+                    .await
+                    .map(|(_ds, stats)| stats.num_attempts);
+                let elapsed = start.elapsed();
+                (res, elapsed)
             });
             handles.push(handle);
         }
 
-        try_join_all(handles).await.unwrap();
+        let results = try_join_all(handles).await.unwrap();
 
-        dataset.checkout_latest().await.unwrap();
-        let batches = dataset.scan().try_into_batch().await.unwrap();
+        for (attempts, elapsed) in results.iter() {
+            let buffer = Duration::from_millis(100);
+            assert!(
+                *elapsed < timeout + buffer,
+                "Elapsed time should be less than {} ms, was {} ms",
+                (timeout + buffer).as_millis(),
+                elapsed.as_millis()
+            );
 
-        let values = batches["value"].as_primitive::<UInt32Type>();
-        assert!(
-            values.values().iter().all(|&v| v == 1),
-            "All values should be 1 after merge insert. Got: {:?}",
-            values
-        );
+            match attempts {
+                Ok(attempts) => {
+                    assert!(*attempts <= 10, "Attempt count should be <= 10");
+                }
+                Err(err) => {
+                    // If we get an error, it means the task was cancelled
+                    // due to timeout. This is expected if the timeout is
+                    // set to a low value.
+                    assert!(
+                        matches!(err, Error::TooMuchWriteContention { message, .. } if message.contains("failed on retry_timeout")),
+                        "Expected TooMuchWriteContention error, got: {:?}",
+                        err
+                    );
+                }
+            }
+        }
+
+        if timeout.as_secs() > 10 {
+            dataset.checkout_latest().await.unwrap();
+            let batches = dataset.scan().try_into_batch().await.unwrap();
+
+            let values = batches["value"].as_primitive::<UInt32Type>();
+            assert!(
+                values.values().iter().all(|&v| v == 1),
+                "All values should be 1 after merge insert. Got: {:?}",
+                values
+            );
+        }
     }
 
     #[tokio::test]
