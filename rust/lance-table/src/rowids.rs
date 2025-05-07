@@ -618,6 +618,23 @@ pub fn select_row_ids<'a>(
             let sequence = sequence.slice(range.start, range.end - range.start);
             Ok(sequence.iter().collect())
         }
+        ReadBatchParams::Ranges(ranges) => {
+            let num_rows = ranges
+                .iter()
+                .map(|r| (r.end - r.start) as usize)
+                .sum::<usize>();
+            let mut result = Vec::with_capacity(num_rows);
+            for range in ranges.as_ref() {
+                if range.end > sequence.len() {
+                    return Err(out_of_bounds_err(range.end as u32));
+                }
+                let sequence =
+                    sequence.slice(range.start as usize, (range.end - range.start) as usize);
+                result.extend(sequence.iter());
+            }
+            Ok(result)
+        }
+
         ReadBatchParams::RangeFull => Ok(sequence.iter().collect()),
         ReadBatchParams::RangeTo(to) => {
             if to.end > sequence.len() as usize {
@@ -804,6 +821,7 @@ mod test {
             ReadBatchParams::RangeFull,
             ReadBatchParams::RangeTo(..5),
             ReadBatchParams::RangeFrom(5..),
+            ReadBatchParams::Ranges(vec![2..3, 5..10].into()),
         ];
 
         // Sequences with all segment types. These have at least 10 elements,
@@ -838,6 +856,10 @@ mod test {
                     ReadBatchParams::RangeTo(to) => (0..to.end).collect(),
                     ReadBatchParams::RangeFrom(from) => (from.start..flat_sequence.len()).collect(),
                     ReadBatchParams::Range(range) => range.clone().collect(),
+                    ReadBatchParams::Ranges(ranges) => ranges
+                        .iter()
+                        .flat_map(|r| r.start as usize..r.end as usize)
+                        .collect(),
                     ReadBatchParams::Indices(indices) => {
                         indices.values().iter().map(|i| *i as usize).collect()
                     }

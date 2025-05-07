@@ -924,7 +924,7 @@ pub fn apply_scalar_indices(
     visit_node(&expr, index_info).unwrap_or(IndexedExpression::refine_only(expr))
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct FilterPlan {
     pub index_query: Option<ScalarIndexExpr>,
     /// True if the index query is guaranteed to return exact results
@@ -934,6 +934,15 @@ pub struct FilterPlan {
 }
 
 impl FilterPlan {
+    pub fn empty() -> Self {
+        Self {
+            index_query: None,
+            skip_recheck: true,
+            refine_expr: None,
+            full_expr: None,
+        }
+    }
+
     pub fn refine_columns(&self) -> Vec<String> {
         self.refine_expr
             .as_ref()
