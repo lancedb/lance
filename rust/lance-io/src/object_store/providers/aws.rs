@@ -52,6 +52,9 @@ impl ObjectStoreProvider for AwsStoreProvider {
             max_retries,
             retry_timeout: Duration::from_secs(retry_timeout),
         };
+        let client_options = ClientOptions::default().with_timeout(Duration::from_secs(
+            storage_options.client_request_timeout(),
+        ));
 
         storage_options.with_env_s3();
 
@@ -83,15 +86,15 @@ impl ObjectStoreProvider for AwsStoreProvider {
         base_path.set_query(None);
 
         // we can't use parse_url_opts here because we need to manually set the credentials provider
-        let mut builder = AmazonS3Builder::new();
+        let mut builder = AmazonS3Builder::new()
+            .with_url(base_path.as_ref())
+            .with_credentials(aws_creds)
+            .with_client_options(client_options)
+            .with_retry(retry_config)
+            .with_region(region);
         for (key, value) in storage_options {
             builder = builder.with_config(key, value);
         }
-        builder = builder
-            .with_url(base_path.as_ref())
-            .with_credentials(aws_creds)
-            .with_retry(retry_config)
-            .with_region(region);
         let inner = Arc::new(builder.build()?);
 
         Ok(ObjectStore {

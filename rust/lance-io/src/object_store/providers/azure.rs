@@ -3,9 +3,10 @@
 
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
+use aws_config::imds::{client, Client};
 use object_store::{
     azure::{AzureConfigKey, MicrosoftAzureBuilder},
-    RetryConfig,
+    ClientOptions, RetryConfig,
 };
 use url::Url;
 
@@ -34,9 +35,14 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             retry_timeout: Duration::from_secs(retry_timeout),
         };
 
+        let client_options = ClientOptions::default().with_timeout(Duration::from_secs(
+            storage_options.client_request_timeout(),
+        ));
+
         storage_options.with_env_azure();
         let mut builder = MicrosoftAzureBuilder::new()
             .with_url(base_path.as_ref())
+            .with_client_options(client_options)
             .with_retry(retry_config);
         for (key, value) in storage_options.as_azure_options() {
             builder = builder.with_config(key, value);

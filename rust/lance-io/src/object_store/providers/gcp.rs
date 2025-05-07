@@ -5,7 +5,7 @@ use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 use object_store::{
     gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey},
-    RetryConfig, StaticCredentialProvider,
+    ClientOptions, RetryConfig, StaticCredentialProvider,
 };
 use url::Url;
 
@@ -34,9 +34,14 @@ impl ObjectStoreProvider for GcsStoreProvider {
             retry_timeout: Duration::from_secs(retry_timeout),
         };
 
+        let client_options = ClientOptions::default().with_timeout(Duration::from_secs(
+            storage_options.client_request_timeout(),
+        ));
+
         storage_options.with_env_gcs();
         let mut builder = GoogleCloudStorageBuilder::new()
             .with_url(base_path.as_ref())
+            .with_client_options(client_options)
             .with_retry(retry_config);
         for (key, value) in storage_options.as_gcs_options() {
             builder = builder.with_config(key, value);

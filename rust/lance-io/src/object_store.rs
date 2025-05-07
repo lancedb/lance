@@ -568,6 +568,9 @@ impl StorageOptions {
         if let Ok(value) = std::env::var("OBJECT_STORE_CLIENT_RETRY_TIMEOUT") {
             options.insert("client_retry_timeout".into(), value);
         }
+        if let Ok(value) = std::env::var("OBJECT_STORE_CLIENT_REQUEST_TIMEOUT") {
+            options.insert("client_request_timeout".into(), value);
+        }
         Self(options)
     }
 
@@ -603,6 +606,14 @@ impl StorageOptions {
             .find(|(key, _)| key.eq_ignore_ascii_case("client_retry_timeout"))
             .and_then(|(_, value)| value.parse::<u64>().ok())
             .unwrap_or(180)
+    }
+
+    pub fn client_request_timeout(&self) -> u64 {
+        self.0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("client_request_timeout"))
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .unwrap_or(30)
     }
 
     pub fn get(&self, key: &str) -> Option<&String> {
