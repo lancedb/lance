@@ -41,6 +41,7 @@ use futures::{FutureExt, TryStreamExt};
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{analyze_plan, execute_plan, LanceExecutionOptions};
@@ -65,6 +66,7 @@ use super::Dataset;
 use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
+use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -201,6 +203,12 @@ impl MaterializationStyle {
             .collect();
         Ok(Self::AllEarlyExcept(field_ids))
     }
+}
+
+struct PlannedFilteredScan {
+    plan: Arc<dyn ExecutionPlan>,
+    limit_pushed_down: bool,
+    filter_pushed_down: bool,
 }
 
 /// Filter for filtering rows
@@ -1303,6 +1311,111 @@ impl Scanner {
             .union_schema(&filter_schema))
     }
 
+    fn validate_options(&self) -> Result<()> {
+        if self.projection_plan.physical_schema.fields.is_empty()
+            && !self.with_row_id
+            && !self.with_row_address
+        {
+            return Err(Error::InvalidInput {
+                source:
+                    "no columns were selected and with_row_id is false, there is nothing to scan"
+                        .into(),
+                location: location!(),
+            });
+        }
+
+        if self.include_deleted_rows && !self.with_row_id {
+            return Err(Error::InvalidInput {
+                source: "include_deleted_rows is set but with_row_id is false".into(),
+                location: location!(),
+            });
+        }
+
+        if let Some(first_blob_col) = self
+            .projection_plan
+            .physical_schema
+            .fields
+            .iter()
+            .find(|f| !f.is_default_storage())
+        {
+            return Err(Error::NotSupported {
+                source: format!(
+                    "Scanning blob columns such as \"{}\" is not yet supported",
+                    first_blob_col.name
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn create_filter_plan(&self, use_scalar_index: bool) -> Result<FilterPlan> {
+        let filter_schema = self.scan_input_schema()?;
+        let planner = Planner::new(Arc::new(filter_schema.as_ref().into()));
+
+        if let Some(filter) = self.filter.as_ref() {
+            let filter = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
+            let index_info = self.dataset.scalar_index_info().await?;
+            let filter_plan =
+                planner.create_filter_plan(filter.clone(), &index_info, use_scalar_index)?;
+
+            // This tests if any of the fragments are missing the physical_rows property (old style)
+            // If they are then we cannot use scalar indices
+            if filter_plan.index_query.is_some() {
+                let fragments = if let Some(fragments) = self.fragments.as_ref() {
+                    fragments
+                } else {
+                    self.dataset.fragments()
+                };
+                let mut has_missing_row_count = false;
+                for frag in fragments {
+                    if frag.physical_rows.is_none() {
+                        has_missing_row_count = true;
+                        break;
+                    }
+                }
+                if has_missing_row_count {
+                    // We need row counts to use scalar indices.  If we don't have them then
+                    // fallback to a non-indexed filter
+                    Ok(planner.create_filter_plan(filter.clone(), &index_info, false)?)
+                } else {
+                    Ok(filter_plan)
+                }
+            } else {
+                Ok(filter_plan)
+            }
+        } else {
+            Ok(FilterPlan::default())
+        }
+    }
+
+    async fn get_scan_range(&self, filter_plan: &FilterPlan) -> Result<Option<Range<u64>>> {
+        if filter_plan.has_any_filter() {
+            // If there is a filter we can't pushdown limit / offset
+            Ok(None)
+        } else {
+            match (self.limit, self.offset) {
+                (None, None) => Ok(None),
+                (Some(limit), None) => {
+                    let num_rows = self.dataset.count_all_rows().await? as i64;
+                    Ok(Some(0..limit.min(num_rows) as u64))
+                }
+                (None, Some(offset)) => {
+                    let num_rows = self.dataset.count_all_rows().await? as i64;
+                    Ok(Some(offset.min(num_rows) as u64..num_rows as u64))
+                }
+                (Some(limit), Some(offset)) => {
+                    let num_rows = self.dataset.count_all_rows().await? as i64;
+                    Ok(Some(
+                        offset.min(num_rows) as u64..(offset + limit).min(num_rows) as u64,
+                    ))
+                }
+            }
+        }
+    }
+
     /// Create [`ExecutionPlan`] for Scan.
     ///
     /// An ExecutionPlan is a graph of operators that can be executed.
@@ -1350,224 +1463,26 @@ impl Scanner {
     /// 5. Take remaining columns / Projection
     #[instrument(level = "debug", skip_all)]
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        if self.projection_plan.physical_schema.fields.is_empty()
-            && !self.with_row_id
-            && !self.with_row_address
-        {
-            return Err(Error::InvalidInput {
-                source:
-                    "no columns were selected and with_row_id is false, there is nothing to scan"
-                        .into(),
-                location: location!(),
-            });
-        }
-
-        if self.include_deleted_rows && !self.with_row_id {
-            return Err(Error::InvalidInput {
-                source: "include_deleted_rows is set but with_row_id is false".into(),
-                location: location!(),
-            });
-        }
-
-        if let Some(first_blob_col) = self
-            .projection_plan
-            .physical_schema
-            .fields
-            .iter()
-            .find(|f| !f.is_default_storage())
-        {
-            return Err(Error::NotSupported {
-                source: format!(
-                    "Scanning blob columns such as \"{}\" is not yet supported",
-                    first_blob_col.name
-                )
-                .into(),
-                location: location!(),
-            });
-        }
-
+        log::trace!("creating scanner plan");
+        self.validate_options()?;
         // Scalar indices are only used when prefiltering
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
+        let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
 
-        let filter_schema = self.scan_input_schema()?;
-        let planner = Planner::new(Arc::new(filter_schema.as_ref().into()));
-
-        let mut filter_plan = if let Some(filter) = self.filter.as_ref() {
-            let filter = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
-            let index_info = self.dataset.scalar_index_info().await?;
-            let filter_plan =
-                planner.create_filter_plan(filter.clone(), &index_info, use_scalar_index)?;
-
-            // This tests if any of the fragments are missing the physical_rows property (old style)
-            // If they are then we cannot use scalar indices
-            if filter_plan.index_query.is_some() {
-                let fragments = if let Some(fragments) = self.fragments.as_ref() {
-                    fragments
-                } else {
-                    self.dataset.fragments()
-                };
-                let mut has_missing_row_count = false;
-                for frag in fragments {
-                    if frag.physical_rows.is_none() {
-                        has_missing_row_count = true;
-                        break;
-                    }
-                }
-                if has_missing_row_count {
-                    // We need row counts to use scalar indices.  If we don't have them then
-                    // fallback to a non-indexed filter
-                    planner.create_filter_plan(filter.clone(), &index_info, false)?
-                } else {
-                    filter_plan
-                }
-            } else {
-                filter_plan
-            }
-        } else {
-            FilterPlan::default()
-        };
-
-        let scan_range = if filter_plan.has_any_filter() {
-            // If there is a filter we can't pushdown limit / offset
-            None
-        } else {
-            match (self.limit, self.offset) {
-                (None, None) => None,
-                (Some(limit), None) => {
-                    let num_rows = self.dataset.count_all_rows().await? as i64;
-                    Some(0..limit.min(num_rows) as u64)
-                }
-                (None, Some(offset)) => {
-                    let num_rows = self.dataset.count_all_rows().await? as i64;
-                    Some(offset.min(num_rows) as u64..num_rows as u64)
-                }
-                (Some(limit), Some(offset)) => {
-                    let num_rows = self.dataset.count_all_rows().await? as i64;
-                    Some(offset.min(num_rows) as u64..(offset + limit).min(num_rows) as u64)
-                }
-            }
-        };
         let mut use_limit_node = true;
-
         // Stage 1: source (either an (K|A)NN search, full text search or or a (full|indexed) scan)
         let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
-            (Some(_), None) => {
-                if self.include_deleted_rows {
-                    return Err(Error::InvalidInput {
-                        source: "Cannot include deleted rows in a nearest neighbor search".into(),
-                        location: location!(),
-                    });
-                }
-
-                // The source is an nearest neighbor search
-                if self.prefilter {
-                    // If we are prefiltering then the knn node will take care of the filter
-                    let source = self.knn(&filter_plan).await?;
-                    filter_plan = FilterPlan::default();
-                    source
-                } else {
-                    // If we are postfiltering then we can't use scalar indices for the filter
-                    // and will need to run the postfilter in memory
-                    filter_plan.make_refine_only();
-                    self.knn(&FilterPlan::default()).await?
-                }
-            }
-            (None, Some(query)) => {
-                if self.include_deleted_rows {
-                    return Err(Error::InvalidInput {
-                        source: "Cannot include deleted rows in an FTS search".into(),
-                        location: location!(),
-                    });
-                }
-
-                // The source is an FTS search
-                if self.prefilter {
-                    // If we are prefiltering then the fts node will take care of the filter
-                    let source = self.fts(&filter_plan, query).await?;
-                    filter_plan = FilterPlan::default();
-                    source
-                } else {
-                    // If we are postfiltering then we can't use scalar indices for the filter
-                    // and will need to run the postfilter in memory
-                    filter_plan.make_refine_only();
-                    self.fts(&FilterPlan::default(), query).await?
-                }
-            }
+            (Some(_), None) => self.vector_search_source(&mut filter_plan).await?,
+            (None, Some(query)) => self.fts_search_source(&mut filter_plan, query).await?,
             (None, None) => {
-                let fragments = if let Some(fragments) = self.fragments.as_ref() {
-                    fragments
-                } else {
-                    self.dataset.fragments()
-                };
-                // Avoid pushdown scan node if using v2 files
-                let use_stats = if fragments.iter().any(|f| !f.has_legacy_files()) {
-                    false
-                } else {
-                    self.use_stats
-                };
-
-                if filter_plan.index_query.is_some() && self.include_deleted_rows {
-                    return Err(Error::InvalidInput {
-                        source: "Cannot include deleted rows in a scalar indexed scan".into(),
-                        location: location!(),
-                    });
+                let planned_read = self.filtered_read_source(&mut filter_plan).await?;
+                if planned_read.limit_pushed_down {
+                    use_limit_node = false;
                 }
-
-                match (
-                    filter_plan.index_query.is_some(),
-                    filter_plan.refine_expr.is_some(),
-                ) {
-                    (true, false) => {
-                        let projection = self
-                            .dataset
-                            .empty_projection()
-                            .union_schema(&self.projection_plan.physical_schema);
-                        self.scalar_indexed_scan(projection, &filter_plan).await?
-                    }
-                    // TODO: support combined pushdown and scalar index scan
-                    (true, true) => {
-                        // If there is a filter then just load the eager columns and
-                        // "take" the other columns later.
-                        let eager_projection = self.calc_eager_projection(
-                            &filter_plan,
-                            self.projection_plan.physical_schema.as_ref(),
-                        )?;
-                        self.scalar_indexed_scan(eager_projection, &filter_plan)
-                            .await?
-                    }
-                    (false, true) if use_stats && self.batch_size.is_none() => {
-                        self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
-                    }
-                    (false, _) => {
-                        // The source is a full scan of the table
-                        let with_row_id = filter_plan.has_refine() || self.with_row_id;
-                        let eager_schema = if filter_plan.has_refine() {
-                            // If there is a filter then only load the filter columns in the
-                            // initial scan.  We will `take` the remaining columns later
-                            self.calc_eager_projection(
-                                &filter_plan,
-                                self.projection_plan.physical_schema.as_ref(),
-                            )?
-                            .into_schema_ref()
-                        } else {
-                            // If there is no filter we eagerly load everything
-                            self.projection_plan.physical_schema.clone()
-                        };
-                        if scan_range.is_some() && !self.dataset.is_legacy_storage() {
-                            // If this is a v2 dataset with no filter then we can pushdown
-                            // limit/offset (via scan_range and we zero out limit/offset
-                            // so we don't apply it twice)
-                            use_limit_node = false;
-                        }
-                        self.scan(
-                            with_row_id,
-                            self.with_row_address,
-                            self.include_deleted_rows,
-                            scan_range,
-                            eager_schema,
-                        )
-                    }
+                if planned_read.filter_pushed_down {
+                    filter_plan = FilterPlan::default();
                 }
+                planned_read.plan
             }
             _ => {
                 return Err(Error::InvalidInput {
@@ -1663,6 +1578,228 @@ impl Scanner {
         }
 
         Ok(plan)
+    }
+
+    // Helper function for filtered_read
+    //
+    // Do not call this directly, use filtered_read instead
+    async fn legacy_filtered_read(
+        &self,
+        filter_plan: &FilterPlan,
+        projection: Projection,
+        make_deletions_null: bool,
+        fragments: Option<Arc<Vec<Fragment>>>,
+        scan_range: Option<Range<u64>>,
+        is_prefilter: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let fragments = fragments.unwrap_or(self.dataset.fragments().clone());
+
+        if filter_plan.has_index_query() {
+            if self.include_deleted_rows {
+                return Err(Error::InvalidInput {
+                    source: "Cannot include deleted rows in a scalar indexed scan".into(),
+                    location: location!(),
+                });
+            }
+            self.scalar_indexed_scan(projection, filter_plan, fragments)
+                .await
+        } else if !is_prefilter
+            && filter_plan.has_refine()
+            && self.batch_size.is_none()
+            && self.use_stats
+        {
+            self.pushdown_scan(false, filter_plan.refine_expr.clone().take().unwrap())
+        } else {
+            let ordered = if self.ordering.is_some() || self.nearest.is_some() {
+                // If we are sorting the results there is no need to scan in order
+                false
+            } else {
+                self.ordered
+            };
+
+            Ok(self.scan_fragments(
+                projection.with_row_id,
+                self.with_row_address,
+                make_deletions_null,
+                projection.into_schema_ref(),
+                fragments,
+                scan_range,
+                ordered,
+            ))
+        }
+    }
+
+    // Helper function for filtered_read
+    //
+    // Do not call this directly, use filtered_read instead
+    async fn new_filtered_read(
+        &self,
+        filter_plan: &FilterPlan,
+        projection: Projection,
+        make_deletions_null: bool,
+        fragments: Option<Arc<Vec<Fragment>>>,
+        scan_range: Option<Range<u64>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
+            .with_filter_plan(filter_plan.clone())
+            .with_projection(projection);
+
+        if let Some(fragments) = fragments {
+            read_options = read_options.with_fragments(fragments);
+        }
+
+        if let Some(scan_range) = scan_range {
+            read_options = read_options.with_scan_range_before_filter(scan_range);
+        }
+
+        if let Some(batch_size) = self.batch_size {
+            read_options = read_options.with_batch_size(batch_size as u32);
+        }
+
+        if let Some(fragment_readahead) = self.fragment_readahead {
+            read_options = read_options.with_fragment_readahead(fragment_readahead as usize);
+        }
+
+        if make_deletions_null {
+            read_options = read_options.with_deleted_rows();
+        }
+
+        Ok(Arc::new(FilteredReadExec::try_new(
+            self.dataset.clone(),
+            read_options,
+        )?))
+    }
+
+    async fn filtered_read(
+        &self,
+        filter_plan: &FilterPlan,
+        projection: Projection,
+        make_deletions_null: bool,
+        fragments: Option<Arc<Vec<Fragment>>>,
+        scan_range: Option<Range<u64>>,
+        is_prefilter: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if self.dataset.is_legacy_storage() {
+            self.legacy_filtered_read(
+                &filter_plan,
+                projection,
+                make_deletions_null,
+                fragments,
+                scan_range,
+                is_prefilter,
+            )
+            .await
+        } else {
+            self.new_filtered_read(
+                &filter_plan,
+                projection,
+                make_deletions_null,
+                fragments,
+                scan_range,
+            )
+            .await
+        }
+    }
+
+    async fn filtered_read_source(
+        &self,
+        filter_plan: &mut FilterPlan,
+    ) -> Result<PlannedFilteredScan> {
+        log::trace!("source is a filtered read");
+        let mut projection = if filter_plan.has_two_steps() {
+            // If the filter plan has two steps (a scalar indexed portion and a refine portion) then
+            // it makes sense to grab cheap columns during the first step to avoid taking them for
+            // the second step.
+            self.calc_eager_projection(&filter_plan, self.projection_plan.physical_schema.as_ref())?
+                .with_row_id()
+        } else {
+            // If the filter plan only has one step then we just do a filtered read of all the
+            // columns that the user asked for.
+            self.dataset
+                .empty_projection()
+                .union_schema(&self.projection_plan.physical_schema)
+        };
+
+        projection.with_row_id |= self.with_row_id;
+        projection.with_row_addr = self.with_row_address;
+
+        let scan_range = if filter_plan.is_empty() {
+            log::trace!("pushing scan_range into filtered_read");
+            self.get_scan_range(&filter_plan).await?
+        } else {
+            None
+        };
+        let limit_pushed_down = scan_range.is_some();
+
+        let filter_pushed_down = !self.dataset.is_legacy_storage();
+        let plan = self
+            .filtered_read(
+                &filter_plan,
+                projection,
+                self.include_deleted_rows,
+                self.fragments.clone().map(Arc::new),
+                scan_range,
+                /*is_prefilter= */ false,
+            )
+            .await?;
+        Ok(PlannedFilteredScan {
+            plan,
+            limit_pushed_down,
+            filter_pushed_down,
+        })
+    }
+
+    async fn fts_search_source(
+        &self,
+        filter_plan: &mut FilterPlan,
+        query: &FullTextSearchQuery,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        log::trace!("source is an fts search");
+        if self.include_deleted_rows {
+            return Err(Error::InvalidInput {
+                source: "Cannot include deleted rows in an FTS search".into(),
+                location: location!(),
+            });
+        }
+
+        // The source is an FTS search
+        if self.prefilter {
+            // If we are prefiltering then the fts node will take care of the filter
+            let source = self.fts(&filter_plan, query).await?;
+            *filter_plan = FilterPlan::default();
+            Ok(source)
+        } else {
+            // If we are postfiltering then we can't use scalar indices for the filter
+            // and will need to run the postfilter in memory
+            filter_plan.make_refine_only();
+            self.fts(&FilterPlan::default(), query).await
+        }
+    }
+
+    async fn vector_search_source(
+        &self,
+        filter_plan: &mut FilterPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if self.include_deleted_rows {
+            return Err(Error::InvalidInput {
+                source: "Cannot include deleted rows in a nearest neighbor search".into(),
+                location: location!(),
+            });
+        }
+
+        if self.prefilter {
+            log::trace!("source is a vector search (prefilter)");
+            // If we are prefiltering then the ann / knn node will take care of the filter
+            let source = self.vector_search(&filter_plan).await?;
+            *filter_plan = FilterPlan::default();
+            Ok(source)
+        } else {
+            log::trace!("source is a vector search (postfilter)");
+            // If we are postfiltering then we can't use scalar indices for the filter
+            // and will need to run the postfilter in memory
+            filter_plan.make_refine_only();
+            self.vector_search(&FilterPlan::default()).await
+        }
     }
 
     async fn fragments_covered_by_fts_leaf(
@@ -2142,7 +2279,7 @@ impl Scanner {
     }
 
     // ANN/KNN search execution node with optional prefilter
-    async fn knn(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn vector_search(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {
             return Err(Error::invalid_input(
                 "No nearest query".to_string(),
@@ -2161,11 +2298,12 @@ impl Scanner {
             Arc::new(vec![])
         };
         if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
+            log::trace!("index found for vector search");
             // There is an index built for the column.
             // We will use the index.
             if matches!(q.refine_factor, Some(0)) {
                 return Err(Error::invalid_input(
-                    "Refine factor can not be zero".to_string(),
+                    "Refine factor cannot be zero".to_string(),
                     location!(),
                 ));
             }
@@ -2215,19 +2353,20 @@ impl Scanner {
             let vector_scan_projection = self
                 .dataset
                 .empty_projection()
+                .with_row_id()
                 .union_columns(&columns, OnMissing::Error)?;
-            let mut plan = if filter_plan.index_query.is_some() {
-                self.scalar_indexed_scan(vector_scan_projection, filter_plan)
-                    .await?
-            } else {
-                self.scan(
-                    true,
-                    false,
-                    true,
+
+            let mut plan = self
+                .filtered_read(
+                    &filter_plan,
+                    vector_scan_projection,
+                    /*include_deleted_rows=*/ true,
                     None,
-                    vector_scan_projection.into_schema_ref(),
+                    None,
+                    /*is_prefilter= */ true,
                 )
-            };
+                .await?;
+
             if let Some(refine_expr) = &filter_plan.refine_expr {
                 plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
             }
@@ -2356,55 +2495,19 @@ impl Scanner {
     async fn partition_frags_by_coverage(
         &self,
         index_expr: &ScalarIndexExpr,
+        fragments: Arc<Vec<Fragment>>,
     ) -> Result<(Vec<Fragment>, Vec<Fragment>)> {
-        // Figure out which fragments are covered by ALL of the indices we are using
-        let fragments = if let Some(fragment) = self.fragments.as_ref() {
-            fragment.clone()
-        } else {
-            (**self.dataset.fragments()).clone()
-        };
-
         let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
         let mut relevant_frags = Vec::with_capacity(fragments.len());
         let mut missing_frags = Vec::with_capacity(fragments.len());
-        for fragment in fragments {
+        for fragment in fragments.iter() {
             if covered_frags.contains(fragment.id as u32) {
-                relevant_frags.push(fragment);
+                relevant_frags.push(fragment.clone());
             } else {
-                missing_frags.push(fragment);
+                missing_frags.push(fragment.clone());
             }
         }
         Ok((relevant_frags, missing_frags))
-    }
-
-    async fn prefilter_scalar_indexed_query(
-        &self,
-        index_query: &ScalarIndexExpr,
-        filter_plan: &FilterPlan,
-        required_frags: RoaringBitmap,
-    ) -> Result<PreFilterSource> {
-        let (_, missing_frags) = self.partition_frags_by_coverage(index_query).await?;
-
-        // We want to use this as a pre-filter.  We don't need it to cover the _entire_ dataset.  It
-        // just needs to cover the same fragments as the vector index.  If it doesn't then we need to
-        // fall back to a scalar index scan.
-        if missing_frags
-            .iter()
-            .all(|frag| !required_frags.contains(frag.id as u32))
-        {
-            // The index covers the entire dataset, no need for materialization or scanning
-            return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(
-                ScalarIndexExec::new(self.dataset.clone(), index_query.clone()),
-            )));
-        }
-
-        // The index is missing one or more fragments.  We need to scan and filter those fragments
-        // This also means we will need to materialize the index because we need to union it with
-        // the other results, so just fall back to a scalar_indexed_scan
-        Ok(PreFilterSource::FilteredRowIds(
-            self.scalar_indexed_scan(self.dataset.empty_projection().with_row_id(), filter_plan)
-                .await?,
-        ))
     }
 
     // First perform a lookup in a scalar index for ids and then perform a take on the
@@ -2413,7 +2516,9 @@ impl Scanner {
         &self,
         projection: Projection,
         filter_plan: &FilterPlan,
+        fragments: Arc<Vec<Fragment>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        log::trace!("scalar indexed scan");
         // One or more scalar indices cover this data and there is a filter which is
         // compatible with the indices.  Use that filter to perform a take instead of
         // a full scan.
@@ -2425,7 +2530,9 @@ impl Scanner {
         let needs_recheck = index_expr.needs_recheck();
 
         // Figure out which fragments are covered by ALL indices
-        let (relevant_frags, missing_frags) = self.partition_frags_by_coverage(index_expr).await?;
+        let (relevant_frags, missing_frags) = self
+            .partition_frags_by_coverage(index_expr, fragments)
+            .await?;
 
         let mut plan: Arc<dyn ExecutionPlan> = Arc::new(MaterializeIndexExec::new(
             self.dataset.clone(),
@@ -2451,6 +2558,7 @@ impl Scanner {
                 let refine_cols = Planner::column_names_in_expr(refine_expr);
                 take_projection = take_projection.union_columns(refine_cols, OnMissing::Error)?;
             }
+            log::trace!("need to take additional columns for scalar_indexed_scan");
             plan = self.take(plan, take_projection)?;
         }
 
@@ -2467,6 +2575,8 @@ impl Scanner {
         if let Some(post_take_filter) = post_take_filter {
             let planner = Planner::new(plan.schema());
             let optimized_filter = planner.optimize_expr(post_take_filter)?;
+
+            log::trace!("applying post-take filter to indexed scan");
             plan = Arc::new(LanceFilterExec::try_new(optimized_filter, plan)?);
         }
 
@@ -2475,6 +2585,11 @@ impl Scanner {
         }
 
         let new_data_path: Option<Arc<dyn ExecutionPlan>> = if !missing_frags.is_empty() {
+            log::trace!(
+                "scalar_indexed_scan will need full scan of {} missing fragments",
+                missing_frags.len()
+            );
+
             // If there is new data then we need this:
             //
             // MaterializeIndexExec(old_frags) -> Take -> Union
@@ -2509,6 +2624,7 @@ impl Scanner {
             let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, new_data_scan)?);
             Some(Arc::new(project(filtered, plan.schema().as_ref())?))
         } else {
+            log::trace!("scalar_indexed_scan will not need full scan of any missing fragments");
             None
         };
 
@@ -2574,6 +2690,7 @@ impl Scanner {
         range: Option<Range<u64>>,
         ordered: bool,
     ) -> Arc<dyn ExecutionPlan> {
+        log::trace!("scan_fragments covered {} fragments", fragments.len());
         let config = LanceScanConfig {
             batch_size: self.get_batch_size(),
             batch_readahead: self.batch_readahead,
@@ -2599,6 +2716,7 @@ impl Scanner {
         make_deletions_null: bool,
         predicate: Expr,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        log::trace!("pushdown_scan");
         let config = ScanConfig {
             batch_readahead: self.batch_readahead,
             fragment_readahead: self
@@ -2814,59 +2932,65 @@ impl Scanner {
     }
 
     /// Create prefilter source from filter plan
+    ///
+    /// A prefilter is an input to a vector or fts search.  It tells us which rows are eligible
+    /// for the search.  A prefilter is calculated by doing a filtered read of the row id column.
     async fn prefilter_source(
         &self,
         filter_plan: &FilterPlan,
         required_frags: RoaringBitmap,
     ) -> Result<PreFilterSource> {
-        let prefilter_source = match (
-            &filter_plan.index_query,
-            &filter_plan.refine_expr,
-            self.prefilter,
-            filter_plan.skip_recheck,
-        ) {
-            (Some(_), Some(_), _, _) | (Some(_), None, true, false) => {
-                // Prefilter source is covered by an index but either that index needs a recheck or there
-                // is a refine expression that needs to be applied to the results so we need to do a full
-                // filtered scan
-                let filtered_row_ids = self
-                    .scalar_indexed_scan(self.dataset.empty_projection().with_row_id(), filter_plan)
-                    .await?;
-                PreFilterSource::FilteredRowIds(filtered_row_ids)
-            } // Should be index_scan -> filter
-            (Some(index_query), None, true, true) => {
-                if self.is_fragment_scan() {
-                    let filtered_row_ids = self
-                        .scalar_indexed_scan(
-                            self.dataset.empty_projection().with_row_id(),
-                            filter_plan,
-                        )
-                        .await?;
-                    PreFilterSource::FilteredRowIds(filtered_row_ids)
-                } else {
-                    // The filter is completely satisfied by the index.  If it also covers all fragments we might
-                    // be able to use a faster version that doesn't even require materialization
-                    self.prefilter_scalar_indexed_query(index_query, filter_plan, required_frags)
-                        .await?
-                }
-            }
-            (None, Some(refine_expr), true, _) => {
-                // No indices match the filter.  We need to do a full scan
-                // of the filter columns to determine the valid row ids.
+        if filter_plan.is_empty() {
+            log::trace!("no filter plan, no prefilter");
+            return Ok(PreFilterSource::None);
+        }
 
-                let columns_in_filter = Planner::column_names_in_expr(refine_expr);
-                let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-                let filter_input = self.scan(true, false, true, None, filter_schema);
-                let filtered_row_ids =
-                    Arc::new(LanceFilterExec::try_new(refine_expr.clone(), filter_input)?);
-                PreFilterSource::FilteredRowIds(filtered_row_ids)
-            }
-            // No prefilter
-            (None, None, true, _) => PreFilterSource::None,
-            (_, _, false, _) => PreFilterSource::None,
-        };
+        let fragments = Arc::new(
+            self.dataset
+                .manifest
+                .fragments
+                .iter()
+                .filter(|f| required_frags.contains(f.id as u32))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
 
-        Ok(prefilter_source)
+        if filter_plan.is_exact_index_search() {
+            let index_query = filter_plan.index_query.as_ref().expect_ok()?;
+            let (_, missing_frags) = self
+                .partition_frags_by_coverage(index_query, fragments.clone())
+                .await?;
+
+            if missing_frags.is_empty() {
+                log::trace!("prefilter entirely satisfied by exact index search");
+                // We can only avoid materializing the index for a prefilter if:
+                // 1. The search is indexed
+                // 2. The index search is an exact search with no recheck or refine
+                // 3. The indices cover at least the same fragments as the vector index
+                return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(
+                    ScalarIndexExec::new(self.dataset.clone(), index_query.clone()),
+                )));
+            } else {
+                log::trace!("exact index search did not cover all fragments");
+            }
+        }
+
+        // If one of our criteria is not met, we need to do a filtered read of just the row id column
+        log::trace!(
+            "prefilter is a filtered read of {} fragments",
+            fragments.len()
+        );
+        let filtered_row_ids = self
+            .filtered_read(
+                filter_plan,
+                self.dataset.empty_projection().with_row_id(),
+                false,
+                Some(fragments),
+                None,
+                /*is_prefilter= */ true,
+            )
+            .await?;
+        Ok(PreFilterSource::FilteredRowIds(filtered_row_ids))
     }
 
     /// Take row indices produced by input plan from the dataset (with projection)
@@ -5198,7 +5322,7 @@ mod test {
         assert_plan_node_equals(
             plan,
             "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
-  LanceScan: uri=..., projection=[], row_id=true, row_addr=false, ordered=true",
+  LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, indexed_filter=--, refine_filter=--",
         )
         .await
         .unwrap();
@@ -5211,8 +5335,7 @@ mod test {
             plan,
             "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
   ProjectionExec: expr=[_rowid@1 as _rowid]
-    FilterExec: s@0 = 
-      LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true",
+    LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, indexed_filter=--, refine_filter=s = Utf8(\"\")",
         )
         .await
         .unwrap();
