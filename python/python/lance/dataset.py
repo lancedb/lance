@@ -199,7 +199,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         least one attempt will be made, regardless of how long it takes to complete.
         Subsequent attempts will be cancelled once this timeout is reached. If
         the timeout has been reached during the first attempt, the operation
-        will be cancelled immediately.
+        will be cancelled immediately before making a second attempt.
 
         The default is 30 seconds.
         """
