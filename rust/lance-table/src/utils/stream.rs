@@ -225,9 +225,18 @@ pub fn apply_row_id_and_deletes(
 
     let row_ids = if config.with_row_id {
         if let Some(row_id_sequence) = &config.row_id_sequence {
-            let row_ids = row_id_sequence
+            let selection = config
+                .params
                 .slice(batch_offset as usize, num_rows as usize)
-                .iter()
+                .unwrap()
+                .to_ranges()
+                .unwrap();
+            let row_ids = row_id_sequence
+                .select(
+                    selection
+                        .iter()
+                        .flat_map(|r| r.start as usize..r.end as usize),
+                )
                 .collect::<UInt64Array>();
             Some(Arc::new(row_ids))
         } else {
