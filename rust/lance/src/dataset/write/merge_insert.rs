@@ -2320,26 +2320,28 @@ mod tests {
                     .unwrap();
                 barrier_ref.wait().await;
 
-                job.execute_reader(source)
+                let start = Instant::now();
+                let res = job
+                    .execute_reader(source)
                     .await
-                    .map(|(_ds, stats)| stats.num_attempts)
+                    .map(|(_ds, stats)| stats.num_attempts);
+                let elapsed = start.elapsed();
+                (res, elapsed)
             });
             handles.push(handle);
         }
 
-        let start = Instant::now();
-        let attempts = try_join_all(handles).await.unwrap();
-        let elapsed = start.elapsed();
+        let results = try_join_all(handles).await.unwrap();
 
-        let buffer = Duration::from_millis(100);
-        assert!(
-            elapsed < timeout + buffer,
-            "Elapsed time should be less than {} ms, was {} ms",
-            (timeout + buffer).as_millis(),
-            elapsed.as_millis()
-        );
+        for (attempts, elapsed) in results.iter() {
+            let buffer = Duration::from_millis(100);
+            assert!(
+                *elapsed < timeout + buffer,
+                "Elapsed time should be less than {} ms, was {} ms",
+                (timeout + buffer).as_millis(),
+                elapsed.as_millis()
+            );
 
-        for attempts in attempts.iter() {
             match attempts {
                 Ok(attempts) => {
                     assert!(*attempts <= 10, "Attempt count should be <= 10");
