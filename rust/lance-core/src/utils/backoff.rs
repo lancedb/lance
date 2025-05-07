@@ -77,27 +77,37 @@ impl Backoff {
     }
 }
 
-/// SlotBackoff is a backoff strategy that uses a slot-based approach.
+/// SlotBackoff is a backoff strategy that randomly chooses a time slot to retry.
 ///
-/// This is for when the cause of the failure is concurrency itself and that
-/// the attempts take about the same amount of time.
+/// This is useful when you have multiple tasks that can't overlap, and each
+/// task takes roughly the same amount of time.
 ///
-/// Say you have N attempts to do something. We don't know there are N ahead of
-/// time. We start guessing with 4 slots:
+/// The `unit` represents the time it takes to complete one attempt. Future attempts
+/// are divided into time slots, and a random slot is chosen for the retry. The number
+/// of slots increases exponentially with each attempt. Initially, there are 4 slots,
+/// then 8, then 16, and so on.
 ///
-/// | 1, 2, 3 | 4, 5, 6 | 7, 8, 9 | 10 |
+/// Example:
+/// Suppose you have 10 tasks that can't overlap, each taking 1 second. The tasks
+/// don't know about each other and can't coordinate. Each task randomly picks a
+/// time slot to retry. Here's how it might look:
 ///
-/// Each slot can have one success, so we can eliminate 3, 6, 9, and 10. In the
-/// next round, we will use twice as many slots (8):
+/// First round (4 slots):
+/// ```text
+/// task id   | 1, 2, 3 | 4, 5, 6 | 7, 8, 9 | 10 |
+/// status    | x, x, ✓ | x, x, ✓ | x, x, ✓ | ✓  |
+/// timeline  | 0s      | 1s      | 2s      | 3s |
+/// ```
+/// Each slot can have one success. Here, tasks 3, 6, 9, and 10 succeed.
+/// In the next round, the number of slots doubles (8):
 ///
-/// | 1 | 2 | 4 | 5 | 7 | 8 | ... |
-///
-/// Optimally, that should be 16 total attempts. For a 1s unit, the retry times
-/// are:
-/// * Round 1: 0 - 3s
-/// * Round 2: 0 - 7s
-/// * Round 3: 0 - 15s
-/// * ...
+/// Second round (8 slots):
+/// ```text
+/// task id   |  1 |  2 |    | 4, 5 |  7 |  8 |    |    |
+/// status    |  ✓ |  ✓ |    | x, ✓ |  ✓ |  ✓ |    |    |
+/// timeline  | 0s | 1s | 2s | 3s   | 4s | 5s | 6s | 7s |
+/// ```
+/// Most tasks are done now, except for task 4. It will succeed in the next round.
 pub struct SlotBackoff {
     base: u32,
     unit: u32,
