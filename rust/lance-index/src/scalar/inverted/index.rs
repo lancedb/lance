@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::fmt::Debug;
 use std::sync::Arc;
 use std::{
     cmp::{min, Reverse},
@@ -12,6 +11,7 @@ use std::{
     collections::{HashMap, HashSet},
     ops::Range,
 };
+use std::{fmt::Debug, sync::LazyLock};
 
 use arrow::{
     array::{AsArray, ListBuilder, StringBuilder, UInt32Builder},
@@ -33,13 +33,11 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{IntoStreamer, Streamer};
-use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::utils::{
     mask::RowIdMask,
-    tokio::spawn_cpu,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
 };
 use lance_core::{container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus};
@@ -55,7 +53,7 @@ use super::{
         doc_file_path, inverted_list_schema, posting_file_path, token_file_path, OrderedDoc,
         BLOCK_SIZE,
     },
-    encoding::{compress_posting_list, decompress_posting_block},
+    encoding::compress_posting_list,
     query::*,
     scorer::{idf, BM25Scorer, B, K1},
 };
@@ -103,12 +101,19 @@ lazy_static! {
         .unwrap_or(512 * 1024 * 1024);
 }
 
+static COMPRESSED_SEARCH_LENGTH_THRESHOLD: LazyLock<u32> = LazyLock::new(|| {
+    std::env::var("LANCE_COMPRESSED_SEARCH_LENGTH_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(BLOCK_SIZE as u32 * 16)
+});
+
 #[derive(Clone)]
 pub struct InvertedIndex {
     params: InvertedIndexParams,
     store: Arc<dyn IndexStore>,
     tokenizer: tantivy::tokenizer::TextAnalyzer,
-    pub(crate) partitions: Vec<InvertedPartition>,
+    pub(crate) partitions: Vec<Arc<InvertedPartition>>,
 }
 
 impl Debug for InvertedIndex {
@@ -145,12 +150,12 @@ impl InvertedIndex {
     #[instrument(level = "debug", skip_all)]
     pub async fn bm25_search(
         &self,
-        tokens: &[String],
-        params: &FtsSearchParams,
+        tokens: Arc<Vec<String>>,
+        params: Arc<FtsSearchParams>,
         operator: Operator,
         is_phrase_query: bool,
         prefilter: Arc<dyn PreFilter>,
-        metrics: &dyn MetricsCollector,
+        metrics: Arc<dyn MetricsCollector>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
         metrics.record_comparisons(tokens.len());
         let limit = params.limit.unwrap_or(usize::MAX);
@@ -163,18 +168,27 @@ impl InvertedIndex {
             .partitions
             .iter()
             .map(|part| {
-                part.bm25_search(
-                    tokens,
-                    params,
-                    operator,
-                    is_phrase_query,
-                    mask.clone(),
-                    metrics,
-                )
+                let part = part.clone();
+                let tokens = tokens.clone();
+                let params = params.clone();
+                let mask = mask.clone();
+                let metrics = metrics.clone();
+                tokio::spawn(async move {
+                    part.bm25_search(
+                        tokens.as_ref(),
+                        params.as_ref(),
+                        operator,
+                        is_phrase_query,
+                        mask,
+                        metrics.as_ref(),
+                    )
+                    .await
+                })
             })
             .collect::<Vec<_>>();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
-        while let Some((row_ids, scores)) = parts.try_next().await? {
+        while let Some(res) = parts.try_next().await? {
+            let (row_ids, scores) = res?;
             for (row_id, score) in row_ids.into_iter().zip(scores.into_iter()) {
                 if candidates.len() < limit {
                     candidates.push(Reverse(OrderedDoc::new(row_id, score)));
@@ -236,13 +250,13 @@ impl InvertedIndex {
             params: tokenizer_config,
             store: store.clone(),
             tokenizer,
-            partitions: vec![InvertedPartition {
+            partitions: vec![Arc::new(InvertedPartition {
                 id: 0,
                 store,
                 tokens,
                 inverted_list,
                 docs,
-            }],
+            })],
         }))
     }
 }
@@ -346,7 +360,7 @@ impl ScalarIndex for InvertedIndex {
 
                 let partitions = partitions.into_iter().map(|id| {
                     let store = store.clone();
-                    async move { InvertedPartition::load(store, id).await }
+                    async move { Result::Ok(Arc::new(InvertedPartition::load(store, id).await?)) }
                 });
                 let partitions = stream::iter(partitions)
                     .buffer_unordered(store.io_parallelism())
@@ -490,15 +504,22 @@ impl InvertedPartition {
             true => self.expand_fuzzy(tokens, params.fuzziness, params.max_expansions)?,
             false => tokens.to_vec(),
         };
-        let token_ids = self.map(&tokens);
+        let mut token_ids = self.map(&tokens);
         if token_ids.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
-        if is_phrase_query && token_ids.len() != tokens.len() {
-            return Ok((Vec::new(), Vec::new()));
+        if is_phrase_query {
+            if token_ids.len() != tokens.len() {
+                return Ok((Vec::new(), Vec::new()));
+            }
+        } else {
+            // remove duplicates
+            token_ids.sort_unstable();
+            token_ids.dedup();
         }
 
         let num_docs = self.docs.len();
+        let row_ids = &self.docs.row_ids;
         let postings = stream::iter(token_ids)
             .enumerate()
             .map(|(position, token_id)| async move {
@@ -506,29 +527,33 @@ impl InvertedPartition {
                     .inverted_list
                     .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
-                // let posting = match posting {
-                //     PostingList::Compressed(compressed) => {
-                //         let (doc_ids, freqs) =
-                //             decompress_posting_list(compressed.length, &compressed.blocks)?;
-                //         let row_ids = doc_ids
-                //             .into_iter()
-                //             .map(|doc_id| row_ids[doc_id as usize])
-                //             .collect();
-                //         let freqs = freqs.into_iter().map(|freq| freq as f32).collect();
-                //         let positions = compressed
-                //             .positions
-                //             .map(|positions| decompress_positions_list(&positions))
-                //             .transpose()?;
+                let posting = match posting {
+                    PostingList::Compressed(compressed) => {
+                        if compressed.length >= *COMPRESSED_SEARCH_LENGTH_THRESHOLD {
+                            PostingList::Compressed(compressed)
+                        } else {
+                            let (doc_ids, freqs) =
+                                decompress_posting_list(compressed.length, &compressed.blocks)?;
+                            let row_ids = doc_ids
+                                .into_iter()
+                                .map(|doc_id| row_ids[doc_id as usize])
+                                .collect();
+                            let freqs = freqs.into_iter().map(|freq| freq as f32).collect();
+                            let positions = compressed
+                                .positions
+                                .map(|positions| decompress_positions_list(&positions))
+                                .transpose()?;
 
-                //         PostingList::Plain(PlainPostingList::new(
-                //             row_ids,
-                //             freqs,
-                //             Some(compressed.max_score),
-                //             positions,
-                //         ))
-                //     }
-                //     _ => posting,
-                // };
+                            PostingList::Plain(PlainPostingList::new(
+                                row_ids,
+                                freqs,
+                                Some(compressed.max_score),
+                                positions,
+                            ))
+                        }
+                    }
+                    _ => posting,
+                };
 
                 Result::Ok(PostingIterator::new(
                     token_id,
@@ -557,6 +582,7 @@ impl InvertedPartition {
                 let freq = doc.frequency() as f32;
                 freq / (freq + doc_norm)
             },
+            metrics,
         )
     }
 
@@ -1422,8 +1448,7 @@ impl PostingListBuilder {
                 length,
             ))
         });
-        for (index, (doc_id, freq)) in self.doc_ids.iter().zip(self.frequencies.iter()).enumerate()
-        {
+        for index in 0..length {
             if let Some(position_builder) = position_builder.as_mut() {
                 let positions = self.positions.as_ref().unwrap().get(index);
                 let compressed = compress_positions(positions)?;
@@ -1526,7 +1551,7 @@ impl From<Vec<Vec<u32>>> for PositionBuilder {
     }
 }
 
-#[derive(Debug, Clone, DeepSizeOf)]
+#[derive(Debug, Clone, DeepSizeOf, Copy)]
 pub enum DocInfo {
     Located(LocatedDocInfo),
     Raw(RawDocInfo),
@@ -1568,7 +1593,7 @@ impl Ord for DocInfo {
     }
 }
 
-#[derive(Debug, Clone, Default, DeepSizeOf)]
+#[derive(Debug, Clone, Default, DeepSizeOf, Copy)]
 pub struct LocatedDocInfo {
     pub row_id: u64,
     pub frequency: f32,
@@ -1600,7 +1625,7 @@ impl Ord for LocatedDocInfo {
     }
 }
 
-#[derive(Debug, Clone, Default, DeepSizeOf)]
+#[derive(Debug, Clone, Default, DeepSizeOf, Copy)]
 pub struct RawDocInfo {
     pub doc_id: u32,
     pub frequency: u32,

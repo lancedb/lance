@@ -49,7 +49,11 @@ impl DisplayAs for MatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "MatchQuery: query={}", self.query.terms)
+                write!(
+                    f,
+                    "MatchQuery: query={}, limit={:?}",
+                    self.query.terms, self.params.limit
+                )
             }
         }
     }
@@ -217,12 +221,12 @@ impl ExecutionPlan for MatchQueryExec {
             pre_filter.wait_for_ready().await?;
             let (doc_ids, mut scores) = inverted_idx
                 .bm25_search(
-                    &tokens,
-                    &params,
+                    tokens.into(),
+                    params.into(),
                     query.operator,
                     false,
                     pre_filter,
-                    metrics.as_ref(),
+                    metrics,
                 )
                 .boxed()
                 .await?;
@@ -563,12 +567,12 @@ impl ExecutionPlan for PhraseQueryExec {
             pre_filter.wait_for_ready().await?;
             let (doc_ids, scores) = index
                 .bm25_search(
-                    &tokens,
-                    &params,
+                    tokens.into(),
+                    params.into(),
                     lance_index::scalar::inverted::query::Operator::And,
                     true,
                     pre_filter,
-                    metrics.as_ref(),
+                    metrics,
                 )
                 .boxed()
                 .await?;

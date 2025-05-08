@@ -91,12 +91,14 @@ fn bench_inverted(c: &mut Criterion) {
             black_box(
                 invert_index
                     .bm25_search(
-                        &[tokens[rand::random::<usize>() % tokens.len()].to_owned()],
-                        &params,
+                        [tokens[rand::random::<usize>() % tokens.len()].to_owned()]
+                            .to_vec()
+                            .into(),
+                        params.clone().into(),
                         Operator::Or,
                         false,
                         no_filter.clone(),
-                        &NoOpMetricsCollector,
+                        Arc::new(NoOpMetricsCollector),
                     )
                     .await
                     .unwrap(),

@@ -18,6 +18,11 @@ pub(crate) enum Compression {
     // bitpack for frequencies
     // and plain for the remainder
     Bitpack,
+
+    // | max score | delta-encode + bitpack for doc ids |
+    // bitpack for frequencies
+    // and plain for the remainder
+    BlockMaxBitpack,
 }
 
 // compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
