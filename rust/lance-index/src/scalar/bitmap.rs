@@ -255,6 +255,7 @@ impl ScalarIndex for BitmapIndex {
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
+        println!("Loading bitmap index from");
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         let serialized_lookup = page_lookup_file
             .read_range(0..page_lookup_file.num_rows(), None)
@@ -462,7 +463,9 @@ pub mod tests {
     async fn test_big_value() {
         // WARNING: This test allocates a huge state to force overflow.
         // You must run it only on a machine with enough resources (or skip it normally).
+        use super::{BitmapIndex, ScalarIndex, SearchResult, BITMAP_LOOKUP_NAME};
         use crate::scalar::lance_format::LanceIndexStore;
+        use crate::scalar::IndexStore;
         use arrow_schema::DataType;
         use datafusion_common::ScalarValue;
         use lance_core::cache::FileMetadataCache;
@@ -483,33 +486,123 @@ pub mod tests {
         let m: u32 = 2_500;
         let per_bitmap_size = 1000; // assumed bytes per bitmap
 
-        let mut state = HashMap::new();
-        for i in 0..m {
-            // Create a bitmap that contains, say, 1000 row IDs.
-            // (The actual serialized size will depend on the internal representation.)
-            let bitmap = RowIdTreeMap::from_iter(0..per_bitmap_size);
-            // Use i as the key.
-            let key = ScalarValue::UInt32(Some(i));
-            state.insert(key, bitmap);
-        }
+        ///let mut state = HashMap::new();
+        ///for i in 0..m {
+        ///    // Create a bitmap that contains, say, 1000 row IDs.
+        ///    // (The actual serialized size will depend on the internal representation.)
+        ///    let bitmap = RowIdTreeMap::from_iter(0..per_bitmap_size);
+        ///    // Use i as the key.
+        ///    let key = ScalarValue::UInt32(Some(i));
+        ///    state.insert(key, bitmap);
+        ///}
 
-        // Create a temporary store.
-        let tmpdir = Arc::new(tempdir().unwrap());
+        ///// Create a temporary store.
+        ///let tmpdir = Arc::new(tempdir().unwrap());
+        ///let test_store = LanceIndexStore::new(
+        ///    Arc::new(ObjectStore::local()),
+        ///    Path::from_filesystem_path(tmpdir.path()).unwrap(),
+        ///    FileMetadataCache::no_cache(),
+        ///);
+
+        ///// This call should trigger a "byte array offset overflow" error
+        ///// when BinaryBuilder in `get_bitmaps_from_iter` tries to append all these entries.
+        ///let result =
+        ///    crate::scalar::bitmap::write_bitmap_index(state, &test_store, &DataType::UInt32).await;
         let test_store = LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Path::from_filesystem_path("/Users/haochengliu/Documents/projects/lance/big_data")
+                .unwrap(),
             FileMetadataCache::no_cache(),
         );
 
-        // This call should trigger a "byte array offset overflow" error
-        // when BinaryBuilder in `get_bitmaps_from_iter` tries to append all these entries.
-        let result =
-            crate::scalar::bitmap::write_bitmap_index(state, &test_store, &DataType::UInt32).await;
+        // Verify the index file exists
+        let index_file = test_store.open_index_file(BITMAP_LOOKUP_NAME).await;
+        assert!(
+            index_file.is_ok(),
+            "Failed to open index file: {:?}",
+            index_file.err()
+        );
+        let index_file = index_file.unwrap();
 
-        if m < 2_500_000 {
-            return;
-        } else {
-            // TODO: read the data back and check the values???
+        // Print stats about the index file
+        println!(
+            "Index file contains {} rows in total",
+            index_file.num_rows()
+        );
+
+        // Load the index using BitmapIndex::load
+        println!("Loading index from disk...");
+        let loaded_index = BitmapIndex::load(Arc::new(test_store))
+            .await
+            .expect("Failed to load bitmap index");
+
+        // Verify the loaded index has the correct number of entries
+        assert_eq!(
+            loaded_index.index_map.len(),
+            m as usize,
+            "Loaded index has incorrect number of keys (expected {}, got {})",
+            m,
+            loaded_index.index_map.len()
+        );
+
+        // Manually verify specific keys without using search()
+        let test_keys = [0, m / 2, m - 1]; // Beginning, middle, and end
+        for &key_val in &test_keys {
+            let key = super::OrderableScalarValue(ScalarValue::UInt32(Some(key_val)));
+            let bitmap = loaded_index
+                .index_map
+                .get(&key)
+                .expect(&format!("Key {} should exist", key_val));
+
+            // Convert RowIdTreeMap to a vector for easier assertion
+            let row_ids: Vec<u64> = bitmap
+                .row_ids()
+                .unwrap()
+                .map(|addr| u64::from(addr))
+                .collect();
+
+            // Verify length
+            assert_eq!(
+                row_ids.len(),
+                per_bitmap_size as usize,
+                "Bitmap for key {} has wrong size",
+                key_val
+            );
+
+            // Verify first few and last few elements
+            for i in 0..5.min(per_bitmap_size) {
+                assert!(
+                    row_ids.contains(&i),
+                    "Bitmap for key {} should contain row_id {}",
+                    key_val,
+                    i
+                );
+            }
+
+            for i in (per_bitmap_size - 5).max(0)..per_bitmap_size {
+                assert!(
+                    row_ids.contains(&i),
+                    "Bitmap for key {} should contain row_id {}",
+                    key_val,
+                    i
+                );
+            }
+
+            // Verify exact range
+            let expected_range: Vec<u64> = (0..per_bitmap_size).collect();
+            assert_eq!(
+                row_ids, expected_range,
+                "Bitmap for key {} doesn't contain expected values",
+                key_val
+            );
+
+            println!(
+                "✓ Verified bitmap for key {}: {} rows as expected",
+                key_val,
+                row_ids.len()
+            );
         }
+
+        println!("Test successful! Index properly contains {} keys", m);
     }
 }
