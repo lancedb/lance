@@ -17,7 +17,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
-use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
+use lance_core::{error::LanceOptionExt, utils::mask::RowIdTreeMap, Error, Result};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::location;
@@ -30,7 +30,7 @@ use super::{btree::TrainingSource, AnyQuery, IndexStore, ScalarIndex};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
-const MAX_ARROW_ARRAY_LEN: usize = i32::MAX as usize - 1024 * 1024; // leave headroom
+const MAX_BITMAP_ARRAY_LENGTH: usize = i32::MAX as usize - 1024 * 1024; // leave headroom
 
 /// A scalar index that stores a bitmap for each possible value
 ///
@@ -63,55 +63,6 @@ impl BitmapIndex {
             index_map_size_bytes,
             store,
         }
-    }
-
-    // creates a new BitmapIndex from a serialized RecordBatch
-    fn try_from_serialized(data: RecordBatch, store: Arc<dyn IndexStore>) -> Result<Self> {
-        if data.num_rows() == 0 {
-            let data_type = data.schema().field(0).data_type().clone();
-            return Ok(Self::new(
-                BTreeMap::new(),
-                RowIdTreeMap::default(),
-                data_type,
-                0,
-                store,
-            ));
-        }
-
-        let dict_keys = data.column(0);
-        let value_type = dict_keys.data_type().clone();
-        let binary_bitmaps = data.column(1);
-        let bitmap_binary_array = binary_bitmaps
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap();
-
-        let mut index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap> = BTreeMap::new();
-
-        let mut index_map_size_bytes = 0;
-        let mut null_map = RowIdTreeMap::default();
-        for idx in 0..data.num_rows() {
-            let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
-            let bitmap_bytes = bitmap_binary_array.value(idx);
-            let bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
-
-            index_map_size_bytes += key.deep_size_of();
-            // This should be a reasonable approximation of the RowIdTreeMap size
-            index_map_size_bytes += bitmap_bytes.len();
-            if key.0.is_null() {
-                null_map = bitmap;
-            } else {
-                index_map.insert(key, bitmap);
-            }
-        }
-
-        Ok(Self::new(
-            index_map,
-            null_map,
-            value_type,
-            index_map_size_bytes,
-            store,
-        ))
     }
 }
 
@@ -255,16 +206,25 @@ impl ScalarIndex for BitmapIndex {
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
-        println!("Loading bitmap index from");
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
-        // let serialized_lookup = page_lookup_file
-        //     .read_range(0..page_lookup_file.num_rows(), None)
-        //     .await?;
-
-        // For very large indices, read in chunks
-        const MAX_ROWS_PER_CHUNK: usize = 1_000_000;
         let total_rows = page_lookup_file.num_rows();
-        println!("Total rows: {}", total_rows);
+
+        if total_rows == 0 {
+            let serialized_lookup = page_lookup_file
+                .read_range(0..page_lookup_file.num_rows(), None)
+                .await?;
+            let data_type = serialized_lookup.schema().field(0).data_type().clone();
+            return Ok(Arc::new(Self::new(
+                BTreeMap::new(),
+                RowIdTreeMap::default(),
+                data_type,
+                0,
+                store,
+            )));
+        }
+
+        // Read in chunks to avoid overflow one binary array
+        const MAX_ROWS_PER_CHUNK: usize = 1_000_000;
 
         let mut index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap> = BTreeMap::new();
         let mut null_map = RowIdTreeMap::default();
@@ -272,7 +232,7 @@ impl ScalarIndex for BitmapIndex {
         let mut index_map_size_bytes = 0;
 
         // Read and process in chunks to avoid offset overflow
-        for start_row in (0..total_rows).step_by(MAX_ROWS_PER_CHUNK as usize) {
+        for start_row in (0..total_rows).step_by(MAX_ROWS_PER_CHUNK) {
             let end_row = (start_row + MAX_ROWS_PER_CHUNK).min(total_rows);
             let chunk = page_lookup_file
                 .read_range(start_row..end_row, None)
@@ -309,14 +269,7 @@ impl ScalarIndex for BitmapIndex {
             }
         }
 
-        // Handle empty index case
-        let final_value_type = value_type.unwrap_or_else(|| {
-            // CULPRIT HERE????
-            // Default to some type if completely empty
-            DataType::Utf8
-            // for empty_dataset test
-            //serialized_lookup.schema().field(0).data_type().clone()
-        });
+        let final_value_type = value_type.expect_ok()?;
 
         Ok(Arc::new(Self::new(
             index_map,
@@ -401,7 +354,9 @@ fn chunked_keys_and_bitmaps(
         let bitmap_len = bytes.len();
 
         // If adding this bitmap would overflow, flush current batch
-        if cur_keys.len() >= MAX_ARROW_ARRAY_LEN || cur_bytes + bitmap_len > MAX_ARROW_ARRAY_LEN {
+        if cur_keys.len() >= MAX_BITMAP_ARRAY_LENGTH
+            || cur_bytes + bitmap_len > MAX_BITMAP_ARRAY_LENGTH
+        {
             let keys_array = if cur_keys.is_empty() {
                 new_empty_array(value_type)
             } else {
@@ -460,7 +415,6 @@ async fn write_bitmap_index(
         ]))
     };
 
-    // Open file once
     let mut bitmap_index_file = index_store
         .new_index_file(BITMAP_LOOKUP_NAME, schema)
         .await?;
@@ -468,7 +422,6 @@ async fn write_bitmap_index(
     // Write all batches to the same file
     for (keys_array, binary_bitmap_array) in batches.into_iter() {
         let record_batch = get_batch_from_arrays(keys_array, binary_bitmap_array)?;
-
         bitmap_index_file.write_record_batch(record_batch).await?;
     }
 
@@ -520,10 +473,11 @@ pub async fn train_bitmap_index(
 #[cfg(test)]
 pub mod tests {
     #[tokio::test]
-    async fn test_big_value() {
-        // WARNING: This test allocates a huge state to force overflow.
+    #[ignore]
+    async fn test_big_bitmap_index() {
+        // WARNING: This test allocates a huge state to force overflow over int32 on BinaryArray
         // You must run it only on a machine with enough resources (or skip it normally).
-        use super::{BitmapIndex, ScalarIndex, SearchResult, BITMAP_LOOKUP_NAME};
+        use super::{BitmapIndex, ScalarIndex, BITMAP_LOOKUP_NAME};
         use crate::scalar::lance_format::LanceIndexStore;
         use crate::scalar::IndexStore;
         use arrow_schema::DataType;
@@ -540,38 +494,36 @@ pub mod tests {
         //     m * (serialized size per bitmap) > 2^31 bytes.
         //
         // For example, if we assume each bitmap serializes to ~1000 bytes,
-        // you need m > 2.1e6. (Here we use a much lower value for illustration,
-        // but in practice you’d need to upscale these numbers.)
+        // you need m > 2.1e6.
         let m: u32 = 2_500_000;
         let per_bitmap_size = 1000; // assumed bytes per bitmap
 
-        ///let mut state = HashMap::new();
-        ///for i in 0..m {
-        ///    // Create a bitmap that contains, say, 1000 row IDs.
-        ///    // (The actual serialized size will depend on the internal representation.)
-        ///    let bitmap = RowIdTreeMap::from_iter(0..per_bitmap_size);
-        ///    // Use i as the key.
-        ///    let key = ScalarValue::UInt32(Some(i));
-        ///    state.insert(key, bitmap);
-        ///}
+        let mut state = HashMap::new();
+        for i in 0..m {
+            // Create a bitmap that contains, say, 1000 row IDs.
+            let bitmap = RowIdTreeMap::from_iter(0..per_bitmap_size);
 
-        ///// Create a temporary store.
-        ///let tmpdir = Arc::new(tempdir().unwrap());
-        ///let test_store = LanceIndexStore::new(
-        ///    Arc::new(ObjectStore::local()),
-        ///    Path::from_filesystem_path(tmpdir.path()).unwrap(),
-        ///    FileMetadataCache::no_cache(),
-        ///);
+            let key = ScalarValue::UInt32(Some(i));
+            state.insert(key, bitmap);
+        }
 
-        ///// This call should trigger a "byte array offset overflow" error
-        ///// when BinaryBuilder in `get_bitmaps_from_iter` tries to append all these entries.
-        ///let result =
-        ///    crate::scalar::bitmap::write_bitmap_index(state, &test_store, &DataType::UInt32).await;
+        // Create a temporary store.
+        let tmpdir = Arc::new(tempdir().unwrap());
         let test_store = LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path("/Users/haochengliu/Documents/projects/lance/big_data")
-                .unwrap(),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
             FileMetadataCache::no_cache(),
+        );
+
+        // This call should never trigger a "byte array offset overflow" error since now the code supports
+        // read by chunks
+        let result =
+            crate::scalar::bitmap::write_bitmap_index(state, &test_store, &DataType::UInt32).await;
+
+        assert!(
+            result.is_ok(),
+            "Failed to write bitmap index: {:?}",
+            result.err()
         );
 
         // Verify the index file exists
@@ -584,13 +536,13 @@ pub mod tests {
         let index_file = index_file.unwrap();
 
         // Print stats about the index file
-        println!(
+        tracing::info!(
             "Index file contains {} rows in total",
             index_file.num_rows()
         );
 
         // Load the index using BitmapIndex::load
-        println!("Loading index from disk...");
+        tracing::info!("Loading index from disk...");
         let loaded_index = BitmapIndex::load(Arc::new(test_store))
             .await
             .expect("Failed to load bitmap index");
@@ -611,14 +563,10 @@ pub mod tests {
             let bitmap = loaded_index
                 .index_map
                 .get(&key)
-                .expect(&format!("Key {} should exist", key_val));
+                .unwrap_or_else(|| panic!("Key {} should exist", key_val));
 
             // Convert RowIdTreeMap to a vector for easier assertion
-            let row_ids: Vec<u64> = bitmap
-                .row_ids()
-                .unwrap()
-                .map(|addr| u64::from(addr))
-                .collect();
+            let row_ids: Vec<u64> = bitmap.row_ids().unwrap().map(u64::from).collect();
 
             // Verify length
             assert_eq!(
@@ -638,7 +586,7 @@ pub mod tests {
                 );
             }
 
-            for i in (per_bitmap_size - 5).max(0)..per_bitmap_size {
+            for i in (per_bitmap_size - 5)..per_bitmap_size {
                 assert!(
                     row_ids.contains(&i),
                     "Bitmap for key {} should contain row_id {}",
@@ -655,13 +603,13 @@ pub mod tests {
                 key_val
             );
 
-            println!(
+            tracing::info!(
                 "✓ Verified bitmap for key {}: {} rows as expected",
                 key_val,
                 row_ids.len()
             );
         }
 
-        println!("Test successful! Index properly contains {} keys", m);
+        tracing::info!("Test successful! Index properly contains {} keys", m);
     }
 }
