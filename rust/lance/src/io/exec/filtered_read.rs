@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::any::Any;
 use std::iter::Peekable;
 use std::sync::atomic::{AtomicUsize, Ordering};

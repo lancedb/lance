@@ -2740,11 +2740,15 @@ mod tests {
                     .buffered(1)
                     .try_collect::<Vec<_>>()
             };
-            // Since the first batch is all deleted, it will return an empty batch.
+
+            // Since the first batch is all deleted, it will return all nulls row ids.
             let batches = to_batches(0..10).await.unwrap();
             assert_eq!(batches.len(), 1);
             let batch = batches.into_iter().next().unwrap();
-            assert_eq!(batch.num_rows(), 0);
+            assert_eq!(
+                batch.column_by_name(ROW_ID).unwrap().as_ref(),
+                &UInt64Array::from_iter(std::iter::repeat_n(None, 10))
+            );
 
             let batches = to_batches(10..20).await.unwrap();
             assert_eq!(batches.len(), 1);
