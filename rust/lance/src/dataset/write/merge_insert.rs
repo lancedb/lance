@@ -1109,6 +1109,7 @@ impl MergeInsertJob {
                     let sleep_fut =
                         maybe_timeout(&backoff, start, self.params.retry_timeout, sleep_fut);
                     sleep_fut.await?;
+
                     let mut ds = dataset_ref.as_ref().clone();
                     ds.checkout_latest().await?;
 
