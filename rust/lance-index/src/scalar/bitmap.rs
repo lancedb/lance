@@ -257,14 +257,74 @@ impl ScalarIndex for BitmapIndex {
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
         println!("Loading bitmap index from");
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
-        let serialized_lookup = page_lookup_file
-            .read_range(0..page_lookup_file.num_rows(), None)
-            .await?;
+        // let serialized_lookup = page_lookup_file
+        //     .read_range(0..page_lookup_file.num_rows(), None)
+        //     .await?;
 
-        Ok(Arc::new(Self::try_from_serialized(
-            serialized_lookup,
+        // For very large indices, read in chunks
+        const MAX_ROWS_PER_CHUNK: usize = 1_000_000;
+        let total_rows = page_lookup_file.num_rows();
+        println!("Total rows: {}", total_rows);
+
+        let mut index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap> = BTreeMap::new();
+        let mut null_map = RowIdTreeMap::default();
+        let mut value_type: Option<DataType> = None;
+        let mut index_map_size_bytes = 0;
+
+        // Read and process in chunks to avoid offset overflow
+        for start_row in (0..total_rows).step_by(MAX_ROWS_PER_CHUNK as usize) {
+            let end_row = (start_row + MAX_ROWS_PER_CHUNK).min(total_rows);
+            let chunk = page_lookup_file
+                .read_range(start_row..end_row, None)
+                .await?;
+
+            if chunk.num_rows() == 0 {
+                continue;
+            }
+
+            // Set value_type from first chunk if not already set
+            if value_type.is_none() {
+                value_type = Some(chunk.schema().field(0).data_type().clone());
+            }
+
+            let dict_keys = chunk.column(0);
+            let binary_bitmaps = chunk.column(1);
+            let bitmap_binary_array = binary_bitmaps
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+
+            for idx in 0..chunk.num_rows() {
+                let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
+                let bitmap_bytes = bitmap_binary_array.value(idx);
+                let bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
+
+                index_map_size_bytes += key.deep_size_of();
+                index_map_size_bytes += bitmap_bytes.len();
+                if key.0.is_null() {
+                    null_map = bitmap;
+                } else {
+                    index_map.insert(key, bitmap);
+                }
+            }
+        }
+
+        // Handle empty index case
+        let final_value_type = value_type.unwrap_or_else(|| {
+            // CULPRIT HERE????
+            // Default to some type if completely empty
+            DataType::Utf8
+            // for empty_dataset test
+            //serialized_lookup.schema().field(0).data_type().clone()
+        });
+
+        Ok(Arc::new(Self::new(
+            index_map,
+            null_map,
+            final_value_type,
+            index_map_size_bytes,
             store,
-        )?))
+        )))
     }
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
@@ -483,7 +543,6 @@ pub mod tests {
         // you need m > 2.1e6. (Here we use a much lower value for illustration,
         // but in practice you’d need to upscale these numbers.)
         let m: u32 = 2_500_000;
-        let m: u32 = 2_500;
         let per_bitmap_size = 1000; // assumed bytes per bitmap
 
         ///let mut state = HashMap::new();
