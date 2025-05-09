@@ -29,6 +29,7 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.ByteArrayInputStream;
@@ -303,6 +304,38 @@ public class Dataset implements Closeable {
 
   private native void nativeAddColumnsByReader(
       long arrowStreamMemoryAddress, Optional<Long> batchSize);
+
+  /**
+   * Add columns to the dataset.
+   *
+   * @param schema The Arrow schema definitions to add columns.
+   * @param batchSize The number of rows to read at a time from the source dataset when applying the
+   *     transform.
+   */
+  public void addColumns(Schema schema, Optional<Long> batchSize) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(schema != null, "Schema is empty");
+      try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportSchema(allocator, schema, null, arrowSchema);
+        nativeAddColumnsBySchema(arrowSchema.memoryAddress(), batchSize);
+      }
+    }
+  }
+
+  /**
+   * Add columns to the dataset.
+   *
+   * @param fields The Arrow field definitions to add columns.
+   * @param batchSize The number of rows to read at a time from the source dataset when applying the
+   *     transform.
+   */
+  public void addColumns(List<Field> fields, Optional<Long> batchSize) {
+    Preconditions.checkArgument(fields != null && !fields.isEmpty(), "Fields is empty");
+    addColumns(new Schema(fields), batchSize);
+  }
+
+  private native void nativeAddColumnsBySchema(long schemaPtr, Optional<Long> batchSize);
 
   /**
    * Drop columns from the dataset.
