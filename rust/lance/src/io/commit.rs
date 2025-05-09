@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
+use conflict_resolver::ConflictResolver;
 use lance_core::utils::backoff::Backoff;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_file::version::LanceFileVersion;
@@ -56,6 +57,7 @@ use crate::index::DatasetIndexInternalExt;
 use crate::session::Session;
 use crate::Dataset;
 
+mod conflict_resolver;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod dynamodb;
 #[cfg(test)]
@@ -85,31 +87,33 @@ fn transaction_file_cache_path(base_path: &Path, version: u64) -> Path {
 async fn read_dataset_transaction_file(
     dataset: &Dataset,
     version: u64,
-) -> Result<Arc<Transaction>> {
+) -> Result<(Arc<Transaction>, Arc<Manifest>)> {
     let cache_path = transaction_file_cache_path(&dataset.base, version);
-    dataset
+
+    let dataset_version = dataset.checkout_version(version).await?;
+    let object_store = dataset_version.object_store();
+    let manifest = dataset_version.manifest.clone();
+    let txn_file = manifest.transaction_file.as_ref();
+
+    let txn = dataset
         .session
         .file_metadata_cache
         .get_or_insert(&cache_path, |_| async move {
-            let dataset_version = dataset.checkout_version(version).await?;
-            let object_store = dataset_version.object_store();
-            let path = dataset_version
-                .manifest
-                .transaction_file
-                .as_ref()
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
-                        "Dataset version {} does not have a transaction file",
-                        version
-                    ),
-                    location: location!(),
-                })?;
+            let path = txn_file.as_ref().ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Dataset version {} does not have a transaction file",
+                    version
+                ),
+                location: location!(),
+            })?;
             let transaction = read_transaction_file(object_store, &dataset.base, path)
                 .await
                 .unwrap();
             Ok(transaction)
         })
-        .await
+        .await?;
+
+    Ok((txn, manifest))
 }
 
 /// Write a transaction to a file and return the relative path.
@@ -126,58 +130,6 @@ async fn write_transaction_file(
     object_store.inner.put(&path, buf.into()).await?;
 
     Ok(file_name)
-}
-
-// Return true
-fn check_transaction(
-    transaction: &Transaction,
-    other_version: u64,
-    other_transaction: Option<&Transaction>,
-    affected_rows: Option<&RowIdTreeMap>,
-) -> Result<bool> {
-    let Some(other_transaction) = other_transaction else {
-        return Err(crate::Error::Internal {
-            message: format!(
-                "There was a conflicting transaction at version {}, \
-                and it was missing transaction metadata.",
-                other_version
-            ),
-            location: location!(),
-        });
-    };
-
-    todo!("Use affected_rows to see if we can merge the deletion files.");
-
-    // TODO: What do we do when the other transaction was an upsert that rewrote
-    // fragments rather than just touched the deletion file? This would generally
-    // be easier to handle if the transaction was simply a diff.
-    // Maybe what we can do, is:
-    // (1) We grab the fragments as they are at read_version
-    // (2) We keep around the data files that were (a) present at read_version
-    //     and (b) are in fragments this transaction is touching.
-    // (3) We can use those sets of data files to check if the other transaction
-    //     modified the data files we are touching, and not just the deletion files.
-
-    match transaction.conflicts_with(other_transaction) {
-        ConflictResult::Compatible => Ok(()),
-        ConflictResult::NotCompatible => {
-            Err(crate::Error::CommitConflict {
-                version: other_version,
-                source: format!(
-                    "This {} transaction is incompatible with concurrent transaction {} at version {}.",
-                    transaction.operation, other_transaction.operation, other_version).into(),
-                location: location!(),
-            })
-        },
-        ConflictResult::Retryable => {
-            Err(crate::Error::RetryableCommitConflict {
-                version: other_version,
-                source: format!(
-                    "This {} transaction was preempted by concurrent transaction {} at version {}. Please retry.",
-                    transaction.operation, other_transaction.operation, other_version).into(),
-                location: location!() })
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -801,6 +753,9 @@ pub(crate) async fn commit_transaction(
         // recent manifest.
         dataset.checkout_latest().await?;
     }
+
+    let resolver = ConflictResolver::try_new(&dataset, transaction).await?;
+
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
     let mut backoff = Backoff::default();
     while backoff.attempt() < num_attempts {
@@ -808,7 +763,7 @@ pub(crate) async fn commit_transaction(
         // transactions that have been committed since the read_version.
         // Use small amount of backoff to handle transactions that all
         // started at exact same time better.
-        let check_deletion_files = futures::stream::iter(target_version..=dataset.manifest.version)
+        let concurrent_txns = futures::stream::iter(target_version..=dataset.manifest.version)
             .map(|version| {
                 read_dataset_transaction_file(&dataset, version)
                     .map(move |res| res.map(|tx| (version, tx)))
@@ -823,21 +778,13 @@ pub(crate) async fn commit_transaction(
                                 | Err(crate::Error::DatasetNotFound { .. })
                         ),
                 )
-            })
-            .map_ok(|(other_version, other_transaction)| {
-                let res =
-                    check_transaction(transaction, other_version, Some(other_transaction.as_ref()));
-                futures::future::ready(res)
-            })
-            .try_fold(false, |acc, res| async move {
-                if let Ok(res) = res {
-                    if res {
-                        return Ok(true);
-                    }
-                }
-                Ok(acc)
-            })
-            .await?;
+            });
+
+        while let Some((other_manifest, other_transaction)) = concurrent_txns.try_next().await? {
+            resolver.check_txn(transaction, Some(&other_transaction), &other_manifest)?;
+        }
+
+        transaction = resolver.update_files().await?;
 
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
