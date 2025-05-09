@@ -188,6 +188,22 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn conflict_retries(
+        mut slf: PyRefMut<'_, Self>,
+        max_retries: u32,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.conflict_retries(max_retries);
+        Ok(slf)
+    }
+
+    pub fn retry_timeout(
+        mut slf: PyRefMut<'_, Self>,
+        timeout: std::time::Duration,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.retry_timeout(timeout);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<PyObject> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;

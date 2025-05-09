@@ -10,6 +10,7 @@ use lance_table::{
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 use snafu::location;
+use tracing::instrument;
 
 use crate::{
     dataset::{
@@ -148,6 +149,7 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    #[instrument(name = "CommitBuilder::execute", level = "debug", skip_all)]
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let session = self
             .session
@@ -221,7 +223,7 @@ impl<'a> CommitBuilder<'a> {
         }
 
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
-            ds.manifest_naming_scheme
+            ds.manifest_location.naming_scheme
         } else if self.enable_v2_manifest_paths {
             ManifestNamingScheme::V2
         } else {
@@ -259,7 +261,7 @@ impl<'a> CommitBuilder<'a> {
             ..Default::default()
         };
 
-        let (manifest, manifest_file, manifest_e_tag) = if let Some(dataset) = dest.dataset() {
+        let (manifest, manifest_location) = if let Some(dataset) = dest.dataset() {
             if self.detached {
                 if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
                     return Err(Error::NotSupported {
@@ -316,9 +318,8 @@ impl<'a> CommitBuilder<'a> {
         match &self.dest {
             WriteDestination::Dataset(dataset) => Ok(Dataset {
                 manifest: Arc::new(manifest),
-                manifest_file,
+                manifest_location,
                 session,
-                manifest_e_tag,
                 ..dataset.as_ref().clone()
             }),
             WriteDestination::Uri(uri) => Ok(Dataset {
@@ -326,12 +327,10 @@ impl<'a> CommitBuilder<'a> {
                 base: base_path,
                 uri: uri.to_string(),
                 manifest: Arc::new(manifest),
-                manifest_file,
+                manifest_location,
                 session,
                 commit_handler,
                 tags,
-                manifest_naming_scheme,
-                manifest_e_tag,
             }),
         }
     }

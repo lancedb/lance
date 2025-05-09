@@ -29,6 +29,10 @@ use crate::dataset::transaction::Operation;
 use crate::dataset::WriteParams;
 use crate::Dataset;
 
+mod throttle_store;
+
+pub use throttle_store::ThrottledStoreWrapper;
+
 /// A dataset generator that can generate random layouts. This is used to test
 /// dataset operations are robust to different layouts.
 ///
@@ -293,8 +297,14 @@ impl Display for IoTrackingStore {
     }
 }
 
-#[derive(Debug)]
-struct StatsHolder(Arc<Mutex<IoStats>>);
+#[derive(Debug, Default, Clone)]
+pub struct StatsHolder(Arc<Mutex<IoStats>>);
+
+impl StatsHolder {
+    pub fn incremental_stats(&self) -> IoStats {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
 
 impl WrappingObjectStore for StatsHolder {
     fn wrap(&self, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {

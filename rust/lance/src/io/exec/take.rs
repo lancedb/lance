@@ -29,8 +29,10 @@ use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use tracing::instrument;
 
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
 use crate::dataset::rowids::get_row_id_index;
@@ -256,6 +258,7 @@ impl TakeStream {
     fn apply<S: Stream<Item = Result<RecordBatch>> + Send + 'static>(
         self: Arc<Self>,
         input: S,
+        span: tracing::Span,
     ) -> impl Stream<Item = Result<RecordBatch>> {
         let scan_scheduler = self.scan_scheduler.clone();
         let metrics = self.metrics.clone();
@@ -274,6 +277,11 @@ impl TakeStream {
             .try_buffered(get_num_compute_intensive_cpus())
             .finally(move || {
                 metrics.io_metrics.record_final(scan_scheduler.as_ref());
+
+                let scan_stats = scan_scheduler.stats();
+                span.record("iops", scan_stats.iops);
+                span.record("requests", scan_stats.requests);
+                span.record("bytes_read", scan_stats.bytes_read);
             })
     }
 }
@@ -492,6 +500,11 @@ impl ExecutionPlan for TakeExec {
         }
     }
 
+    #[instrument(level = "debug", skip(self, context), fields(
+        iops = tracing::field::Empty,
+        requests = tracing::field::Empty,
+        bytes_read = tracing::field::Empty,
+    ))]
     fn execute(
         &self,
         partition: usize,
@@ -502,6 +515,8 @@ impl ExecutionPlan for TakeExec {
         let schema_to_take = self.schema_to_take.clone();
         let output_schema = self.output_schema.clone();
         let metrics = self.metrics.clone();
+
+        let span = tracing::Span::current();
 
         // ScanScheduler::new launches the I/O scheduler in the background.
         // We aren't allowed to do work in `execute` and so we defer creation of the
@@ -519,12 +534,12 @@ impl ExecutionPlan for TakeExec {
                 &metrics,
                 partition,
             ));
-            take_stream.apply(input_stream)
+            take_stream.apply(input_stream, span)
         });
         let output_schema = self.output_schema.clone();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
-            lazy_take_stream.flatten(),
+            lazy_take_stream.flatten().stream_in_current_span(),
         )))
     }
 

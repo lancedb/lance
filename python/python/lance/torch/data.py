@@ -394,9 +394,9 @@ class SafeLanceDataset(torch.utils.data.Dataset):
         return self._len
 
     def __getitem__(self, idx):
-        return self.get_items([idx])[0]
+        return self.__getitems__([idx])[0]
 
-    def get_items(self, indices):
+    def __getitems__(self, indices):
         """Batch data fetching with worker-safe initialization
 
         Args:
