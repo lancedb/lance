@@ -278,4 +278,30 @@ public class SparkWriteTest {
     spark.sql("CREATE OR REPLACE TABLE lance.`" + path + "` AS SELECT * FROM tmp_view");
     spark.sql("DROP TABLE lance.`" + path + "`");
   }
+
+  @Test
+  public void addColumnAndInsert(TestInfo testInfo) {
+    String datasetName = testInfo.getTestMethod().get().getName();
+    String path = LanceConfig.getDatasetUri(dbPath.toString(), datasetName);
+    spark.sql("CREATE OR REPLACE TABLE lance.`" + path + "` AS SELECT * FROM tmp_view");
+
+    spark.sql("ALTER TABLE lance.`" + path + "` ADD COLUMN age INT");
+    spark.sql("INSERT INTO TABLE lance.`" + path + "` VALUES (3, 'Charlie', 30)");
+    List<Row> rows = spark.sql("select * from lance.`" + path + "`").collectAsList();
+    assertEquals(3, rows.size());
+    rows = spark.sql("select * from lance.`" + path + "` WHERE age IS NULL").collectAsList();
+    assertEquals(2, rows.size());
+  }
+
+  @Test
+  public void dropColumnAndInsert(TestInfo testInfo) {
+    String datasetName = testInfo.getTestMethod().get().getName();
+    String path = LanceConfig.getDatasetUri(dbPath.toString(), datasetName);
+    spark.sql("CREATE OR REPLACE TABLE lance.`" + path + "` AS SELECT * FROM tmp_view");
+
+    spark.sql("ALTER TABLE lance.`" + path + "` DROP COLUMN name");
+    spark.sql("INSERT INTO TABLE lance.`" + path + "` VALUES (3)");
+    List<Row> rows = spark.sql("select * from lance.`" + path + "`").collectAsList();
+    assertEquals(3, rows.size());
+  }
 }

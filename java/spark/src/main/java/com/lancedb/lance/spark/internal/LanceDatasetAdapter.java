@@ -145,6 +145,12 @@ public class LanceDatasetAdapter {
         .close();
   }
 
+  public static Dataset openDataset(LanceConfig config) {
+    String uri = config.getDatasetUri();
+    ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
+    return Dataset.open(uri, options);
+  }
+
   public static void dropDataset(LanceConfig config) {
     String uri = config.getDatasetUri();
     ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
