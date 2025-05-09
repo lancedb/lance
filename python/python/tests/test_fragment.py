@@ -245,7 +245,7 @@ def test_fragment_meta():
     data = {
         "id": 0,
         "files": [
-            {"path": "0.lance", "fields": [0]},
+            {"path": "0.lance", "fields": [0], "file_size_bytes": 100},
             {"path": "1.lance", "fields": [1]},
         ],
         "deletion_file": None,
@@ -261,10 +261,10 @@ def test_fragment_meta():
 
     assert repr(meta) == (
         "FragmentMetadata(id=0, files=[DataFile(path='0.lance', fields=[0], "
-        "column_indices=[], file_major_version=0, file_minor_version=0), "
-        "DataFile(path='1.lance', fields=[1], column_indices=[], "
-        "file_major_version=0, file_minor_version=0)], physical_rows=100, "
-        "deletion_file=None, row_id_meta=None)"
+        "column_indices=[], file_major_version=0, file_minor_version=0, "
+        "file_size_bytes=100), DataFile(path='1.lance', fields=[1], column_indices=[], "
+        "file_major_version=0, file_minor_version=0, file_size_bytes=None)], "
+        "physical_rows=100, deletion_file=None, row_id_meta=None)"
     )
 
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::num::NonZero;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -487,9 +488,14 @@ impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String
         Ok(self.0.tell().await? as u64)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        let size_bytes = self.0.tell().await?;
         Ok((
             self.0.finish().await? as u32,
-            DataFile::new_legacy(self.1.clone(), self.0.schema()),
+            DataFile::new_legacy(
+                self.1.clone(),
+                self.0.schema(),
+                NonZero::new(size_bytes as u64),
+            ),
         ))
     }
 }
@@ -524,14 +530,15 @@ impl GenericWriter for V2WriterAdapter {
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
         let (major, minor) = self.writer.version().to_numbers();
+        let num_rows = self.writer.finish().await? as u32;
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
             column_indices,
             major,
             minor,
+            NonZero::new(self.writer.tell().await?),
         );
-        let num_rows = self.writer.finish().await? as u32;
         Ok((num_rows, data_file))
     }
 }

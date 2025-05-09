@@ -145,6 +145,8 @@ class DataFile:
         The major version of the data storage format.
     file_minor_version : int
         The minor version of the data storage format.
+    file_size_bytes : Optional[int]
+        The size of the data file in bytes, if available.
     """
 
     _path: str
@@ -152,6 +154,7 @@ class DataFile:
     column_indices: List[int] = field(default_factory=list)
     file_major_version: int = 0
     file_minor_version: int = 0
+    file_size_bytes: Optional[int] = None
 
     def __init__(
         self,
@@ -160,6 +163,7 @@ class DataFile:
         column_indices: List[int] = None,
         file_major_version: int = 0,
         file_minor_version: int = 0,
+        file_size_bytes: Optional[int] = None,
     ):
         # TODO: only we eliminate the path method, we can remove this
         self._path = path
@@ -167,6 +171,7 @@ class DataFile:
         self.column_indices = column_indices or []
         self.file_major_version = file_major_version
         self.file_minor_version = file_minor_version
+        self.file_size_bytes = file_size_bytes
 
     def __repr__(self):
         # pretend we have a 'path' attribute
@@ -174,7 +179,8 @@ class DataFile:
             f"DataFile(path='{self._path}', fields={self.fields}, "
             f"column_indices={self.column_indices}, "
             f"file_major_version={self.file_major_version}, "
-            f"file_minor_version={self.file_minor_version})"
+            f"file_minor_version={self.file_minor_version}, "
+            f"file_size_bytes={self.file_size_bytes})"
         )
 
     @property

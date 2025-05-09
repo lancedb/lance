@@ -3506,6 +3506,7 @@ dependencies = [
  "pin-project",
  "prost 0.13.5",
  "rand",
+ "serde",
  "shellexpand",
  "snafu",
  "tokio",

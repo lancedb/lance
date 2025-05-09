@@ -18,6 +18,7 @@ use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::{FileReader, FileReaderOptions};
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
+    utils::CachedFileSize,
     ReadBatchParams,
 };
 use object_store::path::Path;
@@ -92,7 +93,9 @@ fn inner_open<'local>(env: &mut JNIEnv<'local>, file_uri: JString) -> Result<JOb
         let config = SchedulerConfig::max_bandwidth(&obj_store);
         let scan_scheduler = ScanScheduler::new(obj_store, config);
 
-        let file_scheduler = scan_scheduler.open_file(&Path::parse(&path)?).await?;
+        let file_scheduler = scan_scheduler
+            .open_file(&Path::parse(&path)?, &CachedFileSize::unknown())
+            .await?;
         FileReader::try_open(
             file_scheduler,
             None,

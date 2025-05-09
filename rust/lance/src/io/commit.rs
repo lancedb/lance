@@ -20,11 +20,13 @@
 //! alternative to [CommitHandler].
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZero;
 use std::sync::Arc;
 
 use lance_core::utils::backoff::Backoff;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_io::utils::CachedFileSize;
 use lance_table::format::{
     is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, Index, Manifest,
     WriterVersion, DETACHED_VERSION_MASK,
@@ -37,7 +39,7 @@ use rand::{thread_rng, Rng};
 use snafu::location;
 
 use futures::future::Either;
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::DatasetIndexExt;
 use log;
@@ -294,6 +296,7 @@ async fn migrate_manifest(
                     .as_ref()
                     .map(|d| d.num_deleted_rows.is_some())
                     .unwrap_or(true))
+                && f.files.iter().all(|f| f.file_size_bytes.get().is_some())
         })
     {
         return Ok(());
@@ -477,6 +480,35 @@ pub(crate) async fn migrate_fragments(
             let (physical_rows, num_deleted_rows) =
                 futures::future::try_join(physical_rows, num_deleted_rows).await?;
 
+            let mut data_files = fragment.files.clone();
+
+            // For each of the data files in the fragment, we need to get the file size
+            let object_store = dataset.object_store();
+            let get_sizes = data_files
+                .iter()
+                .map(|file| {
+                    if let Some(size) = file.file_size_bytes.get() {
+                        Either::Left(futures::future::ready(Ok(size)))
+                    } else {
+                        Either::Right(async {
+                            object_store
+                                .size(&dataset.base.child("data").child(file.path.clone()))
+                                .map_ok(|size| {
+                                    NonZero::new(size as u64).ok_or_else(|| Error::Internal {
+                                        message: format!("File {} has size 0", file.path),
+                                        location: location!(),
+                                    })
+                                })
+                                .await?
+                        })
+                    }
+                })
+                .collect::<Vec<_>>();
+            let sizes = futures::future::try_join_all(get_sizes).await?;
+            data_files.iter_mut().zip(sizes).for_each(|(file, size)| {
+                file.file_size_bytes = CachedFileSize::new(size.into());
+            });
+
             let deletion_file = fragment
                 .deletion_file
                 .as_ref()
@@ -488,6 +520,7 @@ pub(crate) async fn migrate_fragments(
             Ok::<_, Error>(Fragment {
                 physical_rows: Some(physical_rows),
                 deletion_file,
+                files: data_files,
                 ..fragment.clone()
             })
         })
