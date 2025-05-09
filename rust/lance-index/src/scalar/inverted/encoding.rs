@@ -13,21 +13,31 @@ use tracing::instrument;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
+#[allow(dead_code)]
 pub(crate) enum Compression {
-    // delta-encode + bitpack for doc ids
-    // bitpack for frequencies
+    // each block is:
+    // - 4 bytes for the first doc id
+    // - 1 byte for the number of bits used for the doc ids
+    // - delta encoded & bitpacked binary for the doc ids
+    // - 1 byte for the number of bits used for the frequencies
+    // - bitpacked binary for the frequencies
     // and plain for the remainder
     Bitpack,
 
-    // | max score | delta-encode + bitpack for doc ids |
-    // bitpack for frequencies
+    // each block is:
+    // - 4 bytes for the first doc id
+    // - 4 bytes for max score of the block
+    // - 1 byte for the number of bits used for the doc ids
+    // - delta encoded & bitpacked binary for the doc ids
+    // - 1 byte for the number of bits used for the frequencies
+    // - bitpacked binary for the frequencies
     // and plain for the remainder
     BlockMaxBitpack,
 }
 
 // compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
-// returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies),
-// the first binary is
+// returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
+#[allow(dead_code)]
 pub fn compress_posting_list(
     doc_ids: &[u32],
     frequencies: &[u32],
@@ -190,6 +200,7 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
 
 /// decompress the posting list from a LargeBinaryArray
 /// returns a vector of (row_id, frequency) tuples
+#[allow(dead_code)]
 pub fn decompress_posting_list(
     num_docs: u32,
     posting_list: &arrow::array::LargeBinaryArray,
@@ -235,6 +246,7 @@ pub fn decompress_positions(compressed: &arrow::array::LargeBinaryArray) -> Vec<
 
 // decompress the positions list from a ListArray of binary
 // to a ListArray of u32
+#[allow(dead_code)]
 pub fn decompress_positions_list(compressed: &ListArray) -> Result<ListArray> {
     let mut builder = ListBuilder::with_capacity(UInt32Builder::new(), compressed.len());
     for i in 0..compressed.len() {

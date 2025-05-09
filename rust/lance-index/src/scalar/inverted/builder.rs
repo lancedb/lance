@@ -67,28 +67,37 @@ lazy_static! {
 pub struct InvertedIndexBuilder {
     params: InvertedIndexParams,
     partitions: Vec<u64>,
+    new_partitions: Vec<u64>,
 
     _tmpdir: TempDir,
     local_store: Arc<dyn IndexStore>,
+    src_store: Arc<dyn IndexStore>,
 }
 
 impl InvertedIndexBuilder {
     pub fn new(params: InvertedIndexParams) -> Self {
-        Self::from_existing_index(params, Vec::new())
+        Self::from_existing_index(params, None, Vec::new())
     }
 
-    pub fn from_existing_index(params: InvertedIndexParams, partitions: Vec<u64>) -> Self {
+    pub fn from_existing_index(
+        params: InvertedIndexParams,
+        store: Option<Arc<dyn IndexStore>>,
+        partitions: Vec<u64>,
+    ) -> Self {
         let tmpdir = tempdir().unwrap();
-        let store = Arc::new(LanceIndexStore::new(
+        let local_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
             FileMetadataCache::no_cache(),
         ));
+        let src_store = store.unwrap_or_else(|| local_store.clone());
         Self {
             params,
             partitions,
+            new_partitions: Vec::new(),
             _tmpdir: tmpdir,
-            local_store: store,
+            local_store,
+            src_store,
         }
     }
 
@@ -180,7 +189,7 @@ impl InvertedIndexBuilder {
         // wait for the workers to finish
         let start = std::time::Instant::now();
         for index_task in index_tasks {
-            self.partitions.extend(index_task.await??);
+            self.new_partitions.extend(index_task.await??);
         }
         log::info!("wait workers indexing elapsed: {:?}", start.elapsed());
         Ok(())
@@ -192,32 +201,17 @@ impl InvertedIndexBuilder {
         src_store: Arc<dyn IndexStore>,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        // no need to remap the TokenSet,
-        // since no row_id is stored in the TokenSet
-
         for part in self.partitions.iter() {
             let part = InvertedPartition::load(src_store.clone(), *part).await?;
-            let builder = part.into_builder().await?;
+            let mut builder = part.into_builder().await?;
+            builder.remap(mapping).await?;
+            builder.write(dest_store).await?;
         }
-
-        self.write(dest_store).await?;
+        self.write_metadata(dest_store, &self.partitions).await?;
         Ok(())
     }
 
-    async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
-        let partitions = futures::future::try_join_all(
-            self.partitions
-                .iter()
-                .map(|part| InvertedPartition::load(self.local_store.clone(), *part)),
-        )
-        .await?;
-        let mut merger = SizeBasedMerger::new(
-            self.local_store.clone(),
-            dest_store,
-            partitions.iter(),
-            (*LANCE_FTS_PARTITION_SIZE << 20) * 8,
-        );
-        let partitions = merger.merge().await?;
+    async fn write_metadata(&self, dest_store: &dyn IndexStore, partitions: &[u64]) -> Result<()> {
         let metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
@@ -226,6 +220,28 @@ impl InvertedIndexBuilder {
             .new_index_file(METADATA_FILE, Arc::new(Schema::empty()))
             .await?;
         writer.finish_with_metadata(metadata).await?;
+        Ok(())
+    }
+
+    async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
+        let partitions = futures::future::try_join_all(
+            self.partitions
+                .iter()
+                .map(|part| InvertedPartition::load(self.src_store.clone(), *part))
+                .chain(
+                    self.new_partitions
+                        .iter()
+                        .map(|part| InvertedPartition::load(self.local_store.clone(), *part)),
+                ),
+        )
+        .await?;
+        let mut merger = SizeBasedMerger::new(
+            dest_store,
+            partitions.iter(),
+            (*LANCE_FTS_PARTITION_SIZE << 20) * 8,
+        );
+        let partitions = merger.merge().await?;
+        self.write_metadata(dest_store, &partitions).await?;
         Ok(())
     }
 }
@@ -261,18 +277,16 @@ impl InnerBuilder {
     }
 
     pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        unimplemented!("TODO")
+        // no need to remap the TokenSet,
+        // no row_id is stored in the TokenSet
+        let removed = self.docs.remap(mapping);
+        for posting_list in self.posting_lists.iter_mut() {
+            posting_list.remap(&removed);
+        }
+        Ok(())
     }
 
     pub async fn write(&mut self, store: &dyn IndexStore) -> Result<()> {
-        log::info!(
-            "partition {} in-memory size: tokens: {} MiB, posting lists: {} MiB, docs: {} MiB",
-            self.id,
-            self.tokens.deep_size_of() / (1024 * 1024),
-            self.posting_lists.iter().map(|p| p.size()).sum::<u64>() / (1024 * 1024),
-            self.docs.deep_size_of() / (1024 * 1024),
-        );
-
         let docs = Arc::new(std::mem::take(&mut self.docs));
         self.write_posting_lists(store, docs.clone()).await?;
         self.write_tokens(store).await?;

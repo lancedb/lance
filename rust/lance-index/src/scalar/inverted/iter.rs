@@ -3,7 +3,7 @@
 
 use std::collections::hash_map;
 
-use arrow::{array::AsArray, datatypes::Int32Type};
+use arrow::array::AsArray;
 use arrow_array::{Array, LargeBinaryArray, ListArray};
 use fst::Streamer;
 
@@ -50,28 +50,7 @@ pub enum PostingListIterator<'a> {
 impl<'a> PostingListIterator<'a> {
     pub fn new(posting: &'a PostingList) -> Self {
         match posting {
-            PostingList::Plain(posting) => Self::Plain(Box::new(
-                posting
-                    .row_ids
-                    .iter()
-                    .zip(posting.frequencies.iter())
-                    .enumerate()
-                    .map(|(idx, (doc_id, freq))| {
-                        (
-                            *doc_id,
-                            *freq,
-                            posting.positions.as_ref().map(|p| {
-                                let start = p.value_offsets()[idx] as usize;
-                                let end = p.value_offsets()[idx + 1] as usize;
-                                Box::new(
-                                    p.values().as_primitive::<Int32Type>().values()[start..end]
-                                        .iter()
-                                        .map(|pos| *pos as u32),
-                                ) as _
-                            }),
-                        )
-                    }),
-            )),
+            PostingList::Plain(posting) => Self::Plain(posting.iter()),
             PostingList::Compressed(posting) => {
                 Self::Compressed(CompressedPostingListIterator::new(
                     posting.length as usize,
@@ -98,7 +77,7 @@ impl<'a> Iterator for PostingListIterator<'a> {
     }
 }
 
-type PlainPostingListIterator<'a> =
+pub(crate) type PlainPostingListIterator<'a> =
     Box<dyn Iterator<Item = (u64, f32, Option<Box<dyn Iterator<Item = u32> + 'a>>)> + 'a>;
 
 pub struct CompressedPostingListIterator {

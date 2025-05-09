@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
 use std::{cell::UnsafeCell, collections::BinaryHeap};
-use std::{
-    cell::{Cell, RefCell},
-    sync::Arc,
-};
 use std::{cmp::Reverse, fmt::Debug};
 
 use arrow::array::AsArray;
@@ -141,11 +138,6 @@ impl PostingIterator {
             index: 0,
             approximate_upper_bound,
             compressed: is_compressed.then(|| UnsafeCell::new(CompressedState::new())),
-            // read_doc_elapsed: Cell::new(std::time::Duration::ZERO),
-            // decompress_elapsed: Cell::new(std::time::Duration::ZERO),
-            // next_elapsed: Cell::new(std::time::Duration::ZERO),
-            // decompress_num: Cell::new(0),
-            // borrow_elapsed: Cell::new(std::time::Duration::ZERO),
         }
     }
 
@@ -172,16 +164,14 @@ impl PostingIterator {
                 };
                 let block_idx = self.index / BLOCK_SIZE;
                 let block_offset = self.index % BLOCK_SIZE;
-                {
-                    if compressed.block_idx == block_idx {
-                        let doc_ids = &compressed.doc_ids;
-                        let freqs = &compressed.freqs;
-                        if !doc_ids.is_empty() {
-                            let doc_id = doc_ids[block_offset];
-                            let frequency = freqs[block_offset];
-                            let doc = DocInfo::Raw(RawDocInfo { doc_id, frequency });
-                            return Some(doc);
-                        }
+                if compressed.block_idx == block_idx {
+                    let doc_ids = &compressed.doc_ids;
+                    let freqs = &compressed.freqs;
+                    if !doc_ids.is_empty() {
+                        let doc_id = doc_ids[block_offset];
+                        let frequency = freqs[block_offset];
+                        let doc = DocInfo::Raw(RawDocInfo { doc_id, frequency });
+                        return Some(doc);
                     }
                 }
 
@@ -210,13 +200,13 @@ impl PostingIterator {
 
     // move to the next doc id that is greater than or equal to least_id
     #[instrument(level = "debug", name = "posting_iter_next", skip(self))]
-    fn next(&mut self, least_id: u64) -> Option<(u64, usize)> {
+    fn next(&mut self, least_id: u64) {
+        assert!(least_id <= u32::MAX as u64);
         match self.list {
             PostingList::Plain(ref list) => {
                 self.index += list.row_ids[self.index..].partition_point(|&id| id < least_id);
             }
             PostingList::Compressed(ref mut list) => {
-                // let start = std::time::Instant::now();
                 let least_id = least_id as u32;
                 let mut block_idx = self.index / BLOCK_SIZE;
                 while block_idx + 1 < list.blocks.len()
@@ -225,15 +215,15 @@ impl PostingIterator {
                     block_idx += 1;
                 }
                 self.index = self.index.max(block_idx * BLOCK_SIZE);
-                let length = list.length as usize;
+                let length = self.list.len();
                 while self.index < length && (self.doc().unwrap().doc_id() as u32) < least_id {
                     self.index += 1;
                 }
-                // self.next_elapsed
-                //     .set(self.next_elapsed.get() + start.elapsed());
+                if self.index < length {
+                    assert!(self.doc().unwrap().doc_id() as u32 >= least_id);
+                }
             }
         }
-        None
     }
 }
 
@@ -295,6 +285,15 @@ impl<'a> Wand<'a> {
         let mut candidates = BinaryHeap::new();
         let mut num_comparisons = 0;
         while let Some(doc) = self.next()? {
+            if let Some(cur_doc) = self.cur_doc {
+                assert!(
+                    doc.doc_id() > cur_doc,
+                    "new_doc_id: {}, cur_doc: {}",
+                    doc.doc_id(),
+                    cur_doc
+                );
+            }
+            self.cur_doc = Some(doc.doc_id());
             num_comparisons += 1;
             if is_phrase_query && !self.check_positions() {
                 continue;
@@ -361,7 +360,6 @@ impl<'a> Wand<'a> {
                 // all the posting iterators preceding pivot have reached this doc id,
                 // so that means the sum of upper bound of all terms is not less than the threshold,
                 // this document is a candidate
-                self.cur_doc = Some(doc.doc_id());
                 return Ok(Some(doc));
             } else {
                 // some posting iterators haven't reached this doc id,
@@ -394,11 +392,15 @@ impl<'a> Wand<'a> {
         self.postings[picked].next(least_id);
         let posting = self.postings.remove(picked);
         if posting.doc().is_some() {
+            assert!(posting.doc().unwrap().doc_id() >= least_id);
             let idx = self.postings.binary_search(&posting).inspect(|&idx| {
                 log::warn!("the posting is removed from the list, this is a bug: {:?}, same posting: {:?}", posting, self.postings[idx]);
             }).unwrap_err();
             self.postings.insert(idx, posting);
         }
+        assert!(self
+            .postings
+            .is_sorted_by_key(|posting| posting.doc().unwrap().doc_id()));
     }
 
     fn pick_term(&self, least_id: u64) -> usize {

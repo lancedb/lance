@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use lance_core::Result;
 
@@ -25,7 +25,6 @@ pub(crate) trait Merger {
 // the partitions and write them to a new partition,
 // until the size of the new partition reaches the target size.
 pub(crate) struct SizeBasedMerger<'a> {
-    src_store: Arc<dyn IndexStore>,
     dest_store: &'a dyn IndexStore,
     input: Vec<&'a InvertedPartition>,
     target_size: u64,
@@ -39,7 +38,6 @@ impl<'a> SizeBasedMerger<'a> {
     // Typically, just set the size to the memory limit,
     // because less partitions means faster query.
     pub fn new(
-        src_store: Arc<dyn IndexStore>,
         dest_store: &'a dyn IndexStore,
         input: impl IntoIterator<Item = &'a InvertedPartition>,
         target_size: u64,
@@ -47,7 +45,6 @@ impl<'a> SizeBasedMerger<'a> {
         let input = input.into_iter().collect::<Vec<_>>();
         let max_id = input.iter().map(|p| p.id()).max().unwrap_or(0);
         Self {
-            src_store,
             dest_store,
             input,
             target_size,
@@ -76,20 +73,19 @@ impl<'a> SizeBasedMerger<'a> {
 impl<'a> Merger for SizeBasedMerger<'a> {
     async fn merge(&mut self) -> Result<Vec<u64>> {
         if self.input.len() <= 1 {
-            let part_ids = self.input.iter().map(|p| p.id()).collect::<Vec<_>>();
-            for &part_id in part_ids.iter() {
-                self.src_store
-                    .copy_index_file(&token_file_path(part_id), self.dest_store)
+            for part in self.input.iter() {
+                part.store()
+                    .copy_index_file(&token_file_path(part.id()), self.dest_store)
                     .await?;
-                self.src_store
-                    .copy_index_file(&posting_file_path(part_id), self.dest_store)
+                part.store()
+                    .copy_index_file(&posting_file_path(part.id()), self.dest_store)
                     .await?;
-                self.src_store
-                    .copy_index_file(&doc_file_path(part_id), self.dest_store)
+                part.store()
+                    .copy_index_file(&doc_file_path(part.id()), self.dest_store)
                     .await?;
             }
 
-            return Ok(part_ids);
+            return Ok(self.input.iter().map(|p| p.id()).collect());
         }
 
         // for token set, union the tokens,

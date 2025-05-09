@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::{
     cmp::{min, Reverse},
@@ -11,15 +12,14 @@ use std::{
     collections::{HashMap, HashSet},
     ops::Range,
 };
-use std::{fmt::Debug, sync::LazyLock};
 
+use arrow::{
+    array::LargeBinaryBuilder,
+    datatypes::{self, Float32Type, Int32Type, UInt64Type},
+};
 use arrow::{
     array::{AsArray, ListBuilder, StringBuilder, UInt32Builder},
     buffer::OffsetBuffer,
-};
-use arrow::{
-    array::{Int32Builder, LargeBinaryBuilder},
-    datatypes::{self, Float32Type, Int32Type, UInt64Type},
 };
 use arrow::{buffer::ScalarBuffer, datatypes::UInt32Type};
 use arrow_array::{
@@ -51,19 +51,18 @@ use tracing::{info, instrument};
 use super::{
     builder::{
         doc_file_path, inverted_list_schema, posting_file_path, token_file_path, OrderedDoc,
-        BLOCK_SIZE,
     },
-    encoding::compress_posting_list,
+    iter::PlainPostingListIterator,
     query::*,
     scorer::{idf, BM25Scorer, B, K1},
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
-    encoding::{compress_posting_slices, decompress_posting_list},
+    encoding::compress_posting_slices,
     iter::CompressedPostingListIterator,
 };
 use super::{
-    encoding::{compress_positions, decompress_positions_list},
+    encoding::compress_positions,
     iter::{PostingListIterator, TokenIterator, TokenSource},
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
@@ -101,13 +100,6 @@ lazy_static! {
         .unwrap_or(512 * 1024 * 1024);
 }
 
-static COMPRESSED_SEARCH_LENGTH_THRESHOLD: LazyLock<u32> = LazyLock::new(|| {
-    std::env::var("LANCE_COMPRESSED_SEARCH_LENGTH_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(BLOCK_SIZE as u32 * 16)
-});
-
 #[derive(Clone)]
 pub struct InvertedIndex {
     params: InvertedIndexParams,
@@ -135,6 +127,7 @@ impl InvertedIndex {
     fn to_builder(&self) -> InvertedIndexBuilder {
         InvertedIndexBuilder::from_existing_index(
             self.params.clone(),
+            Some(self.store.clone()),
             self.partitions.iter().map(|part| part.id).collect(),
         )
     }
@@ -157,7 +150,6 @@ impl InvertedIndex {
         prefilter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
-        metrics.record_comparisons(tokens.len());
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok((Vec::new(), Vec::new()));
@@ -413,17 +405,21 @@ impl InvertedPartition {
     pub fn id(&self) -> u64 {
         self.id
     }
-    pub fn num_docs(&self) -> usize {
-        self.docs.len()
-    }
 
-    pub fn num_tokens(&self) -> usize {
-        self.tokens.len()
+    pub fn store(&self) -> &dyn IndexStore {
+        self.store.as_ref()
     }
+    // pub fn num_docs(&self) -> usize {
+    //     self.docs.len()
+    // }
 
-    pub fn size(&self) -> u64 {
-        self.inverted_list.size()
-    }
+    // pub fn num_tokens(&self) -> usize {
+    //     self.tokens.len()
+    // }
+
+    // pub fn size(&self) -> u64 {
+    //     self.inverted_list.size()
+    // }
 
     pub async fn load(store: Arc<dyn IndexStore>, id: u64) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
@@ -519,7 +515,6 @@ impl InvertedPartition {
         }
 
         let num_docs = self.docs.len();
-        let row_ids = &self.docs.row_ids;
         let postings = stream::iter(token_ids)
             .enumerate()
             .map(|(position, token_id)| async move {
@@ -527,33 +522,6 @@ impl InvertedPartition {
                     .inverted_list
                     .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
-                let posting = match posting {
-                    PostingList::Compressed(compressed) => {
-                        if compressed.length >= *COMPRESSED_SEARCH_LENGTH_THRESHOLD {
-                            PostingList::Compressed(compressed)
-                        } else {
-                            let (doc_ids, freqs) =
-                                decompress_posting_list(compressed.length, &compressed.blocks)?;
-                            let row_ids = doc_ids
-                                .into_iter()
-                                .map(|doc_id| row_ids[doc_id as usize])
-                                .collect();
-                            let freqs = freqs.into_iter().map(|freq| freq as f32).collect();
-                            let positions = compressed
-                                .positions
-                                .map(|positions| decompress_positions_list(&positions))
-                                .transpose()?;
-
-                            PostingList::Plain(PlainPostingList::new(
-                                row_ids,
-                                freqs,
-                                Some(compressed.max_score),
-                                positions,
-                            ))
-                        }
-                    }
-                    _ => posting,
-                };
 
                 Result::Ok(PostingIterator::new(
                     token_id,
@@ -568,6 +536,7 @@ impl InvertedPartition {
 
         let mut wand = Wand::new(operator, postings.into_iter(), &self.docs);
         let avgdl = self.docs.average_length();
+        log::info!("searching on partition {}", self.id);
         wand.search(
             is_phrase_query,
             params.limit.unwrap_or(usize::MAX),
@@ -594,20 +563,13 @@ impl InvertedPartition {
         builder
             .posting_lists
             .reserve_exact(self.inverted_list.len());
-        for posting_list in self.inverted_list.read_all().await? {
+        for posting_list in self.inverted_list.read_all(true).await? {
             let posting_list = posting_list?;
-            builder.posting_lists.push(posting_list.into());
+            builder
+                .posting_lists
+                .push(posting_list.into_builder(&builder.docs));
         }
         Ok(builder)
-    }
-
-    pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        let removed = self.docs.remap(mapping);
-        for posting_list in self.inverted_list.read_all().await? {
-            let mut posting_list = posting_list?;
-            posting_list.remap(mapping, &self.docs, &removed);
-        }
-        Ok(())
     }
 }
 
@@ -682,7 +644,7 @@ impl TokenSet {
         self.tokens.len()
     }
 
-    pub fn iter(&self) -> TokenIterator {
+    pub(crate) fn iter(&self) -> TokenIterator {
         TokenIterator::new(match &self.tokens {
             TokenMap::HashMap(map) => TokenSource::HashMap(map.iter()),
             TokenMap::Fst(map) => TokenSource::Fst(map.stream()),
@@ -693,16 +655,20 @@ impl TokenSet {
         let mut token_builder = StringBuilder::with_capacity(self.tokens.len(), self.total_length);
         let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
 
-        if let TokenMap::HashMap(map) = self.tokens {
-            for (token, token_id) in map.into_iter().sorted_unstable() {
-                token_builder.append_value(&token);
-                token_id_builder.append_value(token_id);
+        match self.tokens {
+            TokenMap::Fst(map) => {
+                let mut stream = map.stream();
+                while let Some((token, token_id)) = stream.next() {
+                    token_builder.append_value(String::from_utf8_lossy(token));
+                    token_id_builder.append_value(token_id as u32);
+                }
             }
-        } else {
-            return Err(Error::Index {
-                message: "tokens is not a HashMap".to_owned(),
-                location: location!(),
-            });
+            TokenMap::HashMap(map) => {
+                for (token, token_id) in map.into_iter().sorted_unstable() {
+                    token_builder.append_value(token);
+                    token_id_builder.append_value(token_id);
+                }
+            }
         }
 
         let token_col = token_builder.finish();
@@ -1037,11 +1003,15 @@ impl PostingListReader {
         Ok(batch)
     }
 
-    pub(crate) async fn read_all(&self) -> Result<impl Iterator<Item = Result<PostingList>> + '_> {
-        let batch = self.read_batch(false).await?;
-        Ok((0..batch.num_rows()).map(move |i| {
-            let batch = batch.slice(i, 1);
-            let token_id = batch[ROW_ID].as_primitive::<UInt32Type>().value(0);
+    pub(crate) async fn read_all(
+        &self,
+        with_position: bool,
+    ) -> Result<impl Iterator<Item = Result<PostingList>> + '_> {
+        let batch = self.read_batch(with_position).await?;
+        Ok((0..self.len()).map(move |i| {
+            let token_id = i as u32;
+            let range = self.posting_list_range(token_id);
+            let batch = batch.slice(i, range.end - range.start);
             self.posting_list_from_batch(&batch, token_id)
         }))
     }
@@ -1070,8 +1040,8 @@ impl PostingListReader {
         match self.offsets {
             Some(ref offsets) => {
                 let offset = offsets[token_id as usize];
-                let postsing_len = self.posting_len(token_id);
-                offset..offset + postsing_len
+                let posting_len = self.posting_len(token_id);
+                offset..offset + posting_len
             }
             None => {
                 let token_id = token_id as usize;
@@ -1138,15 +1108,6 @@ impl PostingList {
         }
     }
 
-    pub fn row_id(&self, i: usize) -> u64 {
-        match self {
-            PostingList::Plain(posting) => posting.row_id(i),
-            PostingList::Compressed(posting) => {
-                unimplemented!("compressed posting list does not support row_id")
-            }
-        }
-    }
-
     pub fn max_score(&self) -> Option<f32> {
         match self {
             PostingList::Plain(posting) => posting.max_score,
@@ -1161,20 +1122,56 @@ impl PostingList {
         }
     }
 
-    pub fn remap(
-        &mut self,
-        mapping: &HashMap<u64, Option<u64>>,
-        docs: &DocSet,
-        removed: &Vec<u32>,
-    ) {
+    pub fn into_builder(self, docs: &DocSet) -> PostingListBuilder {
+        let mut builder = PostingListBuilder::new(self.has_position());
         match self {
+            // legacy format
             PostingList::Plain(posting) => {
-                posting.remap(mapping);
+                // convert the posting list to the new format:
+                // 1. map row ids to doc ids
+                // 2. sort the posting list by doc ids
+                struct Item {
+                    doc_id: u32,
+                    positions: PositionRecorder,
+                }
+                let doc_ids = docs
+                    .row_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
+                    .collect::<HashMap<_, _>>();
+                let mut items = Vec::with_capacity(posting.len());
+                for (row_id, freq, positions) in posting.iter() {
+                    let freq = freq as u32;
+                    let positions = match positions {
+                        Some(positions) => {
+                            PositionRecorder::Position(positions.collect::<Vec<_>>())
+                        }
+                        None => PositionRecorder::Count(freq),
+                    };
+                    items.push(Item {
+                        doc_id: doc_ids[&row_id],
+                        positions,
+                    });
+                }
+                items.sort_unstable_by_key(|item| item.doc_id);
+                for item in items {
+                    builder.add(item.doc_id, item.positions);
+                }
             }
             PostingList::Compressed(posting) => {
-                posting.remap(docs, removed);
+                posting.iter().for_each(|(doc_id, freq, positions)| {
+                    let positions = match positions {
+                        Some(positions) => {
+                            PositionRecorder::Position(positions.collect::<Vec<_>>())
+                        }
+                        None => PositionRecorder::Count(freq),
+                    };
+                    builder.add(doc_id, positions);
+                });
             }
         }
+        builder
     }
 }
 
@@ -1234,6 +1231,30 @@ impl PlainPostingList {
         self.len() == 0
     }
 
+    pub fn iter(&self) -> PlainPostingListIterator {
+        Box::new(
+            self.row_ids
+                .iter()
+                .zip(self.frequencies.iter())
+                .enumerate()
+                .map(|(idx, (doc_id, freq))| {
+                    (
+                        *doc_id,
+                        *freq,
+                        self.positions.as_ref().map(|p| {
+                            let start = p.value_offsets()[idx] as usize;
+                            let end = p.value_offsets()[idx + 1] as usize;
+                            Box::new(
+                                p.values().as_primitive::<Int32Type>().values()[start..end]
+                                    .iter()
+                                    .map(|pos| *pos as u32),
+                            ) as _
+                        }),
+                    )
+                }),
+        )
+    }
+
     pub fn doc(&self, i: usize) -> LocatedDocInfo {
         LocatedDocInfo::new(self.row_ids[i], self.frequencies[i])
     }
@@ -1250,54 +1271,6 @@ impl PlainPostingList {
 
     pub fn row_id(&self, i: usize) -> u64 {
         self.row_ids[i]
-    }
-
-    pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
-        let mut new_row_ids = Vec::with_capacity(self.len());
-        let mut new_frequencies = Vec::with_capacity(self.len());
-        let mut new_positions = self.positions.as_mut().map(|positions| {
-            ListBuilder::with_capacity(
-                Int32Builder::with_capacity(positions.values().len()),
-                positions.len(),
-            )
-        });
-
-        for (idx, (&row_id, &freq)) in self.row_ids.iter().zip(self.frequencies.iter()).enumerate()
-        {
-            let positions = self.positions.as_ref().map(|positions| {
-                let offset = positions.offsets()[idx];
-                let length = positions.value_length(idx);
-                positions
-                    .values()
-                    .as_primitive::<Int32Type>()
-                    .slice(offset as usize, length as usize)
-            });
-
-            match mapping.get(&row_id) {
-                Some(Some(new_row_id)) => {
-                    new_row_ids.push(*new_row_id);
-                    new_frequencies.push(freq);
-                    if let Some(new_positions) = new_positions.as_mut() {
-                        new_positions.append_value(positions.unwrap().iter());
-                    }
-                }
-                Some(None) => {
-                    // this doc is removed
-                    // do nothing
-                }
-                None => {
-                    new_row_ids.push(row_id);
-                    new_frequencies.push(freq);
-                    if let Some(new_positions) = new_positions.as_mut() {
-                        new_positions.append_value(positions.unwrap().iter());
-                    }
-                }
-            }
-        }
-
-        self.row_ids = ScalarBuffer::from(new_row_ids);
-        self.frequencies = ScalarBuffer::from(new_frequencies);
-        self.positions = new_positions.map(|mut builder| builder.finish());
     }
 }
 
@@ -1350,43 +1323,6 @@ impl CompressedPostingList {
         )
     }
 
-    fn remap(&mut self, docs: &DocSet, removed: &Vec<u32>) -> Result<()> {
-        let mut cursor = 0;
-        let length = self.length as usize;
-        let mut new_doc_ids = Vec::with_capacity(length);
-        let mut new_frequencies = Vec::with_capacity(length);
-        let mut new_positions = self
-            .positions
-            .as_ref()
-            .map(|_| ListBuilder::with_capacity(LargeBinaryBuilder::new(), length));
-        for (doc_id, freq, positions) in self.iter() {
-            while cursor < removed.len() && removed[cursor] < doc_id {
-                cursor += 1;
-            }
-            if cursor < removed.len() && removed[cursor] == doc_id {
-                // this doc is removed
-                continue;
-            }
-            // there are cursor removed docs before this doc
-            // so we need to shift the doc id
-            new_doc_ids.push(doc_id - cursor as u32);
-            new_frequencies.push(freq);
-            if let Some(new_positions) = new_positions.as_mut() {
-                let positions = positions.unwrap().collect::<Vec<_>>();
-                let compressed = compress_positions(&positions)?;
-                new_positions.append_value(compressed.into_iter());
-            }
-        }
-
-        self.max_score = docs.calculate_max_score(new_doc_ids.iter(), new_frequencies.iter());
-        self.length = new_doc_ids.len() as u32;
-        let compressed = compress_posting_list(&new_doc_ids, &new_frequencies)?;
-        self.blocks = compressed;
-        self.positions = new_positions.map(|mut builder| builder.finish());
-
-        Ok(())
-    }
-
     pub fn block_least_doc_id(&self, block_idx: usize) -> u32 {
         let block = self.blocks.value(block_idx);
         block[0..4].try_into().map(u32::from_le_bytes).unwrap()
@@ -1429,6 +1365,17 @@ impl PostingListBuilder {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&u32, &u32, Option<&[u32]>)> {
+        self.doc_ids
+            .iter()
+            .zip(self.frequencies.iter())
+            .enumerate()
+            .map(|(idx, (doc_id, freq))| {
+                let positions = self.positions.as_ref().map(|positions| positions.get(idx));
+                (doc_id, freq, positions)
+            })
     }
 
     pub fn add(&mut self, doc_id: u32, term_positions: PositionRecorder) {
@@ -1483,19 +1430,32 @@ impl PostingListBuilder {
         let batch = RecordBatch::try_new(schema, columns)?;
         Ok(batch)
     }
-}
 
-impl From<PostingList> for PostingListBuilder {
-    fn from(posting_list: PostingList) -> Self {
-        let mut builder = Self::new(posting_list.has_position());
-        for (doc_id, freq, positions) in posting_list.iter() {
-            let positions = match positions {
-                Some(positions) => PositionRecorder::Position(positions.collect::<Vec<_>>()),
-                None => PositionRecorder::Count(freq),
-            };
-            builder.add(doc_id as u32, positions);
+    pub fn remap(&mut self, removed: &[u32]) {
+        let mut cursor = 0;
+        let mut new_doc_ids = ExpLinkedList::with_capacity(self.len());
+        let mut new_frequencies = ExpLinkedList::with_capacity(self.len());
+        let mut new_positions = self.positions.as_mut().map(|_| PositionBuilder::new());
+        for (&doc_id, &freq, positions) in self.iter() {
+            while cursor < removed.len() && removed[cursor] < doc_id {
+                cursor += 1;
+            }
+            if cursor < removed.len() && removed[cursor] == doc_id {
+                // this doc is removed
+                continue;
+            }
+            // there are cursor removed docs before this doc
+            // so we need to shift the doc id
+            new_doc_ids.push(doc_id - cursor as u32);
+            new_frequencies.push(freq);
+            if let Some(new_positions) = new_positions.as_mut() {
+                new_positions.push(positions.unwrap().to_vec());
+            }
         }
-        builder
+
+        self.doc_ids = new_doc_ids;
+        self.frequencies = new_frequencies;
+        self.positions = new_positions;
     }
 }
 
