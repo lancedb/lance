@@ -134,7 +134,7 @@ impl LabelListIndex {
             return Ok(intersect_bitmap);
         }
         while let Some(next) = sets.try_next().await? {
-            intersect_bitmap &= next;
+            intersect_bitmap &= &next;
         }
         Ok(intersect_bitmap)
     }

@@ -609,7 +609,7 @@ async fn retain_fragments(
                 Ok(acc)
             })
             .await?;
-        *allow_list &= fragment_ids;
+        *allow_list &= &fragment_ids;
     } else {
         // Assume row ids are addresses, so we can filter out fragments by their ids.
         allow_list.retain_fragments(fragments.iter().map(|frag| frag.id as u32));

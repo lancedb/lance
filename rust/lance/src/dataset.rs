@@ -1117,6 +1117,11 @@ impl Dataset {
         Projection::empty(self.clone())
     }
 
+    /// Creates a projection that includes all columns in the dataset
+    pub fn full_projection(self: &Arc<Self>) -> Projection {
+        Projection::full(self.clone())
+    }
+
     /// Get fragments.
     ///
     /// If `filter` is provided, only fragments with the given name will be returned.

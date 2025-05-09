@@ -71,6 +71,13 @@ impl Bitmap {
     pub fn count_zeros(&self) -> usize {
         self.len - self.count_ones()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {
+        self.data
+            .iter()
+            .flat_map(|&x| (0..8).map(move |i| x & (1 << i) != 0))
+            .take(self.len)
+    }
 }
 
 impl From<&[bool]> for Bitmap {
@@ -224,6 +231,84 @@ mod tests {
             let values_slice = values[start..(start + len)].to_vec();
 
             prop_assert_eq!(slice.count_ones(), values_slice.iter().filter(|&&x| x).count());
+        }
+    }
+
+    #[test]
+    fn test_bitmap_iter_empty() {
+        let bitmap = Bitmap::new_empty(10);
+        let values: Vec<bool> = bitmap.iter().collect();
+        assert_eq!(values, vec![false; 10]);
+    }
+
+    #[test]
+    fn test_bitmap_iter_full() {
+        let bitmap = Bitmap::new_full(10);
+        let values: Vec<bool> = bitmap.iter().collect();
+        assert_eq!(values, vec![true; 10]);
+    }
+
+    #[test]
+    fn test_bitmap_iter_partial() {
+        let mut bitmap = Bitmap::new_empty(10);
+        bitmap.set(0);
+        bitmap.set(3);
+        bitmap.set(7);
+        bitmap.set(9);
+
+        let values: Vec<bool> = bitmap.iter().collect();
+        let expected = vec![
+            true,  // 0
+            false, // 1
+            false, // 2
+            true,  // 3
+            false, // 4
+            false, // 5
+            false, // 6
+            true,  // 7
+            false, // 8
+            true,  // 9
+        ];
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn test_bitmap_iter_edge_cases() {
+        // Test with length that's not a multiple of 8
+        let mut bitmap = Bitmap::new_empty(15);
+        bitmap.set(0);
+        bitmap.set(7);
+        bitmap.set(14);
+
+        let values: Vec<bool> = bitmap.iter().collect();
+        let expected = vec![
+            true,  // 0
+            false, // 1
+            false, // 2
+            false, // 3
+            false, // 4
+            false, // 5
+            false, // 6
+            true,  // 7
+            false, // 8
+            false, // 9
+            false, // 10
+            false, // 11
+            false, // 12
+            false, // 13
+            true,  // 14
+        ];
+        assert_eq!(values, expected);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_bitmap_iter_property(
+            values in proptest::collection::vec(proptest::bool::ANY, 0..100)
+        ) {
+            let bitmap = Bitmap::from(values.as_slice());
+            let iter_values: Vec<bool> = bitmap.iter().collect();
+            assert_eq!(iter_values, values);
         }
     }
 }

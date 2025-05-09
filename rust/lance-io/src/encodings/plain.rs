@@ -496,6 +496,8 @@ impl AsyncIndex<ReadBatchParams> for PlainDecoder<'_> {
     async fn get(&self, params: ReadBatchParams) -> Self::Output {
         match params {
             ReadBatchParams::Range(r) => self.get(r).await,
+            // Ranges not supported in v1 files
+            ReadBatchParams::Ranges(_) => unimplemented!(),
             ReadBatchParams::RangeFull => self.get(..).await,
             ReadBatchParams::RangeTo(r) => self.get(r).await,
             ReadBatchParams::RangeFrom(r) => self.get(r).await,
