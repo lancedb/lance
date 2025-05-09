@@ -605,6 +605,7 @@ async fn reserve_fragment_ids(
         &Default::default(),
         &Default::default(),
         dataset.manifest_location.naming_scheme,
+        None,
     )
     .await?;
 

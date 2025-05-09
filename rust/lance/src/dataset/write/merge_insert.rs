@@ -16,7 +16,6 @@
 //! key columns are identical in both the source and the target.  This means that you will need some kind of
 //! meaningful key column to be able to perform a merge insert.
 
-use aws_sdk_dynamodb::types::error::TransactionCanceledException;
 use futures::FutureExt;
 use std::{
     collections::BTreeMap,
