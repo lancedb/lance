@@ -22,7 +22,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use conflict_resolver::ConflictResolver;
 use lance_core::utils::backoff::Backoff;
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::{
@@ -53,6 +55,7 @@ use crate::index::DatasetIndexInternalExt;
 use crate::session::Session;
 use crate::Dataset;
 
+mod conflict_resolver;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod dynamodb;
 #[cfg(test)]
@@ -82,31 +85,33 @@ fn transaction_file_cache_path(base_path: &Path, version: u64) -> Path {
 async fn read_dataset_transaction_file(
     dataset: &Dataset,
     version: u64,
-) -> Result<Arc<Transaction>> {
+) -> Result<(Arc<Transaction>, Arc<Manifest>)> {
     let cache_path = transaction_file_cache_path(&dataset.base, version);
-    dataset
+
+    let dataset_version = dataset.checkout_version(version).await?;
+    let object_store = dataset_version.object_store();
+    let manifest = dataset_version.manifest.clone();
+    let txn_file = manifest.transaction_file.as_ref();
+
+    let txn = dataset
         .session
         .file_metadata_cache
         .get_or_insert(&cache_path, |_| async move {
-            let dataset_version = dataset.checkout_version(version).await?;
-            let object_store = dataset_version.object_store();
-            let path = dataset_version
-                .manifest
-                .transaction_file
-                .as_ref()
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
-                        "Dataset version {} does not have a transaction file",
-                        version
-                    ),
-                    location: location!(),
-                })?;
+            let path = txn_file.as_ref().ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Dataset version {} does not have a transaction file",
+                    version
+                ),
+                location: location!(),
+            })?;
             let transaction = read_transaction_file(object_store, &dataset.base, path)
                 .await
                 .unwrap();
             Ok(transaction)
         })
-        .await
+        .await?;
+
+    Ok((txn, manifest))
 }
 
 /// Write a transaction to a file and return the relative path.
@@ -123,44 +128,6 @@ async fn write_transaction_file(
     object_store.inner.put(&path, buf.into()).await?;
 
     Ok(file_name)
-}
-
-fn check_transaction(
-    transaction: &Transaction,
-    other_version: u64,
-    other_transaction: Option<&Transaction>,
-) -> Result<()> {
-    let Some(other_transaction) = other_transaction else {
-        return Err(crate::Error::Internal {
-            message: format!(
-                "There was a conflicting transaction at version {}, \
-                and it was missing transaction metadata.",
-                other_version
-            ),
-            location: location!(),
-        });
-    };
-
-    match transaction.conflicts_with(other_transaction) {
-        ConflictResult::Compatible => Ok(()),
-        ConflictResult::NotCompatible => {
-            Err(crate::Error::CommitConflict {
-                version: other_version,
-                source: format!(
-                    "This {} transaction is incompatible with concurrent transaction {} at version {}.",
-                    transaction.operation, other_transaction.operation, other_version).into(),
-                location: location!(),
-            })
-        },
-        ConflictResult::Retryable => {
-            Err(crate::Error::RetryableCommitConflict {
-                version: other_version,
-                source: format!(
-                    "This {} transaction was preempted by concurrent transaction {} at version {}. Please retry.",
-                    transaction.operation, other_transaction.operation, other_version).into(),
-                location: location!() })
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -716,6 +683,7 @@ pub(crate) async fn commit_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
     manifest_naming_scheme: ManifestNamingScheme,
+    affected_rows: Option<&RowIdTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
@@ -752,6 +720,9 @@ pub(crate) async fn commit_transaction(
         // recent manifest.
         dataset.checkout_latest().await?;
     }
+
+    let resolver = ConflictResolver::try_new(&dataset, transaction).await?;
+
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
     let mut backoff = Backoff::default();
     while backoff.attempt() < num_attempts {
@@ -759,7 +730,7 @@ pub(crate) async fn commit_transaction(
         // transactions that have been committed since the read_version.
         // Use small amount of backoff to handle transactions that all
         // started at exact same time better.
-        futures::stream::iter(target_version..=dataset.manifest.version)
+        let concurrent_txns = futures::stream::iter(target_version..=dataset.manifest.version)
             .map(|version| {
                 read_dataset_transaction_file(&dataset, version)
                     .map(move |res| res.map(|tx| (version, tx)))
@@ -774,13 +745,14 @@ pub(crate) async fn commit_transaction(
                                 | Err(crate::Error::DatasetNotFound { .. })
                         ),
                 )
-            })
-            .try_for_each(|(other_version, other_transaction)| {
-                let res =
-                    check_transaction(transaction, other_version, Some(other_transaction.as_ref()));
-                futures::future::ready(res)
-            })
-            .await?;
+            });
+
+        while let Some((other_manifest, other_transaction)) = concurrent_txns.try_next().await? {
+            resolver.check_txn(transaction, Some(&other_transaction), &other_manifest)?;
+        }
+
+        transaction = resolver.update_files().await?;
+
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
             return Err(Error::Internal { message: "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.".into(), location: location!() });
