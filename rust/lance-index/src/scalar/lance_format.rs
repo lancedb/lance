@@ -137,6 +137,10 @@ impl IndexReader for FileReader {
     fn schema(&self) -> &lance_core::datatypes::Schema {
         Self::schema(self)
     }
+
+    fn size(&self) -> u64 {
+        unimplemented!("size is not implemented for v1 reader")
+    }
 }
 
 #[async_trait]
@@ -192,6 +196,13 @@ impl IndexReader for v2::reader::FileReader {
 
     fn schema(&self) -> &lance_core::datatypes::Schema {
         Self::schema(self)
+    }
+
+    fn size(&self) -> u64 {
+        self.metadata().num_data_bytes
+            + self.metadata().num_column_metadata_bytes
+            + self.metadata().num_global_buffer_bytes
+            + self.metadata().num_footer_bytes
     }
 }
 

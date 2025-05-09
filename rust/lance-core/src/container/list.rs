@@ -43,12 +43,9 @@ impl<T> ExpLinkedList<T> {
     /// Creates a new `ExpLinkedList` with a specified capacity limit.
     /// The limit is the maximum capacity of a single node in the list.
     /// If the limit is 0, there is no limit.
-    pub fn with_capacity_limit(limit: u16) -> Self {
-        Self {
-            inner: LinkedList::new(),
-            len: 0,
-            limit,
-        }
+    pub fn with_capacity_limit(mut self, limit: u16) -> Self {
+        self.limit = limit;
+        self
     }
 
     /// Pushes a new element into the list. If the last element in the list
@@ -57,7 +54,9 @@ impl<T> ExpLinkedList<T> {
         match self.inner.back() {
             Some(last) => {
                 if last.len() == last.capacity() {
-                    let new_cap = if self.limit > 0 && last.capacity() * 2 >= self.limit as usize {
+                    let new_cap = if self.inner.len() == 1 {
+                        last.capacity()
+                    } else if self.limit > 0 && last.capacity() * 2 >= self.limit as usize {
                         self.limit as usize
                     } else {
                         last.capacity() * 2
@@ -66,7 +65,7 @@ impl<T> ExpLinkedList<T> {
                 }
             }
             None => {
-                self.inner.push_back(Vec::with_capacity(1));
+                self.inner.push_back(Vec::with_capacity(2));
             }
         }
         self.do_push(v);
@@ -129,6 +128,10 @@ impl<T> ExpLinkedList<T> {
     /// Returns an iterator over the elements in the list.
     pub fn iter(&self) -> ExpLinkedListIter<'_, T> {
         ExpLinkedListIter::new(self)
+    }
+
+    pub fn block_iter(&self) -> impl Iterator<Item = &[T]> {
+        self.inner.iter().map(|v| v.as_slice())
     }
 }
 
@@ -277,7 +280,7 @@ mod tests {
 
     #[test]
     fn test_exp_linked_list_with_capacity_limit() {
-        let mut list = ExpLinkedList::with_capacity_limit(10);
+        let mut list = ExpLinkedList::new().with_capacity_limit(10);
         for i in 0..100 {
             list.push(i);
             assert_eq!(list.len(), i + 1);

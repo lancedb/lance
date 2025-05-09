@@ -1791,9 +1791,11 @@ mod tests {
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
-    use lance_index::scalar::inverted::query::{MatchQuery, Operator, PhraseQuery};
-    use lance_index::scalar::inverted::TokenizerConfig;
-    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
+    use lance_index::scalar::inverted::{
+        query::{MatchQuery, Operator, PhraseQuery},
+        tokenizer::InvertedIndexParams,
+    };
+    use lance_index::scalar::FullTextSearchQuery;
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
@@ -5121,14 +5123,13 @@ mod tests {
     >(
         is_list: bool,
         with_position: bool,
-        tokenizer: TokenizerConfig,
+        params: InvertedIndexParams,
     ) -> Dataset {
         let tempdir = tempfile::tempdir().unwrap();
         let uri = tempdir.path().to_str().unwrap().to_owned();
         tempdir.close().unwrap();
 
-        let mut params = InvertedIndexParams::default().with_position(with_position);
-        params.tokenizer_config = tokenizer;
+        let params = params.with_position(with_position);
         let doc_col: Arc<dyn Array> = if is_list {
             let string_builder = GenericStringBuilder::<Offset>::new();
             let mut list_col = GenericListBuilder::<ListOffset, _>::new(string_builder);
@@ -5193,9 +5194,12 @@ mod tests {
     >(
         is_list: bool,
     ) {
-        let ds =
-            create_fts_dataset::<Offset, ListOffset>(is_list, false, TokenizerConfig::default())
-                .await;
+        let ds = create_fts_dataset::<Offset, ListOffset>(
+            is_list,
+            false,
+            InvertedIndexParams::default(),
+        )
+        .await;
         let result = ds
             .scan()
             .project(&["id"])
@@ -5205,11 +5209,11 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 3);
+        assert_eq!(result.num_rows(), 3, "{:?}", result);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert!(ids.contains(&0));
-        assert!(ids.contains(&1));
-        assert!(ids.contains(&2));
+        assert!(ids.contains(&0), "{:?}", result);
+        assert!(ids.contains(&1), "{:?}", result);
+        assert!(ids.contains(&2), "{:?}", result);
 
         let result = ds
             .scan()
@@ -5222,9 +5226,9 @@ mod tests {
             .unwrap();
         assert_eq!(result.num_rows(), 3);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert!(ids.contains(&0));
-        assert!(ids.contains(&1));
-        assert!(ids.contains(&3));
+        assert!(ids.contains(&0), "{:?}", result);
+        assert!(ids.contains(&1), "{:?}", result);
+        assert!(ids.contains(&3), "{:?}", result);
 
         let result = ds
             .scan()
@@ -5242,7 +5246,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_rows(), 2, "{:?}", result);
 
         let result = ds
             .scan()
@@ -5278,7 +5282,7 @@ mod tests {
 
         // recreate the index with position
         let ds =
-            create_fts_dataset::<Offset, ListOffset>(is_list, true, TokenizerConfig::default())
+            create_fts_dataset::<Offset, ListOffset>(is_list, true, InvertedIndexParams::default())
                 .await;
         let result = ds
             .scan()
@@ -5376,7 +5380,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fts_accented_chars() {
-        let ds = create_fts_dataset::<i32, i32>(false, false, TokenizerConfig::default()).await;
+        let ds = create_fts_dataset::<i32, i32>(false, false, InvertedIndexParams::default()).await;
         let result = ds
             .scan()
             .project(&["id"])
@@ -5403,7 +5407,9 @@ mod tests {
         let ds = create_fts_dataset::<i32, i32>(
             false,
             false,
-            TokenizerConfig::default().ascii_folding(true),
+            InvertedIndexParams::default()
+                .stem(false)
+                .ascii_folding(true),
         )
         .await;
         let result = ds

@@ -2,9 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod builder;
+mod encoding;
 mod index;
+mod iter;
+mod merger;
 pub mod query;
-mod tokenizer;
+mod scorer;
+pub mod tokenizer;
 mod wand;
 
 pub use builder::InvertedIndexBuilder;
@@ -13,7 +17,7 @@ use lance_core::Result;
 pub use tokenizer::*;
 
 use super::btree::TrainingSource;
-use super::{IndexStore, InvertedIndexParams};
+use super::IndexStore;
 
 pub async fn train_inverted_index(
     data_source: Box<dyn TrainingSource>,
