@@ -1970,39 +1970,36 @@ fn create_scheduler_decoder(
         rx,
     );
 
-    let scheduler_handle = tokio::task::spawn(
-        (async move {
-            let mut decode_scheduler = match DecodeBatchScheduler::try_new(
-                target_schema.as_ref(),
-                &column_indices,
-                &column_infos,
-                &vec![],
-                num_rows,
-                config.decoder_plugins,
-                config.io.clone(),
-                config.cache,
-                &filter,
-            )
-            .await
-            {
-                Ok(scheduler) => scheduler,
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    return;
-                }
-            };
-
-            match requested_rows {
-                RequestedRows::Ranges(ranges) => {
-                    decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
-                }
-                RequestedRows::Indices(indices) => {
-                    decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
-                }
+    let scheduler_handle = tokio::task::spawn(async move {
+        let mut decode_scheduler = match DecodeBatchScheduler::try_new(
+            target_schema.as_ref(),
+            &column_indices,
+            &column_infos,
+            &vec![],
+            num_rows,
+            config.decoder_plugins,
+            config.io.clone(),
+            config.cache,
+            &filter,
+        )
+        .await
+        {
+            Ok(scheduler) => scheduler,
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
             }
-        })
-        .in_current_span(),
-    );
+        };
+
+        match requested_rows {
+            RequestedRows::Ranges(ranges) => {
+                decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
+            }
+            RequestedRows::Indices(indices) => {
+                decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
+            }
+        }
+    });
 
     Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
 }
