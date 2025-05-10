@@ -656,6 +656,9 @@ async fn resolve_commit_handler(
 /// data. Otherwise, the source will be spilled to a temporary file on disk.
 ///
 /// This is used to support retries on write operations.
+// TODO: we will use this again once we bring back
+// https://github.com/lancedb/lance/issues/3798
+#[allow(dead_code)]
 async fn new_source_iter(
     source: SendableRecordBatchStream,
     enable_retries: bool,
@@ -685,6 +688,9 @@ async fn new_source_iter(
     }
 }
 
+// We will use this again once we address this:
+// https://github.com/lancedb/lance/issues/3798
+#[allow(dead_code)]
 struct SpillStreamIter {
     receiver: SpillReceiver,
     #[allow(dead_code)] // Exists to keep the SpillSender alive

@@ -16,12 +16,10 @@
 //! key columns are identical in both the source and the target.  This means that you will need some kind of
 //! meaningful key column to be able to perform a merge insert.
 
-use futures::FutureExt;
 use std::{
     collections::BTreeMap,
-    future::Future,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use arrow_array::{
@@ -55,14 +53,13 @@ use lance_datafusion::{
 
 use datafusion_physical_expr::expressions::Column;
 use futures::{
-    future::Either,
     stream::{self},
-    Stream, StreamExt, TryFutureExt, TryStreamExt,
+    Stream, StreamExt, TryStreamExt,
 };
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::{backoff::SlotBackoff, futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
