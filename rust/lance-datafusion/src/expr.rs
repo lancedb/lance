@@ -406,6 +406,7 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
         },
         ScalarValue::Binary(value) => match ty {
             DataType::Binary => Some(ScalarValue::Binary(value.clone())),
+            DataType::LargeBinary => Some(ScalarValue::LargeBinary(value.clone())),
             DataType::FixedSizeBinary(len) => {
                 if let Some(value) = value {
                     if value.len() == *len as usize {
