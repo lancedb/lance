@@ -195,3 +195,4 @@ print_stdout = "deny"
 print_stderr = "deny"
 # not too much we can do to avoid multiple crate versions
 multiple-crate-versions = "allow"
+await_holding_invalid_type = "deny"
