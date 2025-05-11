@@ -35,6 +35,7 @@ use super::local::LocalObjectReader;
 mod list_retry;
 pub mod providers;
 mod tracing;
+use crate::object_reader::SmallReader;
 use crate::object_writer::WriteResult;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
@@ -384,6 +385,17 @@ impl ObjectStore {
     /// cached metadata. By passing in the known size, we can skip a HEAD / metadata
     /// call.
     pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Box<dyn Reader>> {
+        // If we know the file is really small, we can read the whole thing
+        // as a single request.
+        if known_size <= self.block_size {
+            return Ok(Box::new(SmallReader::new(
+                self.inner.clone(),
+                path.clone(),
+                self.download_retry_count,
+                known_size,
+            )));
+        }
+
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(path, self.block_size, Some(known_size)).await,
             _ => Ok(Box::new(CloudObjectReader::new(

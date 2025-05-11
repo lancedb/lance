@@ -33,6 +33,7 @@ use lance_file::{
 use lance_io::object_store::ObjectStoreParams;
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
+    utils::CachedFileSize,
     ReadBatchParams,
 };
 use object_store::path::Path;
@@ -398,7 +399,10 @@ impl LanceFileReader {
                 io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
             },
         );
-        let file = scheduler.open_file(&path).await.infer_error()?;
+        let file = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .infer_error()?;
         let inner = FileReader::try_open(
             file,
             None,

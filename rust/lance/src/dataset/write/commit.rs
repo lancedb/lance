@@ -408,6 +408,7 @@ pub struct BatchCommitResult {
 mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_io::utils::CachedFileSize;
     use lance_table::format::{DataFile, Fragment};
 
     use crate::dataset::{InsertBuilder, WriteParams};
@@ -423,6 +424,7 @@ mod tests {
                 column_indices: vec![0],
                 file_major_version: 2,
                 file_minor_version: 0,
+                file_size_bytes: CachedFileSize::new(100),
             }],
             deletion_file: None,
             row_id_meta: None,
