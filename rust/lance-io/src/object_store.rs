@@ -52,6 +52,11 @@ const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
 #[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
 const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
 
+lazy_static::lazy_static! {
+    pub static ref DEFAULT_MAX_IOP_SIZE: u64 = std::env::var("LANCE_DEFAULT_MAX_IOP_SIZE")
+        .map(|val| val.parse().unwrap()).unwrap_or(16 * 1024 * 1024);
+}
+
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
@@ -103,6 +108,7 @@ pub struct ObjectStore {
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
     block_size: usize,
+    max_iop_size: u64,
     /// Whether to use constant size upload parts for multipart uploads. This
     /// is only necessary for Cloudflare R2.
     pub use_constant_size_upload_parts: bool,
@@ -295,6 +301,7 @@ impl ObjectStore {
                 inner,
                 scheme: path.scheme().to_string(),
                 block_size: params.block_size.unwrap_or(64 * 1024),
+                max_iop_size: *DEFAULT_MAX_IOP_SIZE,
                 use_constant_size_upload_parts: params.use_constant_size_upload_parts,
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
@@ -354,6 +361,10 @@ impl ObjectStore {
 
     pub fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    pub fn max_iop_size(&self) -> u64 {
+        self.max_iop_size
     }
 
     pub fn io_parallelism(&self) -> usize {
@@ -652,6 +663,7 @@ impl ObjectStore {
             inner: store,
             scheme: scheme.into(),
             block_size,
+            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
             list_is_lexically_ordered,
             io_parallelism,
