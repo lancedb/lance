@@ -35,12 +35,6 @@ pub struct PostingIterator {
 
     // for compressed posting list
     compressed: Option<UnsafeCell<CompressedState>>,
-    // stat
-    // read_doc_elapsed: Cell<std::time::Duration>,
-    // decompress_elapsed: Cell<std::time::Duration>,
-    // next_elapsed: Cell<std::time::Duration>,
-    // decompress_num: Cell<usize>,
-    // borrow_elapsed: Cell<std::time::Duration>,
 }
 
 #[derive(Clone)]
@@ -153,7 +147,6 @@ impl PostingIterator {
         }
 
         match self.list {
-            PostingList::Plain(ref list) => Some(DocInfo::Located(list.doc(self.index))),
             PostingList::Compressed(ref list) => {
                 debug_assert!(self.compressed.is_some());
                 // this method is called very frequently, so we prefer to use `UnsafeCell` instead of `RefCell`
@@ -164,19 +157,10 @@ impl PostingIterator {
                 };
                 let block_idx = self.index / BLOCK_SIZE;
                 let block_offset = self.index % BLOCK_SIZE;
-                if compressed.block_idx == block_idx {
-                    let doc_ids = &compressed.doc_ids;
-                    let freqs = &compressed.freqs;
-                    if !doc_ids.is_empty() {
-                        let doc_id = doc_ids[block_offset];
-                        let frequency = freqs[block_offset];
-                        let doc = DocInfo::Raw(RawDocInfo { doc_id, frequency });
-                        return Some(doc);
-                    }
+                if compressed.block_idx != block_idx || compressed.doc_ids.is_empty() {
+                    let block = list.blocks.value(block_idx);
+                    compressed.decompress(block, block_idx, list.blocks.len(), list.length);
                 }
-
-                let block = list.blocks.value(block_idx);
-                compressed.decompress(block, block_idx, list.blocks.len(), list.length);
 
                 // Read from the decompressed block
                 let doc_id = compressed.doc_ids[block_offset];
@@ -184,6 +168,7 @@ impl PostingIterator {
                 let doc = DocInfo::Raw(RawDocInfo { doc_id, frequency });
                 Some(doc)
             }
+            PostingList::Plain(ref list) => Some(DocInfo::Located(list.doc(self.index))),
         }
     }
 
@@ -201,12 +186,9 @@ impl PostingIterator {
     // move to the next doc id that is greater than or equal to least_id
     #[instrument(level = "debug", name = "posting_iter_next", skip(self))]
     fn next(&mut self, least_id: u64) {
-        assert!(least_id <= u32::MAX as u64);
         match self.list {
-            PostingList::Plain(ref list) => {
-                self.index += list.row_ids[self.index..].partition_point(|&id| id < least_id);
-            }
             PostingList::Compressed(ref mut list) => {
+                debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
                 let mut block_idx = self.index / BLOCK_SIZE;
                 while block_idx + 1 < list.blocks.len()
@@ -219,9 +201,9 @@ impl PostingIterator {
                 while self.index < length && (self.doc().unwrap().doc_id() as u32) < least_id {
                     self.index += 1;
                 }
-                if self.index < length {
-                    assert!(self.doc().unwrap().doc_id() as u32 >= least_id);
-                }
+            }
+            PostingList::Plain(ref list) => {
+                self.index += list.row_ids[self.index..].partition_point(|&id| id < least_id);
             }
         }
     }
@@ -258,11 +240,7 @@ impl<'a> Wand<'a> {
         Self {
             threshold,
             cur_doc: None,
-            postings: posting_lists
-                .into_iter()
-                .filter(|posting| posting.doc().is_some())
-                .map(Box::new)
-                .collect(),
+            postings: posting_lists.into_iter().map(Box::new).collect(),
             docs,
         }
     }
@@ -301,12 +279,12 @@ impl<'a> Wand<'a> {
 
             // if the doc is not located, we need to find the row id
             let row_id = match &doc {
-                DocInfo::Located(doc) => doc.row_id,
                 DocInfo::Raw(doc) => {
                     // if the doc is not located, we need to find the row id
                     // in the doc set. This is a bit slow, but it should be rare.
                     self.docs.row_id(doc.doc_id as u32)
                 }
+                DocInfo::Located(doc) => doc.row_id,
             };
             if !mask.selected(row_id) {
                 continue;
@@ -392,13 +370,13 @@ impl<'a> Wand<'a> {
         self.postings[picked].next(least_id);
         let posting = self.postings.remove(picked);
         if posting.doc().is_some() {
-            assert!(posting.doc().unwrap().doc_id() >= least_id);
-            let idx = self.postings.binary_search(&posting).inspect(|&idx| {
+            debug_assert!(posting.doc().unwrap().doc_id() >= least_id);
+            let idx = picked + self.postings[picked..].binary_search(&posting).inspect(|&idx| {
                 log::warn!("the posting is removed from the list, this is a bug: {:?}, same posting: {:?}", posting, self.postings[idx]);
             }).unwrap_err();
             self.postings.insert(idx, posting);
         }
-        assert!(self
+        debug_assert!(self
             .postings
             .is_sorted_by_key(|posting| posting.doc().unwrap().doc_id()));
     }

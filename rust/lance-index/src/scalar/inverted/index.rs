@@ -536,7 +536,6 @@ impl InvertedPartition {
 
         let mut wand = Wand::new(operator, postings.into_iter(), &self.docs);
         let avgdl = self.docs.average_length();
-        log::info!("searching on partition {}", self.id);
         wand.search(
             is_phrase_query,
             params.limit.unwrap_or(usize::MAX),
