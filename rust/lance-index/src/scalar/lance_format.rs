@@ -271,26 +271,29 @@ impl IndexStore for LanceIndexStore {
         let path = self.index_dir.child(name);
 
         let other_store = dest_store.as_any().downcast_ref::<Self>();
-        if let Some(dest_lance_store) = other_store {
-            // If both this store and the destination are lance stores we can use object_store's copy
-            // This does blindly assume that both stores are using the same underlying object_store
-            // but there is no easy way to verify this and it happens to always be true at the moment
-            let dest_path = dest_lance_store.index_dir.child(name);
-            self.object_store.copy(&path, &dest_path).await
-        } else {
-            let reader = self.open_index_file(name).await?;
-            let mut writer = dest_store
-                .new_index_file(name, Arc::new(reader.schema().into()))
-                .await?;
-
-            for offset in (0..reader.num_rows()).step_by(4096) {
-                let next_offset = min(offset + 4096, reader.num_rows());
-                let batch = reader.read_range(offset..next_offset, None).await?;
-                writer.write_record_batch(batch).await?;
+        match other_store {
+            Some(dest_store) if dest_store.object_store.scheme() == self.object_store.scheme() => {
+                // If both this store and the destination are lance stores we can use object_store's copy
+                // This does blindly assume that both stores are using the same underlying object_store
+                // but there is no easy way to verify this and it happens to always be true at the moment
+                let dest_path = dest_store.index_dir.child(name);
+                self.object_store.copy(&path, &dest_path).await
             }
-            writer.finish().await?;
+            _ => {
+                let reader = self.open_index_file(name).await?;
+                let mut writer = dest_store
+                    .new_index_file(name, Arc::new(reader.schema().into()))
+                    .await?;
 
-            Ok(())
+                for offset in (0..reader.num_rows()).step_by(4096) {
+                    let next_offset = min(offset + 4096, reader.num_rows());
+                    let batch = reader.read_range(offset..next_offset, None).await?;
+                    writer.write_record_batch(batch).await?;
+                }
+                writer.finish().await?;
+
+                Ok(())
+            }
         }
     }
 

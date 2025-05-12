@@ -352,6 +352,10 @@ impl ObjectStore {
         self.scheme != "file" && self.scheme != "memory"
     }
 
+    pub fn scheme(&self) -> &str {
+        &self.scheme
+    }
+
     pub fn block_size(&self) -> usize {
         self.block_size
     }

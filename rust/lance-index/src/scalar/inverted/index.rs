@@ -1254,6 +1254,7 @@ impl PlainPostingList {
         )
     }
 
+    #[inline]
     pub fn doc(&self, i: usize) -> LocatedDocInfo {
         LocatedDocInfo::new(self.row_ids[i], self.frequencies[i])
     }
