@@ -166,7 +166,7 @@ fn compress_block(data: &[u32], buffer: &mut [u8], builder: &mut LargeBinaryBuil
 #[inline]
 fn compress_remainder(data: &[u32], builder: &mut LargeBinaryBuilder) -> Result<()> {
     for value in data.iter() {
-        builder.write_all(value.to_le_bytes().as_ref())?;
+        let _ = builder.write(value.to_le_bytes().as_ref())?;
     }
     Ok(())
 }
