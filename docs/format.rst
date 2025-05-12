@@ -365,7 +365,7 @@ Conflict resolution
 
 If two writers try to commit at the same time, one will succeed and the other
 will fail. The failed writer should attempt to retry the commit, but only if
-it's changes are compatible with the changes made by the successful writer.
+its changes are compatible with the changes made by the successful writer.
 
 The changes for a given commit are recorded as a transaction file, under the
 ``_transactions`` prefix in the dataset directory. The transaction file is a
@@ -378,7 +378,7 @@ The commit process is as follows:
 
  1. The writer finishes writing all data files.
  2. The writer creates a transaction file in the ``_transactions`` directory.
-    This files describes the operations that were performed, which is used for two
+    This file describes the operations that were performed, which is used for two
     purposes: (1) to detect conflicts, and (2) to re-build the manifest during
     retries.
  3. Look for any new commits since the writer started writing. If there are any,
@@ -416,7 +416,7 @@ The commit process is as follows:
 Note that the commit is effectively complete after step 2. If the writer fails
 after step 2, a reader will be able to detect the external store and object store
 are out-of-sync, and will try to synchronize the two stores. If the reattempt at
-synchronization fails, the reader will refuse to load. This is to ensure the that
+synchronization fails, the reader will refuse to load. This is to ensure that
 the dataset is always portable by copying the dataset directory without special
 tool.
 
@@ -445,7 +445,7 @@ Statistic values
 Three types of statistics are stored per column: null count, min value, max value.
 The min and max values are stored as their native data types in arrays.
 
-There are special behavior for different data types to account for nulls:
+There are special behaviors for different data types to account for nulls:
 
 For integer-based data types (including signed and unsigned integers, dates,
 and timestamps), if the min and max are unknown (all values are null), then the
@@ -542,7 +542,7 @@ If the commit fails, the writer will re-read the new ``next_row_id``, update
 the new row ids, and then try again. This is similar to how the ``max_fragment_id``
 is used to assign new fragment ids.
 
-When a row id updated, it it typically assigned a new row id rather than
+When a row id updated, it is typically assigned a new row id rather than
 reusing the old one. This is because this feature doesn't have a mechanism to
 update secondary indices that may reference the old values for the row id. By
 deleting the old row id and creating a new one, the secondary indices will avoid

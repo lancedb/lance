@@ -4,7 +4,7 @@ Training Multi-Modal models using a Lance dataset
 In this example we will be training a CLIP model for natural image based search using a Lance image-text dataset. 
 In particular, we will be using the `flickr_8k Lance dataset <https://www.kaggle.com/datasets/heyytanay/flickr-8k-lance>`_.
 
-The model architecture and part of the training code is adapted from Manan Goel's `Implementing CLIP with PyTorch Lightning <https://wandb.ai/manan-goel/coco-clip/reports/Implementing-CLIP-With-PyTorch-Lightning--VmlldzoyMzg4Njk1>`_ with necessary changes to for a minimal, lance-compatible training example.
+The model architecture and part of the training code are adapted from Manan Goel's `Implementing CLIP with PyTorch Lightning <https://wandb.ai/manan-goel/coco-clip/reports/Implementing-CLIP-With-PyTorch-Lightning--VmlldzoyMzg4Njk1>`_ with necessary changes to for a minimal, lance-compatible training example.
 
 Imports and Setup
 ~~~~~~~~~~~~~~~~~
@@ -134,7 +134,7 @@ Since we our training a CLIP model, we have the following:
 * :meth:`TextEncoder` that uses a pre-trained language model (:meth:`bert-base-cased` in this case) to transform text captions into feature vectors.
 * :meth:`Head` which is a Projection module projects these feature vectors into a common embedding space.
 
-Going into deeper details of the CLIP model and it's architectural nuances are out of the scope of this example, however if you wish to read more on it, you can read the official paper `here <https://arxiv.org/abs/2103.00020/>`_.
+Going into deeper details of the CLIP model and its architectural nuances are out of the scope of this example, however if you wish to read more on it, you can read the official paper `here <https://arxiv.org/abs/2103.00020/>`_.
 
 Now that we have understood the general summary of the model, let's define all the required modules.
 
@@ -235,7 +235,7 @@ In order for us to train, we will define the models, tokenizer and the optimizer
     text_encoder = TextEncoder(model_name=Config.text_encoder_model).to('cuda')
     text_head = Head(Config.text_embed_dim, Config.projection_dim).to('cuda')
 
-    # Since we our optimizing two different models together, we will define parameters manually
+    # Since we are optimizing two different models together, we will define parameters manually
     parameters = [
         {"params": img_encoder.parameters(), "lr": Config.img_enc_lr},
         {"params": text_encoder.parameters(), "lr": Config.text_enc_lr},

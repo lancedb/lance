@@ -3,7 +3,7 @@
 
 //! Table maintenance for optimizing table layout.
 //!
-//! As a table is updated, it's layout can become suboptimal. For example, if
+//! As a table is updated, its layout can become suboptimal. For example, if
 //! a series of small streaming appends are performed, eventually there will be
 //! a large number of small files. This imposes an overhead to track the large
 //! number of files and for very small files can make it harder to read data
@@ -237,7 +237,7 @@ pub async fn compact_files(
     Ok(metrics)
 }
 
-/// Information about a fragment used to decide it's fate in compaction
+/// Information about a fragment used to decide its fate in compaction
 #[derive(Debug)]
 struct FragmentMetrics {
     /// The number of original rows in the fragment

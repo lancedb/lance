@@ -293,7 +293,7 @@ pub struct Scanner {
 
     /// If Some then results will be ordered by the provided ordering
     ///
-    /// If there are multiple columns the the results will first be ordered
+    /// If there are multiple columns the results will first be ordered
     /// by the first column.  Then, any values whose first column is equal
     /// will be sorted by the next column, and so on.
     ///
