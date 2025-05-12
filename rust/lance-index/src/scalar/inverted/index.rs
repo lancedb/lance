@@ -409,17 +409,6 @@ impl InvertedPartition {
     pub fn store(&self) -> &dyn IndexStore {
         self.store.as_ref()
     }
-    // pub fn num_docs(&self) -> usize {
-    //     self.docs.len()
-    // }
-
-    // pub fn num_tokens(&self) -> usize {
-    //     self.tokens.len()
-    // }
-
-    // pub fn size(&self) -> u64 {
-    //     self.inverted_list.size()
-    // }
 
     pub async fn load(store: Arc<dyn IndexStore>, id: u64) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;

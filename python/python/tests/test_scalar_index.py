@@ -489,9 +489,9 @@ def test_fts_stats(dataset):
     assert params["language"] == "English"
     assert params["max_token_length"] == 40
     assert params["lower_case"] is True
-    assert params["stem"] is False
+    assert params["stem"] is True
     assert params["remove_stop_words"] is True
-    assert params["ascii_folding"] is False
+    assert params["ascii_folding"] is True
 
 
 def test_fts_on_list(tmp_path):
@@ -564,7 +564,7 @@ def test_fts_phrase_query(tmp_path):
     )
 
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", "INVERTED")
+    ds.create_scalar_index("text", "INVERTED", with_position=True)
 
     results = ds.to_table(
         full_text_query='"frodo was a puppy"',
@@ -1167,23 +1167,29 @@ def test_index_prewarm(tmp_path: Path):
     test_table_size = 100
     test_table = pa.table(
         {
-            "fts": ["a" for _ in range(test_table_size)],
+            "fts": ["word" for _ in range(test_table_size)],
         }
     )
 
     # Write index, cache should not be populated
     ds = lance.write_dataset(test_table, tmp_path)
     ds.create_scalar_index("fts", index_type="INVERTED")
-    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback, full_text_query="word"
+    ).to_table()
     assert scan_stats.parts_loaded > 0
 
     # Fresh load, no prewarm, cache should not be populated
     ds = lance.dataset(tmp_path)
-    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback, full_text_query="word"
+    ).to_table()
     assert scan_stats.parts_loaded > 0
 
     # Prewarm index, cache should be populated
     ds = lance.dataset(tmp_path)
     ds.prewarm_index("fts_idx")
-    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback, full_text_query="word"
+    ).to_table()
     assert scan_stats.parts_loaded == 0

@@ -107,10 +107,7 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         self.update_index(new_data).await?;
-
-        let start = std::time::Instant::now();
         self.write(dest_store).await?;
-        log::info!("FTS writing documents elapsed {:?}", start.elapsed());
         Ok(())
     }
 
