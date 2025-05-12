@@ -1340,7 +1340,7 @@ pub struct PostingListBuilder {
 impl PostingListBuilder {
     pub fn size(&self) -> u64 {
         (std::mem::size_of::<u32>() * self.doc_ids.len()
-            + std::mem::size_of::<f32>() * self.frequencies.len()
+            + std::mem::size_of::<u32>() * self.frequencies.len()
             + self
                 .positions
                 .as_ref()
