@@ -36,11 +36,11 @@ pub enum Compression {
     BlockMaxBitpack,
 }
 
-impl Into<&str> for Compression {
-    fn into(self) -> &'static str {
-        match self {
-            Self::Bitpack => "bitpack",
-            Self::BlockMaxBitpack => "block_max_bitpack",
+impl From<Compression> for &str {
+    fn from(value: Compression) -> Self {
+        match value {
+            Compression::Bitpack => "bitpack",
+            Compression::BlockMaxBitpack => "block_max_bitpack",
         }
     }
 }

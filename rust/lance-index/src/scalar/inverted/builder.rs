@@ -61,6 +61,11 @@ lazy_static! {
         .unwrap_or_else(|_| "256".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_PARTITION_SIZE");
+    // the target size of partition after merging in MiB (uncompressed format)
+    pub static ref LANCE_FTS_TARGET_SIZE: u64 = std::env::var("LANCE_FTS_TARGET_SIZE")
+        .unwrap_or_else(|_| "4096".to_string())
+        .parse()
+        .expect("failed to parse LANCE_FTS_TARGET_SIZE");
 }
 
 #[derive(Debug)]
@@ -232,11 +237,7 @@ impl InvertedIndexBuilder {
                 ),
         )
         .await?;
-        let mut merger = SizeBasedMerger::new(
-            dest_store,
-            partitions,
-            (*LANCE_FTS_PARTITION_SIZE << 20) * 8,
-        );
+        let mut merger = SizeBasedMerger::new(dest_store, partitions, *LANCE_FTS_TARGET_SIZE << 20);
         let partitions = merger.merge().await?;
         self.write_metadata(dest_store, &partitions).await?;
         Ok(())
