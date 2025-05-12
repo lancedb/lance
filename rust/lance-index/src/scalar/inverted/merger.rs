@@ -26,7 +26,7 @@ pub trait Merger {
 // until the size of the new partition reaches the target size.
 pub struct SizeBasedMerger<'a> {
     dest_store: &'a dyn IndexStore,
-    input: Vec<&'a InvertedPartition>,
+    input: Vec<InvertedPartition>,
     target_size: u64,
     builder: InnerBuilder,
     partitions: Vec<u64>,
@@ -39,7 +39,7 @@ impl<'a> SizeBasedMerger<'a> {
     // because less partitions means faster query.
     pub fn new(
         dest_store: &'a dyn IndexStore,
-        input: impl IntoIterator<Item = &'a InvertedPartition>,
+        input: impl IntoIterator<Item = InvertedPartition>,
         target_size: u64,
     ) -> Self {
         let input = input.into_iter().collect::<Vec<_>>();
@@ -98,9 +98,8 @@ impl Merger for SizeBasedMerger<'_> {
         );
         let mut estimated_size = 0;
         let start = std::time::Instant::now();
-        for idx in 0..self.input.len() {
-            let part = self.input[idx];
-
+        let parts = std::mem::take(&mut self.input);
+        for (idx, part) in parts.into_iter().enumerate() {
             // single partition can index up to u32::MAX documents,
             // or target size is reached
             if self.builder.docs.len() + part.docs.len() > u32::MAX as usize
