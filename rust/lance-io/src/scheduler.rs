@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
-use tracing::{instrument, Instrument};
 
 use lance_core::{Error, Result};
 
@@ -483,7 +482,6 @@ impl IoTask {
 
 // Every time a scheduler starts up it launches a task to run the I/O loop.  This loop
 // repeats endlessly until the scheduler is destroyed.
-#[instrument(skip(tasks))]
 async fn run_io_loop(tasks: Arc<IoQueue>) {
     // Pop the first finished task off the queue and submit another until
     // we are done
@@ -491,7 +489,7 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
         let next_task = tasks.pop().await;
         match next_task {
             Some(task) => {
-                tokio::spawn(task.run().in_current_span());
+                tokio::spawn(task.run());
             }
             None => {
                 // The sender has been dropped, we are done

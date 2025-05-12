@@ -10,7 +10,6 @@ use lance_table::{
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 use snafu::location;
-use tracing::instrument;
 
 use crate::{
     dataset::{
@@ -149,7 +148,6 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    #[instrument(name = "CommitBuilder::execute", level = "debug", skip_all)]
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let session = self
             .session

@@ -24,7 +24,6 @@ use futures::stream::{BoxStream, Stream};
 use futures::{stream, FutureExt, TryFutureExt};
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
-use lance_core::utils::stream::LanceTryStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
@@ -99,8 +98,6 @@ pub struct LanceStream {
     ///
     /// Only set on v2 scans.  Used to record scan metrics.
     scan_scheduler: Option<Arc<ScanScheduler>>,
-
-    span: tracing::Span,
 }
 
 impl LanceStream {
@@ -130,7 +127,6 @@ impl LanceStream {
         config: LanceScanConfig,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
-        span: tracing::Span,
     ) -> Result<Self> {
         let is_v2_scan = fragments
             .iter()
@@ -139,12 +135,10 @@ impl LanceStream {
             .unwrap_or(false);
         if is_v2_scan {
             Self::try_new_v2(
-                dataset, fragments, offsets, projection, config, metrics, partition, span,
+                dataset, fragments, offsets, projection, config, metrics, partition,
             )
         } else {
-            Self::try_new_v1(
-                dataset, fragments, projection, config, metrics, partition, span,
-            )
+            Self::try_new_v1(dataset, fragments, projection, config, metrics, partition)
         }
     }
 
@@ -157,7 +151,6 @@ impl LanceStream {
         config: LanceScanConfig,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
-        span: tracing::Span,
     ) -> Result<Self> {
         let scan_metrics = ScanMetrics::new(metrics, partition);
         let timer = scan_metrics.baseline_metrics.elapsed_compute().timer();
@@ -292,7 +285,7 @@ impl LanceStream {
             // As soon as we open the fragment we will start scheduling and that will kick off many background
             // tasks (not tracked by this stream) to read I/O.  The limit here is really to limit how many open
             // files we have.  It's not going to have much affect on how much RAM we are using.
-            .try_buffered_with_ordering(frag_parallelism, config.ordered_output)
+            .try_buffered(frag_parallelism)
             .boxed();
         let batches = batches
             .try_flatten()
@@ -301,7 +294,8 @@ impl LanceStream {
             // TODO: Ideally this will eventually get tied into datafusion as a # of partitions.  This will let
             // us fully fuse decode into the first half of the plan.  Currently there is likely to be a thread
             // transfer between the two steps.
-            .try_buffered_with_ordering(get_num_compute_intensive_cpus(), config.ordered_output)
+            .try_buffered(get_num_compute_intensive_cpus())
+            .stream_in_current_span()
             .boxed();
 
         timer.done();
@@ -311,7 +305,6 @@ impl LanceStream {
             config,
             scan_metrics,
             scan_scheduler: Some(scan_scheduler_clone),
-            span,
         })
     }
 
@@ -323,7 +316,6 @@ impl LanceStream {
         config: LanceScanConfig,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
-        span: tracing::Span,
     ) -> Result<Self> {
         let scan_metrics = ScanMetrics::new(metrics, partition);
         let timer = scan_metrics.baseline_metrics.elapsed_compute().timer();
@@ -341,7 +333,7 @@ impl LanceStream {
             .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
             .collect::<Vec<_>>();
 
-        let inner_stream = {
+        let inner_stream = if config.ordered_output {
             let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
                     Ok(open_file(
@@ -354,7 +346,7 @@ impl LanceStream {
                         None,
                     ))
                 })
-                .try_buffered_with_ordering(fragment_readahead, config.ordered_output);
+                .try_buffered(fragment_readahead);
             let tasks = readers.and_then(move |reader| {
                 std::future::ready(
                     reader
@@ -367,7 +359,38 @@ impl LanceStream {
                 // We must be waiting to finish a file before moving onto thenext. That's an issue.
                 .try_flatten()
                 // We buffer up to `batch_readahead` batches across all streams.
-                .try_buffered_with_ordering(fragment_readahead, config.ordered_output)
+                .try_buffered(config.batch_readahead)
+                .stream_in_current_span()
+                .boxed()
+        } else {
+            let readers = stream::iter(file_fragments)
+                .map(move |file_fragment| {
+                    Ok(open_file(
+                        file_fragment,
+                        project_schema.clone(),
+                        FragReadConfig::default()
+                            .with_row_id(config.with_row_id)
+                            .with_row_address(config.with_row_address),
+                        config.with_make_deletions_null,
+                        None,
+                    ))
+                })
+                .try_buffered(fragment_readahead);
+            let tasks = readers.and_then(move |reader| {
+                std::future::ready(
+                    reader
+                        .read_all(config.batch_size as u32)
+                        .map(|task_stream| task_stream.map(Ok))
+                        .map_err(DataFusionError::from),
+                )
+            });
+            // When we flatten the streams (one stream per fragment), we allow
+            // `fragment_readahead` stream to be read concurrently.
+            tasks
+                .try_flatten_unordered(config.fragment_readahead)
+                // We buffer up to `batch_readahead` batches across all streams.
+                .try_buffer_unordered(config.batch_readahead)
+                .stream_in_current_span()
                 .boxed()
         };
 
@@ -382,7 +405,6 @@ impl LanceStream {
             config,
             scan_metrics,
             scan_scheduler: None,
-            span,
         })
     }
 }
@@ -421,11 +443,6 @@ impl Stream for LanceStream {
         if matches!(poll, Poll::Ready(None)) {
             if let Some(scan_scheduler) = this.scan_scheduler.as_ref() {
                 this.scan_metrics.io_metrics.record_final(scan_scheduler);
-
-                let scan_stats = scan_scheduler.stats();
-                this.span.record("iops", scan_stats.iops);
-                this.span.record("requests", scan_stats.requests);
-                this.span.record("bytes_read", scan_stats.bytes_read);
             }
         }
         this.scan_metrics.baseline_metrics.record_poll(poll)
@@ -607,24 +624,12 @@ impl ExecutionPlan for LanceScanExec {
         let config = self.config.clone();
         let metrics = self.metrics.clone();
 
-        let span = tracing::debug_span!(
-            "LanceScanExec::execute",
-            num_fields = self.projection.fields_pre_order().count(),
-            range = ?range,
-            num_fragments = fragments.len(),
-            partition,
-            iops = tracing::field::Empty,
-            requests = tracing::field::Empty,
-            bytes_read = tracing::field::Empty,
-        );
-
-        let span_copy = span.clone(); // Send one to record metrics.
         let lance_fut_stream = stream::once(async move {
             LanceStream::try_new(
-                dataset, fragments, range, projection, config, &metrics, partition, span_copy,
+                dataset, fragments, range, projection, config, &metrics, partition,
             )
         });
-        let lance_stream = lance_fut_stream.try_flatten().stream_in_span(span);
+        let lance_stream = lance_fut_stream.try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
             lance_stream,
