@@ -39,10 +39,9 @@ impl<'a> SizeBasedMerger<'a> {
     // because less partitions means faster query.
     pub fn new(
         dest_store: &'a dyn IndexStore,
-        input: impl IntoIterator<Item = InvertedPartition>,
+        input: Vec<InvertedPartition>,
         target_size: u64,
     ) -> Self {
-        let input = input.into_iter().collect::<Vec<_>>();
         let max_id = input.iter().map(|p| p.id()).max().unwrap_or(0);
         Self {
             dest_store,
@@ -99,6 +98,7 @@ impl Merger for SizeBasedMerger<'_> {
         let mut estimated_size = 0;
         let start = std::time::Instant::now();
         let parts = std::mem::take(&mut self.input);
+        let num_parts = parts.len();
         for (idx, part) in parts.into_iter().enumerate() {
             // single partition can index up to u32::MAX documents,
             // or target size is reached
@@ -152,7 +152,7 @@ impl Merger for SizeBasedMerger<'_> {
             log::info!(
                 "merged {}/{} partitions in {:?}",
                 idx + 1,
-                self.input.len(),
+                num_parts,
                 start.elapsed()
             );
         }

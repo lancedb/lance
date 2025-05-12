@@ -564,7 +564,9 @@ def test_fts_phrase_query(tmp_path):
     )
 
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", "INVERTED", with_position=True)
+    ds.create_scalar_index(
+        "text", "INVERTED", with_position=True, remove_stop_words=False
+    )
 
     results = ds.to_table(
         full_text_query='"frodo was a puppy"',

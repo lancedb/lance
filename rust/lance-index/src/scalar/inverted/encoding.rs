@@ -35,6 +35,25 @@ pub enum Compression {
     BlockMaxBitpack,
 }
 
+impl Into<&str> for Compression {
+    fn into(self) -> &'static str {
+        match self {
+            Self::Bitpack => "bitpack",
+            Self::BlockMaxBitpack => "block_max_bitpack",
+        }
+    }
+}
+
+impl From<&str> for Compression {
+    fn from(s: &str) -> Self {
+        match s {
+            "bitpack" => Self::Bitpack,
+            "block_max_bitpack" => Self::BlockMaxBitpack,
+            _ => panic!("Unknown compression type: {}", s),
+        }
+    }
+}
+
 // compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
 #[allow(dead_code)]

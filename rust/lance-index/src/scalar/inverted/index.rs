@@ -804,14 +804,6 @@ impl PostingListReader {
         let posting_cache = Cache::builder()
             .max_capacity(*CACHE_SIZE as u64)
             .weigher(|_, posting: &PostingList| posting.deep_size_of() as u32)
-            .eviction_listener(|token_id, posting_list, reason| {
-                log::info!(
-                    "Evicted posting list {}: {}KiB ({:?})",
-                    token_id,
-                    posting_list.deep_size_of() / 1024,
-                    reason
-                );
-            })
             .build();
         let position_cache = Cache::builder()
             .max_capacity(*CACHE_SIZE as u64)

@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::{fmt::Debug, sync::atomic::AtomicU64};
 
-use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::IndexStore;
+use crate::scalar::{inverted::encoding::Compression, lance_format::LanceIndexStore};
 use crate::vector::graph::OrderedFloat;
 use arrow::datatypes;
 use arrow::{array::AsArray, compute::concat_batches};
@@ -355,7 +355,11 @@ impl InnerBuilder {
             writer.write_record_batch(batch).await?;
         }
 
-        writer.finish().await?;
+        let metadata = HashMap::from_iter(vec![(
+            "compression_type".to_owned(),
+            Into::<&str>::into(Compression::Bitpack).to_owned(),
+        )]);
+        writer.finish_with_metadata(metadata).await?;
 
         Ok(())
     }
