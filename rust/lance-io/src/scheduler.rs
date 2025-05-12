@@ -863,8 +863,8 @@ impl FileScheduler {
                         while copy_offset < orig_size {
                             updated_index += 1;
                             let next_range = &updated_requests[updated_index];
-                            let bytes_to_take = (orig_range.end - copy_offset)
-                                .min(next_range.end - next_range.start);
+                            let bytes_to_take =
+                                (orig_size - copy_offset).min(next_range.end - next_range.start);
                             merged_bytes.extend_from_slice(
                                 &bytes_vec[updated_index].slice(0..bytes_to_take as usize),
                             );
@@ -1058,6 +1058,19 @@ mod tests {
             "data is not the same"
         );
         assert_eq!(8, scheduler.stats().iops);
+
+        let reads = (0..44)
+            .map(|i| (i * 1_000_000..(i + 1) * 1_000_000))
+            .collect::<Vec<_>>();
+        let req = file_scheduler.submit_request(reads, 0);
+        let bytes = req.await.unwrap();
+        for (i, bytes) in bytes.iter().enumerate() {
+            assert!(
+                bytes == &some_data[i * 1_000_000..(i + 1) * 1_000_000],
+                "data is not the same"
+            );
+        }
+        assert_eq!(11, scheduler.stats().iops);
     }
 
     #[tokio::test]
