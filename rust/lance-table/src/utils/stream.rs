@@ -521,11 +521,15 @@ mod tests {
                             assert_eq!(total_actually_deleted, expected_deletions);
                             if expected_deletions > 0 && with_row_id {
                                 if make_deletions_null {
+                                    // If we make deletions null we get 3 batches of all-null and then
+                                    // a batch of half-null
                                     assert_eq!(
-                                        batches[0][ROW_ID].as_primitive::<UInt64Type>().value(0),
+                                        batches[3][ROW_ID].as_primitive::<UInt64Type>().value(0),
                                         u64::from(RowAddress::new_from_parts(frag_id, 30))
                                     );
+                                    assert_eq!(batches[3][ROW_ID].null_count(), 5);
                                 } else {
+                                    // If we materialize deletions the first row will be 35
                                     assert_eq!(
                                         batches[0][ROW_ID].as_primitive::<UInt64Type>().value(0),
                                         u64::from(RowAddress::new_from_parts(frag_id, 35))
