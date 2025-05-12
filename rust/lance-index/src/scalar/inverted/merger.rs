@@ -12,7 +12,7 @@ use super::{
     InvertedPartition, PostingListBuilder,
 };
 
-pub(crate) trait Merger {
+pub trait Merger {
     // Merge the partitions and write new partitions,
     // the new partitions are returned.
     // This method would read all the input partitions at the same time,
@@ -24,7 +24,7 @@ pub(crate) trait Merger {
 // it would read the posting lists for each token from
 // the partitions and write them to a new partition,
 // until the size of the new partition reaches the target size.
-pub(crate) struct SizeBasedMerger<'a> {
+pub struct SizeBasedMerger<'a> {
     dest_store: &'a dyn IndexStore,
     input: Vec<&'a InvertedPartition>,
     target_size: u64,
@@ -54,7 +54,7 @@ impl<'a> SizeBasedMerger<'a> {
     }
 
     async fn flush(&mut self) -> Result<()> {
-        if self.builder.tokens.len() > 0 {
+        if !self.builder.tokens.is_empty() {
             log::info!("flushing partition {}", self.builder.id());
             let start = std::time::Instant::now();
             self.builder.write(self.dest_store).await?;
@@ -70,7 +70,7 @@ impl<'a> SizeBasedMerger<'a> {
     }
 }
 
-impl<'a> Merger for SizeBasedMerger<'a> {
+impl Merger for SizeBasedMerger<'_> {
     async fn merge(&mut self) -> Result<Vec<u64>> {
         if self.input.len() <= 1 {
             for part in self.input.iter() {

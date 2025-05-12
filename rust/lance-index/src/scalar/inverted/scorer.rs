@@ -61,12 +61,12 @@ impl<'a> BM25Scorer<'a> {
     }
 }
 
-impl<'a> Scorer for BM25Scorer<'a> {
+impl Scorer for BM25Scorer<'_> {
     fn score(&self, token: &str, freq: u32, doc_tokens: u32) -> f32 {
         let freq = freq as f32;
         let doc_tokens = doc_tokens as f32;
         let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avgdl());
-        return idf(self.nq(token), self.num_docs) * (K1 + 1.0) * freq / (freq + doc_norm);
+        idf(self.nq(token), self.num_docs) * (K1 + 1.0) * freq / (freq + doc_norm)
     }
 }
 

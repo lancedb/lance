@@ -214,6 +214,7 @@ pub struct Wand<'a> {
     cur_doc: Option<u64>,
     // we need to sort the posting iterators frequently,
     // so wrap them in `Box` to avoid the cost of copying
+    #[allow(clippy::vec_box)]
     postings: Vec<Box<PostingIterator>>,
     docs: &'a DocSet,
 }
@@ -282,7 +283,7 @@ impl<'a> Wand<'a> {
                 DocInfo::Raw(doc) => {
                     // if the doc is not located, we need to find the row id
                     // in the doc set. This is a bit slow, but it should be rare.
-                    self.docs.row_id(doc.doc_id as u32)
+                    self.docs.row_id(doc.doc_id)
                 }
                 DocInfo::Located(doc) => doc.row_id,
             };
@@ -468,11 +469,11 @@ impl PositionIterator {
     fn relative_position(&self) -> Option<u32> {
         if self.index < self.positions.len() {
             match self.positions.data_type() {
-                &DataType::Int32 => Some(
+                DataType::Int32 => Some(
                     self.positions.as_primitive::<Int32Type>().value(self.index) as u32
                         - self.position_in_query,
                 ),
-                &DataType::UInt32 => Some(
+                DataType::UInt32 => Some(
                     self.positions
                         .as_primitive::<UInt32Type>()
                         .value(self.index)
@@ -491,12 +492,12 @@ impl PositionIterator {
     fn next(&mut self, least_relative_pos: u32) {
         let least_pos = least_relative_pos + self.position_in_query;
         self.index = match self.positions.data_type() {
-            &DataType::Int32 => self
+            DataType::Int32 => self
                 .positions
                 .as_primitive::<Int32Type>()
                 .values()
                 .partition_point(|&pos| (pos as u32) < least_pos),
-            &DataType::UInt32 => self
+            DataType::UInt32 => self
                 .positions
                 .as_primitive::<UInt32Type>()
                 .values()

@@ -393,7 +393,7 @@ impl ScalarIndex for InvertedIndex {
 }
 
 #[derive(Debug, Clone, DeepSizeOf)]
-pub(crate) struct InvertedPartition {
+pub struct InvertedPartition {
     id: u64,
     store: Arc<dyn IndexStore>,
     pub(crate) tokens: TokenSet,
@@ -457,7 +457,7 @@ impl InvertedPartition {
         for token in tokens {
             let fuzziness = match fuzziness {
                 Some(fuzziness) => fuzziness,
-                None => MatchQuery::auto_fuzziness(&token),
+                None => MatchQuery::auto_fuzziness(token),
             };
             let lev =
                 fst::automaton::Levenshtein::new(token, fuzziness).map_err(|e| Error::Index {
@@ -641,6 +641,10 @@ impl TokenSet {
 
     pub fn len(&self) -> usize {
         self.tokens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub(crate) fn iter(&self) -> TokenIterator {
@@ -861,6 +865,10 @@ impl PostingListReader {
             Some(ref offsets) => offsets.len(),
             None => self.reader.num_rows(),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     // the file size of the posting lists
@@ -1093,15 +1101,15 @@ impl PostingList {
 
     pub fn has_position(&self) -> bool {
         match self {
-            PostingList::Plain(posting) => posting.positions.is_some(),
-            PostingList::Compressed(posting) => posting.positions.is_some(),
+            Self::Plain(posting) => posting.positions.is_some(),
+            Self::Compressed(posting) => posting.positions.is_some(),
         }
     }
 
     pub fn set_positions(&mut self, positions: ListArray) {
         match self {
-            PostingList::Plain(posting) => posting.positions = Some(positions),
-            PostingList::Compressed(posting) => {
+            Self::Plain(posting) => posting.positions = Some(positions),
+            Self::Compressed(posting) => {
                 posting.positions = Some(positions.value(0).as_list::<i32>().clone());
             }
         }
@@ -1109,23 +1117,27 @@ impl PostingList {
 
     pub fn max_score(&self) -> Option<f32> {
         match self {
-            PostingList::Plain(posting) => posting.max_score,
-            PostingList::Compressed(posting) => Some(posting.max_score),
+            Self::Plain(posting) => posting.max_score,
+            Self::Compressed(posting) => Some(posting.max_score),
         }
     }
 
     pub fn len(&self) -> usize {
         match self {
-            PostingList::Plain(posting) => posting.len(),
-            PostingList::Compressed(posting) => posting.length as usize,
+            Self::Plain(posting) => posting.len(),
+            Self::Compressed(posting) => posting.length as usize,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn into_builder(self, docs: &DocSet) -> PostingListBuilder {
         let mut builder = PostingListBuilder::new(self.has_position());
         match self {
             // legacy format
-            PostingList::Plain(posting) => {
+            Self::Plain(posting) => {
                 // convert the posting list to the new format:
                 // 1. map row ids to doc ids
                 // 2. sort the posting list by doc ids
@@ -1158,7 +1170,7 @@ impl PostingList {
                     builder.add(item.doc_id, item.positions);
                 }
             }
-            PostingList::Compressed(posting) => {
+            Self::Compressed(posting) => {
                 posting.iter().for_each(|(doc_id, freq, positions)| {
                     let positions = match positions {
                         Some(positions) => {
@@ -1380,7 +1392,7 @@ impl PostingListBuilder {
 
     pub fn add(&mut self, doc_id: u32, term_positions: PositionRecorder) {
         self.doc_ids.push(doc_id);
-        self.frequencies.push(term_positions.len() as u32);
+        self.frequencies.push(term_positions.len());
         if let Some(positions) = self.positions.as_mut() {
             positions.push(term_positions.into_vec());
         }
@@ -1520,15 +1532,15 @@ pub enum DocInfo {
 impl DocInfo {
     pub fn doc_id(&self) -> u64 {
         match self {
-            DocInfo::Located(info) => info.row_id,
-            DocInfo::Raw(info) => info.doc_id as u64,
+            Self::Located(info) => info.row_id,
+            Self::Raw(info) => info.doc_id as u64,
         }
     }
 
     pub fn frequency(&self) -> u32 {
         match self {
-            DocInfo::Located(info) => info.frequency as u32,
-            DocInfo::Raw(info) => info.frequency,
+            Self::Located(info) => info.frequency as u32,
+            Self::Raw(info) => info.frequency,
         }
     }
 }

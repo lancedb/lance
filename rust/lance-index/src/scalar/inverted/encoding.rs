@@ -14,7 +14,7 @@ use tracing::instrument;
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 #[allow(dead_code)]
-pub(crate) enum Compression {
+pub enum Compression {
     // each block is:
     // - 4 bytes for the first doc id
     // - 1 byte for the number of bits used for the doc ids
@@ -105,7 +105,7 @@ pub fn compress_posting_slices<'a>(
     let mut freq_buffer = Vec::with_capacity(BLOCK_SIZE);
     for (doc_id_chunk, freq_chunk) in std::iter::zip(doc_ids, frequencies) {
         let (doc_id_chunk, freq_chunk) =
-            if doc_id_buffer.len() == 0 && doc_id_chunk.len() == BLOCK_SIZE {
+            if doc_id_buffer.is_empty() && doc_id_chunk.len() == BLOCK_SIZE {
                 (doc_id_chunk, freq_chunk) // no need to copy
             } else {
                 doc_id_buffer.extend_from_slice(doc_id_chunk);
@@ -130,7 +130,7 @@ pub fn compress_posting_slices<'a>(
     }
 
     // we don't compress the last block if it is not full
-    if doc_id_buffer.len() > 0 {
+    if !doc_id_buffer.is_empty() {
         compress_remainder(&doc_id_buffer, &mut builder)?;
         compress_remainder(&freq_buffer, &mut builder)?;
         builder.append_value("");
@@ -147,9 +147,9 @@ fn compress_sorted_block(
     let compressor = BitPacker4x::new();
     let num_bits = compressor.num_bits_sorted(data[0], data);
     let num_bytes = compressor.compress_sorted(data[0], data, buffer, num_bits);
-    builder.write(data[0].to_le_bytes().as_ref())?;
-    builder.write(&[num_bits])?;
-    builder.write(&buffer[..num_bytes])?;
+    let _ = builder.write(data[0].to_le_bytes().as_ref())?;
+    let _ = builder.write(&[num_bits])?;
+    let _ = builder.write(&buffer[..num_bytes])?;
     Ok(())
 }
 
@@ -158,15 +158,15 @@ fn compress_block(data: &[u32], buffer: &mut [u8], builder: &mut LargeBinaryBuil
     let compressor = BitPacker4x::new();
     let num_bits = compressor.num_bits(data);
     let num_bytes = compressor.compress(data, buffer, num_bits);
-    builder.write(&[num_bits])?;
-    builder.write(&buffer[..num_bytes])?;
+    let _ = builder.write(&[num_bits])?;
+    let _ = builder.write(&buffer[..num_bytes])?;
     Ok(())
 }
 
 #[inline]
 fn compress_remainder(data: &[u32], builder: &mut LargeBinaryBuilder) -> Result<()> {
     for value in data.iter() {
-        builder.write(value.to_le_bytes().as_ref())?;
+        builder.write_all(value.to_le_bytes().as_ref())?;
     }
     Ok(())
 }
@@ -178,7 +178,7 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
     );
     // record the number of positions in the first binary
     let num_positions = positions.len() as u32;
-    builder.append_value(&num_positions.to_le_bytes().as_ref());
+    builder.append_value(num_positions.to_le_bytes().as_ref());
 
     let position_chunks = positions.chunks_exact(BLOCK_SIZE);
     let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];

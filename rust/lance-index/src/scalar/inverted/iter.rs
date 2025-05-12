@@ -13,11 +13,11 @@ use super::{
     PostingList,
 };
 
-pub(crate) enum TokenSource<'a> {
+pub enum TokenSource<'a> {
     HashMap(hash_map::Iter<'a, String, u32>),
     Fst(fst::map::Stream<'a>),
 }
-pub(crate) struct TokenIterator<'a> {
+pub struct TokenIterator<'a> {
     source: TokenSource<'a>,
 }
 
@@ -27,7 +27,7 @@ impl<'a> TokenIterator<'a> {
     }
 }
 
-impl<'a> Iterator for TokenIterator<'a> {
+impl Iterator for TokenIterator<'_> {
     type Item = (String, u32);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -77,7 +77,7 @@ impl<'a> Iterator for PostingListIterator<'a> {
     }
 }
 
-pub(crate) type PlainPostingListIterator<'a> =
+pub type PlainPostingListIterator<'a> =
     Box<dyn Iterator<Item = (u64, f32, Option<Box<dyn Iterator<Item = u32> + 'a>>)> + 'a>;
 
 pub struct CompressedPostingListIterator {

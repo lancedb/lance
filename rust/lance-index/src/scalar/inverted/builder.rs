@@ -255,7 +255,7 @@ impl Default for InvertedIndexBuilder {
 
 // builder for single partition
 #[derive(Debug)]
-pub(crate) struct InnerBuilder {
+pub struct InnerBuilder {
     id: u64,
     pub(crate) tokens: TokenSet,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
@@ -353,7 +353,7 @@ impl InnerBuilder {
                 );
             }
         }
-        if buffer.len() > 0 {
+        if !buffer.is_empty() {
             let batch = concat_batches(&schema, buffer.iter())?;
             writer.write_record_batch(batch).await?;
         }
@@ -481,7 +481,7 @@ impl IndexWorker {
 
     #[instrument(level = "debug", skip_all)]
     async fn flush(&mut self) -> Result<()> {
-        if self.builder.tokens.len() == 0 {
+        if self.builder.tokens.is_empty() {
             return Ok(());
         }
 
@@ -504,7 +504,7 @@ impl IndexWorker {
     }
 
     async fn finish(mut self) -> Result<Vec<u64>> {
-        if self.builder.tokens.len() > 0 {
+        if !self.builder.tokens.is_empty() {
             self.flush().await?;
         }
         Ok(self.partitions)
