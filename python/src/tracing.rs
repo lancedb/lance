@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
-use pyo3::exceptions::PyValueError;
 use pyo3::pyclass;
 use pyo3::pyfunction;
 use pyo3::pymethods;
@@ -27,48 +26,30 @@ use pyo3::PyResult;
 use tracing::field::Visit;
 use tracing::span;
 use tracing::subscriber;
-use tracing::Level;
-use tracing::Subscriber;
+use tracing::Event;
 use tracing_chrome::ChromeLayer;
 use tracing_chrome::{ChromeLayerBuilder, TraceStyle};
 use tracing_subscriber::filter;
-use tracing_subscriber::filter::Filtered;
-use tracing_subscriber::filter::Targets;
-use tracing_subscriber::layer::Layered;
+use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::Registry;
 
-pub type TracingSubscriber = Layered<Filtered<ChromeLayer<Registry>, Targets, Registry>, Registry>;
-
 lazy_static::lazy_static! {
-    static ref SUBSCRIBER: LoggingSubscriberRef = LoggingPassthrough::init();
+    static ref SUBSCRIBER: Arc<RwLock<Option<LoggingPassthroughState>>> = Arc::new(RwLock::new(None));
 }
 
 struct LoggingPassthroughState {
-    inner: Option<TracingSubscriber>,
-    level: Level,
+    inner: Option<ChromeLayer<Registry>>,
+    level: log::Level,
 }
 
-impl Default for LoggingPassthroughState {
-    fn default() -> Self {
-        Self {
-            inner: None,
-            // This value doesn't matter, we'll override it in `initialize_tracing`
-            level: Level::INFO,
-        }
+impl LoggingPassthroughState {
+    fn new(level: log::Level) -> Self {
+        Self { inner: None, level }
     }
-}
 
-#[derive(Default)]
-struct LoggingPassthrough {
-    state: RwLock<LoggingPassthroughState>,
-}
-
-impl LoggingPassthrough {
-    fn init() -> LoggingSubscriberRef {
-        let subscriber = LoggingSubscriberRef(Arc::new(Self::default()));
-        subscriber::set_global_default(subscriber.clone()).unwrap();
-        subscriber
+    fn set_inner(&mut self, inner: ChromeLayer<Registry>) {
+        self.inner = Some(inner);
     }
 }
 
@@ -84,69 +65,48 @@ impl Visit for EventToStr {
 }
 
 #[derive(Clone)]
-pub struct LoggingSubscriberRef(Arc<LoggingPassthrough>);
+pub struct LoggingPassthroughRef(Arc<RwLock<Option<LoggingPassthroughState>>>);
 
-impl Subscriber for LoggingSubscriberRef {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.is_event() || self.0.state.read().unwrap().inner.is_some()
+impl LoggingPassthroughRef {
+    fn inner_do<F: FnOnce(&ChromeLayer<Registry>)>(&self, f: F) {
+        let state_guard = self.0.read().unwrap();
+        let state = state_guard.as_ref().unwrap();
+        let inner = state.inner.as_ref().unwrap();
+        f(inner)
+    }
+}
+
+impl tracing_subscriber::Layer<Registry> for LoggingPassthroughRef {
+    fn on_enter(&self, id: &span::Id, ctx: Context<'_, Registry>) {
+        self.inner_do(|inner| inner.on_enter(id, ctx));
     }
 
-    fn new_span(&self, span: &span::Attributes<'_>) -> span::Id {
-        let state = self.0.state.read().unwrap();
-        if let Some(inner) = &state.inner {
-            inner.new_span(span)
-        } else {
-            span::Id::from_u64(0)
-        }
+    fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, Registry>) {
+        self.inner_do(|inner| inner.on_record(id, values, ctx));
     }
 
-    fn record(&self, span: &span::Id, values: &span::Record<'_>) {
-        let state = self.0.state.read().unwrap();
-        if let Some(inner) = &state.inner {
-            inner.record(span, values);
-        }
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, Registry>) {
+        let state_guard = self.0.read().unwrap();
+        let state = state_guard.as_ref().unwrap();
+
+        let mut fields = EventToStr::default();
+        event.record(&mut fields);
+        log::log!(target: "lance::events", state.level, "target=\"{}\" {}", event.metadata().target(), fields.str);
+
+        let inner = state.inner.as_ref().unwrap();
+        inner.on_event(event, ctx);
     }
 
-    fn record_follows_from(&self, span: &span::Id, follows: &span::Id) {
-        let state = self.0.state.read().unwrap();
-        if let Some(inner) = &state.inner {
-            inner.record_follows_from(span, follows);
-        }
+    fn on_exit(&self, id: &span::Id, ctx: Context<'_, Registry>) {
+        self.inner_do(|inner| inner.on_exit(id, ctx));
     }
 
-    fn event(&self, event: &tracing::Event<'_>) {
-        let state = self.0.state.read().unwrap();
-
-        if event.metadata().level() <= &state.level {
-            let log_level = match *event.metadata().level() {
-                Level::TRACE => log::Level::Trace,
-                Level::DEBUG => log::Level::Debug,
-                Level::INFO => log::Level::Info,
-                Level::WARN => log::Level::Warn,
-                Level::ERROR => log::Level::Error,
-            };
-            let mut fields = EventToStr::default();
-            event.record(&mut fields);
-            log::log!(target: "lance::events", log_level, "target=\"{}\" {}", event.metadata().target(), fields.str);
-        }
-
-        if let Some(inner) = &state.inner {
-            inner.event(event);
-        }
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, Registry>) {
+        self.inner_do(|inner| inner.on_new_span(attrs, id, ctx));
     }
 
-    fn enter(&self, span: &span::Id) {
-        let state = self.0.state.read().unwrap();
-        if let Some(inner) = &state.inner {
-            inner.enter(span);
-        }
-    }
-
-    fn exit(&self, span: &span::Id) {
-        let state = self.0.state.read().unwrap();
-        if let Some(inner) = &state.inner {
-            inner.exit(span);
-        }
+    fn on_close(&self, id: span::Id, ctx: Context<'_, Registry>) {
+        self.inner_do(|inner| inner.on_close(id, ctx));
     }
 }
 
@@ -163,24 +123,9 @@ impl TraceGuard {
     }
 }
 
-fn get_filter(level: Option<&str>) -> PyResult<filter::LevelFilter> {
-    match level {
-        Some("trace") => Ok(filter::LevelFilter::TRACE),
-        Some("debug") => Ok(filter::LevelFilter::DEBUG),
-        Some("info") => Ok(filter::LevelFilter::INFO),
-        Some("warn") => Ok(filter::LevelFilter::WARN),
-        Some("error") => Ok(filter::LevelFilter::ERROR),
-        None => Ok(filter::LevelFilter::INFO),
-        _ => Err(PyValueError::new_err(format!(
-            "Unexpected tracing level: {}",
-            level.unwrap()
-        ))),
-    }
-}
-
 #[pyfunction]
-#[pyo3(signature=(path=None, level=None))]
-pub fn trace_to_chrome(path: Option<&str>, level: Option<&str>) -> PyResult<TraceGuard> {
+#[pyo3(signature=(path=None))]
+pub fn trace_to_chrome(path: Option<&str>) -> PyResult<TraceGuard> {
     let mut builder = ChromeLayerBuilder::new()
         .trace_style(TraceStyle::Async)
         .include_args(true);
@@ -188,17 +133,13 @@ pub fn trace_to_chrome(path: Option<&str>, level: Option<&str>) -> PyResult<Trac
         builder = builder.file(path);
     }
     let (chrome_layer, guard) = builder.build();
-    let level_filter = get_filter(level)?;
-    // Narrow down to just our targets, otherwise we get a lot of spam from
-    // our dependencies. The target check is based on a prefix, so `lance` is
-    // sufficient to match `lance_*`.
-    let filter = filter::Targets::new()
-        .with_target("lance", level_filter)
-        .with_target("pylance", level_filter);
-    let subscriber = Registry::default().with(chrome_layer.with_filter(filter));
 
-    let mut state = SUBSCRIBER.0.state.write().unwrap();
-    state.inner.replace(subscriber);
+    SUBSCRIBER
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .set_inner(chrome_layer);
 
     Ok(TraceGuard {
         guard: Arc::new(Mutex::new(Some(guard))),
@@ -206,14 +147,26 @@ pub fn trace_to_chrome(path: Option<&str>, level: Option<&str>) -> PyResult<Trac
 }
 
 pub fn initialize_tracing(level: log::Level) {
-    let tracing_level = match level {
-        log::Level::Trace => Level::TRACE,
-        log::Level::Debug => Level::DEBUG,
-        log::Level::Info => Level::INFO,
-        log::Level::Warn => Level::WARN,
-        log::Level::Error => Level::ERROR,
+    let level_filter = match level {
+        log::Level::Trace => filter::LevelFilter::TRACE,
+        log::Level::Debug => filter::LevelFilter::DEBUG,
+        log::Level::Info => filter::LevelFilter::INFO,
+        log::Level::Warn => filter::LevelFilter::WARN,
+        log::Level::Error => filter::LevelFilter::ERROR,
     };
+    // Narrow down to just our targets, otherwise we get a lot of spam from
+    // our dependencies. The target check is based on a prefix, so `lance` is
+    // sufficient to match `lance_*`.
+    let filter = filter::Targets::new()
+        .with_target("lance", level_filter)
+        .with_target("pylance", level_filter);
 
-    let mut state = SUBSCRIBER.0.state.write().unwrap();
-    state.level = tracing_level;
+    SUBSCRIBER
+        .write()
+        .unwrap()
+        .replace(LoggingPassthroughState::new(level));
+
+    let subscriber =
+        Registry::default().with(LoggingPassthroughRef(SUBSCRIBER.clone()).with_filter(filter));
+    subscriber::set_global_default(subscriber).unwrap();
 }
