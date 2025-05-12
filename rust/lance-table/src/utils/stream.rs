@@ -206,16 +206,16 @@ pub fn apply_row_id_and_deletes(
     let num_rows = batch.num_rows() as u32;
 
     let row_addrs = if should_fetch_row_addr {
-        let ids_in_batch = config
+        let row_offsets_in_batch = &config
             .params
             .slice(batch_offset as usize, num_rows as usize)
             .unwrap()
             .to_offsets()
             .unwrap();
-        let row_addrs: UInt64Array = ids_in_batch
+        let row_addrs: UInt64Array = row_offsets_in_batch
             .values()
             .iter()
-            .map(|row_id| u64::from(RowAddress::new_from_parts(fragment_id, *row_id)))
+            .map(|row_offset| u64::from(RowAddress::new_from_parts(fragment_id, *row_offset)))
             .collect();
 
         Some(Arc::new(row_addrs))
