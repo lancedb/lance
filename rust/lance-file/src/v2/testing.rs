@@ -14,6 +14,7 @@ use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
+    utils::CachedFileSize,
     ReadBatchParams,
 };
 use object_store::path::Path;
@@ -94,7 +95,11 @@ pub async fn read_lance_file(
     decoder_middleware: Arc<DecoderPlugins>,
     filter: FilterExpression,
 ) -> Vec<RecordBatch> {
-    let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+    let file_scheduler = fs
+        .scheduler
+        .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+        .await
+        .unwrap();
     let file_reader = FileReader::try_open(
         file_scheduler,
         None,
