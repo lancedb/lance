@@ -9,6 +9,7 @@ use arrow::array::{ListBuilder, UInt32Builder};
 use arrow_array::{Array, ListArray};
 use bitpacking::{BitPacker, BitPacker4x};
 use lance_core::Result;
+use snafu::location;
 use tracing::instrument;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -44,12 +45,17 @@ impl Into<&str> for Compression {
     }
 }
 
-impl From<&str> for Compression {
-    fn from(s: &str) -> Self {
-        match s {
-            "bitpack" => Self::Bitpack,
-            "block_max_bitpack" => Self::BlockMaxBitpack,
-            _ => panic!("Unknown compression type: {}", s),
+impl TryFrom<&str> for Compression {
+    type Error = lance_core::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "bitpack" => Ok(Self::Bitpack),
+            "block_max_bitpack" => Ok(Self::BlockMaxBitpack),
+            _ => Err(lance_core::Error::invalid_input(
+                format!("invalid compression type: {}", value),
+                location!(),
+            )),
         }
     }
 }
