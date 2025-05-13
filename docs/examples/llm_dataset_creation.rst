@@ -61,7 +61,7 @@ let's define the main function that takes in the dataset, number of samples and 
                 continue
             # Tokenize the current sample
             tokenized_sample = tokenize(sample, field)
-            # Increement the counter
+            # Increment the counter
             current_sample += 1
             # Yield a PyArrow RecordBatch
             yield pa.RecordBatch.from_arrays(
@@ -73,7 +73,7 @@ This function will be iterating over the huggingface dataset, one sample at a ti
 with all the tokens. We will do this until we have reached the `num_samples` number of samples or the end of the dataset, whichever comes first.
 
 Please note that by 'sample', we mean one example (row) in the original dataset. What one example exactly means will depend on the dataset itself as it could 
-be one line or an entire file of text. In this example, it's varies in length between a line and a paragraph of text.
+be one line or an entire file of text. In this example, it varies in length between a line and a paragraph of text.
 
 We also need to define a schema to tell Lance what type of data we are expecting in our table. Since our dataset consists only of tokens which are long integers, `int64` is the suitable datatype.
 
