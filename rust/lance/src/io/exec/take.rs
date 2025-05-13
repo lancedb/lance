@@ -342,7 +342,7 @@ impl TakeExec {
         let original_projection = projection.clone();
         let projection =
             projection.subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
-        if projection.is_empty() {
+        if !projection.has_data_fields() {
             return Ok(None);
         }
 
