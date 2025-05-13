@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::{fmt::Debug, sync::atomic::AtomicU64};
 
+use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::IndexStore;
-use crate::scalar::{inverted::encoding::Compression, lance_format::LanceIndexStore};
 use crate::vector::graph::OrderedFloat;
 use arrow::datatypes;
 use arrow::{array::AsArray, compute::concat_batches};
@@ -317,11 +317,11 @@ impl InnerBuilder {
 
         let mut batches = stream::iter(posting_lists)
             .map(|posting_list| {
-                let max_score = docs.calculate_max_score(
+                let block_max_scores = docs.calculate_block_max_scores(
                     posting_list.doc_ids.iter(),
                     posting_list.frequencies.iter(),
                 );
-                spawn_cpu(move || posting_list.to_batch(max_score))
+                spawn_cpu(move || posting_list.to_batch(block_max_scores))
             })
             .buffered(get_num_compute_intensive_cpus());
 
@@ -356,12 +356,7 @@ impl InnerBuilder {
             writer.write_record_batch(batch).await?;
         }
 
-        let metadata = HashMap::from_iter(vec![(
-            "compression_type".to_owned(),
-            Into::<&str>::into(Compression::Bitpack).to_owned(),
-        )]);
-        writer.finish_with_metadata(metadata).await?;
-
+        writer.finish().await?;
         Ok(())
     }
 
@@ -555,12 +550,12 @@ impl PositionRecorder {
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, DeepSizeOf)]
-pub struct OrderedDoc {
+pub struct ScoredDoc {
     pub row_id: u64,
     pub score: OrderedFloat,
 }
 
-impl OrderedDoc {
+impl ScoredDoc {
     pub fn new(row_id: u64, score: f32) -> Self {
         Self {
             row_id,
@@ -569,13 +564,13 @@ impl OrderedDoc {
     }
 }
 
-impl PartialOrd for OrderedDoc {
+impl PartialOrd for ScoredDoc {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for OrderedDoc {
+impl Ord for ScoredDoc {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.score.cmp(&other.score)
     }

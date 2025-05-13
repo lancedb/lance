@@ -50,15 +50,16 @@ use tracing::{info, instrument};
 
 use super::{
     builder::{
-        doc_file_path, inverted_list_schema, posting_file_path, token_file_path, OrderedDoc,
+        doc_file_path, inverted_list_schema, posting_file_path, token_file_path, ScoredDoc,
+        BLOCK_SIZE,
     },
     iter::PlainPostingListIterator,
     query::*,
-    scorer::{idf, BM25Scorer, B, K1},
+    scorer::{idf, BM25Scorer, Scorer, B, K1},
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
-    encoding::compress_posting_slices,
+    encoding::compress_posting_list,
     iter::CompressedPostingListIterator,
 };
 use super::{
@@ -85,6 +86,7 @@ pub const COMPRESSED_POSITION_COL: &str = "_compressed_position";
 pub const POSTING_COL: &str = "_posting";
 pub const MAX_SCORE_COL: &str = "_max_score";
 pub const LENGTH_COL: &str = "_length";
+pub const BLOCK_MAX_SCORE_COL: &str = "_block_max_score";
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 lazy_static! {
@@ -139,7 +141,8 @@ impl InvertedIndex {
     // search the documents that contain the query
     // return the row ids of the documents sorted by bm25 score
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
-    // we first calculate in-partition BM25 scores, then finally merge the scores
+    // we first calculate in-partition BM25 scores,
+    // then re-calculate the scores for the top k documents across all partitions
     #[instrument(level = "debug", skip_all)]
     pub async fn bm25_search(
         &self,
@@ -179,14 +182,18 @@ impl InvertedIndex {
             })
             .collect::<Vec<_>>();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
+        let scorer = BM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
         while let Some(res) = parts.try_next().await? {
-            let (row_ids, scores) = res?;
-            for (row_id, score) in row_ids.into_iter().zip(scores.into_iter()) {
+            for (row_id, freq, length) in res? {
+                let mut score = 0.0;
+                for token in tokens.iter() {
+                    score += scorer.score(token, freq, length);
+                }
                 if candidates.len() < limit {
-                    candidates.push(Reverse(OrderedDoc::new(row_id, score)));
+                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
                 } else if candidates.peek().unwrap().0.score.0 < score {
                     candidates.pop();
-                    candidates.push(Reverse(OrderedDoc::new(row_id, score)));
+                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
                 }
             }
         }
@@ -427,13 +434,8 @@ impl InvertedPartition {
         })
     }
 
-    // map tokens to token ids
-    // ignore tokens that are not in the index cause they won't contribute to the search
-    fn map(&self, texts: &[String]) -> Vec<u32> {
-        texts
-            .iter()
-            .filter_map(|text| self.tokens.get(text))
-            .collect()
+    fn map(&self, token: &str) -> Option<u32> {
+        self.tokens.get(token)
     }
 
     pub fn expand_fuzzy(
@@ -472,7 +474,7 @@ impl InvertedPartition {
     }
 
     // search the documents that contain the query
-    // return the row ids of the documents sorted by bm25 score
+    // return the doc info and the doc length
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     #[instrument(level = "debug", skip_all)]
     pub async fn bm25_search(
@@ -483,36 +485,42 @@ impl InvertedPartition {
         is_phrase_query: bool,
         mask: Arc<RowIdMask>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<(Vec<u64>, Vec<f32>)> {
+    ) -> Result<Vec<(u64, u32, u32)>> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let tokens = match is_fuzzy {
             true => self.expand_fuzzy(tokens, params.fuzziness, params.max_expansions)?,
             false => tokens.to_vec(),
         };
-        let mut token_ids = self.map(&tokens);
-        if token_ids.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        if is_phrase_query {
-            if token_ids.len() != tokens.len() {
-                return Ok((Vec::new(), Vec::new()));
+        let mut token_ids = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            let token_id = self.map(&token);
+            if let Some(token_id) = token_id {
+                token_ids.push((token_id, token));
+            } else if is_phrase_query {
+                // if the token is not found, we can't do phrase query
+                return Ok(Vec::new());
             }
-        } else {
+        }
+        if token_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !is_phrase_query {
             // remove duplicates
-            token_ids.sort_unstable();
-            token_ids.dedup();
+            token_ids.sort_unstable_by_key(|(token_id, _)| *token_id);
+            token_ids.dedup_by_key(|(token_id, _)| *token_id);
         }
 
         let num_docs = self.docs.len();
         let postings = stream::iter(token_ids)
             .enumerate()
-            .map(|(position, token_id)| async move {
+            .map(|(position, (token_id, token))| async move {
                 let posting = self
                     .inverted_list
                     .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
 
                 Result::Ok(PostingIterator::new(
+                    token,
                     token_id,
                     position as u32,
                     posting,
@@ -522,23 +530,13 @@ impl InvertedPartition {
             .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
-
-        let mut wand = Wand::new(operator, postings.into_iter(), &self.docs);
-        let avgdl = self.docs.average_length();
+        let scorer = BM25Scorer::new(std::iter::once(self));
+        let mut wand = Wand::new(operator, postings.into_iter(), &self.docs, scorer);
         wand.search(
             is_phrase_query,
             params.limit.unwrap_or(usize::MAX),
             mask,
             params.wand_factor,
-            |doc| {
-                let num_tokens = match doc {
-                    DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
-                    DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
-                } as f32;
-                let doc_norm = K1 * (1.0 - B + B * num_tokens / avgdl);
-                let freq = doc.frequency() as f32;
-                freq / (freq + doc_norm)
-            },
             metrics,
         )
     }
@@ -1316,9 +1314,14 @@ impl CompressedPostingList {
         )
     }
 
+    pub fn block_max_score(&self, block_idx: usize) -> f32 {
+        let block = self.blocks.value(block_idx);
+        block[0..4].try_into().map(f32::from_le_bytes).unwrap()
+    }
+
     pub fn block_least_doc_id(&self, block_idx: usize) -> u32 {
         let block = self.blocks.value(block_idx);
-        block[0..4].try_into().map(u32::from_le_bytes).unwrap()
+        block[4..8].try_into().map(u32::from_le_bytes).unwrap()
     }
 }
 
@@ -1380,7 +1383,7 @@ impl PostingListBuilder {
     }
 
     // assume the posting list is sorted by doc id
-    pub fn to_batch(mut self, max_score: f32) -> Result<RecordBatch> {
+    pub fn to_batch(mut self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
         let length = self.len();
         let mut position_builder = self.positions.as_mut().map(|_| {
             ListBuilder::new(ListBuilder::with_capacity(
@@ -1388,6 +1391,7 @@ impl PostingListBuilder {
                 length,
             ))
         });
+        let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
         for index in 0..length {
             if let Some(position_builder) = position_builder.as_mut() {
                 let positions = self.positions.as_ref().unwrap().get(index);
@@ -1396,16 +1400,18 @@ impl PostingListBuilder {
                 inner_builder.append_value(compressed.into_iter());
             }
         }
-        let compressed = compress_posting_slices(
+        let compressed = compress_posting_list(
             self.doc_ids.len(),
             self.doc_ids.block_iter(),
             self.frequencies.block_iter(),
+            block_max_scores.into_iter(),
         )?;
         let schema = inverted_list_schema(self.has_positions());
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32]));
         let mut columns = vec![
             Arc::new(ListArray::try_new(
                 Arc::new(Field::new("item", datatypes::DataType::LargeBinary, true)),
-                OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32])),
+                offsets,
                 Arc::new(compressed),
                 None,
             )?) as ArrayRef,
@@ -1513,15 +1519,15 @@ pub enum DocInfo {
 impl DocInfo {
     pub fn doc_id(&self) -> u64 {
         match self {
-            Self::Located(info) => info.row_id,
             Self::Raw(info) => info.doc_id as u64,
+            Self::Located(info) => info.row_id,
         }
     }
 
     pub fn frequency(&self) -> u32 {
         match self {
-            Self::Located(info) => info.frequency as u32,
             Self::Raw(info) => info.frequency,
+            Self::Located(info) => info.frequency as u32,
         }
     }
 }
@@ -1650,25 +1656,33 @@ impl DocSet {
         self.total_tokens as f32 / self.len() as f32
     }
 
-    pub fn calculate_max_score<'a>(
+    pub fn calculate_block_max_scores<'a>(
         &self,
         doc_ids: impl Iterator<Item = &'a u32>,
         freqs: impl Iterator<Item = &'a u32>,
-    ) -> f32 {
+    ) -> Vec<f32> {
         let avgdl = self.average_length();
-        let mut length = 0;
-        let mut max_score = 0.0;
-        for (doc_id, freq) in doc_ids.zip(freqs) {
-            length += 1;
+        let length = doc_ids.size_hint().0;
+        let mut block_max_scores = Vec::with_capacity(length);
+        let mut max_score = f32::MIN;
+        for (i, (doc_id, freq)) in doc_ids.zip(freqs).enumerate() {
             let doc_norm = K1 * (1.0 - B + B * self.num_tokens(*doc_id) as f32 / avgdl);
             let freq = *freq as f32;
             let score = freq / (freq + doc_norm);
             if score > max_score {
                 max_score = score;
             }
+            if (i + 1) % BLOCK_SIZE == 0 {
+                max_score *= idf(length, self.len()) * (K1 + 1.0);
+                block_max_scores.push(max_score);
+                max_score = f32::MIN;
+            }
         }
-        max_score *= idf(length, self.len()) * (K1 + 1.0);
-        max_score
+        if length % BLOCK_SIZE > 0 {
+            max_score *= idf(length, self.len()) * (K1 + 1.0);
+            block_max_scores.push(max_score);
+        }
+        block_max_scores
     }
 
     pub fn to_batch(&self) -> Result<RecordBatch> {
@@ -1880,7 +1894,7 @@ pub fn flat_bm25_search_stream(
         .sorted_unstable()
         .collect::<HashSet<_>>();
 
-    let bm25_scorer = BM25Scorer::new(index);
+    let bm25_scorer = BM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()));
     let num_docs = bm25_scorer.num_docs();
     let avgdl = bm25_scorer.avgdl();
     let mut nq = HashMap::with_capacity(tokens.len());

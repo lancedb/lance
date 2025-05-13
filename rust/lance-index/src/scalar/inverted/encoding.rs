@@ -9,105 +9,38 @@ use arrow::array::{ListBuilder, UInt32Builder};
 use arrow_array::{Array, ListArray};
 use bitpacking::{BitPacker, BitPacker4x};
 use lance_core::Result;
-use snafu::location;
 use tracing::instrument;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(u8)]
-#[allow(dead_code)]
-pub enum Compression {
-    // each block is:
-    // - 4 bytes for the first doc id
-    // - 1 byte for the number of bits used for the doc ids
-    // - delta encoded & bitpacked binary for the doc ids
-    // - 1 byte for the number of bits used for the frequencies
-    // - bitpacked binary for the frequencies
-    // and plain for the remainder
-    Bitpack,
-
-    // each block is:
-    // - 4 bytes for the first doc id
-    // - 4 bytes for max score of the block
-    // - 1 byte for the number of bits used for the doc ids
-    // - delta encoded & bitpacked binary for the doc ids
-    // - 1 byte for the number of bits used for the frequencies
-    // - bitpacked binary for the frequencies
-    // and plain for the remainder
-    BlockMaxBitpack,
-}
-
-impl From<Compression> for &str {
-    fn from(value: Compression) -> Self {
-        match value {
-            Compression::Bitpack => "bitpack",
-            Compression::BlockMaxBitpack => "block_max_bitpack",
-        }
-    }
-}
-
-impl TryFrom<&str> for Compression {
-    type Error = lance_core::Error;
-
-    fn try_from(value: &str) -> Result<Self> {
-        match value {
-            "bitpack" => Ok(Self::Bitpack),
-            "block_max_bitpack" => Ok(Self::BlockMaxBitpack),
-            _ => Err(lance_core::Error::invalid_input(
-                format!("invalid compression type: {}", value),
-                location!(),
-            )),
-        }
-    }
-}
+// we compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
+// returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
+// each block is:
+// - 4 bytes for the max block score
+// - 4 bytes for the first doc id
+// - 1 byte for the number of bits used to pack the doc ids
+// - n bytes for the packed doc ids
+// - 1 byte for the number of bits used to pack the frequencies
+// - n bytes for the packed frequencies
+// if the block is not full (the last block), we don't compress it
+// we directly write the remainder to the buffer with the format:
+// - 4 bytes for the max block score
+// - 4*n bytes for the doc ids
+// - 4*n bytes for the frequencies
+// where n is the number of elements in the block
 
 // compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
-#[allow(dead_code)]
-pub fn compress_posting_list(
-    doc_ids: &[u32],
-    frequencies: &[u32],
-) -> Result<arrow::array::LargeBinaryArray> {
-    let length = doc_ids.len();
-    if length < BLOCK_SIZE {
-        // directly do remainder compression to avoid overhead of creating buffer
-        let mut builder = LargeBinaryBuilder::with_capacity(1, length * 4 * 2);
-        compress_remainder(doc_ids, &mut builder)?;
-        compress_remainder(frequencies, &mut builder)?;
-        builder.append_value("");
-        return Ok(builder.finish());
-    }
-
-    let mut builder =
-        LargeBinaryBuilder::with_capacity(doc_ids.len().div_ceil(BLOCK_SIZE), length * 3);
-    let doc_id_chunks = doc_ids.chunks_exact(BLOCK_SIZE);
-    let frequency_chunks = frequencies.chunks_exact(BLOCK_SIZE);
-    let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
-    for (doc_id_chunk, freq_chunk) in std::iter::zip(doc_id_chunks, frequency_chunks) {
-        // delta encoding + bitpacking for doc ids
-        compress_sorted_block(doc_id_chunk, &mut buffer, &mut builder)?;
-        // bitpacking for frequencies
-        compress_block(freq_chunk, &mut buffer, &mut builder)?;
-        builder.append_value("");
-    }
-
-    // we don't compress the last block if it is not full
-    let remainder = length % BLOCK_SIZE;
-    if remainder > 0 {
-        compress_remainder(&doc_ids[length - remainder..], &mut builder)?;
-        compress_remainder(&frequencies[length - remainder..], &mut builder)?;
-        builder.append_value("");
-    }
-    Ok(builder.finish())
-}
-
-pub fn compress_posting_slices<'a>(
+pub fn compress_posting_list<'a>(
     length: usize,
     doc_ids: impl Iterator<Item = &'a [u32]>,
     frequencies: impl Iterator<Item = &'a [u32]>,
+    mut block_max_scores: impl Iterator<Item = f32>,
 ) -> Result<arrow::array::LargeBinaryArray> {
     if length < BLOCK_SIZE {
         // directly do remainder compression to avoid overhead of creating buffer
-        let mut builder = LargeBinaryBuilder::with_capacity(1, length * 4 * 2);
+        let mut builder = LargeBinaryBuilder::with_capacity(1, length * 4 * 2 + 1);
+        // write the max score of the block
+        let max_score = block_max_scores.next().unwrap();
+        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
         compress_remainder(
             doc_ids.flatten().copied().collect::<Vec<_>>().as_slice(),
             &mut builder,
@@ -145,6 +78,9 @@ pub fn compress_posting_slices<'a>(
         }
         assert_eq!(doc_id_chunk.len(), BLOCK_SIZE);
 
+        // write the max score of the block
+        let max_score = block_max_scores.next().unwrap();
+        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
         // delta encoding + bitpacking for doc ids
         compress_sorted_block(doc_id_chunk, &mut buffer, &mut builder)?;
         // bitpacking for frequencies
@@ -156,6 +92,9 @@ pub fn compress_posting_slices<'a>(
 
     // we don't compress the last block if it is not full
     if !doc_id_buffer.is_empty() {
+        // write the max score of the block
+        let max_score = block_max_scores.next().unwrap();
+        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
         compress_remainder(&doc_id_buffer, &mut builder)?;
         compress_remainder(&freq_buffer, &mut builder)?;
         builder.append_value("");
@@ -295,6 +234,8 @@ pub fn decompress_posting_block(
     doc_ids: &mut Vec<u32>,
     frequencies: &mut Vec<u32>,
 ) {
+    // skip the first 4 bytes for the max block score
+    let block = &block[4..];
     let num_bytes = decompress_sorted_block(block, buffer, doc_ids);
     decompress_block(&block[num_bytes..], buffer, frequencies);
 }
@@ -306,6 +247,7 @@ pub fn decompress_posting_remainder(
     doc_ids: &mut Vec<u32>,
     frequencies: &mut Vec<u32>,
 ) {
+    let block = &block[4..];
     decompress_remainder(block, n, doc_ids);
     decompress_remainder(&block[n * 4..], n, frequencies);
 }
@@ -350,7 +292,13 @@ mod tests {
         let mut rng = rand::thread_rng();
         let doc_ids: Vec<u32> = (0..num_rows).map(|_| rng.gen()).sorted_unstable().collect();
         let frequencies: Vec<u32> = (0..num_rows).map(|_| rng.gen_range(1..=u32::MAX)).collect();
-        let posting_list = compress_posting_list(&doc_ids, &frequencies)?;
+        let block_max_scores = (0..num_rows.div_ceil(BLOCK_SIZE)).map(|_| rng.gen_range(0.0..1.0));
+        let posting_list = compress_posting_list(
+            doc_ids.len(),
+            doc_ids.chunks(BLOCK_SIZE),
+            frequencies.chunks(BLOCK_SIZE),
+            block_max_scores,
+        )?;
         assert_eq!(posting_list.len(), num_rows.div_ceil(BLOCK_SIZE));
         let compressed_size =
             posting_list.value_data().len() + posting_list.value_offsets().len() * 8;

@@ -16,8 +16,9 @@ use tracing::instrument;
 use crate::metrics::MetricsCollector;
 
 use super::{
-    builder::OrderedDoc,
+    builder::ScoredDoc,
     encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
+    scorer::Scorer,
     DocSet, PostingList, RawDocInfo,
 };
 use super::{builder::BLOCK_SIZE, DocInfo};
@@ -27,6 +28,7 @@ use super::{
 };
 
 pub struct PostingIterator {
+    token: String,
     token_id: u32,
     position: u32,
     list: PostingList,
@@ -117,7 +119,13 @@ impl Ord for PostingIterator {
 }
 
 impl PostingIterator {
-    pub(crate) fn new(token_id: u32, position: u32, list: PostingList, num_doc: usize) -> Self {
+    pub(crate) fn new(
+        token: String,
+        token_id: u32,
+        position: u32,
+        list: PostingList,
+        num_doc: usize,
+    ) -> Self {
         let approximate_upper_bound = match list.max_score() {
             Some(max_score) => max_score,
             None => idf(list.len(), num_doc) * (K1 + 1.0),
@@ -126,6 +134,7 @@ impl PostingIterator {
         let is_compressed = matches!(list, PostingList::Compressed(_));
 
         Self {
+            token,
             token_id,
             position,
             list,
@@ -141,8 +150,13 @@ impl PostingIterator {
     }
 
     #[inline]
+    fn empty(&self) -> bool {
+        self.index >= self.list.len()
+    }
+
+    #[inline]
     fn doc(&self) -> Option<DocInfo> {
-        if self.index >= self.list.len() {
+        if self.empty() {
             return None;
         }
 
@@ -192,7 +206,7 @@ impl PostingIterator {
                 let least_id = least_id as u32;
                 let mut block_idx = self.index / BLOCK_SIZE;
                 while block_idx + 1 < list.blocks.len()
-                    && list.block_least_doc_id(block_idx + 1) < least_id
+                    && list.block_least_doc_id(block_idx + 1) <= least_id
                 {
                     block_idx += 1;
                 }
@@ -207,26 +221,71 @@ impl PostingIterator {
             }
         }
     }
+
+    fn shallow_next(&mut self, least_id: u64) {
+        match self.list {
+            PostingList::Compressed(ref mut list) => {
+                debug_assert!(least_id <= u32::MAX as u64);
+                let least_id = least_id as u32;
+                let mut block_idx = self.index / BLOCK_SIZE;
+                while block_idx + 1 < list.blocks.len()
+                    && list.block_least_doc_id(block_idx + 1) <= least_id
+                {
+                    block_idx += 1;
+                }
+                self.index = self.index.max(block_idx * BLOCK_SIZE);
+            }
+            PostingList::Plain(ref list) => {
+                // we don't have block max score for legacy index,
+                // and no compression, so just do the same as `next(least_id)`
+                self.index += list.row_ids[self.index..].partition_point(|&id| id < least_id);
+            }
+        }
+    }
+
+    #[inline]
+    fn block_max_score(&self) -> f32 {
+        match self.list {
+            PostingList::Compressed(ref list) => list.block_max_score(self.index / BLOCK_SIZE),
+            PostingList::Plain(_) => self.approximate_upper_bound,
+        }
+    }
+
+    #[inline]
+    fn next_block_first_doc(&self) -> Option<u64> {
+        match self.list {
+            PostingList::Compressed(ref list) => {
+                let next_block = self.index / BLOCK_SIZE + 1;
+                if next_block >= list.blocks.len() {
+                    return None;
+                }
+                Some(list.block_least_doc_id(next_block) as u64)
+            }
+            PostingList::Plain(ref plain) => plain.row_ids.get(self.index + 1).cloned(),
+        }
+    }
 }
 
-pub struct Wand<'a> {
+pub struct Wand<'a, S: Scorer> {
     threshold: f32, // multiple of factor and the minimum score of the top-k documents
-    cur_doc: Option<u64>,
     // we need to sort the posting iterators frequently,
     // so wrap them in `Box` to avoid the cost of copying
     #[allow(clippy::vec_box)]
     postings: Vec<Box<PostingIterator>>,
     docs: &'a DocSet,
+    scorer: S,
+    cur_doc: Option<DocInfo>,
 }
 
 // we were using row id as doc id in the past, which is u64,
 // but now we are using the index as doc id, which is u32.
 // so here WAND is a generic struct that can be used for both u32 and u64 doc ids.
-impl<'a> Wand<'a> {
+impl<'a, S: Scorer> Wand<'a, S> {
     pub(crate) fn new(
         operator: Operator,
         postings: impl Iterator<Item = PostingIterator>,
         docs: &'a DocSet,
+        scorer: S,
     ) -> Self {
         let mut posting_lists = postings.collect::<Vec<_>>();
         posting_lists.sort_unstable();
@@ -240,39 +299,32 @@ impl<'a> Wand<'a> {
 
         Self {
             threshold,
-            cur_doc: None,
             postings: posting_lists.into_iter().map(Box::new).collect(),
             docs,
+            scorer,
+            cur_doc: None,
         }
     }
 
     // search the top-k documents that contain the query
-    // returns the row ids and their scores
+    // returns the row_id, frequency and doc length
     pub(crate) fn search(
         &mut self,
         is_phrase_query: bool,
         limit: usize,
         mask: Arc<RowIdMask>,
         factor: f32,
-        scorer: impl Fn(&DocInfo) -> f32,
         metrics: &dyn MetricsCollector,
-    ) -> Result<(Vec<u64>, Vec<f32>)> {
+    ) -> Result<Vec<(u64, u32, u32)>> {
         if limit == 0 {
-            return Ok((vec![], vec![]));
+            return Ok(vec![]);
         }
 
         let mut candidates = BinaryHeap::new();
         let mut num_comparisons = 0;
-        while let Some(doc) = self.next()? {
-            if let Some(cur_doc) = self.cur_doc {
-                assert!(
-                    doc.doc_id() > cur_doc,
-                    "new_doc_id: {}, cur_doc: {}",
-                    doc.doc_id(),
-                    cur_doc
-                );
-            }
-            self.cur_doc = Some(doc.doc_id());
+        while let Some((pivot, doc)) = self.next()? {
+            log::warn!("found doc: {:?}", doc);
+            self.cur_doc = Some(doc);
             num_comparisons += 1;
             if is_phrase_query && !self.check_positions() {
                 continue;
@@ -290,74 +342,138 @@ impl<'a> Wand<'a> {
             if !mask.selected(row_id) {
                 continue;
             }
-            let score = self.score(&doc, &scorer);
+            let doc_length = match &doc {
+                DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
+            };
+            let score = self.score(pivot, doc.doc_id(), doc.frequency(), doc_length);
             if candidates.len() < limit {
-                candidates.push(Reverse(OrderedDoc::new(row_id, score)));
-            } else if score > candidates.peek().unwrap().0.score.0 {
+                candidates.push(Reverse((
+                    ScoredDoc::new(row_id, score),
+                    doc.frequency(),
+                    doc_length,
+                )));
+            } else if score > candidates.peek().unwrap().0 .0.score.0 {
                 candidates.pop();
-                candidates.push(Reverse(OrderedDoc::new(row_id, score)));
-                self.threshold = candidates.peek().unwrap().0.score.0 * factor;
+                candidates.push(Reverse((
+                    ScoredDoc::new(row_id, score),
+                    doc.frequency(),
+                    doc_length,
+                )));
+                self.threshold = candidates.peek().unwrap().0 .0.score.0 * factor;
             }
+            log::warn!("{} candidates", candidates.len());
+
+            // this is an optimization to avoid moving posting iterators one by one
+            self.move_preceding(pivot, doc.doc_id() + 1);
         }
         metrics.record_comparisons(num_comparisons);
 
         Ok(candidates
             .into_sorted_vec()
             .into_iter()
-            .map(|Reverse(doc)| (doc.row_id, doc.score.0))
-            .unzip())
+            .map(|Reverse((doc, freq, length))| (doc.row_id, freq, length))
+            .collect())
     }
 
     // calculate the score of the document
-    fn score(&self, doc: &DocInfo, scorer: &impl Fn(&DocInfo) -> f32) -> f32 {
+    fn score(&self, pivot: usize, doc_id: u64, freq: u32, doc_length: u32) -> f32 {
         let mut score = 0.0;
-        for posting in &self.postings {
-            let cur_doc = posting.doc().unwrap();
-            if cur_doc.doc_id() > doc.doc_id() {
-                // the posting list is sorted by its current doc id,
-                // so we can break early once we find the current doc id is less than the doc id we are looking for
+        for posting in self.postings[..=pivot].iter() {
+            score += self.scorer.score(&posting.token, freq, doc_length);
+        }
+        for posting in self.postings[pivot + 1..].iter() {
+            let doc = posting.doc().unwrap();
+            if doc.doc_id() > doc_id {
+                // the posting iterator is sorted by doc id,
+                // so we can stop here
                 break;
             }
-            debug_assert!(cur_doc.doc_id() == doc.doc_id());
-            let idf = idf(posting.list.len(), self.docs.len());
-            score += idf * scorer(doc);
+            debug_assert_eq!(doc.doc_id(), doc_id);
+            score += self.scorer.score(&posting.token, freq, doc_length);
         }
         score
     }
 
     // find the next doc candidate
-    fn next(&mut self) -> Result<Option<DocInfo>> {
-        while let Some(pivot_posting) = self.find_pivot_term() {
-            let doc = pivot_posting
-                .doc()
-                .expect("pivot posting should have at least one document");
+    fn next(&mut self) -> Result<Option<(usize, DocInfo)>> {
+        while let Some(pivot) = self.find_pivot_term() {
+            let posting = &self.postings[pivot];
+            let Some(doc) = posting.doc() else {
+                log::warn!("no pivot found");
+                return Ok(None);
+            };
+            let doc_id = doc.doc_id();
+            log::warn!("found pivot doc id: {}, with pivot {}", doc_id, pivot);
+            for posting in self.postings[..pivot].iter_mut() {
+                posting.shallow_next(doc_id);
+            }
 
-            let cur_doc = self.cur_doc.unwrap_or_default();
-            if self.cur_doc.is_some() && doc.doc_id() <= cur_doc {
-                self.move_term(cur_doc + 1);
-            } else if self.postings[0].doc().unwrap().doc_id() == doc.doc_id() {
-                // all the posting iterators preceding pivot have reached this doc id,
-                // so that means the sum of upper bound of all terms is not less than the threshold,
-                // this document is a candidate
-                return Ok(Some(doc));
+            if self.check_block_max(pivot) {
+                if self.cur_doc.is_some() && self.cur_doc.unwrap().doc_id() >= doc_id {
+                    log::warn!("the current doc id is greater than the doc id of the pivot");
+                    self.move_term(self.cur_doc.unwrap().doc_id() + 1);
+                } else if self.postings[0].doc().unwrap().doc_id() == doc_id {
+                    // all the posting iterators preceding pivot have reached this doc id,
+                    // so that means the sum of upper bound of all terms is not less than the threshold,
+                    // this document is a candidate
+                    return Ok(Some((pivot, doc)));
+                } else {
+                    // some posting iterators haven't reached this doc id,
+                    // so move such terms to the doc id
+                    log::warn!(
+                        "not all posting iterators have reached this doc id {}, first doc id: {}",
+                        doc_id,
+                        self.postings[0].doc().unwrap().doc_id()
+                    );
+                    self.move_term(doc_id);
+                }
             } else {
-                // some posting iterators haven't reached this doc id,
-                // so move such terms to the doc id
-                self.move_term(doc.doc_id());
+                // the current block max score is less than the threshold,
+                // which means we have to skip at least the current block
+                if let Some(least_id) = self.get_new_candidate(pivot) {
+                    log::warn!("the current block max score is less than the threshold");
+                    self.move_term(least_id);
+                } else {
+                    // no more candidates, so we can stop
+                    log::warn!("no more candidates");
+                    return Ok(None);
+                }
             }
         }
+        log::warn!("no more docs");
         Ok(None)
+    }
+
+    fn check_block_max(&self, pivot: usize) -> bool {
+        let mut sum = 0.0;
+        for posting in self.postings[..=pivot].iter() {
+            sum += posting.block_max_score();
+        }
+        sum >= self.threshold
+    }
+
+    fn get_new_candidate(&self, pivot: usize) -> Option<u64> {
+        let mut least_id = None;
+        for posting in self.postings[..=pivot].iter() {
+            if let Some(doc) = posting.next_block_first_doc() {
+                if least_id.is_none() || doc < least_id.unwrap() {
+                    least_id = Some(doc);
+                }
+            }
+        }
+        least_id
     }
 
     // find the first term that the sum of upper bound of all preceding terms and itself,
     // are greater than or equal to the threshold
     #[instrument(level = "debug", skip_all)]
-    fn find_pivot_term(&self) -> Option<&PostingIterator> {
+    fn find_pivot_term(&self) -> Option<usize> {
         let mut acc = 0.0;
-        for posting in self.postings.iter() {
+        for (idx, posting) in self.postings.iter().enumerate() {
             acc += posting.approximate_upper_bound();
             if acc >= self.threshold {
-                return Some(posting);
+                return Some(idx);
             }
         }
         None
@@ -380,6 +496,21 @@ impl<'a> Wand<'a> {
         debug_assert!(self
             .postings
             .is_sorted_by_key(|posting| posting.doc().unwrap().doc_id()));
+    }
+
+    fn move_preceding(&mut self, pivot: usize, least_id: u64) {
+        for posting in self.postings[..=pivot].iter_mut() {
+            posting.next(least_id);
+        }
+
+        self.postings.sort_unstable();
+        while let Some(posting) = self.postings.last() {
+            if posting.empty() {
+                self.postings.pop();
+            } else {
+                break;
+            }
+        }
     }
 
     fn pick_term(&self, least_id: u64) -> usize {
