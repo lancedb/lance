@@ -1,73 +1,73 @@
 [workspace]
-exclude = ["python"]
 members = [
-  "java/core/lance-jni",
-  "rust/lance",
-  "rust/lance-arrow",
-  "rust/lance-core",
-  "rust/lance-datagen",
-  "rust/lance-encoding",
-  "rust/lance-encoding-datafusion",
-  "rust/lance-file",
-  "rust/lance-index",
-  "rust/lance-io",
-  "rust/lance-linalg",
-  "rust/lance-table",
-  "rust/lance-test-macros",
-  "rust/lance-testing",
-  "rust/lance-encoding/src/compression_algo/fsst",
+    "java/core/lance-jni",
+    "rust/lance",
+    "rust/lance-arrow",
+    "rust/lance-core",
+    "rust/lance-datagen",
+    "rust/lance-encoding",
+    "rust/lance-encoding-datafusion",
+    "rust/lance-file",
+    "rust/lance-index",
+    "rust/lance-io",
+    "rust/lance-linalg",
+    "rust/lance-table",
+    "rust/lance-test-macros",
+    "rust/lance-testing",
+    "rust/lance-encoding/src/compression_algo/fsst",
 ]
+exclude = ["python"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
 [workspace.package]
-authors = ["Lance Devs <dev@lancedb.com>"]
-categories = [
-  "database-implementations",
-  "data-structures",
-  "development-tools",
-  "science",
-]
-description = "A columnar data format that is 100x faster than Parquet for random access."
-edition = "2021"
-keywords = [
-  "data-format",
-  "data-science",
-  "machine-learning",
-  "apache-arrow",
-  "data-analytics",
-]
-license = "Apache-2.0"
-readme = "README.md"
-repository = "https://github.com/lancedb/lance"
-rust-version = "1.82.0"
 version = "0.27.0"
+edition = "2021"
+authors = ["Lance Devs <dev@lancedb.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/lancedb/lance"
+readme = "README.md"
+description = "A columnar data format that is 100x faster than Parquet for random access."
+keywords = [
+    "data-format",
+    "data-science",
+    "machine-learning",
+    "apache-arrow",
+    "data-analytics",
+]
+categories = [
+    "database-implementations",
+    "data-structures",
+    "development-tools",
+    "science",
+]
+rust-version = "1.82.0"
 
 [workspace.dependencies]
+lance = { version = "=0.27.0", path = "./rust/lance" }
+lance-arrow = { version = "=0.27.0", path = "./rust/lance-arrow" }
+lance-core = { version = "=0.27.0", path = "./rust/lance-core" }
+lance-datafusion = { version = "=0.27.0", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=0.27.0", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=0.27.0", path = "./rust/lance-encoding" }
+lance-encoding-datafusion = { version = "=0.27.0", path = "./rust/lance-encoding-datafusion" }
+lance-file = { version = "=0.27.0", path = "./rust/lance-file" }
+lance-index = { version = "=0.27.0", path = "./rust/lance-index" }
+lance-io = { version = "=0.27.0", path = "./rust/lance-io" }
+lance-jni = { version = "=0.27.0", path = "./java/core/lance-jni" }
+lance-linalg = { version = "=0.27.0", path = "./rust/lance-linalg" }
+lance-table = { version = "=0.27.0", path = "./rust/lance-table" }
+lance-test-macros = { version = "=0.27.0", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=0.27.0", path = "./rust/lance-testing" }
 approx = "0.5.1"
-lance = {version = "=0.27.0", path = "./rust/lance"}
-lance-arrow = {version = "=0.27.0", path = "./rust/lance-arrow"}
-lance-core = {version = "=0.27.0", path = "./rust/lance-core"}
-lance-datafusion = {version = "=0.27.0", path = "./rust/lance-datafusion"}
-lance-datagen = {version = "=0.27.0", path = "./rust/lance-datagen"}
-lance-encoding = {version = "=0.27.0", path = "./rust/lance-encoding"}
-lance-encoding-datafusion = {version = "=0.27.0", path = "./rust/lance-encoding-datafusion"}
-lance-file = {version = "=0.27.0", path = "./rust/lance-file"}
-lance-index = {version = "=0.27.0", path = "./rust/lance-index"}
-lance-io = {version = "=0.27.0", path = "./rust/lance-io"}
-lance-jni = {version = "=0.27.0", path = "./java/core/lance-jni"}
-lance-linalg = {version = "=0.27.0", path = "./rust/lance-linalg"}
-lance-table = {version = "=0.27.0", path = "./rust/lance-table"}
-lance-test-macros = {version = "=0.27.0", path = "./rust/lance-test-macros"}
-lance-testing = {version = "=0.27.0", path = "./rust/lance-testing"}
 # Note that this one does not include pyarrow
-arrow = {version = "54.1", optional = false, features = ["prettyprint"]}
+arrow = { version = "54.1", optional = false, features = ["prettyprint"] }
 arrow-arith = "54.1"
 arrow-array = "54.1"
 arrow-buffer = "54.1"
 arrow-cast = "54.1"
 arrow-data = "54.1"
-arrow-ipc = {version = "54.1", features = ["zstd"]}
+arrow-ipc = { version = "54.1", features = ["zstd"] }
 arrow-ord = "54.1"
 arrow-row = "54.1"
 arrow-schema = "54.1"
@@ -78,122 +78,122 @@ aws-config = "1.2.0"
 aws-credential-types = "1.2.0"
 aws-sdk-dynamodb = "1.38.0"
 aws-sdk-s3 = "1.38.0"
+half = { "version" = "2.1", default-features = false, features = [
+    "num-traits",
+    "std",
+] }
 bitvec = "1"
-byteorder = "1.5"
 bytes = "1.4"
-clap = {version = "4", features = ["derive"]}
-half = {"version" = "2.1", default-features = false, features = [
-  "num-traits",
-  "std",
-]}
+byteorder = "1.5"
+clap = { version = "4", features = ["derive"] }
 # Version temporarily pinned to work around unlabeled breaking change
 # https://github.com/apache/arrow-rs/commit/2fddf85afcd20110ce783ed5b4cdeb82293da30b
-chrono = {version = "=0.4.39", default-features = false, features = [
-  "std",
-  "now",
-]}
-criterion = {version = "0.5", features = [
-  "async",
-  "async_tokio",
-  "html_reports",
-]}
+chrono = { version = "=0.4.39", default-features = false, features = [
+    "std",
+    "now",
+] }
+criterion = { version = "0.5", features = [
+    "async",
+    "async_tokio",
+    "html_reports",
+] }
 crossbeam-queue = "0.3"
-datafusion = {version = "46.0", default-features = false, features = [
-  "nested_expressions",
-  "regex_expressions",
-  "unicode_expressions",
-  "crypto_expressions",
-  "encoding_expressions",
-  "datetime_expressions",
-  "string_expressions",
-]}
+datafusion = { version = "46.0", default-features = false, features = [
+    "nested_expressions",
+    "regex_expressions",
+    "unicode_expressions",
+    "crypto_expressions",
+    "encoding_expressions",
+    "datetime_expressions",
+    "string_expressions",
+] }
 datafusion-common = "46.0"
-datafusion-execution = "46.0"
-datafusion-expr = "46.0"
-datafusion-functions = {version = "46.0", features = ["regex_expressions"]}
-datafusion-optimizer = "46.0"
-datafusion-physical-expr = {version = "46.0"}
-datafusion-physical-plan = {version = "46.0"}
+datafusion-functions = { version = "46.0", features = ["regex_expressions"] }
 datafusion-sql = "46.0"
+datafusion-expr = "46.0"
+datafusion-execution = "46.0"
+datafusion-optimizer = "46.0"
+datafusion-physical-expr = { version = "46.0" }
+datafusion-physical-plan = { version = "46.0" }
 deepsize = "0.2.0"
 dirs = "5.0.0"
 either = "1.0"
-fsst = {version = "=0.27.0", path = "./rust/lance-encoding/src/compression_algo/fsst"}
-fst = {version = "0.4.7", features = ["levenshtein"]}
+fst = { version = "0.4.7", features = ["levenshtein"] }
+fsst = { version = "=0.27.0", path = "./rust/lance-encoding/src/compression_algo/fsst" }
 futures = "0.3"
 http = "1.1.0"
 humantime = "2.2.0"
-hyperloglogplus = {version = "0.4.1", features = ["const-loop"]}
+hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
-jieba-rs = {version = "0.7", default-features = false}
+jieba-rs = { version = "0.7", default-features = false }
 lazy_static = "1"
 log = "0.4"
-mock_instant = {version = "0.3.1", features = ["sync"]}
-mockall = {version = "0.13.1"}
-moka = {version = "0.12", features = ["future", "sync"]}
+mockall = { version = "0.13.1" }
+mock_instant = { version = "0.3.1", features = ["sync"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 num-traits = "0.2"
 # Set min to prevent use of versions with CVE-2024-41178
-lindera = {version = "0.38.1"}
-lindera-tantivy = {version = "0.38.1"}
-object_store = {version = "0.11.0"}
+object_store = { version = "0.11.0" }
 parquet = "54.1"
-path_abs = "0.5"
 pin-project = "1.0"
-pprof = {version = "0.14.0", features = ["flamegraph", "criterion"]}
-pretty_assertions = "1.4.0"
+path_abs = "0.5"
+pprof = { version = "0.14.0", features = ["flamegraph", "criterion"] }
 proptest = "1.3.1"
 prost = "0.13.2"
 prost-build = "0.13.2"
 prost-types = "0.13.2"
-rand = {version = "0.8.3", features = ["small_rng"]}
-rangemap = {version = "1.0"}
+rand = { version = "0.8.3", features = ["small_rng"] }
+rangemap = { version = "1.0" }
 rayon = "1.10"
 roaring = "0.10.1"
 rstest = "0.23.0"
 rustc_version = "0.4"
-serde = {version = "^1"}
-serde_json = {version = "1"}
+serde = { version = "^1" }
+serde_json = { version = "1" }
 shellexpand = "3.0"
 snafu = "0.8"
-tantivy = {version = "0.22.0", features = ["stopwords"]}
+tantivy = { version = "0.22.0", features = ["stopwords"] }
+lindera = { version = "0.38.1" }
+lindera-tantivy = { version = "0.38.1" }
 tempfile = "3"
-test-log = {version = "0.2.15"}
-tokio = {version = "1.23", features = [
-  "rt-multi-thread",
-  "macros",
-  "fs",
-  "sync",
-]}
+test-log = { version = "0.2.15" }
+tokio = { version = "1.23", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "sync",
+] }
 tokio-stream = "0.1.14"
-tokio-util = {version = "0.7.10"}
+tokio-util = { version = "0.7.10" }
 tracing = "0.1"
 url = "2.3"
-uuid = {version = "1.2", features = ["v4", "serde"]}
+uuid = { version = "1.2", features = ["v4", "serde"] }
+pretty_assertions = "1.4.0"
 zstd = "0.13.1"
 
 [profile.bench]
-debug = true
 opt-level = 3
+debug = true
 strip = false
 
 [workspace.lints.clippy]
-all = {level = "deny", priority = -1}
-cargo = {level = "deny", priority = -1}
-dbg_macro = "deny"
+all = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
 fallible_impl_from = "deny"
 manual_let_else = "deny"
-redundant_clone = "deny"
 redundant_pub_crate = "deny"
-string_add = "deny"
 string_add_assign = "deny"
+string_add = "deny"
 string_lit_as_bytes = "deny"
 string_to_string = "deny"
-style = {level = "deny", priority = -1}
-trait_duplication_in_bounds = "deny"
 use_self = "deny"
+dbg_macro = "deny"
+trait_duplication_in_bounds = "deny"
+redundant_clone = "deny"
 # We should always use log instead of println
-print_stderr = "deny"
 print_stdout = "deny"
+print_stderr = "deny"
 # not too much we can do to avoid multiple crate versions
 multiple-crate-versions = "allow"
 # We use Vec<Range<u64>> in a lot of places and it is very common to use a single range in the vec.
