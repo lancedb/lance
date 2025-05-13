@@ -195,3 +195,5 @@ print_stdout = "deny"
 print_stderr = "deny"
 # not too much we can do to avoid multiple crate versions
 multiple-crate-versions = "allow"
+# We use Vec<Range<u64>> in a lot of places and it is very common to use a single range in the vec.
+single_range_in_vec_init = "allow"

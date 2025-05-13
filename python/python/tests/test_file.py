@@ -474,4 +474,13 @@ def test_blob(tmp_path):
 
     reader = LanceFileReader(str(path))
     assert len(reader.metadata().columns[0].pages) == 1
-    assert reader.read_all().to_table() == pa.table({"val": vals})
+
+    actual = reader.read_all().to_table()
+    expected = pa.table({"val": vals})
+
+    assert actual.num_rows == expected.num_rows
+    for row_num in range(expected.num_rows):
+        actual_bytes = actual.column("val").chunk(0)[row_num].as_py()
+        expected_bytes = expected.column("val").chunk(0)[row_num].as_py()
+        assert len(actual_bytes) == len(expected_bytes)
+        assert actual_bytes == expected_bytes

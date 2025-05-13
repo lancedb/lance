@@ -8,6 +8,7 @@ use url::Url;
 
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE,
+    DEFAULT_MAX_IOP_SIZE,
 };
 use lance_core::{error::Result, utils::tokio::get_num_compute_intensive_cpus};
 
@@ -25,6 +26,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             inner: Arc::new(InMemory::new()),
             scheme: String::from("memory"),
             block_size,
+            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: get_num_compute_intensive_cpus(),
