@@ -428,7 +428,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let (vector_type, _) = get_vector_type(dataset.schema(), &self.column)?;
         let is_multivector = matches!(vector_type, datatypes::DataType::List(_));
         if is_multivector {
-            builder.batch_size(1);
+            builder.batch_size(16);
         }
         let stream = builder.try_into_stream().await?;
         self.shuffle_data(Some(stream)).await?;
