@@ -160,6 +160,7 @@ impl<T> FromIterator<T> for ExpLinkedList<T> {
 pub struct ExpLinkedListIter<'a, T> {
     inner: std::collections::linked_list::Iter<'a, Vec<T>>,
     inner_iter: Option<std::slice::Iter<'a, T>>,
+    len: usize,
 }
 
 impl<'a, T> ExpLinkedListIter<'a, T> {
@@ -167,6 +168,7 @@ impl<'a, T> ExpLinkedListIter<'a, T> {
         Self {
             inner: inner.inner.iter(),
             inner_iter: None,
+            len: inner.len(),
         }
     }
 }
@@ -185,6 +187,10 @@ impl<'a, T> Iterator for ExpLinkedListIter<'a, T> {
             return self.next();
         }
         None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
     }
 }
 
