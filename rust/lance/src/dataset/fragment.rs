@@ -33,12 +33,13 @@ use lance_file::v2::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjec
 use lance_file::v2::LanceEncodingsIo;
 use lance_file::version::LanceFileVersion;
 use lance_file::{determine_file_version, v2};
-use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
-use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
+use lance_table::io::deletion::{
+    deletion_file_path, read_deletion_file_cached, write_deletion_file,
+};
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::{
     wrap_with_row_id_and_delete, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
@@ -830,8 +831,7 @@ impl FileFragment {
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
         let open_files = self.open_readers(projection, &read_config);
-        let deletion_vec_load =
-            self.load_deletion_vector(&self.dataset.object_store, &self.metadata);
+        let deletion_vec_load = self.get_deletion_vector();
 
         let row_id_load = if self.dataset.manifest.uses_move_stable_row_ids() {
             futures::future::Either::Left(
@@ -1051,44 +1051,13 @@ impl FileFragment {
                 ..
             }) => Ok(*num_deleted),
             _ => {
-                read_deletion_file(
-                    &self.dataset.base,
-                    &self.metadata,
-                    self.dataset.object_store(),
-                )
-                .map_ok(|v| v.map(|v| v.len()).unwrap_or_default())
-                .await
+                let deleletion_vector = self.get_deletion_vector().await?;
+                if let Some(deletion_vector) = deleletion_vector {
+                    Ok(deletion_vector.len())
+                } else {
+                    Ok(0)
+                }
             }
-        }
-    }
-
-    async fn load_deletion_vector(
-        &self,
-        object_store: &ObjectStore,
-        fragment: &Fragment,
-    ) -> Result<Option<Arc<DeletionVector>>> {
-        if let Some(deletion_file) = &fragment.deletion_file {
-            let path = deletion_file_path(&self.dataset.base, fragment.id, deletion_file);
-
-            let deletion_vector = self
-                .dataset
-                .session
-                .file_metadata_cache
-                .get_or_insert(&path, |_| async {
-                    read_deletion_file(&self.dataset.base, fragment, object_store)
-                        .await?
-                        .ok_or(Error::io(
-                            format!(
-                                "Deletion file {:?} not found in fragment {}",
-                                deletion_file, fragment.id
-                            ),
-                            location!(),
-                        ))
-                })
-                .await?;
-            Ok(Some(deletion_vector))
-        } else {
-            Ok(None)
         }
     }
 
@@ -1205,11 +1174,7 @@ impl FileFragment {
         });
         let get_lengths = try_join_all(get_lengths);
 
-        let deletion_vector = read_deletion_file(
-            &self.dataset.base,
-            &self.metadata,
-            self.dataset.object_store(),
-        );
+        let deletion_vector = self.get_deletion_vector();
 
         let (get_lengths, deletion_vector) = join!(get_lengths, deletion_vector);
 
@@ -1267,7 +1232,7 @@ impl FileFragment {
                 }
             }
 
-            for offset in deletion_vector {
+            for offset in deletion_vector.iter() {
                 if offset >= *expected_length as u32 {
                     let deletion_file_meta = self.metadata.deletion_file.as_ref().unwrap();
                     return Err(Error::corrupt_file(
@@ -1352,25 +1317,16 @@ impl FileFragment {
         };
 
         let cache = &self.dataset.session.file_metadata_cache;
-        let path = deletion_file_path(&self.dataset.base, self.metadata.id, deletion_file);
-        if let Some(deletion_vector) = cache.get::<DeletionVector>(&path) {
-            Ok(Some(deletion_vector))
-        } else {
-            let deletion_vector = read_deletion_file(
-                &self.dataset.base,
-                &self.metadata,
-                self.dataset.object_store(),
-            )
-            .await?;
-            match deletion_vector {
-                Some(deletion_vector) => {
-                    let deletion_vector = Arc::new(deletion_vector);
-                    cache.insert(path, deletion_vector.clone());
-                    Ok(Some(deletion_vector))
-                }
-                None => Ok(None),
-            }
-        }
+        let deletion_vector = read_deletion_file_cached(
+            self.id() as u64,
+            deletion_file,
+            &self.dataset.base,
+            self.dataset.object_store(),
+            cache,
+        )
+        .await?;
+
+        Ok(Some(deletion_vector))
     }
 
     /// Get the file metadata for this fragment, using the cache if available.
@@ -1502,14 +1458,10 @@ impl FileFragment {
                 .with_row_address(with_row_addr)
                 .with_row_id(with_row_id),
         );
-        let deletion_vector = read_deletion_file(
-            &self.dataset.base,
-            &self.metadata,
-            self.dataset.object_store(),
-        );
+        let deletion_vector = self.get_deletion_vector();
         let (reader, deletion_vector) = join!(reader, deletion_vector);
         let reader = reader?;
-        let deletion_vector = deletion_vector?.unwrap_or_default();
+        let deletion_vector = deletion_vector?.unwrap_or_default().as_ref().clone();
 
         Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size)
     }
@@ -1615,13 +1567,12 @@ impl FileFragment {
     /// the manifest.
     pub async fn delete(self, predicate: &str) -> Result<Option<Self>> {
         // Load existing deletion vector
-        let mut deletion_vector = read_deletion_file(
-            &self.dataset.base,
-            &self.metadata,
-            self.dataset.object_store(),
-        )
-        .await?
-        .unwrap_or_default();
+        let mut deletion_vector = self
+            .get_deletion_vector()
+            .await?
+            .unwrap_or_default()
+            .as_ref()
+            .clone();
 
         let starting_length = deletion_vector.len();
 
@@ -1683,13 +1634,12 @@ impl FileFragment {
         self,
         new_deletions: impl IntoIterator<Item = u32>,
     ) -> Result<Option<Self>> {
-        let mut deletion_vector = read_deletion_file(
-            &self.dataset.base,
-            &self.metadata,
-            self.dataset.object_store(),
-        )
-        .await?
-        .unwrap_or_default();
+        let mut deletion_vector = self
+            .get_deletion_vector()
+            .await?
+            .unwrap_or_default()
+            .as_ref()
+            .clone();
 
         deletion_vector.extend(new_deletions);
 
@@ -2394,7 +2344,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen, RowCount};
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::ObjectStoreParams;
+    use lance_io::object_store::ObjectStore;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use tempfile::tempdir;
