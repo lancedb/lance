@@ -381,11 +381,7 @@ struct FFILanceTableProvider {
 impl FFILanceTableProvider {
     #[new]
     #[pyo3(signature = (dataset, *, with_row_id = false, with_row_addr = false))]
-    fn new(
-        dataset: &Bound<'_, PyAny>,
-        with_row_id: bool,
-        with_row_addr: bool,
-    ) -> PyResult<Self> {
+    fn new(dataset: &Bound<'_, PyAny>, with_row_id: bool, with_row_addr: bool) -> PyResult<Self> {
         let py = dataset.py();
         let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
         let dataset_ref = &dataset.bind(py).borrow().ds;
