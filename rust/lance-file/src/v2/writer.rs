@@ -838,7 +838,7 @@ mod tests {
             RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
 
         let options = FileWriterOptions {
-            max_page_bytes: Some(1 * 1024 * 1024), // 1MB
+            max_page_bytes: Some(1024 * 1024), // 1MB
             ..Default::default()
         };
 
@@ -957,8 +957,8 @@ mod tests {
         .await
         .unwrap();
 
-        for (_col_idx, col_metadata) in file_reader.metadata().column_metadatas.iter().enumerate() {
-            for (_page_idx, page) in col_metadata.pages.iter().enumerate() {
+        for col_metadata in file_reader.metadata().column_metadatas.iter() {
+            for page in col_metadata.pages.iter() {
                 let total_size: u64 = page.buffer_sizes.iter().sum();
                 assert!(
                     total_size <= 2 * 1024 * 1024,
