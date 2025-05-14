@@ -70,9 +70,11 @@ pub struct LoggingPassthroughRef(Arc<RwLock<Option<LoggingPassthroughState>>>);
 impl LoggingPassthroughRef {
     fn inner_do<F: FnOnce(&ChromeLayer<Registry>)>(&self, f: F) {
         let state_guard = self.0.read().unwrap();
-        let state = state_guard.as_ref().unwrap();
-        let inner = state.inner.as_ref().unwrap();
-        f(inner)
+        if let Some(state) = state_guard.as_ref() {
+            if let Some(inner) = state.inner.as_ref() {
+                f(inner)
+            }
+        }
     }
 }
 
