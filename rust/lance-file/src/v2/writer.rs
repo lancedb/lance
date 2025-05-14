@@ -831,7 +831,7 @@ mod tests {
         let arrow_schema = Schema::new(vec![arrow_field]);
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
 
-        // almost 8MB
+        // 8MiB
         let data: Vec<u64> = (0..1_000_000).collect();
         let array = UInt64Array::from(data);
         let batch =
@@ -908,15 +908,15 @@ mod tests {
         let arrow_field = Field::new("data", DataType::UInt64, false);
         let arrow_schema = Schema::new(vec![arrow_field]);
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
-        // almost 4MB
+        // 4MiB
         let data: Vec<u64> = (0..500_000).collect();
         let array = UInt64Array::from(data);
         let batch =
             RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
 
+        // 2MiB
         std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
 
-        // 2MB
         let options = FileWriterOptions {
             max_page_bytes: None, // enforce env
             ..Default::default()
