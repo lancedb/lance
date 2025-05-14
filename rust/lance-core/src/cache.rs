@@ -182,7 +182,7 @@ impl FileMetadataCache {
         loader: F,
     ) -> Result<Arc<T>>
     where
-        F: Fn(&Path) -> Fut,
+        F: FnOnce(&Path) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
         if let Some(metadata) = self.get::<T>(path) {

@@ -90,7 +90,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_index::DatasetIndexExt;
-use lance_table::io::deletion::read_deletion_file;
+use lance_table::io::deletion::read_deletion_file_cached;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 
@@ -789,12 +789,21 @@ async fn rechunk_stable_row_ids(
     futures::stream::iter(old_sequences.iter_mut().zip(old_fragments.iter()))
         .map(Ok)
         .try_for_each(|((_, seq), frag)| async move {
-            let deletions = read_deletion_file(&dataset.base, frag, dataset.object_store()).await?;
-            if let Some(deletions) = deletions {
+            if let Some(deletion_file) = &frag.deletion_file {
+                let deletions = read_deletion_file_cached(
+                    frag.id,
+                    deletion_file,
+                    &dataset.base,
+                    dataset.object_store(),
+                    &dataset.session.file_metadata_cache,
+                )
+                .await?;
+
                 let mut new_seq = seq.as_ref().clone();
-                new_seq.mask(deletions.into_iter())?;
+                new_seq.mask(deletions.iter())?;
                 *seq = Arc::new(new_seq);
             }
+
             Ok::<(), crate::Error>(())
         })
         .await?;

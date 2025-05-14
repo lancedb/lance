@@ -287,6 +287,16 @@ impl FromIterator<u32> for DeletionVector {
     }
 }
 
+impl From<RoaringBitmap> for DeletionVector {
+    fn from(bitmap: RoaringBitmap) -> Self {
+        if bitmap.is_empty() {
+            Self::NoDeletions
+        } else {
+            Self::Bitmap(bitmap)
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

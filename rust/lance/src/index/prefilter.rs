@@ -147,7 +147,6 @@ impl DatasetPreFilter {
         session
             .file_metadata_cache
             .get_or_insert(&path, move |_| {
-                let dataset = dataset.clone();
                 async move {
                     let row_ids_and_deletions = load_row_ids_and_deletions(&dataset).await?;
 
