@@ -753,6 +753,8 @@ impl EncodedBatchWriteExt for EncodedBatch {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::v2::reader::{FileReader, FileReaderOptions};
     use crate::v2::testing::FsFixture;
     use crate::v2::writer::{FileWriter, FileWriterOptions, ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES};
@@ -766,7 +768,6 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use lance_io::utils::CachedFileSize;
     use object_store::path::Path;
-    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[tokio::test]
