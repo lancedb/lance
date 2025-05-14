@@ -240,7 +240,7 @@ impl Operation {
     /// Returns the IDs of fragments that have been modified by this operation.
     ///
     /// This does not include new fragments.
-    fn modified_fragment_ids(&self) -> Box<dyn Iterator<Item = u64> + '_> {
+    pub(crate) fn modified_fragment_ids(&self) -> Box<dyn Iterator<Item = u64> + '_> {
         match self {
             // These operations add new fragments or don't modify any.
             Self::Append { .. }

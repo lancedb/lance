@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
-use conflict_resolver::ConflictResolver;
+use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::Backoff;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_file::version::LanceFileVersion;
@@ -36,7 +36,7 @@ use lance_table::format::{
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
-use lance_table::io::deletion::read_deletion_file;
+use lance_table::io::deletion::read_deletion_file_cached;
 use rand::{thread_rng, Rng};
 use snafu::location;
 
@@ -51,7 +51,7 @@ use prost::Message;
 use super::ObjectStore;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
-use crate::dataset::transaction::{ConflictResult, Operation, Transaction};
+use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig, BLOB_DIR};
 use crate::index::DatasetIndexInternalExt;
 use crate::session::Session;
@@ -87,33 +87,31 @@ fn transaction_file_cache_path(base_path: &Path, version: u64) -> Path {
 async fn read_dataset_transaction_file(
     dataset: &Dataset,
     version: u64,
-) -> Result<(Arc<Transaction>, Arc<Manifest>)> {
+) -> Result<Arc<Transaction>> {
     let cache_path = transaction_file_cache_path(&dataset.base, version);
-
-    let dataset_version = dataset.checkout_version(version).await?;
-    let object_store = dataset_version.object_store();
-    let manifest = dataset_version.manifest.clone();
-    let txn_file = manifest.transaction_file.as_ref();
-
-    let txn = dataset
+    dataset
         .session
         .file_metadata_cache
         .get_or_insert(&cache_path, |_| async move {
-            let path = txn_file.as_ref().ok_or_else(|| Error::Internal {
-                message: format!(
-                    "Dataset version {} does not have a transaction file",
-                    version
-                ),
-                location: location!(),
-            })?;
+            let dataset_version = dataset.checkout_version(version).await?;
+            let object_store = dataset_version.object_store();
+            let path = dataset_version
+                .manifest
+                .transaction_file
+                .as_ref()
+                .ok_or_else(|| Error::Internal {
+                    message: format!(
+                        "Dataset version {} does not have a transaction file",
+                        version
+                    ),
+                    location: location!(),
+                })?;
             let transaction = read_transaction_file(object_store, &dataset.base, path)
                 .await
                 .unwrap();
             Ok(transaction)
         })
-        .await?;
-
-    Ok((txn, manifest))
+        .await
 }
 
 /// Write a transaction to a file and return the relative path.
@@ -433,14 +431,16 @@ pub(crate) async fn migrate_fragments(
                 }) if !recompute_stats => {
                     Either::Left(futures::future::ready(Ok(Some(*deleted_rows))))
                 }
-                Some(_) => Either::Right(async {
-                    let deletion_vector =
-                        read_deletion_file(&dataset.base, fragment, dataset.object_store()).await?;
-                    if let Some(deletion_vector) = deletion_vector {
-                        Ok(Some(deletion_vector.len()))
-                    } else {
-                        Ok(None)
-                    }
+                Some(deletion_file) => Either::Right(async {
+                    let deletion_vector = read_deletion_file_cached(
+                        fragment.id,
+                        deletion_file,
+                        &dataset.base,
+                        dataset.object_store(),
+                        &dataset.session().file_metadata_cache,
+                    )
+                    .await?;
+                    Ok(Some(deletion_vector.len()))
                 }),
             };
 
@@ -708,6 +708,7 @@ pub(crate) async fn commit_detached_transaction(
 }
 
 /// Attempt to commit a transaction, with retries and conflict resolution.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
     object_store: &ObjectStore,
@@ -754,7 +755,7 @@ pub(crate) async fn commit_transaction(
         dataset.checkout_latest().await?;
     }
 
-    let resolver = ConflictResolver::try_new(&dataset, transaction).await?;
+    let mut transaction = transaction.clone();
 
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
     let mut backoff = Backoff::default();
@@ -763,7 +764,10 @@ pub(crate) async fn commit_transaction(
         // transactions that have been committed since the read_version.
         // Use small amount of backoff to handle transactions that all
         // started at exact same time better.
-        let concurrent_txns = futures::stream::iter(target_version..=dataset.manifest.version)
+
+        let mut rebase = TransactionRebase::try_new(&dataset, transaction, affected_rows).await?;
+
+        let mut concurrent_txns = futures::stream::iter(target_version..=dataset.manifest.version)
             .map(|version| {
                 read_dataset_transaction_file(&dataset, version)
                     .map(move |res| res.map(|tx| (version, tx)))
@@ -780,11 +784,15 @@ pub(crate) async fn commit_transaction(
                 )
             });
 
-        while let Some((other_manifest, other_transaction)) = concurrent_txns.try_next().await? {
-            resolver.check_txn(transaction, Some(&other_transaction), &other_manifest)?;
+        while let Some((other_version, other_transaction)) = concurrent_txns.try_next().await? {
+            rebase.check_txn(Some(&other_transaction), other_version)?;
         }
+        drop(concurrent_txns);
 
-        transaction = resolver.update_files().await?;
+        transaction = rebase.finish(&dataset).await?;
+
+        // TODO: how about writing a new transaction file with the rebased transaction?
+        // TODO: how about deleting the old transaction file?
 
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {

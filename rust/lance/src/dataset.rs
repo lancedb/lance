@@ -835,6 +835,7 @@ impl Dataset {
             write_config,
             commit_config,
             self.manifest_location.naming_scheme,
+            None,
         )
         .await?;
 
@@ -1805,7 +1806,6 @@ mod tests {
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
 
-    use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -3640,27 +3640,19 @@ mod tests {
 
         // The deletion file should contain 20 rows
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);
-        let store = dataset.object_store().clone();
-        let path = Path::from_filesystem_path(test_uri).unwrap();
         // First fragment has 0..10 deleted
-        let deletion_vector = read_deletion_file(&path, &fragments[0].metadata, &store)
-            .await
-            .unwrap()
-            .unwrap();
+        let deletion_vector = fragments[0].get_deletion_vector().await.unwrap().unwrap();
         assert_eq!(deletion_vector.len(), 10);
         assert_eq!(
-            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            deletion_vector.iter().collect::<HashSet<_>>(),
             (0..10).collect::<HashSet<_>>()
         );
         // Second fragment has 90..100 deleted
-        let deletion_vector = read_deletion_file(&path, &fragments[1].metadata, &store)
-            .await
-            .unwrap()
-            .unwrap();
+        let deletion_vector = fragments[1].get_deletion_vector().await.unwrap().unwrap();
         assert_eq!(deletion_vector.len(), 10);
         // The second fragment starts at 50, so 90..100 becomes 40..50 in local row ids.
         assert_eq!(
-            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            deletion_vector.iter().collect::<HashSet<_>>(),
             (40..50).collect::<HashSet<_>>()
         );
         let second_deletion_file = fragments[1].metadata.deletion_file.clone().unwrap();
@@ -3674,13 +3666,10 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert!(fragments[0].metadata.deletion_file.is_some());
-        let deletion_vector = read_deletion_file(&path, &fragments[0].metadata, &store)
-            .await
-            .unwrap()
-            .unwrap();
+        let deletion_vector = fragments[0].get_deletion_vector().await.unwrap().unwrap();
         assert_eq!(deletion_vector.len(), 20);
         assert_eq!(
-            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            deletion_vector.iter().collect::<HashSet<_>>(),
             (0..20).collect::<HashSet<_>>()
         );
         // Second deletion vector was not rewritten
