@@ -42,6 +42,8 @@ use crate::format::MAGIC;
 /// Pages buffers are aligned to 64 bytes
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
+const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
+const ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES: &str = "LANCE_FILE_WRITER_MAX_PAGE_BYTES";
 
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
@@ -285,7 +287,19 @@ impl FileWriter {
             8 * 1024 * 1024
         };
 
-        let max_page_bytes = self.options.max_page_bytes.unwrap_or(32 * 1024 * 1024);
+        let max_page_bytes = self.options.max_page_bytes.unwrap_or_else(|| {
+            std::env::var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES)
+                .map(|s| {
+                    s.parse::<u64>().unwrap_or_else(|e| {
+                        warn!(
+                            "Failed to parse {}: {}, using default",
+                            ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, e
+                        );
+                        MAX_PAGE_BYTES as u64
+                    })
+                })
+                .unwrap_or(MAX_PAGE_BYTES as u64)
+        });
 
         schema.validate()?;
 
@@ -739,14 +753,21 @@ impl EncodedBatchWriteExt for EncodedBatch {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use crate::v2::reader::{FileReader, FileReaderOptions};
+    use crate::v2::testing::FsFixture;
+    use crate::v2::writer::{FileWriter, FileWriterOptions, ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES};
     use arrow_array::{types::Float64Type, RecordBatchReader};
+    use arrow_array::{RecordBatch, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance_core::cache::FileMetadataCache;
+    use lance_core::datatypes::Schema as LanceSchema;
     use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_encoding::decoder::DecoderPlugins;
     use lance_io::object_store::ObjectStore;
+    use lance_io::utils::CachedFileSize;
     use object_store::path::Path;
-
-    use crate::v2::writer::{FileWriter, FileWriterOptions};
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_basic_write() {
@@ -801,5 +822,151 @@ mod tests {
         }
         file_writer.add_schema_metadata("foo", "bar");
         file_writer.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_max_page_bytes_enforced() {
+        let arrow_field = Field::new("data", DataType::UInt64, false);
+        let arrow_schema = Schema::new(vec![arrow_field]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+
+        // almost 8MB
+        let data: Vec<u64> = (0..1_000_000).collect();
+        let array = UInt64Array::from(data);
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
+
+        let options = FileWriterOptions {
+            max_page_bytes: Some(1 * 1024 * 1024), // 1MB
+            ..Default::default()
+        };
+
+        let tmp_dir = tempdir().unwrap();
+        let path = tmp_dir.path().join("test.lance");
+        let object_store = ObjectStore::local();
+        let mut writer = FileWriter::try_new(
+            object_store
+                .create(&Path::from(path.to_str().unwrap()))
+                .await
+                .unwrap(),
+            lance_schema,
+            options,
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(
+                &Path::from(path.to_str().unwrap()),
+                &CachedFileSize::unknown(),
+            )
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &FileMetadataCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let column_meta = file_reader.metadata();
+
+        let mut total_page_num: u32 = 0;
+        for (col_idx, col_metadata) in column_meta.column_metadatas.iter().enumerate() {
+            assert!(
+                !col_metadata.pages.is_empty(),
+                "Column {} has no pages",
+                col_idx
+            );
+
+            for (page_idx, page) in col_metadata.pages.iter().enumerate() {
+                total_page_num += 1;
+                let total_size: u64 = page.buffer_sizes.iter().sum();
+                assert!(
+                    total_size <= 1024 * 1024,
+                    "Column {} Page {} size {} exceeds 1MB limit",
+                    col_idx,
+                    page_idx,
+                    total_size
+                );
+            }
+        }
+
+        assert_eq!(total_page_num, 8)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_max_page_bytes_env_var() {
+        let arrow_field = Field::new("data", DataType::UInt64, false);
+        let arrow_schema = Schema::new(vec![arrow_field]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        // almost 4MB
+        let data: Vec<u64> = (0..500_000).collect();
+        let array = UInt64Array::from(data);
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
+
+        std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
+
+        // 2MB
+        let options = FileWriterOptions {
+            max_page_bytes: None, // enforce env
+            ..Default::default()
+        };
+
+        let tmp_dir = tempdir().unwrap();
+        let path = tmp_dir.path().join("test_env_var.lance");
+        let object_store = ObjectStore::local();
+        let mut writer = FileWriter::try_new(
+            object_store
+                .create(&Path::from(path.to_str().unwrap()))
+                .await
+                .unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(
+                &Path::from(path.to_str().unwrap()),
+                &CachedFileSize::unknown(),
+            )
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &FileMetadataCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        for (_col_idx, col_metadata) in file_reader.metadata().column_metadatas.iter().enumerate() {
+            for (_page_idx, page) in col_metadata.pages.iter().enumerate() {
+                let total_size: u64 = page.buffer_sizes.iter().sum();
+                assert!(
+                    total_size <= 2 * 1024 * 1024,
+                    "Page size {} exceeds 2MB limit",
+                    total_size
+                );
+            }
+        }
+
+        std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
     }
 }
