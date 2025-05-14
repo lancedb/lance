@@ -114,6 +114,7 @@ datafusion-expr = "46.0"
 datafusion-execution = "46.0"
 datafusion-optimizer = "46.0"
 datafusion-physical-expr = { version = "46.0" }
+datafusion-physical-plan = { version = "46.0" }
 deepsize = "0.2.0"
 dirs = "5.0.0"
 either = "1.0"

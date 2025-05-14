@@ -81,6 +81,13 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
         batch_size: u32,
         projection: Arc<lance_core::datatypes::Schema>,
     ) -> Result<ReadBatchTaskStream>;
+    /// Reads the requested ranges of rows from the file, only supported by v2
+    fn read_ranges_tasks(
+        &self,
+        ranges: Arc<[Range<u64>]>,
+        batch_size: u32,
+        projection: Arc<lance_core::datatypes::Schema>,
+    ) -> Result<ReadBatchTaskStream>;
     /// Reads all rows from the file, returning as a stream of tasks
     fn read_all_tasks(
         &self,
@@ -221,6 +228,18 @@ impl GenericFileReader for V1Reader {
         Ok(ranges_to_tasks(&self.reader, ranges, projection))
     }
 
+    fn read_ranges_tasks(
+        &self,
+        _ranges: Arc<[Range<u64>]>,
+        _batch_size: u32,
+        _projection: Arc<Schema>,
+    ) -> Result<ReadBatchTaskStream> {
+        Err(Error::Internal {
+            message: "Attempt to perform FilteredRead on v1 files".to_string(),
+            location: location!(),
+        })
+    }
+
     fn take_all_tasks(
         &self,
         indices: &[u32],
@@ -320,6 +339,32 @@ mod v2_adapter {
                 .reader
                 .read_tasks(
                     ReadBatchParams::Range(range.start as usize..range.end as usize),
+                    batch_size,
+                    Some(projection),
+                    FilterExpression::no_filter(),
+                )?
+                .map(|v2_task| ReadBatchTask {
+                    task: v2_task.task.map_err(Error::from).boxed(),
+                    num_rows: v2_task.num_rows,
+                })
+                .boxed())
+        }
+
+        fn read_ranges_tasks(
+            &self,
+            ranges: Arc<[Range<u64>]>,
+            batch_size: u32,
+            projection: Arc<Schema>,
+        ) -> Result<ReadBatchTaskStream> {
+            let projection = ReaderProjection::from_field_ids(
+                self.reader.as_ref(),
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
+            Ok(self
+                .reader
+                .read_tasks(
+                    ReadBatchParams::Ranges(ranges),
                     batch_size,
                     Some(projection),
                     FilterExpression::no_filter(),
@@ -476,7 +521,16 @@ impl GenericFileReader for NullReader {
         batch_size: u32,
         projection: Arc<Schema>,
     ) -> Result<ReadBatchTaskStream> {
-        let mut remaining_rows = range.end - range.start;
+        self.read_ranges_tasks(vec![range].into(), batch_size, projection)
+    }
+
+    fn read_ranges_tasks(
+        &self,
+        ranges: Arc<[Range<u64>]>,
+        batch_size: u32,
+        projection: Arc<Schema>,
+    ) -> Result<ReadBatchTaskStream> {
+        let mut remaining_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         let projection: Arc<ArrowSchema> = Arc::new(projection.as_ref().into());
 
         let task_iter = std::iter::from_fn(move || {
@@ -502,7 +556,7 @@ impl GenericFileReader for NullReader {
         batch_size: u32,
         projection: Arc<Schema>,
     ) -> Result<ReadBatchTaskStream> {
-        self.read_range_tasks(0..self.num_rows as u64, batch_size, projection)
+        self.read_ranges_tasks(vec![0..self.num_rows as u64].into(), batch_size, projection)
     }
 
     fn take_all_tasks(
@@ -513,7 +567,7 @@ impl GenericFileReader for NullReader {
         _take_priority: Option<u32>,
     ) -> Result<ReadBatchTaskStream> {
         let num_rows = indices.len() as u64;
-        self.read_range_tasks(0..num_rows, batch_size, projection)
+        self.read_ranges_tasks(vec![0..num_rows].into(), batch_size, projection)
     }
 
     fn update_storage_stats(&self, _field_stats: &mut HashMap<u32, FieldStatistics>) {
@@ -1975,6 +2029,12 @@ impl FragmentReader {
                     .map(|i| *i + batch_offset as u32)
                     .collect(),
             ),
+            ReadBatchParams::Ranges(_) => {
+                return Err(Error::Internal {
+                    message: "ReadBatchParams::Ranges should not be used in v1 files".to_string(),
+                    location: location!(),
+                })
+            }
             ReadBatchParams::RangeFull => {
                 ReadBatchParams::Range(batch_offset..(batch_offset + rows_in_batch))
             }
@@ -2177,6 +2237,97 @@ impl FragmentReader {
         self.new_read_impl(ReadBatchParams::RangeFull, batch_size, move |reader| {
             reader.read_all_tasks(batch_size, reader.projection().clone())
         })
+    }
+
+    // This method is a clone of new_read_impl but returns tasks instead of batches
+    //
+    // It also only supports v2 files
+    pub fn read_ranges(
+        &self,
+        ranges: Arc<[Range<u64>]>,
+        batch_size: u32,
+    ) -> Result<ReadBatchFutStream> {
+        let total_num_rows = self.num_physical_rows as u32;
+        let mut num_requested_rows = 0;
+        // Note that row ranges at this point are physical and not logical.
+        for range in ranges.as_ref() {
+            if range.end > total_num_rows as u64 {
+                return Err(Error::Internal {
+                    message: format!(
+                        "Invalid read of range {:?} for fragment {} with {} addressable rows",
+                        range, self.fragment_id, total_num_rows
+                    ),
+                    location: location!(),
+                });
+            }
+            num_requested_rows += range.end - range.start;
+        }
+
+        let merged_stream = if self.with_row_addr as usize + self.with_row_id as usize
+            == self.output_schema.fields.len()
+        {
+            let tasks = (0..num_requested_rows)
+                .step_by(batch_size as usize)
+                .map(move |offset| {
+                    let num_rows = (batch_size as u64).min(num_requested_rows - offset);
+                    let batch =
+                        RecordBatch::from(StructArray::new_empty_fields(num_rows as usize, None));
+                    ReadBatchTask {
+                        task: std::future::ready(Ok(batch)).boxed(),
+                        num_rows: num_rows as u32,
+                    }
+                });
+            stream::iter(tasks).boxed()
+        } else {
+            // Read each data file, these reads should produce streams of equal sized
+            // tasks.  In other words, if we get 3 tasks of 20 rows and then a task
+            // of 10 rows from one data file we should get the same from the other.
+            let read_streams = self
+                .readers
+                .iter()
+                .map(|reader| {
+                    reader.read_ranges_tasks(
+                        ranges.clone(),
+                        batch_size,
+                        reader.projection().clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Merge the streams, this merges the generated batches
+            lance_table::utils::stream::merge_streams(read_streams)
+        };
+
+        // Add the row id column (if needed) and delete rows (if a deletion
+        // vector is present).
+        let config = RowIdAndDeletesConfig {
+            deletion_vector: self.deletion_vec.clone(),
+            row_id_sequence: self.row_id_sequence.clone(),
+            make_deletions_null: self.make_deletions_null,
+            with_row_id: self.with_row_id,
+            with_row_addr: self.with_row_addr,
+            params: ReadBatchParams::Ranges(ranges),
+            total_num_rows,
+        };
+        let output_schema = Arc::new(self.output_schema.clone());
+        Ok(
+            wrap_with_row_id_and_delete(merged_stream, self.fragment_id as u32, config)
+                // Finally, reorder the columns to match the order specified in the projection
+                .map(move |batch_fut| {
+                    let output_schema = output_schema.clone();
+                    batch_fut
+                        .map(move |batch| {
+                            batch?
+                                .project_by_schema(&output_schema)
+                                .map_err(Error::from)
+                        })
+                        .boxed()
+                })
+                .stream_in_span(tracing::debug_span!(
+                    "ReadBatchFutStream",
+                    id = self.fragment_id,
+                ))
+                .boxed(),
+        )
     }
 
     // Legacy function that reads a range of data and concatenates the results
@@ -2559,12 +2710,15 @@ mod tests {
         reader.with_make_deletions_null();
 
         if data_storage_version == LanceFileVersion::Legacy {
-            // Since the first batch is all deleted, it will return an empty batch.
+            // The first batch is entirely deleted, deleted rows will be marked null with null row ids.
             let batch1 = reader
                 .legacy_read_batch_projected(0, .., dataset.schema())
                 .await
                 .unwrap();
-            assert_eq!(batch1.num_rows(), 0);
+            assert_eq!(
+                batch1.column_by_name(ROW_ID).unwrap().as_ref(),
+                &UInt64Array::from_iter(std::iter::repeat_n(None, 10))
+            );
 
             // The second batch is partially deleted, so the deleted rows will be
             // marked null with null row ids.
@@ -2595,11 +2749,15 @@ mod tests {
                     .buffered(1)
                     .try_collect::<Vec<_>>()
             };
-            // Since the first batch is all deleted, it will return an empty batch.
+
+            // Since the first batch is all deleted, it will return all nulls row ids.
             let batches = to_batches(0..10).await.unwrap();
             assert_eq!(batches.len(), 1);
             let batch = batches.into_iter().next().unwrap();
-            assert_eq!(batch.num_rows(), 0);
+            assert_eq!(
+                batch.column_by_name(ROW_ID).unwrap().as_ref(),
+                &UInt64Array::from_iter(std::iter::repeat_n(None, 10))
+            );
 
             let batches = to_batches(10..20).await.unwrap();
             assert_eq!(batches.len(), 1);
