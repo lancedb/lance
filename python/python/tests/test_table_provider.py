@@ -18,7 +18,9 @@ def test_table_loading():
     df = pd.DataFrame({"col1": [4, 2], "col2": ["a", "b"], "col3": [4.2, 2.4]})
     dataset: LanceDataset = lance.write_dataset(df, lancedb_temp_path)
 
-    ffi_lance_table = FFILanceTableProvider(dataset, with_row_id=True, with_row_addr=True)
+    ffi_lance_table = FFILanceTableProvider(
+        dataset, with_row_id=True, with_row_addr=True
+    )
     ctx.register_table_provider("ffi_lance_table", ffi_lance_table)
     result = ctx.table("ffi_lance_table").collect()
 
