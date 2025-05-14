@@ -620,18 +620,23 @@ impl std::ops::BitOr<Self> for RowIdTreeMap {
 impl std::ops::BitOrAssign<Self> for RowIdTreeMap {
     fn bitor_assign(&mut self, rhs: Self) {
         for (fragment, rhs_set) in &rhs.inner {
-            match self.inner.get_mut(fragment) {
-                None => {
-                    self.inner.insert(*fragment, rhs_set.clone());
-                }
-                Some(RowIdSelection::Full) => {
-                    // If the fragment is already selected then there is nothing to do
-                }
-                Some(RowIdSelection::Partial(lhs_set)) => {
-                    if let RowIdSelection::Partial(rhs_set) = rhs_set {
-                        *lhs_set |= rhs_set;
+            let lhs_set = self.inner.get_mut(fragment);
+            if let Some(lhs_set) = lhs_set {
+                match lhs_set {
+                    RowIdSelection::Full => {
+                        // If the fragment is already selected then there is nothing to do
                     }
+                    RowIdSelection::Partial(lhs_bitmap) => match rhs_set {
+                        RowIdSelection::Full => {
+                            *lhs_set = RowIdSelection::Full;
+                        }
+                        RowIdSelection::Partial(rhs_set) => {
+                            *lhs_bitmap |= rhs_set;
+                        }
+                    },
                 }
+            } else {
+                self.inner.insert(*fragment, rhs_set.clone());
             }
         }
     }
@@ -945,14 +950,22 @@ mod tests {
             right.extend(right_rows.iter().copied());
 
             let mut expected = RowIdTreeMap::default();
-            for fragment in left_full_fragments {
-                if right_full_fragments.contains(&fragment) {
-                    expected.insert_fragment(fragment);
+            for fragment in &left_full_fragments {
+                if right_full_fragments.contains(fragment) {
+                    expected.insert_fragment(*fragment);
                 }
             }
 
-            let combined_rows = left_rows.iter().filter(|row| right_rows.contains(row));
-            expected.extend(combined_rows);
+            let left_in_right = left_rows.iter().filter(|row| {
+                right_rows.contains(row)
+                    || right_full_fragments.contains(&((*row >> 32) as u32))
+            });
+            expected.extend(left_in_right);
+            let right_in_left = right_rows.iter().filter(|row| {
+                left_rows.contains(row)
+                    || left_full_fragments.contains(&((*row >> 32) as u32))
+            });
+            expected.extend(right_in_left);
 
             let actual = left & right;
             prop_assert_eq!(expected, actual);
@@ -989,6 +1002,16 @@ mod tests {
             expected.extend(combined_rows);
 
             let actual = left | right;
+            for actual_key_val in &actual.inner {
+                proptest::prop_assert!(expected.inner.contains_key(actual_key_val.0));
+                let expected_val = expected.inner.get(actual_key_val.0).unwrap();
+                prop_assert_eq!(
+                    actual_key_val.1,
+                    expected_val,
+                    "error on key {}",
+                    actual_key_val.0
+                );
+            }
             prop_assert_eq!(expected, actual);
         }
 
