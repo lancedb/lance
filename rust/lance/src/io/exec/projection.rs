@@ -190,6 +190,8 @@ pub fn compute_projection<'a>(
                         }
                     }
                     DataType::LargeBinary => {
+                        // This can happen when loading blob fields.  The projection we load from disk
+                        // is the blob description (struct) but the actual result / schema field is large_binary
                         selections.push(Selection::FullField(projected_field.name()));
                     }
                     _ => {
