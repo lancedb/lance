@@ -943,6 +943,10 @@ impl FilterPlan {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.refine_expr.is_none() && self.index_query.is_none()
+    }
+
     pub fn refine_columns(&self) -> Vec<String> {
         self.refine_expr
             .as_ref()
@@ -955,6 +959,11 @@ impl FilterPlan {
         self.refine_expr.is_some()
     }
 
+    /// Return true if this has a scalar index query
+    pub fn has_index_query(&self) -> bool {
+        self.index_query.is_some()
+    }
+
     pub fn has_any_filter(&self) -> bool {
         self.refine_expr.is_some() || self.index_query.is_some()
     }
@@ -962,6 +971,22 @@ impl FilterPlan {
     pub fn make_refine_only(&mut self) {
         self.index_query = None;
         self.refine_expr = self.full_expr.clone();
+    }
+
+    /// Return true if there is no refine or recheck of any kind and there is an index query
+    pub fn is_exact_index_search(&self) -> bool {
+        self.index_query.is_some() && self.refine_expr.is_none() && self.skip_recheck
+    }
+
+    pub fn benefits_from_late_materialization(&self) -> bool {
+        // If there is no refine step then either:
+        // 1. We are doing a full scan so there is no second filter
+        // 2. We are doing a pure scalar index search, so there is no first filter
+        //
+        // Note: In case #2 we are making the assumption that the scalar index covers
+        // most of our fragments.  If 90% of our fragments are not covered by the scalar
+        // index then we might actually benefit from late materialization.
+        self.refine_expr.is_some()
     }
 }
 
