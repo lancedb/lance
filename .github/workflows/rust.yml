@@ -33,6 +33,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
       - name: Check formatting
         run: cargo fmt -- --check
   clippy:
@@ -41,6 +44,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: |
@@ -59,11 +65,11 @@ jobs:
     name: Check Rust dependencies (cargo-deny)
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
-    - uses: EmbarkStudios/cargo-deny-action@v2
-      with:
-        log-level: warn
-        command: check
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          log-level: warn
+          command: check
   linux-build:
     runs-on: "ubuntu-24.04"
     timeout-minutes: 60

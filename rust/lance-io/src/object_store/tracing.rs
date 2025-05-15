@@ -59,14 +59,12 @@ impl std::fmt::Display for TracedObjectStore {
 #[async_trait::async_trait]
 #[deny(clippy::missing_trait_methods)]
 impl object_store::ObjectStore for TracedObjectStore {
-    // Instead of using Path in trace span, use use Path.as_ref() -> &str which
-    // is cleaner.
-    #[instrument(level = "debug", skip(self, bytes, location), fields(path = location.as_ref(), size = bytes.content_length()))]
+    #[instrument(level = "debug", skip(self, bytes))]
     async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
         self.target.put(location, bytes).await
     }
 
-    #[instrument(level = "debug", skip(self, bytes, location), fields(path = location.as_ref(), size = bytes.content_length()))]
+    #[instrument(level = "debug", skip(self, bytes))]
     async fn put_opts(
         &self,
         location: &Path,
@@ -99,42 +97,32 @@ impl object_store::ObjectStore for TracedObjectStore {
         }))
     }
 
-    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref(), size = tracing::field::Empty))]
+    #[instrument(level = "debug", skip(self, location))]
     async fn get(&self, location: &Path) -> OSResult<GetResult> {
-        let res = self.target.get(location).await?;
-
-        let span = tracing::Span::current();
-        span.record("size", res.meta.size);
-
-        Ok(res)
+        self.target.get(location).await
     }
 
-    #[instrument(level = "debug", skip(self, options, location), fields(path = location.as_ref(), size = tracing::field::Empty))]
+    #[instrument(level = "debug", skip(self, options))]
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
-        let res = self.target.get_opts(location, options).await?;
-
-        let span = tracing::Span::current();
-        span.record("size", res.range.len());
-
-        Ok(res)
+        self.target.get_opts(location, options).await
     }
 
-    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref(), size = range.len()))]
+    #[instrument(level = "debug", skip(self))]
     async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
         self.target.get_range(location, range).await
     }
 
-    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref()))]
+    #[instrument(level = "debug", skip(self, ranges))]
     async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
         self.target.get_ranges(location, ranges).await
     }
 
-    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref()))]
+    #[instrument(level = "debug", skip(self))]
     async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
         self.target.head(location).await
     }
 
-    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref()))]
+    #[instrument(level = "debug", skip(self))]
     async fn delete(&self, location: &Path) -> OSResult<()> {
         self.target.delete(location).await
     }
@@ -150,12 +138,12 @@ impl object_store::ObjectStore for TracedObjectStore {
             .boxed()
     }
 
-    #[instrument(level = "debug", skip(self, prefix), fields(prefix = prefix.map(|p| p.as_ref())))]
+    #[instrument(level = "debug", skip(self))]
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
         self.target.list(prefix).stream_in_current_span().boxed()
     }
 
-    #[instrument(level = "debug", skip(self, prefix, offset), fields(prefix = prefix.map(|p| p.as_ref()), offset = offset.as_ref()))]
+    #[instrument(level = "debug", skip(self))]
     fn list_with_offset(
         &self,
         prefix: Option<&Path>,
@@ -167,27 +155,27 @@ impl object_store::ObjectStore for TracedObjectStore {
             .boxed()
     }
 
-    #[instrument(level = "debug", skip(self, prefix), fields(prefix = prefix.map(|p| p.as_ref())))]
+    #[instrument(level = "debug", skip(self))]
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
         self.target.list_with_delimiter(prefix).await
     }
 
-    #[instrument(level = "debug", skip(self, from, to), fields(from = from.as_ref(), to = to.as_ref()))]
+    #[instrument(level = "debug", skip(self))]
     async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.copy(from, to).await
     }
 
-    #[instrument(level = "debug", skip(self, from, to), fields(from = from.as_ref(), to = to.as_ref()))]
+    #[instrument(level = "debug", skip(self))]
     async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.rename(from, to).await
     }
 
-    #[instrument(level = "debug", skip(self, from, to), fields(from = from.as_ref(), to = to.as_ref()))]
+    #[instrument(level = "debug", skip(self))]
     async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.rename_if_not_exists(from, to).await
     }
 
-    #[instrument(level = "debug", skip(self, from, to), fields(from = from.as_ref(), to = to.as_ref()))]
+    #[instrument(level = "debug", skip(self))]
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.copy_if_not_exists(from, to).await
     }

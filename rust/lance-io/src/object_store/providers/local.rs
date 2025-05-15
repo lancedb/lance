@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE,
-    DEFAULT_LOCAL_IO_PARALLELISM,
+    DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
 };
 use lance_core::error::Result;
 
@@ -25,6 +25,7 @@ impl ObjectStoreProvider for FileStoreProvider {
             inner: Arc::new(LocalFileSystem::new()),
             scheme: base_path.scheme().to_owned(),
             block_size,
+            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,

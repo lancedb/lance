@@ -112,7 +112,11 @@ pub fn merge_streams(streams: Vec<ReadBatchTaskStream>) -> ReadBatchTaskStream {
 }
 
 /// Apply a mask to the batch, where rows are "deleted" by the _rowid column null.
-/// This is used as a performance optimization to avoid copying data.
+///
+/// This is used partly as a performance optimization (cheaper to null than to filter)
+/// but also because there are cases where we want to load the physical rows.  For example,
+/// we may be replacing a column based on some UDF and we want to provide a value for the
+/// deleted rows to ensure the fragments are aligned.
 fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<RecordBatch> {
     // Transform mask into null buffer. Null means deleted, though note that
     // null buffers are actually validity buffers, so True means not null
@@ -120,8 +124,6 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
     let mask_buffer = NullBuffer::new(mask.values().clone());
 
     match mask_buffer.null_count() {
-        // All rows are deleted
-        n if n == mask_buffer.len() => return Ok(RecordBatch::new_empty(batch.schema())),
         // No rows are deleted
         0 => return Ok(batch),
         _ => {}
@@ -204,16 +206,16 @@ pub fn apply_row_id_and_deletes(
     let num_rows = batch.num_rows() as u32;
 
     let row_addrs = if should_fetch_row_addr {
-        let ids_in_batch = config
+        let row_offsets_in_batch = &config
             .params
             .slice(batch_offset as usize, num_rows as usize)
             .unwrap()
             .to_offsets()
             .unwrap();
-        let row_addrs: UInt64Array = ids_in_batch
+        let row_addrs: UInt64Array = row_offsets_in_batch
             .values()
             .iter()
-            .map(|row_id| u64::from(RowAddress::new_from_parts(fragment_id, *row_id)))
+            .map(|row_offset| u64::from(RowAddress::new_from_parts(fragment_id, *row_offset)))
             .collect();
 
         Some(Arc::new(row_addrs))
@@ -237,9 +239,12 @@ pub fn apply_row_id_and_deletes(
         None
     };
 
-    // TODO: This is a minor cop out. Pushing deletion vector in to the decoders is hard
-    // so I'm going to just leave deletion filter at this layer for now.
-    // We should push this down futurther when we get to statistics-based predicate pushdown
+    let span = tracing::span!(tracing::Level::DEBUG, "apply_deletions");
+    let _enter = span.enter();
+    let deletion_mask = deletion_vector.and_then(|v| {
+        let row_addrs: &[u64] = row_addrs.as_ref().unwrap().values();
+        v.build_predicate(row_addrs.iter())
+    });
 
     let batch = if config.with_row_id {
         let row_id_arr = row_ids.unwrap();
@@ -249,32 +254,16 @@ pub fn apply_row_id_and_deletes(
     };
 
     let batch = if config.with_row_addr {
-        let row_addr_arr = row_addrs.clone().unwrap();
+        let row_addr_arr = row_addrs.unwrap();
         batch.try_with_column(ROW_ADDR_FIELD.clone(), row_addr_arr)?
     } else {
         batch
     };
 
-    if let Some(deletion_vector) = deletion_vector {
-        // We only enter this span if there are deletions to apply
-        let span = tracing::span!(tracing::Level::DEBUG, "apply_deletions");
-        let _enter = span.enter();
-
-        // This function is meant to be IO bound, but we are doing CPU-bound work here
-        // We should try to move this to later.
-        let row_addrs = row_addrs.as_ref().unwrap().values();
-        if let Some(deletion_mask) = deletion_vector.build_predicate(row_addrs.iter()) {
-            if config.make_deletions_null {
-                apply_deletions_as_nulls(batch, &deletion_mask)
-            } else {
-                Ok(arrow::compute::filter_record_batch(&batch, &deletion_mask)?)
-            }
-        } else {
-            // No rows are deleted, so just return the batch
-            Ok(batch)
-        }
-    } else {
-        Ok(batch)
+    match (deletion_mask, config.make_deletions_null) {
+        (None, _) => Ok(batch),
+        (Some(mask), false) => Ok(arrow::compute::filter_record_batch(&batch, &mask)?),
+        (Some(mask), true) => Ok(apply_deletions_as_nulls(batch, &mask)?),
     }
 }
 
@@ -532,11 +521,15 @@ mod tests {
                             assert_eq!(total_actually_deleted, expected_deletions);
                             if expected_deletions > 0 && with_row_id {
                                 if make_deletions_null {
+                                    // If we make deletions null we get 3 batches of all-null and then
+                                    // a batch of half-null
                                     assert_eq!(
-                                        batches[0][ROW_ID].as_primitive::<UInt64Type>().value(0),
+                                        batches[3][ROW_ID].as_primitive::<UInt64Type>().value(0),
                                         u64::from(RowAddress::new_from_parts(frag_id, 30))
                                     );
+                                    assert_eq!(batches[3][ROW_ID].null_count(), 5);
                                 } else {
+                                    // If we materialize deletions the first row will be 35
                                     assert_eq!(
                                         batches[0][ROW_ID].as_primitive::<UInt64Type>().value(0),
                                         u64::from(RowAddress::new_from_parts(frag_id, 35))

@@ -63,7 +63,7 @@ use crate::dataset::ProjectionRequest;
 use crate::index::vector::ivf::v2::PartitionEntry;
 use crate::Dataset;
 
-use super::utils;
+use super::utils::{self, get_vector_type};
 use super::v2::IVFIndex;
 
 // Builder for IVF index
@@ -418,11 +418,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             "dataset not set before shuffling",
             location!(),
         ))?;
+
         let mut builder = dataset.scan();
         builder
             .batch_readahead(get_num_compute_intensive_cpus())
             .project(&[self.column.as_str()])?
             .with_row_id();
+
+        let (vector_type, _) = get_vector_type(dataset.schema(), &self.column)?;
+        let is_multivector = matches!(vector_type, datatypes::DataType::List(_));
+        if is_multivector {
+            builder.batch_size(64);
+        }
         let stream = builder.try_into_stream().await?;
         self.shuffle_data(Some(stream)).await?;
         Ok(())

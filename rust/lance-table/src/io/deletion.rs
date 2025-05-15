@@ -18,7 +18,7 @@ use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
 use snafu::{location, ResultExt};
-use tracing::info;
+use tracing::{info, instrument};
 
 use crate::format::{DeletionFile, DeletionFileType, Fragment};
 
@@ -123,6 +123,7 @@ pub async fn write_deletion_file(
 /// Returns the deletion vector if one was present. Otherwise returns `Ok(None)`.
 ///
 /// Will return an error if the file is present but invalid.
+#[instrument(level = "debug", skip_all)]
 pub async fn read_deletion_file(
     base: &Path,
     fragment: &Fragment,
@@ -132,19 +133,11 @@ pub async fn read_deletion_file(
         return Ok(None);
     };
 
-    // Create span after early return to avoid creating a span if we don't need it.
-    let span = tracing::debug_span!(
-        "lance::io::deletion::read_deletion_file",
-        fragment_id = fragment.id,
-        bytes_read = tracing::field::Empty,
-    );
-
     match deletion_file.file_type {
         DeletionFileType::Array => {
             let path = deletion_file_path(base, fragment.id, deletion_file);
 
             let data = object_store.read_one_all(&path).await?;
-            span.record("bytes_read", data.len());
             let data = std::io::Cursor::new(data);
             let mut batches: Vec<RecordBatch> = ArrowFileReader::try_new(data, None)?
                 .collect::<std::result::Result<_, ArrowError>>()
@@ -202,7 +195,6 @@ pub async fn read_deletion_file(
             let path = deletion_file_path(base, fragment.id, deletion_file);
 
             let data = object_store.read_one_all(&path).await?;
-            span.record("bytes_read", data.len());
             let reader = data.reader();
             let bitmap = RoaringBitmap::deserialize_from(reader)
                 .map_err(box_error)
