@@ -282,3 +282,111 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_ipc::Schema;
+    use arrow_schema::{DataType, Field};
+    use lance_io::object_store::ObjectStoreParams;
+
+    use crate::{
+        dataset::{InsertBuilder, WriteParams},
+        utils::test::StatsHolder,
+    };
+
+    use super::*;
+
+    async fn test_dataset(num_rows: usize, num_fragments: usize) -> (Dataset, Arc<StatsHolder>) {
+        let io_stats = Arc::new(StatsHolder::default());
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(io_stats.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
+                Arc::new(Int32Array::from_iter_values(
+                    std::iter::repeat(0).take(num_rows),
+                )),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&write_params)
+            .execute(vec![data])
+            .await
+            .unwrap();
+        (dataset, io_stats)
+    }
+
+    #[tokio::test]
+    async fn test_non_overlapping_rebase() {
+        let (dataset, io_stats) = test_dataset(5, 5).await;
+        let transaction = Transaction {
+            read_version: 1,
+            uuid: "test".to_string(),
+            operation: Operation::Update {
+                updated_fragments: vec![Fragment {
+                    id: 0,
+                    deletion_file: None,
+                    files: vec![],
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let other_transactions = [
+            todo!("update on fragment 1, delete on fragment 2"),
+            todo!("delete on fragment 3"),
+            todo!("update on fragment 4"),
+        ];
+        let mut rebase = TransactionRebase::try_new(&dataset, transaction.clone(), None)
+            .await
+            .unwrap();
+
+        for (other_version, other_transaction) in other_transactions.iter().enumerate() {
+            rebase
+                .check_txn(Some(other_transaction), other_version as u64)
+                .unwrap();
+            let io_stats = io_tracker.get_stats().await;
+            assert_eq!(io_stats.read_iops, 0);
+            assert_eq!(io_stats.write_iops, 0);
+        }
+
+        let expected_transaction = Transaction {
+            read_version: 4,
+            ..transaction
+        };
+        let rebased_transaction = rebase.finish(&dataset).await.unwrap();
+        assert_eq!(rebased_transaction, expected_transaction);
+    }
+
+    #[tokio::test]
+    async fn test_non_conflicting_rebase() {
+        todo!()
+    }
+
+    #[tokio::test]
+    async fn test_conflicting_rebase() {
+        todo!();
+
+        todo!("test IO requests");
+
+        todo!("test cleanup")
+    }
+
+    #[tokio::test]
+    async fn test_modifies_file() {
+        todo!()
+    }
+}
