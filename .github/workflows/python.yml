@@ -68,6 +68,8 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install rustfmt
+        run: rustup component add rustfmt
       - name: Lint Rust
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
