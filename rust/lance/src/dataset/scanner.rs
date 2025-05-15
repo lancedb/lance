@@ -76,6 +76,7 @@ use crate::io::exec::{
 use crate::{Error, Result};
 use snafu::location;
 
+pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
 
@@ -292,7 +293,7 @@ pub struct Scanner {
 
     /// If Some then results will be ordered by the provided ordering
     ///
-    /// If there are multiple columns the the results will first be ordered
+    /// If there are multiple columns the results will first be ordered
     /// by the first column.  Then, any values whose first column is equal
     /// will be sorted by the next column, and so on.
     ///
@@ -338,6 +339,9 @@ pub struct Scanner {
 
     /// If true, the scanner will emit deleted rows
     include_deleted_rows: bool,
+
+    /// If set, this callback will be called after the scan with summary statistics
+    scan_stats_callback: Option<ExecutionStatsCallback>,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -377,6 +381,7 @@ impl Scanner {
             fast_search: false,
             use_scalar_index: true,
             include_deleted_rows: false,
+            scan_stats_callback: None,
         }
     }
 
@@ -468,6 +473,12 @@ impl Scanner {
     /// results do not match the filter.
     pub fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
         self.prefilter = should_prefilter;
+        self
+    }
+
+    /// Set the callback to be called after the scan with summary statistics
+    pub fn scan_stats_callback(&mut self, callback: ExecutionStatsCallback) -> &mut Self {
+        self.scan_stats_callback = Some(callback);
         self
     }
 
@@ -1036,6 +1047,7 @@ impl Scanner {
                 plan,
                 LanceExecutionOptions {
                     batch_size: self.batch_size,
+                    execution_stats_callback: self.scan_stats_callback.clone(),
                     ..Default::default()
                 },
             )?))
@@ -1045,9 +1057,15 @@ impl Scanner {
 
     pub(crate) async fn try_into_dfstream(
         &self,
-        options: LanceExecutionOptions,
+        mut options: LanceExecutionOptions,
     ) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
+
+        // Use the scan stats callback if the user didn't set an execution stats callback
+        if options.execution_stats_callback.is_none() {
+            options.execution_stats_callback = self.scan_stats_callback.clone();
+        }
+
         execute_plan(plan, options)
     }
 
@@ -1566,6 +1584,96 @@ impl Scanner {
         Ok(plan)
     }
 
+    async fn fragments_covered_by_fts_leaf(
+        &self,
+        column: &str,
+        accum: &mut RoaringBitmap,
+    ) -> Result<bool> {
+        let index = self
+            .dataset
+            .load_scalar_index_for_column(column)
+            .await?
+            .ok_or(Error::invalid_input(
+                format!("Column {} has no inverted index", column),
+                location!(),
+            ))?;
+        if let Some(fragmap) = &index.fragment_bitmap {
+            *accum |= fragmap;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    #[async_recursion]
+    async fn fragments_covered_by_fts_query_helper(
+        &self,
+        query: &FtsQuery,
+        accum: &mut RoaringBitmap,
+    ) -> Result<bool> {
+        match query {
+            FtsQuery::Match(match_query) => {
+                self.fragments_covered_by_fts_leaf(
+                    match_query.column.as_ref().ok_or(Error::invalid_input(
+                        "the column must be specified in the query".to_string(),
+                        location!(),
+                    ))?,
+                    accum,
+                )
+                .await
+            }
+            FtsQuery::Boost(boost) => Ok(self
+                .fragments_covered_by_fts_query_helper(&boost.negative, accum)
+                .await?
+                & self
+                    .fragments_covered_by_fts_query_helper(&boost.positive, accum)
+                    .await?),
+            FtsQuery::MultiMatch(multi_match) => {
+                for mq in &multi_match.match_queries {
+                    if !self
+                        .fragments_covered_by_fts_leaf(
+                            mq.column.as_ref().ok_or(Error::invalid_input(
+                                "the column must be specified in the query".to_string(),
+                                location!(),
+                            ))?,
+                            accum,
+                        )
+                        .await?
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            FtsQuery::Phrase(phrase_query) => {
+                self.fragments_covered_by_fts_leaf(
+                    phrase_query.column.as_ref().ok_or(Error::invalid_input(
+                        "the column must be specified in the query".to_string(),
+                        location!(),
+                    ))?,
+                    accum,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn fragments_covered_by_fts_query(&self, query: &FtsQuery) -> Result<RoaringBitmap> {
+        let all_fragments = self.get_fragments_as_bitmap();
+
+        let mut referenced_fragments = RoaringBitmap::new();
+        if !self
+            .fragments_covered_by_fts_query_helper(query, &mut referenced_fragments)
+            .await?
+        {
+            // One or more indices is missing the fragment bitmap, require all fragments in prefilter
+            Ok(all_fragments)
+        } else {
+            // Fragments required for prefilter is intersection of index fragments and query fragments
+            Ok(all_fragments & referenced_fragments)
+        }
+    }
+
     // Create an execution plan to do full text search
     async fn fts(
         &self,
@@ -1616,7 +1724,15 @@ impl Scanner {
             query.query.clone()
         };
 
-        let prefilter_source = self.prefilter_source(filter_plan).await?;
+        // TODO: Could maybe walk the query here to find all the indices that will be
+        // involved in the query to calculate a more accuarate required_fragments than
+        // get_fragments_as_bitmap but this is safe for now.
+        let prefilter_source = self
+            .prefilter_source(
+                filter_plan,
+                self.fragments_covered_by_fts_query(&query).await?,
+            )
+            .await?;
         let fts_exec = self
             .plan_fts(&query, &params, filter_plan, &prefilter_source)
             .await?;
@@ -2020,29 +2136,24 @@ impl Scanner {
         }
     }
 
-    // First perform a lookup in a scalar index for ids and then perform a take on the
-    // target fragments with those ids
-    async fn scalar_indexed_scan(
+    /// Given an index query, split the fragments into two sets
+    ///
+    /// The first set is the relevant fragments, which are covered by ALL indices in the query
+    /// The second set is the missing fragments, which are missed by at least one index
+    ///
+    /// There is no point in handling the case where a fragment is covered by some (but not all)
+    /// of the indices.  If we have to do a full scan of the fragment then we do it
+    async fn partition_frags_by_coverage(
         &self,
-        projection: Projection,
-        filter_plan: &FilterPlan,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        // One or more scalar indices cover this data and there is a filter which is
-        // compatible with the indices.  Use that filter to perform a take instead of
-        // a full scan.
+        index_expr: &ScalarIndexExpr,
+    ) -> Result<(Vec<Fragment>, Vec<Fragment>)> {
+        // Figure out which fragments are covered by ALL of the indices we are using
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
             fragment.clone()
         } else {
             (**self.dataset.fragments()).clone()
         };
 
-        // If this unwrap fails we have a bug because we shouldn't be using this function unless we've already
-        // checked that there is an index query
-        let index_expr = filter_plan.index_query.as_ref().unwrap();
-
-        let needs_recheck = index_expr.needs_recheck();
-
-        // Figure out which fragments are covered by ALL of the indices we are using
         let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
         let mut relevant_frags = Vec::with_capacity(fragments.len());
         let mut missing_frags = Vec::with_capacity(fragments.len());
@@ -2053,6 +2164,58 @@ impl Scanner {
                 missing_frags.push(fragment);
             }
         }
+        Ok((relevant_frags, missing_frags))
+    }
+
+    async fn prefilter_scalar_indexed_query(
+        &self,
+        index_query: &ScalarIndexExpr,
+        filter_plan: &FilterPlan,
+        required_frags: RoaringBitmap,
+    ) -> Result<PreFilterSource> {
+        let (_, missing_frags) = self.partition_frags_by_coverage(index_query).await?;
+
+        // We want to use this as a pre-filter.  We don't need it to cover the _entire_ dataset.  It
+        // just needs to cover the same fragments as the vector index.  If it doesn't then we need to
+        // fall back to a scalar index scan.
+        if missing_frags
+            .iter()
+            .all(|frag| !required_frags.contains(frag.id as u32))
+        {
+            // The index covers the entire dataset, no need for materialization or scanning
+            return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(
+                ScalarIndexExec::new(self.dataset.clone(), index_query.clone()),
+            )));
+        }
+
+        // The index is missing one or more fragments.  We need to scan and filter those fragments
+        // This also means we will need to materialize the index because we need to union it with
+        // the other results, so just fall back to a scalar_indexed_scan
+        Ok(PreFilterSource::FilteredRowIds(
+            self.scalar_indexed_scan(self.dataset.empty_projection().with_row_id(), filter_plan)
+                .await?,
+        ))
+    }
+
+    // First perform a lookup in a scalar index for ids and then perform a take on the
+    // target fragments with those ids
+    async fn scalar_indexed_scan(
+        &self,
+        projection: Projection,
+        filter_plan: &FilterPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // One or more scalar indices cover this data and there is a filter which is
+        // compatible with the indices.  Use that filter to perform a take instead of
+        // a full scan.
+
+        // If this unwrap fails we have a bug because we shouldn't be using this function unless we've already
+        // checked that there is an index query
+        let index_expr = filter_plan.index_query.as_ref().unwrap();
+
+        let needs_recheck = index_expr.needs_recheck();
+
+        // Figure out which fragments are covered by ALL indices
+        let (relevant_frags, missing_frags) = self.partition_frags_by_coverage(index_expr).await?;
 
         let mut plan: Arc<dyn ExecutionPlan> = Arc::new(MaterializeIndexExec::new(
             self.dataset.clone(),
@@ -2327,6 +2490,31 @@ impl Scanner {
         Ok(Arc::new(not_nulls))
     }
 
+    fn get_fragments_as_bitmap(&self) -> RoaringBitmap {
+        if let Some(fragments) = &self.fragments {
+            RoaringBitmap::from_iter(fragments.iter().map(|f| f.id as u32))
+        } else {
+            RoaringBitmap::from_iter(self.dataset.fragments().iter().map(|f| f.id as u32))
+        }
+    }
+
+    fn get_indexed_frags(&self, index: &[Index]) -> RoaringBitmap {
+        let all_fragments = self.get_fragments_as_bitmap();
+
+        let mut all_indexed_frags = RoaringBitmap::new();
+        for idx in index {
+            if let Some(fragmap) = idx.fragment_bitmap.as_ref() {
+                all_indexed_frags |= fragmap;
+            } else {
+                // If any index is missing the fragment bitmap it is safest to just assume we
+                // need all fragments
+                return all_fragments;
+            }
+        }
+
+        all_indexed_frags & all_fragments
+    }
+
     /// Create an Execution plan to do indexed ANN search
     async fn ann(
         &self,
@@ -2334,7 +2522,9 @@ impl Scanner {
         index: &[Index],
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let prefilter_source = self.prefilter_source(filter_plan).await?;
+        let prefilter_source = self
+            .prefilter_source(filter_plan, self.get_indexed_frags(index))
+            .await?;
         let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
@@ -2362,7 +2552,9 @@ impl Scanner {
 
         let over_fetch_factor = *DEFAULT_XTR_OVERFETCH;
 
-        let prefilter_source = self.prefilter_source(filter_plan).await?;
+        let prefilter_source = self
+            .prefilter_source(filter_plan, self.get_indexed_frags(index))
+            .await?;
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
 
         let num_queries = q.key.len() / dim;
@@ -2418,7 +2610,11 @@ impl Scanner {
     }
 
     /// Create prefilter source from filter plan
-    async fn prefilter_source(&self, filter_plan: &FilterPlan) -> Result<PreFilterSource> {
+    async fn prefilter_source(
+        &self,
+        filter_plan: &FilterPlan,
+        required_frags: RoaringBitmap,
+    ) -> Result<PreFilterSource> {
         let prefilter_source = match (
             &filter_plan.index_query,
             &filter_plan.refine_expr,
@@ -2435,22 +2631,25 @@ impl Scanner {
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             } // Should be index_scan -> filter
             (Some(index_query), None, true, true) => {
-                // Index scan doesn't honor the fragment allowlist today.
-                // TODO: we could filter the index scan results to only include the allowed fragments.
-                self.ensure_not_fragment_scan()?;
-
-                // The filter is completely satisfied by the index.  We
-                // only need to search the index to determine the valid row
-                // ids.
-                let index_query = Arc::new(ScalarIndexExec::new(
-                    self.dataset.clone(),
-                    index_query.clone(),
-                ));
-                PreFilterSource::ScalarIndexQuery(index_query)
+                if self.is_fragment_scan() {
+                    let filtered_row_ids = self
+                        .scalar_indexed_scan(
+                            self.dataset.empty_projection().with_row_id(),
+                            filter_plan,
+                        )
+                        .await?;
+                    PreFilterSource::FilteredRowIds(filtered_row_ids)
+                } else {
+                    // The filter is completely satisfied by the index.  If it also covers all fragments we might
+                    // be able to use a faster version that doesn't even require materialization
+                    self.prefilter_scalar_indexed_query(index_query, filter_plan, required_frags)
+                        .await?
+                }
             }
             (None, Some(refine_expr), true, _) => {
                 // No indices match the filter.  We need to do a full scan
                 // of the filter columns to determine the valid row ids.
+
                 let columns_in_filter = Planner::column_names_in_expr(refine_expr);
                 let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
                 let filter_input = self.scan(true, false, true, None, filter_schema);
@@ -3987,7 +4186,7 @@ mod test {
 
             assert_eq!(
                 dataset.index_cache_entry_count(),
-                1, // 1 for index metadata
+                2, // 2 for index metadata at version 1 and 2.
             );
             let results = scan
                 .try_into_stream()
@@ -4991,17 +5190,20 @@ mod test {
         assert!(filtered_scan_bytes < full_scan_bytes);
 
         // Now do a scan with pushdown, the benefit should be even greater
-        let start_bytes = get_bytes();
-        dataset
-            .scan()
-            .filter("not_indexed = 50")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let pushdown_scan_bytes = get_bytes() - start_bytes;
+        // Pushdown only works with the legacy format for now.
+        if data_storage_version == LanceFileVersion::Legacy {
+            let start_bytes = get_bytes();
+            dataset
+                .scan()
+                .filter("not_indexed = 50")
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let pushdown_scan_bytes = get_bytes() - start_bytes;
 
-        assert!(pushdown_scan_bytes < filtered_scan_bytes);
+            assert!(pushdown_scan_bytes < filtered_scan_bytes);
+        }
 
         // Now do a scalar index scan, this should be better than a
         // full scan but since we have to load the index might be more
@@ -5706,7 +5908,6 @@ mod test {
         .await?;
 
         // With prefilter
-        dataset.make_fts_index().await?;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -5720,7 +5921,12 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: query=hello
-        ScalarIndexQuery: query=i > 10"#,
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            MaterializeIndex: query=i > 10
+            ProjectionExec: expr=[_rowid@1 as _rowid]
+              FilterExec: i@0 > 10
+                LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false"#,
         )
         .await?;
 
@@ -5762,7 +5968,12 @@ mod test {
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
             MatchQuery: query=hello
-              ScalarIndexQuery: query=i > 10
+              RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+                UnionExec
+                  MaterializeIndex: query=i > 10
+                  ProjectionExec: expr=[_rowid@1 as _rowid]
+                    FilterExec: i@0 > 10
+                      LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false
             FlatMatchQuery: query=hello
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false"#,

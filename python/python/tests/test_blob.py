@@ -66,20 +66,59 @@ def dataset_with_blobs(tmp_path):
         ),
     )
     ds = lance.write_dataset(table, tmp_path / "test_ds")
+
+    values = pa.array([b"qux", b"quux", b"corge"], pa.large_binary())
+    idx = pa.array([3, 4, 5], pa.uint64())
+    table = pa.table(
+        [values, idx],
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                ),
+                pa.field("idx", pa.uint64()),
+            ]
+        ),
+    )
+    ds.insert(table)
     return ds
 
 
-def test_blob_files(tmp_path, dataset_with_blobs):
+def test_blob_files(dataset_with_blobs):
     row_ids = (
         dataset_with_blobs.to_table(columns=[], with_row_id=True)
         .column("_rowid")
         .to_pylist()
     )
-    blobs = dataset_with_blobs.take_blobs(row_ids, "blobs")
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
 
     for expected in [b"foo", b"bar", b"baz"]:
         with blobs.pop(0) as f:
             assert f.read() == expected
+
+
+def test_blob_files_by_address(dataset_with_blobs):
+    addresses = (
+        dataset_with_blobs.to_table(columns=[], with_row_address=True)
+        .column("_rowaddr")
+        .to_pylist()
+    )
+    blobs = dataset_with_blobs.take_blobs("blobs", addresses=addresses)
+
+    for expected in [b"foo", b"bar", b"baz"]:
+        with blobs.pop(0) as f:
+            assert f.read() == expected
+
+
+def test_blob_by_indices(tmp_path, dataset_with_blobs):
+    indices = [0, 4]
+    blobs = dataset_with_blobs.take_blobs("blobs", indices=indices)
+
+    blobs2 = dataset_with_blobs.take_blobs("blobs", ids=[0, (1 << 32) + 1])
+    assert len(blobs) == len(blobs2)
+    for b1, b2 in zip(blobs, blobs2):
+        with b1 as f1, b2 as f2:
+            assert f1.read() == f2.read()
 
 
 def test_blob_file_seek(tmp_path, dataset_with_blobs):
@@ -88,7 +127,7 @@ def test_blob_file_seek(tmp_path, dataset_with_blobs):
         .column("_rowid")
         .to_pylist()
     )
-    blobs = dataset_with_blobs.take_blobs(row_ids, "blobs")
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
     with blobs[1] as f:
         assert f.seek(1) == 1
         assert f.read(1) == b"a"
@@ -103,7 +142,7 @@ def test_blob_file_read_middle(tmp_path, dataset_with_blobs):
         .column("_rowid")
         .to_pylist()
     )
-    blobs = dataset_with_blobs.take_blobs(row_ids, "blobs")
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
     with blobs[1] as f:
         assert f.read(1) == b"b"
         assert f.read(1) == b"a"
@@ -122,4 +161,4 @@ def test_take_deleted_blob(tmp_path, dataset_with_blobs):
         NotImplementedError,
         match="A take operation that includes row addresses must not target deleted",
     ):
-        dataset_with_blobs.take_blobs(row_ids, "blobs")
+        dataset_with_blobs.take_blobs("blobs", ids=row_ids)

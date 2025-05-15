@@ -27,22 +27,30 @@ jobs:
   rust-clippy-fmt:
     runs-on: ubuntu-24.04
     name: Rust Clippy and Fmt Check
-    defaults:
-      run:
-        working-directory: ./java/core/lance-jni
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: java/core/lance-jni
+          workspaces: |
+            lance
+            java/core/lance-jni -> ../target/rust-maven-plugin/lance-jni
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
+      # pin the toolchain version to avoid surprises
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: rui314/setup-mold@v1
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run cargo fmt
+        working-directory: java/core/lance-jni
         run: cargo fmt --check
       - name: Rust Clippy
+        working-directory: java/core/lance-jni
         run: cargo clippy --all-targets -- -D warnings
 
   build-and-test-java:
@@ -52,19 +60,23 @@ jobs:
       matrix:
         java-version: [8, 11, 17]
     name: Build and Test with Java ${{ matrix.java-version }}
-    defaults:
-      run:
-        working-directory: ./java
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: java/core/lance-jni
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
+      # pin the toolchain version to avoid surprises
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: rui314/setup-mold@v1
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: java/core/lance-jni -> ../target/rust-maven-plugin/lance-jni
       - name: Set up Java ${{ matrix.java-version }}
         uses: actions/setup-java@v4
         with:
@@ -72,6 +84,7 @@ jobs:
           java-version: ${{ matrix.java-version }}
           cache: "maven"
       - name: Running code style check with Java ${{ matrix.java-version }}
+        working-directory: java
         run: |
           if [ "${{ matrix.java-version }}" == "17" ]; then
             export JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS \
@@ -96,6 +109,7 @@ jobs:
           fi
           mvn spotless:check
       - name: Running tests with Java ${{ matrix.java-version }}
+        working-directory: java
         run: |
           if [ "${{ matrix.java-version }}" == "17" ]; then
             export JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS \
@@ -118,4 +132,4 @@ jobs:
             -Djdk.reflect.useDirectMethodHandle=false \
             -Dio.netty.tryReflectionSetAccessible=true"
           fi
-          mvn clean install
+          mvn install

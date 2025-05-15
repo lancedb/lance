@@ -23,6 +23,7 @@ use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::utils::StreamingWriteSource;
@@ -34,6 +35,7 @@ use lance_file::version::LanceFileVersion;
 use lance_file::{determine_file_version, v2};
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
@@ -76,6 +78,13 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     fn read_range_tasks(
         &self,
         range: Range<u64>,
+        batch_size: u32,
+        projection: Arc<lance_core::datatypes::Schema>,
+    ) -> Result<ReadBatchTaskStream>;
+    /// Reads the requested ranges of rows from the file, only supported by v2
+    fn read_ranges_tasks(
+        &self,
+        ranges: Arc<[Range<u64>]>,
         batch_size: u32,
         projection: Arc<lance_core::datatypes::Schema>,
     ) -> Result<ReadBatchTaskStream>;
@@ -219,6 +228,18 @@ impl GenericFileReader for V1Reader {
         Ok(ranges_to_tasks(&self.reader, ranges, projection))
     }
 
+    fn read_ranges_tasks(
+        &self,
+        _ranges: Arc<[Range<u64>]>,
+        _batch_size: u32,
+        _projection: Arc<Schema>,
+    ) -> Result<ReadBatchTaskStream> {
+        Err(Error::Internal {
+            message: "Attempt to perform FilteredRead on v1 files".to_string(),
+            location: location!(),
+        })
+    }
+
     fn take_all_tasks(
         &self,
         indices: &[u32],
@@ -318,6 +339,32 @@ mod v2_adapter {
                 .reader
                 .read_tasks(
                     ReadBatchParams::Range(range.start as usize..range.end as usize),
+                    batch_size,
+                    Some(projection),
+                    FilterExpression::no_filter(),
+                )?
+                .map(|v2_task| ReadBatchTask {
+                    task: v2_task.task.map_err(Error::from).boxed(),
+                    num_rows: v2_task.num_rows,
+                })
+                .boxed())
+        }
+
+        fn read_ranges_tasks(
+            &self,
+            ranges: Arc<[Range<u64>]>,
+            batch_size: u32,
+            projection: Arc<Schema>,
+        ) -> Result<ReadBatchTaskStream> {
+            let projection = ReaderProjection::from_field_ids(
+                self.reader.as_ref(),
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
+            Ok(self
+                .reader
+                .read_tasks(
+                    ReadBatchParams::Ranges(ranges),
                     batch_size,
                     Some(projection),
                     FilterExpression::no_filter(),
@@ -474,7 +521,16 @@ impl GenericFileReader for NullReader {
         batch_size: u32,
         projection: Arc<Schema>,
     ) -> Result<ReadBatchTaskStream> {
-        let mut remaining_rows = range.end - range.start;
+        self.read_ranges_tasks(vec![range].into(), batch_size, projection)
+    }
+
+    fn read_ranges_tasks(
+        &self,
+        ranges: Arc<[Range<u64>]>,
+        batch_size: u32,
+        projection: Arc<Schema>,
+    ) -> Result<ReadBatchTaskStream> {
+        let mut remaining_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         let projection: Arc<ArrowSchema> = Arc::new(projection.as_ref().into());
 
         let task_iter = std::iter::from_fn(move || {
@@ -500,7 +556,7 @@ impl GenericFileReader for NullReader {
         batch_size: u32,
         projection: Arc<Schema>,
     ) -> Result<ReadBatchTaskStream> {
-        self.read_range_tasks(0..self.num_rows as u64, batch_size, projection)
+        self.read_ranges_tasks(vec![0..self.num_rows as u64].into(), batch_size, projection)
     }
 
     fn take_all_tasks(
@@ -511,7 +567,7 @@ impl GenericFileReader for NullReader {
         _take_priority: Option<u32>,
     ) -> Result<ReadBatchTaskStream> {
         let num_rows = indices.len() as u64;
-        self.read_range_tasks(0..num_rows, batch_size, projection)
+        self.read_ranges_tasks(vec![0..num_rows].into(), batch_size, projection)
     }
 
     fn update_storage_stats(&self, _field_stats: &mut HashMap<u32, FieldStatistics>) {
@@ -665,7 +721,9 @@ impl FileFragment {
                 dataset.object_store.clone(),
                 SchedulerConfig::max_bandwidth(&dataset.object_store),
             );
-            let file_scheduler = scheduler.open_file(&filepath).await?;
+            let file_scheduler = scheduler
+                .open_file(&filepath, &CachedFileSize::unknown())
+                .await?;
             let reader = v2::reader::FileReader::try_open(
                 file_scheduler,
                 None,
@@ -697,6 +755,7 @@ impl FileFragment {
                 dataset.schema().field_ids(),
                 column_indices,
                 &file_version,
+                None,
             );
             Ok(frag)
         }
@@ -883,7 +942,7 @@ impl FileFragment {
                     )
                 };
             let file_scheduler = store_scheduler
-                .open_file_with_priority(&path, reader_priority as u64)
+                .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
                 .await?;
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let path = file_scheduler.reader().path().clone();
@@ -939,8 +998,9 @@ impl FileFragment {
             }
         }
 
-        // This should return immediately on modern datasets.
-        let num_rows = self.count_rows(None).await?;
+        // This should return immediately on modern datasets.  Need to use physical_rows because
+        // deletions will be applied later
+        let num_rows = self.physical_rows().await?;
 
         // Check if there are any fields that are not in any data files
         let field_ids_in_files = opened_files
@@ -1969,6 +2029,12 @@ impl FragmentReader {
                     .map(|i| *i + batch_offset as u32)
                     .collect(),
             ),
+            ReadBatchParams::Ranges(_) => {
+                return Err(Error::Internal {
+                    message: "ReadBatchParams::Ranges should not be used in v1 files".to_string(),
+                    location: location!(),
+                })
+            }
             ReadBatchParams::RangeFull => {
                 ReadBatchParams::Range(batch_offset..(batch_offset + rows_in_batch))
             }
@@ -2103,6 +2169,10 @@ impl FragmentReader {
                         })
                         .boxed()
                 })
+                .stream_in_span(tracing::debug_span!(
+                    "ReadBatchFutStream",
+                    id = self.fragment_id,
+                ))
                 .boxed(),
         )
     }
@@ -2169,6 +2239,97 @@ impl FragmentReader {
         })
     }
 
+    // This method is a clone of new_read_impl but returns tasks instead of batches
+    //
+    // It also only supports v2 files
+    pub fn read_ranges(
+        &self,
+        ranges: Arc<[Range<u64>]>,
+        batch_size: u32,
+    ) -> Result<ReadBatchFutStream> {
+        let total_num_rows = self.num_physical_rows as u32;
+        let mut num_requested_rows = 0;
+        // Note that row ranges at this point are physical and not logical.
+        for range in ranges.as_ref() {
+            if range.end > total_num_rows as u64 {
+                return Err(Error::Internal {
+                    message: format!(
+                        "Invalid read of range {:?} for fragment {} with {} addressable rows",
+                        range, self.fragment_id, total_num_rows
+                    ),
+                    location: location!(),
+                });
+            }
+            num_requested_rows += range.end - range.start;
+        }
+
+        let merged_stream = if self.with_row_addr as usize + self.with_row_id as usize
+            == self.output_schema.fields.len()
+        {
+            let tasks = (0..num_requested_rows)
+                .step_by(batch_size as usize)
+                .map(move |offset| {
+                    let num_rows = (batch_size as u64).min(num_requested_rows - offset);
+                    let batch =
+                        RecordBatch::from(StructArray::new_empty_fields(num_rows as usize, None));
+                    ReadBatchTask {
+                        task: std::future::ready(Ok(batch)).boxed(),
+                        num_rows: num_rows as u32,
+                    }
+                });
+            stream::iter(tasks).boxed()
+        } else {
+            // Read each data file, these reads should produce streams of equal sized
+            // tasks.  In other words, if we get 3 tasks of 20 rows and then a task
+            // of 10 rows from one data file we should get the same from the other.
+            let read_streams = self
+                .readers
+                .iter()
+                .map(|reader| {
+                    reader.read_ranges_tasks(
+                        ranges.clone(),
+                        batch_size,
+                        reader.projection().clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Merge the streams, this merges the generated batches
+            lance_table::utils::stream::merge_streams(read_streams)
+        };
+
+        // Add the row id column (if needed) and delete rows (if a deletion
+        // vector is present).
+        let config = RowIdAndDeletesConfig {
+            deletion_vector: self.deletion_vec.clone(),
+            row_id_sequence: self.row_id_sequence.clone(),
+            make_deletions_null: self.make_deletions_null,
+            with_row_id: self.with_row_id,
+            with_row_addr: self.with_row_addr,
+            params: ReadBatchParams::Ranges(ranges),
+            total_num_rows,
+        };
+        let output_schema = Arc::new(self.output_schema.clone());
+        Ok(
+            wrap_with_row_id_and_delete(merged_stream, self.fragment_id as u32, config)
+                // Finally, reorder the columns to match the order specified in the projection
+                .map(move |batch_fut| {
+                    let output_schema = output_schema.clone();
+                    batch_fut
+                        .map(move |batch| {
+                            batch?
+                                .project_by_schema(&output_schema)
+                                .map_err(Error::from)
+                        })
+                        .boxed()
+                })
+                .stream_in_span(tracing::debug_span!(
+                    "ReadBatchFutStream",
+                    id = self.fragment_id,
+                ))
+                .boxed(),
+        )
+    }
+
     // Legacy function that reads a range of data and concatenates the results
     // into a single batch
     //
@@ -2233,14 +2394,18 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen, RowCount};
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::ObjectStoreRegistry;
+    use lance_io::object_store::ObjectStoreParams;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use tempfile::tempdir;
     use v2::writer::FileWriterOptions;
 
     use super::*;
-    use crate::{dataset::transaction::Operation, utils::test::TestDatasetGenerator};
+    use crate::{
+        dataset::{transaction::Operation, InsertBuilder},
+        session::Session,
+        utils::test::{StatsHolder, TestDatasetGenerator},
+    };
 
     async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -2545,12 +2710,15 @@ mod tests {
         reader.with_make_deletions_null();
 
         if data_storage_version == LanceFileVersion::Legacy {
-            // Since the first batch is all deleted, it will return an empty batch.
+            // The first batch is entirely deleted, deleted rows will be marked null with null row ids.
             let batch1 = reader
                 .legacy_read_batch_projected(0, .., dataset.schema())
                 .await
                 .unwrap();
-            assert_eq!(batch1.num_rows(), 0);
+            assert_eq!(
+                batch1.column_by_name(ROW_ID).unwrap().as_ref(),
+                &UInt64Array::from_iter(std::iter::repeat_n(None, 10))
+            );
 
             // The second batch is partially deleted, so the deleted rows will be
             // marked null with null row ids.
@@ -2581,11 +2749,15 @@ mod tests {
                     .buffered(1)
                     .try_collect::<Vec<_>>()
             };
-            // Since the first batch is all deleted, it will return an empty batch.
+
+            // Since the first batch is all deleted, it will return all nulls row ids.
             let batches = to_batches(0..10).await.unwrap();
             assert_eq!(batches.len(), 1);
             let batch = batches.into_iter().next().unwrap();
-            assert_eq!(batch.num_rows(), 0);
+            assert_eq!(
+                batch.column_by_name(ROW_ID).unwrap().as_ref(),
+                &UInt64Array::from_iter(std::iter::repeat_n(None, 10))
+            );
 
             let batches = to_batches(10..20).await.unwrap();
             assert_eq!(batches.len(), 1);
@@ -2822,10 +2994,10 @@ mod tests {
             config_upsert_values: None,
         };
 
-        let registry = Arc::new(ObjectStoreRegistry::default());
-        let new_dataset = Dataset::commit(test_uri, op, None, None, None, registry, false)
-            .await
-            .unwrap();
+        let new_dataset =
+            Dataset::commit(test_uri, op, None, None, None, Default::default(), false)
+                .await
+                .unwrap();
 
         assert_eq!(new_dataset.count_rows(None).await.unwrap(), dataset_rows);
 
@@ -2931,10 +3103,10 @@ mod tests {
                 config_upsert_values: None,
             };
 
-            let registry = Arc::new(ObjectStoreRegistry::default());
-            let dataset = Dataset::commit(test_uri, op, None, None, None, registry, false)
-                .await
-                .unwrap();
+            let dataset =
+                Dataset::commit(test_uri, op, None, None, None, Default::default(), false)
+                    .await
+                    .unwrap();
 
             // We only kept the first fragment of 40 rows
             assert_eq!(
@@ -3152,7 +3324,6 @@ mod tests {
 
         // Rearrange schema so it's `s` then `i`.
         let schema = updater.schema().unwrap().clone().project(&["s", "i"])?;
-        let registry = Arc::new(ObjectStoreRegistry::default());
 
         let dataset = Dataset::commit(
             test_uri,
@@ -3163,7 +3334,7 @@ mod tests {
             Some(dataset.manifest.version),
             None,
             None,
-            registry,
+            Default::default(),
             false,
         )
         .await?;
@@ -3292,14 +3463,13 @@ mod tests {
         let op = Operation::Append {
             fragments: vec![frag],
         };
-        let object_store_registry = Arc::new(ObjectStoreRegistry::default());
         let dataset = Dataset::commit(
             &dataset.uri,
             op,
             Some(dataset.version().version),
             None,
             None,
-            object_store_registry,
+            Default::default(),
             false,
         )
         .await
@@ -3312,5 +3482,71 @@ mod tests {
                 .unwrap(),
             256
         );
+    }
+
+    #[tokio::test]
+    async fn test_iops_read_small() {
+        // Create a file that has 10 columns.
+        let schema = Arc::new(ArrowSchema::new(
+            (0..10)
+                .map(|i| ArrowField::new(format!("col_{}", i), DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ));
+
+        // Single row batch
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            (0..10)
+                .map(|i| Arc::new(Int32Array::from(vec![i])) as ArrayRef)
+                .collect(),
+        )
+        .unwrap();
+        let session = Arc::new(Session::default());
+        let io_stats = Arc::new(StatsHolder::default());
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(io_stats.clone()),
+                ..Default::default()
+            }),
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://test")
+            .with_params(&write_params)
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        let fragment = dataset.get_fragments().pop().unwrap();
+
+        // Assert file is small (< 4kb)
+        {
+            let stats = io_stats.incremental_stats();
+            assert_eq!(stats.write_iops, 3);
+            assert!(stats.write_bytes < 4096);
+        }
+
+        // Measure IOPS needed to scan all data first time.
+        let projection = Schema::try_from(schema.as_ref())
+            .unwrap()
+            .project_by_ids(&[0, 1, 2, 3, 4, 6, 7, 8, 9], true);
+        let reader = fragment
+            .open(&projection, Default::default())
+            .await
+            .unwrap();
+        let mut data = reader
+            .read_all(1024)
+            .unwrap()
+            .buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(data.len(), 1);
+        let data = data.pop().unwrap();
+        assert_eq!(data.num_rows(), 1);
+        assert_eq!(data.num_columns(), 9);
+
+        let stats = io_stats.incremental_stats();
+        assert_eq!(stats.read_iops, 1);
+        assert!(stats.read_bytes < 4096);
     }
 }

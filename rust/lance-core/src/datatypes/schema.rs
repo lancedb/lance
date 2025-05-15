@@ -16,7 +16,7 @@ use lance_arrow::*;
 use snafu::location;
 
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
-use crate::{Error, Result, ROW_ADDR, ROW_ID};
+use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
@@ -828,6 +828,11 @@ impl Projection {
         }
     }
 
+    pub fn full(base: Arc<dyn Projectable>) -> Self {
+        let schema = base.schema().clone();
+        Self::empty(base).union_schema(&schema)
+    }
+
     pub fn with_row_id(mut self) -> Self {
         self.with_row_id = true;
         self
@@ -1012,9 +1017,9 @@ impl Projection {
         self
     }
 
-    /// True if the projection does not select any fields
+    /// True if the projection does not select any fields or take the row id / addr
     pub fn is_empty(&self) -> bool {
-        self.field_ids.is_empty()
+        self.field_ids.is_empty() && !self.with_row_addr && !self.with_row_id
     }
 
     /// Convert the projection to a schema
@@ -1031,6 +1036,19 @@ impl Projection {
     /// Convert the projection to a schema reference
     pub fn into_schema_ref(self) -> Arc<Schema> {
         Arc::new(self.into_schema())
+    }
+
+    /// Convert the projection into an Arrow schema
+    pub fn to_arrow_schema(&self) -> Result<arrow_schema::Schema> {
+        let mut arrow_schema: arrow_schema::Schema = (&self.to_schema()).into();
+        // Should we be adding row_id / row_addr on to_schema?
+        if self.with_row_id {
+            arrow_schema = arrow_schema.try_with_column(ROW_ID_FIELD.clone())?;
+        }
+        if self.with_row_addr {
+            arrow_schema = arrow_schema.try_with_column(ROW_ADDR_FIELD.clone())?;
+        }
+        Ok(arrow_schema)
     }
 }
 
@@ -1309,6 +1327,30 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(actual, expected);
+
+        let schema_with_list_struct = ArrowSchema::new(vec![ArrowField::new(
+            "struct_list",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                ])),
+                true,
+            ))),
+            true,
+        )]);
+        let schema_with_list_struct = Schema::try_from(&schema_with_list_struct).unwrap();
+
+        let with_missing_field = schema_with_list_struct.project_by_ids(&[1, 3], false);
+        let intersection = schema_with_list_struct
+            .intersection_ignore_types(&with_missing_field)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
+        let intersection = with_missing_field
+            .intersection_ignore_types(&schema_with_list_struct)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
     }
 
     #[test]

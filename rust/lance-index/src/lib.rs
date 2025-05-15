@@ -56,6 +56,11 @@ pub trait Index: Send + Sync + DeepSizeOf {
     /// Retrieve index statistics as a JSON Value
     fn statistics(&self) -> Result<serde_json::Value>;
 
+    /// Prewarm the index.
+    ///
+    /// This will load the index into memory and cache it.
+    async fn prewarm(&self) -> Result<()>;
+
     /// Get the type of the index
     fn index_type(&self) -> IndexType;
 

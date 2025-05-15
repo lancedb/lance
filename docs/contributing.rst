@@ -101,7 +101,11 @@ To make a dev install:
 
 .. code-block::
 
+    cd python
     maturin develop
+
+To use the local python bindings, it's recommended to use venv or conda
+environment.
 
 Documentation
 ~~~~~~~~~~~~~

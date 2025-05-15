@@ -930,6 +930,69 @@ impl FileReader {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn do_read_ranges(
+        column_infos: Vec<Arc<ColumnInfo>>,
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<FileMetadataCache>,
+        decoder_plugins: Arc<DecoderPlugins>,
+        ranges: Vec<Range<u64>>,
+        batch_size: u32,
+        projection: ReaderProjection,
+        filter: FilterExpression,
+        should_validate: bool,
+    ) -> Result<BoxStream<'static, ReadBatchTask>> {
+        let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
+        debug!(
+            "Taking {} ranges ({} rows) spread across range {}..{} with batch_size {} from columns {:?}",
+            ranges.len(),
+            num_rows,
+            ranges[0].start,
+            ranges[ranges.len() - 1].end,
+            batch_size,
+            column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
+        );
+
+        let config = SchedulerDecoderConfig {
+            batch_size,
+            cache,
+            decoder_plugins,
+            io,
+            should_validate,
+        };
+
+        let requested_rows = RequestedRows::Ranges(ranges);
+
+        Ok(schedule_and_decode(
+            column_infos,
+            requested_rows,
+            filter,
+            projection.column_indices,
+            projection.schema,
+            config,
+        ))
+    }
+
+    fn read_ranges(
+        &self,
+        ranges: Vec<Range<u64>>,
+        batch_size: u32,
+        projection: ReaderProjection,
+        filter: FilterExpression,
+    ) -> Result<BoxStream<'static, ReadBatchTask>> {
+        Self::do_read_ranges(
+            self.collect_columns_from_projection(&projection)?,
+            self.scheduler.clone(),
+            self.cache.clone(),
+            self.decoder_plugins.clone(),
+            ranges,
+            batch_size,
+            projection,
+            filter,
+            self.options.validate_on_decode,
+        )
+    }
+
     /// Creates a stream of "read tasks" to read the data from the file
     ///
     /// The arguments are similar to [`Self::read_stream_projected`] but instead of returning a stream
@@ -988,6 +1051,14 @@ impl FileReader {
                     projection,
                     filter,
                 )
+            }
+            ReadBatchParams::Ranges(ranges) => {
+                let mut ranges_u64 = Vec::with_capacity(ranges.len());
+                for range in ranges.as_ref() {
+                    verify_bound(&params, range.end, false)?;
+                    ranges_u64.push(range.start..range.end);
+                }
+                self.read_ranges(ranges_u64, batch_size, projection, filter)
             }
             ReadBatchParams::RangeFrom(range) => {
                 verify_bound(&params, range.start as u64, true)?;
@@ -1075,6 +1146,45 @@ impl FileReader {
         };
 
         let requested_rows = RequestedRows::Indices(indices);
+
+        schedule_and_decode_blocking(
+            column_infos,
+            requested_rows,
+            filter,
+            projection.column_indices,
+            projection.schema,
+            config,
+        )
+    }
+
+    fn read_ranges_blocking(
+        &self,
+        ranges: Vec<Range<u64>>,
+        batch_size: u32,
+        projection: ReaderProjection,
+        filter: FilterExpression,
+    ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        let column_infos = self.collect_columns_from_projection(&projection)?;
+        let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
+        debug!(
+            "Taking {} ranges ({} rows) spread across range {}..{} with batch_size {} from columns {:?}",
+            ranges.len(),
+            num_rows,
+            ranges[0].start,
+            ranges[ranges.len() - 1].end,
+            batch_size,
+            column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
+        );
+
+        let config = SchedulerDecoderConfig {
+            batch_size,
+            cache: self.cache.clone(),
+            decoder_plugins: self.decoder_plugins.clone(),
+            io: self.scheduler.clone(),
+            should_validate: self.options.validate_on_decode,
+        };
+
+        let requested_rows = RequestedRows::Ranges(ranges);
 
         schedule_and_decode_blocking(
             column_infos,
@@ -1184,6 +1294,14 @@ impl FileReader {
                     projection,
                     filter,
                 )
+            }
+            ReadBatchParams::Ranges(ranges) => {
+                let mut ranges_u64 = Vec::with_capacity(ranges.len());
+                for range in ranges.as_ref() {
+                    verify_bound(&params, range.end, false)?;
+                    ranges_u64.push(range.start..range.end);
+                }
+                self.read_ranges_blocking(ranges_u64, batch_size, projection, filter)
             }
             ReadBatchParams::RangeFrom(range) => {
                 verify_bound(&params, range.start as u64, true)?;
@@ -1401,7 +1519,7 @@ pub mod tests {
         encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodingOptions},
         version::LanceFileVersion,
     };
-    use lance_io::stream::RecordBatchStream;
+    use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
     use log::debug;
     use tokio::sync::mpsc;
 
@@ -1498,7 +1616,11 @@ pub mod tests {
         let WrittenFile { data, .. } = create_some_file(&fs, LanceFileVersion::V2_0).await;
 
         for read_size in [32, 1024, 1024 * 1024] {
-            let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+            let file_scheduler = fs
+                .scheduler
+                .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
             let file_reader = FileReader::try_open(
                 file_scheduler,
                 None,
@@ -1592,7 +1714,11 @@ pub mod tests {
         let fs = FsFixture::default();
 
         let written_file = create_some_file(&fs, LanceFileVersion::V2_0).await;
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
 
         let field_id_mapping = written_file
             .field_id_mapping
@@ -1735,7 +1861,11 @@ pub mod tests {
         let fs = FsFixture::default();
 
         let written_file = create_some_file(&fs, LanceFileVersion::V2_0).await;
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
 
         // We can specify the projection as part of the read operation via read_stream_projected
         let file_reader = FileReader::try_open(
@@ -1787,7 +1917,11 @@ pub mod tests {
         let WrittenFile { data, .. } = create_some_file(&fs, LanceFileVersion::V2_0).await;
         let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
@@ -1819,7 +1953,11 @@ pub mod tests {
         let WrittenFile { data, schema, .. } = create_some_file(&fs, LanceFileVersion::V2_1).await;
         let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             Some(ReaderProjection::from_column_names(&schema, &["score"]).unwrap()),
@@ -1856,7 +1994,11 @@ pub mod tests {
         let WrittenFile { data, .. } = create_some_file(&fs, LanceFileVersion::V2_0).await;
         let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
@@ -1904,7 +2046,11 @@ pub mod tests {
             .map(|batch| batch.num_rows())
             .sum::<usize>();
 
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
@@ -1980,7 +2126,11 @@ pub mod tests {
 
         file_writer.finish().await.unwrap();
 
-        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,

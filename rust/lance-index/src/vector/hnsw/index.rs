@@ -135,6 +135,11 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
         }))
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: HNSW can (and should) support pre-warming
+        Ok(())
+    }
+
     /// Get the type of the index
     fn index_type(&self) -> IndexType {
         IndexType::Vector

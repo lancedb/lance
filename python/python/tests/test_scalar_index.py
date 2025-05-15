@@ -111,7 +111,7 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
 
 
 def test_indexed_between(tmp_path):
-    dataset = lance.write_dataset(pa.table({"val": range(100)}), tmp_path)
+    dataset = lance.write_dataset(pa.table({"val": range(0, 10000)}), tmp_path)
     dataset.create_scalar_index("val", index_type="BTREE")
 
     scanner = dataset.scanner(filter="val BETWEEN 10 AND 20", prefilter=True)
@@ -127,6 +127,23 @@ def test_indexed_between(tmp_path):
 
     actual_data = scanner.to_table()
     assert actual_data.num_rows == 11
+
+    # The following cases are slightly ill-formed since end is before start
+    # but we should handle them gracefully and simply return an empty result
+    # (previously we panicked here)
+    scanner = dataset.scanner(filter="val >= 5000 AND val <= 0", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 0
+
+    scanner = dataset.scanner(filter="val BETWEEN 5000 AND 0", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 0
 
 
 def test_temporal_index(tmp_path):
@@ -194,6 +211,93 @@ def test_indexed_vector_scan(indexed_dataset: lance.LanceDataset, data_table: pa
     assert "MaterializeIndex" in scanner.explain_plan()
 
     check_result(scanner.to_table())
+
+
+def test_partly_indexed_prefiltered_search(tmp_path):
+    # Regresses a case where the vector index is ahead of a scalar index.  The scalar
+    # index wants to be used as a prefilter but we have to make sure to scan the
+    # unindexed fragments and feed those into the prefilter
+
+    # Create initial dataset
+    table = pa.table(
+        {
+            "vec": pa.array([[i, i] for i in range(1000)], pa.list_(pa.float32(), 2)),
+            "text": ["book" for _ in range(1000)],
+            "id": range(1000),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path)
+    ds = ds.create_index(
+        "vec",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=2,
+    )
+    ds.create_scalar_index("id", "BTREE")
+    ds.create_scalar_index("text", index_type="INVERTED", with_position=False)
+
+    def make_vec_search(ds):
+        return ds.scanner(
+            nearest={"column": "vec", "q": [5, 5], "k": 1000},
+            prefilter=True,
+            filter="id in (5, 10, 15, 20, 25, 30)",
+        )
+
+    def make_fts_search(ds):
+        return ds.scanner(
+            full_text_query="book",
+            prefilter=True,
+            filter="id in (5, 10, 15, 20, 25, 30)",
+        )
+
+    # Sanity test, no new data, should get 6 results
+    plan = make_vec_search(ds).explain_plan()
+    assert "ScalarIndexQuery" in plan
+    assert "KNNVectorDistance" not in plan
+    assert "LanceScan" not in plan
+    assert make_vec_search(ds).to_table().num_rows == 6
+
+    plan = make_fts_search(ds).explain_plan()
+    assert "ScalarIndexQuery" in plan
+    assert "KNNVectorDistance" not in plan
+    assert "LanceScan" not in plan
+    assert make_fts_search(ds).to_table().num_rows == 6
+
+    # Add new data (including 6 more results)
+    ds.insert(table)
+
+    # Basic ann combined search, should get 12 results
+    plan = make_vec_search(ds).explain_plan()
+    assert "ScalarIndexQuery" in plan
+    assert "MaterializeIndex" not in plan
+    assert "KNNVectorDistance" in plan
+    assert "LanceScan" in plan
+    assert make_vec_search(ds).to_table().num_rows == 12
+
+    plan = make_fts_search(ds).explain_plan()
+    assert "ScalarIndexQuery" in plan
+    assert "MaterializeIndex" not in plan
+    assert "FlatMatchQuery" in plan
+    assert "LanceScan" in plan
+    assert make_fts_search(ds).to_table().num_rows == 12
+
+    # Update vector index but NOT scalar index
+    ds.optimize.optimize_indices(index_names=["vec_idx", "text_idx"])
+
+    # Ann search but with combined prefilter, should get 12 results
+    plan = make_vec_search(ds).explain_plan()
+    assert "ScalarIndexQuery" not in plan
+    assert "MaterializeIndex" in plan
+    assert "KNNVectorDistance" not in plan
+    assert "LanceScan" in plan
+    assert make_vec_search(ds).to_table().num_rows == 12
+
+    plan = make_fts_search(ds).explain_plan()
+    assert "ScalarIndexQuery" not in plan
+    assert "MaterializeIndex" in plan
+    assert "FlatMatchQuery" not in plan
+    assert "LanceScan" in plan
+    assert make_fts_search(ds).to_table().num_rows == 12
 
 
 # Post filtering does not use scalar indices.  This test merely confirms
@@ -369,6 +473,25 @@ def test_indexed_filter_with_fts_index(tmp_path):
         with_row_id=True,
     )
     assert results["_rowid"].to_pylist() == [2, 3]
+
+
+def test_fts_stats(dataset):
+    dataset.create_scalar_index(
+        "doc", index_type="INVERTED", with_position=False, remove_stop_words=True
+    )
+    stats = dataset.stats.index_stats("doc_idx")
+    assert stats["index_type"] == "Inverted"
+    stats = stats["indices"][0]
+    params = stats["params"]
+
+    assert params["with_position"] is False
+    assert params["base_tokenizer"] == "simple"
+    assert params["language"] == "English"
+    assert params["max_token_length"] == 40
+    assert params["lower_case"] is True
+    assert params["stem"] is False
+    assert params["remove_stop_words"] is True
+    assert params["ascii_folding"] is False
 
 
 def test_fts_on_list(tmp_path):
@@ -722,6 +845,31 @@ def test_bitmap_index(tmp_path: Path):
     assert indices[0]["type"] == "Bitmap"
 
 
+def test_bitmap_remap(tmp_path: Path):
+    # Make one full fragment
+    tbl = pa.Table.from_arrays(
+        [pa.array([["a", "b"][i % 2] for i in range(10)])], names=["a"]
+    )
+    ds = lance.write_dataset(tbl, tmp_path, max_rows_per_file=10)
+
+    # Make two half fragments
+    tbl = pa.Table.from_arrays(
+        [pa.array([["a", "b"][i % 2] for i in range(10)])], names=["a"]
+    )
+    ds = lance.write_dataset(tbl, tmp_path, max_rows_per_file=5, mode="append")
+
+    # Create scalar index
+    ds.create_scalar_index("a", index_type="BITMAP")
+
+    # Run compaction (two partials will be remapped, full will not)
+    compaction = ds.optimize.compact_files(target_rows_per_fragment=10)
+    assert compaction.fragments_removed == 2
+
+    for category in ["a", "b"]:
+        # All rows should still be in index
+        assert ds.count_rows(f"a = '{category}'") == 10
+
+
 def test_ngram_index(tmp_path: Path):
     """Test create ngram index"""
     tbl = pa.Table.from_arrays(
@@ -1007,3 +1155,35 @@ def test_drop_index(tmp_path):
     assert ds.to_table(filter="bitmap = 1").num_rows == 1
     assert ds.to_table(filter="fts = 'a'").num_rows == test_table_size
     assert ds.to_table(filter="contains(ngram, 'a')").num_rows == test_table_size
+
+
+def test_index_prewarm(tmp_path: Path):
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table_size = 100
+    test_table = pa.table(
+        {
+            "fts": ["a" for _ in range(test_table_size)],
+        }
+    )
+
+    # Write index, cache should not be populated
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("fts", index_type="INVERTED")
+    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    assert scan_stats.parts_loaded > 0
+
+    # Fresh load, no prewarm, cache should not be populated
+    ds = lance.dataset(tmp_path)
+    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    assert scan_stats.parts_loaded > 0
+
+    # Prewarm index, cache should be populated
+    ds = lance.dataset(tmp_path)
+    ds.prewarm_index("fts_idx")
+    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    assert scan_stats.parts_loaded == 0

@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::num::NonZero;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use chrono::TimeDelta;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions, StorageClass,
 };
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
+use lance_datafusion::spill::{create_replay_spill, SpillReceiver, SpillSender};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
@@ -111,6 +116,22 @@ impl TryFrom<&str> for WriteMode {
     }
 }
 
+/// Auto cleanup parameters
+#[derive(Debug, Clone)]
+pub struct AutoCleanupParams {
+    pub interval: usize,
+    pub older_than: TimeDelta,
+}
+
+impl Default for AutoCleanupParams {
+    fn default() -> Self {
+        Self {
+            interval: 20,
+            older_than: TimeDelta::days(14),
+        }
+    }
+}
+
 /// Dataset Write Parameters
 #[derive(Debug, Clone)]
 pub struct WriteParams {
@@ -170,9 +191,15 @@ pub struct WriteParams {
     /// Default is False.
     pub enable_v2_manifest_paths: bool,
 
-    pub object_store_registry: Arc<ObjectStoreRegistry>,
-
     pub session: Option<Arc<Session>>,
+
+    /// If Some and this is a new dataset, old dataset versions will be
+    /// automatically cleaned up according to the parameters set out in
+    /// `AutoCleanupParams`. This parameter has no effect on existing datasets.
+    /// To add autocleaning to an existing dataset, use Dataset::update_config
+    /// to set lance.auto_cleanup.interval and lance.auto_cleanup.older_than.
+    /// Both parameters must be set to invoke autocleaning.
+    pub auto_cleanup: Option<AutoCleanupParams>,
 }
 
 impl Default for WriteParams {
@@ -190,8 +217,8 @@ impl Default for WriteParams {
             data_storage_version: None,
             enable_move_stable_row_ids: false,
             enable_v2_manifest_paths: false,
-            object_store_registry: Arc::new(ObjectStoreRegistry::default()),
             session: None,
+            auto_cleanup: Some(AutoCleanupParams::default()),
         }
     }
 }
@@ -208,6 +235,13 @@ impl WriteParams {
 
     pub fn storage_version_or_default(&self) -> LanceFileVersion {
         self.data_storage_version.unwrap_or_default()
+    }
+
+    pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
+        self.session
+            .as_ref()
+            .map(|s| s.store_registry())
+            .unwrap_or_default()
     }
 }
 
@@ -387,7 +421,6 @@ pub async fn write_fragments_internal(
         enable_move_stable_row_ids: true,
         // This shouldn't really matter since all commits are detached
         enable_v2_manifest_paths: true,
-        object_store_registry: params.object_store_registry.clone(),
         max_bytes_per_file: params.max_bytes_per_file,
         max_rows_per_file: params.max_rows_per_file,
         ..Default::default()
@@ -455,9 +488,14 @@ impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String
         Ok(self.0.tell().await? as u64)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        let size_bytes = self.0.tell().await?;
         Ok((
             self.0.finish().await? as u32,
-            DataFile::new_legacy(self.1.clone(), self.0.schema()),
+            DataFile::new_legacy(
+                self.1.clone(),
+                self.0.schema(),
+                NonZero::new(size_bytes as u64),
+            ),
         ))
     }
 }
@@ -492,14 +530,15 @@ impl GenericWriter for V2WriterAdapter {
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
         let (major, minor) = self.writer.version().to_numbers();
+        let num_rows = self.writer.finish().await? as u32;
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
             column_indices,
             major,
             minor,
+            NonZero::new(self.writer.tell().await?),
         );
-        let num_rows = self.writer.finish().await? as u32;
         Ok((num_rows, data_file))
     }
 }
@@ -591,6 +630,7 @@ async fn resolve_commit_handler(
 ) -> Result<Arc<dyn CommitHandler>> {
     match commit_handler {
         None => {
+            #[allow(deprecated)]
             if store_options
                 .as_ref()
                 .map(|opts| opts.object_store.is_some())
@@ -611,6 +651,112 @@ async fn resolve_commit_handler(
                 Ok(commit_handler)
             }
         }
+    }
+}
+
+/// Create an iterator of record batch streams from the given source.
+///
+/// If `enable_retries` is true, then the source will be saved either in memory
+/// or spilled to disk to allow replaying the source in case of a failure. The
+/// source will be kept in memory if either (1) the size hint shows that
+/// there is only one batch or (2) the stream contains less than 100MB of
+/// data. Otherwise, the source will be spilled to a temporary file on disk.
+///
+/// This is used to support retries on write operations.
+async fn new_source_iter(
+    source: SendableRecordBatchStream,
+    enable_retries: bool,
+) -> Result<Box<dyn Iterator<Item = SendableRecordBatchStream> + Send + 'static>> {
+    if enable_retries {
+        let schema = source.schema();
+
+        // If size hint shows there is only one batch, spilling has no benefit, just keep that
+        // in memory. (This is a pretty common case.)
+        let size_hint = source.size_hint();
+        if size_hint.0 == 1 && size_hint.1 == Some(1) {
+            let batches: Vec<RecordBatch> = source.try_collect().await?;
+            Ok(Box::new(std::iter::repeat_with(move || {
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(batches.clone().into_iter().map(Ok)),
+                )) as SendableRecordBatchStream
+            })))
+        } else {
+            // Allow buffering up to 100MB in memory before spilling to disk.
+            Ok(Box::new(
+                SpillStreamIter::try_new(source, 100 * 1024 * 1024).await?,
+            ))
+        }
+    } else {
+        Ok(Box::new(std::iter::once(source)))
+    }
+}
+
+struct SpillStreamIter {
+    receiver: SpillReceiver,
+    #[allow(dead_code)] // Exists to keep the SpillSender alive
+    sender_handle: tokio::task::JoinHandle<SpillSender>,
+    // This temp dir is used to store the spilled data. It is kept alive by
+    // this struct. When this struct is dropped, the Drop implementation of
+    // tempfile::TempDir will delete the temp dir.
+    #[allow(dead_code)] // Exists to keep the temp dir alive
+    tmp_dir: tempfile::TempDir,
+}
+
+impl SpillStreamIter {
+    pub async fn try_new(
+        mut source: SendableRecordBatchStream,
+        memory_limit: usize,
+    ) -> Result<Self> {
+        let tmp_dir = tokio::task::spawn_blocking(|| {
+            tempfile::tempdir().map_err(|e| Error::InvalidInput {
+                source: format!("Failed to create temp dir: {}", e).into(),
+                location: location!(),
+            })
+        })
+        .await
+        .ok()
+        .expect_ok()??;
+
+        let tmp_path = tmp_dir.path().join("spill.arrows");
+        let (mut sender, receiver) = create_replay_spill(tmp_path, source.schema(), memory_limit);
+
+        let sender_handle = tokio::task::spawn(async move {
+            while let Some(res) = source.next().await {
+                match res {
+                    Ok(batch) => match sender.write(batch).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            sender.send_error(e);
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        sender.send_error(e);
+                        break;
+                    }
+                }
+            }
+
+            if let Err(err) = sender.finish().await {
+                sender.send_error(err);
+            }
+            sender
+        });
+
+        Ok(Self {
+            receiver,
+            tmp_dir,
+            sender_handle,
+        })
+    }
+}
+
+impl Iterator for SpillStreamIter {
+    type Item = SendableRecordBatchStream;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.receiver.read())
     }
 }
 

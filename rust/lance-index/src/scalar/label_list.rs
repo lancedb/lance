@@ -78,6 +78,10 @@ impl Index for LabelListIndex {
         })
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        self.values_index.prewarm().await
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::LabelList
     }
@@ -130,7 +134,7 @@ impl LabelListIndex {
             return Ok(intersect_bitmap);
         }
         while let Some(next) = sets.try_next().await? {
-            intersect_bitmap &= next;
+            intersect_bitmap &= &next;
         }
         Ok(intersect_bitmap)
     }

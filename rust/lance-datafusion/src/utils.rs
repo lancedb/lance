@@ -7,30 +7,22 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
 use async_trait::async_trait;
+use background_iterator::BackgroundIterator;
 use datafusion::{
     execution::RecordBatchStream,
     physical_plan::{
-        metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet},
+        metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet, Time},
         stream::RecordBatchStreamAdapter,
         SendableRecordBatchStream,
     },
 };
 use datafusion_common::DataFusionError;
-use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use lance_core::datatypes::Schema;
 use lance_core::Result;
-use tokio::task::{spawn, spawn_blocking};
+use tokio::task::spawn;
 
-fn background_iterator<I: Iterator + Send + 'static>(iter: I) -> impl Stream<Item = I::Item>
-where
-    I::Item: Send,
-{
-    stream::unfold(iter, |mut iter| {
-        spawn_blocking(|| iter.next().map(|val| (val, iter)))
-            .unwrap_or_else(|err| panic!("{}", err))
-    })
-    .fuse()
-}
+pub mod background_iterator;
 
 /// A trait for [BatchRecord] iterators, readers and streams
 /// that can be converted to a concrete stream type [SendableRecordBatchStream].
@@ -151,7 +143,9 @@ pub fn reader_to_stream(batches: Box<dyn RecordBatchReader + Send>) -> SendableR
     let arrow_schema = batches.arrow_schema();
     let stream = RecordBatchStreamAdapter::new(
         arrow_schema,
-        background_iterator(batches).map_err(DataFusionError::from),
+        BackgroundIterator::new(batches)
+            .fuse()
+            .map_err(DataFusionError::from),
     );
     Box::pin(stream)
 }
@@ -177,6 +171,7 @@ impl MetricsExt for MetricsSet {
 
 pub trait ExecutionPlanMetricsSetExt {
     fn new_count(&self, name: &'static str, partition: usize) -> Count;
+    fn new_time(&self, name: &'static str, partition: usize) -> Time;
 }
 
 impl ExecutionPlanMetricsSetExt for ExecutionPlanMetricsSet {
@@ -190,6 +185,17 @@ impl ExecutionPlanMetricsSetExt for ExecutionPlanMetricsSet {
             });
         count
     }
+
+    fn new_time(&self, name: &'static str, partition: usize) -> Time {
+        let time = Time::new();
+        MetricBuilder::new(self)
+            .with_partition(partition)
+            .build(MetricValue::Time {
+                name: Cow::Borrowed(name),
+                time: time.clone(),
+            });
+        time
+    }
 }
 
 // Common metrics
@@ -199,3 +205,7 @@ pub const BYTES_READ_METRIC: &str = "bytes_read";
 pub const INDICES_LOADED_METRIC: &str = "indices_loaded";
 pub const PARTS_LOADED_METRIC: &str = "parts_loaded";
 pub const INDEX_COMPARISONS_METRIC: &str = "index_comparisons";
+pub const FRAGMENTS_SCANNED_METRIC: &str = "fragments_scanned";
+pub const RANGES_SCANNED_METRIC: &str = "ranges_scanned";
+pub const ROWS_SCANNED_METRIC: &str = "rows_scanned";
+pub const TASK_WAIT_TIME_METRIC: &str = "task_wait_time";

@@ -7,6 +7,13 @@ on:
   pull_request:
     paths:
       - .github/workflows/java-publish.yml
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Directly publish the Java artifact under the current version'
+        required: true
+        default: false
+
 
 jobs:
   macos-arm64:
@@ -36,28 +43,68 @@ jobs:
     name: Build on Linux Arm64
     runs-on: ubuntu-2404-8x-arm64
     timeout-minutes: 60
-    defaults:
-      run:
-        working-directory: ./java
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: "stable"
-          cache-workspaces: "src/rust"
-          # Disable full debug symbol generation to speed up CI build and keep memory down
-          # "1" means line tables only, which is useful for panic tracebacks.
-          rustflags: "-C debuginfo=1"
-      - name: Install dependencies
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Check glibc version outside docker
+        run: ldd --version
+      - name: Build and run in Ubuntu 20.04 container
         run: |
-          sudo apt -y -qq update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
-      - name: Build release
-        run: |
-          cargo build --release
-          cp ../target/release/liblance_jni.so liblance_jni.so
+          docker run --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace debian:10 bash -c "
+            
+            set -ex
+            apt-get update
+          
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes \
+              apt-transport-https \
+              ca-certificates \
+              curl \
+              gpg \
+              bash \
+              less \
+              openssl \
+              libssl-dev \
+              pkg-config \
+              libsqlite3-dev \
+              libsqlite3-0 \
+              libreadline-dev \
+              git \
+              cmake \
+              dh-autoreconf \
+              clang \
+              g++ \
+              libc++-dev \
+              libc++abi-dev \
+              libprotobuf-dev \
+              libncurses5-dev \
+              libncursesw5-dev \
+              libudev-dev \
+              libhidapi-dev \
+              zip \
+              unzip
+            
+            # https://github.com/databendlabs/databend/issues/8035
+            PROTOC_ZIP=protoc-3.15.0-linux-aarch_64.zip
+            curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.15.0/\$PROTOC_ZIP
+            unzip -o \$PROTOC_ZIP -d /usr/local
+            rm -f \$PROTOC_ZIP
+            protoc --version
+          
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+            source \$HOME/.cargo/env
+            
+            cd java
+            
+            # https://github.com/rustls/rustls/issues/1967
+            export CC=clang
+            export CXX=clang++
+            ldd --version
+
+            cargo build --release
+            cp ../target/release/liblance_jni.so liblance_jni.so
+          "
       - uses: actions/upload-artifact@v4
         with:
           name: liblance_jni_linux_aarch64.zip
@@ -97,21 +144,157 @@ jobs:
           mkdir -p ./core/target/classes/nativelib/darwin-aarch64 ./core/target/classes/nativelib/linux-aarch64
           cp ../liblance_jni_darwin_aarch64.zip/liblance_jni.dylib ./core/target/classes/nativelib/darwin-aarch64/liblance_jni.dylib
           cp ../liblance_jni_linux_aarch64.zip/liblance_jni.so ./core/target/classes/nativelib/linux-aarch64/liblance_jni.so
-      - name: Set github
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Check glibc version outside docker
+        run: ldd --version
+      - name: Build and run in Ubuntu 20.04 container (Dry Run)
+        if: |
+          github.event_name == 'pull_request' ||
+          inputs.dry_run == 'true'
         run: |
-          git config --global user.email "Lance Github Runner"
-          git config --global user.name "dev+gha@lancedb.com"
-      - name: Dry run
-        if: github.event_name == 'pull_request'
+          docker run --platform linux/amd64 -v ${{ github.workspace }}:/workspace -w /workspace openjdk:8-jdk-buster bash -c "
+            set -ex
+            apt-get update
+          
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes \
+              apt-transport-https \
+              ca-certificates \
+              curl \
+              gpg \
+              bash \
+              less \
+              openssl \
+              libssl-dev \
+              pkg-config \
+              libsqlite3-dev \
+              libsqlite3-0 \
+              libreadline-dev \
+              git \
+              cmake \
+              dh-autoreconf \
+              clang \
+              g++ \
+              libc++-dev \
+              libc++abi-dev \
+              libprotobuf-dev \
+              libncurses5-dev \
+              libncursesw5-dev \
+              libudev-dev \
+              libhidapi-dev \
+              zip \
+              unzip \
+          
+            # manually install maven, apt will use java11
+            MAVEN_VERSION=3.9.6
+            curl -OL https://dlcdn.apache.org/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz
+            tar -xzf apache-maven-3.9.9-bin.tar.gz
+            mv apache-maven-3.9.9 /opt/maven
+            ln -s /opt/maven/bin/mvn /usr/bin/mvn
+          
+            # https://github.com/databendlabs/databend/issues/8035
+            PROTOC_ZIP=protoc-3.15.0-linux-x86_64.zip
+            curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.15.0/\$PROTOC_ZIP
+            unzip -o \$PROTOC_ZIP -d /usr/local
+            rm -f \$PROTOC_ZIP
+            protoc --version
+          
+            # set Github
+            git config --global user.email \"Lance Github Runner\"
+            git config --global user.name \"dev+gha@lancedb.com\"
+          
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+            source \$HOME/.cargo/env
+          
+            cd java
+          
+            # https://github.com/rustls/rustls/issues/1967
+            export CC=clang
+            export CXX=clang++
+            ldd --version
+
+            mvn --batch-mode -DskipTests -Drust.release.build=true package
+          "
+      - name: Build and run in Ubuntu 20.04 container (Publish to Sonatype)
+        if: |
+          github.event_name == 'release' ||
+          inputs.dry_run == 'false'
         run: |
-          mvn --batch-mode -DskipTests -Drust.release.build=true package
-      - name: Publish with Java 8
-        if: github.event_name == 'release'
-        run: |
-          echo "use-agent" >> ~/.gnupg/gpg.conf
-          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
-          export GPG_TTY=$(tty)
-          mvn --batch-mode -DskipTests -Drust.release.build=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh -P shade-jar
-        env:
-          SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
-          SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
+          docker run --platform linux/amd64 -v ${{ github.workspace }}:/workspace -w /workspace openjdk:8-jdk-buster bash -c "
+            set -ex
+            apt-get update
+
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes \
+              apt-transport-https \
+              ca-certificates \
+              curl \
+              gpg \
+              bash \
+              less \
+              openssl \
+              libssl-dev \
+              pkg-config \
+              libsqlite3-dev \
+              libsqlite3-0 \
+              libreadline-dev \
+              git \
+              cmake \
+              dh-autoreconf \
+              clang \
+              g++ \
+              libc++-dev \
+              libc++abi-dev \
+              libprotobuf-dev \
+              libncurses5-dev \
+              libncursesw5-dev \
+              libudev-dev \
+              libhidapi-dev \
+              zip \
+              unzip
+
+            # manually install maven, apt will use java11
+            MAVEN_VERSION=3.9.6
+            curl -OL https://dlcdn.apache.org/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz
+            tar -xzf apache-maven-3.9.9-bin.tar.gz
+            mv apache-maven-3.9.9 /opt/maven
+            ln -s /opt/maven/bin/mvn /usr/bin/mvn
+          
+            # https://github.com/databendlabs/databend/issues/8035
+            PROTOC_ZIP=protoc-3.15.0-linux-x86_64.zip
+            curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.15.0/\$PROTOC_ZIP
+            unzip -o \$PROTOC_ZIP -d /usr/local
+            rm -f \$PROTOC_ZIP
+            protoc --version
+
+            # set Github
+            git config --global user.email \"Lance Github Runner\"
+            git config --global user.name \"dev+gha@lancedb.com\"
+
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+            source \$HOME/.cargo/env
+
+            cd java
+
+            # https://github.com/rustls/rustls/issues/1967
+            export CC=clang
+            export CXX=clang++
+            ldd --version
+            
+            export SONATYPE_USER=${{ secrets.SONATYPE_USER }}
+            export SONATYPE_TOKEN=${{ secrets.SONATYPE_TOKEN }}
+
+            mkdir -p /root/.gnupg
+            touch /root/.gnupg/gpg.conf
+            echo 'use-agent' >> /root/.gnupg/gpg.conf
+            echo 'pinentry-mode loopback' >> /root/.gnupg/gpg.conf
+            cat /root/.gnupg/gpg.conf
+          
+            export GPG_TTY=\$TTY
+            
+            touch signing.key
+            echo '${{ secrets.GPG_PRIVATE_KEY }}' >> signing.key
+            cat signing.key
+            gpg --import signing.key
+            
+            mvn --batch-mode -DskipTests -Drust.release.build=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh -P shade-jar
+          "

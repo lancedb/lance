@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -51,6 +52,7 @@ from .lance import (
     Compaction,
     CompactionMetrics,
     LanceSchema,
+    ScanStatistics,
     _Dataset,
     _MergeInsertBuilder,
     _Scanner,
@@ -176,6 +178,32 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         the filter will be deleted.
         """
         return super(MergeInsertBuilder, self).when_not_matched_by_source_delete(expr)
+
+    def conflict_retries(self, max_retries: int) -> "MergeInsertBuilder":
+        """
+        Set number of times to retry the operation if there is contention.
+
+        If this is set > 0, then the operation will keep a copy of the input data
+        either in memory or on disk (depending on the size of the data) and will
+        retry the operation if there is contention.
+
+        Default is 10.
+        """
+        return super(MergeInsertBuilder, self).conflict_retries(max_retries)
+
+    def retry_timeout(self, timeout: timedelta) -> "MergeInsertBuilder":
+        """
+        Set the timeout used to limit retries.
+
+        This is the maximum time to spend on the operation before giving up. At
+        least one attempt will be made, regardless of how long it takes to complete.
+        Subsequent attempts will be cancelled once this timeout is reached. If
+        the timeout has been reached during the first attempt, the operation
+        will be cancelled immediately before making a second attempt.
+
+        The default is 30 seconds.
+        """
+        return super(MergeInsertBuilder, self).retry_timeout(timeout)
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -348,6 +376,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
+        scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -440,6 +469,10 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search:  bool, default False
             If True, then the search will only be performed on the indexed data, which
             yields faster search time.
+        scan_stats_callback: Callable[[ScanStatistics], None], default None
+            A callback function that will be called with the scan statistics after the
+            scan is complete.  Errors raised by the callback will be logged but not
+            re-raised.
         include_deleted_rows: bool, default False
             If True, then rows that have been deleted, but are still present in the
             fragment, will be returned.  These rows will have the _rowid column set
@@ -500,7 +533,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.use_scalar_index, use_scalar_index)
         setopt(builder.fast_search, fast_search)
         setopt(builder.include_deleted_rows, include_deleted_rows)
-
+        setopt(builder.scan_stats_callback, scan_stats_callback)
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
             # No defaults, use user-provided, if any
@@ -898,8 +931,10 @@ class LanceDataset(pa.dataset.Dataset):
 
     def take_blobs(
         self,
-        row_ids: Union[List[int], pa.Array],
         blob_column: str,
+        ids: Optional[Union[List[int], pa.Array]] = None,
+        addresses: Optional[Union[List[int], pa.Array]] = None,
+        indices: Optional[Union[List[int], pa.Array]] = None,
     ) -> List[BlobFile]:
         """
         Select blobs by row IDs.
@@ -908,18 +943,36 @@ class LanceDataset(pa.dataset.Dataset):
         this API allows you to open binary blob data as a regular Python file-like
         object. For more details, see :py:class:`lance.BlobFile`.
 
+        Exactly one of ids, addresses, or indices must be specified.
         Parameters
         ----------
-        row_ids : List Array or array-like
-            row IDs to select in the dataset.
         blob_column : str
             The name of the blob column to select.
+        ids : Integer Array or array-like
+            row IDs to select in the dataset.
+        addresses: Integer Array or array-like
+            The (unstable) row addresses to select in the dataset.
+        indices : Integer Array or array-like
+            The offset / indices of the row in the dataset.
 
         Returns
         -------
         blob_files : List[BlobFile]
         """
-        lance_blob_files = self._ds.take_blobs(row_ids, blob_column)
+        if sum([bool(v is not None) for v in [ids, addresses, indices]]) != 1:
+            raise ValueError(
+                "Exactly one of ids, indices, or addresses must be specified"
+            )
+
+        if ids is not None:
+            lance_blob_files = self._ds.take_blobs(ids, blob_column)
+        elif addresses is not None:
+            # ROW ids and Row address are the same until stable ROW ID is implemented.
+            lance_blob_files = self._ds.take_blobs(addresses, blob_column)
+        elif indices is not None:
+            lance_blob_files = self._ds.take_blobs_by_indices(indices, blob_column)
+        else:
+            raise ValueError("Either ids or indices must be specified")
         return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
 
     def head(self, num_rows, **kwargs):
@@ -997,7 +1050,7 @@ class LanceDataset(pa.dataset.Dataset):
         string to large string, binary to large binary, and list to large list.
 
         Columns that are renamed can keep any indices that are on them. However, if
-        the column is casted to a different type, it's indices will be dropped.
+        the column is casted to a different type, its indices will be dropped.
 
         Parameters
         ----------
@@ -1293,7 +1346,7 @@ class LanceDataset(pa.dataset.Dataset):
     def merge_insert(
         self,
         on: Union[str, Iterable[str]],
-    ):
+    ) -> MergeInsertBuilder:
         """
         Returns a builder that can be used to create a "merge insert" operation
 
@@ -2315,6 +2368,21 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.drop_index(name)
 
+    def prewarm_index(self, name: str):
+        """
+        Prewarm an index
+
+        This will load the entire index into memory.  This can help avoid cold start
+        issues with index queries.  If the index does not fit in the index cache, then
+        this will result in wasted I/O.
+
+        Parameters
+        ----------
+        name: str
+            The name of the index to prewarm.
+        """
+        return self._ds.prewarm_index(name)
+
     def session(self) -> Session:
         """
         Return the dataset session, which holds the dataset's state.
@@ -3098,6 +3166,7 @@ class ScannerBuilder:
         self._full_text_query = None
         self._use_scalar_index = None
         self._include_deleted_rows = None
+        self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -3405,14 +3474,23 @@ class ScannerBuilder:
             The columns to search in. If None, search in all indexed columns.
         """
         if isinstance(query, FullTextQuery):
-            self._full_text_query = {
-                "query": query.to_dict(),
-            }
+            self._full_text_query = query.inner
         else:
             self._full_text_query = {
                 "query": query,
                 "columns": columns,
             }
+        return self
+
+    def scan_stats_callback(
+        self, callback: Callable[[ScanStatistics], None]
+    ) -> ScannerBuilder:
+        """
+        Set a callback function that will be called with the scan statistics after the
+        scan is complete.  Errors raised by the callback will be logged but not
+        re-raised.
+        """
+        self._scan_stats_callback = callback
         return self
 
     def to_scanner(self) -> LanceScanner:
@@ -3439,6 +3517,7 @@ class ScannerBuilder:
             self._late_materialization,
             self._use_scalar_index,
             self._include_deleted_rows,
+            self._scan_stats_callback,
         )
         return LanceScanner(scanner, self.ds)
 

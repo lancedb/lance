@@ -43,6 +43,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{
     read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
+    CachedFileSize,
 };
 use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
@@ -381,24 +382,39 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
+    async fn prewarm_index(&self, name: &str) -> Result<()> {
+        let indices = self.load_indices_by_name(name).await?;
+        if indices.is_empty() {
+            return Err(Error::IndexNotFound {
+                identity: format!("name={}", name),
+                location: location!(),
+            });
+        }
+
+        let index = self
+            .open_generic_index(name, &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .await?;
+        index.prewarm().await?;
+
+        Ok(())
+    }
+
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        let dataset_dir = self.base.to_string();
         if let Some(indices) = self
             .session
             .index_cache
-            .get_metadata(&dataset_dir, self.version().version)
+            .get_metadata(self.base.as_ref(), self.version().version)
         {
             return Ok(indices);
         }
 
-        let manifest_file = self.manifest_file().await?;
         let loaded_indices: Arc<Vec<IndexMetadata>> =
-            read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest)
+            read_manifest_indexes(&self.object_store, &self.manifest_location, &self.manifest)
                 .await?
                 .into();
 
         self.session.index_cache.insert_metadata(
-            &dataset_dir,
+            self.base.as_ref(),
             self.version().version,
             loaded_indices.clone(),
         );
@@ -853,7 +869,9 @@ impl DatasetIndexInternalExt for Dataset {
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
-                let file = scheduler.open_file(&index_file).await?;
+                let file = scheduler
+                    .open_file(&index_file, &CachedFileSize::unknown())
+                    .await?;
                 let reader = v2::reader::FileReader::try_open(
                     file,
                     None,
@@ -1060,7 +1078,9 @@ impl DatasetIndexInternalExt for Dataset {
 mod tests {
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::dataset::{ReadParams, WriteParams};
+    use crate::session::Session;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, StatsHolder};
 
     use super::*;
 
@@ -1073,6 +1093,7 @@ mod tests {
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
+    use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
@@ -1809,5 +1830,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(index.index_type(), IndexType::Bitmap);
+    }
+
+    #[tokio::test]
+    async fn test_load_indices() {
+        let session = Arc::new(Session::default());
+        let io_stats = Arc::new(StatsHolder::default());
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(io_stats.clone()),
+                ..Default::default()
+            }),
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+
+        let test_dir = tempdir().unwrap();
+        let field = Field::new("tag", DataType::Utf8, false);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let array = StringArray::from_iter_values((0..128).map(|i| ["a", "b", "c"][i % 3]));
+        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+        let reader = RecordBatchIterator::new(
+            vec![record_batch.clone()].into_iter().map(Ok),
+            schema.clone(),
+        );
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["tag"],
+                IndexType::Bitmap,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        io_stats.incremental_stats(); // Reset
+
+        let indices = dataset.load_indices().await.unwrap();
+        let stats = io_stats.incremental_stats();
+        // We should already have this cached since we just wrote it.
+        assert_eq!(stats.read_iops, 0);
+        assert_eq!(stats.read_bytes, 0);
+        assert_eq!(indices.len(), 1);
+
+        session.index_cache.clear(); // Clear the cache
+
+        let dataset2 = DatasetBuilder::from_uri(test_uri)
+            .with_session(session.clone())
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(io_stats.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        let stats = io_stats.incremental_stats(); // Reset
+        assert!(stats.read_bytes < 64 * 1024);
+
+        // Because the manifest is so small, we should have opportunistically
+        // cached the indices in memory already.
+        let indices2 = dataset2.load_indices().await.unwrap();
+        let stats = io_stats.incremental_stats();
+        assert_eq!(stats.read_iops, 0);
+        assert_eq!(stats.read_bytes, 0);
+        assert_eq!(indices2.len(), 1);
     }
 }

@@ -5,44 +5,37 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use aws_config::default_provider::credentials::DefaultCredentialsChain;
-use aws_credential_types::provider::ProvideCredentials;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
-use futures::Stream;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream};
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use list_retry::ListRetryStream;
-use object_store::aws::{
-    AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
-};
-use object_store::azure::MicrosoftAzureBuilder;
-use object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder};
-use object_store::{
-    aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
-    memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
-};
+#[cfg(feature = "aws")]
+use object_store::aws::AwsCredentialProvider;
+use object_store::DynObjectStore;
+use object_store::Error as ObjectStoreError;
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
-use object_store::{ClientOptions, DynObjectStore, RetryConfig, StaticCredentialProvider};
+use providers::local::FileStoreProvider;
+use providers::memory::MemoryStoreProvider;
 use shellexpand::tilde;
 use snafu::location;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
 use url::Url;
 
 use super::local::LocalObjectReader;
 mod list_retry;
+pub mod providers;
 mod tracing;
-use self::tracing::ObjectStoreTracingExt;
+use crate::object_reader::SmallReader;
 use crate::object_writer::WriteResult;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
@@ -55,7 +48,18 @@ pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 8;
 // Cloud disks often need many many threads to saturate the network
 pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
 
+const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
+#[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
+const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
+
+lazy_static::lazy_static! {
+    pub static ref DEFAULT_MAX_IOP_SIZE: u64 = std::env::var("LANCE_MAX_IOP_SIZE")
+        .map(|val| val.parse().unwrap()).unwrap_or(16 * 1024 * 1024);
+}
+
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
+
+pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
 
 #[async_trait]
 pub trait ObjectStoreExt {
@@ -104,6 +108,7 @@ pub struct ObjectStore {
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
     block_size: usize,
+    max_iop_size: u64,
     /// Whether to use constant size upload parts for multipart uploads. This
     /// is only necessary for Cloudflare R2.
     pub use_constant_size_upload_parts: bool,
@@ -131,212 +136,6 @@ impl std::fmt::Display for ObjectStore {
     }
 }
 
-pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
-    fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore>;
-}
-
-#[derive(Default, Debug)]
-pub struct ObjectStoreRegistry {
-    providers: HashMap<String, Arc<dyn ObjectStoreProvider>>,
-}
-
-impl ObjectStoreRegistry {
-    pub fn insert(&mut self, scheme: &str, provider: Arc<dyn ObjectStoreProvider>) {
-        self.providers.insert(scheme.into(), provider);
-    }
-}
-
-const AWS_CREDS_CACHE_KEY: &str = "aws_credentials";
-
-/// Adapt an AWS SDK cred into object_store credentials
-#[derive(Debug)]
-pub struct AwsCredentialAdapter {
-    pub inner: Arc<dyn ProvideCredentials>,
-
-    // RefCell can't be shared across threads, so we use HashMap
-    cache: Arc<RwLock<HashMap<String, Arc<aws_credential_types::Credentials>>>>,
-
-    // The amount of time before expiry to refresh credentials
-    credentials_refresh_offset: Duration,
-}
-
-impl AwsCredentialAdapter {
-    pub fn new(
-        provider: Arc<dyn ProvideCredentials>,
-        credentials_refresh_offset: Duration,
-    ) -> Self {
-        Self {
-            inner: provider,
-            cache: Arc::new(RwLock::new(HashMap::new())),
-            credentials_refresh_offset,
-        }
-    }
-}
-
-#[async_trait]
-impl CredentialProvider for AwsCredentialAdapter {
-    type Credential = ObjectStoreAwsCredential;
-
-    async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
-        let cached_creds = {
-            let cache_value = self.cache.read().await.get(AWS_CREDS_CACHE_KEY).cloned();
-            let expired = cache_value
-                .clone()
-                .map(|cred| {
-                    cred.expiry()
-                        .map(|exp| {
-                            exp.checked_sub(self.credentials_refresh_offset)
-                                .expect("this time should always be valid")
-                                < SystemTime::now()
-                        })
-                        // no expiry is never expire
-                        .unwrap_or(false)
-                })
-                .unwrap_or(true); // no cred is the same as expired;
-            if expired {
-                None
-            } else {
-                cache_value.clone()
-            }
-        };
-
-        if let Some(creds) = cached_creds {
-            Ok(Arc::new(Self::Credential {
-                key_id: creds.access_key_id().to_string(),
-                secret_key: creds.secret_access_key().to_string(),
-                token: creds.session_token().map(|s| s.to_string()),
-            }))
-        } else {
-            let refreshed_creds = Arc::new(self.inner.provide_credentials().await.map_err(
-                |e| Error::Internal {
-                    message: format!("Failed to get AWS credentials: {}", e),
-                    location: location!(),
-                },
-            )?);
-
-            self.cache
-                .write()
-                .await
-                .insert(AWS_CREDS_CACHE_KEY.to_string(), refreshed_creds.clone());
-
-            Ok(Arc::new(Self::Credential {
-                key_id: refreshed_creds.access_key_id().to_string(),
-                secret_key: refreshed_creds.secret_access_key().to_string(),
-                token: refreshed_creds.session_token().map(|s| s.to_string()),
-            }))
-        }
-    }
-}
-
-/// Figure out the S3 region of the bucket.
-///
-/// This resolves in order of precedence:
-/// 1. The region provided in the storage options
-/// 2. (If endpoint is not set), the region returned by the S3 API for the bucket
-///
-/// It can return None if no region is provided and the endpoint is set.
-async fn resolve_s3_region(
-    url: &Url,
-    storage_options: &HashMap<AmazonS3ConfigKey, String>,
-) -> Result<Option<String>> {
-    if let Some(region) = storage_options.get(&AmazonS3ConfigKey::Region) {
-        Ok(Some(region.clone()))
-    } else if storage_options.get(&AmazonS3ConfigKey::Endpoint).is_none() {
-        // If no endpoint is set, we can assume this is AWS S3 and the region
-        // can be resolved from the bucket.
-        let bucket = url.host_str().ok_or_else(|| {
-            Error::invalid_input(
-                format!("Could not parse bucket from url: {}", url),
-                location!(),
-            )
-        })?;
-
-        let mut client_options = ClientOptions::default();
-        for (key, value) in storage_options {
-            if let AmazonS3ConfigKey::Client(client_key) = key {
-                client_options = client_options.with_config(*client_key, value.clone());
-            }
-        }
-
-        let bucket_region =
-            object_store::aws::resolve_bucket_region(bucket, &client_options).await?;
-        Ok(Some(bucket_region))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Build AWS credentials
-///
-/// This resolves credentials from the following sources in order:
-/// 1. An explicit `credentials` provider
-/// 2. Explicit credentials in storage_options (as in `aws_access_key_id`,
-///    `aws_secret_access_key`, `aws_session_token`)
-/// 3. The default credential provider chain from AWS SDK.
-///
-/// `credentials_refresh_offset` is the amount of time before expiry to refresh credentials.
-pub async fn build_aws_credential(
-    credentials_refresh_offset: Duration,
-    credentials: Option<AwsCredentialProvider>,
-    storage_options: Option<&HashMap<AmazonS3ConfigKey, String>>,
-    region: Option<String>,
-) -> Result<(AwsCredentialProvider, String)> {
-    // TODO: make this return no credential provider not using AWS
-    use aws_config::meta::region::RegionProviderChain;
-    const DEFAULT_REGION: &str = "us-west-2";
-
-    let region = if let Some(region) = region {
-        region
-    } else {
-        RegionProviderChain::default_provider()
-            .or_else(DEFAULT_REGION)
-            .region()
-            .await
-            .map(|r| r.as_ref().to_string())
-            .unwrap_or(DEFAULT_REGION.to_string())
-    };
-
-    if let Some(creds) = credentials {
-        Ok((creds, region))
-    } else if let Some(creds) = storage_options.and_then(extract_static_s3_credentials) {
-        Ok((Arc::new(creds), region))
-    } else {
-        let credentials_provider = DefaultCredentialsChain::builder().build().await;
-
-        Ok((
-            Arc::new(AwsCredentialAdapter::new(
-                Arc::new(credentials_provider),
-                credentials_refresh_offset,
-            )),
-            region,
-        ))
-    }
-}
-
-fn extract_static_s3_credentials(
-    options: &HashMap<AmazonS3ConfigKey, String>,
-) -> Option<StaticCredentialProvider<ObjectStoreAwsCredential>> {
-    let key_id = options
-        .get(&AmazonS3ConfigKey::AccessKeyId)
-        .map(|s| s.to_string());
-    let secret_key = options
-        .get(&AmazonS3ConfigKey::SecretAccessKey)
-        .map(|s| s.to_string());
-    let token = options
-        .get(&AmazonS3ConfigKey::Token)
-        .map(|s| s.to_string());
-    match (key_id, secret_key, token) {
-        (Some(key_id), Some(secret_key), token) => {
-            Some(StaticCredentialProvider::new(ObjectStoreAwsCredential {
-                key_id,
-                secret_key,
-                token,
-            }))
-        }
-        _ => None,
-    }
-}
-
 pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
 }
@@ -346,8 +145,10 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ObjectStoreParams {
     pub block_size: Option<usize>,
+    #[deprecated(note = "Implement an ObjectStoreProvider instead")]
     pub object_store: Option<(Arc<DynObjectStore>, Url)>,
     pub s3_credentials_refresh_offset: Duration,
+    #[cfg(feature = "aws")]
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub storage_options: Option<HashMap<String, String>>,
@@ -361,10 +162,12 @@ pub struct ObjectStoreParams {
 
 impl Default for ObjectStoreParams {
     fn default() -> Self {
+        #[allow(deprecated)]
         Self {
             object_store: None,
             block_size: None,
             s3_credentials_refresh_offset: Duration::from_secs(60),
+            #[cfg(feature = "aws")]
             aws_credentials: None,
             object_store_wrapper: None,
             storage_options: None,
@@ -374,26 +177,107 @@ impl Default for ObjectStoreParams {
     }
 }
 
-impl ObjectStoreParams {
-    /// Create a new instance of [`ObjectStoreParams`] based on the AWS credentials.
-    pub fn with_aws_credentials(
-        aws_credentials: Option<AwsCredentialProvider>,
-        region: Option<String>,
-    ) -> Self {
-        Self {
-            aws_credentials,
-            storage_options: region
-                .map(|region| [("region".into(), region)].iter().cloned().collect()),
-            ..Default::default()
+// We implement hash for caching
+impl std::hash::Hash for ObjectStoreParams {
+    #[allow(deprecated)]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // For hashing, we use pointer values for ObjectStore, S3 credentials, and wrapper
+        self.block_size.hash(state);
+        if let Some((store, url)) = &self.object_store {
+            Arc::as_ptr(store).hash(state);
+            url.hash(state);
+        }
+        self.s3_credentials_refresh_offset.hash(state);
+        #[cfg(feature = "aws")]
+        if let Some(aws_credentials) = &self.aws_credentials {
+            Arc::as_ptr(aws_credentials).hash(state);
+        }
+        if let Some(wrapper) = &self.object_store_wrapper {
+            Arc::as_ptr(wrapper).hash(state);
+        }
+        if let Some(storage_options) = &self.storage_options {
+            for (key, value) in storage_options {
+                key.hash(state);
+                value.hash(state);
+            }
+        }
+        self.use_constant_size_upload_parts.hash(state);
+        self.list_is_lexically_ordered.hash(state);
+    }
+}
+
+// We implement eq for caching
+impl Eq for ObjectStoreParams {}
+impl PartialEq for ObjectStoreParams {
+    #[allow(deprecated)]
+    fn eq(&self, other: &Self) -> bool {
+        // For equality, we use pointer comparison for ObjectStore, S3 credentials, and wrapper
+        self.block_size == other.block_size
+            && self
+                .object_store
+                .as_ref()
+                .map(|(store, url)| (Arc::as_ptr(store), url))
+                == other
+                    .object_store
+                    .as_ref()
+                    .map(|(store, url)| (Arc::as_ptr(store), url))
+            && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
+            && self.aws_credentials.as_ref().map(Arc::as_ptr)
+                == other.aws_credentials.as_ref().map(Arc::as_ptr)
+            && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
+                == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
+            && self.storage_options == other.storage_options
+            && self.use_constant_size_upload_parts == other.use_constant_size_upload_parts
+            && self.list_is_lexically_ordered == other.list_is_lexically_ordered
+    }
+}
+
+fn uri_to_url(uri: &str) -> Result<Url> {
+    match Url::parse(uri) {
+        Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
+            // On Windows, the drive is parsed as a scheme
+            local_path_to_url(uri)
+        }
+        Ok(url) => Ok(url),
+        Err(_) => local_path_to_url(uri),
+    }
+}
+
+fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
+    let expanded = tilde(str_path.as_ref()).to_string();
+
+    let mut expanded_path = path_abs::PathAbs::new(expanded)
+        .unwrap()
+        .as_path()
+        .to_path_buf();
+    // path_abs::PathAbs::new(".") returns an empty string.
+    if let Some(s) = expanded_path.as_path().to_str() {
+        if s.is_empty() {
+            expanded_path = std::env::current_dir()?;
         }
     }
+
+    Ok(expanded_path)
+}
+
+fn local_path_to_url(str_path: &str) -> Result<Url> {
+    let expanded_path = expand_path(str_path)?;
+
+    Url::from_directory_path(expanded_path).map_err(|_| Error::InvalidInput {
+        source: format!("Invalid table location: '{}'", str_path).into(),
+        location: location!(),
+    })
 }
 
 impl ObjectStore {
     /// Parse from a string URI.
     ///
     /// Returns the ObjectStore instance and the absolute path to the object.
-    pub async fn from_uri(uri: &str) -> Result<(Self, Path)> {
+    ///
+    /// This uses the default [ObjectStoreRegistry] to find the object store. To
+    /// allow for potential re-use of object store instances, it's recommended to
+    /// create a shared [ObjectStoreRegistry] and pass that to [Self::from_uri_and_params].
+    pub async fn from_uri(uri: &str) -> Result<(Arc<Self>, Path)> {
         let registry = Arc::new(ObjectStoreRegistry::default());
 
         Self::from_uri_and_params(registry, uri, &ObjectStoreParams::default()).await
@@ -406,7 +290,8 @@ impl ObjectStore {
         registry: Arc<ObjectStoreRegistry>,
         uri: &str,
         params: &ObjectStoreParams,
-    ) -> Result<(Self, Path)> {
+    ) -> Result<(Arc<Self>, Path)> {
+        #[allow(deprecated)]
         if let Some((store, path)) = params.object_store.as_ref() {
             let mut inner = store.clone();
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
@@ -416,102 +301,53 @@ impl ObjectStore {
                 inner,
                 scheme: path.scheme().to_string(),
                 block_size: params.block_size.unwrap_or(64 * 1024),
+                max_iop_size: *DEFAULT_MAX_IOP_SIZE,
                 use_constant_size_upload_parts: params.use_constant_size_upload_parts,
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
             };
             let path = Path::from(path.path());
-            return Ok((store, path));
+            return Ok((Arc::new(store), path));
         }
-        let (object_store, path) = match Url::parse(uri) {
-            Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
-                // On Windows, the drive is parsed as a scheme
-                Self::from_path(uri)
-            }
-            Ok(url) => {
-                let store = Self::new_from_url(registry, url.clone(), params.clone()).await?;
-                Ok((store, Path::from(url.path())))
-            }
-            Err(_) => Self::from_path(uri),
-        }?;
+        let url = uri_to_url(uri)?;
+        let store = registry.get_store(url.clone(), params).await?;
+        // We know the scheme is valid if we got a store back.
+        let provider = registry.get_provider(url.scheme()).expect_ok()?;
+        let path = provider.extract_path(&url);
 
-        Ok((
-            Self {
-                inner: params
-                    .object_store_wrapper
-                    .as_ref()
-                    .map(|w| w.wrap(object_store.inner.clone()))
-                    .unwrap_or(object_store.inner),
-                ..object_store
-            },
-            path,
-        ))
+        Ok((store, path))
     }
 
-    pub fn from_path_with_scheme(str_path: &str, scheme: &str) -> Result<(Self, Path)> {
-        let expanded = tilde(str_path).to_string();
-
-        let mut expanded_path = path_abs::PathAbs::new(expanded)
-            .unwrap()
-            .as_path()
-            .to_path_buf();
-        // path_abs::PathAbs::new(".") returns an empty string.
-        if let Some(s) = expanded_path.as_path().to_str() {
-            if s.is_empty() {
-                expanded_path = std::env::current_dir()?;
-            }
-        }
-        Ok((
-            Self {
-                inner: Arc::new(LocalFileSystem::new()).traced(),
-                scheme: String::from(scheme),
-                block_size: 4 * 1024, // 4KB block size
-                use_constant_size_upload_parts: false,
-                list_is_lexically_ordered: false,
-                io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
-                download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
-            },
-            Path::from_absolute_path(expanded_path.as_path())?,
-        ))
-    }
-
-    pub fn from_path(str_path: &str) -> Result<(Self, Path)> {
-        Self::from_path_with_scheme(str_path, "file")
-    }
-
-    async fn new_from_url(
-        registry: Arc<ObjectStoreRegistry>,
-        url: Url,
-        params: ObjectStoreParams,
-    ) -> Result<Self> {
-        configure_store(registry, url.as_str(), params).await
+    #[deprecated(note = "Use `from_uri` instead")]
+    pub fn from_path(str_path: &str) -> Result<(Arc<Self>, Path)> {
+        Self::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            str_path,
+            &Default::default(),
+        )
+        .now_or_never()
+        .unwrap()
     }
 
     /// Local object store.
     pub fn local() -> Self {
-        Self {
-            inner: Arc::new(LocalFileSystem::new()).traced(),
-            scheme: String::from("file"),
-            block_size: 4 * 1024, // 4KB block size
-            use_constant_size_upload_parts: false,
-            list_is_lexically_ordered: false,
-            io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
-            download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
-        }
+        let provider = FileStoreProvider;
+        provider
+            .new_store(Url::parse("file:///").unwrap(), &Default::default())
+            .now_or_never()
+            .unwrap()
+            .unwrap()
     }
 
     /// Create a in-memory object store directly for testing.
     pub fn memory() -> Self {
-        Self {
-            inner: Arc::new(InMemory::new()).traced(),
-            scheme: String::from("memory"),
-            block_size: 4 * 1024,
-            use_constant_size_upload_parts: false,
-            list_is_lexically_ordered: true,
-            io_parallelism: get_num_compute_intensive_cpus(),
-            download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
-        }
+        let provider = MemoryStoreProvider;
+        provider
+            .new_store(Url::parse("memory:///").unwrap(), &Default::default())
+            .now_or_never()
+            .unwrap()
+            .unwrap()
     }
 
     /// Returns true if the object store pointed to a local file system.
@@ -527,12 +363,8 @@ impl ObjectStore {
         self.block_size
     }
 
-    pub fn set_block_size(&mut self, new_size: usize) {
-        self.block_size = new_size;
-    }
-
-    pub fn set_io_parallelism(&mut self, io_parallelism: usize) {
-        self.io_parallelism = io_parallelism;
+    pub fn max_iop_size(&self) -> u64 {
+        self.max_iop_size
     }
 
     pub fn io_parallelism(&self) -> usize {
@@ -564,6 +396,17 @@ impl ObjectStore {
     /// cached metadata. By passing in the known size, we can skip a HEAD / metadata
     /// call.
     pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Box<dyn Reader>> {
+        // If we know the file is really small, we can read the whole thing
+        // as a single request.
+        if known_size <= self.block_size {
+            return Ok(Box::new(SmallReader::new(
+                self.inner.clone(),
+                path.clone(),
+                self.download_retry_count,
+                known_size,
+            )));
+        }
+
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(path, self.block_size, Some(known_size)).await,
             _ => Ok(Box::new(CloudObjectReader::new(
@@ -579,14 +422,16 @@ impl ObjectStore {
     /// Create an [ObjectWriter] from local [std::path::Path]
     pub async fn create_local_writer(path: &std::path::Path) -> Result<ObjectWriter> {
         let object_store = Self::local();
-        let os_path = Path::from(path.to_str().unwrap());
+        let absolute_path = expand_path(path.to_string_lossy())?;
+        let os_path = Path::from_absolute_path(absolute_path)?;
         object_store.create(&os_path).await
     }
 
     /// Open an [Reader] from local [std::path::Path]
     pub async fn open_local(path: &std::path::Path) -> Result<Box<dyn Reader>> {
         let object_store = Self::local();
-        let os_path = Path::from(path.to_str().unwrap());
+        let absolute_path = expand_path(path.to_string_lossy())?;
+        let os_path = Path::from_absolute_path(absolute_path)?;
         object_store.open(&os_path).await
     }
 
@@ -749,55 +594,6 @@ impl StorageOptions {
         Self(options)
     }
 
-    /// Add values from the environment to storage options
-    pub fn with_env_azure(&mut self) {
-        for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
-                if let Ok(config_key) = AzureConfigKey::from_str(&key.to_ascii_lowercase()) {
-                    if !self.0.contains_key(config_key.as_ref()) {
-                        self.0
-                            .insert(config_key.as_ref().to_string(), value.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    /// Add values from the environment to storage options
-    pub fn with_env_gcs(&mut self) {
-        for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
-                let lowercase_key = key.to_ascii_lowercase();
-                let token_key = "google_storage_token";
-
-                if let Ok(config_key) = GoogleConfigKey::from_str(&lowercase_key) {
-                    if !self.0.contains_key(config_key.as_ref()) {
-                        self.0
-                            .insert(config_key.as_ref().to_string(), value.to_string());
-                    }
-                }
-                // Check for GOOGLE_STORAGE_TOKEN until GoogleConfigKey supports storage token
-                else if lowercase_key == token_key && !self.0.contains_key(token_key) {
-                    self.0.insert(token_key.to_string(), value.to_string());
-                }
-            }
-        }
-    }
-
-    /// Add values from the environment to storage options
-    pub fn with_env_s3(&mut self) {
-        for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
-                if let Ok(config_key) = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()) {
-                    if !self.0.contains_key(config_key.as_ref()) {
-                        self.0
-                            .insert(config_key.as_ref().to_string(), value.to_string());
-                    }
-                }
-            }
-        }
-    }
-
     /// Denotes if unsecure connections via http are allowed
     pub fn allow_http(&self) -> bool {
         self.0.iter().any(|(key, value)| {
@@ -832,39 +628,6 @@ impl StorageOptions {
             .unwrap_or(180)
     }
 
-    /// Subset of options relevant for azure storage
-    pub fn as_azure_options(&self) -> HashMap<AzureConfigKey, String> {
-        self.0
-            .iter()
-            .filter_map(|(key, value)| {
-                let az_key = AzureConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
-                Some((az_key, value.clone()))
-            })
-            .collect()
-    }
-
-    /// Subset of options relevant for s3 storage
-    pub fn as_s3_options(&self) -> HashMap<AmazonS3ConfigKey, String> {
-        self.0
-            .iter()
-            .filter_map(|(key, value)| {
-                let s3_key = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
-                Some((s3_key, value.clone()))
-            })
-            .collect()
-    }
-
-    /// Subset of options relevant for gcs storage
-    pub fn as_gcs_options(&self) -> HashMap<GoogleConfigKey, String> {
-        self.0
-            .iter()
-            .filter_map(|(key, value)| {
-                let gcs_key = GoogleConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
-                Some((gcs_key, value.clone()))
-            })
-            .collect()
-    }
-
     pub fn get(&self, key: &str) -> Option<&String> {
         self.0.get(key)
     }
@@ -873,178 +636,6 @@ impl StorageOptions {
 impl From<HashMap<String, String>> for StorageOptions {
     fn from(value: HashMap<String, String>) -> Self {
         Self::new(value)
-    }
-}
-
-async fn configure_store(
-    registry: Arc<ObjectStoreRegistry>,
-    url: &str,
-    options: ObjectStoreParams,
-) -> Result<ObjectStore> {
-    let mut storage_options = StorageOptions(options.storage_options.clone().unwrap_or_default());
-    let download_retry_count = storage_options.download_retry_count();
-    let mut url = ensure_table_uri(url)?;
-    // Block size: On local file systems, we use 4KB block size. On cloud
-    // object stores, we use 64KB block size. This is generally the largest
-    // block size where we don't see a latency penalty.
-    let file_block_size = options.block_size.unwrap_or(4 * 1024);
-    let cloud_block_size = options.block_size.unwrap_or(64 * 1024);
-    let max_retries = storage_options.client_max_retries();
-    let retry_timeout = storage_options.client_retry_timeout();
-    let retry_config = RetryConfig {
-        backoff: Default::default(),
-        max_retries,
-        retry_timeout: Duration::from_secs(retry_timeout),
-    };
-    match url.scheme() {
-        "s3" | "s3+ddb" => {
-            storage_options.with_env_s3();
-
-            // if url.scheme() == "s3+ddb" && options.commit_handler.is_some() {
-            //     return Err(Error::InvalidInput {
-            //         source: "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
-            //             .into(),
-            //         location: location!(),
-            //     });
-            // }
-
-            let mut storage_options = storage_options.as_s3_options();
-            let region = resolve_s3_region(&url, &storage_options).await?;
-            let (aws_creds, region) = build_aws_credential(
-                options.s3_credentials_refresh_offset,
-                options.aws_credentials.clone(),
-                Some(&storage_options),
-                region,
-            )
-            .await?;
-
-            // This will be default in next version of object store.
-            // https://github.com/apache/arrow-rs/pull/7181
-            storage_options
-                .entry(AmazonS3ConfigKey::ConditionalPut)
-                .or_insert_with(|| "etag".to_string());
-
-            // Cloudflare does not support varying part sizes.
-            let use_constant_size_upload_parts = storage_options
-                .get(&AmazonS3ConfigKey::Endpoint)
-                .map(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
-                .unwrap_or(false);
-
-            // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
-            url.set_scheme("s3").map_err(|()| Error::Internal {
-                message: "could not set scheme".into(),
-                location: location!(),
-            })?;
-
-            url.set_query(None);
-
-            // we can't use parse_url_opts here because we need to manually set the credentials provider
-            let mut builder = AmazonS3Builder::new();
-            for (key, value) in storage_options {
-                builder = builder.with_config(key, value);
-            }
-            builder = builder
-                .with_url(url.as_ref())
-                .with_credentials(aws_creds)
-                .with_retry(retry_config)
-                .with_region(region);
-            let store = builder.build()?;
-
-            Ok(ObjectStore {
-                inner: Arc::new(store).traced(),
-                scheme: String::from(url.scheme()),
-                block_size: cloud_block_size,
-                use_constant_size_upload_parts,
-                list_is_lexically_ordered: true,
-                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-                download_retry_count,
-            })
-        }
-        "gs" => {
-            storage_options.with_env_gcs();
-            let mut builder = GoogleCloudStorageBuilder::new()
-                .with_url(url.as_ref())
-                .with_retry(retry_config);
-            for (key, value) in storage_options.as_gcs_options() {
-                builder = builder.with_config(key, value);
-            }
-            let token_key = "google_storage_token";
-            if let Some(storage_token) = storage_options.get(token_key) {
-                let credential = GcpCredential {
-                    bearer: storage_token.to_string(),
-                };
-                let credential_provider = Arc::new(StaticCredentialProvider::new(credential)) as _;
-                builder = builder.with_credentials(credential_provider);
-            }
-            let store = builder.build()?;
-            let store = Arc::new(store).traced();
-
-            Ok(ObjectStore {
-                inner: store,
-                scheme: String::from("gs"),
-                block_size: cloud_block_size,
-                use_constant_size_upload_parts: false,
-                list_is_lexically_ordered: true,
-                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-                download_retry_count,
-            })
-        }
-        "az" => {
-            storage_options.with_env_azure();
-            let mut builder = MicrosoftAzureBuilder::new()
-                .with_url(url.as_ref())
-                .with_retry(retry_config);
-            for (key, value) in storage_options.as_azure_options() {
-                builder = builder.with_config(key, value);
-            }
-            let store = builder.build()?;
-            let store = Arc::new(store).traced();
-
-            Ok(ObjectStore {
-                inner: store,
-                scheme: String::from("az"),
-                block_size: cloud_block_size,
-                use_constant_size_upload_parts: false,
-                list_is_lexically_ordered: true,
-                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-                download_retry_count,
-            })
-        }
-        // we have a bypass logic to use `tokio::fs` directly to lower overhead
-        // however this makes testing harder as we can't use the same code path
-        // "file-object-store" forces local file system dataset to use the same
-        // code path as cloud object stores
-        "file" => {
-            let mut object_store = ObjectStore::from_path(url.path())?.0;
-            object_store.set_block_size(file_block_size);
-            Ok(object_store)
-        }
-        "file-object-store" => {
-            let mut object_store =
-                ObjectStore::from_path_with_scheme(url.path(), "file-object-store")?.0;
-            object_store.set_block_size(file_block_size);
-            Ok(object_store)
-        }
-        "memory" => Ok(ObjectStore {
-            inner: Arc::new(InMemory::new()).traced(),
-            scheme: String::from("memory"),
-            block_size: file_block_size,
-            use_constant_size_upload_parts: false,
-            list_is_lexically_ordered: true,
-            io_parallelism: get_num_compute_intensive_cpus(),
-            download_retry_count,
-        }),
-        unknown_scheme => {
-            if let Some(provider) = registry.providers.get(unknown_scheme) {
-                provider.new_store(url, &options)
-            } else {
-                let err = lance_core::Error::from(object_store::Error::NotSupported {
-                    source: format!("Unsupported URI scheme: {} in url {}", unknown_scheme, url)
-                        .into(),
-                });
-                Err(err)
-            }
-        }
     }
 }
 
@@ -1072,6 +663,7 @@ impl ObjectStore {
             inner: store,
             scheme: scheme.into(),
             block_size,
+            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
             list_is_lexically_ordered,
             io_parallelism,
@@ -1090,79 +682,10 @@ fn infer_block_size(scheme: &str) -> usize {
     }
 }
 
-/// Attempt to create a Url from given table location.
-///
-/// The location could be:
-///  * A valid URL, which will be parsed and returned
-///  * A path to a directory, which will be created and then converted to a URL.
-///
-/// If it is a local path, it will be created if it doesn't exist.
-///
-/// Extra slashes will be removed from the end path as well.
-///
-/// Will return an error if the location is not valid. For example,
-pub fn ensure_table_uri(table_uri: impl AsRef<str>) -> Result<Url> {
-    let table_uri = table_uri.as_ref();
-
-    enum UriType {
-        LocalPath(PathBuf),
-        Url(Url),
-    }
-    let uri_type: UriType = if let Ok(url) = Url::parse(table_uri) {
-        if url.scheme() == "file" {
-            UriType::LocalPath(url.to_file_path().map_err(|err| {
-                let msg = format!("Invalid table location: {}\nError: {:?}", table_uri, err);
-                Error::InvalidTableLocation { message: msg }
-            })?)
-        // NOTE this check is required to support absolute windows paths which may properly parse as url
-        } else {
-            UriType::Url(url)
-        }
-    } else {
-        UriType::LocalPath(PathBuf::from(table_uri))
-    };
-
-    // If it is a local path, we need to create it if it does not exist.
-    let mut url = match uri_type {
-        UriType::LocalPath(path) => {
-            let path = std::fs::canonicalize(path).map_err(|err| Error::DatasetNotFound {
-                path: table_uri.to_string(),
-                source: Box::new(err),
-                location: location!(),
-            })?;
-            Url::from_directory_path(path).map_err(|_| {
-                let msg = format!(
-                    "Could not construct a URL from canonicalized path: {}.\n\
-                  Something must be very wrong with the table path.",
-                    table_uri
-                );
-                Error::InvalidTableLocation { message: msg }
-            })?
-        }
-        UriType::Url(url) => url,
-    };
-
-    let trimmed_path = url.path().trim_end_matches('/').to_owned();
-    url.set_path(&trimmed_path);
-    Ok(url)
-}
-
-lazy_static::lazy_static! {
-  static ref KNOWN_SCHEMES: Vec<&'static str> =
-      Vec::from([
-        "s3",
-        "s3+ddb",
-        "gs",
-        "az",
-        "file",
-        "file-object-store",
-        "memory"
-      ]);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::memory::InMemory;
     use parquet::data_type::AsBytes;
     use rstest::rstest;
     use std::env::set_current_dir;
@@ -1178,7 +701,7 @@ mod tests {
         write(path, contents)
     }
 
-    async fn read_from_store(store: ObjectStore, path: &Path) -> Result<String> {
+    async fn read_from_store(store: &ObjectStore, path: &Path) -> Result<String> {
         let test_file_store = store.open(path).await.unwrap();
         let size = test_file_store.size().await.unwrap();
         let bytes = test_file_store.get_range(0..size).await.unwrap();
@@ -1203,7 +726,7 @@ mod tests {
             format!("{tmp_path}/bar/foo.lance/../foo.lance"),
         ] {
             let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
-            let contents = read_from_store(store, &path.child("test_file"))
+            let contents = read_from_store(store.as_ref(), &path.child("test_file"))
                 .await
                 .unwrap();
             assert_eq!(contents, "TEST_CONTENT");
@@ -1302,7 +825,7 @@ mod tests {
         set_current_dir(StdPath::new(&tmp_path)).expect("Error changing current dir");
         let (store, path) = ObjectStore::from_uri("./bar/foo.lance").await.unwrap();
 
-        let contents = read_from_store(store, &path.child("test_file"))
+        let contents = read_from_store(store.as_ref(), &path.child("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "RELATIVE_URL");
@@ -1313,7 +836,7 @@ mod tests {
         let uri = "~/foo.lance";
         write_to_file(&format!("{uri}/test_file"), "TILDE").unwrap();
         let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
-        let contents = read_from_store(store, &path.child("test_file"))
+        let contents = read_from_store(store.as_ref(), &path.child("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "TILDE");
@@ -1415,54 +938,6 @@ mod tests {
         assert_eq!(Arc::strong_count(&mock_inner_store), 2);
     }
 
-    #[derive(Debug, Default)]
-    struct MockAwsCredentialsProvider {
-        called: AtomicBool,
-    }
-
-    #[async_trait]
-    impl CredentialProvider for MockAwsCredentialsProvider {
-        type Credential = ObjectStoreAwsCredential;
-
-        async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
-            self.called.store(true, Ordering::Relaxed);
-            Ok(Arc::new(Self::Credential {
-                key_id: "".to_string(),
-                secret_key: "".to_string(),
-                token: None,
-            }))
-        }
-    }
-
-    #[tokio::test]
-    async fn test_injected_aws_creds_option_is_used() {
-        let mock_provider = Arc::new(MockAwsCredentialsProvider::default());
-        let registry = Arc::new(ObjectStoreRegistry::default());
-
-        let params = ObjectStoreParams {
-            aws_credentials: Some(mock_provider.clone() as AwsCredentialProvider),
-            ..ObjectStoreParams::default()
-        };
-
-        // Not called yet
-        assert!(!mock_provider.called.load(Ordering::Relaxed));
-
-        let (store, _) = ObjectStore::from_uri_and_params(registry, "s3://not-a-bucket", &params)
-            .await
-            .unwrap();
-
-        // fails, but we don't care
-        let _ = store
-            .open(&Path::parse("/").unwrap())
-            .await
-            .unwrap()
-            .get_range(0..1)
-            .await;
-
-        // Not called yet
-        assert!(mock_provider.called.load(Ordering::Relaxed));
-    }
-
     #[tokio::test]
     async fn test_local_paths() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1536,7 +1011,7 @@ mod tests {
             format!("{drive_letter}:\\test_folder\\test.lance"),
         ] {
             let (store, base) = ObjectStore::from_uri(uri).await.unwrap();
-            let contents = read_from_store(store, &base.child("test_file"))
+            let contents = read_from_store(store.as_ref(), &base.child("test_file"))
                 .await
                 .unwrap();
             assert_eq!(contents, "WINDOWS");

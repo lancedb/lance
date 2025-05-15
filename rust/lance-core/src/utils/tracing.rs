@@ -33,6 +33,11 @@ pub trait StreamTracingExt {
     where
         Self: Stream,
         Self: Sized;
+
+    fn stream_in_span(self, span: Span) -> InstrumentedStream<Self>
+    where
+        Self: Stream,
+        Self: Sized;
 }
 
 impl<S: Stream> StreamTracingExt for S {
@@ -41,10 +46,15 @@ impl<S: Stream> StreamTracingExt for S {
         Self: Stream,
         Self: Sized,
     {
-        InstrumentedStream {
-            stream: self,
-            span: Span::current(),
-        }
+        self.stream_in_span(Span::current())
+    }
+
+    fn stream_in_span(self, span: Span) -> InstrumentedStream<Self>
+    where
+        Self: Stream,
+        Self: Sized,
+    {
+        InstrumentedStream { stream: self, span }
     }
 }
 

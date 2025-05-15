@@ -14,7 +14,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use futures::stream::{self};
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
@@ -40,7 +40,6 @@ pub struct MatchQueryExec {
     query: MatchQuery,
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
-    is_flat_search: bool,
 
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -74,7 +73,6 @@ impl MatchQueryExec {
             query,
             params,
             prefilter_source,
-            is_flat_search: false,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -98,6 +96,14 @@ impl ExecutionPlan for MatchQueryExec {
         }
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // Prefilter inputs must be a single partition
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -115,7 +121,6 @@ impl ExecutionPlan for MatchQueryExec {
                     query: self.query.clone(),
                     params: self.params.clone(),
                     prefilter_source: PreFilterSource::None,
-                    is_flat_search: self.is_flat_search,
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -141,7 +146,6 @@ impl ExecutionPlan for MatchQueryExec {
                     query: self.query.clone(),
                     params: self.params.clone(),
                     prefilter_source,
-                    is_flat_search: self.is_flat_search,
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -213,7 +217,14 @@ impl ExecutionPlan for MatchQueryExec {
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, mut scores) = inverted_idx
-                .bm25_search(&tokens, &params, false, pre_filter, metrics.as_ref())
+                .bm25_search(
+                    &tokens,
+                    &params,
+                    query.operator,
+                    false,
+                    pre_filter,
+                    metrics.as_ref(),
+                )
                 .await?;
             scores.iter_mut().for_each(|s| {
                 *s *= query.boost;
@@ -248,6 +259,7 @@ impl ExecutionPlan for MatchQueryExec {
     }
 }
 
+/// Calculates the FTS score for each row in the input
 #[derive(Debug)]
 pub struct FlatMatchQueryExec {
     dataset: Arc<Dataset>,
@@ -449,6 +461,14 @@ impl ExecutionPlan for PhraseQueryExec {
         }
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // Prefilter inputs must be a single partition
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -542,7 +562,14 @@ impl ExecutionPlan for PhraseQueryExec {
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, scores) = index
-                .bm25_search(&tokens, &params, true, pre_filter, metrics.as_ref())
+                .bm25_search(
+                    &tokens,
+                    &params,
+                    lance_index::scalar::inverted::query::Operator::And,
+                    true,
+                    pre_filter,
+                    metrics.as_ref(),
+                )
                 .await?;
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
@@ -634,6 +661,15 @@ impl ExecutionPlan for BoostQueryExec {
         vec![&self.positive, &self.negative]
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // This node fully consumes and re-orders the input rows.
+        // It must be run on a single partition.
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -721,5 +757,97 @@ impl ExecutionPlan for BoostQueryExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use std::sync::Arc;
+
+    use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
+    use lance_datafusion::datagen::DatafusionDatagenExt;
+    use lance_datagen::{BatchCount, ByteCount, RowCount};
+    use lance_index::scalar::inverted::query::{
+        BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
+    };
+
+    use crate::{io::exec::PreFilterSource, utils::test::NoContextTestFixture};
+
+    use super::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
+
+    #[test]
+    fn execute_without_context() {
+        // These tests ensure we can create nodes and call execute without a tokio Runtime
+        // being active.  This is a requirement for proper implementation of a Datafusion foreign
+        // table provider.
+        let fixture = NoContextTestFixture::new();
+        let match_query = MatchQueryExec::new(
+            Arc::new(fixture.dataset.clone()),
+            MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        );
+        match_query
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+
+        let flat_input = lance_datagen::gen()
+            .col(
+                "text",
+                lance_datagen::array::rand_utf8(ByteCount::from(10), false),
+            )
+            .into_df_exec(RowCount::from(15), BatchCount::from(2));
+
+        let flat_match_query = FlatMatchQueryExec::new(
+            Arc::new(fixture.dataset.clone()),
+            MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+            FtsSearchParams::default(),
+            flat_input,
+        );
+        flat_match_query
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+
+        let phrase_query = PhraseQueryExec::new(
+            Arc::new(fixture.dataset.clone()),
+            PhraseQuery::new("blah".to_string()),
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        );
+        phrase_query
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+
+        let boost_input_one = MatchQueryExec::new(
+            Arc::new(fixture.dataset.clone()),
+            MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        );
+
+        let boost_input_two = MatchQueryExec::new(
+            Arc::new(fixture.dataset),
+            MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        );
+
+        let boost_query = BoostQueryExec::new(
+            BoostQuery::new(
+                FtsQuery::Match(
+                    MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+                ),
+                FtsQuery::Match(
+                    MatchQuery::new("test".to_string()).with_column(Some("text".to_string())),
+                ),
+                Some(1.0),
+            ),
+            FtsSearchParams::default(),
+            Arc::new(boost_input_one),
+            Arc::new(boost_input_two),
+        );
+        boost_query
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
     }
 }

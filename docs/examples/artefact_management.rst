@@ -109,7 +109,7 @@ Loading Models
 Loading weights from a Lance weight dataset into a model is just the reverse of saving them. The key part is to reshape the flattened weights back to their original shape, which is easier thanks to the shape that you saved corresponding to the weights.
 We will divide this into three functions for better readability.
 
-The first function will be the :meth:`_load_weight` function which will take a "weight" retrieved from the Lance weight dataset and return the weight as a torch tensor in it's original shape. The "weight" that we retrieve from the Lance weight dataset will be a dict with value corresponding to each column in form of a key.
+The first function will be the :meth:`_load_weight` function which will take a "weight" retrieved from the Lance weight dataset and return the weight as a torch tensor in its original shape. The "weight" that we retrieve from the Lance weight dataset will be a dict with value corresponding to each column in form of a key.
 
 .. code-block:: python
 
@@ -171,6 +171,6 @@ The :meth:`load_model` function will require the model, the lance weight dataset
 
 Conclusion
 ~~~~~~~~~~
-In conclusion, you only need to call the two function: :meth:`save_model` and :meth:`load_model` to save and load the models respectively and as long as the weights can be fit in the memory and are in PyTorch, it should be fine.
+In conclusion, you only need to call the two functions: :meth:`save_model` and :meth:`load_model` to save and load the models respectively and as long as the weights can be fit in the memory and are in PyTorch, it should be fine.
 
 Although experimental, this approach defines a new way of doing deep learning artefact management.

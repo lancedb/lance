@@ -19,6 +19,7 @@ use lance_file::{
 use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
+    utils::CachedFileSize,
 };
 use rand::seq::SliceRandom;
 
@@ -33,8 +34,12 @@ fn bench_reader(c: &mut Criterion) {
 
         let tempdir = tempfile::tempdir().unwrap();
         let test_path = tempdir.path();
-        let (object_store, base_path) =
-            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
+        let (object_store, base_path) = rt
+            .block_on(ObjectStore::from_uri(
+                test_path.as_os_str().to_str().unwrap(),
+            ))
+            .unwrap();
+
         let file_path = base_path.child("foo.lance");
         let object_writer = rt.block_on(object_store.create(&file_path)).unwrap();
 
@@ -59,10 +64,13 @@ fn bench_reader(c: &mut Criterion) {
                 let data = &data;
                 rt.block_on(async move {
                     let store_scheduler = ScanScheduler::new(
-                        Arc::new(object_store.clone()),
+                        object_store.clone(),
                         SchedulerConfig::default_for_testing(),
                     );
-                    let scheduler = store_scheduler.open_file(file_path).await.unwrap();
+                    let scheduler = store_scheduler
+                        .open_file(file_path, &CachedFileSize::unknown())
+                        .await
+                        .unwrap();
                     let reader = FileReader::try_open(
                         scheduler.clone(),
                         None,
@@ -125,8 +133,11 @@ fn bench_random_access(c: &mut Criterion) {
 
         let tempdir = tempfile::tempdir().unwrap();
         let test_path = tempdir.path();
-        let (object_store, base_path) =
-            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
+        let (object_store, base_path) = rt
+            .block_on(ObjectStore::from_uri(
+                test_path.as_os_str().to_str().unwrap(),
+            ))
+            .unwrap();
         let file_path = base_path.child("foo.lance");
         let object_writer = rt.block_on(object_store.create(&file_path)).unwrap();
 
@@ -150,11 +161,12 @@ fn bench_random_access(c: &mut Criterion) {
         let object_store = &object_store;
         let file_path = &file_path;
         let reader = rt.block_on(async move {
-            let store_scheduler = ScanScheduler::new(
-                Arc::new(object_store.clone()),
-                SchedulerConfig::default_for_testing(),
-            );
-            let scheduler = store_scheduler.open_file(file_path).await.unwrap();
+            let store_scheduler =
+                ScanScheduler::new(object_store.clone(), SchedulerConfig::default_for_testing());
+            let scheduler = store_scheduler
+                .open_file(file_path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
             Arc::new(
                 FileReader::try_open(
                     scheduler.clone(),

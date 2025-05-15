@@ -1416,7 +1416,11 @@ def test_merge_insert(tmp_path: Path):
     is_new = pc.field("b") == 2
 
     merge_dict = (
-        dataset.merge_insert("a").when_not_matched_insert_all().execute(new_table)
+        dataset.merge_insert("a")
+        .when_not_matched_insert_all()
+        .retry_timeout(timedelta(seconds=5))
+        .conflict_retries(0)
+        .execute(new_table)
     )
     table = dataset.to_table()
     assert table.num_rows == 1300
@@ -1576,6 +1580,19 @@ def test_flat_vector_search_with_delete(tmp_path: Path):
         .num_rows
         == 9
     )
+
+
+def test_null_reader_with_deletes(tmp_path: Path):
+    full_schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("other", pa.int64()),
+        ]
+    )
+    ds = lance.write_dataset([], tmp_path, schema=full_schema, mode="create")
+    ds.insert(pa.table({"id": [1, 2, 3, 4, 5]}))
+    ds.delete("id in (1, 2)")
+    ds.to_table()
 
 
 def test_merge_insert_conditional_upsert_example(tmp_path: Path):

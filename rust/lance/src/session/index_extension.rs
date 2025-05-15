@@ -112,6 +112,10 @@ mod test {
             Ok(self)
         }
 
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
         fn statistics(&self) -> Result<serde_json::Value> {
             Ok(json!(()))
         }

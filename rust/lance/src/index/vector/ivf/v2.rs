@@ -49,6 +49,7 @@ use lance_index::{
 use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::local::to_local_path;
 use lance_io::scheduler::SchedulerConfig;
+use lance_io::utils::CachedFileSize;
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader, ReadBatchParams,
 };
@@ -133,7 +134,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .unwrap_or_else(FileMetadataCache::no_cache);
         let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
         let index_reader = FileReader::try_open(
-            scheduler.open_file(&uri).await?,
+            scheduler
+                .open_file(&uri, &CachedFileSize::unknown())
+                .await?,
             None,
             Arc::<DecoderPlugins>::default(),
             &file_metadata_cache,
@@ -185,6 +188,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     &index_dir
                         .child(uuid.as_str())
                         .child(INDEX_AUXILIARY_FILE_NAME),
+                    &CachedFileSize::unknown(),
                 )
                 .await?,
             None,
@@ -332,6 +336,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
         Ok(self)
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: We should prewarm the IVF index by loading the partitions into memory
+        Ok(())
     }
 
     fn index_type(&self) -> IndexType {
@@ -772,7 +781,7 @@ mod tests {
             ));
             let array = Arc::new(ListArray::new(
                 vector_field,
-                OffsetBuffer::from_lengths(std::iter::repeat(VECTOR_NUM_PER_ROW).take(num_rows)),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(VECTOR_NUM_PER_ROW, num_rows)),
                 Arc::new(fsl),
                 None,
             ));

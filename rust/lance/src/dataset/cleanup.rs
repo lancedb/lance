@@ -35,6 +35,7 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
+use humantime::parse_duration;
 use lance_core::{
     utils::tracing::{
         AUDIT_MODE_DELETE, AUDIT_MODE_DELETE_UNVERIFIED, AUDIT_TYPE_DATA, AUDIT_TYPE_DELETION,
@@ -191,7 +192,7 @@ impl<'a> CleanupTask<'a> {
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || manifest.timestamp() >= self.before || is_tagged;
         let indexes =
-            read_manifest_indexes(&self.dataset.object_store, &location.path, &manifest).await?;
+            read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
 
         let mut inspection = inspection.lock().unwrap();
 
@@ -466,6 +467,53 @@ pub async fn cleanup_old_versions(
         error_if_tagged_old_versions.unwrap_or(true),
     );
     cleanup.run().await
+}
+
+/// If the dataset config has `lance.auto_cleanup` parameters set,
+/// this function automatically calls `dataset.cleanup_old_versions`
+/// every `lance.auto_cleanup.interval` versions. This function calls
+/// `dataset.cleanup_old_versions` with `lance.auto_cleanup.older_than`
+/// for `older_than` and `Some(false)` for both `delete_unverified` and
+/// `error_if_tagged_old_versions`.
+pub async fn auto_cleanup_hook(
+    dataset: &Dataset,
+    manifest: &Manifest,
+) -> Result<Option<RemovalStats>> {
+    if let Some(older_than) = manifest.config.get("lance.auto_cleanup.older_than") {
+        if let Some(interval) = manifest.config.get("lance.auto_cleanup.interval") {
+            let std_older_than = match parse_duration(older_than) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Err(Error::Cleanup {
+                        message: format!(
+                        "Error encountered while parsing lance.auto_cleanup.older_than as std::time::Duration: {}",
+                        e
+                    ),
+                    })
+                }
+            };
+            let older_than = TimeDelta::from_std(std_older_than).unwrap_or(TimeDelta::MAX);
+            let interval: u64 = match interval.parse() {
+                Ok(i) => i,
+                Err(e) => {
+                    return Err(Error::Cleanup {
+                        message: format!(
+                        "Error encountered while parsing lance.auto_cleanup.interval as u64: {}",
+                        e
+                    ),
+                    })
+                }
+            };
+            if manifest.version % interval == 0 {
+                return Ok(Some(
+                    dataset
+                        .cleanup_old_versions(older_than, Some(false), Some(false))
+                        .await?,
+                ));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn tagged_old_versions_cleanup_error(
@@ -959,6 +1007,96 @@ mod tests {
             .unwrap();
 
         assert_eq!(removed.old_versions, 1);
+    }
+
+    #[tokio::test]
+    async fn auto_cleanup_old_versions() {
+        // Every n commits, all versions older than T should be deleted.
+        //
+        // We first make many commits and check that all of the versions are
+        // present. We then wait until the "older_than" period has elapsed and
+        // make many more commits. We check that, without explicitly calling
+        // `fixture.run_cleanup`, the old versions are automatically cleaned
+        // up and only the new ones remain. File counts are made after every
+        // commit.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+
+        fixture.create_some_data().await.unwrap();
+
+        let dataset_config = &fixture.open().await.unwrap().manifest.config;
+        let cleanup_interval: usize = dataset_config
+            .get("lance.auto_cleanup.interval")
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let cleanup_older_than = TimeDelta::from_std(
+            parse_duration(dataset_config.get("lance.auto_cleanup.older_than").unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        // Helper function to check that the number of files is correct.
+        async fn check_num_files<'a>(
+            fixture: &'a MockDatasetFixture<'a>,
+            num_expected_files: usize,
+        ) {
+            let file_count = fixture.count_files().await.unwrap();
+
+            assert_eq!(file_count.num_data_files, num_expected_files);
+            assert_eq!(file_count.num_manifest_files, num_expected_files);
+            assert_eq!(file_count.num_tx_files, num_expected_files);
+        }
+
+        // First, write many files within the "older_than" window. Check that
+        // no files are automatically cleaned up.
+        for num_expected_files in 2..2 * cleanup_interval {
+            fixture.overwrite_some_data().await.unwrap();
+            check_num_files(&fixture, num_expected_files).await;
+        }
+
+        // Fast forward so we are outside of the "older_than" window.
+        fixture
+            .clock
+            .set_system_time(cleanup_older_than + TimeDelta::minutes(1));
+
+        // Write more files and check that those outside of the "older_than" window
+        // are cleaned up.
+        for num_expected_files in 2..cleanup_interval {
+            fixture.overwrite_some_data().await.unwrap();
+            check_num_files(&fixture, num_expected_files).await;
+        }
+
+        // Overwrite auto cleanup params with custom values
+        let mut dataset = *(fixture.open().await.unwrap());
+        let mut new_autoclean_params = HashMap::new();
+
+        let new_cleanup_older_than_str = "1month 2days 2h 42min 6sec";
+        let new_cleanup_older_than =
+            TimeDelta::from_std(parse_duration(new_cleanup_older_than_str).unwrap()).unwrap();
+        new_autoclean_params.insert(
+            "lance.auto_cleanup.older_than".to_string(),
+            new_cleanup_older_than_str.to_string(),
+        );
+
+        let new_cleanup_interval = 5;
+        new_autoclean_params.insert(
+            "lance.auto_cleanup.interval".to_string(),
+            new_cleanup_interval.to_string(),
+        );
+
+        dataset.update_config(new_autoclean_params).await.unwrap();
+
+        // Fast forward so we are outside of the new "older_than" window.
+        fixture
+            .clock
+            .set_system_time(cleanup_older_than + new_cleanup_older_than + TimeDelta::minutes(2));
+
+        fixture.overwrite_some_data().await.unwrap();
+
+        for num_expected_files in 2..new_cleanup_interval {
+            fixture.overwrite_some_data().await.unwrap();
+            check_num_files(&fixture, num_expected_files).await;
+        }
     }
 
     #[tokio::test]

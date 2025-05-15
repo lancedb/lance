@@ -22,7 +22,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
@@ -44,6 +44,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
+use take::row_indices_to_row_addresses;
 use tracing::{info, instrument};
 
 mod blob;
@@ -120,11 +121,9 @@ pub struct Dataset {
     pub(crate) manifest: Arc<Manifest>,
     // Path for the manifest that is loaded. Used to get additional information,
     // such as the index metadata.
-    pub(crate) manifest_file: Path,
+    pub(crate) manifest_location: ManifestLocation,
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
-    pub manifest_naming_scheme: ManifestNamingScheme,
-    pub manifest_e_tag: Option<String>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -197,8 +196,6 @@ pub struct ReadParams {
     /// If a custom object store is provided (via store_params.object_store) then this
     /// must also be provided.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
-
-    pub object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl ReadParams {
@@ -220,15 +217,6 @@ impl ReadParams {
         self
     }
 
-    /// Provide an object store registry for custom object stores
-    pub fn with_object_store_registry(
-        &mut self,
-        object_store_registry: Arc<ObjectStoreRegistry>,
-    ) -> &mut Self {
-        self.object_store_registry = object_store_registry;
-        self
-    }
-
     /// Use the explicit locking to resolve the latest version
     pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
         self.commit_handler = Some(Arc::new(lock));
@@ -243,7 +231,6 @@ impl Default for ReadParams {
             session: None,
             store_options: None,
             commit_handler: None,
-            object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
@@ -336,9 +323,9 @@ impl Dataset {
 
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
-        let (manifest, path) = self.latest_manifest().await?;
+        let (manifest, manifest_location) = self.latest_manifest().await?;
         self.manifest = Arc::new(manifest);
-        self.manifest_file = path;
+        self.manifest_location = manifest_location;
         Ok(())
     }
 
@@ -347,7 +334,8 @@ impl Dataset {
         // happen if the table has been dropped then re-created recently.
         self.manifest.version == location.version
             && location.e_tag.as_ref().is_some_and(|e_tag| {
-                self.manifest_e_tag
+                self.manifest_location
+                    .e_tag
                     .as_ref()
                     .is_some_and(|current_e_tag| e_tag == current_e_tag)
             })
@@ -364,17 +352,21 @@ impl Dataset {
             return Ok(self.clone());
         }
 
-        let manifest = Self::load_manifest(self.object_store.as_ref(), &manifest_location).await?;
+        let manifest = Self::load_manifest(
+            self.object_store.as_ref(),
+            &manifest_location,
+            &base_path,
+            self.session.as_ref(),
+        )
+        .await?;
         Self::checkout_manifest(
             self.object_store.clone(),
             base_path,
             self.uri.clone(),
             manifest,
-            manifest_location.path,
+            manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
-            manifest_location.naming_scheme,
-            manifest_location.e_tag,
         )
         .await
     }
@@ -387,6 +379,8 @@ impl Dataset {
     async fn load_manifest(
         object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
+        base_path: &Path,
+        session: &Session,
     ) -> Result<Manifest> {
         let object_reader = if let Some(size) = manifest_location.size {
             object_store
@@ -445,6 +439,30 @@ impl Dataset {
             });
         }
 
+        // If indices were also the last block, we can take the opportunity to
+        // decode them now and cache them.
+        if let Some(index_offset) = manifest.index_section {
+            if manifest_size - index_offset <= last_block.len() {
+                let offset_in_block = last_block.len() - (manifest_size - index_offset);
+                let message_len =
+                    LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4])
+                        as usize;
+                let message_data =
+                    &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
+                let section = lance_table::format::pb::IndexSection::decode(message_data)?;
+                let indices = section
+                    .indices
+                    .into_iter()
+                    .map(Index::try_from)
+                    .collect::<Result<Vec<_>>>()?;
+                session.index_cache.insert_metadata(
+                    base_path.as_ref(),
+                    manifest_location.version,
+                    Arc::new(indices),
+                );
+            }
+        }
+
         populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
 
         Ok(manifest)
@@ -456,11 +474,9 @@ impl Dataset {
         base_path: Path,
         uri: String,
         manifest: Manifest,
-        manifest_file: Path,
+        manifest_location: ManifestLocation,
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
-        manifest_naming_scheme: ManifestNamingScheme,
-        e_tag: Option<String>,
     ) -> Result<Self> {
         let tags = Tags::new(
             object_store.clone(),
@@ -472,12 +488,10 @@ impl Dataset {
             base: base_path,
             uri,
             manifest: Arc::new(manifest),
-            manifest_file,
+            manifest_location,
             commit_handler,
             session,
             tags,
-            manifest_naming_scheme,
-            manifest_e_tag: e_tag,
         })
     }
 
@@ -535,6 +549,10 @@ impl Dataset {
         &self.manifest
     }
 
+    pub fn manifest_location(&self) -> &ManifestLocation {
+        &self.manifest_location
+    }
+
     // TODO: Cache this
     pub async fn blobs_dataset(&self) -> Result<Option<Arc<Self>>> {
         if let Some(blobs_version) = self.manifest.blob_dataset_version {
@@ -554,11 +572,9 @@ impl Dataset {
                 blobs_path,
                 format!("{}/{}", self.uri, BLOB_DIR),
                 manifest,
-                blob_manifest_location.path,
+                blob_manifest_location,
                 self.session.clone(),
                 self.commit_handler.clone(),
-                ManifestNamingScheme::V2,
-                blob_manifest_location.e_tag,
             )
             .await?;
             Ok(Some(Arc::new(blobs_dataset)))
@@ -575,14 +591,17 @@ impl Dataset {
             == LanceFileVersion::Legacy
     }
 
-    pub async fn latest_manifest(&self) -> Result<(Manifest, Path)> {
+    pub async fn latest_manifest(&self) -> Result<(Manifest, ManifestLocation)> {
         let location = self
             .commit_handler
             .resolve_latest_location(&self.base, &self.object_store)
             .await?;
 
         if self.already_checked_out(&location) {
-            return Ok((self.manifest.as_ref().clone(), self.manifest_file.clone()));
+            return Ok((
+                self.manifest.as_ref().clone(),
+                self.manifest_location.clone(),
+            ));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
         if manifest.schema.has_dictionary_types() {
@@ -595,7 +614,7 @@ impl Dataset {
             };
             populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         }
-        Ok((manifest, location.path))
+        Ok((manifest, location))
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -677,7 +696,7 @@ impl Dataset {
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
-        object_store_registry: Arc<ObjectStoreRegistry>,
+        session: Arc<Session>,
         enable_v2_manifest_paths: bool,
         detached: bool,
     ) -> Result<Self> {
@@ -695,8 +714,8 @@ impl Dataset {
         let transaction = Transaction::new(read_version, operation, blobs_op, None);
 
         let mut builder = CommitBuilder::new(base_uri)
-            .with_object_store_registry(object_store_registry)
             .enable_v2_manifest_paths(enable_v2_manifest_paths)
+            .with_session(session)
             .with_detached(detached);
 
         if let Some(store_params) = store_params {
@@ -750,7 +769,7 @@ impl Dataset {
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
-        object_store_registry: Arc<ObjectStoreRegistry>,
+        session: Arc<Session>,
         enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
         Self::do_commit(
@@ -762,7 +781,7 @@ impl Dataset {
             read_version,
             store_params,
             commit_handler,
-            object_store_registry,
+            session,
             enable_v2_manifest_paths,
             /*detached=*/ false,
         )
@@ -783,7 +802,7 @@ impl Dataset {
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
-        object_store_registry: Arc<ObjectStoreRegistry>,
+        session: Arc<Session>,
         enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
         Self::do_commit(
@@ -795,7 +814,7 @@ impl Dataset {
             read_version,
             store_params,
             commit_handler,
-            object_store_registry,
+            session,
             enable_v2_manifest_paths,
             /*detached=*/ true,
         )
@@ -808,20 +827,19 @@ impl Dataset {
         write_config: &ManifestWriteConfig,
         commit_config: &CommitConfig,
     ) -> Result<()> {
-        let (manifest, manifest_path, manifest_e_tag) = commit_transaction(
+        let (manifest, manifest_location) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
             &transaction,
             write_config,
             commit_config,
-            self.manifest_naming_scheme,
+            self.manifest_location.naming_scheme,
         )
         .await?;
 
         self.manifest = Arc::new(manifest);
-        self.manifest_file = manifest_path;
-        self.manifest_e_tag = manifest_e_tag;
+        self.manifest_location = manifest_location;
 
         Ok(())
     }
@@ -922,12 +940,24 @@ impl Dataset {
         TakeBuilder::try_new_from_ids(self.clone(), row_ids.to_vec(), projection.into())
     }
 
+    /// Take [BlobFile] by row ids (row address).
     pub async fn take_blobs(
         self: &Arc<Self>,
         row_ids: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<BlobFile>> {
         blob::take_blobs(self, row_ids, column.as_ref()).await
+    }
+
+    /// Take [BlobFile] by row indices.
+    ///
+    pub async fn take_blobs_by_indices(
+        self: &Arc<Self>,
+        row_indices: &[u64],
+        column: impl AsRef<str>,
+    ) -> Result<Vec<BlobFile>> {
+        let row_addrs = row_indices_to_row_addresses(self, row_indices).await?;
+        blob::take_blobs(self, &row_addrs, column.as_ref()).await
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.
@@ -1004,10 +1034,6 @@ impl Dataset {
 
     pub(crate) fn object_store(&self) -> &ObjectStore {
         &self.object_store
-    }
-
-    pub(crate) async fn manifest_file(&self) -> Result<Path> {
-        Ok(self.manifest_file.clone())
     }
 
     pub(crate) fn data_dir(&self) -> Path {
@@ -1089,6 +1115,11 @@ impl Dataset {
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
         Projection::empty(self.clone())
+    }
+
+    /// Creates a projection that includes all columns in the dataset
+    pub fn full_projection(self: &Arc<Self>) -> Projection {
+        Projection::full(self.clone())
     }
 
     /// Get fragments.
@@ -1357,7 +1388,7 @@ impl Dataset {
         for index in indices.iter() {
             if !index_ids.insert(&index.uuid) {
                 return Err(Error::corrupt_file(
-                    self.manifest_file.clone(),
+                    self.manifest_location.path.clone(),
                     format!(
                         "Duplicate index id {} found in dataset {:?}",
                         &index.uuid, self.base
@@ -1377,7 +1408,7 @@ impl Dataset {
                 ));
             }
             return Err(Error::corrupt_file(
-                self.manifest_file.clone(),
+                self.manifest_location.path.clone(),
                 message,
                 location!(),
             ));
@@ -1408,10 +1439,10 @@ impl Dataset {
     /// #  .into_reader_rows(RowCount::from(10), BatchCount::from(1));
     /// # let fut = async {
     /// let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
-    /// assert_eq!(dataset.manifest_naming_scheme, ManifestNamingScheme::V1);
+    /// assert_eq!(dataset.manifest_location().naming_scheme, ManifestNamingScheme::V1);
     ///
     /// dataset.migrate_manifest_paths_v2().await.unwrap();
-    /// assert_eq!(dataset.manifest_naming_scheme, ManifestNamingScheme::V2);
+    /// assert_eq!(dataset.manifest_location().naming_scheme, ManifestNamingScheme::V2);
     /// # };
     /// # tokio::runtime::Runtime::new().unwrap().block_on(fut);
     /// ```
@@ -1765,21 +1796,21 @@ mod tests {
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
-    use lance_index::scalar::inverted::query::PhraseQuery;
+    use lance_index::scalar::inverted::query::{MatchQuery, Operator, PhraseQuery};
     use lance_index::scalar::inverted::TokenizerConfig;
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
+    use lance_io::utils::CachedFileSize;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
-    use lance_table::io::commit::RenameCommitHandler;
+
     use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
-    use url::Url;
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -2019,6 +2050,8 @@ mod tests {
         // Need to use in-memory for accurate IOPS tracking.
         use crate::utils::test::IoTrackingStore;
 
+        // Use consistent session so memory store can be reused.
+        let session = Arc::new(Session::default());
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
             DataType::Int32,
@@ -2030,26 +2063,33 @@ mod tests {
         )
         .unwrap();
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let dataset = Dataset::write(batches, "memory://test", None)
-            .await
-            .unwrap();
-
-        // Then open with wrapping store.
-        let memory_store = dataset.object_store.inner.clone();
         let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let _original_ds = Dataset::write(
+            batches,
+            "memory://test",
+            Some(WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(io_stats_wrapper.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        io_stats.lock().unwrap().read_iops = 0;
+
         let _dataset = DatasetBuilder::from_uri("memory://test")
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
                     object_store_wrapper: Some(io_stats_wrapper),
                     ..Default::default()
                 }),
+                session: Some(session),
                 ..Default::default()
             })
-            .with_object_store(
-                memory_store,
-                Url::parse("memory://test").unwrap(),
-                Arc::new(RenameCommitHandler),
-            )
             .load()
             .await
             .unwrap();
@@ -2147,6 +2187,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
+                auto_cleanup: None,
                 ..Default::default()
             }),
         );
@@ -2216,7 +2257,7 @@ mod tests {
                 use_legacy_format: None,
                 storage_format: None,
             },
-            dataset.manifest_naming_scheme,
+            dataset.manifest_location.naming_scheme,
         )
         .await
         .unwrap();
@@ -3159,15 +3200,50 @@ mod tests {
             None,
             None,
             None,
-            Arc::new(ObjectStoreRegistry::default()),
+            Default::default(),
             true, // enable_v2_manifest_paths
         )
         .await
         .unwrap();
 
-        assert!(dataset.manifest_naming_scheme == ManifestNamingScheme::V2);
+        assert!(dataset.manifest_location.naming_scheme == ManifestNamingScheme::V2);
 
         assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
+    }
+
+    #[tokio::test]
+    async fn test_strict_overwrite() {
+        let schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap();
+        let operation = Operation::Overwrite {
+            fragments: vec![],
+            schema,
+            config_upsert_values: None,
+        };
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let read_version_0_transaction = Transaction::new(0, operation, None, None);
+        let strict_builder = CommitBuilder::new(test_uri).with_max_retries(0);
+        let unstrict_builder = CommitBuilder::new(test_uri).with_max_retries(1);
+        strict_builder
+            .clone()
+            .execute(read_version_0_transaction.clone())
+            .await
+            .expect("Strict overwrite should succeed when writing a new dataset");
+        strict_builder
+            .clone()
+            .execute(read_version_0_transaction.clone())
+            .await
+            .expect_err("Strict overwrite should fail when committing to a stale version");
+        unstrict_builder
+            .clone()
+            .execute(read_version_0_transaction.clone())
+            .await
+            .expect("Unstrict overwrite should succeed when committing to a stale version");
     }
 
     #[rstest]
@@ -3736,8 +3812,8 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
-        let mut desired_config = HashMap::new();
-        desired_config.insert("lance:test".to_string(), "value".to_string());
+        let mut desired_config = dataset.manifest.config.clone();
+        desired_config.insert("lance.test".to_string(), "value".to_string());
         desired_config.insert("other-key".to_string(), "other-value".to_string());
 
         dataset.update_config(desired_config.clone()).await.unwrap();
@@ -4026,7 +4102,7 @@ mod tests {
         dataset.delete("true").await.unwrap();
 
         let indices = dataset.load_indices().await.unwrap();
-        // Indices should be gone if it's fragments are deleted
+        // Indices should be gone if its fragments are deleted
         assert_eq!(indices.len(), 0);
 
         let mut stream = dataset
@@ -5150,12 +5226,29 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-
         assert_eq!(result.num_rows(), 3);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(ids.contains(&3));
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    MatchQuery::new("lance database".to_owned())
+                        .with_operator(Operator::And)
+                        .into(),
+                )
+                .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
 
         let result = ds
             .scan()
@@ -5223,8 +5316,8 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 2);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert_eq!(result.num_rows(), 2, "{:?}", ids);
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
 
@@ -5876,6 +5969,7 @@ mod tests {
             column_indices: vec![0],
             file_major_version: 2,
             file_minor_version: 0,
+            file_size_bytes: CachedFileSize::unknown(),
         };
 
         let dataset = Dataset::commit(
@@ -5929,6 +6023,7 @@ mod tests {
             column_indices: vec![0],
             file_major_version: 2,
             file_minor_version: 0,
+            file_size_bytes: CachedFileSize::unknown(),
         };
 
         let dataset = Dataset::commit(
@@ -6026,6 +6121,7 @@ mod tests {
             column_indices: vec![0],
             file_major_version: 2,
             file_minor_version: 0,
+            file_size_bytes: CachedFileSize::unknown(),
         };
 
         let new_data_file = DataFile {
@@ -6067,7 +6163,8 @@ mod tests {
             .await
             .unwrap();
 
-        ds.object_store().remove_dir_all(test_uri).await.unwrap();
+        let test_path = Path::from_filesystem_path(test_uri).unwrap();
+        ds.object_store().remove_dir_all(test_path).await.unwrap();
 
         let ds2 = InsertBuilder::new(test_uri)
             .execute(vec![data2.clone()])
@@ -6082,5 +6179,76 @@ mod tests {
         ds2.validate().await.unwrap();
         assert_eq!(ds.manifest.version, 1);
         assert_eq!(ds2.manifest.version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_session_store_registry() {
+        // Create a session
+        let session = Arc::new(Session::default());
+        let registry = session.store_registry();
+        assert!(registry.active_stores().is_empty());
+
+        // Create a dataset with memory store
+        let write_params = WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://test")
+            .with_params(&write_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+
+        // Assert there is one active store.
+        assert_eq!(registry.active_stores().len(), 1);
+
+        // If we create another dataset also in memory, it should re-use the
+        // existing store.
+        let dataset2 = InsertBuilder::new("memory://test2")
+            .with_params(&write_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(registry.active_stores().len(), 1);
+        assert_eq!(
+            Arc::as_ptr(&dataset.object_store().inner),
+            Arc::as_ptr(&dataset2.object_store().inner)
+        );
+
+        // If we create another with **different parameters**, it should create a new store.
+        let write_params2 = WriteParams {
+            session: Some(session.clone()),
+            store_params: Some(ObjectStoreParams {
+                block_size: Some(10_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset3 = InsertBuilder::new("memory://test3")
+            .with_params(&write_params2)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(registry.active_stores().len(), 2);
+        assert_ne!(
+            Arc::as_ptr(&dataset.object_store().inner),
+            Arc::as_ptr(&dataset3.object_store().inner)
+        );
+
+        // Remove both datasets
+        drop(dataset3);
+        assert_eq!(registry.active_stores().len(), 1);
+        drop(dataset2);
+        drop(dataset);
+        assert_eq!(registry.active_stores().len(), 0);
     }
 }

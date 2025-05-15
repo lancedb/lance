@@ -3,7 +3,7 @@
 
 //! Table maintenance for optimizing table layout.
 //!
-//! As a table is updated, it's layout can become suboptimal. For example, if
+//! As a table is updated, its layout can become suboptimal. For example, if
 //! a series of small streaming appends are performed, eventually there will be
 //! a large number of small files. This imposes an overhead to track the large
 //! number of files and for very small files can make it harder to read data
@@ -237,7 +237,7 @@ pub async fn compact_files(
     Ok(metrics)
 }
 
-/// Information about a fragment used to decide it's fate in compaction
+/// Information about a fragment used to decide its fate in compaction
 #[derive(Debug)]
 struct FragmentMetrics {
     /// The number of original rows in the fragment
@@ -597,14 +597,14 @@ async fn reserve_fragment_ids(
         None,
     );
 
-    let (manifest, _, _) = commit_transaction(
+    let (manifest, _) = commit_transaction(
         dataset,
         dataset.object_store(),
         dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),
-        dataset.manifest_naming_scheme,
+        dataset.manifest_location.naming_scheme,
     )
     .await?;
 
@@ -972,11 +972,9 @@ mod tests {
         assert!(!single_bin.is_noop());
 
         let big_bin = CandidateBin {
-            fragments: std::iter::repeat(fragment).take(8).collect(),
+            fragments: std::iter::repeat_n(fragment, 8).collect(),
             pos_range: 0..8,
-            candidacy: std::iter::repeat(CompactionCandidacy::CompactItself)
-                .take(8)
-                .collect(),
+            candidacy: std::iter::repeat_n(CompactionCandidacy::CompactItself, 8).collect(),
             row_counts: vec![100, 400, 200, 200, 400, 300, 300, 100],
             indices: vec![],
             // Will group into: [[100, 400], [200, 200, 400], [300, 300, 100]]

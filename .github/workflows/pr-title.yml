@@ -28,7 +28,7 @@ jobs:
     # Make sure we add any labels to this PR first.
     needs: labeler
     steps:
-      # For security reasons, we check out the base branch to use it's CI scripts.
+      # For security reasons, we check out the base branch to use its CI scripts.
       - uses: actions/checkout@v4
         with:
           path: base

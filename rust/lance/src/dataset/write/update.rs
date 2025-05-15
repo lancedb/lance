@@ -418,9 +418,9 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(Int64Array::from_iter_values(0..30)),
-                Arc::new(StringArray::from_iter_values(
-                    std::iter::repeat("foo").take(30),
-                )),
+                Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                    "foo", 30,
+                ))),
             ],
         )
         .unwrap();

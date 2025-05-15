@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::ops::RangeBounds;
+use std::ops::{Range, RangeBounds};
 use std::{collections::BTreeMap, io::Read};
 
 use arrow_array::{Array, BinaryArray, GenericBinaryArray};
@@ -573,6 +573,39 @@ impl RowIdTreeMap {
 
         Self { inner: new_map }
     }
+
+    /// Apply a mask to the row ids
+    ///
+    /// If there is an allow list then this will intersect the set with the allow list
+    /// If there is a block list then this will subtract the block list from the set
+    pub fn mask(&mut self, mask: &RowIdMask) {
+        if let Some(allow_list) = &mask.allow_list {
+            *self &= allow_list;
+        }
+        if let Some(block_list) = &mask.block_list {
+            *self -= block_list;
+        }
+    }
+
+    /// Convert the set into an iterator of row ids
+    ///
+    /// # Safety
+    ///
+    /// This is unsafe because if any of the inner RowIdSelection elements
+    /// is not a Partial then the iterator will panic because we don't know
+    /// the size of the bitmap.
+    pub unsafe fn into_id_iter(self) -> impl Iterator<Item = u64> {
+        self.inner
+            .into_iter()
+            .flat_map(|(fragment, selection)| match selection {
+                RowIdSelection::Full => panic!("Size of full fragment is unknown"),
+                RowIdSelection::Partial(bitmap) => bitmap.into_iter().map(move |val| {
+                    let fragment = fragment as u64;
+                    let row_offset = val as u64;
+                    (fragment << 32) | row_offset
+                }),
+            })
+    }
 }
 
 impl std::ops::BitOr<Self> for RowIdTreeMap {
@@ -587,18 +620,23 @@ impl std::ops::BitOr<Self> for RowIdTreeMap {
 impl std::ops::BitOrAssign<Self> for RowIdTreeMap {
     fn bitor_assign(&mut self, rhs: Self) {
         for (fragment, rhs_set) in &rhs.inner {
-            match self.inner.get_mut(fragment) {
-                None => {
-                    self.inner.insert(*fragment, rhs_set.clone());
-                }
-                Some(RowIdSelection::Full) => {
-                    // If the fragment is already selected then there is nothing to do
-                }
-                Some(RowIdSelection::Partial(lhs_set)) => {
-                    if let RowIdSelection::Partial(rhs_set) = rhs_set {
-                        *lhs_set |= rhs_set;
+            let lhs_set = self.inner.get_mut(fragment);
+            if let Some(lhs_set) = lhs_set {
+                match lhs_set {
+                    RowIdSelection::Full => {
+                        // If the fragment is already selected then there is nothing to do
                     }
+                    RowIdSelection::Partial(lhs_bitmap) => match rhs_set {
+                        RowIdSelection::Full => {
+                            *lhs_set = RowIdSelection::Full;
+                        }
+                        RowIdSelection::Partial(rhs_set) => {
+                            *lhs_bitmap |= rhs_set;
+                        }
+                    },
                 }
+            } else {
+                self.inner.insert(*fragment, rhs_set.clone());
             }
         }
     }
@@ -608,13 +646,13 @@ impl std::ops::BitAnd<Self> for RowIdTreeMap {
     type Output = Self;
 
     fn bitand(mut self, rhs: Self) -> Self::Output {
-        self &= rhs;
+        self &= &rhs;
         self
     }
 }
 
-impl std::ops::BitAndAssign<Self> for RowIdTreeMap {
-    fn bitand_assign(&mut self, rhs: Self) {
+impl std::ops::BitAndAssign<&Self> for RowIdTreeMap {
+    fn bitand_assign(&mut self, rhs: &Self) {
         // Remove fragment that aren't on the RHS
         self.inner
             .retain(|fragment, _| rhs.inner.contains_key(fragment));
@@ -704,6 +742,14 @@ impl FromIterator<u64> for RowIdTreeMap {
 impl<'a> FromIterator<&'a u64> for RowIdTreeMap {
     fn from_iter<T: IntoIterator<Item = &'a u64>>(iter: T) -> Self {
         Self::from_iter(iter.into_iter().copied())
+    }
+}
+
+impl From<Range<u64>> for RowIdTreeMap {
+    fn from(range: Range<u64>) -> Self {
+        let mut map = Self::default();
+        map.insert_range(range);
+        map
     }
 }
 
@@ -904,14 +950,22 @@ mod tests {
             right.extend(right_rows.iter().copied());
 
             let mut expected = RowIdTreeMap::default();
-            for fragment in left_full_fragments {
-                if right_full_fragments.contains(&fragment) {
-                    expected.insert_fragment(fragment);
+            for fragment in &left_full_fragments {
+                if right_full_fragments.contains(fragment) {
+                    expected.insert_fragment(*fragment);
                 }
             }
 
-            let combined_rows = left_rows.iter().filter(|row| right_rows.contains(row));
-            expected.extend(combined_rows);
+            let left_in_right = left_rows.iter().filter(|row| {
+                right_rows.contains(row)
+                    || right_full_fragments.contains(&((*row >> 32) as u32))
+            });
+            expected.extend(left_in_right);
+            let right_in_left = right_rows.iter().filter(|row| {
+                left_rows.contains(row)
+                    || left_full_fragments.contains(&((*row >> 32) as u32))
+            });
+            expected.extend(right_in_left);
 
             let actual = left & right;
             prop_assert_eq!(expected, actual);
@@ -948,6 +1002,16 @@ mod tests {
             expected.extend(combined_rows);
 
             let actual = left | right;
+            for actual_key_val in &actual.inner {
+                proptest::prop_assert!(expected.inner.contains_key(actual_key_val.0));
+                let expected_val = expected.inner.get(actual_key_val.0).unwrap();
+                prop_assert_eq!(
+                    actual_key_val.1,
+                    expected_val,
+                    "error on key {}",
+                    actual_key_val.0
+                );
+            }
             prop_assert_eq!(expected, actual);
         }
 
