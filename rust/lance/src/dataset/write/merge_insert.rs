@@ -70,7 +70,7 @@ use lance_datafusion::{
     utils::StreamingWriteSource,
 };
 use lance_file::version::LanceFileVersion;
-use lance_index::DatasetIndexExt;
+use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
 use lance_table::format::{Fragment, Index};
 use log::info;
 use roaring::RoaringTreemap;
@@ -438,7 +438,14 @@ impl MergeInsertJob {
             Ok(None)
         } else {
             let col = &self.params.on[0];
-            self.dataset.load_scalar_index_for_column(col).await
+            self.dataset
+                .load_scalar_index(
+                    ScalarIndexCriteria::default()
+                        .for_column(col)
+                        // Unclear if this would work if the index does not support exact equality
+                        .supports_exact_equality(),
+                )
+                .await
         }
     }
 
@@ -478,6 +485,7 @@ impl MergeInsertJob {
             // create index from original data and key column
             self.dataset.clone(),
             index_column.clone(),
+            index.name.clone(),
             index_mapper_input,
         ));
 

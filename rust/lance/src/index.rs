@@ -22,8 +22,8 @@ use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
-    IndexInformationProvider, LabelListQueryParser, SargableQueryParser, ScalarQueryParser,
-    TextQueryParser,
+    FtsQueryParser, IndexInformationProvider, LabelListQueryParser, MultiQueryParser,
+    SargableQueryParser, ScalarQueryParser, TextQueryParser,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndex, ScalarIndexType};
@@ -32,13 +32,13 @@ use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
 pub use lance_index::IndexParams;
-use lance_index::INDEX_METADATA_SCHEMA_KEY;
 use lance_index::{
     pb,
     scalar::{ScalarIndexParams, LANCE_SCALAR_INDEX},
     vector::VectorIndex,
     DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME,
 };
+use lance_index::{ScalarIndexCriteria, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{
@@ -49,7 +49,9 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
-use scalar::{build_inverted_index, detect_scalar_index_type, inverted_index_details};
+use scalar::{
+    build_inverted_index, detect_scalar_index_type, index_matches_criteria, inverted_index_details,
+};
 use serde_json::json;
 use snafu::location;
 use tracing::{info, instrument};
@@ -160,14 +162,14 @@ pub(crate) async fn remap_index(
 
 #[derive(Debug)]
 pub struct ScalarIndexInfo {
-    indexed_columns: HashMap<String, (DataType, Box<dyn ScalarQueryParser>)>,
+    indexed_columns: HashMap<String, (DataType, Box<MultiQueryParser>)>,
 }
 
 impl IndexInformationProvider for ScalarIndexInfo {
     fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)> {
         self.indexed_columns
             .get(col)
-            .map(|(ty, parser)| (ty, parser.as_ref()))
+            .map(|(ty, parser)| (ty, parser.as_ref() as &dyn ScalarQueryParser))
     }
 }
 
@@ -462,21 +464,45 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
-    async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<IndexMetadata>> {
-        Ok(self
-            .load_indices()
-            .await?
+    async fn load_scalar_index<'a, 'b>(
+        &'a self,
+        criteria: ScalarIndexCriteria<'b>,
+    ) -> Result<Option<IndexMetadata>> {
+        let indices = self.load_indices().await?;
+
+        let mut indices = indices
             .iter()
-            .filter(|idx| idx.fields.len() == 1)
-            .find(|idx| {
-                let field = self.schema().field_by_id(idx.fields[0]);
-                if let Some(field) = field {
-                    field.name == col
-                } else {
+            .filter(|idx| {
+                // We shouldn't have any indices with empty fields, but just in case, log an error
+                // but don't fail the operation (we might not be using that index)
+                if idx.fields.is_empty() {
+                    log::error!("Index {} has no fields", idx.name);
                     false
+                } else {
+                    true
                 }
             })
-            .cloned())
+            .collect::<Vec<_>>();
+        // This sorting & chunking is only needed to provide some backwards compatibility behavior for
+        // old versions of Lance that don't write index details.
+        //
+        // TODO: At some point we should just fail if the index details are missing and ask the user to
+        // retrain the index.
+        indices.sort_by_key(|idx| idx.fields[0]);
+        let indice_by_field = indices.into_iter().chunk_by(|idx| idx.fields[0]);
+        for (field_id, indices) in &indice_by_field {
+            let indices = indices.collect::<Vec<_>>();
+            let has_multiple = indices.len() > 1;
+            for idx in indices {
+                let field = self.schema().field_by_id(field_id);
+                if let Some(field) = field {
+                    if index_matches_criteria(&idx, &criteria, &field, has_multiple)? {
+                        return Ok(Some(idx.clone()));
+                    }
+                }
+            }
+        }
+        return Ok(None);
     }
 
     #[instrument(skip_all)]
@@ -1004,33 +1030,55 @@ impl DatasetIndexInternalExt for Dataset {
             })?;
 
             let query_parser = match field.data_type() {
-                DataType::List(_) => {
-                    Box::<LabelListQueryParser>::default() as Box<dyn ScalarQueryParser>
-                }
+                DataType::List(_) => Box::new(LabelListQueryParser::new(index.name.clone()))
+                    as Box<dyn ScalarQueryParser>,
                 DataType::Utf8 | DataType::LargeUtf8 => {
                     let index_type =
                         detect_scalar_index_type(self, index, &field.name, self.session.as_ref())
                             .await?;
-                    // Inverted index can't be used for filtering
-                    if matches!(index_type, ScalarIndexType::Inverted) {
-                        continue;
-                    }
                     match index_type {
                         ScalarIndexType::BTree | ScalarIndexType::Bitmap => {
-                            Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>
+                            Box::new(SargableQueryParser::new(index.name.clone()))
+                                as Box<dyn ScalarQueryParser>
                         }
                         ScalarIndexType::NGram => {
-                            Box::<TextQueryParser>::default() as Box<dyn ScalarQueryParser>
+                            Box::new(TextQueryParser::new(index.name.clone()))
+                                as Box<dyn ScalarQueryParser>
+                        }
+                        ScalarIndexType::Inverted => {
+                            Box::new(FtsQueryParser::new(index.name.clone()))
+                                as Box<dyn ScalarQueryParser>
                         }
                         _ => continue,
                     }
                 }
-                _ => Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>,
+                _ => Box::new(SargableQueryParser::new(index.name.clone()))
+                    as Box<dyn ScalarQueryParser>,
             };
 
             indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
         }
-        let index_info_map = HashMap::from_iter(indexed_fields);
+        let mut index_info_map = HashMap::with_capacity(indexed_fields.len());
+        for indexed_field in indexed_fields {
+            // Need to wrap in an option here because we know that only one of and_modify and or_insert will be called
+            // but the rust compiler does not.
+            let mut parser = Some(indexed_field.1 .1);
+            let parser = &mut parser;
+            index_info_map
+                .entry(indexed_field.0)
+                .and_modify(|existing: &mut (DataType, Box<MultiQueryParser>)| {
+                    // If there are two indices on the same column, they must have the same type
+                    debug_assert_eq!((*existing).0, indexed_field.1 .0);
+
+                    existing.1.add(parser.take().unwrap());
+                })
+                .or_insert_with(|| {
+                    (
+                        indexed_field.1 .0,
+                        Box::new(MultiQueryParser::single(parser.take().unwrap())),
+                    )
+                });
+        }
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
         })

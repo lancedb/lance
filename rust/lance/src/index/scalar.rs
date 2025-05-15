@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::TryStreamExt;
+use lance_core::datatypes::Field;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::scalar::btree::DEFAULT_BTREE_BATCH_SIZE;
@@ -25,6 +26,7 @@ use lance_index::scalar::{
     lance_format::LanceIndexStore,
     ScalarIndex, ScalarIndexParams, ScalarIndexType,
 };
+use lance_index::ScalarIndexCriteria;
 use lance_table::format::Index;
 use log::info;
 use snafu::location;
@@ -425,4 +427,68 @@ pub async fn detect_scalar_index_type(
         session.index_cache.insert_type(&uuid, index_type);
         Ok(index_type)
     }
+}
+
+/// Grabs the scalar index type from the index details.  If the details are not
+/// present (written by an older version of Lance) then this returns None.
+fn best_effort_scalar_index_type(index: &Index) -> Result<Option<ScalarIndexType>> {
+    if let Some(details) = &index.index_details {
+        let details = get_scalar_index_details(details)?;
+        if let Some(details) = details {
+            return Ok(Some(details.get_type()));
+        }
+    }
+    Ok(None)
+}
+
+pub fn index_matches_criteria(
+    index: &Index,
+    criteria: &ScalarIndexCriteria,
+    field: &Field,
+    has_multiple_indices: bool,
+) -> Result<bool> {
+    if let Some(name) = &criteria.has_name {
+        if &index.name != name {
+            return Ok(false);
+        }
+    }
+    if let Some(expected_type) = criteria.has_type {
+        let index_type = best_effort_scalar_index_type(index)?;
+        if let Some(index_type) = index_type {
+            if index_type != expected_type {
+                return Ok(false);
+            }
+            // We should not use FTS / NGram indices for exact equality queries
+            // (i.e. merge insert with a join on the indexed column)
+            if criteria.supports_exact_equality {
+                match index_type {
+                    ScalarIndexType::Inverted | ScalarIndexType::NGram => {
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+            }
+        } else if has_multiple_indices {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "An index {} on the field with id {} co-exists with other indices on the same column but was written with an older Lance version, and this is not supported.  Please retrain this index.",
+                    index.name,
+                    index.fields.get(0).unwrap_or(&0),
+                ).into(),
+                location: location!(),
+            });
+        }
+        // Otherwise, if the index is the only index on the column, then we accept it
+        // to allow for backwards compatibility.
+        // else { }
+    }
+    if let Some(for_column) = criteria.for_column {
+        if index.fields.len() != 1 {
+            return Ok(false);
+        }
+        if for_column != field.name {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

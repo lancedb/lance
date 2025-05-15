@@ -28,7 +28,7 @@ use lance_datafusion::utils::{
     ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
 use lance_index::scalar::expression::{FilterPlan, IndexExprResult, ScalarIndexExpr};
-use lance_index::DatasetIndexExt;
+use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
@@ -826,9 +826,11 @@ impl FilteredReadStream {
             ScalarIndexExpr::Not(expr) => {
                 Self::fragments_covered_by_index_query(expr, dataset).await
             }
-            ScalarIndexExpr::Query(column, _) => {
+            ScalarIndexExpr::Query(search_key) => {
                 let idx = dataset
-                    .load_scalar_index_for_column(column)
+                    .load_scalar_index(
+                        ScalarIndexCriteria::default().with_name(&search_key.index_name),
+                    )
                     .await?
                     .expect("Index not found even though it must have been found earlier");
                 Ok(idx

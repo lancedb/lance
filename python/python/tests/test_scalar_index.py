@@ -441,6 +441,78 @@ def test_filter_with_fts_index(dataset):
         assert query == row.as_py()
 
 
+def test_multi_index_create(tmp_path):
+    dataset = lance.write_dataset(
+        pa.table({"ints": range(1024)}), tmp_path, max_rows_per_file=100
+    )
+    dataset.create_scalar_index("ints", index_type="BTREE")
+    dataset.create_scalar_index(
+        "ints", index_type="BITMAP", name="ints_bitmap_idx", replace=True
+    )
+
+    indices = dataset.list_indices()
+    assert len(indices) == 2
+
+    assert indices[0]["name"] == "ints_idx"
+    assert indices[0]["type"] == "BTree"
+    assert indices[1]["name"] == "ints_bitmap_idx"
+    assert indices[1]["type"] == "Bitmap"
+
+    # Test that we can drop one of the indices
+    dataset.drop_index("ints_idx")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["name"] == "ints_bitmap_idx"
+    assert indices[0]["type"] == "Bitmap"
+
+    # Test that we can drop the last index
+    dataset.drop_index("ints_bitmap_idx")
+    indices = dataset.list_indices()
+    assert len(indices) == 0
+
+
+def test_use_multi_index(tmp_path):
+    dataset = lance.write_dataset(
+        pa.table({"ints": range(1024)}), tmp_path, max_rows_per_file=100
+    )
+    dataset.create_scalar_index("ints", index_type="BTREE")
+    dataset.create_scalar_index("ints", index_type="BITMAP", name="ints_bitmap_idx")
+
+    print(dataset.scanner(filter="ints = 0", prefilter=True).explain_plan())
+
+    # Test that we can use the index.  Multiple indices can be applied here.
+    # One of them will be chosen (it is not deterministic which one is chosen)
+    results = dataset.to_table(filter="ints = 0", prefilter=True)
+    assert results.num_rows == 1
+
+    assert (
+        "MaterializeIndex"
+        in dataset.scanner(filter="ints = 0", prefilter=True).explain_plan()
+    )
+
+
+def test_ngram_fts(tmp_path):
+    dataset = lance.write_dataset(
+        pa.table({"text": ["hello", "world", "hello world"]}),
+        tmp_path,
+    )
+    dataset.create_scalar_index("text", index_type="INVERTED")
+    dataset.create_scalar_index("text", name="text_ngram_idx", index_type="NGRAM")
+
+    results = dataset.to_table(full_text_query="hello")
+    assert results.num_rows == 2
+
+    results = dataset.to_table(filter="contains(text, 'hello')")
+    assert results.num_rows == 2
+
+    assert (
+        "MaterializeIndex"
+        in dataset.scanner(
+            filter="contains(text, 'hello')", prefilter=True
+        ).explain_plan()
+    )
+
+
 def test_indexed_filter_with_fts_index(tmp_path):
     data = pa.table(
         {
