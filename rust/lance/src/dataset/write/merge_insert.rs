@@ -2394,9 +2394,25 @@ mod tests {
         )
         .unwrap();
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = InsertBuilder::new(test_uri)
+        // Adding latency helps ensure we get contention
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: Duration::from_millis(10),
+                wait_get_per_call: Duration::from_millis(10),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
             .execute(vec![initial_data])
             .await
             .unwrap();
@@ -2447,7 +2463,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             schema.clone(),
         );
-        let dataset2 = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let dataset2 = DatasetBuilder::from_uri("memory://")
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
         let job = MergeInsertBuilder::try_new(Arc::new(dataset2), vec!["id".to_string()])
             .unwrap()
             .when_matched(WhenMatched::UpdateAll)
