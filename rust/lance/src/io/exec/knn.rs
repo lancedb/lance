@@ -582,7 +582,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 dataset: self.dataset.clone(),
                 indices: self.indices.clone(),
                 query: self.query.clone(),
-                prefilter_source: prefilter_source,
+                prefilter_source,
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             }
