@@ -1050,7 +1050,7 @@ class LanceDataset(pa.dataset.Dataset):
         string to large string, binary to large binary, and list to large list.
 
         Columns that are renamed can keep any indices that are on them. However, if
-        the column is casted to a different type, it's indices will be dropped.
+        the column is casted to a different type, its indices will be dropped.
 
         Parameters
         ----------

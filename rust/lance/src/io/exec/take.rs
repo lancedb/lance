@@ -789,7 +789,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_struct() {
         // When taking fields into an existing struct, the field order should be maintained
-        // according the the schema of the struct.
+        // according to the schema of the struct.
         let TestFixture {
             dataset,
             _tmp_dir_guard,
