@@ -27,6 +27,7 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -454,6 +455,66 @@ public class DatasetTest {
       }
     } catch (Exception e) {
       fail("Exception occurred during test: " + e.getMessage(), e);
+    }
+  }
+
+  @Test
+  void testAddColumnByFieldsOrSchema() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      Field newColumnField = Field.nullable("age", new ArrowType.Int(32, true));
+      dataset.addColumns(Collections.singletonList(newColumnField), Optional.empty());
+      Schema expectedSchema =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("id", new ArrowType.Int(32, true)),
+                  Field.nullable("name", new ArrowType.Utf8()),
+                  Field.nullable("age", new ArrowType.Int(32, true))));
+      assertEquals(expectedSchema.getFields().size(), dataset.getSchema().getFields().size());
+      assertEquals(
+          expectedSchema.getFields().stream().map(Field::getName).collect(Collectors.toList()),
+          dataset.getSchema().getFields().stream()
+              .map(Field::getName)
+              .collect(Collectors.toList()));
+
+      Field complexField =
+          new Field(
+              "extra",
+              FieldType.nullable(new ArrowType.Struct()),
+              Arrays.asList(
+                  Field.nullable("tag1", new ArrowType.Int(64, true)),
+                  Field.nullable("tag2", new ArrowType.Utf8())));
+
+      Schema addedColumns =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("height", new ArrowType.Int(64, true)),
+                  Field.nullable("desc", new ArrowType.Utf8()),
+                  complexField));
+      dataset.addColumns(addedColumns, Optional.empty());
+
+      expectedSchema =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("id", new ArrowType.Int(32, true)),
+                  Field.nullable("name", new ArrowType.Utf8()),
+                  Field.nullable("age", new ArrowType.Int(32, true)),
+                  Field.nullable("height", new ArrowType.Int(64, true)),
+                  Field.nullable("desc", new ArrowType.Utf8()),
+                  complexField),
+              null);
+
+      assertEquals(expectedSchema.getFields().size(), dataset.getSchema().getFields().size());
+      assertEquals(
+          expectedSchema.getFields().stream().map(Field::getName).collect(Collectors.toList()),
+          dataset.getSchema().getFields().stream()
+              .map(Field::getName)
+              .collect(Collectors.toList()));
     }
   }
 
