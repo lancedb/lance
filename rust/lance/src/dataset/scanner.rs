@@ -3883,6 +3883,7 @@ mod test {
         let mut scan = dataset.scan();
         scan.filter("filterable > 5").unwrap();
         scan.nearest("vector", query_key.as_ref(), 1).unwrap();
+        scan.nprobs(100);
         scan.with_row_id();
 
         let batches = scan
@@ -3892,6 +3893,7 @@ mod test {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+
         assert_eq!(batches.len(), 0);
 
         scan.prefilter(true);
