@@ -218,7 +218,19 @@ def test_to_batches_with_partial_last_batch(tmp_path: Path):
     )
     assert sum(b.num_rows for b in all_batches) == row_count_per_file * 3  # Total rows
     assert all(b.num_rows == 32 for b in all_batches)  # Full batches
+    # 32 rows, 1 row per file
+    ds = lance.write_dataset(
+        pa.table({"a": range(32)}), base_dir, max_rows_per_file=1, mode="overwrite"
+    )
+    # 1 row per batch if strict_batch_size is False (regardless of batch_size)
+    for batch in ds.to_batches():
+        assert batch.num_rows == 1
+    for batch in ds.to_batches(batch_size=8):
+        assert batch.num_rows == 1
 
+    # We should get 8 rows per batch if strict_batch_size is True
+    for batch in ds.to_batches(batch_size=8, strict_batch_size=True):
+        assert batch.num_rows == 8
 
 def test_schema_metadata(tmp_path: Path):
     schema = pa.schema(
