@@ -45,6 +45,13 @@ pub trait ShuffleReader: Send + Sync {
         partition_id: usize,
     ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>>;
 
+    /// Remove the partition by partition_id
+    /// this is used to free up the disk space
+    /// after the partition is read and consumed.
+    /// This is optional, the disk space will be freed up
+    /// after indexing done.
+    async fn remove_partition(&self, partition_id: usize) -> Result<()>;
+
     /// Get the size of the partition by partition_id
     fn partition_size(&self, partition_id: usize) -> Result<usize>;
 
@@ -59,6 +66,8 @@ pub trait ShuffleReader: Send + Sync {
 /// A shuffler that can shuffle the incoming stream of record batches into IVF partitions.
 /// Returns a IvfShuffleReader that can be used to read the shuffled partitions.
 pub trait Shuffler: Send + Sync {
+    /// The outpur directory for the shuffled partitions.
+    fn output_dir(&self) -> &Path;
     /// Shuffle the incoming stream of record batches into IVF partitions.
     /// Returns a IvfShuffleReader that can be used to read the shuffled partitions.
     async fn shuffle(
@@ -94,6 +103,10 @@ impl IvfShuffler {
 
 #[async_trait::async_trait]
 impl Shuffler for IvfShuffler {
+    fn output_dir(&self) -> &Path {
+        &self.output_dir
+    }
+
     async fn shuffle(
         &self,
         data: Box<dyn RecordBatchStream + Unpin + 'static>,
@@ -248,13 +261,13 @@ pub struct IvfShufflerReader {
 
 impl IvfShufflerReader {
     pub fn new(
-        object_store: Arc<ObjectStore>,
+        obj_store: Arc<ObjectStore>,
         output_dir: Path,
         partition_sizes: Vec<usize>,
         loss: f64,
     ) -> Self {
-        let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
+        let scheduler = ScanScheduler::new(obj_store, scheduler_config);
         Self {
             scheduler,
             output_dir,
@@ -294,6 +307,11 @@ impl ShuffleReader for IvfShufflerReader {
         ))))
     }
 
+    async fn remove_partition(&self, partition_id: usize) -> Result<()> {
+        let partition_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
+        self.scheduler.store().delete(&partition_path).await
+    }
+
     fn partition_size(&self, partition_id: usize) -> Result<usize> {
         Ok(self.partition_sizes[partition_id])
     }
@@ -329,6 +347,13 @@ impl ShuffleReader for SinglePartitionReader {
                 location: location!(),
             }),
         }
+    }
+
+    async fn remove_partition(&self, _partition_id: usize) -> Result<()> {
+        // for single partition reader,
+        // the data stream is from dataset scanning,
+        // so we don't need to remove the partition
+        Ok(())
     }
 
     fn partition_size(&self, _partition_id: usize) -> Result<usize> {

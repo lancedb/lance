@@ -47,7 +47,6 @@ use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::utils::is_finite;
-use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
     optimize::OptimizeOptions,
@@ -372,7 +371,6 @@ pub(crate) async fn optimize_vector_indices_v2(
     let ivf_model = existing_indices[0].ivf_model();
     let quantizer = existing_indices[0].quantizer();
     let distance_type = existing_indices[0].metric_type();
-    let num_partitions = ivf_model.num_partitions();
     let index_type = existing_indices[0].sub_index_type();
 
     let num_indices_to_merge = if options.retrain {
@@ -380,9 +378,6 @@ pub(crate) async fn optimize_vector_indices_v2(
     } else {
         options.num_indices_to_merge
     };
-    let temp_dir = tempfile::tempdir()?;
-    let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
-    let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
     let start_pos = if options.num_indices_to_merge > existing_indices.len() {
         0
     } else {
@@ -401,7 +396,6 @@ pub(crate) async fn optimize_vector_indices_v2(
                     vector_column.to_owned(),
                     index_dir,
                     distance_type,
-                    shuffler,
                     (),
                 )?
                 .with_ivf(ivf_model.clone())
@@ -418,7 +412,6 @@ pub(crate) async fn optimize_vector_indices_v2(
                     vector_column.to_owned(),
                     index_dir,
                     distance_type,
-                    shuffler,
                     (),
                 )?
                 .with_ivf(ivf_model.clone())
@@ -438,7 +431,6 @@ pub(crate) async fn optimize_vector_indices_v2(
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
-                shuffler,
                 (),
             )?
             .with_ivf(ivf_model.clone())
@@ -457,7 +449,6 @@ pub(crate) async fn optimize_vector_indices_v2(
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
-                shuffler,
                 None,
                 None,
                 // TODO: get the HNSW parameters from the existing indices
@@ -479,7 +470,6 @@ pub(crate) async fn optimize_vector_indices_v2(
                 vector_column.to_owned(),
                 index_dir,
                 distance_type,
-                shuffler,
                 None,
                 None,
                 // TODO: get the HNSW parameters from the existing indices

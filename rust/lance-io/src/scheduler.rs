@@ -625,6 +625,11 @@ impl ScanScheduler {
         Arc::new(scheduler)
     }
 
+    /// Returns the inner object store
+    pub fn store(&self) -> &ObjectStore {
+        &self.object_store
+    }
+
     /// Open a file for reading
     ///
     /// # Arguments
