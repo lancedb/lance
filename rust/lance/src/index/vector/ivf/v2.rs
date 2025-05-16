@@ -1794,7 +1794,7 @@ mod tests {
         let row_ids = results.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
         assert!(row_ids.len() == k);
 
-        let gt = ground_truth(&dataset, vector_column, &query, k, params.metric_type).await;
+        let gt = ground_truth(dataset, vector_column, &query, k, params.metric_type).await;
 
         let recall = row_ids.intersection(&gt).count() as f32 / k as f32;
         assert!(

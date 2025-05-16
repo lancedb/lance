@@ -197,13 +197,11 @@ fn extract_static_s3_credentials(
 ) -> Option<StaticCredentialProvider<ObjectStoreAwsCredential>> {
     let key_id = options
         .get(&AmazonS3ConfigKey::AccessKeyId)
-        .map(|s| s.to_string());
+        .map(|s| s.clone());
     let secret_key = options
         .get(&AmazonS3ConfigKey::SecretAccessKey)
-        .map(|s| s.to_string());
-    let token = options
-        .get(&AmazonS3ConfigKey::Token)
-        .map(|s| s.to_string());
+        .map(|s| s.clone());
+    let token = options.get(&AmazonS3ConfigKey::Token).map(|s| s.clone());
     match (key_id, secret_key, token) {
         (Some(key_id), Some(secret_key), token) => {
             Some(StaticCredentialProvider::new(ObjectStoreAwsCredential {
