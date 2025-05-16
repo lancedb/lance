@@ -111,8 +111,8 @@ impl DisplayAs for OneShotExec {
                 let columns = self
                     .schema
                     .field_names()
-                    .iter()
-                    .map(|s| s.to_string())
+                    .into_iter()
+                    .cloned()
                     .collect::<Vec<_>>();
                 write!(
                     f,
