@@ -5,9 +5,6 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
-from lance.tracing import trace_to_chrome
-
-trace_to_chrome(level="debug", file="/tmp/trace.json")
 
 NUM_ROWS = 10_000_000
 ROWS_TO_SAMPLE = 10

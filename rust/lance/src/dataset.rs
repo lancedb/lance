@@ -4104,7 +4104,7 @@ mod tests {
         dataset.delete("true").await.unwrap();
 
         let indices = dataset.load_indices().await.unwrap();
-        // Indices should be gone if it's fragments are deleted
+        // Indices should be gone if its fragments are deleted
         assert_eq!(indices.len(), 0);
 
         let mut stream = dataset

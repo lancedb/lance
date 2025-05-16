@@ -562,16 +562,27 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let plan = if children.len() == 1 || children.len() == 2 {
-            if children.len() == 2 {
-                let _prefilter = children.pop().expect("length checked");
-            }
-            // NOTE!!!! Prefilter transformation is ignored.
+            let prefilter_source = if children.len() == 2 {
+                let prefilter = children.pop().expect("length checked");
+                match &self.prefilter_source {
+                    PreFilterSource::None => PreFilterSource::None,
+                    PreFilterSource::FilteredRowIds(_) => {
+                        PreFilterSource::FilteredRowIds(prefilter)
+                    }
+                    PreFilterSource::ScalarIndexQuery(_) => {
+                        PreFilterSource::ScalarIndexQuery(prefilter)
+                    }
+                }
+            } else {
+                self.prefilter_source.clone()
+            };
+
             Self {
                 input: children.pop().expect("length checked"),
                 dataset: self.dataset.clone(),
                 indices: self.indices.clone(),
                 query: self.query.clone(),
-                prefilter_source: self.prefilter_source.clone(),
+                prefilter_source,
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             }

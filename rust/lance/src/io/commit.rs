@@ -576,7 +576,7 @@ pub(crate) struct BadFragmentBitmapError {
     pub bad_indices: Vec<(String, Vec<u32>)>,
 }
 
-/// Detect whether a given index has overlapping fragment bitmaps in it's index
+/// Detect whether a given index has overlapping fragment bitmaps in its index
 /// segments.
 pub(crate) fn detect_overlapping_fragments(
     indices: &[Index],

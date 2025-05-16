@@ -23,7 +23,12 @@ from .dataset import (
     write_dataset,
 )
 from .fragment import FragmentMetadata, LanceFragment
-from .lance import ScanStatistics, bytes_read_counter, iops_counter
+from .lance import (
+    FFILanceTableProvider,
+    ScanStatistics,
+    bytes_read_counter,
+    iops_counter,
+)
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -59,6 +64,7 @@ __all__ = [
     "dataset",
     "batch_udf",
     "set_logger",
+    "FFILanceTableProvider",
 ]
 
 
