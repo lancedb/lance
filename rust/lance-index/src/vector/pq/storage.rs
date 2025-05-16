@@ -93,6 +93,9 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
             location: location!(),
         })?;
 
+        debug_assert!(metadata.codebook.is_none());
+        debug_assert!(metadata.codebook_tensor.is_empty());
+
         let codebook_tensor: pb::Tensor =
             read_message(reader.object_reader.as_ref(), metadata.codebook_position).await?;
         metadata.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
