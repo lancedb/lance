@@ -367,45 +367,6 @@ impl ProductQuantizationStorage {
         }
         Ok(self.batch.num_rows())
     }
-
-    // / Write the PQ storage to disk.
-    // pub async fn write_full(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
-    //     let pos = writer.object_writer.tell().await?;
-    //     let codebook_tensor = pb::Tensor::try_from(&self.codebook)?;
-    //     writer
-    //         .object_writer
-    //         .write_protobuf(&codebook_tensor)
-    //         .await?;
-
-    //     self.write_partition(writer).await?;
-
-    //     let metadata = ProductQuantizationMetadata {
-    //         codebook_position: pos,
-    //         nbits: self.num_bits,
-    //         num_sub_vectors: self.num_sub_vectors,
-    //         dimension: self.dimension,
-    //         codebook: None,
-    //         codebook_tensor: Vec::new(),
-    //         transposed: true,
-    //     };
-
-    //     let index_metadata = IndexMetadata {
-    //         index_type: "PQ".to_string(),
-    //         distance_type: self.distance_type.to_string(),
-    //     };
-
-    //     let mut schema_metadata = HashMap::new();
-    //     schema_metadata.insert(
-    //         PQ_METADATA_KEY.to_string(),
-    //         serde_json::to_string(&metadata)?,
-    //     );
-    //     schema_metadata.insert(
-    //         INDEX_METADATA_SCHEMA_KEY.to_string(),
-    //         serde_json::to_string(&index_metadata)?,
-    //     );
-    //     writer.finish_with_metadata(&schema_metadata).await?;
-    //     Ok(())
-    // }
 }
 
 pub fn transpose<T: ArrowPrimitiveType>(
@@ -1116,31 +1077,6 @@ mod tests {
         assert_eq!(storage.pq_code.len(), TOTAL * NUM_SUB_VECTORS);
         assert_eq!(storage.row_ids.len(), TOTAL);
     }
-
-    // #[tokio::test]
-    // async fn test_read_write_pq_storage() {
-    //     let storage = create_pq_storage().await;
-
-    //     let store = ObjectStore::memory();
-    //     let path = Path::from("pq_storage");
-    //     let schema = Schema::try_from(storage.schema().as_ref()).unwrap();
-    //     let mut file_writer = FileWriter::<ManifestDescribing>::try_new(
-    //         &store,
-    //         &path,
-    //         schema.clone(),
-    //         &Default::default(),
-    //     )
-    //     .await
-    //     .unwrap();
-
-    //     storage.write_full(&mut file_writer).await.unwrap();
-
-    //     let storage2 = ProductQuantizationStorage::load(&store, &path)
-    //         .await
-    //         .unwrap();
-
-    //     assert_eq!(storage, storage2);
-    // }
 
     #[tokio::test]
     async fn test_distance_all() {
