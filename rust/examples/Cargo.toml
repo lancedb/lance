@@ -14,3 +14,11 @@ tokio = { version = "1.0", features = ["full"] }
 tantivy = "0.22"
 anyhow = "1.0"
 arrow = "54.1"
+parquet = "54.1"
+# Dependencies for Hugging Face integration
+hf-hub = "0.3.2"
+tokenizers = "0.15.2"
+rand = "0.8.5"
+serde_json = "1.0"
+dirs = "5.0.0"
+futures.workspace = true
