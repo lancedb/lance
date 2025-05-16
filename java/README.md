@@ -136,7 +136,7 @@ void randomAccess() {
 * add columns
 
 ```java
-feat(java): support adding columns by schema and field definitionsvoid addColumnsByExpressions() {
+void addColumnsByExpressions() {
     String datasetPath = ""; // specify a path point to a dataset
     try (BufferAllocator allocator = new RootAllocator()) {
         try (Dataset dataset = Dataset.open(datasetPath, allocator)) {

@@ -468,7 +468,7 @@ public class DatasetTest {
       dataset = testDataset.createEmptyDataset();
 
       Field newColumnField = Field.nullable("age", new ArrowType.Int(32, true));
-      dataset.addColumns(Collections.singletonList(newColumnField), Optional.empty());
+      dataset.addColumns(Collections.singletonList(newColumnField));
       Schema expectedSchema =
           new Schema(
               Arrays.asList(
@@ -496,7 +496,7 @@ public class DatasetTest {
                   Field.nullable("height", new ArrowType.Int(64, true)),
                   Field.nullable("desc", new ArrowType.Utf8()),
                   complexField));
-      dataset.addColumns(addedColumns, Optional.empty());
+      dataset.addColumns(addedColumns);
 
       expectedSchema =
           new Schema(

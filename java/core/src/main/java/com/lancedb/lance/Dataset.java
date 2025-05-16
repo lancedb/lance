@@ -309,16 +309,14 @@ public class Dataset implements Closeable {
    * Add columns to the dataset.
    *
    * @param schema The Arrow schema definitions to add columns.
-   * @param batchSize The number of rows to read at a time from the source dataset when applying the
-   *     transform.
    */
-  public void addColumns(Schema schema, Optional<Long> batchSize) {
+  public void addColumns(Schema schema) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       Preconditions.checkArgument(schema != null, "Schema is empty");
       try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
         Data.exportSchema(allocator, schema, null, arrowSchema);
-        nativeAddColumnsBySchema(arrowSchema.memoryAddress(), batchSize);
+        nativeAddColumnsBySchema(arrowSchema.memoryAddress());
       }
     }
   }
@@ -327,15 +325,13 @@ public class Dataset implements Closeable {
    * Add columns to the dataset.
    *
    * @param fields The Arrow field definitions to add columns.
-   * @param batchSize The number of rows to read at a time from the source dataset when applying the
-   *     transform.
    */
-  public void addColumns(List<Field> fields, Optional<Long> batchSize) {
-    Preconditions.checkArgument(fields != null && !fields.isEmpty(), "Fields is empty");
-    addColumns(new Schema(fields), batchSize);
+  public void addColumns(List<Field> fields) {
+    Preconditions.checkArgument(fields != null && !fields.isEmpty(), "Fields are empty");
+    addColumns(new Schema(fields));
   }
 
-  private native void nativeAddColumnsBySchema(long schemaPtr, Optional<Long> batchSize);
+  private native void nativeAddColumnsBySchema(long schemaPtr);
 
   /**
    * Drop columns from the dataset.

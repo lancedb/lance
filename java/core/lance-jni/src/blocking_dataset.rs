@@ -1126,12 +1126,11 @@ fn inner_add_columns_by_reader(
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAddColumnsBySchema(
     mut env: JNIEnv,
     java_dataset: JObject,
-    schema_ptr: jlong, // SqlExpressions
-    batch_size: JObject,      // Optional<Long>
+    schema_ptr: jlong,        // Schema pointer
 ) {
     ok_or_throw_without_return!(
         env,
-        inner_add_columns_by_schema(&mut env, java_dataset, schema_ptr, batch_size)
+        inner_add_columns_by_schema(&mut env, java_dataset, schema_ptr)
     )
 }
 
@@ -1139,33 +1138,17 @@ fn inner_add_columns_by_schema(
     env: &mut JNIEnv,
     java_dataset: JObject,
     schema_ptr: jlong,
-    batch_size: JObject,
 ) -> Result<()> {
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(schema_ptr as *mut _) };
 
     let schema = ArrowSchema::try_from(&c_schema)
-        .map_err(|_| Error::input_error("Batch size conversion error".to_string()))?;
+        .map_err(|_| Error::input_error("ArrowSchema conversion error".to_string()))?;
 
     let transform = NewColumnTransform::AllNulls(Arc::new(schema));
-
-    let batch_size = if env.call_method(&batch_size, "isPresent", "()Z", &[])?.z()? {
-        let batch_size_value = env.get_long_opt(&batch_size)?;
-        match batch_size_value {
-            Some(value) => Some(
-                value
-                    .try_into()
-                    .map_err(|_| Error::input_error("Batch size conversion error".to_string()))?,
-            ),
-            None => None,
-        }
-    } else {
-        None
-    };
-
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
-    RT.block_on(dataset_guard.inner.add_columns(transform, None, batch_size))?;
+    RT.block_on(dataset_guard.inner.add_columns(transform, None, None))?;
 
     Ok(())
 }
