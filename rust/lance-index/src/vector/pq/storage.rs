@@ -84,7 +84,12 @@ impl PartialEq for ProductQuantizationMetadata {
 #[async_trait]
 impl QuantizerMetadata for ProductQuantizationMetadata {
     fn buffer_index(&self) -> Option<u32> {
-        return Some(self.codebook_position as u32);
+        if self.codebook_position > 0 {
+            // the global buffer index starts from 1
+            Some(self.codebook_position as u32)
+        } else {
+            None
+        }
     }
 
     fn set_buffer_index(&mut self, index: u32) {
@@ -92,7 +97,7 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
     }
 
     fn parse_buffer(&mut self, bytes: Bytes) -> Result<()> {
-        debug_assert!(bytes.len() > 0);
+        debug_assert!(!bytes.is_empty());
         debug_assert!(self.codebook.is_none());
         let codebook_tensor: pb::Tensor = pb::Tensor::decode(bytes)?;
         self.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
@@ -293,7 +298,7 @@ impl ProductQuantizationStorage {
     }
 
     pub fn codebook(&self) -> &FixedSizeListArray {
-        &self.metadata.codebook.as_ref().unwrap()
+        self.metadata.codebook.as_ref().unwrap()
     }
 
     /// Load full PQ storage from disk.
