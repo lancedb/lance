@@ -3122,12 +3122,16 @@ def test_dataset_schema(tmp_path: Path):
 
 
 def test_data_replacement(tmp_path: Path):
-    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    table = pa.Table.from_pydict({"a": range(100), "b": [str(i) for i in range(100)]})
     base_dir = tmp_path / "test"
 
     dataset = lance.write_dataset(table, base_dir)
 
-    table = pa.Table.from_pydict({"a": range(100, 200), "b": range(100, 200)})
+    # Note: by using a string column here we are making sure the new file has a
+    # different size than the old file (this regresses a bug).
+    table = pa.Table.from_pydict(
+        {"a": range(100, 200), "b": [str(i) for i in range(100, 200)]}
+    )
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
     data_file = fragment.files[0]
     data_replacement = lance.LanceOperation.DataReplacement(
@@ -3140,7 +3144,7 @@ def test_data_replacement(tmp_path: Path):
     expected = pa.Table.from_pydict(
         {
             "a": list(range(100, 200)),
-            "b": list(range(100, 200)),
+            "b": list([str(i) for i in range(100, 200)]),
         }
     )
     assert tbl == expected
