@@ -96,7 +96,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     reader: FileReader,
     sub_index_metadata: Vec<String>,
-    storage: IvfQuantizationStorage,
+    storage: IvfQuantizationStorage<Q>,
 
     partition_locks: PartitionLoadLock,
 
@@ -298,7 +298,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     pub async fn load_partition_storage(&self, partition_id: usize) -> Result<Q::Storage> {
-        self.storage.load_partition::<Q>(partition_id).await
+        self.storage.load_partition(partition_id).await
     }
 
     /// preprocess the query vector given the partition id.
@@ -371,7 +371,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             } else {
                 serde_json::map::Map::new()
             };
-        let mut store_stats = serde_json::to_value(self.storage.metadata::<Q>()?)?;
+        let mut store_stats = serde_json::to_value(self.storage.metadata())?;
         let store_stats = store_stats.as_object_mut().ok_or(Error::Internal {
             message: "failed to get storage metadata".to_string(),
             location: location!(),
@@ -624,7 +624,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     }
 
     fn quantizer(&self) -> Quantizer {
-        self.storage.quantizer::<Q>().unwrap()
+        self.storage.quantizer().unwrap()
     }
 
     /// the index type of this vector index.

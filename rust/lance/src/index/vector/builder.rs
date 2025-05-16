@@ -17,8 +17,6 @@ use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::FileReaderOptions;
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
-use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
@@ -27,7 +25,9 @@ use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::utils::is_finite;
 use lance_index::vector::v3::shuffler::IvfShufflerReader;
 use lance_index::vector::v3::subindex::SubIndexType;
+use lance_index::vector::{ivf::storage::IvfModel, quantizer::QuantizerMetadata};
 use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN};
+use lance_index::{metrics::NoOpMetricsCollector, vector::quantizer::QuantizerStorage};
 use lance_index::{
     pb,
     vector::{
@@ -811,13 +811,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
         // For now, each partition's metadata is just the quantizer,
         // it's all the same for now, so we just take the first one
-        let storage_partition_metadata = vec![quantizer
-            .metadata(Some(QuantizationMetadata {
-                codebook_position: Some(0),
-                codebook: None,
-                transposed: true,
-            }))?
-            .to_string()];
+        let mut metadata = quantizer.metadata(Some(QuantizationMetadata {
+            codebook_position: Some(0),
+            codebook: None,
+            transposed: true,
+        }));
+        if let Some(extra_metadata) = metadata.extra_metadata()? {
+            let idx = storage_writer.add_global_buffer(extra_metadata).await?;
+            metadata.set_buffer_index(idx);
+        }
+        let metadata = serde_json::to_string(&metadata)?;
+        println!("metadata: {}", metadata);
+        let storage_partition_metadata = vec![metadata];
         storage_writer.add_schema_metadata(
             STORAGE_METADATA_KEY,
             serde_json::to_string(&storage_partition_metadata)?,

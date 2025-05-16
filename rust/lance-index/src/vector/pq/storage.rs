@@ -16,15 +16,12 @@ use arrow_array::{
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
-use lance_io::{
-    object_store::ObjectStore,
-    traits::{WriteExt, Writer},
-    utils::read_message,
-};
+use lance_io::{object_store::ObjectStore, utils::read_message};
 use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_table::utils::LanceIteratorExtension;
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
@@ -35,7 +32,6 @@ use snafu::location;
 
 use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use super::ProductQuantizer;
-use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     pb,
     vector::{
@@ -60,7 +56,9 @@ pub struct ProductQuantizationMetadata {
     #[serde(skip)]
     pub codebook: Option<FixedSizeListArray>,
 
-    // empty for old format
+    // empty for v1 format
+    // used for v3 format
+    // deprecated in later version
     pub codebook_tensor: Vec<u8>,
     pub transposed: bool,
 }
@@ -74,8 +72,41 @@ impl DeepSizeOf for ProductQuantizationMetadata {
     }
 }
 
+impl PartialEq for ProductQuantizationMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.num_sub_vectors == other.num_sub_vectors
+            && self.nbits == other.nbits
+            && self.dimension == other.dimension
+            && self.codebook == other.codebook
+    }
+}
+
 #[async_trait]
 impl QuantizerMetadata for ProductQuantizationMetadata {
+    fn buffer_index(&self) -> Option<u32> {
+        return Some(self.codebook_position as u32);
+    }
+
+    fn set_buffer_index(&mut self, index: u32) {
+        self.codebook_position = index as usize;
+    }
+
+    fn parse_buffer(&mut self, bytes: Bytes) -> Result<()> {
+        debug_assert!(bytes.len() > 0);
+        debug_assert!(self.codebook.is_none());
+        let codebook_tensor: pb::Tensor = pb::Tensor::decode(bytes)?;
+        self.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
+        Ok(())
+    }
+
+    fn extra_metadata(&self) -> Result<Option<Bytes>> {
+        debug_assert!(self.codebook.is_some());
+        let codebook_tensor: pb::Tensor = pb::Tensor::try_from(self.codebook.as_ref().unwrap())?;
+        let mut bytes = BytesMut::new();
+        codebook_tensor.encode(&mut bytes)?;
+        Ok(Some(bytes.freeze()))
+    }
+
     async fn load(reader: &FileReader) -> Result<Self> {
         let metadata = reader
             .schema()
@@ -110,14 +141,9 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
 /// It is possible to store additional metadata to accelerate filtering later.
 #[derive(Clone, Debug)]
 pub struct ProductQuantizationStorage {
-    codebook: FixedSizeListArray,
-    batch: RecordBatch,
-
-    // Metadata
-    num_bits: u32,
-    num_sub_vectors: usize,
-    dimension: usize,
+    metadata: ProductQuantizationMetadata,
     distance_type: DistanceType,
+    batch: RecordBatch,
 
     // For easy access
     pq_code: Arc<UInt8Array>,
@@ -126,21 +152,20 @@ pub struct ProductQuantizationStorage {
 
 impl DeepSizeOf for ProductQuantizationStorage {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.codebook.get_array_memory_size()
-            + self.batch.get_array_memory_size()
-            + self.pq_code.get_array_memory_size()
-            + self.row_ids.get_array_memory_size()
+        self.batch.get_array_memory_size()
+            + self
+                .metadata
+                .codebook
+                .as_ref()
+                .map(|codebook| codebook.get_array_memory_size())
+                .unwrap_or(0)
     }
 }
 
 impl PartialEq for ProductQuantizationStorage {
     fn eq(&self, other: &Self) -> bool {
-        self.distance_type.eq(&other.distance_type)
-            && self.codebook.eq(&other.codebook)
-            && self.num_bits.eq(&other.num_bits)
-            && self.num_sub_vectors.eq(&other.num_sub_vectors)
-            && self.dimension.eq(&other.dimension)
-            // Ignore the schema because they might have different metadata.
+        self.distance_type == other.distance_type
+            && self.metadata.eq(&other.metadata)
             && self.batch.columns().eq(other.batch.columns())
     }
 }
@@ -183,6 +208,7 @@ impl ProductQuantizationStorage {
             .into();
 
         if !transposed {
+            println!("try transpose pq code");
             let num_sub_vectors_in_byte = if num_bits == 4 {
                 num_sub_vectors / 2
             } else {
@@ -212,15 +238,21 @@ impl ProductQuantizationStorage {
             DistanceType::Cosine => DistanceType::L2,
             _ => distance_type,
         };
+        let metadata = ProductQuantizationMetadata {
+            codebook_position: 0,
+            nbits: num_bits,
+            num_sub_vectors,
+            dimension,
+            codebook: Some(codebook),
+            codebook_tensor: Vec::new(),
+            transposed: true,
+        };
         Ok(Self {
-            codebook,
+            metadata,
+            distance_type,
             batch,
             pq_code,
             row_ids,
-            num_sub_vectors,
-            num_bits,
-            dimension,
-            distance_type,
         })
     }
 
@@ -262,7 +294,7 @@ impl ProductQuantizationStorage {
     }
 
     pub fn codebook(&self) -> &FixedSizeListArray {
-        &self.codebook
+        &self.metadata.codebook.as_ref().unwrap()
     }
 
     /// Load full PQ storage from disk.
@@ -332,44 +364,44 @@ impl ProductQuantizationStorage {
         Ok(self.batch.num_rows())
     }
 
-    /// Write the PQ storage to disk.
-    pub async fn write_full(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
-        let pos = writer.object_writer.tell().await?;
-        let codebook_tensor = pb::Tensor::try_from(&self.codebook)?;
-        writer
-            .object_writer
-            .write_protobuf(&codebook_tensor)
-            .await?;
+    // / Write the PQ storage to disk.
+    // pub async fn write_full(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
+    //     let pos = writer.object_writer.tell().await?;
+    //     let codebook_tensor = pb::Tensor::try_from(&self.codebook)?;
+    //     writer
+    //         .object_writer
+    //         .write_protobuf(&codebook_tensor)
+    //         .await?;
 
-        self.write_partition(writer).await?;
+    //     self.write_partition(writer).await?;
 
-        let metadata = ProductQuantizationMetadata {
-            codebook_position: pos,
-            nbits: self.num_bits,
-            num_sub_vectors: self.num_sub_vectors,
-            dimension: self.dimension,
-            codebook: None,
-            codebook_tensor: Vec::new(),
-            transposed: true,
-        };
+    //     let metadata = ProductQuantizationMetadata {
+    //         codebook_position: pos,
+    //         nbits: self.num_bits,
+    //         num_sub_vectors: self.num_sub_vectors,
+    //         dimension: self.dimension,
+    //         codebook: None,
+    //         codebook_tensor: Vec::new(),
+    //         transposed: true,
+    //     };
 
-        let index_metadata = IndexMetadata {
-            index_type: "PQ".to_string(),
-            distance_type: self.distance_type.to_string(),
-        };
+    //     let index_metadata = IndexMetadata {
+    //         index_type: "PQ".to_string(),
+    //         distance_type: self.distance_type.to_string(),
+    //     };
 
-        let mut schema_metadata = HashMap::new();
-        schema_metadata.insert(
-            PQ_METADATA_KEY.to_string(),
-            serde_json::to_string(&metadata)?,
-        );
-        schema_metadata.insert(
-            INDEX_METADATA_SCHEMA_KEY.to_string(),
-            serde_json::to_string(&index_metadata)?,
-        );
-        writer.finish_with_metadata(&schema_metadata).await?;
-        Ok(())
-    }
+    //     let mut schema_metadata = HashMap::new();
+    //     schema_metadata.insert(
+    //         PQ_METADATA_KEY.to_string(),
+    //         serde_json::to_string(&metadata)?,
+    //     );
+    //     schema_metadata.insert(
+    //         INDEX_METADATA_SCHEMA_KEY.to_string(),
+    //         serde_json::to_string(&index_metadata)?,
+    //     );
+    //     writer.finish_with_metadata(&schema_metadata).await?;
+    //     Ok(())
+    // }
 }
 
 pub fn transpose<T: ArrowPrimitiveType>(
@@ -397,6 +429,106 @@ where
 #[async_trait]
 impl QuantizerStorage for ProductQuantizationStorage {
     type Metadata = ProductQuantizationMetadata;
+
+    fn try_from_batch(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+    ) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let distance_type = match distance_type {
+            DistanceType::Cosine => DistanceType::L2,
+            _ => distance_type,
+        };
+
+        // now it supports only Float32Type
+        let codebook = match &metadata.codebook {
+            Some(codebook) => codebook.clone(),
+            None => {
+                // legacy format would contains codebook tensor but not codebook
+                debug_assert!(!metadata.codebook_tensor.is_empty());
+                let codebook_tensor = pb::Tensor::decode(metadata.codebook_tensor.as_slice())?;
+                FixedSizeListArray::try_from(&codebook_tensor)?
+            }
+        };
+
+        Self::new(
+            codebook,
+            batch,
+            metadata.nbits,
+            metadata.num_sub_vectors,
+            metadata.dimension,
+            distance_type,
+            metadata.transposed,
+        )
+    }
+
+    fn metadata(&self) -> &Self::Metadata {
+        &self.metadata
+    }
+
+    // we can't use the default implementation of remap,
+    // because PQ Storage transposed the PQ codes
+    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+        let transposed_codes = self.pq_code.values();
+        let mut new_row_ids = Vec::with_capacity(self.len());
+        let mut new_codes = Vec::with_capacity(self.len() * self.metadata.num_sub_vectors);
+
+        let row_ids = self.row_ids.values();
+        for (i, row_id) in row_ids.iter().enumerate() {
+            match mapping.get(row_id) {
+                Some(Some(new_id)) => {
+                    new_row_ids.push(*new_id);
+                    new_codes.extend(get_pq_code(
+                        transposed_codes,
+                        self.metadata.nbits,
+                        self.metadata.num_sub_vectors,
+                        i as u32,
+                    ));
+                }
+                Some(None) => {}
+                None => {
+                    new_row_ids.push(*row_id);
+                    new_codes.extend(get_pq_code(
+                        transposed_codes,
+                        self.metadata.nbits,
+                        self.metadata.num_sub_vectors,
+                        i as u32,
+                    ));
+                }
+            }
+        }
+
+        let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
+        let new_codes = UInt8Array::from(new_codes);
+        let batch = if new_row_ids.is_empty() {
+            RecordBatch::new_empty(self.schema())
+        } else {
+            let num_bytes_in_code = new_codes.len() / new_row_ids.len();
+            let new_transposed_codes = transpose(&new_codes, new_row_ids.len(), num_bytes_in_code);
+            let codes_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
+                new_transposed_codes,
+                num_bytes_in_code as i32,
+            )?);
+            RecordBatch::try_new(self.schema(), vec![new_row_ids.clone(), codes_fsl])?
+        };
+        let transposed_codes = batch[PQ_CODE_COLUMN]
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<UInt8Type>()
+            .clone();
+
+        Ok(Self {
+            metadata: self.metadata.clone(),
+            distance_type: self.distance_type,
+            batch,
+            pq_code: Arc::new(transposed_codes),
+            row_ids: new_row_ids,
+        })
+    }
+
     /// Load a partition of PQ storage from disk.
     ///
     /// Parameters
@@ -441,116 +573,21 @@ impl QuantizerStorage for ProductQuantizationStorage {
 impl VectorStore for ProductQuantizationStorage {
     type DistanceCalculator<'a> = PQDistCalculator;
 
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        let distance_type = match distance_type {
-            DistanceType::Cosine => DistanceType::L2,
-            _ => distance_type,
-        };
-        let metadata_json = batch
-            .metadata()
-            .get(STORAGE_METADATA_KEY)
-            .ok_or(Error::Index {
-                message: "Metadata not found in schema".to_string(),
-                location: location!(),
-            })?;
-        let metadata: ProductQuantizationMetadata = serde_json::from_str(metadata_json)?;
-
-        // now it supports only Float32Type
-        let codebook_tensor = pb::Tensor::decode(metadata.codebook_tensor.as_slice())?;
-        let codebook = FixedSizeListArray::try_from(&codebook_tensor)?;
-
-        Self::new(
-            codebook,
-            batch,
-            metadata.nbits,
-            metadata.num_sub_vectors,
-            metadata.dimension,
-            distance_type,
-            metadata.transposed,
-        )
-    }
-
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
-        let codebook = pb::Tensor::try_from(&self.codebook)?.encode_to_vec();
-        let metadata = ProductQuantizationMetadata {
-            codebook_position: 0, // deprecated in new format
-            nbits: self.num_bits,
-            num_sub_vectors: self.num_sub_vectors,
-            dimension: self.dimension,
-            codebook: None,
-            codebook_tensor: codebook,
-            transposed: true, // we always transpose the pq codes for efficiency
-        };
+        // let codebook = pb::Tensor::try_from(&self.codebook)?.encode_to_vec();
+        // let metadata = ProductQuantizationMetadata {
+        //     codebook_position: 0, // deprecated in new format
+        //     nbits: self.num_bits,
+        //     num_sub_vectors: self.num_sub_vectors,
+        //     dimension: self.dimension,
+        //     codebook: None,
+        //     codebook_tensor: codebook,
+        //     transposed: true, // we always transpose the pq codes for efficiency
+        // };
 
-        let metadata_json = serde_json::to_string(&metadata)?;
-        let metadata = HashMap::from_iter(vec![(STORAGE_METADATA_KEY.to_string(), metadata_json)]);
-        Ok([self.batch.with_metadata(metadata)?].into_iter())
-    }
-
-    // we can't use the default implementation of remap,
-    // because PQ Storage transposed the PQ codes
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
-        let transposed_codes = self.pq_code.values();
-        let mut new_row_ids = Vec::with_capacity(self.len());
-        let mut new_codes = Vec::with_capacity(self.len() * self.num_sub_vectors);
-
-        let row_ids = self.row_ids.values();
-        for (i, row_id) in row_ids.iter().enumerate() {
-            match mapping.get(row_id) {
-                Some(Some(new_id)) => {
-                    new_row_ids.push(*new_id);
-                    new_codes.extend(get_pq_code(
-                        transposed_codes,
-                        self.num_bits,
-                        self.num_sub_vectors,
-                        i as u32,
-                    ));
-                }
-                Some(None) => {}
-                None => {
-                    new_row_ids.push(*row_id);
-                    new_codes.extend(get_pq_code(
-                        transposed_codes,
-                        self.num_bits,
-                        self.num_sub_vectors,
-                        i as u32,
-                    ));
-                }
-            }
-        }
-
-        let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
-        let new_codes = UInt8Array::from(new_codes);
-        let batch = if new_row_ids.is_empty() {
-            RecordBatch::new_empty(self.schema())
-        } else {
-            let num_bytes_in_code = new_codes.len() / new_row_ids.len();
-            let new_transposed_codes = transpose(&new_codes, new_row_ids.len(), num_bytes_in_code);
-            let codes_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
-                new_transposed_codes,
-                num_bytes_in_code as i32,
-            )?);
-            RecordBatch::try_new(self.schema(), vec![new_row_ids.clone(), codes_fsl])?
-        };
-        let transposed_codes = batch[PQ_CODE_COLUMN]
-            .as_fixed_size_list()
-            .values()
-            .as_primitive::<UInt8Type>()
-            .clone();
-
-        Ok(Self {
-            codebook: self.codebook.clone(),
-            batch,
-            pq_code: Arc::new(transposed_codes),
-            row_ids: new_row_ids,
-            num_sub_vectors: self.num_sub_vectors,
-            num_bits: self.num_bits,
-            dimension: self.dimension,
-            distance_type: self.distance_type,
-        })
+        // let metadata_json = serde_json::to_string(&metadata)?;
+        // let metadata = HashMap::from_iter(vec![(STORAGE_METADATA_KEY.to_string(), metadata_json)]);
+        Ok(std::iter::once(self.batch.clone()))
     }
 
     fn append_batch(&self, _batch: RecordBatch, _vector_column: &str) -> Result<Self> {
@@ -582,119 +619,118 @@ impl VectorStore for ProductQuantizationStorage {
     }
 
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
-        match self.codebook.value_type() {
+        let codebook = self.metadata.codebook.as_ref().unwrap();
+        match codebook.value_type() {
             DataType::Float16 => PQDistCalculator::new(
-                self.codebook
+                codebook
                     .values()
                     .as_primitive::<datatypes::Float16Type>()
                     .values(),
-                self.num_bits,
-                self.num_sub_vectors,
+                self.metadata.nbits,
+                self.metadata.num_sub_vectors,
                 self.pq_code.clone(),
                 query.as_primitive::<datatypes::Float16Type>().values(),
                 self.distance_type,
             ),
             DataType::Float32 => PQDistCalculator::new(
-                self.codebook
+                codebook
                     .values()
                     .as_primitive::<datatypes::Float32Type>()
                     .values(),
-                self.num_bits,
-                self.num_sub_vectors,
+                self.metadata.nbits,
+                self.metadata.num_sub_vectors,
                 self.pq_code.clone(),
                 query.as_primitive::<datatypes::Float32Type>().values(),
                 self.distance_type,
             ),
             DataType::Float64 => PQDistCalculator::new(
-                self.codebook
+                codebook
                     .values()
                     .as_primitive::<datatypes::Float64Type>()
                     .values(),
-                self.num_bits,
-                self.num_sub_vectors,
+                self.metadata.nbits,
+                self.metadata.num_sub_vectors,
                 self.pq_code.clone(),
                 query.as_primitive::<datatypes::Float64Type>().values(),
                 self.distance_type,
             ),
-            _ => unimplemented!("Unsupported data type: {:?}", self.codebook.value_type()),
+            _ => unimplemented!("Unsupported data type: {:?}", codebook.value_type()),
         }
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         let codes = get_pq_code(
             self.pq_code.values(),
-            self.num_bits,
-            self.num_sub_vectors,
+            self.metadata.nbits,
+            self.metadata.num_sub_vectors,
             id,
         );
-        match self.codebook.value_type() {
+        let codebook = self.metadata.codebook.as_ref().unwrap();
+        match codebook.value_type() {
             DataType::Float16 => {
-                let codebook = self
-                    .codebook
+                let codebook = codebook
                     .values()
                     .as_primitive::<datatypes::Float16Type>()
                     .values();
                 let query = get_centroids(
                     codebook,
-                    self.num_bits,
-                    self.num_sub_vectors,
-                    self.dimension,
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
+                    self.metadata.dimension,
                     codes,
                 );
                 PQDistCalculator::new(
                     codebook,
-                    self.num_bits,
-                    self.num_sub_vectors,
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
                     self.pq_code.clone(),
                     &query,
                     self.distance_type,
                 )
             }
             DataType::Float32 => {
-                let codebook = self
-                    .codebook
+                let codebook = codebook
                     .values()
                     .as_primitive::<datatypes::Float32Type>()
                     .values();
                 let query = get_centroids(
                     codebook,
-                    self.num_bits,
-                    self.num_sub_vectors,
-                    self.dimension,
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
+                    self.metadata.dimension,
                     codes,
                 );
                 PQDistCalculator::new(
                     codebook,
-                    self.num_bits,
-                    self.num_sub_vectors,
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
                     self.pq_code.clone(),
                     &query,
                     self.distance_type,
                 )
             }
             DataType::Float64 => {
-                let codebook = self
-                    .codebook
+                let codebook = codebook
                     .values()
                     .as_primitive::<datatypes::Float64Type>()
                     .values();
                 let query = get_centroids(
                     codebook,
-                    self.num_bits,
-                    self.num_sub_vectors,
-                    self.dimension,
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
+                    self.metadata.dimension,
                     codes,
                 );
                 PQDistCalculator::new(
                     codebook,
-                    self.num_bits,
-                    self.num_sub_vectors,
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
                     self.pq_code.clone(),
                     &query,
                     self.distance_type,
                 )
             }
-            _ => unimplemented!("Unsupported data type: {:?}", self.codebook.value_type()),
+            _ => unimplemented!("Unsupported data type: {:?}", codebook.value_type()),
         }
     }
 
@@ -702,80 +738,91 @@ impl VectorStore for ProductQuantizationStorage {
         // this is a fast way to compute distance between two vectors in the same storage.
         // it doesn't construct the distance table.
         let pq_codes = self.pq_code.values();
-        let u_codes = get_pq_code(pq_codes, self.num_bits, self.num_sub_vectors, u);
-        let v_codes = get_pq_code(pq_codes, self.num_bits, self.num_sub_vectors, v);
+        let u_codes = get_pq_code(
+            pq_codes,
+            self.metadata.nbits,
+            self.metadata.num_sub_vectors,
+            u,
+        );
+        let v_codes = get_pq_code(
+            pq_codes,
+            self.metadata.nbits,
+            self.metadata.num_sub_vectors,
+            v,
+        );
+        let codebook = self.metadata.codebook.as_ref().unwrap();
 
-        match self.codebook.value_type() {
+        match codebook.value_type() {
             DataType::Float16 => {
                 let qu = get_centroids(
-                    self.codebook
+                    codebook
                         .values()
                         .as_primitive::<datatypes::Float16Type>()
                         .values(),
-                    self.num_bits,
-                    self.num_sub_vectors,
-                    self.dimension,
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
+                    self.metadata.dimension,
                     u_codes,
                 );
                 let qv = get_centroids(
-                    self.codebook
+                    codebook
                         .values()
                         .as_primitive::<datatypes::Float16Type>()
                         .values(),
-                    self.num_bits,
-                    self.num_sub_vectors,
-                    self.dimension,
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
+                    self.metadata.dimension,
                     v_codes,
                 );
                 self.distance_type.func()(&qu, &qv)
             }
             DataType::Float32 => {
                 let qu = get_centroids(
-                    self.codebook
+                    codebook
                         .values()
                         .as_primitive::<datatypes::Float32Type>()
                         .values(),
-                    self.num_bits,
-                    self.num_sub_vectors,
-                    self.dimension,
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
+                    self.metadata.dimension,
                     u_codes,
                 );
                 let qv = get_centroids(
-                    self.codebook
+                    codebook
                         .values()
                         .as_primitive::<datatypes::Float32Type>()
                         .values(),
-                    self.num_bits,
-                    self.num_sub_vectors,
-                    self.dimension,
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
+                    self.metadata.dimension,
                     v_codes,
                 );
                 self.distance_type.func()(&qu, &qv)
             }
             DataType::Float64 => {
                 let qu = get_centroids(
-                    self.codebook
+                    codebook
                         .values()
                         .as_primitive::<datatypes::Float64Type>()
                         .values(),
-                    self.num_bits,
-                    self.num_sub_vectors,
-                    self.dimension,
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
+                    self.metadata.dimension,
                     u_codes,
                 );
                 let qv = get_centroids(
-                    self.codebook
+                    codebook
                         .values()
                         .as_primitive::<datatypes::Float64Type>()
                         .values(),
-                    self.num_bits,
-                    self.num_sub_vectors,
-                    self.dimension,
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
+                    self.metadata.dimension,
                     v_codes,
                 );
                 self.distance_type.func()(&qu, &qv)
             }
-            _ => unimplemented!("Unsupported data type: {:?}", self.codebook.value_type()),
+            _ => unimplemented!("Unsupported data type: {:?}", codebook.value_type()),
         }
     }
 }
@@ -984,7 +1031,6 @@ mod tests {
     use arrow_array::{Float32Array, UInt32Array};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::datatypes::Schema;
     use lance_core::ROW_ID_FIELD;
     use rand::Rng;
 
@@ -1058,36 +1104,39 @@ mod tests {
     async fn test_build_pq_storage() {
         let storage = create_pq_storage().await;
         assert_eq!(storage.len(), TOTAL);
-        assert_eq!(storage.num_sub_vectors, NUM_SUB_VECTORS);
-        assert_eq!(storage.codebook.values().len(), 256 * DIM);
+        assert_eq!(storage.metadata.num_sub_vectors, NUM_SUB_VECTORS);
+        assert_eq!(
+            storage.metadata.codebook.as_ref().unwrap().values().len(),
+            256 * DIM
+        );
         assert_eq!(storage.pq_code.len(), TOTAL * NUM_SUB_VECTORS);
         assert_eq!(storage.row_ids.len(), TOTAL);
     }
 
-    #[tokio::test]
-    async fn test_read_write_pq_storage() {
-        let storage = create_pq_storage().await;
+    // #[tokio::test]
+    // async fn test_read_write_pq_storage() {
+    //     let storage = create_pq_storage().await;
 
-        let store = ObjectStore::memory();
-        let path = Path::from("pq_storage");
-        let schema = Schema::try_from(storage.schema().as_ref()).unwrap();
-        let mut file_writer = FileWriter::<ManifestDescribing>::try_new(
-            &store,
-            &path,
-            schema.clone(),
-            &Default::default(),
-        )
-        .await
-        .unwrap();
+    //     let store = ObjectStore::memory();
+    //     let path = Path::from("pq_storage");
+    //     let schema = Schema::try_from(storage.schema().as_ref()).unwrap();
+    //     let mut file_writer = FileWriter::<ManifestDescribing>::try_new(
+    //         &store,
+    //         &path,
+    //         schema.clone(),
+    //         &Default::default(),
+    //     )
+    //     .await
+    //     .unwrap();
 
-        storage.write_full(&mut file_writer).await.unwrap();
+    //     storage.write_full(&mut file_writer).await.unwrap();
 
-        let storage2 = ProductQuantizationStorage::load(&store, &path)
-            .await
-            .unwrap();
+    //     let storage2 = ProductQuantizationStorage::load(&store, &path)
+    //         .await
+    //         .unwrap();
 
-        assert_eq!(storage, storage2);
-    }
+    //     assert_eq!(storage, storage2);
+    // }
 
     #[tokio::test]
     async fn test_distance_all() {

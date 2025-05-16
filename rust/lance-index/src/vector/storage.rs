@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
+use crate::vector::quantizer::{QuantizationMetadata, QuantizerStorage};
 use arrow::array::AsArray;
 use arrow::compute::concat_batches;
 use arrow::datatypes::UInt64Type;
@@ -30,7 +31,7 @@ use crate::{
     },
 };
 
-use super::quantizer::Quantizer;
+use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::DISTANCE_TYPE_KEY;
 
 /// <section class="warning">
@@ -68,52 +69,11 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     where
         Self: 'a;
 
-    /// Create a [VectorStore] from a [RecordBatch].
-    /// The batch should consist of row IDs and quantized vector.
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>;
-
     fn as_any(&self) -> &dyn Any;
 
     fn schema(&self) -> &SchemaRef;
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch> + Send>;
-
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
-        let batches = self
-            .to_batches()?
-            .map(|b| {
-                let mut indices = Vec::with_capacity(b.num_rows());
-                let mut new_row_ids = Vec::with_capacity(b.num_rows());
-
-                let row_ids = b.column(0).as_primitive::<UInt64Type>().values();
-                for (i, row_id) in row_ids.iter().enumerate() {
-                    match mapping.get(row_id) {
-                        Some(Some(new_id)) => {
-                            indices.push(i as u32);
-                            new_row_ids.push(*new_id);
-                        }
-                        Some(None) => {}
-                        None => {
-                            indices.push(i as u32);
-                            new_row_ids.push(*row_id);
-                        }
-                    }
-                }
-
-                let indices = UInt32Array::from(indices);
-                let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
-                let new_vectors = arrow::compute::take(b.column(1), &indices, None)?;
-
-                Ok(RecordBatch::try_new(
-                    self.schema().clone(),
-                    vec![new_row_ids, new_vectors],
-                )?)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let batch = concat_batches(self.schema(), batches.iter())?;
-        Self::try_from_batch(batch, self.distance_type())
-    }
 
     fn len(&self) -> usize;
 
@@ -196,33 +156,36 @@ impl<Q: Quantization> StorageBuilder<Q> {
         debug_assert!(batch.column_by_name(ROW_ID).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
-        let batch = batch.add_metadata(
-            STORAGE_METADATA_KEY.to_owned(),
-            self.quantizer.metadata(None)?.to_string(),
-        )?;
-        Q::Storage::try_from_batch(batch, self.distance_type)
+        Q::Storage::try_from_batch(
+            batch,
+            &self.quantizer.metadata(Some(QuantizationMetadata {
+                codebook_position: Some(0),
+                codebook: None,
+                transposed: true,
+            })),
+            self.distance_type,
+        )
     }
 }
 
 /// Loader to load partitioned PQ storage from disk.
 #[derive(Debug)]
-pub struct IvfQuantizationStorage {
+pub struct IvfQuantizationStorage<Q: Quantization> {
     reader: FileReader,
 
     distance_type: DistanceType,
-    metadata: Vec<String>,
+    metadata: Q::Metadata,
 
     ivf: IvfModel,
 }
 
-impl DeepSizeOf for IvfQuantizationStorage {
+impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.metadata.deep_size_of_children(context) + self.ivf.deep_size_of_children(context)
     }
 }
 
-#[allow(dead_code)]
-impl IvfQuantizationStorage {
+impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Open a Loader.
     ///
     ///
@@ -255,7 +218,7 @@ impl IvfQuantizationStorage {
         let ivf_bytes = reader.read_global_buffer(ivf_pos).await?;
         let ivf = IvfModel::try_from(pb::Ivf::decode(ivf_bytes)?)?;
 
-        let metadata: Vec<String> = serde_json::from_str(
+        let mut metadata: Vec<String> = serde_json::from_str(
             schema
                 .metadata
                 .get(STORAGE_METADATA_KEY)
@@ -265,6 +228,20 @@ impl IvfQuantizationStorage {
                 })?
                 .as_str(),
         )?;
+        // for now the metadata is the same for all partitions, so we just store one
+        let metadata = metadata.pop().ok_or(Error::Index {
+            message: "metadata is empty".to_string(),
+            location: location!(),
+        })?;
+        println!("load metadata: {}", metadata);
+        let mut metadata: Q::Metadata = serde_json::from_str(&metadata)?;
+        // we store large metadata (e.g. PQ codebook) in global buffer,
+        // and the schema metadata just contains a pointer to the buffer
+        if let Some(pos) = metadata.buffer_index() {
+            let bytes = reader.read_global_buffer(pos).await?;
+            metadata.parse_buffer(bytes)?;
+        }
+
         Ok(Self {
             reader,
             distance_type,
@@ -277,13 +254,13 @@ impl IvfQuantizationStorage {
         self.reader.num_rows()
     }
 
-    pub fn quantizer<Q: Quantization>(&self) -> Result<Quantizer> {
-        let metadata = self.metadata::<Q>()?;
-        Q::from_metadata(&metadata, self.distance_type)
+    pub fn quantizer(&self) -> Result<Quantizer> {
+        let metadata = self.metadata();
+        Q::from_metadata(metadata, self.distance_type)
     }
 
-    pub fn metadata<Q: Quantization>(&self) -> Result<Q::Metadata> {
-        Ok(serde_json::from_str(&self.metadata[0])?)
+    pub fn metadata(&self) -> &Q::Metadata {
+        &self.metadata
     }
 
     pub fn distance_type(&self) -> DistanceType {
@@ -299,7 +276,7 @@ impl IvfQuantizationStorage {
         self.ivf.num_partitions()
     }
 
-    pub async fn load_partition<Q: Quantization>(&self, part_id: usize) -> Result<Q::Storage> {
+    pub async fn load_partition(&self, part_id: usize) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
         let batch = if range.is_empty() {
             let schema = self.reader.schema();
@@ -311,7 +288,7 @@ impl IvfQuantizationStorage {
                 .read_stream(
                     ReadBatchParams::Range(range),
                     u32::MAX,
-                    16,
+                    1,
                     FilterExpression::no_filter(),
                 )?
                 .try_collect::<Vec<_>>()
@@ -319,12 +296,6 @@ impl IvfQuantizationStorage {
             let schema = Arc::new(self.reader.schema().as_ref().into());
             concat_batches(&schema, batches.iter())?
         };
-        let batch = batch.add_metadata(
-            STORAGE_METADATA_KEY.to_owned(),
-            // TODO: this is a hack, cause the metadata is just the quantizer metadata
-            // it's all the same for all partitions, so now we store only one copy of it
-            self.metadata[0].clone(),
-        )?;
-        Q::Storage::try_from_batch(batch, self.distance_type)
+        Q::Storage::try_from_batch(batch, self.metadata(), self.distance_type)
     }
 }
