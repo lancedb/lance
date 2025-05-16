@@ -3500,11 +3500,10 @@ class ScannerBuilder:
 
     def strict_batch_size(self, strict_batch_size: bool = False) -> ScannerBuilder:
         """
-        Whether the result returned by the scanner must be of the size of the
-        batch_size.
+        If True, then all batches except the last batch will have exactly `batch_size` rows
         By default, it is false.
-        Mainly, if the result is returned strictly according to the batch_size,
-        batching and waiting are required, and the performance will decrease.
+        If this is true then small batches will need to be merged together which will require
+        a data copy and incur a (typically very small) performance penalty.
         """
         self._strict_batch_size = strict_batch_size
         return self
