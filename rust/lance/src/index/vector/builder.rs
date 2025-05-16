@@ -205,9 +205,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         // step 3. build partitions
         self.build_partitions().await?;
+        self.assert_disk_size(None).await?;
 
         // step 4. merge all partitions
         self.merge_partitions().await?;
+        self.assert_disk_size(Some(0)).await?;
 
         Ok(())
     }
@@ -450,9 +452,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             "quantizer not set before shuffle data",
             location!(),
         ))?;
-        let shuffler = IvfShuffler::new(self.temp_dir.clone(), ivf.num_partitions());
-
-        let code_dim = quantizer.code_dim();
         let transformer = Arc::new(
             lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
                 ivf.centroids.clone().unwrap(),
@@ -488,6 +487,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         };
 
+        let shuffler = IvfShuffler::new(self.temp_dir.clone(), ivf.num_partitions());
         self.shuffle_reader = Some(
             shuffler
                 .shuffle(Box::new(RecordBatchStreamAdapter::new(
@@ -497,28 +497,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 .await?
                 .into(),
         );
-
-        if cfg!(debug_assertions) {
-            let dataset = self.dataset.as_ref().ok_or(Error::invalid_input(
-                "dataset not set before checking shuffled data size",
-                location!(),
-            ))?;
-
-            let num_rows = dataset.count_rows(None).await?;
-            // the shuffled data is with schema | ROW_ID(u64) | PART_ID(u32) | quantized_vector |
-            let expected_size =
-                num_rows * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>() + code_dim);
-            let actual_size = read_dir_size(to_local_path(shuffler.output_dir()))?;
-            // there are some overhead (e.g. metadata), can't expect the size is exactly equal
-            assert!(actual_size > 0);
-            assert!(
-                actual_size < expected_size + expected_size / 10,
-                "shuffled data size is too large: {} > {}",
-                actual_size,
-                expected_size
-            );
+        if ivf.num_partitions() > 1 {
+            self.assert_disk_size(None).await?;
         }
-
         Ok(self)
     }
 
@@ -890,7 +871,50 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(batches)
     }
 
-    async fn assert_disk_size(&self) {}
+    // for testing purpose
+    #[inline(always)]
+    async fn assert_disk_size(&self, expected: Option<usize>) -> Result<()> {
+        // don't check HNSW  for now,
+        // because the size of HNSW index is not deterministic
+        if cfg!(debug_assertions) && S::name() != "HNSW" {
+            let expected = match expected {
+                Some(size) => size,
+                None => {
+                    let dataset = self.dataset.as_ref().ok_or(Error::invalid_input(
+                        "dataset not set before checking shuffled data size",
+                        location!(),
+                    ))?;
+                    let quantizer = self.quantizer.clone().ok_or(Error::invalid_input(
+                        "quantizer not set before checking shuffled data size",
+                        location!(),
+                    ))?;
+
+                    let num_rows = dataset.count_rows(None).await?;
+                    num_rows
+                        * (std::mem::size_of::<u64>()
+                            + std::mem::size_of::<u32>()
+                            + quantizer.code_dim())
+                }
+            };
+            let actual_size = read_dir_size(to_local_path(&self.temp_dir))?;
+            println!(
+                "dir {} size: {}",
+                to_local_path(&self.temp_dir),
+                actual_size
+            );
+            // there are some overhead (e.g. metadata), can't expect the size is exactly equal
+            if expected > 0 {
+                assert!(actual_size > 0);
+            }
+            assert!(
+                actual_size < expected + expected / 10,
+                "shuffled data size is too large: {} > {}",
+                actual_size,
+                expected
+            );
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: QuantizationType) -> String {

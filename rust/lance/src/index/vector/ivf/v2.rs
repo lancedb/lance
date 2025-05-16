@@ -669,7 +669,6 @@ mod tests {
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::DIST_COL;
     use lance_index::{DatasetIndexExt, IndexType};
-    use lance_io::utils::read_dir_size;
     use lance_linalg::distance::{multivec_distance, DistanceType};
     use lance_linalg::kernels::normalize_fsl;
     use lance_testing::datagen::generate_random_array_with_range;
@@ -889,20 +888,11 @@ mod tests {
             None => generate_test_dataset::<T>(test_uri, range).await,
         };
 
-        let rand_path = format!("/tmp/{}", uuid::Uuid::new_v4().to_string());
-        std::env::set_var("TMPDIR", &rand_path);
-        std::fs::create_dir_all(&rand_path).unwrap();
         let vector_column = "vector";
         dataset
             .create_index(&[vector_column], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
-        assert_eq!(
-            read_dir_size(&rand_path).unwrap(),
-            0,
-            "temp files not deleted: {}",
-            rand_path
-        );
 
         let query = vectors.value(0);
         let k = 100;

@@ -23,6 +23,7 @@ use lance_file::v2::{
     writer::FileWriter,
 };
 use lance_io::{
+    local::to_local_path,
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
@@ -196,6 +197,7 @@ impl Shuffler for IvfShuffler {
                     .map(|partition_id| {
                         let part_path =
                             self.output_dir.child(format!("ivf_{}.lance", partition_id));
+                        println!("shuffle write to {}", to_local_path(&part_path));
                         let object_store = self.object_store.clone();
                         let schema = schema.clone();
                         async move {
