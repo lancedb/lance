@@ -3860,7 +3860,7 @@ impl PrimitiveStructuralEncoder {
         Ok(EncodedPage {
             column_idx,
             data: vec![],
-            description: PageEncoding::Structural(description),
+            description: PageEncoding::Structural(description.into()),
             num_rows,
             row_number,
         })
@@ -3894,7 +3894,7 @@ impl PrimitiveStructuralEncoder {
         Ok(EncodedPage {
             column_idx,
             data: vec![rep_bytes, def_bytes],
-            description: PageEncoding::Structural(description),
+            description: PageEncoding::Structural(description.into()),
             num_rows,
             row_number,
         })
@@ -4010,7 +4010,7 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 column_idx,
                 data,
-                description: PageEncoding::Structural(description),
+                description: PageEncoding::Structural(description.into()),
                 row_number,
             })
         } else {
@@ -4037,7 +4037,7 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 column_idx,
                 data,
-                description: PageEncoding::Structural(description),
+                description: PageEncoding::Structural(description.into()),
                 row_number,
             })
         }
@@ -4301,7 +4301,7 @@ impl PrimitiveStructuralEncoder {
             num_rows: num_lists,
             column_idx,
             data,
-            description: PageEncoding::Structural(description),
+            description: PageEncoding::Structural(description.into()),
             row_number,
         })
     }

@@ -274,7 +274,7 @@ const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 #[derive(Debug)]
 pub enum PageEncoding {
     Legacy(pb::ArrayEncoding),
-    Structural(pb::PageLayout),
+    Structural(Box<pb::PageLayout>),
 }
 
 impl PageEncoding {
