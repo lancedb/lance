@@ -208,7 +208,6 @@ impl ProductQuantizationStorage {
             .into();
 
         if !transposed {
-            println!("try transpose pq code");
             let num_sub_vectors_in_byte = if num_bits == 4 {
                 num_sub_vectors / 2
             } else {

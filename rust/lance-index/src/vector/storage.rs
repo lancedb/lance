@@ -3,14 +3,9 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
-use std::collections::HashMap;
-use std::{any::Any, sync::Arc};
-
 use crate::vector::quantizer::{QuantizationMetadata, QuantizerStorage};
-use arrow::array::AsArray;
 use arrow::compute::concat_batches;
-use arrow::datatypes::UInt64Type;
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
@@ -22,6 +17,7 @@ use lance_io::ReadBatchParams;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
 use snafu::location;
+use std::{any::Any, sync::Arc};
 
 use crate::{
     pb,
@@ -156,15 +152,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
         debug_assert!(batch.column_by_name(ROW_ID).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
-        Q::Storage::try_from_batch(
-            batch,
-            &self.quantizer.metadata(Some(QuantizationMetadata {
-                codebook_position: Some(0),
-                codebook: None,
-                transposed: true,
-            })),
-            self.distance_type,
-        )
+        Q::Storage::try_from_batch(batch, &self.quantizer.metadata(None), self.distance_type)
     }
 }
 
@@ -233,7 +221,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             message: "metadata is empty".to_string(),
             location: location!(),
         })?;
-        println!("load metadata: {}", metadata);
         let mut metadata: Q::Metadata = serde_json::from_str(&metadata)?;
         // we store large metadata (e.g. PQ codebook) in global buffer,
         // and the schema metadata just contains a pointer to the buffer

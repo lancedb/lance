@@ -821,7 +821,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             metadata.set_buffer_index(idx);
         }
         let metadata = serde_json::to_string(&metadata)?;
-        println!("metadata: {}", metadata);
         let storage_partition_metadata = vec![metadata];
         storage_writer.add_schema_metadata(
             STORAGE_METADATA_KEY,
