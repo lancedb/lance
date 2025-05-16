@@ -41,8 +41,6 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev
       # pin the toolchain version to avoid surprises
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
       - uses: rui314/setup-mold@v1
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
