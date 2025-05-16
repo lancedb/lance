@@ -358,7 +358,10 @@ impl Dataset {
             if let Some(user_agent) = storage_options.get_mut("user_agent") {
                 user_agent.push_str(&format!(" pylance/{}", env!("CARGO_PKG_VERSION")));
             } else {
-                storage_options.insert("user_agent".to_string(), format!("pylance/{}", env!("CARGO_PKG_VERSION")));
+                storage_options.insert(
+                    "user_agent".to_string(),
+                    format!("pylance/{}", env!("CARGO_PKG_VERSION")),
+                );
             }
 
             builder = builder.with_storage_options(storage_options);
