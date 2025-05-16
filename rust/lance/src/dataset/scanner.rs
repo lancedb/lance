@@ -657,9 +657,10 @@ impl Scanner {
 
     /// Set whether to use strict batch size.
     ///
-    /// Default, the scanner won't strictly return a batch of rows that is the same size as the batch size.
-    /// If strict_batch_size is set to true, the scanner will return a batch of rows that is the same size as the batch size.
-    /// It is mainly considered from the perspective of performance.
+    /// If this is true then output batches (except the last batch) will have exactly `batch_size` rows.
+    /// By default, this is False and output batches are allowed to have fewer than `batch_size` rows
+    /// Setting this to True will require us to merge batches, incurring a data copy, for a minor performance
+    /// penalty.
     pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
         self.strict_batch_size = strict_batch_size;
         self
