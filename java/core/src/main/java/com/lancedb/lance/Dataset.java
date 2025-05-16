@@ -29,6 +29,7 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.ByteArrayInputStream;
@@ -303,6 +304,34 @@ public class Dataset implements Closeable {
 
   private native void nativeAddColumnsByReader(
       long arrowStreamMemoryAddress, Optional<Long> batchSize);
+
+  /**
+   * Add columns to the dataset.
+   *
+   * @param schema The Arrow schema definitions to add columns.
+   */
+  public void addColumns(Schema schema) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(schema != null, "Schema is empty");
+      try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportSchema(allocator, schema, null, arrowSchema);
+        nativeAddColumnsBySchema(arrowSchema.memoryAddress());
+      }
+    }
+  }
+
+  /**
+   * Add columns to the dataset.
+   *
+   * @param fields The Arrow field definitions to add columns.
+   */
+  public void addColumns(List<Field> fields) {
+    Preconditions.checkArgument(fields != null && !fields.isEmpty(), "Fields are empty");
+    addColumns(new Schema(fields));
+  }
+
+  private native void nativeAddColumnsBySchema(long schemaPtr);
 
   /**
    * Drop columns from the dataset.
