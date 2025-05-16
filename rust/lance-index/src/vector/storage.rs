@@ -3,7 +3,7 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
-use crate::vector::quantizer::{QuantizationMetadata, QuantizerStorage};
+use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
@@ -216,6 +216,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 })?
                 .as_str(),
         )?;
+        debug_assert_eq!(metadata.len(), 1);
         // for now the metadata is the same for all partitions, so we just store one
         let metadata = metadata.pop().ok_or(Error::Index {
             message: "metadata is empty".to_string(),
