@@ -692,6 +692,7 @@ mod tests {
 
     use crate::dataset::{UpdateBuilder, WriteParams};
     use crate::index::DatasetIndexInternalExt;
+    use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         dataset::optimize::{compact_files, CompactionOptions},
         index::vector::{is_ivf_pq, IndexFileVersion},
@@ -1853,5 +1854,23 @@ mod tests {
         writer.finish_with_metadata(metadata).await?;
         obj_store.delete(&copied_path).await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pq_storage_backwards_compat() {
+        let test_dir = copy_test_data_to_tmp("v0.27.1/pq_in_schema").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Just make sure we can query the index.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let query_vec = Float32Array::from(vec![0_f32; 32]);
+        let search_result = dataset
+            .scan()
+            .nearest("vec", &query_vec, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(search_result.num_rows(), 5);
     }
 }

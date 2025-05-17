@@ -5,7 +5,9 @@
 
 from pathlib import Path
 
+import lance
 import pyarrow as pa
+import pyarrow.compute as pc
 from lance.file import LanceFileWriter
 
 
@@ -90,6 +92,33 @@ def write_large():
     path = get_path("large.lance")
     with LanceFileWriter(str(path)) as writer:
         writer.write_batch(build_large())
+
+
+def write_dataset_pq_buffer():
+    # In https://github.com/lancedb/lance/pull/3829, we started storing the PQ
+    # codebook in a global buffer instead of the schema metadata as JSON. However,
+    # for forward compatibility, we still write out the codebook in the
+    # metadata as JSON.
+
+    ndims = 32
+    nvecs = 512
+
+    data = pa.table(
+        {
+            "id": pa.array(range(nvecs)),
+            "vec": pa.FixedSizeListArray.from_arrays(
+                pc.random(ndims * nvecs).cast(pa.float32()), ndims
+            ),
+        }
+    )
+
+    dataset = lance.write_dataset(data, get_path("pq_in_schema"))
+    dataset.create_index(
+        "vec",
+        "IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=4,
+    )
 
 
 if __name__ == "__main__":

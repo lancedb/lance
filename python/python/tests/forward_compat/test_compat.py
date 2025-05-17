@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import lance
+import pyarrow.compute as pc
 import pytest
 from lance.file import LanceFileReader
 
@@ -18,3 +20,15 @@ def test_scans():
     expected_large = build_large()
     actual_large = LanceFileReader(str(get_path("large.lance"))).read_all().to_table()
     assert actual_large.equals(expected_large)
+
+
+@pytest.mark.forward
+def test_pq_buffer():
+    ds = lance.dataset(get_path("pq_in_schema"))
+    q = pc.random(32).cast("float32")
+    ds.to_table(
+        nearest={
+            "q": q,
+            "k": 4,
+        }
+    )
