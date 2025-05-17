@@ -232,6 +232,7 @@ def test_to_batches_with_partial_last_batch(tmp_path: Path):
     for batch in ds.to_batches(batch_size=8, strict_batch_size=True):
         assert batch.num_rows == 8
 
+
 def test_schema_metadata(tmp_path: Path):
     schema = pa.schema(
         [

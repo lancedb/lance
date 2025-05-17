@@ -42,7 +42,7 @@ use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
 use super::utils::IoMetrics;
-use std::collections::VecDeque;
+use futures::ready;
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -84,6 +84,124 @@ impl ScanMetrics {
     }
 }
 
+struct StrictBatchSizeStream<S> {
+    inner: S,
+    batch_size: usize,
+    residual: Option<RecordBatch>,
+}
+
+/// Internal polling method for strict batch size enforcement.
+///
+/// # Use Case
+/// When precise batch sizing is required (e.g., ML batch processing), this method guarantees
+/// output batches exactly match batch_size until final partial batch. Maintains data integrity
+/// across splits using row-aware splitting.
+///
+/// # Example
+/// With batch_size=5 and input sequence:
+/// - Fragment 1: 7 rows → splits into [5,2]
+///   (queues 5, carries 2)
+/// - Fragment 2: 4 rows → combines carried 2 + 4 = 6
+///   splits into [5,1]
+///
+/// - Output batches: [5], [5], [1]
+impl<S> Stream for StrictBatchSizeStream<S>
+where
+    S: Stream<Item = Result<RecordBatch, DataFusionError>> + Unpin,
+{
+    type Item = Result<RecordBatch, DataFusionError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            // Process residual first if present
+            if let Some(residual) = self.residual.take() {
+                if residual.num_rows() >= self.batch_size {
+                    let split_at = self.batch_size;
+                    let chunk = residual.slice(0, split_at);
+                    let new_residual = residual.slice(split_at, residual.num_rows() - split_at);
+                    self.residual = Some(new_residual);
+                    return Poll::Ready(Some(Ok(chunk)));
+                } else {
+                    // Keep residual and proceed to get more data
+                    self.residual = Some(residual);
+                }
+            }
+
+            // Poll the inner stream for next batch
+            match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
+                Some(Ok(batch)) => {
+                    // Combine with residual if any
+                    let current_batch = if let Some(residual) = self.residual.take() {
+                        arrow::compute::concat_batches(&residual.schema(), &[residual, batch])
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?
+                    } else {
+                        batch
+                    };
+
+                    if current_batch.num_rows() >= self.batch_size {
+                        let split_at = self.batch_size;
+                        let chunk = current_batch.slice(0, split_at);
+                        let new_residual =
+                            current_batch.slice(split_at, current_batch.num_rows() - split_at);
+                        if new_residual.num_rows() > 0 {
+                            self.residual = Some(new_residual);
+                        }
+                        return Poll::Ready(Some(Ok(chunk)));
+                    } else {
+                        // Not enough rows, store as residual
+                        self.residual = Some(current_batch);
+                        continue;
+                    }
+                }
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                None => {
+                    return Poll::Ready(
+                        self.residual
+                            .take()
+                            .filter(|r| r.num_rows() > 0)
+                            .map(Ok::<_, DataFusionError>),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Default behavior
+/// polling method for non-strict batch size mode.
+///
+/// # Use Case
+/// When strict batch size is disabled, this method allows natural batch sizes from storage,
+/// concatenating residuals across fragments. Ideal for streaming scenarios prioritizing throughput
+/// over consistent batch sizes.
+///
+/// # Example
+/// With batch_size=5 and a fragment containing 7 rows:
+/// Output batches: [5 rows], [2 rows]
+/// Next fragment with 4 rows won't combine residuals with the next fragment.:
+/// Output batches: [4 rows]
+impl Stream for LanceStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let timer = this.scan_metrics.baseline_metrics.elapsed_compute().timer();
+
+        let poll_result = match this.inner_stream.poll_next_unpin(cx) {
+            Poll::Ready(None) => {
+                if let Some(scheduler) = &this.scan_scheduler {
+                    this.scan_metrics.io_metrics.record_final(scheduler);
+                }
+                Poll::Ready(None)
+            }
+            other => other,
+        };
+
+        timer.done();
+        this.scan_metrics.baseline_metrics.record_poll(poll_result)
+    }
+}
+
 /// Dataset Scan Node.
 pub struct LanceStream {
     inner_stream: stream::BoxStream<'static, Result<RecordBatch>>,
@@ -99,17 +217,6 @@ pub struct LanceStream {
     ///
     /// Only set on v2 scans.  Used to record scan metrics.
     scan_scheduler: Option<Arc<ScanScheduler>>,
-    /// Residual rows carried over from previous batches that couldn't form a complete batch.
-    /// This accumulates partial rows from the end of fragment reads to combine with subsequent data.
-    /// For example, if a fragment has 7 rows and batch_size is 5, this would hold the remaining 2 rows
-    /// to be combined with the next fragment's data.
-    residual_batch: Option<RecordBatch>,
-    /// Pre-split batches queue for strict batch size mode.
-    /// When strict_batch_size is enabled, this maintains perfectly sized batches that exactly match
-    /// the configured batch_size. Serves as a buffer for completed batches ready for immediate return.
-    /// For example, if input batches come in sizes of 15 rows with batch_size=5, this queue would hold
-    /// three pre-split batches of 5 rows each.
-    pending_batches: VecDeque<RecordBatch>,
 }
 
 impl LanceStream {
@@ -310,15 +417,25 @@ impl LanceStream {
             .stream_in_current_span()
             .boxed();
 
+        // Apply strict batch size wrapping if needed
+        let inner_stream = if config.strict_batch_size {
+            let strict_stream = StrictBatchSizeStream {
+                inner: batches,
+                batch_size: config.batch_size,
+                residual: None,
+            };
+            strict_stream.boxed()
+        } else {
+            batches
+        };
+
         timer.done();
         Ok(Self {
-            inner_stream: batches,
+            inner_stream,
             projection,
             config,
             scan_metrics,
             scan_scheduler: Some(scan_scheduler_clone),
-            residual_batch: None,
-            pending_batches: VecDeque::new(),
         })
     }
 
@@ -347,7 +464,7 @@ impl LanceStream {
             .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
             .collect::<Vec<_>>();
 
-        let inner_stream = if config.ordered_output {
+        let batches = if config.ordered_output {
             let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
                     Ok(open_file(
@@ -408,9 +525,17 @@ impl LanceStream {
                 .boxed()
         };
 
-        let inner_stream = inner_stream
-            .map(|batch| batch.map_err(DataFusionError::from))
-            .boxed();
+        let inner_stream = if config.strict_batch_size {
+            let strict_stream = StrictBatchSizeStream {
+                inner: batches.map_err(|e| DataFusionError::External(Box::new(e))),
+                batch_size: config.batch_size,
+                residual: None,
+            };
+            Box::pin(strict_stream) as Pin<Box<dyn Stream<Item = Result<_, _>> + Send>>
+        } else {
+            Box::pin(batches.map_err(|e| DataFusionError::External(Box::new(e))))
+                as Pin<Box<dyn Stream<Item = Result<_, _>> + Send>>
+        };
 
         timer.done();
         Ok(Self {
@@ -419,120 +544,7 @@ impl LanceStream {
             config,
             scan_metrics,
             scan_scheduler: None,
-            residual_batch: None,
-            pending_batches: VecDeque::new(),
         })
-    }
-
-    fn split_record_batch(batch: &RecordBatch, split_at: usize) -> (RecordBatch, RecordBatch) {
-        let left = batch.slice(0, split_at);
-        let right = batch.slice(split_at, batch.num_rows() - split_at);
-
-        log::debug!(
-            "Splitting batch[{}] => ({}, {})",
-            batch.num_rows(),
-            left.num_rows(),
-            right.num_rows()
-        );
-
-        (left, right)
-    }
-
-    /// Default behavior
-    /// polling method for non-strict batch size mode.
-    ///
-    /// # Use Case
-    /// When strict batch size is disabled, this method allows natural batch sizes from storage,
-    /// concatenating residuals across fragments. Ideal for streaming scenarios prioritizing throughput
-    /// over consistent batch sizes.
-    ///
-    /// # Example
-    /// With batch_size=5 and a fragment containing 7 rows:
-    /// Output batches: [5 rows], [2 rows]
-    /// Next fragment with 4 rows won't combine residuals with the next fragment.:
-    /// Output batches: [4 rows]
-    fn poll_next_no_strict_batch_size(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<RecordBatch, DataFusionError>>> {
-        let this = self.get_mut();
-        let timer = this.scan_metrics.baseline_metrics.elapsed_compute().timer();
-
-        let poll_result = Pin::new(&mut this.inner_stream).poll_next(cx);
-
-        if matches!(poll_result, Poll::Ready(None)) {
-            if let Some(scan_scheduler) = this.scan_scheduler.as_ref() {
-                this.scan_metrics.io_metrics.record_final(scan_scheduler);
-            }
-        }
-
-        timer.done();
-        this.scan_metrics.baseline_metrics.record_poll(poll_result)
-    }
-
-    /// Internal polling method for strict batch size enforcement.
-    ///
-    /// # Use Case
-    /// When precise batch sizing is required (e.g., ML batch processing), this method guarantees
-    /// output batches exactly match batch_size until final partial batch. Maintains data integrity
-    /// across splits using row-aware splitting.
-    ///
-    /// # Example
-    /// With batch_size=5 and input sequence:
-    /// - Fragment 1: 7 rows → splits into [5,2]
-    ///   (queues 5, carries 2)
-    /// - Fragment 2: 4 rows → combines carried 2 + 4 = 6
-    ///   splits into [5,1]
-    ///
-    /// - Output batches: [5], [5], [1]
-    fn poll_next_strict_batch_size(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<RecordBatch, DataFusionError>>> {
-        let this = self.get_mut();
-        use futures::ready;
-
-        loop {
-            // 1. Prioritize processing pending_batches queue first
-            if let Some(batch) = this.pending_batches.pop_front() {
-                return Poll::Ready(Some(Ok(batch)));
-            }
-
-            // 2. Process next batch from stream
-            match ready!(Pin::new(&mut this.inner_stream).poll_next(cx)) {
-                Some(Ok(mut new_batch)) => {
-                    // Concatenate residual batches
-                    if let Some(residual) = this.residual_batch.take() {
-                        new_batch = arrow::compute::concat_batches(
-                            &residual.schema(),
-                            &[residual, new_batch],
-                        )
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    }
-
-                    // Split and fill pending_batches queue
-                    while new_batch.num_rows() >= this.config.batch_size {
-                        let split_at = this.config.batch_size;
-                        let (complete, residual) = Self::split_record_batch(&new_batch, split_at);
-                        this.pending_batches.push_back(complete);
-                        new_batch = residual;
-                    }
-
-                    // Store remaining partial batch for next iteration
-                    this.residual_batch = Some(new_batch);
-                    continue;
-                }
-                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                None => {
-                    // Handle final residual when stream ends
-                    return if let Some(final_batch) = this.residual_batch.take() {
-                        Poll::Ready(Some(Ok(final_batch)))
-                    } else {
-                        Poll::Ready(None)
-                    };
-                }
-            }
-        }
     }
 }
 
@@ -556,18 +568,6 @@ impl RecordBatchStream for LanceStream {
             schema = schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
         }
         Arc::new(schema)
-    }
-}
-
-impl Stream for LanceStream {
-    type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.config.strict_batch_size {
-            self.poll_next_strict_batch_size(cx)
-        } else {
-            self.poll_next_no_strict_batch_size(cx)
-        }
     }
 }
 
