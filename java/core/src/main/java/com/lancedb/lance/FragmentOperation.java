@@ -86,4 +86,32 @@ public abstract class FragmentOperation {
       }
     }
   }
+
+  /** Fragment merge operation. */
+  public static class Merge extends FragmentOperation {
+    private final List<FragmentMetadata> fragments;
+    private final Schema schema;
+
+    public Merge(List<FragmentMetadata> fragments, Schema schema) {
+      validateFragments(fragments);
+      this.fragments = fragments;
+      this.schema = schema;
+    }
+
+    @Override
+    public Dataset commit(
+        BufferAllocator allocator,
+        String path,
+        Optional<Long> readVersion,
+        Map<String, String> storageOptions) {
+      Preconditions.checkNotNull(allocator);
+      Preconditions.checkNotNull(path);
+      Preconditions.checkNotNull(readVersion);
+      try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportSchema(allocator, schema, null, arrowSchema);
+        return Dataset.commitMerge(
+            path, arrowSchema.memoryAddress(), readVersion, fragments, storageOptions);
+      }
+    }
+  }
 }

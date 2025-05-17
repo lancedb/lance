@@ -456,6 +456,67 @@ pub fn inner_commit_overwrite<'local>(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_commitMerge<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    path: JString,
+    arrow_schema_addr: jlong,
+    read_version_obj: JObject,    // Optional<Long>
+    fragments_obj: JObject,       // List<FragmentMetadata>
+    storage_options_obj: JObject, // Map<String, String>
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_commit_merge(
+            &mut env,
+            path,
+            arrow_schema_addr,
+            read_version_obj,
+            fragments_obj,
+            storage_options_obj
+        )
+    )
+}
+
+pub fn inner_commit_merge<'local>(
+    env: &mut JNIEnv<'local>,
+    path: JString,
+    arrow_schema_addr: jlong,
+    read_version_obj: JObject,    // Optional<Long>
+    fragments_obj: JObject,       // List<FragmentMetadata>
+    storage_options_obj: JObject, // Map<String, String>
+) -> Result<JObject<'local>> {
+    let fragment_objs = import_vec(env, &fragments_obj)?;
+    let mut fragments = Vec::with_capacity(fragment_objs.len());
+    for f in fragment_objs {
+        fragments.push(f.extract_object(env)?);
+    }
+    let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
+    let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
+    let arrow_schema = Schema::try_from(&c_schema)?;
+    let schema = LanceSchema::try_from(&arrow_schema)?;
+
+    let op = Operation::Merge { fragments, schema };
+    let path_str = path.extract(env)?;
+    let read_version = env.get_u64_opt(&read_version_obj)?;
+    let jmap = JMap::from_env(env, &storage_options_obj)?;
+    let storage_options: HashMap<String, String> = env.with_local_frame(16, |env| {
+        let mut map = HashMap::new();
+        let mut iter = jmap.iter(env)?;
+        while let Some((key, value)) = iter.next(env)? {
+            let key_jstring = JString::from(key);
+            let value_jstring = JString::from(value);
+            let key_string: String = env.get_string(&key_jstring)?.into();
+            let value_string: String = env.get_string(&value_jstring)?.into();
+            map.insert(key_string, value_string);
+        }
+        Ok::<_, Error>(map)
+    })?;
+    let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options)?;
+    dataset.into_java(env)
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_releaseNativeDataset(
     mut env: JNIEnv,
     obj: JObject,
@@ -1119,4 +1180,18 @@ fn inner_add_columns_by_reader(
     RT.block_on(dataset_guard.inner.add_columns(transform, None, batch_size))?;
 
     Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_getMaxFieldIdNative(
+    mut env: JNIEnv,
+    _jdataset: JObject,
+) -> jint {
+    ok_or_throw_with_return!(env, inner_get_max_field_id(&mut env, _jdataset), -1) as jint
+}
+
+fn inner_get_max_field_id(env: &mut JNIEnv, _jdataset: JObject) -> Result<jint> {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(_jdataset, NATIVE_DATASET) }?;
+    Ok(dataset_guard.inner.manifest().max_field_id() as jint)
 }
