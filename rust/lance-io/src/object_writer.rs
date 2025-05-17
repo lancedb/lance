@@ -230,7 +230,9 @@ impl ObjectWriter {
                             upload,
                         };
                     }
-                    Poll::Ready(Err(e)) => return Err(std::io::Error::other(e)),
+                    Poll::Ready(Err(e)) => {
+                        return Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    }
                     Poll::Pending => break,
                 },
                 UploadState::InProgress {
@@ -239,7 +241,9 @@ impl ObjectWriter {
                     while let Poll::Ready(Some(res)) = futures.poll_join_next(cx) {
                         match res {
                             Ok(Ok(())) => {}
-                            Err(err) => return Err(std::io::Error::other(err)),
+                            Err(err) => {
+                                return Err(std::io::Error::new(std::io::ErrorKind::Other, err))
+                            }
                             Ok(Err(UploadPutError {
                                 source: OSError::Generic { source, .. },
                                 part_idx,
@@ -288,7 +292,9 @@ impl ObjectWriter {
                             res.size = mut_self.cursor;
                             mut_self.state = UploadState::Done(res)
                         }
-                        Poll::Ready(Err(e)) => return Err(std::io::Error::other(e)),
+                        Poll::Ready(Err(e)) => {
+                            return Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+                        }
                         Poll::Pending => break,
                     }
                 }

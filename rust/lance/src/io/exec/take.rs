@@ -315,7 +315,7 @@ impl DisplayAs for TakeExec {
                         if extra_fields.contains(name) {
                             format!("({})", name)
                         } else {
-                            name.clone()
+                            name.to_string()
                         }
                     })
                     .collect::<Vec<_>>()

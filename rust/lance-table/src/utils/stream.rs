@@ -123,8 +123,10 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
     // and thus not deleted.
     let mask_buffer = NullBuffer::new(mask.values().clone());
 
-    if mask_buffer.null_count() == 0 {
-        return Ok(batch);
+    match mask_buffer.null_count() {
+        // No rows are deleted
+        0 => return Ok(batch),
+        _ => {}
     }
 
     // For each column convert to data

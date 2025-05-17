@@ -818,7 +818,7 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 let bit_widths = bit_widths.as_primitive::<UInt64Type>();
                 // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
                 // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
-                let has_all_zeros = bit_widths.values().contains(&0);
+                let has_all_zeros = bit_widths.values().iter().any(|v| *v == 0);
                 // The minimum bit packing size is a block of 1024 values.  For very small pages the uncompressed
                 // size might be smaller than the compressed size.
                 let too_small = bit_widths.len() == 1

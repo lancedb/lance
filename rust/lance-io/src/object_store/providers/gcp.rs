@@ -44,7 +44,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
         let token_key = "google_storage_token";
         if let Some(storage_token) = storage_options.get(token_key) {
             let credential = GcpCredential {
-                bearer: storage_token.clone(),
+                bearer: storage_token.to_string(),
             };
             let credential_provider = Arc::new(StaticCredentialProvider::new(credential)) as _;
             builder = builder.with_credentials(credential_provider);

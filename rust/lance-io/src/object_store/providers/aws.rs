@@ -195,9 +195,15 @@ pub async fn build_aws_credential(
 fn extract_static_s3_credentials(
     options: &HashMap<AmazonS3ConfigKey, String>,
 ) -> Option<StaticCredentialProvider<ObjectStoreAwsCredential>> {
-    let key_id = options.get(&AmazonS3ConfigKey::AccessKeyId).cloned();
-    let secret_key = options.get(&AmazonS3ConfigKey::SecretAccessKey).cloned();
-    let token = options.get(&AmazonS3ConfigKey::Token).cloned();
+    let key_id = options
+        .get(&AmazonS3ConfigKey::AccessKeyId)
+        .map(|s| s.to_string());
+    let secret_key = options
+        .get(&AmazonS3ConfigKey::SecretAccessKey)
+        .map(|s| s.to_string());
+    let token = options
+        .get(&AmazonS3ConfigKey::Token)
+        .map(|s| s.to_string());
     match (key_id, secret_key, token) {
         (Some(key_id), Some(secret_key), token) => {
             Some(StaticCredentialProvider::new(ObjectStoreAwsCredential {
