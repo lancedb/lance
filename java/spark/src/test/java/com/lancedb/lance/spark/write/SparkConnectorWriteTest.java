@@ -18,63 +18,18 @@ import com.lancedb.lance.spark.LanceDataSource;
 
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
-import org.apache.spark.sql.RowFactory;
-import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException;
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException;
-import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
-import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
-import java.nio.file.Path;
-import java.util.Arrays;
-import java.util.List;
 
 import static org.apache.spark.sql.functions.col;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-public class SparkWriteTest {
-  private static SparkSession spark;
-  private static Dataset<Row> testData;
-  @TempDir static Path dbPath;
-
-  @BeforeAll
-  static void setup() {
-    spark =
-        SparkSession.builder()
-            .appName("spark-lance-connector-test")
-            .master("local")
-            .config("spark.sql.catalog.lance", "com.lancedb.lance.spark.LanceCatalog")
-            .config("spark.sql.catalog.lance.max_row_per_file", "1")
-            .getOrCreate();
-    StructType schema =
-        new StructType(
-            new StructField[] {
-              DataTypes.createStructField("id", DataTypes.IntegerType, false),
-              DataTypes.createStructField("name", DataTypes.StringType, false)
-            });
-
-    Row row1 = RowFactory.create(1, "Alice");
-    Row row2 = RowFactory.create(2, "Bob");
-    List<Row> data = Arrays.asList(row1, row2);
-
-    testData = spark.createDataFrame(data, schema);
-    testData.createOrReplaceTempView("tmp_view");
-  }
-
-  @AfterAll
-  static void tearDown() {
-    if (spark != null) {
-      spark.stop();
-    }
-  }
+public class SparkConnectorWriteTest extends SparkConnectorWriteTestBase {
 
   @Test
   public void defaultWrite(TestInfo testInfo) {
@@ -276,6 +231,20 @@ public class SparkWriteTest {
     String path = LanceConfig.getDatasetUri(dbPath.toString(), datasetName);
     spark.sql("CREATE OR REPLACE TABLE lance.`" + path + "` AS SELECT * FROM tmp_view");
     spark.sql("CREATE OR REPLACE TABLE lance.`" + path + "` AS SELECT * FROM tmp_view");
+    spark.sql("DROP TABLE lance.`" + path + "`");
+  }
+
+  @Test
+  public void appendAndSelectData(TestInfo testInfo) {
+    String datasetName = testInfo.getTestMethod().get().getName();
+    String path = LanceConfig.getDatasetUri(dbPath.toString(), datasetName);
+    spark.sql("CREATE OR REPLACE TABLE lance.`" + path + "` AS SELECT * FROM tmp_view");
+
+    //    Dataset<Row> data = spark.sql("SELECT * FROM lance.`" + path + "`");
+    //    assertEquals(2, data.count());
+    spark.sql("INSERT INTO TABLE lance.`" + path + "` VALUES (3, 'Charlie')");
+    Dataset<Row> data = spark.sql("SELECT * FROM lance.`" + path + "`");
+    assertEquals(3, data.count());
     spark.sql("DROP TABLE lance.`" + path + "`");
   }
 }
