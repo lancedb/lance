@@ -124,3 +124,4 @@ def write_dataset_pq_buffer():
 if __name__ == "__main__":
     write_basic_types()
     write_large()
+    write_dataset_pq_buffer()
