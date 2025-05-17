@@ -172,24 +172,35 @@ pub fn compute_projection<'a>(
                             schema
                         ))
                     })?;
-                let DataType::Struct(input_fields) = original_field.data_type() else {
-                    return Err(DataFusionError::Internal(
-                        "compute_projection: expected struct".to_string(),
-                    ));
-                };
+                match original_field.data_type() {
+                    DataType::Struct(input_fields) => {
+                        let sub_selections = compute_projection(input_fields, fields)?;
 
-                let sub_selections = compute_projection(input_fields, fields)?;
-                if fields.len() == input_fields.len()
-                    && sub_selections
-                        .iter()
-                        .all(|s| matches!(s, Selection::FullField(_)))
-                {
-                    selections.push(Selection::FullField(projected_field.name()));
-                } else {
-                    selections.push(Selection::StructProjection(
-                        projected_field.name(),
-                        sub_selections,
-                    ));
+                        if fields.len() == input_fields.len()
+                            && sub_selections
+                                .iter()
+                                .all(|s| matches!(s, Selection::FullField(_)))
+                        {
+                            selections.push(Selection::FullField(projected_field.name()));
+                        } else {
+                            selections.push(Selection::StructProjection(
+                                projected_field.name(),
+                                sub_selections,
+                            ));
+                        }
+                    }
+                    DataType::LargeBinary => {
+                        // This can happen when loading blob fields.  The projection we load from disk
+                        // is the blob description (struct) but the actual result / schema field is large_binary
+                        selections.push(Selection::FullField(projected_field.name()));
+                    }
+                    _ => {
+                        return Err(DataFusionError::Internal(format!(
+                            "Field '{}' expected struct or LargeBinary, found {:?}",
+                            original_field.name(),
+                            original_field.data_type()
+                        )));
+                    }
                 }
             }
             _ => {
