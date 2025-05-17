@@ -652,7 +652,7 @@ mod tests {
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, FixedSizeListArray, Float32Array,
-        ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
+        Int64Array, ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -1874,7 +1874,38 @@ mod tests {
             .unwrap();
         assert_eq!(search_result.num_rows(), 5);
 
-        let pq_meta: ProductQuantizationMetadata = todo!("get this");
+        let obj_store = Arc::new(ObjectStore::local());
+        let scheduler =
+            ScanScheduler::new(obj_store.clone(), SchedulerConfig::default_for_testing());
+
+        async fn get_pq_metadata(
+            dataset: &Dataset,
+            scheduler: Arc<ScanScheduler>,
+        ) -> ProductQuantizationMetadata {
+            let index = dataset.load_indices().await.unwrap();
+            let index_path = dataset.indices_dir().child(index[0].uuid.to_string());
+            let file_scheduler = scheduler
+                .open_file(
+                    &index_path.child(INDEX_AUXILIARY_FILE_NAME),
+                    &CachedFileSize::unknown(),
+                )
+                .await
+                .unwrap();
+            let reader = FileReader::try_open(
+                file_scheduler,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &FileMetadataCache::no_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            let metadata = reader.schema().metadata.get(STORAGE_METADATA_KEY).unwrap();
+            serde_json::from_str(&serde_json::from_str::<Vec<String>>(metadata).unwrap()[0])
+                .unwrap()
+        }
+        let pq_meta: ProductQuantizationMetadata =
+            get_pq_metadata(&dataset, scheduler.clone()).await;
         assert!(pq_meta.buffer_index().is_none());
 
         // If we add data and optimize indices, then we start using the global
@@ -1882,8 +1913,11 @@ mod tests {
         let new_data = RecordBatch::try_new(
             Arc::new(Schema::from(dataset.schema())),
             vec![
-                Arc::new(UInt64Array::from(vec![0])),
-                Arc::new(Float32Array::from(vec![0_f32; 32])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 32]), 32)
+                        .unwrap(),
+                ),
             ],
         )
         .unwrap();
@@ -1897,7 +1931,8 @@ mod tests {
             .unwrap();
         dataset.optimize_indices(&Default::default()).await.unwrap();
 
-        let pq_meta: ProductQuantizationMetadata = todo!("get this");
+        let pq_meta: ProductQuantizationMetadata =
+            get_pq_metadata(&dataset, scheduler.clone()).await;
         assert!(pq_meta.buffer_index().is_some());
     }
 }
