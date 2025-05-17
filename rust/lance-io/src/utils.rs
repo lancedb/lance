@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{cmp::min, num::NonZero, sync::atomic::AtomicU64};
+use std::{cmp::min, num::NonZero, path::Path, sync::atomic::AtomicU64};
 
 use arrow_array::{
     types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
@@ -171,6 +171,26 @@ pub fn read_struct_from_buf<
 ) -> Result<T> {
     let msg: M = read_message_from_buf(buf)?;
     T::try_from(msg)
+}
+
+/// Read the size of given directory.
+pub fn read_dir_size(path: impl AsRef<Path>) -> Result<usize> {
+    let path = path.as_ref();
+    let mut entries = std::fs::read_dir(path)
+        .map_err(|e| Error::io(format!("{:?}:{:?}", e, path), location!()))?;
+    let mut size = 0;
+    while let Some(entry) = entries.next() {
+        let entry = entry.map_err(|e| Error::io(e.to_string(), location!()))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|e| Error::io(e.to_string(), location!()))?;
+        if metadata.is_file() {
+            size += metadata.len() as usize;
+        } else if metadata.is_dir() {
+            size += read_dir_size(entry.path())?;
+        }
+    }
+    Ok(size)
 }
 
 /// A cached file size.
