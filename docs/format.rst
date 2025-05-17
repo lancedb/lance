@@ -264,6 +264,63 @@ Would be represented as the following field list:
      - 2
      - ``"int32"``
 
+* Field Encoding Specification
+
+Column-level encoding configurations are specified through PyArrow field metadata:
+
+.. code-block::
+
+    import pyarrow as pa
+
+    schema = pa.schema([
+        pa.field(
+            "compressible_strings",
+            pa.string(),
+            metadata={
+                "lance-encoding:compression": "zstd",
+                "lance-encoding:compression-level": "3",
+                "lance-encoding:structural-encoding": "miniblock",
+                "lance-encoding:packed": "true"
+            }
+        )
+    ])
+
+
+.. list-table::
+   :widths: 20 20 20 20 25
+   :header-rows: 1
+
+   * - Metadata Key
+     - Type
+     - Description
+     - Example Values
+     - Example Usage (Python)
+   * - ``lance-encoding:compression``
+     - Compression
+     - Specifies compression algorithm
+     - zstd
+     - ``metadata={"lance-encoding:compression": "zstd"}``
+   * - ``lance-encoding:compression-level``
+     - Compression
+     - Zstd compression level (1-22)
+     - 3
+     - ``metadata={"lance-encoding:compression-level": "3"}``
+   * - ``lance-encoding:blob``
+     - Storage
+     - Marks binary data (>4MB) for chunked storage
+     - true/false
+     - ``metadata={"lance-encoding:blob": "true"}``
+   * - ``lance-encoding:packed``
+     - Optimization
+     - Struct memory layout optimization
+     - true/false
+     - ``metadata={"lance-encoding:packed": "true"}``
+   * - ``lance-encoding:structural-encoding``
+     - Nested Data
+     - Encoding strategy for nested structures
+     - miniblock/fullzip
+     - ``metadata={"lance-encoding:structural-encoding": "miniblock"}``
+
 
 Dataset Update and Schema Evolution
 -----------------------------------
