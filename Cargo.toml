@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "java/core/lance-jni",
+    "rust/examples",
     "rust/lance",
     "rust/lance-arrow",
     "rust/lance-core",
