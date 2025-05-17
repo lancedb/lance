@@ -10,139 +10,170 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::FileReader;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use std::error::Error;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
-fn main() -> Result<()> {
-    // Set up tokio runtime
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        // Load tokenizer from Hugging Face
-        let tokenizer = load_tokenizer("gpt2")?;
+#[derive(Debug)]
+struct SimpleError(String);
 
-        // Load dataset
-        println!("Loading dataset...");
-        let mut samples = Vec::new();
+impl std::fmt::Display for SimpleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
-        // Path to the data directory
-        let dataset_path = Path::new(
-            "/Users/haochengliu/Documents/projects/lance/rust/examples/src/wikitext-103-raw-v1/data",
-        );
-        println!("Looking for data in: {}", dataset_path.display());
+impl std::error::Error for SimpleError {}
 
-        // The parquet files we're looking for
-        let train_files = vec![
-            "train-00000-of-00002-b755d19de94348c6.parquet",
-            "train-00001-of-00002-0bf6d0c487c2e75b.parquet",
-        ];
+struct WikiTextBatchReader {
+    schema: Arc<Schema>,
+    parquet_readers: Vec<Option<ParquetRecordBatchReaderBuilder<File>>>,
+    current_reader_idx: usize,
+    current_reader: Option<Box<dyn RecordBatchReader + Send>>,
+    tokenizer: Tokenizer,
+}
 
-        // Track if we found and processed any files
-        let mut files_processed = false;
+// Implement Send for WikiTextBatchReader
+unsafe impl Send for WikiTextBatchReader {}
 
-        for file in &train_files {
-            let file_path = dataset_path.join(file);
-            if file_path.exists() {
-                files_processed = true;
-                println!("Processing file: {}", file_path.display());
-
-                // Read parquet file
-                let file = File::open(file_path)?;
-                let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-                println!("schema is {}", builder.schema());
-                let reader = builder.build()?;
-
-                // Process record batches instead of row groups
-                for batch in reader {
-                    let batch = batch?;
-                    let num_rows = batch.num_rows();
-                    println!("Processing batch with {} rows", num_rows);
-                    
-                    // Here you would extract text from the batch and tokenize it
-                    // For example, if there's a "text" column:
-                    if let Some(column) = batch.column_by_name("text") {
-                        if let Some(string_array) = column.as_any().downcast_ref::<arrow::array::StringArray>() {
-                            for i in 0..num_rows {
-                                if !Array::is_null(string_array, i) {
-                                    let text = string_array.value(i);
-                                    // Tokenize the text using the loaded tokenizer
-                                    if let Ok(encoding) = tokenizer.encode(text, true) {
-                                        // Convert to i64 and add to samples
-                                        let input_ids: Vec<i64> = encoding.get_ids()
-                                            .iter()
-                                            .map(|&id| id as i64)
-                                            .collect();
-                                        
-                                        samples.push(input_ids);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Just collect enough samples for demonstration
-                    if samples.len() >= 1000 {
-                        break;
-                    }
-                }
-
-                if samples.len() >= 1000 {
-                    println!("Collected {} samples", samples.len());
-                    break;
-                }
-            } else {
-                println!("File not found: {}", file_path.display());
-            }
-        }
-
-        // If we have no samples (files exist but processing failed), exit gracefully
-        if samples.is_empty() {
-            println!("No samples were processed from the parquet files.");
-            println!("Please verify the file format and try again.");
-            return Ok(());
-        }
-
-        // Display the first few samples
-        println!("First 3 tokenized samples (showing first 10 tokens each):");
-        for (i, sample) in samples.iter().take(3).enumerate() {
-            let preview: Vec<_> = sample.iter().take(10).collect();
-            println!("Sample {}: {:?}...", i + 1, preview);
-        }
-
-        // Shuffle the samples
-        let mut rng = rand::rngs::StdRng::seed_from_u64(1337);
-        samples.shuffle(&mut rng);
-
-        // Create schema
+impl WikiTextBatchReader {
+    fn new(
+        parquet_readers: Vec<ParquetRecordBatchReaderBuilder<File>>,
+        tokenizer: Tokenizer,
+    ) -> Result<Self> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "input_ids",
             DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
             false,
         )]));
 
-        // Create record batch
-        let input_ids_array = create_list_array_from_vectors(&samples)?;
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(input_ids_array)])?;
+        Ok(Self {
+            schema,
+            parquet_readers: parquet_readers.into_iter().map(Some).collect(),
+            current_reader_idx: 0,
+            current_reader: None,
+            tokenizer,
+        })
+    }
 
-        // Create a simple RecordBatchReader from our single batch
-        let batch_reader = SingleBatchReader {
-            schema: schema.clone(),
-            batch: Some(Ok(batch)),
-        };
+    fn process_batch(
+        &self,
+        input_batch: &RecordBatch,
+    ) -> Result<RecordBatch, arrow::error::ArrowError> {
+        let num_rows = input_batch.num_rows();
+        let mut tokenized_vectors = Vec::with_capacity(num_rows);
+
+        if let Some(column) = input_batch.column_by_name("text") {
+            if let Some(string_array) = column.as_any().downcast_ref::<arrow::array::StringArray>()
+            {
+                for i in 0..num_rows {
+                    if !Array::is_null(string_array, i) {
+                        let text = string_array.value(i);
+                        if let Ok(encoding) = self.tokenizer.encode(text, true) {
+                            let input_ids: Vec<i64> =
+                                encoding.get_ids().iter().map(|&id| id as i64).collect();
+                            tokenized_vectors.push(input_ids);
+                        }
+                    }
+                }
+            }
+        }
+
+        let input_ids_array = create_list_array_from_vectors(&tokenized_vectors).map_err(|e| {
+            arrow::error::ArrowError::ExternalError(Box::new(SimpleError(e.to_string())))
+        })?;
+        RecordBatch::try_new(self.schema.clone(), vec![Arc::new(input_ids_array)])
+    }
+}
+
+impl RecordBatchReader for WikiTextBatchReader {
+    fn schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+}
+
+impl Iterator for WikiTextBatchReader {
+    type Item = Result<RecordBatch, arrow::error::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // If we have a current reader, try to get next batch
+            if let Some(reader) = &mut self.current_reader {
+                if let Some(batch_result) = reader.next() {
+                    return Some(batch_result.and_then(|batch| self.process_batch(&batch)));
+                }
+            }
+
+            // If no current reader or current reader is exhausted, try to get next reader
+            if self.current_reader_idx < self.parquet_readers.len() {
+                if let Some(builder) = self.parquet_readers[self.current_reader_idx].take() {
+                    match builder.build() {
+                        Ok(reader) => {
+                            self.current_reader = Some(Box::new(reader));
+                            self.current_reader_idx += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            return Some(Err(arrow::error::ArrowError::ExternalError(Box::new(e))))
+                        }
+                    }
+                }
+            }
+
+            // No more readers available
+            return None;
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        // Load tokenizer
+        let tokenizer = load_tokenizer("gpt2")?;
+
+        // Set up dataset path
+        let dataset_path = Path::new(
+            "/Users/haochengliu/Documents/projects/lance/rust/examples/src/wikitext-103-raw-v1/data",
+        );
+        println!("Looking for data in: {}", dataset_path.display());
+
+        // Collect parquet readers
+        let train_files = vec![
+            "train-00000-of-00002-b755d19de94348c6.parquet",
+            "train-00001-of-00002-0bf6d0c487c2e75b.parquet",
+        ];
+
+        let mut parquet_readers = Vec::new();
+        for file in &train_files {
+            let file_path = dataset_path.join(file);
+            if file_path.exists() {
+                println!("Processing file: {}", file_path.display());
+                let file = File::open(file_path)?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+                parquet_readers.push(builder);
+            }
+        }
+
+        if parquet_readers.is_empty() {
+            println!("No parquet files found to process.");
+            return Ok(());
+        }
+
+        // Create batch reader
+        let batch_reader = WikiTextBatchReader::new(parquet_readers, tokenizer)?;
 
         // Save as Lance dataset
         println!("Writing to Lance dataset...");
         let lance_dataset_path = "rust_wikitext_lance_dataset.lance";
 
-        // Use Dataset::write with our RecordBatchReader
         let write_params = WriteParams::default();
         lance::Dataset::write(batch_reader, lance_dataset_path, Some(write_params)).await?;
 
-        // Read and verify the dataset
+        // Verify the dataset
         let ds = lance::Dataset::open(lance_dataset_path).await?;
-
-        // Scan and count rows
         let scanner = ds.scan();
         let mut stream = scanner.try_into_stream().await?;
 
@@ -162,28 +193,7 @@ fn main() -> Result<()> {
     })
 }
 
-// Simple RecordBatchReader implementation that yields a single batch
-struct SingleBatchReader {
-    schema: Arc<Schema>,
-    batch: Option<Result<RecordBatch, arrow::error::ArrowError>>,
-}
-
-impl RecordBatchReader for SingleBatchReader {
-    fn schema(&self) -> Arc<Schema> {
-        self.schema.clone()
-    }
-}
-
-impl Iterator for SingleBatchReader {
-    type Item = Result<RecordBatch, arrow::error::ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.batch.take()
-    }
-}
-
 fn load_tokenizer(model_name: &str) -> Result<Tokenizer> {
-    // Download tokenizer from Hugging Face
     let api = Api::new()?;
     let repo = api.repo(Repo::with_revision(
         model_name.into(),
@@ -198,7 +208,6 @@ fn load_tokenizer(model_name: &str) -> Result<Tokenizer> {
 }
 
 fn create_list_array_from_vectors(vectors: &[Vec<i64>]) -> Result<ListArray> {
-    // Create list array using the builder approach
     let mut builder = arrow::array::ListBuilder::new(arrow::array::Int64Builder::new());
 
     for vector in vectors {
