@@ -978,8 +978,9 @@ impl Transaction {
                             && file.file_major_version == new_file.file_major_version
                             && file.file_minor_version == new_file.file_minor_version
                         {
-                            // assign the new file path to the fragment
+                            // assign the new file path / size to the fragment
                             file.path = new_file.path.clone();
+                            file.file_size_bytes = new_file.file_size_bytes.clone();
                         }
                         columns_covered.extend(file.fields.iter());
                     }
