@@ -248,7 +248,7 @@ impl ProductQuantizationStorage {
             num_sub_vectors,
             dimension,
             codebook: Some(codebook),
-            codebook_tensor: Vec::new(),
+            codebook_tensor: Vec::new(), // empty for v1 format
             transposed: true,
         };
         Ok(Self {

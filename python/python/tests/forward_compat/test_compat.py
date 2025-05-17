@@ -25,7 +25,7 @@ def test_scans():
 
 @pytest.mark.forward
 @pytest.mark.skipif(
-    Version(lance.__version__).release >= (0, 25, 0),  # at least 0.25.0
+    Version(lance.__version__).release < (0, 25, 0),  # at least 0.25.0
     reason="Lance 0.25.0 can read v3 indices",
 )
 def test_pq_buffer():

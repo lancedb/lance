@@ -458,13 +458,18 @@ impl Quantization for ProductQuantizer {
             None => Some(0),
         };
         let codebook_position = codebook_position.expect("codebook position should be set");
+        let codebook_tensor = pb::Tensor::try_from(&self.codebook)
+            .map(|t| t.encode_to_vec())
+            .unwrap_or_default();
         ProductQuantizationMetadata {
             codebook_position,
             nbits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
             codebook: Some(self.codebook.clone()),
-            codebook_tensor: Vec::new(),
+            // Written for backward compatibility
+            // TODO: remove this in the future
+            codebook_tensor,
             transposed: args.map(|args| args.transposed).unwrap_or_default(),
         }
     }
