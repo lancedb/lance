@@ -205,7 +205,9 @@ impl FileWriter {
         }
         let encoded_encoding = match encoded_page.description {
             PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
-            PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
+            PageEncoding::Structural(page_layout) => {
+                Any::from_msg(page_layout.as_ref())?.encode_to_vec()
+            }
         };
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
@@ -673,7 +675,7 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
                         Any::from_msg(array_encoding)?.encode_to_vec()
                     }
                     PageEncoding::Structural(page_layout) => {
-                        Any::from_msg(page_layout)?.encode_to_vec()
+                        Any::from_msg(page_layout.as_ref())?.encode_to_vec()
                     }
                 };
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
