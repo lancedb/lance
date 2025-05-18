@@ -539,19 +539,6 @@ impl VectorStore for ProductQuantizationStorage {
     type DistanceCalculator<'a> = PQDistCalculator;
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
-        // let codebook = pb::Tensor::try_from(&self.codebook)?.encode_to_vec();
-        // let metadata = ProductQuantizationMetadata {
-        //     codebook_position: 0, // deprecated in new format
-        //     nbits: self.num_bits,
-        //     num_sub_vectors: self.num_sub_vectors,
-        //     dimension: self.dimension,
-        //     codebook: None,
-        //     codebook_tensor: codebook,
-        //     transposed: true, // we always transpose the pq codes for efficiency
-        // };
-
-        // let metadata_json = serde_json::to_string(&metadata)?;
-        // let metadata = HashMap::from_iter(vec![(STORAGE_METADATA_KEY.to_string(), metadata_json)]);
         Ok(std::iter::once(self.batch.clone()))
     }
 
