@@ -1080,10 +1080,17 @@ impl Scanner {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             if !self.projection_plan.physical_schema.fields.is_empty() {
-                return Err(Error::invalid_input(
-                    "count_rows should not be called on a plan selecting columns".to_string(),
-                    location!(),
-                ));
+                let columns: Vec<&str> = self.projection_plan.physical_schema.fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect();
+
+                let msg = format!(
+                    "count_rows should not be called on a plan selecting columns. selected columns: [{}]",
+                    columns.join(", ")
+                );
+
+                return Err(Error::invalid_input(msg, location!()));
             }
 
             if self.limit.is_some() || self.offset.is_some() {
