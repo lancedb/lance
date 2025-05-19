@@ -114,8 +114,8 @@ impl<'a> TransactionRebase<'a> {
             },
             ConflictResult::Retryable => {
                 match &other_transaction.operation {
-                    Operation::Update { updated_fragments, .. } |
-                    Operation::Delete { updated_fragments, .. } => {
+                    Operation::Update { updated_fragments, removed_fragment_ids, .. } |
+                    Operation::Delete { updated_fragments, deleted_fragment_ids: removed_fragment_ids, .. } => {
                         for updated in updated_fragments {
                             if let Some((fragment, needs_rewrite)) = self.initial_fragments.get_mut(&updated.id) {
                                 if self.affected_rows.is_none() {
@@ -140,6 +140,16 @@ impl<'a> TransactionRebase<'a> {
 
                                 // Mark any modified fragments as needing a rewrite.
                                 *needs_rewrite |= updated.deletion_file != fragment.deletion_file;
+                            }
+                        }
+
+                        for removed_fragment_id in removed_fragment_ids {
+                            if self.initial_fragments.contains_key(removed_fragment_id) {
+                                return Err(self.retryable_conflict_err(
+                                        other_transaction,
+                                        other_version,
+                                        location!()
+                                    ));
                             }
                         }
                         return Ok(());
@@ -566,13 +576,17 @@ mod tests {
         }
     }
 
+    /// Validate we get a conflict error when rebasing `operation` on top of `other`.
     #[tokio::test]
-    async fn test_conflicting_rebase() {
+    #[rstest::rstest]
+    async fn test_conflicting_rebase(
+        #[values("update_full", "update_partial", "delete_full", "delete_partial")] operation: &str,
+        #[values("update_full", "update_partial", "delete_full", "delete_partial")] other: &str,
+    ) {
         // 5 rows, all in one fragment. Each transaction modifies the same row.
         let (mut dataset, io_tracker) = test_dataset(5, 1).await;
         let mut fragment = dataset.fragments().as_slice()[0].clone();
 
-        // Other operations modify the 1st, 2nd, and 3rd rows sequentially.
         let sample_file = Fragment::new(0)
             .with_file(
                 "path1",
@@ -584,71 +598,101 @@ mod tests {
             .with_physical_rows(3);
 
         let operations = [
-            Operation::Update {
-                updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
-                removed_fragment_ids: vec![],
-                new_fragments: vec![sample_file.clone()],
-            },
-            Operation::Delete {
-                updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
-                deleted_fragment_ids: vec![],
-                predicate: "a > 0".to_string(),
-            },
-            Operation::Update {
-                updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
-                removed_fragment_ids: vec![],
-                new_fragments: vec![sample_file],
-            },
+            (
+                "update_full",
+                Operation::Update {
+                    updated_fragments: vec![],
+                    removed_fragment_ids: vec![0],
+                    new_fragments: vec![sample_file.clone()],
+                },
+            ),
+            (
+                "update_partial",
+                Operation::Update {
+                    updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![sample_file.clone()],
+                },
+            ),
+            (
+                "delete_full",
+                Operation::Delete {
+                    updated_fragments: vec![],
+                    deleted_fragment_ids: vec![0],
+                    predicate: "a > 0".to_string(),
+                },
+            ),
+            (
+                "delete_partial",
+                Operation::Delete {
+                    updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
+                    deleted_fragment_ids: vec![],
+                    predicate: "a > 0".to_string(),
+                },
+            ),
         ];
-        let transactions =
-            operations.map(|op| Transaction::new_from_version(dataset.manifest.version, op));
 
-        let (first_txn, remaining_txns) = transactions.split_at(1);
-        let first_txn = first_txn[0].clone();
+        let operation = operations
+            .iter()
+            .find(|(name, _)| *name == operation)
+            .unwrap()
+            .1
+            .clone();
+        let other_op = operations
+            .iter()
+            .find(|(name, _)| *name == other)
+            .unwrap()
+            .1
+            .clone();
+
+        let other_txn = Transaction::new_from_version(dataset.manifest.version, other_op);
+        let txn = Transaction::new_from_version(dataset.manifest.version, operation);
 
         // Can apply first transaction to create the conflict
         dataset = CommitBuilder::new(Arc::new(dataset))
-            .execute(first_txn.clone())
+            .execute(other_txn.clone())
             .await
             .unwrap();
 
-        for txn in remaining_txns {
-            let affected_rows = RowIdTreeMap::from_iter([0]);
+        let affected_rows = RowIdTreeMap::from_iter([0]);
 
-            let mut rebase =
-                TransactionRebase::try_new(&dataset, txn.clone(), Some(&affected_rows))
-                    .await
-                    .unwrap();
-            io_tracker.incremental_stats(); // reset
-            rebase.check_txn(Some(&first_txn), 1).unwrap();
-
-            assert_eq!(
-                rebase
-                    .initial_fragments
-                    .iter()
-                    .map(|(id, (_, needs_rewrite))| (*id, *needs_rewrite))
-                    .collect::<Vec<_>>(),
-                vec![(0, true)],
-            );
-
-            let io_stats = io_tracker.incremental_stats();
-            assert_eq!(io_stats.read_iops, 0);
-            assert_eq!(io_stats.write_iops, 0);
-
-            let res = rebase.finish(&dataset).await;
+        let mut rebase = TransactionRebase::try_new(&dataset, txn.clone(), Some(&affected_rows))
+            .await
+            .unwrap();
+        io_tracker.incremental_stats(); // reset
+        let res = rebase.check_txn(Some(&other_txn), 1);
+        if other.ends_with("full") {
+            // If the other transaction fully deleted a fragment, we can error early.
             assert!(matches!(
                 res,
                 Err(crate::Error::RetryableCommitConflict { .. })
             ));
-
-            let io_stats = io_tracker.incremental_stats();
-            assert_eq!(io_stats.read_iops, 0); // Cached deletion file
-            assert_eq!(io_stats.write_iops, 0); // Failed before writing
+            return;
+        } else {
+            assert!(res.is_ok());
         }
-    }
 
-    #[tokio::test]
-    async fn test_modifies_file() {
-        todo!()
+        assert_eq!(
+            rebase
+                .initial_fragments
+                .iter()
+                .map(|(id, (_, needs_rewrite))| (*id, *needs_rewrite))
+                .collect::<Vec<_>>(),
+            vec![(0, true)],
+        );
+
+        let io_stats = io_tracker.incremental_stats();
+        assert_eq!(io_stats.read_iops, 0);
+        assert_eq!(io_stats.write_iops, 0);
+
+        let res = rebase.finish(&dataset).await;
+        assert!(matches!(
+            res,
+            Err(crate::Error::RetryableCommitConflict { .. })
+        ));
+
+        let io_stats = io_tracker.incremental_stats();
+        assert_eq!(io_stats.read_iops, 0); // Cached deletion file
+        assert_eq!(io_stats.write_iops, 0); // Failed before writing
     }
 }
