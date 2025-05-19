@@ -194,7 +194,7 @@ pub async fn save_row_addr_map(
     let mut new_row_addrs = Vec::new();
     let mut rows = 0;
 
-    for (old_row_addr, new_row_addr) in row_addr_map.into_iter() {
+    for (old_row_addr, new_row_addr) in row_addr_map.iter() {
         // flush current batch
         if rows > BATCH_SIZE {
             let batch = RecordBatch::try_new(
