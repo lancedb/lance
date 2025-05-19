@@ -37,6 +37,19 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowIdTreeMap>,
     ) -> Result<Self> {
+        // We might not need to check for row-level conflicts anyways.
+        if !matches!(&transaction.operation,
+            Operation::Update { updated_fragments, .. } |
+            Operation::Delete { updated_fragments, .. }
+            if !updated_fragments.is_empty() && affected_rows.is_some(),
+        ) {
+            return Ok(Self {
+                transaction,
+                initial_fragments: HashMap::new(),
+                affected_rows,
+            });
+        }
+
         let dataset = if dataset.manifest.version != transaction.read_version {
             Cow::Owned(dataset.checkout_version(transaction.read_version).await?)
         } else {
@@ -656,10 +669,15 @@ mod tests {
 
         let affected_rows = RowIdTreeMap::from_iter([0]);
 
+        io_tracker.incremental_stats(); // reset
         let mut rebase = TransactionRebase::try_new(&dataset, txn.clone(), Some(&affected_rows))
             .await
             .unwrap();
-        io_tracker.incremental_stats(); // reset
+
+        let io_stats = io_tracker.incremental_stats();
+        assert_eq!(io_stats.read_iops, 0);
+        assert_eq!(io_stats.write_iops, 0);
+
         let res = rebase.check_txn(Some(&other_txn), 1);
         if other.ends_with("full") {
             // If the other transaction fully deleted a fragment, we can error early.
