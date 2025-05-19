@@ -448,7 +448,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn check_block_max(&self, pivot: usize) -> bool {
         let mut sum = 0.0;
         for posting in self.postings[..=pivot].iter() {
-            sum += posting.block_max_score();
+            sum += idf(posting.list.len(), self.docs.len()) * posting.block_max_score();
         }
         sum >= self.threshold
     }
