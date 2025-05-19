@@ -258,7 +258,7 @@ impl MapIndexExec {
             .collect::<datafusion::error::Result<Vec<_>>>()?;
         let query = ScalarIndexExpr::Query(ScalarIndexSearch {
             column: column_name,
-            index_name: index_name,
+            index_name,
             query: Arc::new(SargableQuery::IsIn(index_vals)),
         });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;

@@ -496,7 +496,7 @@ impl DatasetIndexExt for Dataset {
             for idx in indices {
                 let field = self.schema().field_by_id(field_id);
                 if let Some(field) = field {
-                    if index_matches_criteria(&idx, &criteria, &field, has_multiple)? {
+                    if index_matches_criteria(idx, &criteria, field, has_multiple)? {
                         return Ok(Some(idx.clone()));
                     }
                 }
@@ -1068,7 +1068,7 @@ impl DatasetIndexInternalExt for Dataset {
                 .entry(indexed_field.0)
                 .and_modify(|existing: &mut (DataType, Box<MultiQueryParser>)| {
                     // If there are two indices on the same column, they must have the same type
-                    debug_assert_eq!((*existing).0, indexed_field.1 .0);
+                    debug_assert_eq!(existing.0, indexed_field.1 .0);
 
                     existing.1.add(parser.take().unwrap());
                 })

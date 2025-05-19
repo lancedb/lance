@@ -473,7 +473,7 @@ pub fn index_matches_criteria(
                 source: format!(
                     "An index {} on the field with id {} co-exists with other indices on the same column but was written with an older Lance version, and this is not supported.  Please retrain this index.",
                     index.name,
-                    index.fields.get(0).unwrap_or(&0),
+                    index.fields.first().unwrap_or(&0),
                 ).into(),
                 location: location!(),
             });
