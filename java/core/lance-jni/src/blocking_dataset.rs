@@ -1126,7 +1126,7 @@ fn inner_add_columns_by_reader(
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAddColumnsBySchema(
     mut env: JNIEnv,
     java_dataset: JObject,
-    schema_ptr: jlong,        // Schema pointer
+    schema_ptr: jlong, // Schema pointer
 ) {
     ok_or_throw_without_return!(
         env,
