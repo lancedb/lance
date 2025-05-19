@@ -46,7 +46,7 @@ impl<'a> TransactionRebase<'a> {
             return Ok(Self {
                 transaction,
                 initial_fragments: HashMap::new(),
-                affected_rows,
+                affected_rows: None,
             });
         }
 
@@ -129,18 +129,17 @@ impl<'a> TransactionRebase<'a> {
                 match &other_transaction.operation {
                     Operation::Update { updated_fragments, removed_fragment_ids, .. } |
                     Operation::Delete { updated_fragments, deleted_fragment_ids: removed_fragment_ids, .. } => {
+                        if self.affected_rows.is_none() {
+                            // We don't have any affected rows, so we can't
+                            // do the rebase anyways.
+                            return Err(self.retryable_conflict_err(
+                                other_transaction,
+                                other_version,
+                                location!()
+                            ));
+                        }
                         for updated in updated_fragments {
                             if let Some((fragment, needs_rewrite)) = self.initial_fragments.get_mut(&updated.id) {
-                                if self.affected_rows.is_none() {
-                                    // We don't have any affected rows, so we can't
-                                    // do the rebase anyways.
-                                    return Err(self.retryable_conflict_err(
-                                        other_transaction,
-                                        other_version,
-                                        location!()
-                                    ));
-                                }
-
                                 // If data files, not just deletion files, are modified,
                                 // then we can't rebase.
                                 if fragment.files != updated.files {
@@ -593,11 +592,11 @@ mod tests {
     #[tokio::test]
     #[rstest::rstest]
     async fn test_conflicting_rebase(
-        #[values("update_full", "update_partial", "delete_full", "delete_partial")] operation: &str,
+        #[values("update_full", "update_partial", "delete_full", "delete_partial")] ours: &str,
         #[values("update_full", "update_partial", "delete_full", "delete_partial")] other: &str,
     ) {
         // 5 rows, all in one fragment. Each transaction modifies the same row.
-        let (mut dataset, io_tracker) = test_dataset(5, 1).await;
+        let (dataset, io_tracker) = test_dataset(5, 1).await;
         let mut fragment = dataset.fragments().as_slice()[0].clone();
 
         let sample_file = Fragment::new(0)
@@ -647,7 +646,7 @@ mod tests {
 
         let operation = operations
             .iter()
-            .find(|(name, _)| *name == operation)
+            .find(|(name, _)| *name == ours)
             .unwrap()
             .1
             .clone();
@@ -662,7 +661,7 @@ mod tests {
         let txn = Transaction::new_from_version(dataset.manifest.version, operation);
 
         // Can apply first transaction to create the conflict
-        dataset = CommitBuilder::new(Arc::new(dataset))
+        let latest_dataset = CommitBuilder::new(Arc::new(dataset.clone()))
             .execute(other_txn.clone())
             .await
             .unwrap();
@@ -679,7 +678,7 @@ mod tests {
         assert_eq!(io_stats.write_iops, 0);
 
         let res = rebase.check_txn(Some(&other_txn), 1);
-        if other.ends_with("full") {
+        if other.ends_with("full") || ours.ends_with("full") {
             // If the other transaction fully deleted a fragment, we can error early.
             assert!(matches!(
                 res,
@@ -703,7 +702,7 @@ mod tests {
         assert_eq!(io_stats.read_iops, 0);
         assert_eq!(io_stats.write_iops, 0);
 
-        let res = rebase.finish(&dataset).await;
+        let res = rebase.finish(&latest_dataset).await;
         assert!(matches!(
             res,
             Err(crate::Error::RetryableCommitConflict { .. })

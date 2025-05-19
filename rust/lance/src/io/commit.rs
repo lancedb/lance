@@ -743,17 +743,20 @@ pub(crate) async fn commit_transaction(
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
-    let mut dataset = dataset.clone();
-    if matches!(transaction.operation, Operation::Overwrite { .. })
+    let original_dataset = dataset.clone();
+
+    let mut dataset = if matches!(transaction.operation, Operation::Overwrite { .. })
         && commit_config.num_retries == 0
     {
-        dataset.checkout_version(transaction.read_version).await?;
+        dataset.checkout_version(transaction.read_version).await?
     } else {
         // We need to checkout the latest version, because any fixes we apply
         // (like computing the new row ids) needs to be done based on the most
         // recent manifest.
+        let mut dataset = dataset.clone();
         dataset.checkout_latest().await?;
-    }
+        dataset
+    };
 
     let mut transaction = transaction.clone();
 
@@ -765,7 +768,8 @@ pub(crate) async fn commit_transaction(
         // Use small amount of backoff to handle transactions that all
         // started at exact same time better.
 
-        let mut rebase = TransactionRebase::try_new(&dataset, transaction, affected_rows).await?;
+        let mut rebase =
+            TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
 
         let mut concurrent_txns = futures::stream::iter(target_version..=dataset.manifest.version)
             .map(|version| {
