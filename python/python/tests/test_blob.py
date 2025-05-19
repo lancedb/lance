@@ -156,21 +156,30 @@ def test_null_blobs(tmp_path):
 
     ds.insert(pa.table({"id": pa.array(range(100, 200), pa.uint64())}))
 
-    blobs = ds.take_blobs("blob", indices=range(100, 200))
-    for blob in blobs:
-        assert blob.size() == 0
+    ds.add_columns(
+        pa.field(
+            "more_blob",
+            pa.large_binary(),
+            metadata={"lance-encoding:blob": "true"},
+        )
+    )
 
-    blobs = ds.to_table(columns=["blob"])
-    for blob in blobs.column("blob"):
-        py_blob = blob.as_py()
-        # When we write blobs to a file we store the position as 1 and size as 0
-        # to avoid needing a validity buffer.
-        #
-        # TODO: We should probably convert these to null on read.
-        assert py_blob == {"position": None, "size": None} or py_blob == {
-            "position": 1,
-            "size": 0,
-        }
+    for blob_col in ["blob", "more_blob"]:
+        blobs = ds.take_blobs(blob_col, indices=range(100, 200))
+        for blob in blobs:
+            assert blob.size() == 0
+
+        blobs = ds.to_table(columns=[blob_col])
+        for blob in blobs.column(blob_col):
+            py_blob = blob.as_py()
+            # When we write blobs to a file we store the position as 1 and size as 0
+            # to avoid needing a validity buffer.
+            #
+            # TODO: We should probably convert these to null on read.
+            assert py_blob == {"position": None, "size": None} or py_blob == {
+                "position": 1,
+                "size": 0,
+            }
 
 
 def test_blob_file_read_middle(tmp_path, dataset_with_blobs):
