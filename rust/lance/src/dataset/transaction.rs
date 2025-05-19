@@ -78,7 +78,7 @@ use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 ///
 /// This contains enough information to be able to build the next manifest,
 /// given the current manifest.
-#[derive(Debug, Clone, DeepSizeOf)]
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct Transaction {
     /// The version of the table this transaction is based off of. If this is
     /// the first transaction, this should be 0.
@@ -101,7 +101,7 @@ pub enum BlobsOperation {
     Updated(u64),
 }
 
-#[derive(Debug, Clone, DeepSizeOf)]
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct DataReplacementGroup(pub u64, pub DataFile);
 
 /// An operation on a dataset.
@@ -218,7 +218,139 @@ impl std::fmt::Display for Operation {
     }
 }
 
-#[derive(Debug, Clone)]
+impl PartialEq for Operation {
+    fn eq(&self, other: &Self) -> bool {
+        // Many of the operations contain `Vec<T>` where the order of the
+        // elements don't matter. So we need to compare them in a way that
+        // ignores the order of the elements.
+        // TODO: we can make it so the vecs are always constructed in order.
+        // Then we can use `==` instead of `compare_vec`.
+        fn compare_vec<T: PartialEq>(a: &[T], b: &[T]) -> bool {
+            a.len() == b.len() && a.iter().all(|f| b.contains(f))
+        }
+        match (self, other) {
+            (Self::Append { fragments: a }, Self::Append { fragments: b }) => compare_vec(a, b),
+            (
+                Self::Delete {
+                    updated_fragments: a_updated,
+                    deleted_fragment_ids: a_deleted,
+                    predicate: a_predicate,
+                },
+                Self::Delete {
+                    updated_fragments: b_updated,
+                    deleted_fragment_ids: b_deleted,
+                    predicate: b_predicate,
+                },
+            ) => {
+                compare_vec(a_updated, b_updated)
+                    && compare_vec(a_deleted, b_deleted)
+                    && a_predicate == b_predicate
+            }
+            (
+                Self::Overwrite {
+                    fragments: a_fragments,
+                    schema: a_schema,
+                    config_upsert_values: a_config,
+                },
+                Self::Overwrite {
+                    fragments: b_fragments,
+                    schema: b_schema,
+                    config_upsert_values: b_config,
+                },
+            ) => {
+                compare_vec(a_fragments, b_fragments)
+                    && a_schema == b_schema
+                    && a_config == b_config
+            }
+            (
+                Self::CreateIndex {
+                    new_indices: a_new,
+                    removed_indices: a_removed,
+                },
+                Self::CreateIndex {
+                    new_indices: b_new,
+                    removed_indices: b_removed,
+                },
+            ) => compare_vec(a_new, b_new) && compare_vec(a_removed, b_removed),
+            (
+                Self::Rewrite {
+                    groups: a_groups,
+                    rewritten_indices: a_indices,
+                },
+                Self::Rewrite {
+                    groups: b_groups,
+                    rewritten_indices: b_indices,
+                },
+            ) => compare_vec(a_groups, b_groups) && compare_vec(a_indices, b_indices),
+            (
+                Self::Merge {
+                    fragments: a_fragments,
+                    schema: a_schema,
+                },
+                Self::Merge {
+                    fragments: b_fragments,
+                    schema: b_schema,
+                },
+            ) => compare_vec(a_fragments, b_fragments) && a_schema == b_schema,
+            (Self::Restore { version: a }, Self::Restore { version: b }) => a == b,
+            (
+                Self::ReserveFragments { num_fragments: a },
+                Self::ReserveFragments { num_fragments: b },
+            ) => a == b,
+            (
+                Self::Update {
+                    removed_fragment_ids: a_removed,
+                    updated_fragments: a_updated,
+                    new_fragments: a_new,
+                },
+                Self::Update {
+                    removed_fragment_ids: b_removed,
+                    updated_fragments: b_updated,
+                    new_fragments: b_new,
+                },
+            ) => {
+                compare_vec(a_removed, b_removed)
+                    && compare_vec(a_updated, b_updated)
+                    && compare_vec(a_new, b_new)
+            }
+            (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
+            (
+                Self::UpdateConfig {
+                    upsert_values: a_upsert,
+                    delete_keys: a_delete,
+                    schema_metadata: a_schema,
+                    field_metadata: a_field,
+                },
+                Self::UpdateConfig {
+                    upsert_values: b_upsert,
+                    delete_keys: b_delete,
+                    schema_metadata: b_schema,
+                    field_metadata: b_field,
+                },
+            ) => {
+                a_upsert == b_upsert
+                    && a_delete.as_ref().map(|v| {
+                        let mut v = v.clone();
+                        v.sort();
+                        v
+                    }) == b_delete.as_ref().map(|v| {
+                        let mut v = v.clone();
+                        v.sort();
+                        v
+                    })
+                    && a_schema == b_schema
+                    && a_field == b_field
+            }
+            (
+                Self::DataReplacement { replacements: a },
+                Self::DataReplacement { replacements: b },
+            ) => a.len() == b.len() && a.iter().all(|r| b.contains(r)),
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct RewrittenIndex {
     pub old_id: Uuid,
     pub new_id: Uuid,
@@ -234,6 +366,16 @@ impl DeepSizeOf for RewrittenIndex {
 pub struct RewriteGroup {
     pub old_fragments: Vec<Fragment>,
     pub new_fragments: Vec<Fragment>,
+}
+
+impl PartialEq for RewriteGroup {
+    fn eq(&self, other: &Self) -> bool {
+        fn compare_vec<T: PartialEq>(a: &[T], b: &[T]) -> bool {
+            a.len() == b.len() && a.iter().all(|f| b.contains(f))
+        }
+        compare_vec(&self.old_fragments, &other.old_fragments)
+            && compare_vec(&self.new_fragments, &other.new_fragments)
+    }
 }
 
 impl Operation {
@@ -404,6 +546,21 @@ pub enum ConflictResult {
 }
 
 impl Transaction {
+    pub fn new_from_version(read_version: u64, operation: Operation) -> Self {
+        let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
+        Self {
+            read_version,
+            uuid,
+            operation,
+            blobs_op: None,
+            tag: None,
+        }
+    }
+
+    pub fn with_blobs_op(self, blobs_op: Option<Operation>) -> Self {
+        Self { blobs_op, ..self }
+    }
+
     pub fn new(
         read_version: u64,
         operation: Operation,

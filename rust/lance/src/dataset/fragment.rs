@@ -2344,7 +2344,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen, RowCount};
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::object_store::{ObjectStore, ObjectStoreParams};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use tempfile::tempdir;
