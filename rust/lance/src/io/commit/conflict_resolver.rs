@@ -4,6 +4,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
 use futures::{StreamExt, TryStreamExt};
@@ -13,7 +14,7 @@ use lance_core::{
 };
 use lance_table::{
     format::Fragment,
-    io::deletion::{read_deletion_file_cached, write_deletion_file},
+    io::deletion::{deletion_file_path, read_deletion_file_cached, write_deletion_file},
 };
 use snafu::{location, Location};
 
@@ -248,6 +249,19 @@ impl<'a> TransactionRebase<'a> {
                         dataset.object_store(),
                     )
                     .await?;
+
+                    // Make sure this is available in the cache for future conflict resolution.
+                    let path = deletion_file_path(
+                        &dataset.base,
+                        *fragment_id,
+                        new_deletion_file.as_ref().unwrap(),
+                    );
+                    dataset
+                        .session
+                        .file_metadata_cache
+                        .insert(path, Arc::new(dv));
+
+                    // TODO: also cleanup the old deletion file.
                     new_deletion_files.insert(*fragment_id, new_deletion_file);
                 }
 
@@ -267,9 +281,10 @@ impl<'a> TransactionRebase<'a> {
                     _ => {}
                 }
 
-                // TODO: what do we do with the old deletion files?
-
-                Ok(self.transaction)
+                Ok(Transaction {
+                    read_version: dataset.manifest.version,
+                    ..self.transaction
+                })
             } else {
                 // We shouldn't hit this.
                 Err(crate::Error::Internal {
@@ -278,22 +293,26 @@ impl<'a> TransactionRebase<'a> {
                     })
             }
         } else {
-            Ok(self.transaction)
+            Ok(Transaction {
+                read_version: dataset.manifest.version,
+                ..self.transaction
+            })
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{num::NonZero, sync::Arc};
 
     use arrow_array::{Int32Array, RecordBatch};
-    use arrow_ipc::Schema;
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance_file::version::LanceFileVersion;
     use lance_io::object_store::ObjectStoreParams;
+    use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use crate::{
-        dataset::{InsertBuilder, WriteParams},
+        dataset::{CommitBuilder, InsertBuilder, WriteParams},
         utils::test::StatsHolder,
     };
 
@@ -306,6 +325,7 @@ mod tests {
                 object_store_wrapper: Some(io_stats.clone()),
                 ..Default::default()
             }),
+            max_rows_per_file: num_rows / num_fragments,
             ..Default::default()
         };
         let data = RecordBatch::try_new(
@@ -315,9 +335,9 @@ mod tests {
             ])),
             vec![
                 Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
-                Arc::new(Int32Array::from_iter_values(
-                    std::iter::repeat(0).take(num_rows),
-                )),
+                Arc::new(Int32Array::from_iter_values(std::iter::repeat_n(
+                    0, num_rows,
+                ))),
             ],
         )
         .unwrap();
@@ -331,58 +351,300 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_overlapping_rebase() {
-        let (dataset, io_stats) = test_dataset(5, 5).await;
-        let transaction = Transaction {
-            read_version: 1,
-            uuid: "test".to_string(),
-            operation: Operation::Update {
-                updated_fragments: vec![Fragment {
-                    id: 0,
-                    deletion_file: None,
-                    files: vec![],
-                }],
-                ..Default::default()
-            },
-            ..Default::default()
+        let (dataset, io_tracker) = test_dataset(5, 5).await;
+        let operation = Operation::Update {
+            updated_fragments: vec![Fragment::new(0)],
+            removed_fragment_ids: vec![],
+            new_fragments: vec![],
         };
-        let other_transactions = [
-            todo!("update on fragment 1, delete on fragment 2"),
-            todo!("delete on fragment 3"),
-            todo!("update on fragment 4"),
+        let transaction = Transaction::new_from_version(1, operation);
+        let other_operations = [
+            Operation::Update {
+                updated_fragments: vec![Fragment::new(1)],
+                removed_fragment_ids: vec![2],
+                new_fragments: vec![],
+            },
+            Operation::Delete {
+                deleted_fragment_ids: vec![3],
+                updated_fragments: vec![],
+                predicate: "a > 0".to_string(),
+            },
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![Fragment::new(4)],
+                new_fragments: vec![],
+            },
         ];
+        let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
         let mut rebase = TransactionRebase::try_new(&dataset, transaction.clone(), None)
             .await
             .unwrap();
 
+        io_tracker.incremental_stats(); // reset
         for (other_version, other_transaction) in other_transactions.iter().enumerate() {
             rebase
                 .check_txn(Some(other_transaction), other_version as u64)
                 .unwrap();
-            let io_stats = io_tracker.get_stats().await;
+            let io_stats = io_tracker.incremental_stats();
             assert_eq!(io_stats.read_iops, 0);
             assert_eq!(io_stats.write_iops, 0);
         }
 
         let expected_transaction = Transaction {
-            read_version: 4,
+            // This doesn't really exercise it, since the other transactions
+            // haven't been applied yet, but just doing this for completeness.
+            read_version: dataset.manifest.version,
             ..transaction
         };
         let rebased_transaction = rebase.finish(&dataset).await.unwrap();
         assert_eq!(rebased_transaction, expected_transaction);
+        // We didn't need to do any IO, so the stats should be 0.
+        let io_stats = io_tracker.incremental_stats();
+        assert_eq!(io_stats.read_iops, 0);
+        assert_eq!(io_stats.write_iops, 0);
+    }
+
+    async fn apply_deletion(
+        delete_rows: &[u32],
+        fragment: &mut Fragment,
+        dataset: &Dataset,
+    ) -> Fragment {
+        let mut current_deletions = if let Some(deletion_file) = &fragment.deletion_file {
+            read_deletion_file(
+                fragment.id,
+                deletion_file,
+                &dataset.base,
+                dataset.object_store(),
+            )
+            .await
+            .unwrap()
+        } else {
+            DeletionVector::default()
+        };
+
+        current_deletions.extend(delete_rows.iter().copied());
+
+        fragment.deletion_file = write_deletion_file(
+            &dataset.base,
+            fragment.id,
+            dataset.manifest.version,
+            &current_deletions,
+            dataset.object_store(),
+        )
+        .await
+        .unwrap();
+
+        let path = deletion_file_path(
+            &dataset.base,
+            fragment.id,
+            fragment.deletion_file.as_ref().unwrap(),
+        );
+        dataset
+            .session
+            .file_metadata_cache
+            .insert(path, Arc::new(current_deletions));
+
+        fragment.clone()
     }
 
     #[tokio::test]
+    #[rstest::rstest]
     async fn test_non_conflicting_rebase() {
-        todo!()
+        // 5 rows, all in one fragment. Each transaction modifies a different row.
+        let (mut dataset, io_tracker) = test_dataset(5, 1).await;
+        let mut fragment = dataset.fragments().as_slice()[0].clone();
+
+        // Other operations modify the 1st, 2nd, and 3rd rows sequentially.
+        let sample_file = Fragment::new(0)
+            .with_file(
+                "path1",
+                vec![0],
+                vec![0],
+                &LanceFileVersion::V2_0,
+                NonZero::new(10),
+            )
+            .with_physical_rows(3);
+        let operations = [
+            Operation::Update {
+                updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
+                removed_fragment_ids: vec![],
+                new_fragments: vec![sample_file.clone()],
+            },
+            Operation::Delete {
+                updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
+                deleted_fragment_ids: vec![],
+                predicate: "a > 0".to_string(),
+            },
+            Operation::Update {
+                updated_fragments: vec![apply_deletion(&[2], &mut fragment, &dataset).await],
+                removed_fragment_ids: vec![],
+                new_fragments: vec![sample_file],
+            },
+        ];
+        let transactions =
+            operations.map(|op| Transaction::new_from_version(dataset.manifest.version, op));
+
+        for (i, transaction) in transactions.iter().enumerate() {
+            let previous_transactions = transactions.iter().take(i).cloned().collect::<Vec<_>>();
+
+            let affected_rows = RowIdTreeMap::from_iter([i as u64]);
+            let mut rebase =
+                TransactionRebase::try_new(&dataset, transaction.clone(), Some(&affected_rows))
+                    .await
+                    .unwrap();
+
+            io_tracker.incremental_stats(); // reset
+            for (other_version, other_transaction) in previous_transactions.iter().enumerate() {
+                rebase
+                    .check_txn(Some(other_transaction), other_version as u64)
+                    .unwrap();
+                let io_stats = io_tracker.incremental_stats();
+                assert_eq!(io_stats.read_iops, 0);
+                assert_eq!(io_stats.write_iops, 0);
+            }
+
+            // First iteration, we don't need to rewrite the deletion file.
+            let expected_rewrite = i > 0;
+
+            let rebased_transaction = rebase.finish(&dataset).await.unwrap();
+            assert_eq!(rebased_transaction.read_version, dataset.manifest.version);
+
+            let io_stats = io_tracker.incremental_stats();
+            if expected_rewrite {
+                // Read the current deletion file, and write the new one.
+                assert_eq!(io_stats.read_iops, 0); // Cached
+                assert_eq!(io_stats.write_iops, 1);
+
+                // TODO: The old deletion file should be gone.
+                // This can be done later, as it will be cleaned up by the
+                // background cleanup process for now.
+                // let original_fragment = match &original_transaction.operation {
+                //     Operation::Update {
+                //         updated_fragments, ..
+                //     }
+                //     | Operation::Delete {
+                //         updated_fragments, ..
+                //     } => updated_fragments[0].clone(),
+                //     _ => {
+                //         panic!("Expected an update or delete operation");
+                //     }
+                // };
+                // let old_path = deletion_file_path(
+                //     &dataset.base,
+                //     original_fragment.id,
+                //     original_fragment.deletion_file.as_ref().unwrap(),
+                // );
+                // assert!(!dataset.object_store().exists(&old_path).await.unwrap());
+                // The new deletion file should exist.
+                let final_fragment = match &rebased_transaction.operation {
+                    Operation::Update {
+                        updated_fragments, ..
+                    }
+                    | Operation::Delete {
+                        updated_fragments, ..
+                    } => updated_fragments[0].clone(),
+                    _ => {
+                        panic!("Expected an update or delete operation");
+                    }
+                };
+                let new_path = deletion_file_path(
+                    &dataset.base,
+                    final_fragment.id,
+                    final_fragment.deletion_file.as_ref().unwrap(),
+                );
+                assert!(dataset.object_store().exists(&new_path).await.unwrap());
+            } else {
+                // No IO should have happened.
+                assert_eq!(io_stats.read_iops, 0);
+                assert_eq!(io_stats.write_iops, 0);
+            }
+
+            dataset = CommitBuilder::new(Arc::new(dataset))
+                .execute(rebased_transaction)
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
     async fn test_conflicting_rebase() {
-        todo!();
+        // 5 rows, all in one fragment. Each transaction modifies the same row.
+        let (mut dataset, io_tracker) = test_dataset(5, 1).await;
+        let mut fragment = dataset.fragments().as_slice()[0].clone();
 
-        todo!("test IO requests");
+        // Other operations modify the 1st, 2nd, and 3rd rows sequentially.
+        let sample_file = Fragment::new(0)
+            .with_file(
+                "path1",
+                vec![0],
+                vec![0],
+                &LanceFileVersion::V2_0,
+                NonZero::new(10),
+            )
+            .with_physical_rows(3);
 
-        todo!("test cleanup")
+        let operations = [
+            Operation::Update {
+                updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
+                removed_fragment_ids: vec![],
+                new_fragments: vec![sample_file.clone()],
+            },
+            Operation::Delete {
+                updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
+                deleted_fragment_ids: vec![],
+                predicate: "a > 0".to_string(),
+            },
+            Operation::Update {
+                updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
+                removed_fragment_ids: vec![],
+                new_fragments: vec![sample_file],
+            },
+        ];
+        let transactions =
+            operations.map(|op| Transaction::new_from_version(dataset.manifest.version, op));
+
+        let (first_txn, remaining_txns) = transactions.split_at(1);
+        let first_txn = first_txn[0].clone();
+
+        // Can apply first transaction to create the conflict
+        dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(first_txn.clone())
+            .await
+            .unwrap();
+
+        for txn in remaining_txns {
+            let affected_rows = RowIdTreeMap::from_iter([0]);
+
+            let mut rebase =
+                TransactionRebase::try_new(&dataset, txn.clone(), Some(&affected_rows))
+                    .await
+                    .unwrap();
+            io_tracker.incremental_stats(); // reset
+            rebase.check_txn(Some(&first_txn), 1).unwrap();
+
+            assert_eq!(
+                rebase
+                    .initial_fragments
+                    .iter()
+                    .map(|(id, (_, needs_rewrite))| (*id, *needs_rewrite))
+                    .collect::<Vec<_>>(),
+                vec![(0, true)],
+            );
+
+            let io_stats = io_tracker.incremental_stats();
+            assert_eq!(io_stats.read_iops, 0);
+            assert_eq!(io_stats.write_iops, 0);
+
+            let res = rebase.finish(&dataset).await;
+            assert!(matches!(
+                res,
+                Err(crate::Error::RetryableCommitConflict { .. })
+            ));
+
+            let io_stats = io_tracker.incremental_stats();
+            assert_eq!(io_stats.read_iops, 0); // Cached deletion file
+            assert_eq!(io_stats.write_iops, 0); // Failed before writing
+        }
     }
 
     #[tokio::test]
