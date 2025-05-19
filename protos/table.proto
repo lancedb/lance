@@ -370,3 +370,16 @@ message LabelListIndexDetails {}
 message InvertedIndexDetails {}
 message NGramIndexDetails {}
 message VectorIndexDetails {}
+
+message FragmentReuseIndexDetails {
+
+  message Version {
+    // version of the dataset corresponds to the dataset_version at the time the index adds this version entry
+    uint64 dataset_version = 1;
+
+    // The path to the row ID mapping file for this version, relative to the index root
+    string row_id_map_path = 2;
+  }
+
+  repeated Version versions = 1;
+}
