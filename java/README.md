@@ -136,7 +136,7 @@ void randomAccess() {
 * add columns
 
 ```java
-void addColumns() {
+void addColumnsByExpressions() {
     String datasetPath = ""; // specify a path point to a dataset
     try (BufferAllocator allocator = new RootAllocator()) {
         try (Dataset dataset = Dataset.open(datasetPath, allocator)) {
@@ -144,6 +144,20 @@ void addColumns() {
             dataset.addColumns(sqlExpressions, Optional.empty());
         }
     }
+}
+
+void addColumnsBySchema() {
+  String datasetPath = ""; // specify a path point to a dataset
+  try (BufferAllocator allocator = new RootAllocator()) {
+    try (Dataset dataset = Dataset.open(datasetPath, allocator)) {
+      SqlExpressions sqlExpressions = new SqlExpressions.Builder().withExpression("double_id", "id * 2").build();
+      dataset.addColumns(new Schema(
+          Arrays.asList(
+              Field.nullable("id", new ArrowType.Int(32, true)),
+              Field.nullable("name", new ArrowType.Utf8()),
+              Field.nullable("age", new ArrowType.Int(32, true)))), Optional.empty());
+    }
+  }
 }
 ```
 
