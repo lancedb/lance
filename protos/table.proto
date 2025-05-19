@@ -378,7 +378,7 @@ message FragmentReuseIndexDetails {
     uint64 dataset_version = 1;
 
     // The path to the row ID mapping file for this version, relative to the index root
-    string row_id_map_path = 2;
+    string row_addr_map_path = 2;
   }
 
   repeated Version versions = 1;

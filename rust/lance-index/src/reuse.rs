@@ -24,14 +24,14 @@ const MAX_ROWS_PER_CHUNK: usize = 2 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct FragReuseVersion {
     pub dataset_version: u64,
-    pub row_id_map_path: String,
+    pub row_addr_map_path: String,
 }
 
 impl From<&FragReuseVersion> for pb::fragment_reuse_index_details::Version {
     fn from(version: &FragReuseVersion) -> Self {
         Self {
             dataset_version: version.dataset_version,
-            row_id_map_path: version.row_id_map_path.clone(),
+            row_addr_map_path: version.row_addr_map_path.clone(),
         }
     }
 }
@@ -42,7 +42,7 @@ impl TryFrom<pb::fragment_reuse_index_details::Version> for FragReuseVersion {
     fn try_from(version: pb::fragment_reuse_index_details::Version) -> Result<Self> {
         Ok(Self {
             dataset_version: version.dataset_version,
-            row_id_map_path: version.row_id_map_path,
+            row_addr_map_path: version.row_addr_map_path,
         })
     }
 }
@@ -83,7 +83,7 @@ pub struct FragReuseIndex {
 
     // row ID map of all compaction rounds
     // ordered from oldest to newest
-    pub row_id_maps: Vec<HashMap<u64, Option<u64>>>,
+    pub row_addr_maps: Vec<HashMap<u64, Option<u64>>>,
 
     store: Arc<dyn IndexStore>,
 }
@@ -96,12 +96,12 @@ impl DeepSizeOf for FragReuseIndex {
 
 impl FragReuseIndex {
     pub fn new(
-        row_id_maps: Vec<HashMap<u64, Option<u64>>>,
+        row_addr_maps: Vec<HashMap<u64, Option<u64>>>,
         details: FragReuseIndexDetails,
         store: Arc<dyn IndexStore>,
     ) -> Self {
         Self {
-            row_id_maps,
+            row_addr_maps,
             details,
             store,
         }
@@ -111,17 +111,17 @@ impl FragReuseIndex {
         details: FragReuseIndexDetails,
         store: Arc<dyn IndexStore>,
     ) -> Result<Arc<Self>> {
-        let row_id_maps = join_all(
+        let row_addr_maps = join_all(
             details
                 .versions
                 .iter()
-                .map(|version| load_row_id_map(&version.row_id_map_path, store.clone())),
+                .map(|version| load_row_addr_map(&version.row_addr_map_path, store.clone())),
         )
         .await
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
 
-        Ok(Arc::new(Self::new(row_id_maps, details, store)))
+        Ok(Arc::new(Self::new(row_addr_maps, details, store)))
     }
 }
 
@@ -174,56 +174,56 @@ impl Index for FragReuseIndex {
 }
 
 /// Save a row ID map to a Lance index file.
-pub async fn save_row_id_map(
+pub async fn save_row_addr_map(
     index_store: Arc<dyn IndexStore>,
     dataset_version: &u64,
-    row_id_map: &HashMap<u64, Option<u64>>,
+    row_addr_map: &HashMap<u64, Option<u64>>,
 ) -> Result<String> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("old_row_id", DataType::UInt64, false),
-        Field::new("new_row_id", DataType::UInt64, true),
+        Field::new("old_row_addr", DataType::UInt64, false),
+        Field::new("new_row_addr", DataType::UInt64, true),
     ]));
 
     // need a UUID in case of concurrent compactions writing
-    let file_path = format!("{}_row_id_map_{}.lance", dataset_version, Uuid::new_v4());
+    let file_path = format!("{}_row_addr_map_{}.lance", dataset_version, Uuid::new_v4());
     let mut index_file = index_store
         .new_index_file(&file_path, schema.clone())
         .await?;
 
-    let mut old_row_ids = Vec::new();
-    let mut new_row_ids = Vec::new();
+    let mut old_row_addrs = Vec::new();
+    let mut new_row_addrs = Vec::new();
     let mut rows = 0;
 
-    for (old_row_id, new_row_id) in row_id_map.into_iter() {
+    for (old_row_addr, new_row_addr) in row_addr_map.into_iter() {
         // flush current batch
         if rows > BATCH_SIZE {
             let batch = RecordBatch::try_new(
                 schema.clone(),
                 vec![
-                    Arc::new(UInt64Array::from(old_row_ids.clone())),
-                    Arc::new(UInt64Array::from(new_row_ids.clone())),
+                    Arc::new(UInt64Array::from(old_row_addrs.clone())),
+                    Arc::new(UInt64Array::from(new_row_addrs.clone())),
                 ],
             )?;
 
             index_file.write_record_batch(batch).await?;
 
-            old_row_ids.clear();
-            new_row_ids.clear();
+            old_row_addrs.clear();
+            new_row_addrs.clear();
             rows = 0;
         }
 
-        old_row_ids.push(*old_row_id);
-        new_row_ids.push(*new_row_id);
+        old_row_addrs.push(*old_row_addr);
+        new_row_addrs.push(*new_row_addr);
         rows += 1;
     }
 
-    if !old_row_ids.is_empty() {
+    if !old_row_addrs.is_empty() {
         // write remaining
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt64Array::from(old_row_ids)),
-                Arc::new(UInt64Array::from(new_row_ids)),
+                Arc::new(UInt64Array::from(old_row_addrs)),
+                Arc::new(UInt64Array::from(new_row_addrs)),
             ],
         )?;
 
@@ -234,16 +234,16 @@ pub async fn save_row_id_map(
     Ok(file_path)
 }
 
-pub async fn load_row_id_map(
+pub async fn load_row_addr_map(
     file_path: &str,
     store: Arc<dyn IndexStore>,
 ) -> Result<HashMap<u64, Option<u64>>> {
     let index_file = store.open_index_file(file_path).await?;
     let total_rows = index_file.num_rows();
 
-    let mut row_id_map = HashMap::new();
+    let mut row_addr_map = HashMap::new();
     if total_rows == 0 {
-        return Ok(row_id_map);
+        return Ok(row_addr_map);
     }
 
     for start_row in (0..total_rows).step_by(MAX_ROWS_PER_CHUNK) {
@@ -254,28 +254,28 @@ pub async fn load_row_id_map(
             continue;
         }
 
-        let old_row_ids = chunk
+        let old_row_addrs = chunk
             .column(0)
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
-        let new_row_ids = chunk
+        let new_row_addrs = chunk
             .column(1)
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
 
         for idx in 0..chunk.num_rows() {
-            let new_row_id = if new_row_ids.is_null(idx) {
+            let new_row_addr = if new_row_addrs.is_null(idx) {
                 None
             } else {
-                Some(new_row_ids.value(idx))
+                Some(new_row_addrs.value(idx))
             };
-            row_id_map.insert(old_row_ids.value(idx), new_row_id);
+            row_addr_map.insert(old_row_addrs.value(idx), new_row_addr);
         }
     }
 
-    Ok(row_id_map)
+    Ok(row_addr_map)
 }
 
 #[cfg(test)]
@@ -290,15 +290,15 @@ pub mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn test_save_and_load_row_id_map() {
+    async fn test_save_and_load_row_addr_map() {
         // Create a test row ID map, make it not aligned with chunk size
-        let mut row_id_map = HashMap::new();
+        let mut row_addr_map = HashMap::new();
         for i in 0..(1024 * 1024 + 100) {
             // Some rows map to new IDs, some are deleted (None)
             if i % 3 == 0 {
-                row_id_map.insert(i, None);
+                row_addr_map.insert(i, None);
             } else {
-                row_id_map.insert(i, Some(i * 2));
+                row_addr_map.insert(i, Some(i * 2));
             }
         }
 
@@ -312,23 +312,23 @@ pub mod tests {
 
         // Save the row ID map
         let dataset_version = 1;
-        let file_path = save_row_id_map(test_store.clone(), &dataset_version, &row_id_map)
+        let file_path = save_row_addr_map(test_store.clone(), &dataset_version, &row_addr_map)
             .await
             .expect("Failed to save row ID map");
 
         // Load the row ID map back
-        let loaded_map = load_row_id_map(&file_path, test_store)
+        let loaded_map = load_row_addr_map(&file_path, test_store)
             .await
             .expect("Failed to load row ID map");
 
         // Verify the loaded map matches the original
-        assert_eq!(loaded_map.len(), row_id_map.len(), "Map size mismatch");
-        for (old_id, new_id) in &row_id_map {
+        assert_eq!(loaded_map.len(), row_addr_map.len(), "Map size mismatch");
+        for (old_addr, new_addr) in &row_addr_map {
             assert_eq!(
-                loaded_map.get(old_id),
-                Some(new_id),
-                "Mismatch for old_id {}",
-                old_id
+                loaded_map.get(old_addr),
+                Some(new_addr),
+                "Mismatch for old_addr {}",
+                old_addr
             );
         }
     }
@@ -345,21 +345,21 @@ pub mod tests {
 
         // Create multiple versions of row ID maps
         let mut versions = Vec::new();
-        let mut row_id_maps = Vec::new();
+        let mut row_addr_maps = Vec::new();
 
         // Version 1: Simple mapping
         let mut map1 = HashMap::new();
         for i in 0..100 {
             map1.insert(i, Some(i * 2));
         }
-        let file_path1 = save_row_id_map(test_store.clone(), &1, &map1)
+        let file_path1 = save_row_addr_map(test_store.clone(), &1, &map1)
             .await
             .expect("Failed to save row ID map");
         versions.push(FragReuseVersion {
             dataset_version: 1,
-            row_id_map_path: file_path1,
+            row_addr_map_path: file_path1,
         });
-        row_id_maps.push(map1);
+        row_addr_maps.push(map1);
 
         // Version 2: Some deletions
         let mut map2 = HashMap::new();
@@ -370,18 +370,18 @@ pub mod tests {
                 map2.insert(i, Some(i * 3));
             }
         }
-        let file_path2 = save_row_id_map(test_store.clone(), &2, &map2)
+        let file_path2 = save_row_addr_map(test_store.clone(), &2, &map2)
             .await
             .expect("Failed to save row ID map");
         versions.push(FragReuseVersion {
             dataset_version: 2,
-            row_id_map_path: file_path2,
+            row_addr_map_path: file_path2,
         });
-        row_id_maps.push(map2);
+        row_addr_maps.push(map2);
 
         // Create and save the FragReuseIndex
         let details = FragReuseIndexDetails { versions };
-        let index = FragReuseIndex::new(row_id_maps.clone(), details.clone(), test_store.clone());
+        let index = FragReuseIndex::new(row_addr_maps.clone(), details.clone(), test_store.clone());
 
         // Load the index back
         let loaded_index = FragReuseIndex::load(details, test_store)
@@ -390,15 +390,15 @@ pub mod tests {
 
         // Verify the loaded index matches the original
         assert_eq!(
-            loaded_index.row_id_maps.len(),
-            row_id_maps.len(),
+            loaded_index.row_addr_maps.len(),
+            row_addr_maps.len(),
             "Number of row ID maps mismatch"
         );
 
         // Verify each version's row ID map
-        for (i, (original_map, loaded_map)) in row_id_maps
+        for (i, (original_map, loaded_map)) in row_addr_maps
             .iter()
-            .zip(loaded_index.row_id_maps.iter())
+            .zip(loaded_index.row_addr_maps.iter())
             .enumerate()
         {
             assert_eq!(
@@ -407,12 +407,12 @@ pub mod tests {
                 "Map size mismatch for version {}",
                 i + 1
             );
-            for (old_id, new_id) in original_map {
+            for (old_addr, new_addr) in original_map {
                 assert_eq!(
-                    loaded_map.get(old_id),
-                    Some(new_id),
-                    "Mismatch for old_id {} in version {}",
-                    old_id,
+                    loaded_map.get(old_addr),
+                    Some(new_addr),
+                    "Mismatch for old_addr {} in version {}",
+                    old_addr,
                     i + 1
                 );
             }
