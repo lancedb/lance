@@ -740,7 +740,6 @@ pub(crate) async fn commit_transaction(
 
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.
-    let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
     let original_dataset = dataset.clone();
@@ -795,8 +794,8 @@ pub(crate) async fn commit_transaction(
 
         transaction = rebase.finish(&dataset).await?;
 
-        // TODO: how about writing a new transaction file with the rebased transaction?
-        // TODO: how about deleting the old transaction file?
+        let transaction_file =
+            write_transaction_file(object_store, &dataset.base, &transaction).await?;
 
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
