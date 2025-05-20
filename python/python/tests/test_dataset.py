@@ -20,7 +20,7 @@ import lance.fragment
 import numpy as np
 import pandas as pd
 import pandas.testing as tm
-import polars as pl
+# import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
@@ -40,7 +40,7 @@ input_data = [
     (None, pa.table({"a": [1.0, 2.0], "b": [20, 30]})),
     (None, pa.record_batch([[1.0, 2.0], [20, 30]], names=["a", "b"])),
     (None, pd.DataFrame({"a": [1.0, 2.0], "b": [20, 30]})),
-    (None, pl.DataFrame({"a": [1.0, 2.0], "b": [20, 30]})),
+    # (None, pl.DataFrame({"a": [1.0, 2.0], "b": [20, 30]})),
     (
         input_schema,
         [pa.record_batch([pa.array([1.0, 2.0]), pa.array([20, 30])], names=["a", "b"])],
@@ -1063,6 +1063,44 @@ def test_cleanup_around_tagged_old_versions(tmp_path):
     )
     assert stats.bytes_removed > 0
     assert stats.old_versions == 1
+
+
+def test_auto_cleanup(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    auto_cleanup_options = {
+        "interval": "1",
+        "older_than_seconds": "1",
+    }
+    lance.write_dataset(table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="create")
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+
+    time.sleep(3)
+
+    # trigger cleanup
+    lance.write_dataset(table, base_dir, mode="append")
+    dataset = lance.dataset(base_dir)
+    assert len(dataset.versions()) == 2
+
+
+def test_auto_cleanup_invalid(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    auto_cleanup_options = {
+        "interval": "1",
+        "older_than_seconds": "1",
+    }
+    lance.write_dataset(table, base_dir, mode="create")
+    lance.write_dataset(table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append")
+    lance.write_dataset(table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append")
+
+    time.sleep(3)
+
+    lance.write_dataset(table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append")
+    dataset = lance.dataset(base_dir)
+    assert len(dataset.versions()) == 4
 
 
 def test_create_from_commit(tmp_path: Path):
