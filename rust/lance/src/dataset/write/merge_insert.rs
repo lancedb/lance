@@ -16,6 +16,9 @@
 //! key columns are identical in both the source and the target.  This means that you will need some kind of
 //! meaningful key column to be able to perform a merge insert.
 
+use assign_action::merge_insert_action;
+use datafusion_expr::col;
+use exec::MergeInsertMetrics;
 use futures::FutureExt;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -95,6 +98,9 @@ use crate::{
 };
 
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
+
+mod assign_action;
+mod exec;
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -1166,10 +1172,95 @@ impl MergeInsertJob {
         self.execute_uncommitted_impl(stream).await
     }
 
+    async fn create_plan(
+        self,
+        source: SendableRecordBatchStream,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // For upsert, we create a plan:
+        // MergeInsertWriteExec
+        //   ProjectionExec [action=merge_insert_action(), +keep input columns]
+        //     HashJoin [type=left, on=id]
+        //       OneShotRead [input]
+        //       Scan columns=[id, _rowid, _rowaddr]
+
+        // Goal: we shouldn't manually have to specify which columns to scan.
+        //       DataFusion's optimizer should be able to automatically perform
+        //       projection pushdown for us.
+        // Goal: we shouldn't have to add new branches in this code to handle
+        //       indexed vs non-indexed cases. That should be handled by optimizer rules.
+        let session_config = SessionConfig::default();
+        let session_ctx = SessionContext::new_with_config(session_config);
+        todo!("register planning rules to session ctx");
+        let scan = session_ctx.read_lance(self.dataset.clone(), true, true)?;
+        let on = self
+            .params
+            .on
+            .iter()
+            .map(|name| col(name))
+            .collect::<Vec<_>>();
+        let df = session_ctx
+            .read_one_shot(source)?
+            .join_on(scan, JoinType::Left, on)?
+            .select(vec![merge_insert_action(&self.params)?.alias("action")])?;
+        let df: DataFrame = todo!("apply the write node at the end");
+
+        let (session_state, logical_plan) = df.into_parts();
+
+        let logical_plan = session_state.optimize(&logical_plan)?;
+
+        // TODO: we need to register a planner that can take a logical write and make it a FullSchemaMergeInsertExec
+        let mut physical_plan = session_state.create_physical_plan(&logical_plan).await?;
+
+        // Do multiple passes (Maybe datafusion has a method for this, not sure?)
+        let optimizers = session_state.physical_optimizers();
+        for _ in 0..3 {
+            for optimizer in optimizers {
+                physical_plan =
+                    optimizer.optimize(physical_plan, session_state.config_options())?;
+            }
+        }
+
+        Ok(physical_plan)
+    }
+
+    async fn execute_uncommitted_v2(
+        self,
+        source: SendableRecordBatchStream,
+    ) -> Result<(Transaction, MergeStats)> {
+        let plan = self.create_plan(source).await?;
+
+        // We have to get the data off of the execution plan.
+        // Option 1: serialize the output to the recordbatch, then deserialize after
+        // Option 2: add methods on the write execution plan. Then after we run it,
+        //           downcast it and call the methods to get the data.
+        let output: RecordBatch = todo!("execute_plan");
+
+        let stats = MergeInsertMetrics::from(&output);
+        let stats = MergeStats::from(&stats);
+
+        let transaction = todo!("get transaction out of plan");
+
+        Ok((transaction, stats))
+    }
+
     async fn execute_uncommitted_impl(
         self,
         source: SendableRecordBatchStream,
     ) -> Result<UncommittedMergeInsert> {
+        // We are migrating a new plan-based code path. For now, only using this
+        // for select supported queries. Right now that is just upsert without
+        // any scalar index.
+        if self.params.insert_not_matched
+            && matches!(self.params.when_matched, WhenMatched::UpdateAll)
+            && todo!("there is no scalar index")
+        {
+            let (transaction, stats) = self.execute_uncommitted_v2(source).await?;
+            return Ok(UncommittedMergeInsert {
+                transaction,
+                affected_rows: None,
+                stats,
+            });
+        }
         // Erase metadata on source / dataset schemas to avoid comparing metadata
         let schema = lance_core::datatypes::Schema::try_from(source.schema().as_ref())?;
         let full_schema = self.dataset.local_schema();
