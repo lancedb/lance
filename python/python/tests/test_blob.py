@@ -211,3 +211,8 @@ def test_take_deleted_blob(tmp_path, dataset_with_blobs):
         match="A take operation that includes row addresses must not target deleted",
     ):
         dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+
+
+def test_scan_blob(tmp_path, dataset_with_blobs):
+    ds = dataset_with_blobs.scanner(filter="idx = 2").to_table()
+    assert ds.num_rows == 1
