@@ -800,10 +800,9 @@ async fn rechunk_stable_row_ids(
                 .await?;
 
                 let mut new_seq = seq.as_ref().clone();
-                new_seq.mask(deletions.iter())?;
+                new_seq.mask(deletions.to_sorted_iter())?;
                 *seq = Arc::new(new_seq);
             }
-
             Ok::<(), crate::Error>(())
         })
         .await?;
