@@ -478,17 +478,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn move_term(&mut self, least_id: u64) {
         let picked = self.pick_term(least_id);
         self.postings[picked].next(least_id);
-        let posting = self.postings.remove(picked);
-        if posting.doc().is_some() {
-            debug_assert!(posting.doc().unwrap().doc_id() >= least_id);
-            let idx = picked + self.postings[picked..].binary_search(&posting).inspect(|&idx| {
-                log::warn!("the posting is removed from the list, this is a bug: {:?}, same posting: {:?}", posting, self.postings[idx]);
-            }).unwrap_err();
-            self.postings.insert(idx, posting);
+        if self.postings[picked].empty() {
+            self.postings.remove(picked);
         }
-        debug_assert!(self
-            .postings
-            .is_sorted_by_key(|posting| posting.doc().unwrap().doc_id()));
+        self.postings.sort_unstable();
     }
 
     fn move_preceding(&mut self, pivot: usize, least_id: u64) {
