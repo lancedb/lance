@@ -513,6 +513,42 @@ def test_ngram_fts(tmp_path):
     )
 
 
+def test_fts_fts(tmp_path):
+    # Tests creating two FTS indices with the same name but different parameters
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "text": [
+                    "Frodo was a puppy",
+                    "Frodo was a happy puppy",
+                    "Frodo was a very happy puppy",
+                ]
+            }
+        ),
+        tmp_path,
+    )
+    dataset.create_scalar_index("text", "INVERTED", with_position=True)
+
+    results = dataset.to_table(full_text_query='"was a puppy"', prefilter=True)
+    assert results.num_rows == 1
+
+    results = dataset.to_table(full_text_query="was a puppy", prefilter=True)
+    assert results.num_rows == 3
+
+    dataset.create_scalar_index(
+        "text", "INVERTED", name="no_pos_idx", with_position=False
+    )
+
+    # There is no way to currently specify which index to use.  Instead
+    # it will always use the first index in the manifest.
+
+    results = dataset.to_table(full_text_query='"was a puppy"', prefilter=True)
+    assert results.num_rows == 1
+
+    results = dataset.to_table(full_text_query="was a puppy", prefilter=True)
+    assert results.num_rows == 3
+
+
 def test_indexed_filter_with_fts_index(tmp_path):
     data = pa.table(
         {
