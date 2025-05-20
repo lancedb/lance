@@ -1878,10 +1878,10 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         if let Some(auto_cleanup) = get_dict_opt::<Bound<PyDict>>(options, "auto_cleanup_options")? {
             let interval = get_dict_opt::<String>(&auto_cleanup, "interval")?
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0);
+                .unwrap_or(20);
             let older_than = get_dict_opt::<String>(&auto_cleanup, "older_than_seconds")?
                 .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
+                .unwrap_or(14 * 24 * 3600);     // 14 days
 
             p.auto_cleanup = Some(AutoCleanupParams {
                 interval,

@@ -20,7 +20,7 @@ import lance.fragment
 import numpy as np
 import pandas as pd
 import pandas.testing as tm
-# import polars as pl
+import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
@@ -40,7 +40,7 @@ input_data = [
     (None, pa.table({"a": [1.0, 2.0], "b": [20, 30]})),
     (None, pa.record_batch([[1.0, 2.0], [20, 30]], names=["a", "b"])),
     (None, pd.DataFrame({"a": [1.0, 2.0], "b": [20, 30]})),
-    # (None, pl.DataFrame({"a": [1.0, 2.0], "b": [20, 30]})),
+    (None, pl.DataFrame({"a": [1.0, 2.0], "b": [20, 30]})),
     (
         input_schema,
         [pa.record_batch([pa.array([1.0, 2.0]), pa.array([20, 30])], names=["a", "b"])],

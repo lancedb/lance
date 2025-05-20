@@ -64,7 +64,7 @@ __all__ = [
     "dataset",
     "batch_udf",
     "set_logger",
-    # "FFILanceTableProvider",
+    "FFILanceTableProvider",
 ]
 
 
