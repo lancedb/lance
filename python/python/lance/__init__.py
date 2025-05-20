@@ -24,7 +24,7 @@ from .dataset import (
 )
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
-    # FFILanceTableProvider,
+    FFILanceTableProvider,
     ScanStatistics,
     bytes_read_counter,
     iops_counter,
