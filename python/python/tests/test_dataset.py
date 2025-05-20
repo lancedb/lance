@@ -779,6 +779,25 @@ def test_count_rows(tmp_path: Path):
     assert dataset.count_rows(filter="a < 50") == 50
 
 
+def test_count_rows_via_scanner(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"a": range(100), "b": range(100)}), tmp_path)
+
+    assert ds.scanner(filter="a < 50", columns=[], with_row_id=True).count_rows() == 50
+
+    with pytest.raises(
+        ValueError, match="should not be called on a plan selecting columns"
+    ):
+        ds.scanner(filter="a < 50", columns=["a"], with_row_id=True).count_rows()
+
+    with pytest.raises(
+        ValueError, match="should not be called on a plan selecting columns"
+    ):
+        ds.scanner(with_row_id=True).count_rows()
+
+    with pytest.raises(ValueError, match="with_row_id is false"):
+        ds.scanner(columns=[]).count_rows()
+
+
 def test_select_none(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
