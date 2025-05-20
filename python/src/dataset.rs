@@ -37,6 +37,7 @@ use lance::dataset::scanner::{
     DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
+use lance::dataset::AutoCleanupParams;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
@@ -68,7 +69,6 @@ use lance_index::{
     DatasetIndexExt, IndexParams, IndexType,
 };
 use lance_io::object_store::ObjectStoreParams;
-use lance::dataset::AutoCleanupParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
@@ -1875,13 +1875,14 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p.enable_v2_manifest_paths = enable_v2_manifest_paths;
         }
 
-        if let Some(auto_cleanup) = get_dict_opt::<Bound<PyDict>>(options, "auto_cleanup_options")? {
+        if let Some(auto_cleanup) = get_dict_opt::<Bound<PyDict>>(options, "auto_cleanup_options")?
+        {
             let interval = get_dict_opt::<String>(&auto_cleanup, "interval")?
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(20);
             let older_than = get_dict_opt::<String>(&auto_cleanup, "older_than_seconds")?
                 .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(14 * 24 * 3600);     // 14 days
+                .unwrap_or(14 * 24 * 3600); // 14 days
 
             p.auto_cleanup = Some(AutoCleanupParams {
                 interval,

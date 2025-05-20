@@ -1072,7 +1072,9 @@ def test_auto_cleanup(tmp_path):
         "interval": "1",
         "older_than_seconds": "1",
     }
-    lance.write_dataset(table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="create")
+    lance.write_dataset(
+        table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="create"
+    )
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
@@ -1093,12 +1095,18 @@ def test_auto_cleanup_invalid(tmp_path):
         "older_than_seconds": "1",
     }
     lance.write_dataset(table, base_dir, mode="create")
-    lance.write_dataset(table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append")
-    lance.write_dataset(table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append")
+    lance.write_dataset(
+        table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append"
+    )
+    lance.write_dataset(
+        table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append"
+    )
 
     time.sleep(3)
 
-    lance.write_dataset(table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append")
+    lance.write_dataset(
+        table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append"
+    )
     dataset = lance.dataset(base_dir)
     assert len(dataset.versions()) == 4
 

@@ -3977,6 +3977,7 @@ def write_dataset(
         secondary indices need to be updated to point to new row ids.
     auto_cleanup_options: optional, dict
         Config options for automatic cleanup of the dataset.
+        Note: this config options only take effect when creating a new dataset.
     """
     if use_legacy_format is not None:
         warnings.warn(
