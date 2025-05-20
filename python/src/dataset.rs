@@ -43,8 +43,8 @@ use lance::dataset::{
     scanner::Scanner as LanceScanner,
     transaction::{Operation, Transaction},
     Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
-    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
-    WriteParams,
+    UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource, WriteMode, WriteParams,
 };
 use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
@@ -236,7 +236,9 @@ impl MergeInsertBuilder {
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let (transaction, stats) = RT
+        let UncommittedMergeInsert {
+            transaction, stats, ..
+        } = RT
             .spawn(Some(py), job.execute_uncommitted(new_data))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
