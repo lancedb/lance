@@ -323,7 +323,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut candidates = BinaryHeap::new();
         let mut num_comparisons = 0;
         while let Some((pivot, doc)) = self.next()? {
-            log::warn!("found doc: {:?}", doc);
             self.cur_doc = Some(doc);
             num_comparisons += 1;
             if is_phrase_query && !self.check_positions() {
@@ -362,7 +361,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 )));
                 self.threshold = candidates.peek().unwrap().0 .0.score.0 * factor;
             }
-            log::warn!("{} candidates", candidates.len());
 
             // this is an optimization to avoid moving posting iterators one by one
             self.move_preceding(pivot, doc.doc_id() + 1);
@@ -400,18 +398,16 @@ impl<'a, S: Scorer> Wand<'a, S> {
         while let Some(pivot) = self.find_pivot_term() {
             let posting = &self.postings[pivot];
             let Some(doc) = posting.doc() else {
-                log::warn!("no pivot found");
                 return Ok(None);
             };
             let doc_id = doc.doc_id();
-            log::warn!("found pivot doc id: {}, with pivot {}", doc_id, pivot);
+
             for posting in self.postings[..pivot].iter_mut() {
                 posting.shallow_next(doc_id);
             }
 
             if self.check_block_max(pivot) {
                 if self.cur_doc.is_some() && self.cur_doc.unwrap().doc_id() >= doc_id {
-                    log::warn!("the current doc id is greater than the doc id of the pivot");
                     self.move_term(self.cur_doc.unwrap().doc_id() + 1);
                 } else if self.postings[0].doc().unwrap().doc_id() == doc_id {
                     // all the posting iterators preceding pivot have reached this doc id,
@@ -421,27 +417,19 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 } else {
                     // some posting iterators haven't reached this doc id,
                     // so move such terms to the doc id
-                    log::warn!(
-                        "not all posting iterators have reached this doc id {}, first doc id: {}",
-                        doc_id,
-                        self.postings[0].doc().unwrap().doc_id()
-                    );
                     self.move_term(doc_id);
                 }
             } else {
                 // the current block max score is less than the threshold,
                 // which means we have to skip at least the current block
                 if let Some(least_id) = self.get_new_candidate(pivot) {
-                    log::warn!("the current block max score is less than the threshold");
                     self.move_term(least_id);
                 } else {
                     // no more candidates, so we can stop
-                    log::warn!("no more candidates");
                     return Ok(None);
                 }
             }
         }
-        log::warn!("no more docs");
         Ok(None)
     }
 
