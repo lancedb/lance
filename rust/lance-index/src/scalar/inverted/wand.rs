@@ -326,6 +326,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             self.cur_doc = Some(doc);
             num_comparisons += 1;
             if is_phrase_query && !self.check_positions() {
+                self.move_preceding(pivot, doc.doc_id() + 1);
                 continue;
             }
 
@@ -339,6 +340,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 DocInfo::Located(doc) => doc.row_id,
             };
             if !mask.selected(row_id) {
+                self.move_preceding(pivot, doc.doc_id() + 1);
                 continue;
             }
             let doc_length = match &doc {
@@ -361,8 +363,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 )));
                 self.threshold = candidates.peek().unwrap().0 .0.score.0 * factor;
             }
-
-            // this is an optimization to avoid moving posting iterators one by one
             self.move_preceding(pivot, doc.doc_id() + 1);
         }
         metrics.record_comparisons(num_comparisons);
@@ -397,9 +397,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn next(&mut self) -> Result<Option<(usize, DocInfo)>> {
         while let Some(pivot) = self.find_pivot_term() {
             let posting = &self.postings[pivot];
-            let Some(doc) = posting.doc() else {
-                return Ok(None);
-            };
+            let doc = posting.doc().unwrap();
             let doc_id = doc.doc_id();
 
             for posting in self.postings[..pivot].iter_mut() {
@@ -407,17 +405,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             if self.check_block_max(pivot) {
-                if self.cur_doc.is_some() && self.cur_doc.unwrap().doc_id() >= doc_id {
-                    self.move_term(self.cur_doc.unwrap().doc_id() + 1);
-                } else if self.postings[0].doc().unwrap().doc_id() == doc_id {
+                if self.postings[0].doc().unwrap().doc_id() == doc_id {
                     // all the posting iterators preceding pivot have reached this doc id,
                     // so that means the sum of upper bound of all terms is not less than the threshold,
                     // this document is a candidate
                     return Ok(Some((pivot, doc)));
                 } else {
-                    // some posting iterators haven't reached this doc id,
-                    // so move such terms to the doc id
-                    self.move_term(doc_id);
+                    // this doc can't be a candidate,
+                    // move to the next doc id
+                    self.move_term(doc_id + 1);
                 }
             } else {
                 // the current block max score is less than the threshold,
@@ -458,13 +454,22 @@ impl<'a, S: Scorer> Wand<'a, S> {
     #[instrument(level = "debug", skip_all)]
     fn find_pivot_term(&self) -> Option<usize> {
         let mut acc = 0.0;
+        let mut pivot = None;
         for (idx, posting) in self.postings.iter().enumerate() {
             acc += posting.approximate_upper_bound();
             if acc >= self.threshold {
-                return Some(idx);
+                pivot = Some(idx);
+                break;
             }
         }
-        None
+        let mut pivot = pivot?;
+        let doc_id = self.postings[pivot].doc().unwrap().doc_id();
+        while pivot + 1 < self.postings.len()
+            && self.postings[pivot + 1].doc().unwrap().doc_id() == doc_id
+        {
+            pivot += 1;
+        }
+        Some(pivot)
     }
 
     // pick the term that has the maximum upper bound and the current doc id is less than the given doc id
@@ -507,7 +512,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         for (i, posting) in self.postings.iter().enumerate() {
             let doc = posting.doc().unwrap();
             if doc.doc_id() >= least_id {
-                break;
+                continue;
             }
             // a shorter posting list means this term is rare and more likely to skip more documents,
             // so we prefer the term with a shorter posting list.

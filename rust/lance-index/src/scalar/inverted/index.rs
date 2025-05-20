@@ -197,7 +197,6 @@ impl InvertedIndex {
                 }
             }
         }
-        std::mem::drop(parts);
 
         Ok(candidates
             .into_sorted_vec()
