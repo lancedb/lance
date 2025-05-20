@@ -26,7 +26,8 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::{
     flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
 };
-use lance_index::DatasetIndexExt;
+use lance_index::scalar::ScalarIndexType;
+use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
 use tracing::instrument;
 
 use crate::{index::DatasetIndexInternalExt, Dataset};
@@ -176,9 +177,17 @@ impl ExecutionPlan for MatchQueryExec {
         )))?;
 
         let stream = stream::once(async move {
-            let index_meta = ds.load_scalar_index_for_column(&column).await?.ok_or(
-                DataFusionError::Execution(format!("No index found for column {}", column,)),
-            )?;
+            let index_meta = ds
+                .load_scalar_index(
+                    ScalarIndexCriteria::default()
+                        .for_column(&column)
+                        .with_type(ScalarIndexType::Inverted),
+                )
+                .await?
+                .ok_or(DataFusionError::Execution(format!(
+                    "No Inverted index found for column {}",
+                    column,
+                )))?;
             let uuid = index_meta.uuid.to_string();
             let index = ds
                 .open_generic_index(&column, &uuid, metrics.as_ref())
@@ -355,9 +364,17 @@ impl ExecutionPlan for FlatMatchQueryExec {
         )))?;
 
         let stream = stream::once(async move {
-            let index_meta = ds.load_scalar_index_for_column(&column).await?.ok_or(
-                DataFusionError::Execution(format!("No index found for column {}", column,)),
-            )?;
+            let index_meta = ds
+                .load_scalar_index(
+                    ScalarIndexCriteria::default()
+                        .for_column(&column)
+                        .with_type(ScalarIndexType::Inverted),
+                )
+                .await?
+                .ok_or(DataFusionError::Execution(format!(
+                    "No Inverted index found for column {}",
+                    column,
+                )))?;
             let uuid = index_meta.uuid.to_string();
             let index = ds
                 .open_generic_index(&column, &uuid, metrics.as_ref())
@@ -531,9 +548,17 @@ impl ExecutionPlan for PhraseQueryExec {
                 "column not set for PhraseQuery {}",
                 query.terms
             )))?;
-            let index_meta = ds.load_scalar_index_for_column(&column).await?.ok_or(
-                DataFusionError::Execution(format!("No index found for column {}", column,)),
-            )?;
+            let index_meta = ds
+                .load_scalar_index(
+                    ScalarIndexCriteria::default()
+                        .for_column(&column)
+                        .with_type(ScalarIndexType::Inverted),
+                )
+                .await?
+                .ok_or(DataFusionError::Execution(format!(
+                    "No Inverted index found for column {}",
+                    column,
+                )))?;
             let uuid = index_meta.uuid.to_string();
             let index = ds
                 .open_generic_index(&column, &uuid, metrics.as_ref())

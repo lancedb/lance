@@ -804,7 +804,10 @@ def test_analyze_index_scan(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("filter", "BTREE")
     plan = dataset.scanner(filter="filter = 10").analyze_plan()
-    assert "MaterializeIndex: query=filter = 10, metrics=[output_rows=1" in plan
+    assert (
+        "MaterializeIndex: query=[filter = 10]@filter_idx, metrics=[output_rows=1"
+        in plan
+    )
 
 
 def test_analyze_scan(tmp_path: Path):
