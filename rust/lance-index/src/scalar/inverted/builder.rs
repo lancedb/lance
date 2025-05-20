@@ -321,8 +321,7 @@ impl InnerBuilder {
                     posting_list.doc_ids.iter(),
                     posting_list.frequencies.iter(),
                 );
-                let num_docs = docs.len();
-                spawn_cpu(move || posting_list.to_batch(block_max_scores, num_docs))
+                spawn_cpu(move || posting_list.to_batch(block_max_scores))
             })
             .buffered(get_num_compute_intensive_cpus());
 

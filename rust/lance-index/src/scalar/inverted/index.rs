@@ -1383,7 +1383,7 @@ impl PostingListBuilder {
     }
 
     // assume the posting list is sorted by doc id
-    pub fn to_batch(mut self, block_max_scores: Vec<f32>, num_docs: usize) -> Result<RecordBatch> {
+    pub fn to_batch(mut self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
         let length = self.len();
         let mut position_builder = self.positions.as_mut().map(|_| {
             ListBuilder::new(ListBuilder::with_capacity(
@@ -1391,8 +1391,7 @@ impl PostingListBuilder {
                 length,
             ))
         });
-        let max_score =
-            idf(length, num_docs) * block_max_scores.iter().copied().fold(f32::MIN, f32::max);
+        let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
         for index in 0..length {
             if let Some(position_builder) = position_builder.as_mut() {
                 let positions = self.positions.as_ref().unwrap().get(index);
@@ -1674,15 +1673,13 @@ impl DocSet {
                 max_score = score;
             }
             if (i + 1) % BLOCK_SIZE == 0 {
-                // we don't multiply the idf (query weight) for block scores,
-                // because it's related to the posting list length (the number of documents containing the term),
-                // which will prevent us from doing compressing while indexing in the future
-                // multiply the idf (query weight) at query time
+                max_score *= idf(length, self.len());
                 block_max_scores.push(max_score);
                 max_score = f32::MIN;
             }
         }
         if length % BLOCK_SIZE > 0 {
+            max_score *= idf(length, self.len());
             block_max_scores.push(max_score);
         }
         block_max_scores
