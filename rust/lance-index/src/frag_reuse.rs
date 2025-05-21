@@ -162,6 +162,65 @@ impl Index for FragReuseIndex {
 
 #[cfg(test)]
 pub mod tests {
+
+    use super::*;
+
     #[tokio::test]
-    async fn test_serialize_deserialize_index_details() {}
+    async fn test_serialize_deserialize_index_details() {
+        // Create sample FragReuseVersions with different dataset versions
+        let version1 = FragReuseVersion {
+            dataset_version: 2,
+            changed_row_addrs: vec![1, 2, 3],
+            old_frags: vec![Fragment {
+                id: 1,
+                files: vec![],
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: None,
+            }],
+            new_frags: vec![2, 3],
+        };
+
+        let version2 = FragReuseVersion {
+            dataset_version: 1,
+            changed_row_addrs: vec![4, 5, 6],
+            old_frags: vec![Fragment {
+                id: 2,
+                files: vec![],
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: None,
+            }],
+            new_frags: vec![4, 5],
+        };
+
+        // Create FragReuseIndexDetails with versions in reverse order
+        let details = FragReuseIndexDetails {
+            versions: vec![version1, version2],
+        };
+
+        // Convert to protobuf format
+        let inline_content: InlineContent = (&details).into();
+
+        // Convert back to FragReuseIndexDetails
+        let roundtrip_details = FragReuseIndexDetails::try_from(inline_content).unwrap();
+
+        // Verify the roundtrip
+        assert_eq!(roundtrip_details.versions.len(), 2);
+
+        // Verify versions are sorted by dataset_version (oldest to latest)
+        assert_eq!(roundtrip_details.versions[0].dataset_version, 1);
+        assert_eq!(
+            roundtrip_details.versions[0].changed_row_addrs,
+            vec![4, 5, 6]
+        );
+        assert_eq!(roundtrip_details.versions[0].new_frags, vec![4, 5]);
+
+        assert_eq!(roundtrip_details.versions[1].dataset_version, 2);
+        assert_eq!(
+            roundtrip_details.versions[1].changed_row_addrs,
+            vec![1, 2, 3]
+        );
+        assert_eq!(roundtrip_details.versions[1].new_frags, vec![2, 3]);
+    }
 }

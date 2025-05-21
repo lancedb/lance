@@ -94,16 +94,3 @@ pub async fn open_frag_reuse_index(
 
     Ok(Arc::new(FragReuseIndex::new(row_id_maps, details.clone())))
 }
-
-#[cfg(test)]
-pub mod tests {
-    #[tokio::test]
-    async fn test_load_index_details() {
-        
-    }
-
-    #[tokio::test]
-    async fn test_open_frag_reuse_index() {
-        
-    }
-}
