@@ -370,3 +370,29 @@ message LabelListIndexDetails {}
 message InvertedIndexDetails {}
 message NGramIndexDetails {}
 message VectorIndexDetails {}
+
+message FragmentReuseIndexDetails {
+
+  oneof content {
+    // if < 200KB, store the content inline, otherwise store the InlineDetails bytes in external file
+    InlineContent inline = 1;
+    ExternalFile external = 2;
+  }
+
+  message InlineContent {
+    repeated Version versions = 1;
+  }
+
+  message Version {
+    // The dataset_version at the time the index adds this version entry
+    uint64 dataset_version = 1;
+
+    // a roaring treemap of the changed row addresses
+    bytes changed_row_addrs = 2;
+
+    repeated DataFragment old_fragments = 3;
+
+    // could use a bitmap, but might be overkill because new fragment count is typically small
+    repeated uint64 new_fragments = 4;
+  }
+}

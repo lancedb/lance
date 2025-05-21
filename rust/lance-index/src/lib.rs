@@ -19,12 +19,14 @@ use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::convert::TryFrom;
 
+pub mod frag_reuse;
 pub mod metrics;
 pub mod optimize;
 pub mod prefilter;
 pub mod scalar;
 pub mod traits;
 pub mod vector;
+
 pub use crate::traits::*;
 
 pub const INDEX_FILE_NAME: &str = "index.idx";
@@ -87,6 +89,8 @@ pub enum IndexType {
 
     NGram = 5, // NGram
 
+    FragmentReuse = 6,
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -105,6 +109,7 @@ impl std::fmt::Display for IndexType {
             Self::LabelList => write!(f, "LabelList"),
             Self::Inverted => write!(f, "Inverted"),
             Self::NGram => write!(f, "NGram"),
+            Self::FragmentReuse => write!(f, "FragmentReuse"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
