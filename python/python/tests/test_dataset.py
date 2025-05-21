@@ -161,6 +161,78 @@ def test_dataset_from_record_batch_iterable(tmp_path: Path):
     assert list(dataset.to_batches())[0].to_pylist() == test_pylist
 
 
+def test_to_batches_with_partial_last_batch(tmp_path: Path):
+    base_dir = tmp_path / "test_batches"
+    row_count_per_file = 32
+    batch_size = 5
+
+    # Generate 3 batches of 32 rows each (96 total)
+    pylist = [{"colA": f"Row{i}", "colB": i} for i in range(row_count_per_file * 3)]
+    batches = [
+        pa.RecordBatch.from_pylist(
+            pylist[i * row_count_per_file : (i + 1) * row_count_per_file]
+        )
+        for i in range(3)
+    ]
+
+    # Write dataset
+    schema = pa.schema([pa.field("colA", pa.string()), pa.field("colB", pa.int64())])
+    lance.write_dataset(batches, base_dir, schema, max_rows_per_file=row_count_per_file)
+    dataset = lance.dataset(base_dir)
+
+    # Check batch sizes
+    # strict_batch_size = True, batch_size = 5(batch_size < row_count_per_file),
+    all_batches = list(
+        dataset.to_batches(batch_size=batch_size, strict_batch_size=True)
+    )
+    assert sum(b.num_rows for b in all_batches) == row_count_per_file * 3  # Total rows
+    assert all(b.num_rows == batch_size for b in all_batches[:-1])  # Full batches
+    assert all_batches[-1].num_rows == 1  # Final partial batch
+    # Verify data integrity
+    combined = [row for batch in all_batches for row in batch.to_pylist()]
+    assert combined == pylist
+
+    # strict_batch_size = True, batch_size = 5*10 (batch_size > row_count_per_file),
+    large_batch_size = 10 * batch_size
+    all_batches = list(
+        dataset.to_batches(batch_size=large_batch_size, strict_batch_size=True)
+    )
+    assert sum(b.num_rows for b in all_batches) == row_count_per_file * 3  # Total rows
+    assert all(b.num_rows == large_batch_size for b in all_batches[:-1])  # Full batches
+    assert all_batches[-1].num_rows == 46  # Final partial batch
+
+    # strict_batch_size = False
+    # fragment 32 rows --> [5,5,5,5,5,5,2]
+    all_batches = list(
+        dataset.to_batches(batch_size=batch_size, strict_batch_size=False)
+    )
+    assert sum(b.num_rows for b in all_batches) == row_count_per_file * 3  # Total rows
+    partial_batches = [b for b in all_batches if b.num_rows < batch_size]
+    partial_batch_count = 3
+    assert len(partial_batches) == partial_batch_count
+    assert all(b.num_rows == 2 for b in partial_batches[:-1])
+
+    # strict_batch_size = False, batch_size = 5*10 (batch_size > row_count_per_file),
+    all_batches = list(
+        dataset.to_batches(batch_size=large_batch_size, strict_batch_size=False)
+    )
+    assert sum(b.num_rows for b in all_batches) == row_count_per_file * 3  # Total rows
+    assert all(b.num_rows == 32 for b in all_batches)  # Full batches
+    # 32 rows, 1 row per file
+    ds = lance.write_dataset(
+        pa.table({"a": range(32)}), base_dir, max_rows_per_file=1, mode="overwrite"
+    )
+    # 1 row per batch if strict_batch_size is False (regardless of batch_size)
+    for batch in ds.to_batches():
+        assert batch.num_rows == 1
+    for batch in ds.to_batches(batch_size=8):
+        assert batch.num_rows == 1
+
+    # We should get 8 rows per batch if strict_batch_size is True
+    for batch in ds.to_batches(batch_size=8, strict_batch_size=True):
+        assert batch.num_rows == 8
+
+
 def test_schema_metadata(tmp_path: Path):
     schema = pa.schema(
         [

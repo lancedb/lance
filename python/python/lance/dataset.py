@@ -377,6 +377,7 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
+        strict_batch_size: Optional[bool] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -534,6 +535,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.fast_search, fast_search)
         setopt(builder.include_deleted_rows, include_deleted_rows)
         setopt(builder.scan_stats_callback, scan_stats_callback)
+        setopt(builder.strict_batch_size, strict_batch_size)
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
             # No defaults, use user-provided, if any
@@ -803,6 +805,7 @@ class LanceDataset(pa.dataset.Dataset):
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
+        strict_batch_size: Optional[bool] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -834,6 +837,7 @@ class LanceDataset(pa.dataset.Dataset):
             with_row_address=with_row_address,
             use_stats=use_stats,
             full_text_query=full_text_query,
+            strict_batch_size=strict_batch_size,
         ).to_batches()
 
     def sample(
@@ -3167,6 +3171,7 @@ class ScannerBuilder:
         self._use_scalar_index = None
         self._include_deleted_rows = None
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
+        self._strict_batch_size = False
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -3493,6 +3498,18 @@ class ScannerBuilder:
         self._scan_stats_callback = callback
         return self
 
+    def strict_batch_size(self, strict_batch_size: bool = False) -> ScannerBuilder:
+        """
+        If True, then all batches except the last batch will have exactly
+        `batch_size` rows.
+        By default, it is false.
+        If this is true then small batches will need to be merged together
+        which will require a data copy and incur a (typically very small)
+        performance penalty.
+        """
+        self._strict_batch_size = strict_batch_size
+        return self
+
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -3518,6 +3535,7 @@ class ScannerBuilder:
             self._use_scalar_index,
             self._include_deleted_rows,
             self._scan_stats_callback,
+            self._strict_batch_size,
         )
         return LanceScanner(scanner, self.ds)
 

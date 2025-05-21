@@ -343,6 +343,12 @@ pub struct Scanner {
 
     /// If set, this callback will be called after the scan with summary statistics
     scan_stats_callback: Option<ExecutionStatsCallback>,
+
+    /// Whether the result returned by the scanner must be of the size of the batch_size.
+    /// By default, it is false.
+    /// Mainly, if the result is returned strictly according to the batch_size,
+    /// batching and waiting are required, and the performance will decrease.
+    strict_batch_size: bool,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -383,6 +389,7 @@ impl Scanner {
             use_scalar_index: true,
             include_deleted_rows: false,
             scan_stats_callback: None,
+            strict_batch_size: false,
         }
     }
 
@@ -646,6 +653,17 @@ impl Scanner {
     /// This option allows users to disable scalar indices for a query.
     pub fn use_scalar_index(&mut self, use_scalar_index: bool) -> &mut Self {
         self.use_scalar_index = use_scalar_index;
+        self
+    }
+
+    /// Set whether to use strict batch size.
+    ///
+    /// If this is true then output batches (except the last batch) will have exactly `batch_size` rows.
+    /// By default, this is False and output batches are allowed to have fewer than `batch_size` rows
+    /// Setting this to True will require us to merge batches, incurring a data copy, for a minor performance
+    /// penalty.
+    pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
+        self.strict_batch_size = strict_batch_size;
         self
     }
 
@@ -2399,6 +2417,7 @@ impl Scanner {
             with_row_address,
             with_make_deletions_null,
             ordered_output: ordered,
+            strict_batch_size: self.strict_batch_size,
         };
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
