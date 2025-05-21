@@ -70,6 +70,7 @@ pub const TRACE_FILE_CREATE: &str = "create";
 pub const TRACE_IO_EVENTS: &str = "lance::io_events";
 pub const IO_TYPE_OPEN_SCALAR: &str = "open_scalar_index";
 pub const IO_TYPE_OPEN_VECTOR: &str = "open_vector_index";
+pub const IO_TYPE_OPEN_FRAG_REUSE: &str = "open_frag_reuse_index";
 pub const IO_TYPE_LOAD_VECTOR_PART: &str = "load_vector_part";
 pub const IO_TYPE_LOAD_SCALAR_PART: &str = "load_scalar_part";
 pub const TRACE_EXECUTION: &str = "lance::execution";
