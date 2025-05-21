@@ -760,6 +760,7 @@ pub(crate) async fn commit_transaction(
     let mut transaction = transaction.clone();
 
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
+    // TODO: use SlotBackoff here instead and size unit off of attempt time.
     let mut backoff = Backoff::default();
     while backoff.attempt() < num_attempts {
         // See if we can retry the commit. Try to account for all

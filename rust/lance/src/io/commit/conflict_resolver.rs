@@ -575,6 +575,8 @@ mod tests {
                     final_fragment.deletion_file.as_ref().unwrap(),
                 );
                 assert!(dataset.object_store().exists(&new_path).await.unwrap());
+
+                assert_eq!(io_stats.num_hops, 1);
             } else {
                 // No IO should have happened.
                 assert_eq!(io_stats.read_iops, 0);
