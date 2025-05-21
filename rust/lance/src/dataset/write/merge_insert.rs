@@ -2262,7 +2262,10 @@ mod tests {
             Field::new("id", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
         ]));
-        let concurrency = 10;
+        // To benchmark scaling curve: measure how long to run
+        //
+        // And vary `concurrency` to see how it scales. Compare this again `main`.
+        let concurrency = 4;
         let initial_data = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -2278,8 +2281,10 @@ mod tests {
         // Increase likelihood of contention by throttling the store
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
-                wait_list_per_call: Duration::from_millis(1),
-                wait_get_per_call: Duration::from_millis(1),
+                // For benchmarking: Increase this to simulate object storage.
+                wait_list_per_call: Duration::from_millis(20),
+                wait_get_per_call: Duration::from_millis(20),
+                wait_put_per_call: Duration::from_millis(20),
                 ..Default::default()
             },
         });
