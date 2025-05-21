@@ -654,16 +654,17 @@ mod tests {
         // * num_other_txns read txn files (cache-able)
         // * 1 write txn file
         // * 1 write manifest
-        // For total of 7 io requests. If we have caching enabled, we can skip 4
+        // For total of 3 + 2 * num_other_txns io requests. If we have caching enabled, we can skip 2 * num_other_txns
         // of those. We should be able to read in 5 hops.
         if use_cache {
             assert_eq!(io_stats.read_iops, 1); // Just list versions
+            assert_eq!(io_stats.num_hops, 3);
         } else {
             // We need to read the other manifests and transactions.
             assert_eq!(io_stats.read_iops, 1 + num_other_txns * 2);
+            assert_eq!(io_stats.num_hops, 5);
         }
         assert_eq!(io_stats.write_iops, 2); // txn + manifest
-        assert_eq!(io_stats.num_hops, 5);
     }
 
     #[tokio::test]
