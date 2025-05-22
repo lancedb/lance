@@ -18,6 +18,7 @@ use crate::metrics::MetricsCollector;
 use super::{
     builder::ScoredDoc,
     encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
+    query::FtsSearchParams,
     scorer::Scorer,
     DocSet, PostingList, RawDocInfo,
 };
@@ -310,12 +311,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
     // returns the row_id, frequency and doc length
     pub(crate) fn search(
         &mut self,
-        is_phrase_query: bool,
-        limit: usize,
+        params: &FtsSearchParams,
         mask: Arc<RowIdMask>,
-        factor: f32,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, u32, u32)>> {
+        let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok(vec![]);
         }
@@ -325,7 +325,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
         while let Some((pivot, doc)) = self.next()? {
             self.cur_doc = Some(doc);
             num_comparisons += 1;
-            if is_phrase_query && !self.check_positions() {
+            if params.phrase_slop.is_some()
+                && !self.check_positions(params.phrase_slop.unwrap() as i32)
+            {
                 self.move_preceding(pivot, doc.doc_id() + 1);
                 continue;
             }
@@ -361,7 +363,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     doc.frequency(),
                     doc_length,
                 )));
-                self.threshold = candidates.peek().unwrap().0 .0.score.0 * factor;
+                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
             }
             self.move_preceding(pivot, doc.doc_id() + 1);
         }
@@ -411,8 +413,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     // this document is a candidate
                     return Ok(Some((pivot, doc)));
                 } else {
-                    // this doc can't be a candidate,
-                    // move to the next doc id
                     self.move_term(doc_id);
                 }
             } else {
@@ -517,7 +517,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         pick_index
     }
 
-    fn check_positions(&self) -> bool {
+    fn check_positions(&self, slop: i32) -> bool {
         let mut position_iters = self
             .postings
             .iter()
@@ -526,28 +526,25 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     posting
                         .positions(posting.index)
                         .expect("positions must exist"),
-                    posting.position,
+                    posting.position as i32,
                 )
             })
             .collect::<Vec<_>>();
+        position_iters.sort_unstable_by_key(|iter| iter.position_in_query);
 
         loop {
-            let mut max_pos = None;
+            let mut max_relative_pos = None;
             let mut all_same = true;
-            for iter in &position_iters {
-                match (iter.relative_position(), max_pos) {
-                    (Some(pos), None) => {
-                        max_pos = Some(pos);
-                    }
-                    (Some(pos), Some(max)) => {
-                        if pos > max {
-                            max_pos = Some(pos);
-                        }
-                        if pos != max {
-                            all_same = false;
-                        }
-                    }
-                    _ => return false,
+            for window in position_iters.windows(2) {
+                let last = window[0].relative_position();
+                let next = window[1].relative_position();
+                let (Some(last), Some(next)) = (last, next) else {
+                    return false;
+                };
+                max_relative_pos = Some(std::cmp::max(last, next) - slop);
+                if !(last <= next && next <= last + slop) {
+                    all_same = false;
+                    break;
                 }
             }
 
@@ -556,7 +553,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             position_iters.iter_mut().for_each(|iter| {
-                iter.next(max_pos.unwrap());
+                iter.next(max_relative_pos.unwrap());
             });
         }
     }
@@ -567,12 +564,12 @@ struct PositionIterator {
     // It's Int32Array for legacy index,
     // UInt32Array for new index
     positions: Arc<dyn Array>,
-    pub position_in_query: u32,
+    pub position_in_query: i32,
     index: usize,
 }
 
 impl PositionIterator {
-    fn new(positions: Arc<dyn Array>, position_in_query: u32) -> Self {
+    fn new(positions: Arc<dyn Array>, position_in_query: i32) -> Self {
         let mut iter = Self {
             positions,
             position_in_query,
@@ -583,17 +580,17 @@ impl PositionIterator {
     }
 
     // get the current relative position
-    fn relative_position(&self) -> Option<u32> {
+    fn relative_position(&self) -> Option<i32> {
         if self.index < self.positions.len() {
             match self.positions.data_type() {
                 DataType::Int32 => Some(
-                    self.positions.as_primitive::<Int32Type>().value(self.index) as u32
+                    self.positions.as_primitive::<Int32Type>().value(self.index)
                         - self.position_in_query,
                 ),
                 DataType::UInt32 => Some(
                     self.positions
                         .as_primitive::<UInt32Type>()
-                        .value(self.index)
+                        .value(self.index) as i32
                         - self.position_in_query,
                 ),
                 _ => {
@@ -606,19 +603,19 @@ impl PositionIterator {
     }
 
     // move to the next position that the relative position is greater than or equal to least_pos
-    fn next(&mut self, least_relative_pos: u32) {
+    fn next(&mut self, least_relative_pos: i32) {
         let least_pos = least_relative_pos + self.position_in_query;
         self.index = match self.positions.data_type() {
             DataType::Int32 => self
                 .positions
                 .as_primitive::<Int32Type>()
                 .values()
-                .partition_point(|&pos| (pos as u32) < least_pos),
+                .partition_point(|&pos| pos < least_pos),
             DataType::UInt32 => self
                 .positions
                 .as_primitive::<UInt32Type>()
                 .values()
-                .partition_point(|&pos| pos < least_pos),
+                .partition_point(|&pos| (pos as i32) < least_pos),
             _ => unreachable!("position iterator only supports Int32 and UInt32"),
         };
     }

@@ -96,7 +96,7 @@ class MatchQuery(FullTextQuery):
 
 
 class PhraseQuery(FullTextQuery):
-    def __init__(self, query: str, column: str):
+    def __init__(self, query: str, column: str, *, slop: int = 0):
         """
         Phrase query for full-text search.
 
@@ -107,7 +107,7 @@ class PhraseQuery(FullTextQuery):
         column : str
             The name of the column to match against.
         """
-        self._inner = PyFullTextQuery.phrase_query(query, column)
+        self._inner = PyFullTextQuery.phrase_query(query, column, slop)
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MATCH_PHRASE
