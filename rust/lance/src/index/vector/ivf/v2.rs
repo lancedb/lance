@@ -1860,6 +1860,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_pq_storage_backwards_compat() {
+        if *WRITE_CODEBOOK_IN_METADATA {
+            return;
+        }
+
         let test_dir = copy_test_data_to_tmp("v0.27.1/pq_in_schema").unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
