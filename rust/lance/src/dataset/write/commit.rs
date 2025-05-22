@@ -645,7 +645,6 @@ mod tests {
         }
         io_tracker.incremental_stats();
 
-        info!("start commit");
         let _ = CommitBuilder::new(original_dataset.clone())
             .execute(sample_transaction(original_dataset.manifest().version))
             .await

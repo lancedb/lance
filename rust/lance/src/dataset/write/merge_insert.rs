@@ -2273,7 +2273,7 @@ mod tests {
         // To benchmark scaling curve: measure how long to run
         //
         // And vary `concurrency` to see how it scales. Compare this again `main`.
-        let concurrency = 4;
+        let concurrency = 10;
         let initial_data = RecordBatch::try_new(
             schema.clone(),
             vec![
