@@ -2311,8 +2311,8 @@ mod tests {
             .await
             .unwrap();
 
-        // do 10 merge inserts in parallel. Each will open the dataset, signal
-        // they have opened, and then wait for a signal to proceed. Once the signal
+        // do merge inserts in parallel based on the concurrency. Each will open the dataset,
+        // signal they have opened, and then wait for a signal to proceed. Once the signal
         // is received, they will do a merge insert and close the dataset.
 
         let barrier = Arc::new(Barrier::new(concurrency as usize));

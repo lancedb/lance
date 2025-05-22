@@ -324,7 +324,7 @@ impl Dataset {
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
         let (manifest, manifest_location) = self.latest_manifest().await?;
-        self.manifest = Arc::new(manifest);
+        self.manifest = manifest;
         self.manifest_location = manifest_location;
         Ok(())
     }
@@ -591,17 +591,20 @@ impl Dataset {
             == LanceFileVersion::Legacy
     }
 
-    pub async fn latest_manifest(&self) -> Result<(Manifest, ManifestLocation)> {
+    pub async fn latest_manifest(&self) -> Result<(Arc<Manifest>, ManifestLocation)> {
         let location = self
             .commit_handler
             .resolve_latest_location(&self.base, &self.object_store)
             .await?;
 
+        // Check if manifest is in cache before reading from storage
+        let cached_manifest = self.session.file_metadata_cache.get(&location.path);
+        if let Some(cached_manifest) = cached_manifest {
+            return Ok((cached_manifest, location));
+        }
+
         if self.already_checked_out(&location) {
-            return Ok((
-                self.manifest.as_ref().clone(),
-                self.manifest_location.clone(),
-            ));
+            return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
         if manifest.schema.has_dictionary_types() {
@@ -614,7 +617,7 @@ impl Dataset {
             };
             populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         }
-        Ok((manifest, location))
+        Ok((Arc::new(manifest), location))
     }
 
     /// Read the transaction file for this version of the dataset.

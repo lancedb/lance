@@ -50,6 +50,11 @@ impl<'a> TransactionRebase<'a> {
             });
         }
 
+        log::info!(
+            "Manifest version: {}, transaction version: {}",
+            dataset.manifest.version,
+            transaction.read_version
+        );
         let dataset = if dataset.manifest.version != transaction.read_version {
             Cow::Owned(dataset.checkout_version(transaction.read_version).await?)
         } else {

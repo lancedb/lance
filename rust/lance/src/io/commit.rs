@@ -24,7 +24,7 @@ use std::num::NonZero;
 use std::sync::Arc;
 
 use conflict_resolver::TransactionRebase;
-use lance_core::utils::backoff::Backoff;
+use lance_core::utils::backoff::{Backoff, SlotBackoff};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -171,6 +171,9 @@ async fn do_commit_new_dataset(
                 transaction_file_cache_path(base_path, manifest.version),
                 Arc::new(transaction.clone()),
             );
+            session
+                .file_metadata_cache
+                .insert(manifest_location.path.clone(), Arc::new(manifest.clone()));
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
@@ -760,8 +763,7 @@ pub(crate) async fn commit_transaction(
     let mut transaction = transaction.clone();
 
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
-    // TODO: use SlotBackoff here instead and size unit off of attempt time.
-    let mut backoff = Backoff::default();
+    let mut backoff = SlotBackoff::default();
     while backoff.attempt() < num_attempts {
         // See if we can retry the commit. Try to account for all
         // transactions that have been committed since the read_version.
@@ -859,11 +861,16 @@ pub(crate) async fn commit_transaction(
 
         match result {
             Ok(manifest_location) => {
+                // Cache both the transaction file and manifest
                 let cache_path = transaction_file_cache_path(&dataset.base, target_version);
                 dataset
                     .session()
                     .file_metadata_cache
                     .insert(cache_path, Arc::new(transaction.clone()));
+                dataset
+                    .session()
+                    .file_metadata_cache
+                    .insert(manifest_location.path.clone(), Arc::new(manifest.clone()));
                 if !indices.is_empty() {
                     dataset.session().index_cache.insert_metadata(
                         dataset.base.as_ref(),
