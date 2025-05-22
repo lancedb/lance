@@ -696,6 +696,19 @@ def test_fts_phrase_query(tmp_path):
         "frodo was a puppy with a tail",
     }
 
+    results = ds.to_table(full_text_query=PhraseQuery("frodo was happy", "text"))
+    assert results.num_rows == 0
+
+    results = ds.to_table(
+        full_text_query=PhraseQuery("frodo was happy", "text", slop=1)
+    )
+    assert results.num_rows == 1
+
+    results = ds.to_table(
+        full_text_query=PhraseQuery("frodo was happy", "text", slop=2)
+    )
+    assert results.num_rows == 2
+
 
 def test_fts_boost_query(tmp_path):
     data = pa.table(
