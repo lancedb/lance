@@ -1417,8 +1417,8 @@ impl Transaction {
                 // If we updated any fields, remove those fragments from indices covering those fields
                 Self::prune_updated_fields_from_indices(
                     &mut final_indices,
-                    &updated_fragments,
-                    &fields_modified,
+                    updated_fragments,
+                    fields_modified,
                 );
 
                 let mut new_fragments =
@@ -1723,7 +1723,7 @@ impl Transaction {
     /// If an operation modifies one or more fields in a fragment then we need to remove
     /// that fragment from any indices that cover one of the modified fields.
     fn prune_updated_fields_from_indices(
-        indices: &mut Vec<Index>,
+        indices: &mut [Index],
         updated_fragments: &[Fragment],
         fields_modified: &[u32],
     ) {
