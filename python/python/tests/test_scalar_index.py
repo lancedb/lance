@@ -527,7 +527,9 @@ def test_fts_fts(tmp_path):
         ),
         tmp_path,
     )
-    dataset.create_scalar_index("text", "INVERTED", with_position=True)
+    dataset.create_scalar_index(
+        "text", "INVERTED", with_position=True, remove_stop_words=False
+    )
 
     results = dataset.to_table(full_text_query='"was a puppy"', prefilter=True)
     assert results.num_rows == 1
