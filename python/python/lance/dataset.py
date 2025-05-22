@@ -2945,11 +2945,16 @@ class LanceOperation:
             The fragments that have been updated with new deletion vectors.
         new_fragments: list[FragmentMetadata]
             The fragments that contain the new rows.
+        fields_modified: list[int]
+            If any fields are modified in updated_fragments, then they must be
+            listed here so those fragments can be removed from indices covering
+            those fields.
         """
 
         removed_fragment_ids: List[int]
         updated_fragments: List[FragmentMetadata]
         new_fragments: List[FragmentMetadata]
+        fields_modified: List[int]
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)

@@ -159,6 +159,8 @@ message Transaction {
     repeated DataFragment updated_fragments = 2;
     // The new fragments where updated rows have been moved to.
     repeated DataFragment new_fragments = 3;
+    // The ids of the fields that have been modified.
+    repeated uint32 fields_modified = 4;
   }
   
   // An operation that updates the table config.

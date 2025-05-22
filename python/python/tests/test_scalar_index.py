@@ -794,6 +794,28 @@ def test_fts_all_deleted(dataset):
     dataset.to_table(full_text_query=first_row_doc)
 
 
+def test_index_after_merge_insert(tmp_path):
+    # This regresses a defect where a horizontal merge insert was not taking modified
+    # fragments out of the index if the column is modified.
+    dataset = lance.write_dataset(
+        pa.table({"id": range(100), "payload": range(100), "other": range(100)}),
+        tmp_path,
+    )
+    dataset.create_scalar_index("id", index_type="BTREE")
+    dataset.create_scalar_index("payload", index_type="BTREE")
+
+    assert dataset.to_table(filter="payload >= 30").num_rows == 70
+
+    # Partial merge insert triggers horizontal merge insert
+    dataset.merge_insert(
+        "id"
+    ).when_matched_update_all().when_not_matched_insert_all().execute(
+        pa.table({"id": range(50, 150), "payload": [0] * 100})
+    )
+
+    assert dataset.to_table(filter="payload >= 30").num_rows == 20
+
+
 def test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer(
     tmp_path, lindera_ipadic
 ):
