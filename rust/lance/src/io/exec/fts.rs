@@ -16,7 +16,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use futures::stream::{self};
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_index::prefilter::PreFilter;
@@ -212,28 +212,27 @@ impl ExecutionPlan for MatchQueryExec {
                 })?;
 
             let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
+            let params = params
+                .with_fuzziness(query.fuzziness)
+                .with_max_expansions(query.max_expansions);
             let mut tokenizer = match is_fuzzy {
                 false => inverted_idx.tokenizer(),
                 true => tantivy::tokenizer::TextAnalyzer::from(
                     tantivy::tokenizer::SimpleTokenizer::default(),
                 ),
             };
-            let mut tokens = collect_tokens(&query.terms, &mut tokenizer, None);
-            if is_fuzzy {
-                tokens =
-                    inverted_idx.expand_fuzzy(tokens, query.fuzziness, query.max_expansions)?;
-            }
+            let tokens = collect_tokens(&query.terms, &mut tokenizer, None);
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, mut scores) = inverted_idx
                 .bm25_search(
-                    &tokens,
-                    &params,
+                    tokens.into(),
+                    params.into(),
                     query.operator,
-                    false,
                     pre_filter,
-                    metrics.as_ref(),
+                    metrics,
                 )
+                .boxed()
                 .await?;
             scores.iter_mut().for_each(|s| {
                 *s *= query.boost;
@@ -450,6 +449,8 @@ impl PhraseQueryExec {
             EmissionType::Final,
             Boundedness::Bounded,
         );
+        assert_eq!(params.phrase_slop, Some(query.slop));
+
         Self {
             dataset,
             query,
@@ -588,13 +589,13 @@ impl ExecutionPlan for PhraseQueryExec {
             pre_filter.wait_for_ready().await?;
             let (doc_ids, scores) = index
                 .bm25_search(
-                    &tokens,
-                    &params,
+                    tokens.into(),
+                    params.into(),
                     lance_index::scalar::inverted::query::Operator::And,
-                    true,
                     pre_filter,
-                    metrics.as_ref(),
+                    metrics,
                 )
+                .boxed()
                 .await?;
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
@@ -836,7 +837,7 @@ pub mod tests {
         let phrase_query = PhraseQueryExec::new(
             Arc::new(fixture.dataset.clone()),
             PhraseQuery::new("blah".to_string()),
-            FtsSearchParams::default(),
+            FtsSearchParams::new().with_phrase_slop(Some(0)),
             PreFilterSource::None,
         );
         phrase_query
