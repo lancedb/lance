@@ -196,10 +196,6 @@ impl<Q: Quantization> StorageBuilder<Q> {
         debug_assert!(batch.column_by_name(ROW_ID).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
-        let batch = batch.add_metadata(
-            STORAGE_METADATA_KEY.to_owned(),
-            self.quantizer.metadata(None)?.to_string(),
-        )?;
         Q::Storage::try_from_batch(batch, self.distance_type)
     }
 }

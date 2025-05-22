@@ -17,7 +17,6 @@ use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::FileReaderOptions;
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -28,6 +27,7 @@ use lance_index::vector::utils::is_finite;
 use lance_index::vector::v3::shuffler::IvfShufflerReader;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN};
+use lance_index::{metrics::NoOpMetricsCollector, vector::v3::shuffler::IvfShuffler};
 use lance_index::{
     pb,
     vector::{
@@ -44,13 +44,13 @@ use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
 use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
-use lance_io::scheduler::SchedulerConfig;
-use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
+use lance_io::{local::to_local_path, stream::RecordBatchStream};
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, stream::RecordBatchStreamAdapter,
     ReadBatchParams,
 };
+use lance_io::{scheduler::SchedulerConfig, utils::read_dir_size};
 use lance_linalg::distance::DistanceType;
 use log::info;
 use object_store::path::Path;
@@ -80,7 +80,6 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     retrain: bool,
     // build params, only needed for building new IVF, quantizer
     dataset: Option<Dataset>,
-    shuffler: Option<Arc<dyn Shuffler>>,
     ivf_params: Option<IvfBuildParams>,
     quantizer_params: Option<Q::BuildParams>,
     sub_index_params: Option<S::BuildParams>,
@@ -104,13 +103,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         column: String,
         index_dir: Path,
         distance_type: DistanceType,
-        shuffler: Box<dyn Shuffler>,
         ivf_params: Option<IvfBuildParams>,
         quantizer_params: Option<Q::BuildParams>,
         sub_index_params: S::BuildParams,
     ) -> Result<Self> {
         let temp_dir = tempdir()?;
         let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
+
         Ok(Self {
             store: dataset.object_store().clone(),
             column,
@@ -118,7 +117,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             distance_type,
             retrain: false,
             dataset: Some(dataset),
-            shuffler: Some(shuffler.into()),
             ivf_params,
             quantizer_params,
             sub_index_params: Some(sub_index_params),
@@ -138,7 +136,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         column: String,
         index_dir: Path,
         distance_type: DistanceType,
-        shuffler: Box<dyn Shuffler>,
         sub_index_params: S::BuildParams,
     ) -> Result<Self> {
         Self::new(
@@ -146,7 +143,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             column,
             index_dir,
             distance_type,
-            shuffler,
             None,
             None,
             sub_index_params,
@@ -177,7 +173,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             distance_type: ivf_index.metric_type(),
             retrain: false,
             dataset: None,
-            shuffler: None,
             ivf_params: None,
             quantizer_params: None,
             sub_index_params: None,
@@ -210,9 +205,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         // step 3. build partitions
         self.build_partitions().await?;
+        self.assert_disk_size(None).await?;
 
         // step 4. merge all partitions
         self.merge_partitions().await?;
+        self.assert_disk_size(Some(0)).await?;
 
         Ok(())
     }
@@ -455,11 +452,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             "quantizer not set before shuffle data",
             location!(),
         ))?;
-        let shuffler = self.shuffler.as_ref().ok_or(Error::invalid_input(
-            "shuffler not set before shuffle data",
-            location!(),
-        ))?;
-
         let transformer = Arc::new(
             lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
                 ivf.centroids.clone().unwrap(),
@@ -495,6 +487,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         };
 
+        let shuffler = IvfShuffler::new(self.temp_dir.clone(), ivf.num_partitions());
         self.shuffle_reader = Some(
             shuffler
                 .shuffle(Box::new(RecordBatchStreamAdapter::new(
@@ -504,7 +497,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 .await?
                 .into(),
         );
-
+        if ivf.num_partitions() > 1 {
+            self.assert_disk_size(None).await?;
+        }
         Ok(self)
     }
 
@@ -689,6 +684,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let batch = batch.drop_column(PART_ID_COLUMN)?;
                 batches.push(batch);
             }
+            reader.remove_partition(part_id).await?;
         }
 
         Ok((batches, loss))
@@ -751,6 +747,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     )?
                     .try_collect::<Vec<_>>()
                     .await?;
+                scheduler.store().delete(&storage_part_path).await?;
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
                 if storage_writer.is_none() {
                     storage_writer = Some(FileWriter::try_new(
@@ -787,6 +784,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     )?
                     .try_collect::<Vec<_>>()
                     .await?;
+                scheduler.store().delete(&index_part_path).await?;
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
                 index_writer.write_batch(&batch).await?;
                 index_ivf.add_partition(batch.num_rows() as u32);
@@ -871,6 +869,51 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             batches.push(batch);
         }
         Ok(batches)
+    }
+
+    // for testing purpose
+    #[inline(always)]
+    async fn assert_disk_size(&self, expected: Option<usize>) -> Result<()> {
+        // don't check HNSW  for now,
+        // because the size of HNSW index is not deterministic
+        if cfg!(debug_assertions) && S::name() != "HNSW" {
+            let expected = match expected {
+                Some(size) => size,
+                None => {
+                    let dataset = self.dataset.as_ref().ok_or(Error::invalid_input(
+                        "dataset not set before checking shuffled data size",
+                        location!(),
+                    ))?;
+                    let quantizer = self.quantizer.clone().ok_or(Error::invalid_input(
+                        "quantizer not set before checking shuffled data size",
+                        location!(),
+                    ))?;
+
+                    let num_rows = dataset.count_rows(None).await?;
+                    num_rows
+                        * (std::mem::size_of::<u64>()
+                            + std::mem::size_of::<u32>()
+                            + quantizer.code_dim())
+                }
+            };
+            let actual_size = read_dir_size(to_local_path(&self.temp_dir))?;
+            println!(
+                "dir {} size: {}",
+                to_local_path(&self.temp_dir),
+                actual_size
+            );
+            // there are some overhead (e.g. metadata), can't expect the size is exactly equal
+            if expected > 0 {
+                assert!(actual_size > 0);
+            }
+            assert!(
+                actual_size < expected + expected / 10,
+                "shuffled data size is too large: {} > {}",
+                actual_size,
+                expected
+            );
+        }
+        Ok(())
     }
 }
 
