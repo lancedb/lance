@@ -1,0 +1,27 @@
+[package]
+name = "lance-examples"
+description = "Lance examples in Rust"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[[example]]
+name = "llm_dataset_creation"
+path = "src/llm_dataset_creation.rs"
+
+[dependencies]
+arrow = { workspace = true }
+futures = { workspace = true }
+lance = { workspace = true }
+parquet = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+hf-hub = "0.3.2"
+tokenizers = "0.15.2"
+rand.workspace = true

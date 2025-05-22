@@ -20,6 +20,7 @@ Let's setup our environment by doing all the necessary imports and defining a fe
     from torch.utils.data import Dataset, DataLoader, Sampler
 
     from transformers import AutoTokenizer, AutoModelForCausalLM
+    from tqdm.auto import tqdm
 
     # We'll be training the pre-trained GPT2 model in this example
     model_name = 'gpt2'
