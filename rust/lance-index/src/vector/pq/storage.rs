@@ -106,10 +106,15 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
 
     fn extra_metadata(&self) -> Result<Option<Bytes>> {
         debug_assert!(self.codebook.is_some());
-        let codebook_tensor: pb::Tensor = pb::Tensor::try_from(self.codebook.as_ref().unwrap())?;
-        let mut bytes = BytesMut::new();
-        codebook_tensor.encode(&mut bytes)?;
-        Ok(Some(bytes.freeze()))
+        if self.codebook_tensor.is_empty() {
+            let codebook_tensor: pb::Tensor =
+                pb::Tensor::try_from(self.codebook.as_ref().unwrap())?;
+            let mut bytes = BytesMut::new();
+            codebook_tensor.encode(&mut bytes)?;
+            Ok(Some(bytes.freeze()))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn load(reader: &FileReader) -> Result<Self> {
