@@ -40,7 +40,7 @@ pub use inverted::tokenizer::InvertedIndexParams;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ScalarIndexType {
     BTree,
     Bitmap,
