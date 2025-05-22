@@ -20,6 +20,7 @@ Let's setup our environment by doing all the necessary imports and defining a fe
     from torch.utils.data import Dataset, DataLoader, Sampler
 
     from transformers import AutoTokenizer, AutoModelForCausalLM
+    from tqdm.auto import tqdm
 
     # We'll be training the pre-trained GPT2 model in this example
     model_name = 'gpt2'
@@ -182,4 +183,4 @@ One tip: If your lance dataset is huge (like the wikitext_500K is), and you want
 
 And that's basically it! 
 
-The best part about using Lance, the custom Dataset and Sampler is that you get a whooping **95%** average GPU utilisation and minimal CPU overhead thanks to the lightning fast random access that Lance provides 🚀
+The best part about using Lance, the custom Dataset and Sampler is that you get a whopping **95%** average GPU utilisation and minimal CPU overhead thanks to the lightning fast random access that Lance provides 🚀

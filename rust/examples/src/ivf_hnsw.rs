@@ -5,8 +5,8 @@
 //!
 //! run with `cargo run --release --example hnsw`
 #![allow(clippy::print_stdout)]
+use arrow::array::types::Float32Type;
 use arrow::array::AsArray;
-use arrow_array::types::Float32Type;
 use clap::Parser;
 use futures::TryStreamExt;
 use lance::dataset::ProjectionRequest;

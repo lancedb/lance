@@ -58,7 +58,7 @@ jobs:
           echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
       - uses: auguwu/clippy-action@1.4.0
         with:
-          check-args: --locked --features ${{ env.ALL_FEATURES }} --tests --benches
+          check-args: --locked --features ${{ env.ALL_FEATURES }} --tests --benches --examples
           token: ${{secrets.GITHUB_TOKEN}}
           deny: warnings
   cargo-deny:
