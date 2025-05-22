@@ -86,10 +86,13 @@ impl FromPyObject<'_> for PyLance<Operation> {
 
                 let new_fragments = extract_vec(&ob.getattr("new_fragments")?)?;
 
+                let fields_modified = ob.getattr("fields_modified")?.extract()?;
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
+                    fields_modified,
                 };
                 Ok(Self(op))
             }
@@ -208,14 +211,21 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
+                fields_modified,
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
                 let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
                 let new_fragments = export_vec(py, new_fragments.as_slice())?;
+                let fields_modified = fields_modified.into_pyobject(py)?;
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
-                cls.call1((removed_fragment_ids, updated_fragments, new_fragments))
+                cls.call1((
+                    removed_fragment_ids,
+                    updated_fragments,
+                    new_fragments,
+                    fields_modified,
+                ))
             }
             Operation::DataReplacement { replacements } => {
                 let replacements = export_vec(py, replacements.as_slice())?;
