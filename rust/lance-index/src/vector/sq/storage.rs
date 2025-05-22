@@ -21,7 +21,6 @@ use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 
-use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     vector::{
         quantizer::{QuantizerMetadata, QuantizerStorage},
@@ -256,6 +255,27 @@ impl ScalarQuantizationStorage {
 #[async_trait]
 impl QuantizerStorage for ScalarQuantizationStorage {
     type Metadata = ScalarQuantizationMetadata;
+
+    fn try_from_batch(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+    ) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Self::try_new(
+            metadata.num_bits,
+            distance_type,
+            metadata.bounds.clone(),
+            [batch],
+        )
+    }
+
+    fn metadata(&self) -> &Self::Metadata {
+        &self.quantizer.metadata
+    }
+
     /// Load a partition of SQ storage from disk.
     ///
     /// Parameters
@@ -284,23 +304,6 @@ impl QuantizerStorage for ScalarQuantizationStorage {
 
 impl VectorStore for ScalarQuantizationStorage {
     type DistanceCalculator<'a> = SQDistCalculator<'a>;
-
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        let metadata_json = batch
-            .schema_ref()
-            .metadata()
-            .get(STORAGE_METADATA_KEY)
-            .ok_or(Error::Schema {
-                message: "metadata not found".to_string(),
-                location: location!(),
-            })?;
-        let metadata: ScalarQuantizationMetadata = serde_json::from_str(metadata_json)?;
-
-        Self::try_new(metadata.num_bits, distance_type, metadata.bounds, [batch])
-    }
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         Ok(self.chunks.iter().map(|c| c.batch.clone()))

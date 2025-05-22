@@ -116,14 +116,16 @@ jobs:
       - uses: ./.github/workflows/run_tests
       - name: Generate forward compatibility files
         run: python python/tests/forward_compat/datagen.py
-      - name: Install old wheel
+      - name: Run forward compatibility tests (pylance 0.16.0)
         run: |
           python -m venv venv
           source venv/bin/activate
           pip install pytest pylance==0.16.0
-      - name: Run forward compatibility tests
+          pytest python/tests/forward_compat --run-forward
+      - name: Run forward compatibility tests (pylance 0.25.0)
         run: |
           source venv/bin/activate
+          pip install pytest pylance==0.25.0
           pytest python/tests/forward_compat --run-forward
       # Make sure wheels are not included in the Rust cache
       - name: Delete wheels
