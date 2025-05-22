@@ -413,7 +413,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 } else {
                     // this doc can't be a candidate,
                     // move to the next doc id
-                    self.move_term(doc_id + 1);
+                    self.move_term(doc_id);
                 }
             } else {
                 // the current block max score is less than the threshold,
