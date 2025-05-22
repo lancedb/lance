@@ -38,7 +38,7 @@ use super::{pb, PQ_CODE_COLUMN};
 pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
 
-static WRITE_CODEBOOK_IN_METADATA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+pub static WRITE_CODEBOOK_IN_METADATA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     std::env::var("LANCE_WRITE_CODEBOOK_IN_METADATA")
         .ok()
         .and_then(|s| s.parse::<bool>().ok())

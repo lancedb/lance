@@ -665,7 +665,6 @@ mod tests {
         reader::{FileReader, FileReaderOptions},
         writer::FileWriter,
     };
-    use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::builder::SQBuildParams;
@@ -674,6 +673,7 @@ mod tests {
         ivf::storage::IvfModel, pq::storage::ProductQuantizationMetadata,
         storage::STORAGE_METADATA_KEY,
     };
+    use lance_index::vector::{ivf::IvfBuildParams, pq::WRITE_CODEBOOK_IN_METADATA};
     use lance_index::{metrics::NoOpMetricsCollector, INDEX_AUXILIARY_FILE_NAME};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
@@ -926,6 +926,7 @@ mod tests {
         if params.stages.len() > 1
             && matches!(params.version, IndexFileVersion::V3)
             && is_ivf_pq(&params.stages)
+            && !*WRITE_CODEBOOK_IN_METADATA
         {
             let index = dataset.load_indices().await.unwrap();
             assert_eq!(index.len(), 1);
