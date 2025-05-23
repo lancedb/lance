@@ -1305,3 +1305,25 @@ def test_index_prewarm(tmp_path: Path):
         scan_stats_callback=scan_stats_callback, full_text_query="word"
     ).to_table()
     assert scan_stats.parts_loaded == 0
+
+
+def test_fts_backward_v0_27_0():
+    ds = lance.dataset(
+        Path(__file__).parent.parent.parent.parent
+        / "test_data"
+        / "0.27.0"
+        / "legacy_fts_index"
+    )
+    results = ds.to_table(
+        full_text_query=BoostQuery(
+            MatchQuery("puppy", "text"),
+            MatchQuery("happy", "text"),
+            negative_boost=0.5,
+        ),
+    )
+    assert results.num_rows == 3
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+        "frodo was a happy puppy",
+    }
