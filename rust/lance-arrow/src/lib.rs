@@ -436,7 +436,7 @@ pub fn as_fixed_size_binary_array(arr: &dyn Array) -> &FixedSizeBinaryArray {
     arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap()
 }
 
-pub fn iter_str_array(arr: &dyn Array) -> Box<dyn Iterator<Item = Option<&str>> + '_> {
+pub fn iter_str_array(arr: &dyn Array) -> Box<dyn Iterator<Item = Option<&str>> + Send + '_> {
     match arr.data_type() {
         DataType::Utf8 => Box::new(arr.as_string::<i32>().iter()),
         DataType::LargeUtf8 => Box::new(arr.as_string::<i64>().iter()),
