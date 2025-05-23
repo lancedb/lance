@@ -11,6 +11,8 @@ use uuid::Uuid;
 use super::pb;
 use lance_core::{Error, Result};
 
+pub const INIT_INDEX_VERSION: semver::Version = semver::Version::new(0, 27, 0);
+
 /// Index metadata
 #[derive(Debug, Clone)]
 pub struct Index {
@@ -36,6 +38,12 @@ pub struct Index {
     /// This is an Option because older versions of Lance may not have this defined.  However, it should always
     /// be present in newer versions.
     pub index_details: Option<prost_types::Any>,
+
+    /// The lance version which introduced this index format,
+    /// bump this when the index format changes.
+    /// This is used to determine if the index can be read by the current version of lance.
+    /// if the lance version is less than the index version, then the index cannot be read.
+    pub index_version: semver::Version,
 }
 
 impl DeepSizeOf for Index {
@@ -76,6 +84,15 @@ impl TryFrom<pb::IndexMetadata> for Index {
             dataset_version: proto.dataset_version,
             fragment_bitmap,
             index_details: proto.index_details,
+            index_version: proto
+                .index_version
+                .map(|v| semver::Version::parse(&v))
+                .transpose()
+                .map_err(|e| Error::Index {
+                    message: format!("failed to parse the index version: {}", e),
+                    location: location!(),
+                })?
+                .unwrap_or(INIT_INDEX_VERSION),
         })
     }
 }
@@ -99,6 +116,7 @@ impl From<&Index> for pb::IndexMetadata {
             dataset_version: idx.dataset_version,
             fragment_bitmap,
             index_details: idx.index_details.clone(),
+            index_version: Some(idx.index_version.to_string()),
         }
     }
 }

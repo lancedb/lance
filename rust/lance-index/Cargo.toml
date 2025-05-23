@@ -61,6 +61,7 @@ tempfile.workspace = true
 crossbeam-queue.workspace = true
 bytes.workspace = true
 uuid.workspace = true
+semver.workspace = true
 
 [dev-dependencies]
 approx.workspace = true

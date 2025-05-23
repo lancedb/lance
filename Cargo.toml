@@ -50,11 +50,9 @@ lance-core = { version = "=0.27.3", path = "./rust/lance-core" }
 lance-datafusion = { version = "=0.27.3", path = "./rust/lance-datafusion" }
 lance-datagen = { version = "=0.27.3", path = "./rust/lance-datagen" }
 lance-encoding = { version = "=0.27.3", path = "./rust/lance-encoding" }
-lance-encoding-datafusion = { version = "=0.27.3", path = "./rust/lance-encoding-datafusion" }
 lance-file = { version = "=0.27.3", path = "./rust/lance-file" }
 lance-index = { version = "=0.27.3", path = "./rust/lance-index" }
 lance-io = { version = "=0.27.3", path = "./rust/lance-io" }
-lance-jni = { version = "=0.27.3", path = "./java/core/lance-jni" }
 lance-linalg = { version = "=0.27.3", path = "./rust/lance-linalg" }
 lance-table = { version = "=0.27.3", path = "./rust/lance-table" }
 lance-test-macros = { version = "=0.27.3", path = "./rust/lance-test-macros" }
@@ -111,8 +109,6 @@ datafusion-common = "46.0"
 datafusion-functions = { version = "46.0", features = ["regex_expressions"] }
 datafusion-sql = "46.0"
 datafusion-expr = "46.0"
-datafusion-ffi = "46.0"
-datafusion-execution = "46.0"
 datafusion-optimizer = "46.0"
 datafusion-physical-expr = { version = "46.0" }
 datafusion-physical-plan = { version = "46.0" }
@@ -122,7 +118,6 @@ either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
 fsst = { version = "=0.27.3", path = "./rust/lance-encoding/src/compression_algo/fsst" }
 futures = "0.3"
-http = "1.1.0"
 humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
@@ -148,11 +143,11 @@ rangemap = { version = "1.0" }
 rayon = "1.10"
 roaring = "0.10.1"
 rstest = "0.23.0"
-rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 shellexpand = "3.0"
 snafu = "0.8"
+semver = {version = "1.0.26"}
 tantivy = { version = "0.22.0", features = ["stopwords"] }
 lindera = { version = "0.38.1" }
 lindera-tantivy = { version = "0.38.1" }

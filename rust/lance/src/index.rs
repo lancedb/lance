@@ -45,12 +45,13 @@ use lance_io::utils::{
     read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
     CachedFileSize,
 };
-use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
+use lance_table::format::{Index as IndexMetadata, INIT_INDEX_VERSION};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::{
     build_inverted_index, detect_scalar_index_type, index_matches_criteria, inverted_index_details,
+    LANCE_VERSION,
 };
 use serde_json::json;
 use snafu::location;
@@ -242,7 +243,7 @@ impl DatasetIndexExt for Dataset {
         }
 
         let index_id = Uuid::new_v4();
-        let index_details: prost_types::Any = match (index_type, params.index_name()) {
+        let (index_details, version) = match (index_type, params.index_name()) {
             (
                 IndexType::Bitmap
                 | IndexType::BTree
@@ -276,7 +277,7 @@ impl DatasetIndexExt for Dataset {
                     })?;
 
                 build_inverted_index(self, column, &index_id.to_string(), inverted_params).await?;
-                inverted_index_details()
+                (inverted_index_details(), INIT_INDEX_VERSION)
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.
@@ -297,7 +298,7 @@ impl DatasetIndexExt for Dataset {
                     vec_params,
                 ))
                 .await?;
-                vector_index_details()
+                (vector_index_details(), INIT_INDEX_VERSION)
             }
             // Can't use if let Some(...) here because it's not stable yet.
             // TODO: fix after https://github.com/rust-lang/rust/issues/51114
@@ -323,7 +324,7 @@ impl DatasetIndexExt for Dataset {
 
                 ext.create_index(self, column, &index_id.to_string(), params)
                     .await?;
-                vector_index_details()
+                (vector_index_details(), INIT_INDEX_VERSION)
             }
             (index_type, index_name) => {
                 return Err(Error::Index {
@@ -342,6 +343,7 @@ impl DatasetIndexExt for Dataset {
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
             index_details: Some(index_details),
+            index_version: version,
         };
         let transaction = Transaction::new(
             self.manifest.version,
@@ -410,10 +412,13 @@ impl DatasetIndexExt for Dataset {
             return Ok(indices);
         }
 
-        let loaded_indices: Arc<Vec<IndexMetadata>> =
+        let loaded_indices: Vec<IndexMetadata> =
             read_manifest_indexes(&self.object_store, &self.manifest_location, &self.manifest)
                 .await?
-                .into();
+                .into_iter()
+                .filter(|idx| idx.index_version <= *LANCE_VERSION)
+                .collect();
+        let loaded_indices = Arc::new(loaded_indices);
 
         self.session.index_cache.insert_metadata(
             self.base.as_ref(),
@@ -446,6 +451,7 @@ impl DatasetIndexExt for Dataset {
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
             index_details: None,
+            index_version: INIT_INDEX_VERSION,
         };
 
         let transaction = Transaction::new(
@@ -527,7 +533,7 @@ impl DatasetIndexExt for Dataset {
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
-            let Some((new_id, removed, mut new_frag_ids)) =
+            let Some((new_id, removed, mut new_frag_ids, new_version)) =
                 merge_indices(dataset.clone(), deltas.as_slice(), options).await?
             else {
                 continue;
@@ -544,6 +550,7 @@ impl DatasetIndexExt for Dataset {
                 dataset_version: self.manifest.version,
                 fragment_bitmap: Some(new_frag_ids),
                 index_details: last_idx.index_details.clone(),
+                index_version: new_version,
             };
             removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
             if deltas.len() > removed.len() {

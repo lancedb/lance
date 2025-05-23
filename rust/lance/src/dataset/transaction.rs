@@ -1850,6 +1850,8 @@ fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()>
 
 #[cfg(test)]
 mod tests {
+    use lance_table::format::INIT_INDEX_VERSION;
+
     use super::*;
 
     #[test]
@@ -1863,6 +1865,7 @@ mod tests {
             dataset_version: 1,
             fragment_bitmap: None,
             index_details: None,
+            index_version: INIT_INDEX_VERSION,
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
