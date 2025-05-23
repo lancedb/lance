@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -56,6 +57,7 @@ use tracing::{info, instrument};
 mod blob;
 pub mod builder;
 pub mod cleanup;
+mod delta;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;
@@ -80,6 +82,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
+use crate::dataset::delta::DatasetDelta;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::error::box_error;
@@ -619,6 +622,80 @@ impl Dataset {
 
     pub fn manifest_location(&self) -> &ManifestLocation {
         &self.manifest_location
+    }
+
+    async fn validate_version(&self, compared_version: u64) -> Result<()> {
+        if compared_version < 1 {
+            return Err(Error::invalid_input(
+                format!("Compared version must be > 0 (got {})", compared_version),
+                Default::default(),
+            ));
+        }
+
+        let current = self.version().version;
+        if current == compared_version {
+            return Err(Error::invalid_input(
+                "Compared version cannot equal current version",
+                Default::default(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn build_delta_dataset(&self, compared_version: u64) -> Result<DatasetDelta> {
+        let current_version = self.version().version;
+
+        let (begin_ver, begin_manifest, end_ver, end_manifest) = if current_version
+            > compared_version
+        {
+            let location = self
+                .commit_handler
+                .resolve_version_location(&self.base, compared_version, &self.object_store.inner)
+                .await?;
+
+            let manifest =
+                Self::load_manifest(&self.object_store, &location, (&self.base).as_ref(), &self.session)
+                    .await?;
+
+            (
+                compared_version,
+                Arc::new(manifest),
+                current_version,
+                self.manifest.clone(),
+            )
+        } else {
+            let location = self
+                .commit_handler
+                .resolve_version_location(&self.base, compared_version, &self.object_store.inner)
+                .await?;
+
+            let manifest =
+                Self::load_manifest(&self.object_store, &location, (&self.base).as_ref(), &self.session)
+                    .await?;
+
+            (
+                current_version,
+                self.manifest.clone(),
+                compared_version,
+                Arc::new(manifest),
+            )
+        };
+
+        Ok(DatasetDelta {
+            begin_version: begin_ver,
+            begin_manifest,
+            end_version: end_ver,
+            end_manifest,
+            base_dataset: self.clone(),
+        })
+    }
+
+    /// Diff with a specified version and return a list of transactions between (begin_version, end_version].
+    pub async fn diff_meta(&self, compared_version: u64) -> Result<Vec<Transaction>> {
+        self.validate_version(compared_version).await?;
+        let ds_delta = self.build_delta_dataset(compared_version).await?;
+        ds_delta.diff_meta().await
     }
 
     // TODO: Cache this
