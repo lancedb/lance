@@ -849,11 +849,6 @@ impl PostingListReader {
         self.len() == 0
     }
 
-    // the file size of the posting lists
-    pub fn size(&self) -> u64 {
-        self.reader.size()
-    }
-
     pub(crate) fn has_positions(&self) -> bool {
         self.has_position
     }

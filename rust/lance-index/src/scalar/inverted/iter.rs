@@ -107,11 +107,6 @@ impl CompressedPostingListIterator {
             buffer: [0; BLOCK_SIZE],
         }
     }
-
-    // skip to a doc id that is greater than or equal to the given doc id
-    // pub fn skip_to(&mut self, doc_id: u32) {
-    //     let
-    // }
 }
 
 impl Iterator for CompressedPostingListIterator {
