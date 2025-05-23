@@ -1875,19 +1875,28 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p.enable_v2_manifest_paths = enable_v2_manifest_paths;
         }
 
-        if let Some(auto_cleanup) = get_dict_opt::<Bound<PyDict>>(options, "auto_cleanup_options")?
-        {
-            let interval = get_dict_opt::<String>(&auto_cleanup, "interval")?
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(20);
-            let older_than = get_dict_opt::<String>(&auto_cleanup, "older_than_seconds")?
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(14 * 24 * 3600); // 14 days
+        if let Some(auto_cleanup) = get_dict_opt::<Bound<PyAny>>(options, "auto_cleanup_options")? {
+            let mut auto_cleanup_params = AutoCleanupParams::default();
 
-            p.auto_cleanup = Some(AutoCleanupParams {
-                interval,
-                older_than: TimeDelta::seconds(older_than),
-            });
+            auto_cleanup_params.interval = auto_cleanup
+                .get_item("interval")
+                .and_then(|i| i.extract::<String>())
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(auto_cleanup_params.interval);
+
+            auto_cleanup_params.older_than = auto_cleanup
+                .get_item("older_than_seconds")
+                .and_then(|i| i.extract::<String>())
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(TimeDelta::seconds)
+                .unwrap_or(auto_cleanup_params.older_than);
+
+            p.auto_cleanup = Some(auto_cleanup_params);
+        } else {
+            // disable auto cleanup feature
+            p.auto_cleanup = None
         }
 
         p.commit_handler = get_commit_handler(options)?;
