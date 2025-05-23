@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use crate::Dataset;
 use lance_core::utils::deletion::DeletionVector;
 use lance_table::format::DeletionFile;
