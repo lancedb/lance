@@ -1880,20 +1880,20 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
 
             auto_cleanup_params.interval = auto_cleanup
                 .get_item("interval")
-                .and_then(|i| i.extract::<String>())
+                .and_then(|i| i.extract::<usize>())
                 .ok()
-                .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(auto_cleanup_params.interval);
 
             auto_cleanup_params.older_than = auto_cleanup
                 .get_item("older_than_seconds")
-                .and_then(|i| i.extract::<String>())
+                .and_then(|i| i.extract::<i64>())
                 .ok()
-                .and_then(|s| s.parse::<i64>().ok())
                 .map(TimeDelta::seconds)
                 .unwrap_or(auto_cleanup_params.older_than);
 
             p.auto_cleanup = Some(auto_cleanup_params);
+        } else {
+            p.auto_cleanup = None;
         }
 
         p.commit_handler = get_commit_handler(options)?;
