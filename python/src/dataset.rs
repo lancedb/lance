@@ -1894,9 +1894,6 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                 .unwrap_or(auto_cleanup_params.older_than);
 
             p.auto_cleanup = Some(auto_cleanup_params);
-        } else {
-            // disable auto cleanup feature
-            p.auto_cleanup = None
         }
 
         p.commit_handler = get_commit_handler(options)?;
