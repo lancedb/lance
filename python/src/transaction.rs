@@ -123,7 +123,12 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let name = ob.getattr("name")?.extract()?;
                 let fields = ob.getattr("fields")?.extract()?;
                 let dataset_version = ob.getattr("dataset_version")?.extract()?;
-
+                let index_version: Option<String> = ob.getattr("index_version")?.extract()?;
+                let index_version =
+                    semver::Version::parse(&index_version.unwrap_or(String::from("0.27.0")))
+                        .map_err(|e| {
+                            PyValueError::new_err(format!("Failed to parse index version: {}", e))
+                        })?;
                 let fragment_ids = ob.getattr("fragment_ids")?;
                 let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.downcast()?;
                 let fragment_ids = fragment_ids_ref
@@ -142,6 +147,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     // TODO: we should use lance::dataset::Dataset::commit_existing_index once
                     // we have a way to determine index details from an existing index.
                     index_details: None,
+                    index_version,
                 }];
 
                 let op = Operation::CreateIndex {
