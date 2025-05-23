@@ -90,7 +90,6 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_index::DatasetIndexExt;
-use lance_table::io::deletion::read_deletion_file_cached;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 
@@ -108,6 +107,7 @@ use super::{write_fragments_internal, WriteMode, WriteParams};
 
 mod remapping;
 
+use crate::io::deletion::read_dataset_deletion_file;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Options to be passed to [compact_files].
@@ -790,14 +790,7 @@ async fn rechunk_stable_row_ids(
         .map(Ok)
         .try_for_each(|((_, seq), frag)| async move {
             if let Some(deletion_file) = &frag.deletion_file {
-                let deletions = read_deletion_file_cached(
-                    frag.id,
-                    deletion_file,
-                    &dataset.base,
-                    dataset.object_store(),
-                    &dataset.session.file_metadata_cache,
-                )
-                .await?;
+                let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
 
                 let mut new_seq = seq.as_ref().clone();
                 new_seq.mask(deletions.to_sorted_iter())?;

@@ -345,7 +345,416 @@ impl PartialEq for Operation {
                 Self::DataReplacement { replacements: a },
                 Self::DataReplacement { replacements: b },
             ) => a.len() == b.len() && a.iter().all(|r| b.contains(r)),
-            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+            // Handle all remaining combinations.
+            // We spell out all combinations explicitly to prevent
+            // us accidentally handling a new case in the wrong way.
+            (Self::Append { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Delete { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Overwrite { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::CreateIndex { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Rewrite { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Merge { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Restore { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::ReserveFragments { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Update { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Project { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::UpdateConfig { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::DataReplacement { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
         }
     }
 }

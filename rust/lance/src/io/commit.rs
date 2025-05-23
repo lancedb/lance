@@ -36,7 +36,6 @@ use lance_table::format::{
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
-use lance_table::io::deletion::read_deletion_file_cached;
 use rand::{thread_rng, Rng};
 use snafu::location;
 
@@ -54,6 +53,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig, BLOB_DIR};
 use crate::index::DatasetIndexInternalExt;
+use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
 use crate::Dataset;
 
@@ -435,14 +435,9 @@ pub(crate) async fn migrate_fragments(
                     Either::Left(futures::future::ready(Ok(Some(*deleted_rows))))
                 }
                 Some(deletion_file) => Either::Right(async {
-                    let deletion_vector = read_deletion_file_cached(
-                        fragment.id,
-                        deletion_file,
-                        &dataset.base,
-                        dataset.object_store(),
-                        &dataset.session().file_metadata_cache,
-                    )
-                    .await?;
+                    let deletion_vector =
+                        read_dataset_deletion_file(dataset.as_ref(), fragment.id, deletion_file)
+                            .await?;
                     Ok(Some(deletion_vector.len()))
                 }),
             };
@@ -791,7 +786,7 @@ pub(crate) async fn commit_transaction(
             });
 
         while let Some((other_version, other_transaction)) = concurrent_txns.try_next().await? {
-            rebase.check_txn(Some(&other_transaction), other_version)?;
+            rebase.check_txn(&other_transaction, other_version)?;
         }
         drop(concurrent_txns);
 

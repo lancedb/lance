@@ -14,10 +14,11 @@ use lance_core::{
 };
 use lance_table::{
     format::Fragment,
-    io::deletion::{deletion_file_path, read_deletion_file_cached, write_deletion_file},
+    io::deletion::{deletion_file_path, write_deletion_file},
 };
 use snafu::{location, Location};
 
+use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     dataset::transaction::{ConflictResult, Operation, Transaction},
     Dataset,
@@ -50,11 +51,6 @@ impl<'a> TransactionRebase<'a> {
             });
         }
 
-        log::info!(
-            "Manifest version: {}, transaction version: {}",
-            dataset.manifest.version,
-            transaction.read_version
-        );
         let dataset = if dataset.manifest.version != transaction.read_version {
             Cow::Owned(dataset.checkout_version(transaction.read_version).await?)
         } else {
@@ -103,22 +99,7 @@ impl<'a> TransactionRebase<'a> {
     ///
     /// Will return an error if the transaction is not valid. Otherwise, it will
     /// return Ok(()).
-    pub fn check_txn(
-        &mut self,
-        other_transaction: Option<&Transaction>,
-        other_version: u64,
-    ) -> Result<()> {
-        let Some(other_transaction) = other_transaction else {
-            return Err(crate::Error::Internal {
-                message: format!(
-                    "There was a conflicting transaction at version {}, \
-                    and it was missing transaction metadata.",
-                    other_version
-                ),
-                location: location!(),
-            });
-        };
-
+    pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
         match self.transaction.conflicts_with(other_transaction) {
             ConflictResult::Compatible => Ok(()),
             ConflictResult::NotCompatible => {
@@ -220,12 +201,10 @@ impl<'a> TransactionRebase<'a> {
                     .collect::<Vec<_>>();
                 let existing_deletion_vecs = futures::stream::iter(files_to_rewrite)
                     .map(|(fragment_id, deletion_file)| async move {
-                        read_deletion_file_cached(
+                        read_dataset_deletion_file(
+                            dataset,
                             fragment_id,
                             &deletion_file.expect("there should be a deletion file"),
-                            &dataset.base,
-                            dataset.object_store(),
-                            &dataset.session.file_metadata_cache,
                         )
                         .await
                         .map(|dv| (fragment_id, dv))
@@ -250,7 +229,9 @@ impl<'a> TransactionRebase<'a> {
                     return Err(crate::Error::RetryableCommitConflict {
                         version: dataset.manifest.version,
                         source: format!(
-                            "Found conflicts for row addresses {:?}",
+                            "This {} transaction was preempted by concurrent transaction {} (both modified rows at addresses {:?}). Please retry",
+                            self.transaction.uuid,
+                            dataset.manifest.version,
                             sample_addressed.as_slice()
                         )
                         .into(),
@@ -410,7 +391,7 @@ mod tests {
         io_tracker.incremental_stats(); // reset
         for (other_version, other_transaction) in other_transactions.iter().enumerate() {
             rebase
-                .check_txn(Some(other_transaction), other_version as u64)
+                .check_txn(other_transaction, other_version as u64)
                 .unwrap();
             let io_stats = io_tracker.incremental_stats();
             assert_eq!(io_stats.read_iops, 0);
@@ -523,7 +504,7 @@ mod tests {
             io_tracker.incremental_stats(); // reset
             for (other_version, other_transaction) in previous_transactions.iter().enumerate() {
                 rebase
-                    .check_txn(Some(other_transaction), other_version as u64)
+                    .check_txn(other_transaction, other_version as u64)
                     .unwrap();
                 let io_stats = io_tracker.incremental_stats();
                 assert_eq!(io_stats.read_iops, 0);
@@ -684,7 +665,7 @@ mod tests {
         assert_eq!(io_stats.read_iops, 0);
         assert_eq!(io_stats.write_iops, 0);
 
-        let res = rebase.check_txn(Some(&other_txn), 1);
+        let res = rebase.check_txn(&other_txn, 1);
         if other.ends_with("full") || ours.ends_with("full") {
             // If the other transaction fully deleted a fragment, we can error early.
             assert!(matches!(

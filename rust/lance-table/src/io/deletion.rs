@@ -9,7 +9,6 @@ use arrow_ipc::writer::{FileWriter as ArrowFileWriter, IpcWriteOptions};
 use arrow_ipc::CompressionType;
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Buf;
-use lance_core::cache::FileMetadataCache;
 use lance_core::error::{box_error, CorruptFileSnafu};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DELETION, TRACE_FILE_AUDIT};
@@ -209,21 +208,6 @@ pub async fn read_deletion_file(
             Ok(DeletionVector::Bitmap(bitmap))
         }
     }
-}
-
-pub async fn read_deletion_file_cached(
-    fragment_id: u64,
-    deletion_file: &DeletionFile,
-    base: &Path,
-    object_store: &ObjectStore,
-    file_meta_cache: &FileMetadataCache,
-) -> Result<Arc<DeletionVector>> {
-    let path = deletion_file_path(base, fragment_id, deletion_file);
-    file_meta_cache
-        .get_or_insert(&path, |_| {
-            read_deletion_file(fragment_id, deletion_file, base, object_store)
-        })
-        .await
 }
 
 #[cfg(test)]

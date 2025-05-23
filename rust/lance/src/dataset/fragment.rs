@@ -37,9 +37,7 @@ use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::ReadBatchParams;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
-use lance_table::io::deletion::{
-    deletion_file_path, read_deletion_file_cached, write_deletion_file,
-};
+use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::{
     wrap_with_row_id_and_delete, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
@@ -57,6 +55,7 @@ use super::updater::Updater;
 use super::{schema_evolution, NewColumnTransform, WriteParams};
 use crate::arrow::*;
 use crate::dataset::Dataset;
+use crate::io::deletion::read_dataset_deletion_file;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -1316,15 +1315,8 @@ impl FileFragment {
             return Ok(None);
         };
 
-        let cache = &self.dataset.session.file_metadata_cache;
-        let deletion_vector = read_deletion_file_cached(
-            self.id() as u64,
-            deletion_file,
-            &self.dataset.base,
-            self.dataset.object_store(),
-            cache,
-        )
-        .await?;
+        let deletion_vector =
+            read_dataset_deletion_file(&self.dataset, self.id() as u64, deletion_file).await?;
 
         Ok(Some(deletion_vector))
     }
