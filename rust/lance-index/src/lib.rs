@@ -72,7 +72,7 @@ pub trait Index: Send + Sync + DeepSizeOf {
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap>;
 
     fn latest_version(&self) -> semver::Version {
-        return INIT_INDEX_VERSION;
+        INIT_INDEX_VERSION
     }
 }
 
