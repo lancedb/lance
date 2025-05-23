@@ -127,15 +127,24 @@ impl DeepSizeOf for InvertedIndex {
 
 impl InvertedIndex {
     fn to_builder(&self) -> InvertedIndexBuilder {
-        InvertedIndexBuilder::from_existing_index(
-            self.params.clone(),
-            Some(self.store.clone()),
-            self.partitions.iter().map(|part| part.id).collect(),
-        )
+        if self.is_legacy() {
+            // for legacy format, we re-create the index in the new format
+            InvertedIndexBuilder::new(self.params.clone())
+        } else {
+            InvertedIndexBuilder::from_existing_index(
+                self.params.clone(),
+                Some(self.store.clone()),
+                self.partitions.iter().map(|part| part.id).collect(),
+            )
+        }
     }
 
     pub fn tokenizer(&self) -> tantivy::tokenizer::TextAnalyzer {
         self.tokenizer.clone()
+    }
+
+    pub fn params(&self) -> &InvertedIndexParams {
+        &self.params
     }
 
     // search the documents that contain the query
@@ -256,6 +265,10 @@ impl InvertedIndex {
                 docs,
             })],
         }))
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        self.partitions.len() == 1 && self.partitions[0].is_legacy()
     }
 }
 
@@ -400,6 +413,7 @@ impl ScalarIndex for InvertedIndex {
 
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct InvertedPartition {
+    // None for legacy format
     id: u64,
     store: Arc<dyn IndexStore>,
     pub(crate) tokens: TokenSet,
@@ -414,6 +428,10 @@ impl InvertedPartition {
 
     pub fn store(&self) -> &dyn IndexStore {
         self.store.as_ref()
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        self.inverted_list.lengths.is_none()
     }
 
     pub async fn load(store: Arc<dyn IndexStore>, id: u64) -> Result<Self> {

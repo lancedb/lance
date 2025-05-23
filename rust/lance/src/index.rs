@@ -18,7 +18,6 @@ use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR, TRACE
 use lance_file::reader::FileReader;
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
-use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
     FtsQueryParser, IndexInformationProvider, LabelListQueryParser, MultiQueryParser,
@@ -35,6 +34,7 @@ use lance_index::{
     metrics::{MetricsCollector, NoOpMetricsCollector},
     scalar::inverted::tokenizer::InvertedIndexParams,
 };
+use lance_index::{optimize::OptimizeOptions, scalar::inverted::train_inverted_index};
 use lance_index::{
     pb,
     scalar::{ScalarIndexParams, LANCE_SCALAR_INDEX},
@@ -54,6 +54,7 @@ use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::{
     build_inverted_index, detect_scalar_index_type, index_matches_criteria, inverted_index_details,
+    TrainingRequest,
 };
 use serde_json::json;
 use snafu::location;
@@ -139,7 +140,38 @@ pub(crate) async fn remap_index(
             let scalar_index = dataset
                 .open_scalar_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
                 .await?;
-            scalar_index.remap(row_id_map, &new_store).await?;
+
+            match scalar_index.index_type() {
+                IndexType::Inverted => {
+                    let inverted_index = scalar_index
+                        .as_any()
+                        .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+                        .ok_or(Error::Index {
+                            message: "expected inverted index".to_string(),
+                            location: location!(),
+                        })?;
+                    if inverted_index.is_legacy() {
+                        log::warn!("reindex because of legacy format, index_type: {}, index_id: {}, field: {}",
+                            scalar_index.index_type(),
+                            index_id,
+                            field.name
+                        );
+                        let training_request = Box::new(TrainingRequest::new(
+                            Arc::new(dataset.clone()),
+                            field.name.clone(),
+                        ));
+                        train_inverted_index(
+                            training_request,
+                            &new_store,
+                            inverted_index.params().clone(),
+                        )
+                        .await?;
+                    } else {
+                        scalar_index.remap(row_id_map, &new_store).await?;
+                    }
+                }
+                _ => scalar_index.remap(row_id_map, &new_store).await?,
+            };
         }
         it if it.is_vector() => {
             remap_vector_index(

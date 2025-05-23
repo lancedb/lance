@@ -1307,13 +1307,17 @@ def test_index_prewarm(tmp_path: Path):
     assert scan_stats.parts_loaded == 0
 
 
-def test_fts_backward_v0_27_0():
-    ds = lance.dataset(
+def test_fts_backward_v0_27_0(tmp_path: Path):
+    path = (
         Path(__file__).parent.parent.parent.parent
         / "test_data"
         / "0.27.0"
         / "legacy_fts_index"
     )
+    shutil.copytree(path, tmp_path, dirs_exist_ok=True)
+    ds = lance.dataset(tmp_path)
+
+    # we can read the old index
     results = ds.to_table(
         full_text_query=BoostQuery(
             MatchQuery("puppy", "text"),
@@ -1327,3 +1331,30 @@ def test_fts_backward_v0_27_0():
         "frodo was a puppy with a tail",
         "frodo was a happy puppy",
     }
+
+    data = pa.table(
+        {
+            "text": [
+                "new data",
+            ]
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="append")
+    ds.optimize.optimize_indices()
+    results = ds.to_table(
+        full_text_query=BoostQuery(
+            MatchQuery("puppy", "text"),
+            MatchQuery("happy", "text"),
+            negative_boost=0.5,
+        ),
+    )
+    assert results.num_rows == 3
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+        "frodo was a happy puppy",
+    }
+    res = ds.to_table(
+        full_text_query="new",
+    )
+    assert res.num_rows == 1

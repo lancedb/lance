@@ -42,7 +42,7 @@ use crate::{
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
 const TRAINING_UPDATE_FREQ: usize = 1000000;
 
-struct TrainingRequest {
+pub(crate) struct TrainingRequest {
     dataset: Arc<Dataset>,
     column: String,
 }
@@ -65,6 +65,10 @@ impl TrainingSource for TrainingRequest {
 }
 
 impl TrainingRequest {
+    pub fn new(dataset: Arc<Dataset>, column: String) -> Self {
+        Self { dataset, column }
+    }
+
     async fn scan_chunks(
         self: Box<Self>,
         chunk_size: u32,
