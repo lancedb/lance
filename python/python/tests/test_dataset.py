@@ -1080,7 +1080,7 @@ def test_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(3)
+    time.sleep(5)
 
     # trigger cleanup
     lance.write_dataset(table, base_dir, mode="append")
@@ -1103,7 +1103,7 @@ def test_auto_cleanup_invalid(tmp_path):
         table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append"
     )
 
-    time.sleep(5)
+    time.sleep(3)
 
     lance.write_dataset(
         table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append"
