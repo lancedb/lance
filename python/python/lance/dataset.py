@@ -3087,6 +3087,7 @@ class LanceOperation:
         fields: List[int]
         dataset_version: int
         fragment_ids: Set[int]
+        index_version: str
 
     @dataclass
     class DataReplacementGroup:

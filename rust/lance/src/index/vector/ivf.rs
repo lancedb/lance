@@ -77,6 +77,7 @@ use lance_linalg::{
     distance::Normalize,
     kernels::{normalize_arrow, normalize_fsl},
 };
+use lance_table::format::INIT_INDEX_VERSION;
 use log::{info, warn};
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -259,7 +260,7 @@ pub(crate) async fn optimize_vector_indices(
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
-) -> Result<(Uuid, usize)> {
+) -> Result<(Uuid, usize, semver::Version)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::Index {
@@ -344,7 +345,9 @@ pub(crate) async fn optimize_vector_indices(
         });
     };
 
-    Ok((new_uuid, merged))
+    // never change the index version,
+    // because we won't update the legacy vector index format
+    Ok((new_uuid, merged, INIT_INDEX_VERSION))
 }
 
 pub(crate) async fn optimize_vector_indices_v2(
@@ -353,7 +356,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
-) -> Result<(Uuid, usize)> {
+) -> Result<(Uuid, usize, semver::Version)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::Index {
@@ -505,7 +508,12 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
     }
 
-    Ok((new_uuid, merged_num))
+    Ok((
+        new_uuid,
+        merged_num,
+        // the sub index type and quantizer doesn't matter here
+        IvfIndexBuilder::<FlatIndex, FlatQuantizer>::version(),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1863,6 +1871,7 @@ mod tests {
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
+    use lance_table::format::INIT_INDEX_VERSION;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
         generate_scaled_random_array, sample_without_replacement,
@@ -2258,6 +2267,7 @@ mod tests {
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
             index_details: Some(vector_index_details()),
+            index_version: INIT_INDEX_VERSION,
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));

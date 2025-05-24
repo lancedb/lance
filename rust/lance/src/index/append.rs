@@ -33,7 +33,7 @@ pub async fn merge_indices<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
     options: &OptimizeOptions,
-) -> Result<Option<(Uuid, Vec<&'a IndexMetadata>, RoaringBitmap)>> {
+) -> Result<Option<(Uuid, Vec<&'a IndexMetadata>, RoaringBitmap, semver::Version)>> {
     if old_indices.is_empty() {
         return Err(Error::Index {
             message: "Append index: no previous index found".to_string(),
@@ -76,7 +76,7 @@ pub async fn merge_indices<'a>(
         frag_bitmap.insert(frag.id as u32);
     });
 
-    let (new_uuid, indices_merged) = match indices[0].index_type() {
+    let (new_uuid, indices_merged, new_version) = match indices[0].index_type() {
         it if it.is_scalar() => {
             // There are no delta indices for scalar, so adding all indexed
             // fragments to the new index.
@@ -109,7 +109,7 @@ pub async fn merge_indices<'a>(
             let new_store = LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string());
             index.update(new_data_stream.into(), &new_store).await?;
 
-            Ok((new_uuid, 1))
+            Ok((new_uuid, 1, index.latest_version()))
         }
         it if it.is_vector() => {
             let start_pos = old_indices
@@ -156,6 +156,7 @@ pub async fn merge_indices<'a>(
         new_uuid,
         old_indices[old_indices.len() - indices_merged..].to_vec(),
         frag_bitmap,
+        new_version,
     )))
 }
 

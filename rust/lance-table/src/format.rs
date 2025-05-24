@@ -10,7 +10,7 @@ mod index;
 mod manifest;
 
 pub use fragment::*;
-pub use index::Index;
+pub use index::{Index, INIT_INDEX_VERSION};
 pub use manifest::{
     is_detached_version, DataStorageFormat, Manifest, SelfDescribingFileReader, WriterVersion,
     DETACHED_VERSION_MASK,

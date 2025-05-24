@@ -44,6 +44,7 @@ tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+semver.workspace = true
 
 [dev-dependencies]
 lance-datagen.workspace = true

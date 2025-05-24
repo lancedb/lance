@@ -27,7 +27,7 @@ use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, ScalarIndexType,
 };
 use lance_index::ScalarIndexCriteria;
-use lance_table::format::Index;
+use lance_table::format::{Index, INIT_INDEX_VERSION};
 use log::info;
 use snafu::location;
 use tracing::instrument;
@@ -40,6 +40,9 @@ use crate::{
 
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
 const TRAINING_UPDATE_FREQ: usize = 1000000;
+
+pub static LANCE_VERSION: std::sync::LazyLock<semver::Version> =
+    std::sync::LazyLock::new(|| semver::Version::parse(std::env!("CARGO_PKG_VERSION")).unwrap());
 
 struct TrainingRequest {
     dataset: Arc<Dataset>,
@@ -234,7 +237,7 @@ pub(super) async fn build_scalar_index(
     column: &str,
     uuid: &str,
     params: &ScalarIndexParams,
-) -> Result<prost_types::Any> {
+) -> Result<(prost_types::Any, semver::Version)> {
     let training_request = Box::new(TrainingRequest {
         dataset: Arc::new(dataset.clone()),
         column: column.to_string(),
@@ -276,11 +279,11 @@ pub(super) async fn build_scalar_index(
     match params.force_index_type {
         Some(ScalarIndexType::Bitmap) => {
             train_bitmap_index(training_request, &index_store).await?;
-            Ok(bitmap_index_details())
+            Ok((bitmap_index_details(), INIT_INDEX_VERSION))
         }
         Some(ScalarIndexType::LabelList) => {
             train_label_list_index(training_request, &index_store).await?;
-            Ok(label_list_index_details())
+            Ok((label_list_index_details(), INIT_INDEX_VERSION))
         }
         Some(ScalarIndexType::Inverted) => {
             train_inverted_index(
@@ -289,7 +292,7 @@ pub(super) async fn build_scalar_index(
                 InvertedIndexParams::default(),
             )
             .await?;
-            Ok(inverted_index_details())
+            Ok((inverted_index_details(), INIT_INDEX_VERSION))
         }
         Some(ScalarIndexType::NGram) => {
             if field.data_type() != DataType::Utf8 {
@@ -299,7 +302,7 @@ pub(super) async fn build_scalar_index(
                 });
             }
             train_ngram_index(training_request, &index_store).await?;
-            Ok(ngram_index_details())
+            Ok((ngram_index_details(), INIT_INDEX_VERSION))
         }
         _ => {
             let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
@@ -310,7 +313,7 @@ pub(super) async fn build_scalar_index(
                 DEFAULT_BTREE_BATCH_SIZE as u32,
             )
             .await?;
-            Ok(btree_index_details())
+            Ok((btree_index_details(), INIT_INDEX_VERSION))
         }
     }
 }
