@@ -311,7 +311,7 @@
                                 -Dio.netty.tryReflectionSetAccessible=true
                             </argLine>
                             <forkNode
-                                    implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
+                                implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
                             <useSystemClassLoader>false</useSystemClassLoader>
                         </configuration>
                     </plugin>
