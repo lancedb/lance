@@ -281,8 +281,8 @@
                 <jdk>[11,)</jdk>
             </activation>
             <properties>
-                <maven.compiler.source>11</maven.compiler.source>
-                <maven.compiler.target>11</maven.compiler.target>
+                <!-- Ping release target to JDK8 to link only against Java 8 APIs -->
+                <maven.compiler.release>8</maven.compiler.release>
             </properties>
             <build>
                 <plugins>
@@ -290,9 +290,28 @@
                         <artifactId>maven-surefire-plugin</artifactId>
                         <version>3.2.5</version>
                         <configuration>
-                            <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+                            <argLine>
+                                -XX:+IgnoreUnrecognizedVMOptions
+                                --add-opens=java.base/java.lang=ALL-UNNAMED
+                                --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+                                --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+                                --add-opens=java.base/java.io=ALL-UNNAMED
+                                --add-opens=java.base/java.net=ALL-UNNAMED
+                                --add-opens=java.base/java.nio=ALL-UNNAMED
+                                --add-opens=java.base/java.util=ALL-UNNAMED
+                                --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+                                --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+                                --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED
+                                --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+                                --add-opens=java.base/sun.nio.cs=ALL-UNNAMED
+                                --add-opens=java.base/sun.security.action=ALL-UNNAMED
+                                --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+                                --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED
+                                -Djdk.reflect.useDirectMethodHandle=false
+                                -Dio.netty.tryReflectionSetAccessible=true
+                            </argLine>
                             <forkNode
-                                implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
+                                    implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
                             <useSystemClassLoader>false</useSystemClassLoader>
                         </configuration>
                     </plugin>
