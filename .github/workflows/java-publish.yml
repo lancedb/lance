@@ -201,14 +201,14 @@ jobs:
       - name: Dry run
         if: |
           github.event_name == 'pull_request' ||
-          inputs.dry_run
+          inputs.dry_run == 'true'
         working-directory: java
         run: |
           mvn --batch-mode -DskipTests -Drust.release.build=true package
       - name: Publish with Java 8
         if: |
           github.event_name == 'release' ||
-          !inputs.dry_run
+          inputs.dry_run == 'false'
         working-directory: java
         run: |
           echo "use-agent" >> ~/.gnupg/gpg.conf
