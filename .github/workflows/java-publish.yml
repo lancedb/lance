@@ -12,7 +12,7 @@ on:
       dry_run:
         description: 'Dry run (just test publish build, do not publish to Maven Central)'
         required: true
-        default: false
+        default: true
         type: boolean
 
 jobs:
@@ -201,14 +201,14 @@ jobs:
       - name: Dry run
         if: |
           github.event_name == 'pull_request' ||
-          inputs.dry_run == 'true'
+          inputs.dry_run
         working-directory: java
         run: |
           mvn --batch-mode -DskipTests -Drust.release.build=true package
       - name: Publish with Java 8
         if: |
           github.event_name == 'release' ||
-          inputs.dry_run == 'false'
+          !inputs.dry_run
         working-directory: java
         run: |
           echo "use-agent" >> ~/.gnupg/gpg.conf
