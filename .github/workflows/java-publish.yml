@@ -9,11 +9,14 @@ on:
       - .github/workflows/java-publish.yml
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: 'Dry run (just test publish build, do not publish to Maven Central)'
+      mode:
+        description: 'Release mode'
         required: true
-        default: true
-        type: boolean
+        type: choice
+        default: dry_run
+        options:
+          - dry_run
+          - release
       ref:
         description: 'The branch, tag or SHA to checkout'
         required: false
@@ -211,14 +214,14 @@ jobs:
       - name: Dry run
         if: |
           github.event_name == 'pull_request' ||
-          inputs.dry_run == 'true'
+          inputs.mode == 'dry_run'
         working-directory: java
         run: |
           mvn --batch-mode -DskipTests -Drust.release.build=true package
       - name: Publish with Java 8
         if: |
           github.event_name == 'release' ||
-          inputs.dry_run == 'false'
+          inputs.mode == 'release'
         working-directory: java
         run: |
           echo "use-agent" >> ~/.gnupg/gpg.conf
