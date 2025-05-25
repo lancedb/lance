@@ -81,7 +81,6 @@ jobs:
             ldd --version
 
             cargo build --release
-            cp ../target/release/liblance_jni.so liblance_jni.so
           "
       - uses: actions/upload-artifact@v4
         with:
@@ -154,7 +153,6 @@ jobs:
             ldd --version
 
             cargo build --release
-            cp ../target/release/liblance_jni.so liblance_jni.so
           "
       - uses: actions/upload-artifact@v4
         with:
@@ -194,8 +192,8 @@ jobs:
       - name: Copy native libs
         run: |
           mkdir -p ./java/core/target/classes/nativelib/linux-x86-64 ./java/core/target/classes/nativelib/linux-aarch64
-          cp ../liblance_jni_linux_x86_64.zip/liblance_jni.so ./core/target/classes/nativelib/linux-x86-64/liblance_jni.sp
-          cp ../liblance_jni_linux_arm_64.zip/liblance_jni.so ./core/target/classes/nativelib/linux-aarch64/liblance_jni.so
+          cp ../liblance_jni_linux_x86_64.zip/liblance_jni.so ./java/core/target/classes/nativelib/linux-x86-64/liblance_jni.sp
+          cp ../liblance_jni_linux_arm_64.zip/liblance_jni.so ./java/core/target/classes/nativelib/linux-aarch64/liblance_jni.so
       - name: Set github
         run: |
           git config --global user.email "Lance Github Runner"
