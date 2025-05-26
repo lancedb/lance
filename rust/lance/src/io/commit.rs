@@ -84,6 +84,14 @@ fn transaction_file_cache_path(base_path: &Path, version: u64) -> Path {
         .child(format!("{}.txn", version))
 }
 
+pub(crate) fn manifest_cache_path(location: &ManifestLocation) -> Path {
+    let mut buf = location.path.clone();
+    if let Some(e_tag) = &location.e_tag {
+        buf = buf.child(e_tag.as_str());
+    }
+    buf
+}
+
 async fn read_dataset_transaction_file(
     dataset: &Dataset,
     version: u64,
@@ -171,9 +179,10 @@ async fn do_commit_new_dataset(
                 transaction_file_cache_path(base_path, manifest.version),
                 Arc::new(transaction.clone()),
             );
-            session
-                .file_metadata_cache
-                .insert(manifest_location.path.clone(), Arc::new(manifest.clone()));
+            session.file_metadata_cache.insert(
+                manifest_cache_path(&manifest_location),
+                Arc::new(manifest.clone()),
+            );
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
@@ -862,10 +871,10 @@ pub(crate) async fn commit_transaction(
                     .session()
                     .file_metadata_cache
                     .insert(cache_path, Arc::new(transaction.clone()));
-                dataset
-                    .session()
-                    .file_metadata_cache
-                    .insert(manifest_location.path.clone(), Arc::new(manifest.clone()));
+                dataset.session().file_metadata_cache.insert(
+                    manifest_cache_path(&manifest_location),
+                    Arc::new(manifest.clone()),
+                );
                 if !indices.is_empty() {
                     dataset.session().index_cache.insert_metadata(
                         dataset.base.as_ref(),
