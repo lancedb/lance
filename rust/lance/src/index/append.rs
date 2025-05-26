@@ -4,10 +4,10 @@
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::IndexType;
+use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::InvertedIndex};
 use lance_table::format::Index as IndexMetadata;
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -92,16 +92,35 @@ pub async fn merge_indices<'a>(
                 )
                 .await?;
 
+            let need_full_data = match index.index_type() {
+                IndexType::Inverted => {
+                    // we can't directly update the legacy inverted index to the new format,
+                    // so we need to read the full data and rebuild it.
+                    let index =
+                        index
+                            .as_any()
+                            .downcast_ref::<InvertedIndex>()
+                            .ok_or(Error::Index {
+                                message: "Append index: invalid index type".to_string(),
+                                location: location!(),
+                            })?;
+                    index.is_legacy()
+                }
+                _ => false,
+            };
+
             let mut scanner = dataset.scan();
             let orodering = match index.index_type() {
                 IndexType::Inverted => None,
                 _ => Some(vec![ColumnOrdering::asc_nulls_first(column.name.clone())]),
             };
             scanner
-                .with_fragments(unindexed)
                 .with_row_id()
                 .order_by(orodering)?
                 .project(&[&column.name])?;
+            if !need_full_data {
+                scanner.with_fragments(unindexed);
+            }
             let new_data_stream = scanner.try_into_stream().await?;
 
             let new_uuid = Uuid::new_v4();

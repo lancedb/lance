@@ -14,9 +14,7 @@ use futures::TryStreamExt;
 use lance_core::datatypes::Field;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
-use lance_index::scalar::btree::DEFAULT_BTREE_BATCH_SIZE;
 use lance_index::scalar::ngram::{train_ngram_index, NGramIndex};
-use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::{
     bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
     btree::{train_btree_index, BTreeIndex, TrainingSource},
@@ -25,6 +23,9 @@ use lance_index::scalar::{
     label_list::{train_label_list_index, LabelListIndex},
     lance_format::LanceIndexStore,
     ScalarIndex, ScalarIndexParams, ScalarIndexType,
+};
+use lance_index::scalar::{
+    btree::DEFAULT_BTREE_BATCH_SIZE, inverted::tokenizer::InvertedIndexParams,
 };
 use lance_index::ScalarIndexCriteria;
 use lance_table::format::{Index, INIT_INDEX_VERSION};
@@ -44,7 +45,7 @@ const TRAINING_UPDATE_FREQ: usize = 1000000;
 pub static LANCE_VERSION: std::sync::LazyLock<semver::Version> =
     std::sync::LazyLock::new(|| semver::Version::parse(std::env!("CARGO_PKG_VERSION")).unwrap());
 
-struct TrainingRequest {
+pub(crate) struct TrainingRequest {
     dataset: Arc<Dataset>,
     column: String,
 }
@@ -67,6 +68,10 @@ impl TrainingSource for TrainingRequest {
 }
 
 impl TrainingRequest {
+    pub fn new(dataset: Arc<Dataset>, column: String) -> Self {
+        Self { dataset, column }
+    }
+
     async fn scan_chunks(
         self: Box<Self>,
         chunk_size: u32,

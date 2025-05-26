@@ -14,7 +14,7 @@ use lance_core::{Error, Result};
 pub const INIT_INDEX_VERSION: semver::Version = semver::Version::new(0, 27, 0);
 
 /// Index metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Index {
     /// Unique ID across all dataset versions.
     pub uuid: Uuid,

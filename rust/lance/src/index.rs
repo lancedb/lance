@@ -18,20 +18,23 @@ use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR, TRACE
 use lance_file::reader::FileReader;
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
-use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
-use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
     FtsQueryParser, IndexInformationProvider, LabelListQueryParser, MultiQueryParser,
     SargableQueryParser, ScalarQueryParser, TextQueryParser,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::{InvertedIndexParams, ScalarIndex, ScalarIndexType};
+use lance_index::scalar::{ScalarIndex, ScalarIndexType};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
 pub use lance_index::IndexParams;
+use lance_index::{
+    metrics::{MetricsCollector, NoOpMetricsCollector},
+    scalar::inverted::tokenizer::InvertedIndexParams,
+};
+use lance_index::{optimize::OptimizeOptions, scalar::inverted::train_inverted_index};
 use lance_index::{
     pb,
     scalar::{ScalarIndexParams, LANCE_SCALAR_INDEX},
@@ -52,6 +55,7 @@ use roaring::RoaringBitmap;
 use scalar::{
     build_inverted_index, detect_scalar_index_type, index_matches_criteria, inverted_index_details,
     LANCE_VERSION,
+    TrainingRequest,
 };
 use serde_json::json;
 use snafu::location;
@@ -137,7 +141,38 @@ pub(crate) async fn remap_index(
             let scalar_index = dataset
                 .open_scalar_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
                 .await?;
-            scalar_index.remap(row_id_map, &new_store).await?;
+
+            match scalar_index.index_type() {
+                IndexType::Inverted => {
+                    let inverted_index = scalar_index
+                        .as_any()
+                        .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+                        .ok_or(Error::Index {
+                            message: "expected inverted index".to_string(),
+                            location: location!(),
+                        })?;
+                    if inverted_index.is_legacy() {
+                        log::warn!("reindex because of legacy format, index_type: {}, index_id: {}, field: {}",
+                            scalar_index.index_type(),
+                            index_id,
+                            field.name
+                        );
+                        let training_request = Box::new(TrainingRequest::new(
+                            Arc::new(dataset.clone()),
+                            field.name.clone(),
+                        ));
+                        train_inverted_index(
+                            training_request,
+                            &new_store,
+                            inverted_index.params().clone(),
+                        )
+                        .await?;
+                    } else {
+                        scalar_index.remap(row_id_map, &new_store).await?;
+                    }
+                }
+                _ => scalar_index.remap(row_id_map, &new_store).await?,
+            };
         }
         it if it.is_vector() => {
             remap_vector_index(
@@ -1143,7 +1178,6 @@ mod tests {
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
-    use lance_index::scalar::inverted::TokenizerConfig;
     use lance_index::scalar::FullTextSearchQuery;
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
@@ -1630,11 +1664,9 @@ mod tests {
             .await
             .unwrap();
 
-        let tokenizer_config = TokenizerConfig::default().lower_case(false);
-        let params = InvertedIndexParams {
-            with_position: true,
-            tokenizer_config,
-        };
+        let params = InvertedIndexParams::default()
+            .lower_case(false)
+            .with_position(true);
         dataset
             .create_index(&["text"], IndexType::Inverted, None, &params, true)
             .await

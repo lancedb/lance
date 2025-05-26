@@ -12,6 +12,8 @@ use snafu::location;
 pub struct FtsSearchParams {
     pub limit: Option<usize>,
     pub wand_factor: f32,
+    pub fuzziness: Option<u32>,
+    pub max_expansions: usize,
 }
 
 impl FtsSearchParams {
@@ -19,6 +21,8 @@ impl FtsSearchParams {
         Self {
             limit: None,
             wand_factor: 1.0,
+            fuzziness: Some(0),
+            max_expansions: 50,
         }
     }
 
@@ -29,6 +33,16 @@ impl FtsSearchParams {
 
     pub fn with_wand_factor(mut self, factor: f32) -> Self {
         self.wand_factor = factor;
+        self
+    }
+
+    pub fn with_fuzziness(mut self, fuzziness: Option<u32>) -> Self {
+        self.fuzziness = fuzziness;
+        self
+    }
+
+    pub fn with_max_expansions(mut self, max_expansions: usize) -> Self {
+        self.max_expansions = max_expansions;
         self
     }
 }
