@@ -22,6 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
+use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
@@ -768,6 +769,7 @@ pub(crate) async fn commit_transaction(
 
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
     let mut backoff = SlotBackoff::default();
+    let start = Instant::now();
     while backoff.attempt() < num_attempts {
         // See if we can retry the commit. Try to account for all
         // transactions that have been committed since the read_version.
@@ -892,6 +894,15 @@ pub(crate) async fn commit_transaction(
             }
             Err(CommitError::CommitConflict) => {
                 let next_attempt_i = backoff.attempt() + 1;
+
+                if backoff.attempt() == 0 {
+                    // We add 10% buffer here, to allow concurrent writes to complete.
+                    // We pass the first attempt's time to the backoff so it's used
+                    // as the unit for backoff time slots.
+                    // See SlotBackoff implementation for more details on how this works.
+                    backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
+                }
+
                 if next_attempt_i < num_attempts {
                     tokio::time::sleep(backoff.next_backoff()).await;
                     dataset.checkout_latest().await?;
