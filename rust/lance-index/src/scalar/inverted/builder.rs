@@ -148,13 +148,13 @@ impl InvertedIndexBuilder {
             let receiver = receiver.clone();
             let id_alloc = id_alloc.clone();
             let task = tokio::task::spawn(async move {
-                let mut worker =
-                    IndexWorker::new(store, tokenizer, with_position, id_alloc).await?;
-                while let Ok(batch) = receiver.recv().await {
-                    worker.process_batch(batch).await?;
-                }
-                let partitions = worker.finish().await?;
-                Result::Ok(partitions)
+                // let mut worker =
+                //     IndexWorker::new(store, tokenizer, with_position, id_alloc).await?;
+                // while let Ok(batch) = receiver.recv().await {
+                //     worker.process_batch(batch).await?;
+                // }
+                // let partitions = worker.finish().await?;
+                Result::Ok(vec![0])
             });
             index_tasks.push(task);
         }

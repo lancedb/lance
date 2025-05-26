@@ -10,7 +10,7 @@ use chrono::{prelude::*, Duration};
 use datafusion::execution::cache;
 use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 use itertools::Itertools;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -79,7 +80,8 @@ use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments, manifest_cache_path,
+    detect_overlapping_fragments, manifest_cache_path, read_transaction_file,
+    transaction_file_cache_path,
 };
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
@@ -365,12 +367,11 @@ impl Dataset {
             self.object_store.clone(),
             base_path,
             self.uri.clone(),
-            manifest,
+            Arc::new(manifest),
             manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
         )
-        .await
     }
 
     async fn checkout_by_tag(&self, tag: &str) -> Result<Self> {
@@ -471,11 +472,11 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn checkout_manifest(
+    fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         uri: String,
-        manifest: Manifest,
+        manifest: Arc<Manifest>,
         manifest_location: ManifestLocation,
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
@@ -489,7 +490,7 @@ impl Dataset {
             object_store,
             base: base_path,
             uri,
-            manifest: Arc::new(manifest),
+            manifest,
             manifest_location,
             commit_handler,
             session,
@@ -577,8 +578,7 @@ impl Dataset {
                 blob_manifest_location,
                 self.session.clone(),
                 self.commit_handler.clone(),
-            )
-            .await?;
+            )?;
             Ok(Some(Arc::new(blobs_dataset)))
         } else {
             Ok(None)
@@ -1077,8 +1077,7 @@ impl Dataset {
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let mut versions: Vec<Version> = self
             .commit_handler
-            .list_manifest_locations(&self.base, &self.object_store.inner)
-            .await?
+            .list_manifest_locations(&self.base, &self.object_store, false)
             .try_filter_map(|location| async move {
                 match read_manifest(&self.object_store, &location.path, location.size).await {
                     Ok(manifest) => Ok(Some(Version::from(&manifest))),
@@ -1462,39 +1461,112 @@ impl Dataset {
     }
 }
 
-struct NewTransactionResult {
-    pub dataset: Box<dyn Future<Output = Result<Dataset>> + Send>,
-    pub new_transactions: Box<dyn Stream<Item = Result<(u64, Transaction)>> + Send>,
+struct NewTransactionResult<'a> {
+    pub dataset: BoxFuture<'a, Result<Dataset>>,
+    pub new_transactions: BoxStream<'a, Result<(u64, Arc<Transaction>)>>,
 }
 
-pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult {
+pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'_> {
     // Re-use the same list call for getting the latest manifest and the metadata
     // for all manifests in between.
     let io_parallelism = dataset.object_store().io_parallelism();
     let commit_handler = dataset.commit_handler.clone();
+    let session = dataset.session.clone();
     let locations =
         commit_handler.list_manifest_locations(&dataset.base, dataset.object_store(), true);
-    let manifests = locations
-        .try_map(|location| {
-            let fut = Dataset::load_manifest(
-                dataset.object_store(),
-                location,
-                &dataset.base,
-                session.clone(),
-            );
-            async move {
-                let cache_path = todo!();
 
-                // self.session.file_metadata_cache.get(cache_path).await?;
-                todo!("load manifest from object store or read from cache");
+    // Will send the latest manifest via a channel.
+    let (latest_tx, latest_rx) = tokio::sync::oneshot::channel();
+    let latest_tx = Some(latest_tx);
+
+    // TODO: also have a channel to send the error.
+
+    let manifests = locations
+        .map_ok(|location| {
+            let latest_tx = latest_tx.take();
+            async move {
+                let cache_path = manifest_cache_path(&location);
+                let manifest = session
+                    .file_metadata_cache
+                    .get_or_insert(&cache_path, |_| {
+                        Dataset::load_manifest(
+                            dataset.object_store(),
+                            &location,
+                            &dataset.base,
+                            session.as_ref(),
+                        )
+                    })
+                    .await?;
+
+                if let Some(latest_tx) = latest_tx {
+                    // We ignore the error, since we don't care if the receiver is dropped.
+                    let _ = latest_tx.send((manifest.clone(), location.clone()));
+                }
+
+                Ok((manifest, location))
             }
         })
-        .try_buffer_unordered(io_parallelism);
-    let transactions = manifests;
+        .try_buffer_unordered(io_parallelism / 2);
+    let transactions = manifests
+        .map_ok(|(manifest, location)| async move {
+            let cache_path = transaction_file_cache_path(&dataset.base, manifest.version);
+            let transaction = session
+                .file_metadata_cache
+                .get_or_insert(&cache_path, |_| async move {
+                    let dataset_version = Dataset::checkout_manifest(
+                        dataset.object_store.clone(),
+                        dataset.base.clone(),
+                        dataset.uri,
+                        manifest,
+                        location,
+                        session.clone(),
+                        commit_handler.clone(),
+                    )?;
+                    let object_store = dataset_version.object_store();
+                    let path = dataset_version
+                        .manifest
+                        .transaction_file
+                        .as_ref()
+                        .ok_or_else(|| Error::Internal {
+                            message: format!(
+                                "Dataset version {} does not have a transaction file",
+                                manifest.version
+                            ),
+                            location: location!(),
+                        })?;
+                    let transaction = read_transaction_file(object_store, &dataset.base, path)
+                        .await
+                        .unwrap();
+                    Ok(transaction)
+                })
+                .await?;
+            Ok((manifest.version, transaction))
+        })
+        .try_buffer_unordered(io_parallelism / 2);
 
-    todo!("use buffered to read all manifests in parallel");
-    todo!("use oneshot channel to return the latest dataset");
-    todo!("Use buffered to read all transactions in parallel");
+    let dataset = async move {
+        let (latest_manifest, location) = latest_rx.await.map_err(|err| Error::Internal {
+            message: "An unknown error prevented reading the latest dataset version.".into(),
+            location: location!(),
+        })?;
+        Dataset::checkout_manifest(
+            dataset.object_store.clone(),
+            dataset.base.clone(),
+            dataset.uri,
+            latest_manifest,
+            location,
+            session.clone(),
+            commit_handler.clone(),
+        )
+    }
+    .boxed();
+
+    let new_transactions = transactions.boxed();
+
+    NewTransactionResult {
+        dataset,
+        new_transactions,
+    }
 }
 
 /// # Schema Evolution

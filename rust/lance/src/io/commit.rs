@@ -67,7 +67,7 @@ mod external_manifest;
 mod s3_test;
 
 /// Read the transaction data from a transaction file.
-async fn read_transaction_file(
+pub(crate) async fn read_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction_file: &str,
@@ -79,7 +79,7 @@ async fn read_transaction_file(
     transaction.try_into()
 }
 
-fn transaction_file_cache_path(base_path: &Path, version: u64) -> Path {
+pub(crate) fn transaction_file_cache_path(base_path: &Path, version: u64) -> Path {
     base_path
         .child("_transactions")
         .child(format!("{}.txn", version))

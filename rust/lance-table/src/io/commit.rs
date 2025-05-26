@@ -425,13 +425,12 @@ fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
     0
 }
 
-async fn list_manifests<'a>(
+fn list_manifests<'a>(
     base_path: &Path,
     object_store: &'a dyn OSObjectStore,
-) -> Result<BoxStream<'a, Result<ManifestLocation>>> {
-    Ok(object_store
+) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
+    object_store
         .read_dir_all(&base_path.child(VERSIONS_DIR), None)
-        .await?
         .filter_map(|obj_meta| {
             futures::future::ready(
                 obj_meta
@@ -439,7 +438,7 @@ async fn list_manifests<'a>(
                     .transpose(),
             )
         })
-        .boxed())
+        .boxed()
 }
 
 fn make_staging_manifest_path(base: &Path) -> Result<Path> {
@@ -486,13 +485,13 @@ pub trait CommitHandler: Debug + Send + Sync {
     /// list operation. Otherwise, it will list all manifests and sort them
     /// in memory. When `sorted_descending` is `false`, the stream will yield manifests
     /// in arbitrary order.
-    async fn list_manifest_locations<'a>(
+    fn list_manifest_locations<'a>(
         &self,
         base_path: &Path,
         object_store: &'a ObjectStore,
         sorted_descending: bool,
-    ) -> Result<BoxStream<'a, Result<ManifestLocation>>> {
-        let underlying_stream = list_manifests(base_path, &object_store.inner).await?;
+    ) -> BoxStream<'a, Result<ManifestLocation>> {
+        let underlying_stream = list_manifests(base_path, &object_store.inner);
 
         async fn sort_stream(
             input_stream: impl futures::Stream<Item = Result<ManifestLocation>> + Unpin,
@@ -509,7 +508,7 @@ pub trait CommitHandler: Debug + Send + Sync {
                 // We don't know the naming scheme until we see the first manifest.
                 let mut peekable = underlying_stream.peekable();
 
-                Ok(futures::stream::once(async move {
+                futures::stream::once(async move {
                     // Peek the first item to determine the naming scheme.
                     let naming_scheme = match Pin::new(&mut peekable).peek().await {
                         Some(Ok(m)) => m.naming_scheme,
@@ -527,9 +526,9 @@ pub trait CommitHandler: Debug + Send + Sync {
                     }
                 })
                 .try_flatten()
-                .boxed())
+                .boxed()
             } else {
-                Ok(futures::stream::once(async move {
+                futures::stream::once(async move {
                     // If the object store does not support lexicographically ordered lists,
                     // we need to sort the manifests in memory. Systems where this isn't
                     // supported (local fs, S3 express) are typically fast enough
@@ -537,10 +536,10 @@ pub trait CommitHandler: Debug + Send + Sync {
                     sort_stream(underlying_stream).await
                 })
                 .try_flatten()
-                .boxed())
+                .boxed()
             }
         } else {
-            Ok(underlying_stream)
+            underlying_stream.boxed()
         }
     }
 
