@@ -1801,7 +1801,7 @@ mod tests {
     use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::inverted::{
-        query::{MatchQuery, Operator, PhraseQuery},
+        query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
         tokenizer::InvertedIndexParams,
     };
     use lance_index::scalar::FullTextSearchQuery;
@@ -5245,6 +5245,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.num_rows(), 2, "{:?}", result);
+        let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert!(ids.contains(&0), "{:?}", result);
+        assert!(ids.contains(&1), "{:?}", result);
 
         let result = ds
             .scan()
@@ -5360,6 +5363,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.num_rows(), 0);
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                // must contain "lance" and "database", and may contain "search"
+                FullTextSearchQuery::new_query(
+                    BooleanQuery::new([
+                        (
+                            Occur::Should,
+                            MatchQuery::new("search".to_owned())
+                                .with_operator(Operator::And)
+                                .into(),
+                        ),
+                        (
+                            Occur::Must,
+                            MatchQuery::new("lance database".to_owned())
+                                .with_operator(Operator::And)
+                                .into(),
+                        ),
+                    ])
+                    .into(),
+                )
+                .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2, "{:?}", result);
+        let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert!(ids.contains(&0), "{:?}", result);
+        assert!(ids.contains(&1), "{:?}", result);
     }
 
     #[tokio::test]

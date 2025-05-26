@@ -33,8 +33,9 @@ use datafusion::physical_plan::{
 };
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::Operator;
-use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+use datafusion_physical_expr::{aggregate::AggregateExprBuilder, expressions::Column};
 use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr};
+use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
 use futures::{FutureExt, TryStreamExt};
@@ -45,7 +46,6 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{analyze_plan, execute_plan, LanceExecutionOptions};
 use lance_datafusion::projection::ProjectionPlan;
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::inverted::query::{
     fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery,
@@ -54,6 +54,7 @@ use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::ScalarIndexCriteria;
+use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -62,7 +63,6 @@ use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
-use crate::datatypes::Schema;
 use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
@@ -74,6 +74,7 @@ use crate::io::exec::{
     knn::new_knn_exec, project, AddRowAddrExec, FilterPlan, KNNVectorDistanceExec,
     LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
 };
+use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
 use crate::{Error, Result};
 use snafu::location;
 
@@ -1685,6 +1686,25 @@ impl Scanner {
                 )
                 .await
             }
+            FtsQuery::Boolean(bool_query) => {
+                for query in bool_query.must.iter() {
+                    if !self
+                        .fragments_covered_by_fts_query_helper(query, accum)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
+                }
+                for query in &bool_query.should {
+                    if !self
+                        .fragments_covered_by_fts_query_helper(query, accum)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
         }
     }
 
@@ -1874,6 +1894,68 @@ impl Scanner {
                     SortExec::new(LexOrdering::new(vec![sort_expr]), fts_node)
                         .with_fetch(self.limit.map(|l| l as usize)),
                 )
+            }
+            FtsQuery::Boolean(query) => {
+                // TODO: rewrite the query for better performance
+
+                // we need to remove the limit from the params,
+                // so that we won't miss possible matches
+                let unlimited_params = params.clone().with_limit(None);
+
+                // For should queries, union the results of each subquery
+                let mut should = Vec::with_capacity(query.should.len());
+                for subquery in &query.should {
+                    let plan = Box::pin(self.plan_fts(
+                        subquery,
+                        &unlimited_params,
+                        filter_plan,
+                        prefilter_source,
+                    ))
+                    .await?;
+                    should.push(plan);
+                }
+                let should = if should.is_empty() {
+                    Arc::new(EmptyExec::new(FTS_SCHEMA.clone())) as _
+                } else if should.len() == 1 {
+                    should.pop().unwrap()
+                } else {
+                    Arc::new(UnionExec::new(should)) as _
+                };
+
+                // For must queries, inner join the results of each subquery on row_id
+                let mut must = None;
+                for query in &query.must {
+                    let plan = Box::pin(self.plan_fts(
+                        query,
+                        &unlimited_params,
+                        filter_plan,
+                        prefilter_source,
+                    ))
+                    .await?;
+                    if let Some(joined_plan) = must {
+                        must = Some(Arc::new(HashJoinExec::try_new(
+                            joined_plan,
+                            plan,
+                            vec![(
+                                Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
+                                Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
+                            )],
+                            None,
+                            &datafusion_expr::JoinType::Inner,
+                            None,
+                            datafusion_physical_plan::joins::PartitionMode::CollectLeft,
+                            false,
+                        )?) as _);
+                    } else {
+                        must = Some(plan);
+                    }
+                }
+                Arc::new(BooleanQueryExec::new(
+                    query.clone(),
+                    params.clone(),
+                    should,
+                    must,
+                ))
             }
         };
 

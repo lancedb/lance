@@ -744,6 +744,28 @@ def test_fts_multi_match_query(tmp_path):
     assert set(results["content"].to_pylist()) == {"content world", "content common"}
 
 
+def test_fts_boolean_query(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "frodo was a puppy",
+                "frodo was a happy puppy",
+                "frodo was a puppy with a tail",
+            ]
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+
+    query = MatchQuery("puppy", "text") & MatchQuery("happy", "text")
+    results = ds.to_table(
+        full_text_query=query,
+    )
+    assert results.num_rows == 1
+    assert results["text"][0].as_py() == "frodo was a happy puppy"
+
+
 def test_fts_with_postfilter(tmp_path):
     tab = pa.table({"text": ["Frodo the puppy"] * 100, "id": range(100)})
     dataset = lance.write_dataset(tab, tmp_path)
