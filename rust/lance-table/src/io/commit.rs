@@ -618,21 +618,26 @@ pub async fn commit_handler_from_url(
     // This looks unused if dynamodb feature disabled
     #[allow(unused_variables)] options: &Option<ObjectStoreParams>,
 ) -> Result<Arc<dyn CommitHandler>> {
+    let local_handler: Arc<dyn CommitHandler> = if cfg!(windows) {
+        Arc::new(RenameCommitHandler)
+    } else {
+        Arc::new(ConditionalPutCommitHandler)
+    };
+
     let url = match Url::parse(url_or_path) {
         Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
             // On Windows, the drive is parsed as a scheme
-            return Ok(Arc::new(ConditionalPutCommitHandler));
+            return Ok(local_handler);
         }
         Ok(url) => url,
         Err(_) => {
-            return Ok(Arc::new(ConditionalPutCommitHandler));
+            return Ok(local_handler);
         }
     };
 
     match url.scheme() {
-        "s3" | "gs" | "az" | "memory" | "file" | "file-object-store" => {
-            Ok(Arc::new(ConditionalPutCommitHandler))
-        }
+        "file" | "file-object-store" => Ok(local_handler),
+        "s3" | "gs" | "az" | "memory" => Ok(Arc::new(ConditionalPutCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::InvalidInput {
             source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
