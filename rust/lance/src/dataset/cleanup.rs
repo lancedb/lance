@@ -160,7 +160,7 @@ impl<'a> CleanupTask<'a> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
             .commit_handler
-            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store.inner)
+            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store.inner, false)
             .await?
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                 self.process_manifest_file(location, &inspection, tagged_versions)

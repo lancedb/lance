@@ -7,6 +7,7 @@
 use arrow_array::{RecordBatch, RecordBatchReader};
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{prelude::*, Duration};
+use datafusion::execution::cache;
 use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -26,6 +27,7 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
+use lance_table::format::pb::manifest;
 use lance_table::format::{
     DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
 };
@@ -1458,6 +1460,41 @@ impl Dataset {
         *self = self.checkout_version(latest_version).await?;
         Ok(())
     }
+}
+
+struct NewTransactionResult {
+    pub dataset: Box<dyn Future<Output = Result<Dataset>> + Send>,
+    pub new_transactions: Box<dyn Stream<Item = Result<(u64, Transaction)>> + Send>,
+}
+
+pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult {
+    // Re-use the same list call for getting the latest manifest and the metadata
+    // for all manifests in between.
+    let io_parallelism = dataset.object_store().io_parallelism();
+    let commit_handler = dataset.commit_handler.clone();
+    let locations =
+        commit_handler.list_manifest_locations(&dataset.base, dataset.object_store(), true);
+    let manifests = locations
+        .try_map(|location| {
+            let fut = Dataset::load_manifest(
+                dataset.object_store(),
+                location,
+                &dataset.base,
+                session.clone(),
+            );
+            async move {
+                let cache_path = todo!();
+
+                // self.session.file_metadata_cache.get(cache_path).await?;
+                todo!("load manifest from object store or read from cache");
+            }
+        })
+        .try_buffer_unordered(io_parallelism);
+    let transactions = manifests;
+
+    todo!("use buffered to read all manifests in parallel");
+    todo!("use oneshot channel to return the latest dataset");
+    todo!("Use buffered to read all transactions in parallel");
 }
 
 /// # Schema Evolution

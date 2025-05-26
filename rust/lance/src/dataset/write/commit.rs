@@ -595,14 +595,11 @@ mod tests {
 
         // Assert io requests
         let io_stats = io_tracker.incremental_stats();
-        // this can be minimized to 0 by avoiding the initial listing from check_latest(),
-        // but it will result in 2 more iops when retrying,
-        // so we will keep the iops at 1 for now
-        assert_eq!(io_stats.read_iops, 1);
+        assert_eq!(io_stats.read_iops, 0);
         assert_eq!(io_stats.write_iops, 2);
         // We can't write them in parallel. The transaction file must exist before
         // we can write the manifest.
-        assert_eq!(io_stats.num_hops, 3);
+        assert_eq!(io_stats.num_hops, 2);
     }
 
     #[tokio::test]
@@ -665,11 +662,8 @@ mod tests {
             assert_eq!(io_stats.num_hops, 3);
         } else {
             // We need to read the other manifests and transactions.
-            // TODO: currently there is a high read and write amplification without caching
-            //  when data is not cached, some operations like checkout and read are repeatedly performed
-            //  so we cannot really get to the ideal 1 + num_other_txns * 2 situation
-            assert_eq!(io_stats.read_iops, 14);
-            assert_eq!(io_stats.num_hops, 16);
+            assert_eq!(io_stats.read_iops, 1 + num_other_txns * 2);
+            assert_eq!(io_stats.num_hops, 5);
         }
         assert_eq!(io_stats.write_iops, 2); // txn + manifest
     }
