@@ -84,7 +84,7 @@ if TYPE_CHECKING:
 
 
 class MergeInsertBuilder(_MergeInsertBuilder):
-    def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
+    def execute(self, new_data: ReaderLike, *, schema: Optional[pa.Schema] = None):
         """Executes the merge insert operation
 
         This function updates the original dataset and returns a dictionary with
@@ -94,7 +94,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         Parameters
         ----------
 
-        data_obj: ReaderLike
+        new_data: ReaderLike
             The new data to use as the source table for the operation.  This parameter
             can be any source of data (e.g. table / dataset) that
             :func:`~lance.write_dataset` accepts.
@@ -102,12 +102,12 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             The schema of the data.  This only needs to be supplied whenever the data
             source is some kind of generator.
         """
-        reader = _coerce_reader(data_obj, schema)
+        reader = _coerce_reader(new_data, schema)
 
         return super(MergeInsertBuilder, self).execute(reader)
 
     def execute_uncommitted(
-        self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None
+        self, new_data: ReaderLike, *, schema: Optional[pa.Schema] = None
     ) -> Tuple[Transaction, Dict[str, Any]]:
         """Executes the merge insert operation without committing
 
@@ -118,7 +118,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         Parameters
         ----------
 
-        data_obj: ReaderLike
+        new_data: ReaderLike
             The new data to use as the source table for the operation.  This parameter
             can be any source of data (e.g. table / dataset) that
             :func:`~lance.write_dataset` accepts.
@@ -126,7 +126,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             The schema of the data.  This only needs to be supplied whenever the data
             source is some kind of generator.
         """
-        reader = _coerce_reader(data_obj, schema)
+        reader = _coerce_reader(new_data, schema)
 
         return super(MergeInsertBuilder, self).execute_uncommitted(reader)
 
@@ -1037,7 +1037,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("Versioning not yet supported in Rust")
 
-    def alter_columns(self, *alterations: Iterable[AlterColumn]):
+    def alter_columns(self, *alterations: AlterColumn):
         """Alter column name, data type, and nullability.
 
         Columns that are renamed can keep any indices that are on them. If a
@@ -2404,7 +2404,9 @@ class LanceDataset(pa.dataset.Dataset):
             "LanceDataset._commit() is deprecated, use LanceDataset.commit() instead",
             DeprecationWarning,
         )
-        return LanceDataset.commit(base_uri, operation, read_version, commit_lock)
+        return LanceDataset.commit(
+            base_uri, operation, read_version=read_version, commit_lock=commit_lock
+        )
 
     @staticmethod
     def commit(
@@ -4171,22 +4173,6 @@ class VectorIndexReader:
         """
 
         return self.stats["indices"][0]["num_partitions"]
-
-    def centroids(self) -> np.ndarray:
-        """
-        Returns the centroids of the index
-
-        Returns
-        -------
-        np.ndarray
-            The centroids of IVF
-            with shape (num_partitions, dim)
-        """
-        # when we have more delta indices,
-        # they are with the same centroids
-        return np.array(
-            self.dataset._ds.get_index_centroids(self.stats["indices"][0]["centroids"])
-        )
 
     def read_partition(
         self, partition_id: int, *, with_vector: bool = False
