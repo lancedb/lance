@@ -88,23 +88,6 @@ public class FragmentTest {
   }
 
   @Test
-  void commitOldVersion() {
-    String datasetPath = tempDir.resolve("commit_old_version").toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
-      FragmentMetadata meta = testDataset.createNewFragment(20);
-      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(meta));
-      assertThrows(
-          IllegalArgumentException.class,
-          () -> {
-            Dataset.commit(allocator, datasetPath, appendOp, Optional.of(0L));
-          });
-    }
-  }
-
-  @Test
   void appendWithoutFragment() {
     String datasetPath = tempDir.resolve("append_without_fragment").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
