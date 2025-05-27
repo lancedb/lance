@@ -5133,14 +5133,11 @@ mod tests {
             let string_builder = GenericStringBuilder::<Offset>::new();
             let mut list_col = GenericListBuilder::<ListOffset, _>::new(string_builder);
             // Create a list of strings
-            list_col.values().append_value("lance database"); // for testing phrase query
-            list_col.values().append_value("the");
-            list_col.values().append_value("search");
+            list_col.values().append_value("lance database the search"); // for testing phrase query
             list_col.append(true);
             list_col.values().append_value("lance database"); // for testing phrase query
             list_col.append(true);
-            list_col.values().append_value("lance");
-            list_col.values().append_value("search");
+            list_col.values().append_value("lance search");
             list_col.append(true);
             list_col.values().append_value("database");
             list_col.values().append_value("search");
@@ -5355,6 +5352,56 @@ mod tests {
             .full_text_search(
                 FullTextSearchQuery::new_query(PhraseQuery::new("unknown null".to_owned()).into())
                     .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 0);
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(PhraseQuery::new("lance search".to_owned()).into())
+                    .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    PhraseQuery::new("lance search".to_owned())
+                        .with_slop(2)
+                        .into(),
+                )
+                .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    PhraseQuery::new("search lance".to_owned())
+                        .with_slop(2)
+                        .into(),
+                )
+                .limit(Some(3)),
             )
             .unwrap()
             .try_into_batch()

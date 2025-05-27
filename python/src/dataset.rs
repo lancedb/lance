@@ -2222,10 +2222,13 @@ impl PyFullTextQuery {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (query, column))]
-    fn phrase_query(query: String, column: String) -> PyResult<Self> {
+    #[pyo3(signature = (query, column, slop))]
+    fn phrase_query(query: String, column: String, slop: u32) -> PyResult<Self> {
         Ok(Self {
-            inner: PhraseQuery::new(query).with_column(Some(column)).into(),
+            inner: PhraseQuery::new(query)
+                .with_column(Some(column))
+                .with_slop(slop)
+                .into(),
         })
     }
 
