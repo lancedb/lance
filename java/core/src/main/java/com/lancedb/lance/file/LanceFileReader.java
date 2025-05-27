@@ -22,7 +22,10 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import javax.annotation.Nullable;
+
 import java.io.IOException;
+import java.util.List;
 
 public class LanceFileReader implements AutoCloseable {
 
@@ -43,7 +46,12 @@ public class LanceFileReader implements AutoCloseable {
 
   private native void populateSchemaNative(long arrowSchemaMemoryAddress);
 
-  private native void readAllNative(int batchSize, long streamMemoryAddress) throws IOException;
+  private native void readAllNative(
+      int batchSize,
+      @Nullable List<String> projectedNames,
+      @Nullable int[] ranges,
+      long streamMemoryAddress)
+      throws IOException;
 
   private LanceFileReader() {}
 
@@ -67,7 +75,7 @@ public class LanceFileReader implements AutoCloseable {
    * <p>This method must be called to release resources when the reader is no longer needed.
    */
   @Override
-  public void close() throws Exception {
+  public void close() throws IOException {
     closeNative(nativeFileReaderHandle);
   }
 
@@ -101,11 +109,20 @@ public class LanceFileReader implements AutoCloseable {
    * Read all rows from the Lance file
    *
    * @param batchSize the maximum number of rows to read in a single batch
+   * @param projectedNames optional list of column names to project; if null, all columns are read
+   * @param ranges optional array of ranges to read; if null, all rows are read. The array must be
+   *     even, with pattern [start1, end1, start2, end2, ...], where each pair defines a range of
+   *     row indices to read. The starts are inclusive and ends are exclusive.
    * @return an ArrowReader for the Lance file
    */
-  public ArrowReader readAll(int batchSize) throws IOException {
+  public ArrowReader readAll(
+      @Nullable List<String> projectedNames, @Nullable int[] ranges, int batchSize)
+      throws IOException {
+    if (ranges != null && ranges.length % 2 != 0) {
+      throw new IllegalArgumentException("Ranges must be an even-length array.");
+    }
     try (ArrowArrayStream ffiArrowArrayStream = ArrowArrayStream.allocateNew(allocator)) {
-      readAllNative(batchSize, ffiArrowArrayStream.memoryAddress());
+      readAllNative(batchSize, projectedNames, ranges, ffiArrowArrayStream.memoryAddress());
       return Data.importArrayStream(allocator, ffiArrowArrayStream);
     }
   }
