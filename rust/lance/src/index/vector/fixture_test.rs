@@ -14,7 +14,7 @@ mod test {
 
     use approx::assert_relative_eq;
     use arrow::array::AsArray;
-    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use datafusion::execution::SendableRecordBatchStream;
@@ -28,7 +28,7 @@ mod test {
     };
     use lance_index::{vector::Query, Index, IndexType};
     use lance_io::{local::LocalObjectReader, traits::Reader};
-    use lance_linalg::distance::MetricType;
+    use lance_linalg::{distance::MetricType, kernels::normalize_arrow};
     use roaring::RoaringBitmap;
     use uuid::Uuid;
 
@@ -123,16 +123,16 @@ mod test {
             unimplemented!("only for IVF")
         }
 
+        fn total_partitions(&self) -> usize {
+            1
+        }
+
         fn is_loadable(&self) -> bool {
             true
         }
 
         fn use_residual(&self) -> bool {
             self.use_residual
-        }
-
-        fn check_can_remap(&self) -> Result<()> {
-            Ok(())
         }
 
         async fn load(
@@ -247,20 +247,29 @@ mod test {
                 expected_query_at_subindex: vec![2.0 / 8.0_f32.sqrt() - 1.0; 2],
             },
         ] {
+            let mut key = Arc::new(Float32Array::from(query)) as Arc<dyn Array>;
+            if metric == MetricType::Cosine {
+                key = normalize_arrow(&key).unwrap();
+            };
             let q = Query {
                 column: "test".to_string(),
-                key: Arc::new(Float32Array::from(query)),
+                key,
                 k: 1,
                 lower_bound: None,
                 upper_bound: None,
-                nprobes: 1,
+                minimum_nprobes: 1,
+                maximum_nprobes: None,
                 ef: None,
                 refine_factor: None,
                 metric_type: metric,
                 use_index: true,
             };
             let idx = make_idx.clone()(expected_query_at_subindex, metric).await;
-            idx.search(
+            let partition_ids = idx.find_partitions(&q).unwrap();
+            assert_eq!(partition_ids.len(), 4);
+            let nearest_partition_id = partition_ids.value(0);
+            idx.search_in_partition(
+                nearest_partition_id as usize,
                 &q,
                 Arc::new(DatasetPreFilter {
                     deleted_ids: None,
