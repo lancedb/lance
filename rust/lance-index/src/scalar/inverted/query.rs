@@ -14,6 +14,9 @@ pub struct FtsSearchParams {
     pub wand_factor: f32,
     pub fuzziness: Option<u32>,
     pub max_expansions: usize,
+    // None means not a phrase query
+    // Some(n) means a phrase query with slop n
+    pub phrase_slop: Option<u32>,
 }
 
 impl FtsSearchParams {
@@ -23,6 +26,7 @@ impl FtsSearchParams {
             wand_factor: 1.0,
             fuzziness: Some(0),
             max_expansions: 50,
+            phrase_slop: None,
         }
     }
 
@@ -43,6 +47,11 @@ impl FtsSearchParams {
 
     pub fn with_max_expansions(mut self, max_expansions: usize) -> Self {
         self.max_expansions = max_expansions;
+        self
+    }
+
+    pub fn with_phrase_slop(mut self, phrase_slop: Option<u32>) -> Self {
+        self.phrase_slop = phrase_slop;
         self
     }
 }
@@ -348,6 +357,7 @@ pub struct PhraseQuery {
     // If None, it will be determined at query time.
     pub column: Option<String>,
     pub terms: String,
+    pub slop: u32,
 }
 
 impl PhraseQuery {
@@ -355,11 +365,17 @@ impl PhraseQuery {
         Self {
             column: None,
             terms,
+            slop: 0,
         }
     }
 
     pub fn with_column(mut self, column: Option<String>) -> Self {
         self.column = column;
+        self
+    }
+
+    pub fn with_slop(mut self, slop: u32) -> Self {
+        self.slop = slop;
         self
     }
 }

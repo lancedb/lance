@@ -158,7 +158,6 @@ impl InvertedIndex {
         tokens: Arc<Vec<String>>,
         params: Arc<FtsSearchParams>,
         operator: Operator,
-        is_phrase_query: bool,
         prefilter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
@@ -182,7 +181,6 @@ impl InvertedIndex {
                         tokens.as_ref(),
                         params.as_ref(),
                         operator,
-                        is_phrase_query,
                         mask,
                         metrics.as_ref(),
                     )
@@ -499,11 +497,11 @@ impl InvertedPartition {
         tokens: &[String],
         params: &FtsSearchParams,
         operator: Operator,
-        is_phrase_query: bool,
         mask: Arc<RowIdMask>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, u32, u32)>> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
+        let is_phrase_query = params.phrase_slop.is_some();
         let tokens = match is_fuzzy {
             true => self.expand_fuzzy(tokens, params.fuzziness, params.max_expansions)?,
             false => tokens.to_vec(),
@@ -549,13 +547,7 @@ impl InvertedPartition {
             .await?;
         let scorer = BM25Scorer::new(std::iter::once(self));
         let mut wand = Wand::new(operator, postings.into_iter(), &self.docs, scorer);
-        wand.search(
-            is_phrase_query,
-            params.limit.unwrap_or(usize::MAX),
-            mask,
-            params.wand_factor,
-            metrics,
-        )
+        wand.search(params, mask, metrics)
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {

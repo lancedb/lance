@@ -229,7 +229,6 @@ impl ExecutionPlan for MatchQueryExec {
                     tokens.into(),
                     params.into(),
                     query.operator,
-                    false,
                     pre_filter,
                     metrics,
                 )
@@ -450,6 +449,8 @@ impl PhraseQueryExec {
             EmissionType::Final,
             Boundedness::Bounded,
         );
+        assert_eq!(params.phrase_slop, Some(query.slop));
+
         Self {
             dataset,
             query,
@@ -591,7 +592,6 @@ impl ExecutionPlan for PhraseQueryExec {
                     tokens.into(),
                     params.into(),
                     lance_index::scalar::inverted::query::Operator::And,
-                    true,
                     pre_filter,
                     metrics,
                 )
@@ -1018,7 +1018,7 @@ pub mod tests {
         let phrase_query = PhraseQueryExec::new(
             Arc::new(fixture.dataset.clone()),
             PhraseQuery::new("blah".to_string()),
-            FtsSearchParams::default(),
+            FtsSearchParams::new().with_phrase_slop(Some(0)),
             PreFilterSource::None,
         );
         phrase_query

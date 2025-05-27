@@ -96,7 +96,6 @@ fn bench_inverted(c: &mut Criterion) {
                             .into(),
                         params.clone().into(),
                         Operator::Or,
-                        false,
                         no_filter.clone(),
                         Arc::new(NoOpMetricsCollector),
                     )
