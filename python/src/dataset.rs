@@ -2222,7 +2222,7 @@ impl PyFullTextQuery {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (query, column, slop=0))]
+    #[pyo3(signature = (query, column, slop))]
     fn phrase_query(query: String, column: String, slop: u32) -> PyResult<Self> {
         Ok(Self {
             inner: PhraseQuery::new(query)
