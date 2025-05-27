@@ -570,6 +570,18 @@ pub trait DatagenExt {
         frag_count: FragmentCount,
         rows_per_fragment: FragmentRowCount,
     ) -> crate::Result<Dataset>;
+
+    async fn into_ram_dataset(
+        self,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+    ) -> crate::Result<Dataset>
+    where
+        Self: Sized,
+    {
+        self.into_dataset("memory://", frag_count, rows_per_fragment)
+            .await
+    }
 }
 
 #[async_trait::async_trait]

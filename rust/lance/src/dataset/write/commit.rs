@@ -706,6 +706,7 @@ mod tests {
                 updated_fragments: vec![],
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
+                fields_modified: vec![],
             },
             read_version: 1,
             blobs_op: None,

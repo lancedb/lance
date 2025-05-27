@@ -381,6 +381,8 @@ impl UpdateJob {
             removed_fragment_ids,
             updated_fragments,
             new_fragments,
+            // This job only deletes rows, it does not modify any field values.
+            fields_modified: vec![],
         };
         let transaction = Transaction::new(
             self.dataset.manifest.version,

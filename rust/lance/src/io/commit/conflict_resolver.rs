@@ -364,6 +364,7 @@ mod tests {
             updated_fragments: vec![Fragment::new(0)],
             removed_fragment_ids: vec![],
             new_fragments: vec![],
+            fields_modified: vec![],
         };
         let transaction = Transaction::new_from_version(1, operation);
         let other_operations = [
@@ -371,6 +372,7 @@ mod tests {
                 updated_fragments: vec![Fragment::new(1)],
                 removed_fragment_ids: vec![2],
                 new_fragments: vec![],
+                fields_modified: vec![],
             },
             Operation::Delete {
                 deleted_fragment_ids: vec![3],
@@ -381,6 +383,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 updated_fragments: vec![Fragment::new(4)],
                 new_fragments: vec![],
+                fields_modified: vec![],
             },
         ];
         let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
@@ -477,6 +480,7 @@ mod tests {
                 updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file.clone()],
+                fields_modified: vec![],
             },
             Operation::Delete {
                 updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
@@ -487,6 +491,7 @@ mod tests {
                 updated_fragments: vec![apply_deletion(&[2], &mut fragment, &dataset).await],
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file],
+                fields_modified: vec![],
             },
         ];
         let transactions =
@@ -604,6 +609,7 @@ mod tests {
                     updated_fragments: vec![],
                     removed_fragment_ids: vec![0],
                     new_fragments: vec![sample_file.clone()],
+                    fields_modified: vec![],
                 },
             ),
             (
@@ -612,6 +618,7 @@ mod tests {
                     updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
                     removed_fragment_ids: vec![],
                     new_fragments: vec![sample_file.clone()],
+                    fields_modified: vec![],
                 },
             ),
             (
