@@ -54,10 +54,15 @@ The safe dataloader uses the spawning method.
         inputs, targets = batch["prompt"], batch["image"]
         outputs = model(inputs)
         ...
+
+
 * Safe Dataloader
 .. code-block:: python
+
     from lance.torch.data import SafeLanceDataset, get_safe_loader
+
     dataset = SafeLanceDataset(temp_lance_dataset)
+    # use spawn method to avoid fork-safe issue
     loader = get_safe_loader(
         dataset,
         num_workers=2,
