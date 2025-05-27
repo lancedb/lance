@@ -765,6 +765,16 @@ def test_fts_boolean_query(tmp_path):
     assert results.num_rows == 1
     assert results["text"][0].as_py() == "frodo was a happy puppy"
 
+    query = MatchQuery("tail", "text") | MatchQuery("happy", "text")
+    results = ds.to_table(
+        full_text_query=query,
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a happy puppy",
+        "frodo was a puppy with a tail",
+    }
+
 
 def test_fts_with_postfilter(tmp_path):
     tab = pa.table({"text": ["Frodo the puppy"] * 100, "id": range(100)})

@@ -1915,11 +1915,15 @@ impl Scanner {
                     should.push(plan);
                 }
                 let should = if should.is_empty() {
-                    Arc::new(EmptyExec::new(FTS_SCHEMA.clone())) as _
+                    Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
                 } else if should.len() == 1 {
                     should.pop().unwrap()
                 } else {
-                    Arc::new(UnionExec::new(should)) as _
+                    let unioned = Arc::new(UnionExec::new(should));
+                    Arc::new(RepartitionExec::try_new(
+                        unioned,
+                        Partitioning::RoundRobinBatch(1),
+                    )?)
                 };
 
                 // For must queries, inner join the results of each subquery on row_id

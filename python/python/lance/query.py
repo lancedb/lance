@@ -195,10 +195,8 @@ class MultiMatchQuery(FullTextQuery):
         ----------
         query : str | list[Query]
             If a string, the query string to match against.
-
         columns : list[str]
             The list of columns to match against.
-
         boosts : list[float], optional
             The list of boost factors for each column. If not provided,
             all columns will have the same boost factor.
