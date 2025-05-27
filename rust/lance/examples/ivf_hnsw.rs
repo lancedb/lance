@@ -117,7 +117,7 @@ async fn main() {
         .with_row_id()
         .nearest(column, &q, args.k)
         .unwrap()
-        .nprobs(args.nprobe);
+        .minimum_nprobes(args.nprobe);
     println!("{:?}", plan.explain_plan(true).await.unwrap());
 
     let now = std::time::Instant::now();

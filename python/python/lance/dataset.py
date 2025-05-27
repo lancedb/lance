@@ -404,7 +404,8 @@ class LanceDataset(pa.dataset.Dataset):
                     "column": <embedding col name>,
                     "q": <query vector as pa.Float32Array>,
                     "k": 10,
-                    "nprobes": 1,
+                    "minimum_nprobes": 20,
+                    "maximum_nprobes": 50,
                     "refine_factor": 1
                 }
 
@@ -643,7 +644,8 @@ class LanceDataset(pa.dataset.Dataset):
                     "q": <query vector as pa.Float32Array>,
                     "k": 10,
                     "metric": "cosine",
-                    "nprobes": 1,
+                    "minimum_nprobes": 20,
+                    "maximum_nprobes": 50,
                     "refine_factor": 1
                 }
 
@@ -3402,6 +3404,8 @@ class ScannerBuilder:
         k: Optional[int] = None,
         metric: Optional[str] = None,
         nprobes: Optional[int] = None,
+        minimum_nprobes: Optional[int] = None,
+        maximum_nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
@@ -3435,6 +3439,26 @@ class ScannerBuilder:
             raise ValueError(f"Nearest-K must be > 0 but got {k}")
         if nprobes is not None and int(nprobes) <= 0:
             raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
+        if minimum_nprobes is not None and int(minimum_nprobes) < 0:
+            raise ValueError(f"Minimum nprobes must be >= 0 but got {minimum_nprobes}")
+        if maximum_nprobes is not None and int(maximum_nprobes) < 0:
+            raise ValueError(f"Maximum nprobes must be >= 0 but got {maximum_nprobes}")
+
+        if nprobes is not None:
+            if minimum_nprobes is not None or maximum_nprobes is not None:
+                raise ValueError(
+                    "nprobes cannot be set in combination with minimum_nprobes or "
+                    "maximum_nprobes"
+                )
+            else:
+                minimum_nprobes = nprobes
+                maximum_nprobes = nprobes
+        if (
+            minimum_nprobes is not None
+            and maximum_nprobes is not None
+            and minimum_nprobes > maximum_nprobes
+        ):
+            raise ValueError("minimum_nprobes must be <= maximum_nprobes")
         if refine_factor is not None and int(refine_factor) < 1:
             raise ValueError(f"Refine factor must be 1 or more got {refine_factor}")
         if ef is not None and int(ef) <= 0:
@@ -3446,7 +3470,8 @@ class ScannerBuilder:
             "q": q,
             "k": k,
             "metric": metric,
-            "nprobes": nprobes,
+            "minimum_nprobes": minimum_nprobes,
+            "maximum_nprobes": maximum_nprobes,
             "refine_factor": refine_factor,
             "use_index": use_index,
             "ef": ef,
