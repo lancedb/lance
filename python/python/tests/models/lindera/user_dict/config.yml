@@ -1,0 +1,7 @@
+segmenter:
+  mode: "normal"
+  dictionary:
+    kind: "ipadic"
+  user_dictionary:
+    path: "./python/tests/models/lindera/user_dict/userdic.csv"
+    kind: "ipadic"

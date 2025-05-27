@@ -70,18 +70,16 @@ Using the Model
 User Dictionaries
 ~~~~~~~~~~~~~~~~~
 
-Create a file named config.json in the root directory of the current model.
+Create a file named config.yml in the root directory of your model, or specify a custom YAML file using the `LINDERA_CONFIG_PATH` environment variable.
+If both are provided, the config.yml in the root directory takes precedence.
+For more detailed configuration methods,    see the Lindera documentation at https://github.com/lindera/lindera/.
 
-.. code-block::json
-    {
-        "main": "main",
-        "users": "path/to/user/dict.bin",
-        "user_kind": "ipadic|ko-dic|unidic"
-    }
+.. code-block:: yaml
 
-- The "main" field is optional. If not filled, the default is the "main" directory.
-- "user" is the path of the user dictionary. The user dictionary can be passed as a CSV file or as a binary file compiled by lindera-cli.
-- The "user_kind" field can be left blank if the user dictionary is in binary format. If it's in CSV format, you need to specify the type of the language model.
+    segmenter:
+        mode: "normal"
+        dictionary:
+            kind: "ipadic"
 
 
 Create your own language model
