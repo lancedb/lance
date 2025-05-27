@@ -48,6 +48,7 @@ jobs:
         with:
           fetch-depth: 0
           lfs: true
+      - uses: rui314/setup-mold@v1
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -104,6 +105,7 @@ jobs:
         with:
           fetch-depth: 0
           lfs: true
+      - uses: rui314/setup-mold@v1
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -141,6 +143,7 @@ jobs:
         with:
           fetch-depth: 0
           lfs: true
+      - uses: rui314/setup-mold@v1
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
