@@ -52,6 +52,9 @@ impl DisplayAs for MatchQueryExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "MatchQuery: query={}", self.query.terms)
             }
+            DisplayFormatType::TreeRender => {
+                write!(f, "MatchQuery\nquery={}", self.query.terms)
+            }
         }
     }
 }
@@ -285,6 +288,9 @@ impl DisplayAs for FlatMatchQueryExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "FlatMatchQuery: query={}", self.query.terms)
             }
+            DisplayFormatType::TreeRender => {
+                write!(f, "FlatMatchQuery\nquery={}", self.query.terms)
+            }
         }
     }
 }
@@ -431,6 +437,9 @@ impl DisplayAs for PhraseQueryExec {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "PhraseQuery: query={}", self.query.terms)
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "PhraseQuery\nquery={}", self.query.terms)
             }
         }
     }
@@ -643,6 +652,13 @@ impl DisplayAs for BoostQueryExec {
                 write!(
                     f,
                     "BoostQuery: negative_boost={}",
+                    self.query.negative_boost
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "BoostQuery\nnegative_boost={}",
                     self.query.negative_boost
                 )
             }

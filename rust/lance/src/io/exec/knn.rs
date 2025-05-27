@@ -95,6 +95,9 @@ impl DisplayAs for KNNVectorDistanceExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "KNNVectorDistance: metric={}", self.distance_type,)
             }
+            DisplayFormatType::TreeRender => {
+                write!(f, "KNNVectorDistance\nmetric={}", self.distance_type,)
+            }
         }
     }
 }
@@ -351,6 +354,15 @@ impl DisplayAs for ANNIvfPartitionExec {
                     self.index_uuids.len()
                 )
             }
+            DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "ANNIvfPartition\nuuid={}\nnprobes={}\ndeltas={}",
+                    self.index_uuids[0],
+                    self.query.nprobes,
+                    self.index_uuids.len()
+                )
+            }
         }
     }
 }
@@ -519,6 +531,15 @@ impl DisplayAs for ANNIvfSubIndexExec {
                 write!(
                     f,
                     "ANNSubIndex: name={}, k={}, deltas={}",
+                    self.indices[0].name,
+                    self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
+                    self.indices.len()
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "ANNSubIndex\nname={}\nk={}\ndeltas={}",
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
                     self.indices.len()
@@ -763,6 +784,9 @@ impl DisplayAs for MultivectorScoringExec {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "MultivectorScoring: k={}", self.query.k)
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "MultivectorScoring\nk={}", self.query.k)
             }
         }
     }
