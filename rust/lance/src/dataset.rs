@@ -77,7 +77,7 @@ use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments,
+    detect_overlapping_fragments, manifest_cache_path,
 };
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
@@ -598,7 +598,8 @@ impl Dataset {
             .await?;
 
         // Check if manifest is in cache before reading from storage
-        let cached_manifest = self.session.file_metadata_cache.get(&location.path);
+        let cache_path = manifest_cache_path(&location);
+        let cached_manifest = self.session.file_metadata_cache.get(&cache_path);
         if let Some(cached_manifest) = cached_manifest {
             return Ok((cached_manifest, location));
         }

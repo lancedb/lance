@@ -78,6 +78,8 @@ impl ObjectStoreProvider for AwsStoreProvider {
             .map(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
             .unwrap_or(false);
 
+        let is_s3_express = check_s3_express(&base_path, &mut storage_options);
+
         // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
         base_path.set_scheme("s3").unwrap();
         base_path.set_query(None);
@@ -100,11 +102,25 @@ impl ObjectStoreProvider for AwsStoreProvider {
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
-            list_is_lexically_ordered: true,
+            list_is_lexically_ordered: !is_s3_express,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
         })
     }
+}
+
+/// Check if the storage is S3 Express, update object storage options along the way
+fn check_s3_express(url: &Url, storage_options: &mut HashMap<AmazonS3ConfigKey, String>) -> bool {
+    if matches!(storage_options.get(&AmazonS3ConfigKey::S3Express), Some(val) if val == "true") {
+        return true;
+    }
+
+    if url.authority().ends_with("--x-s3") {
+        storage_options.insert(AmazonS3ConfigKey::S3Express, true.to_string());
+        return true;
+    }
+
+    false
 }
 
 /// Figure out the S3 region of the bucket.
@@ -415,6 +431,45 @@ mod tests {
             let path = provider.extract_path(&url);
             let expected_path = Path::from(expected_path);
             assert_eq!(path, expected_path);
+        }
+    }
+
+    #[test]
+    fn test_is_s3_express() {
+        let cases = [
+            (
+                "s3://bucket/path/to/file",
+                HashMap::from([(AmazonS3ConfigKey::S3Express, "true".into())]),
+                true,
+            ),
+            (
+                "s3://bucket/path/to/file",
+                HashMap::from([(AmazonS3ConfigKey::S3Express, "false".into())]),
+                false,
+            ),
+            ("s3://bucket/path/to/file", HashMap::from([]), false),
+            (
+                "s3://bucket--x-s3/path/to/file",
+                HashMap::from([(AmazonS3ConfigKey::S3Express, "true".into())]),
+                true,
+            ),
+            (
+                "s3://bucket--x-s3/path/to/file",
+                HashMap::from([(AmazonS3ConfigKey::S3Express, "false".into())]),
+                true,
+            ),
+            ("s3://bucket--x-s3/path/to/file", HashMap::from([]), true),
+        ];
+
+        for (uri, mut configs, expected) in cases {
+            let url = Url::parse(uri).unwrap();
+            let is_s3_express = check_s3_express(&url, &mut configs);
+            assert_eq!(is_s3_express, expected);
+            if is_s3_express {
+                assert!(configs
+                    .get(&AmazonS3ConfigKey::S3Express)
+                    .is_some_and(|opt| opt == "true"));
+            }
         }
     }
 }
