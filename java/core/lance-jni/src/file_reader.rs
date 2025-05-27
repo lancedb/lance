@@ -194,7 +194,7 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
         let mut read_parameter = ReadBatchParams::default();
         let mut reader_projection: Option<ReaderProjection> = None;
         // We get reader here not from env.get_rust_field, because we need reader: MutexGuard<BlockingFileReader> has no relationship with the env lifecycle.
-        // If we get reader from env.get_rust_field, we can't use env (can't borrow again) before we drop the reader.
+        // If we get reader from env.get_rust_field, we can't use env (can't borrow again) until we drop the reader.
         let reader = unsafe {
             let reader_ref = reader.as_ref();
             let ptr = env.get_field(reader_ref, NATIVE_READER, "J")?.j()? as *mut Mutex<BlockingFileReader>;
