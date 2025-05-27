@@ -50,7 +50,7 @@ lance-datafusion = { path = "../rust/lance-datafusion" }
 lazy_static = "1"
 log = "0.4"
 prost = "0.13.2"
-pyo3 = { version = "0.23", features = [
+pyo3 = { version = "0.24.1", features = [
     "extension-module",
     "abi3-py39",
     "py-clone",
