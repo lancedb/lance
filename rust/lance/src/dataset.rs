@@ -1479,8 +1479,6 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     let (latest_tx, latest_rx) = tokio::sync::oneshot::channel();
     let mut latest_tx = Some(latest_tx);
 
-    // TODO: also have a channel to send the error.
-
     let manifests = locations
         .map_ok(move |location| {
             let latest_tx = latest_tx.take();

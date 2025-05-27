@@ -493,6 +493,10 @@ pub trait CommitHandler: Debug + Send + Sync {
     ) -> BoxStream<'a, Result<ManifestLocation>> {
         let underlying_stream = list_manifests(base_path, &object_store.inner);
 
+        if !sorted_descending {
+            return underlying_stream.boxed();
+        }
+
         async fn sort_stream(
             input_stream: impl futures::Stream<Item = Result<ManifestLocation>> + Unpin,
         ) -> Result<impl Stream<Item = Result<ManifestLocation>> + Unpin> {
@@ -501,45 +505,38 @@ pub trait CommitHandler: Debug + Send + Sync {
             Ok(futures::stream::iter(locations.into_iter().map(Ok)))
         }
 
-        if sorted_descending {
-            // If the object store supports lexicographically ordered lists and
-            // the naming scheme is V2, we can use an optimized list operation.
-            if object_store.list_is_lexically_ordered {
-                // We don't know the naming scheme until we see the first manifest.
-                let mut peekable = underlying_stream.peekable();
+        // If the object store supports lexicographically ordered lists and
+        // the naming scheme is V2, we can use an optimized list operation.
+        if object_store.list_is_lexically_ordered {
+            // We don't know the naming scheme until we see the first manifest.
+            let mut peekable = underlying_stream.peekable();
 
-                futures::stream::once(async move {
-                    // Peek the first item to determine the naming scheme.
-                    let naming_scheme = match Pin::new(&mut peekable).peek().await {
-                        Some(Ok(m)) => m.naming_scheme,
-                        // If we get an error or no manifests are found, we default
-                        // to V2 naming scheme, since it doesn't matter.
-                        Some(Err(_)) => ManifestNamingScheme::V2,
-                        None => ManifestNamingScheme::V2,
-                    };
+            futures::stream::once(async move {
+                let naming_scheme = match Pin::new(&mut peekable).peek().await {
+                    Some(Ok(m)) => m.naming_scheme,
+                    // If we get an error or no manifests are found, we default
+                    // to V2 naming scheme, since it doesn't matter.
+                    Some(Err(_)) => ManifestNamingScheme::V2,
+                    None => ManifestNamingScheme::V2,
+                };
 
-                    if naming_scheme == ManifestNamingScheme::V2 {
-                        // If the first manifest is V2, we can use the optimized list operation.
-                        Ok(Either::Left(peekable))
-                    } else {
-                        sort_stream(peekable).await.map(Either::Right)
-                    }
-                })
-                .try_flatten()
-                .boxed()
-            } else {
-                futures::stream::once(async move {
-                    // If the object store does not support lexicographically ordered lists,
-                    // we need to sort the manifests in memory. Systems where this isn't
-                    // supported (local fs, S3 express) are typically fast enough
-                    // that this is not a problem.
-                    sort_stream(underlying_stream).await
-                })
-                .try_flatten()
-                .boxed()
-            }
+                if naming_scheme == ManifestNamingScheme::V2 {
+                    // If the first manifest is V2, we can use the optimized list operation.
+                    Ok(Either::Left(peekable))
+                } else {
+                    sort_stream(peekable).await.map(Either::Right)
+                }
+            })
+            .try_flatten()
+            .boxed()
         } else {
-            underlying_stream.boxed()
+            // If the object store does not support lexicographically ordered lists,
+            // we need to sort the manifests in memory. Systems where this isn't
+            // supported (local fs, S3 express) are typically fast enough
+            // that this is not a problem.
+            futures::stream::once(sort_stream(underlying_stream))
+                .try_flatten()
+                .boxed()
         }
     }
 
@@ -1174,14 +1171,13 @@ mod tests {
             (store, base)
         };
 
-        // Write 12 manifest files
+        // Write 12 manifest files, latest first
         let mut expected_paths = Vec::new();
-        for i in 0..12 {
+        for i in (0..12).rev() {
             let path = naming_scheme.manifest_path(&base, i);
             object_store.put(&path, b"".as_slice()).await.unwrap();
             expected_paths.push(path);
         }
-        expected_paths.reverse();
 
         let actual_versions = ConditionalPutCommitHandler
             .list_manifest_locations(&base, &object_store, true)

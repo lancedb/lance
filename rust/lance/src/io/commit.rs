@@ -726,16 +726,17 @@ pub(crate) async fn commit_transaction(
 
     // read_version sometimes defaults to zero for overwrite.
     // If num_retries is zero, we are in "strict overwrite" mode.
-    let mut dataset = if dataset.manifest.version != read_version
-        && (read_version != 0 || commit_config.num_retries == 0)
-    {
-        // If the dataset version is not the same as the read version, we need to
-        // checkout the read version.
-        dataset.checkout_version(read_version).await?
-    } else {
-        // If the dataset version is the same as the read version, we can use it directly.
-        dataset.clone()
-    };
+    let strict_overwrite = matches!(transaction.operation, Operation::Overwrite { .. })
+        && commit_config.num_retries == 0;
+    let mut dataset =
+        if dataset.manifest.version != read_version && (read_version != 0 || strict_overwrite) {
+            // If the dataset version is not the same as the read version, we need to
+            // checkout the read version.
+            dataset.checkout_version(read_version).await?
+        } else {
+            // If the dataset version is the same as the read version, we can use it directly.
+            dataset.clone()
+        };
 
     let mut transaction = transaction.clone();
 

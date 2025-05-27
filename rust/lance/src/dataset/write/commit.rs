@@ -621,9 +621,9 @@ mod tests {
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
                 // For benchmarking: Increase this to simulate object storage.
-                wait_list_per_call: Duration::from_millis(10),
-                wait_get_per_call: Duration::from_millis(10),
-                wait_put_per_call: Duration::from_millis(10),
+                wait_list_per_call: Duration::from_millis(1),
+                wait_get_per_call: Duration::from_millis(1),
+                wait_put_per_call: Duration::from_millis(1),
                 ..Default::default()
             },
         });
