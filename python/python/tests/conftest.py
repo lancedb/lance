@@ -90,3 +90,14 @@ def pytest_collection_modifyitems(config, items):
         disable_items_with_mark(items, "torch", reason)
         disable_items_with_mark(items, "cuda", reason)
         disable_items_with_mark(items, "gpu", reason)
+
+
+def has_cuda():
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        return True
+    except ImportError:
+        return False
