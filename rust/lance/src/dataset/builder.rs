@@ -332,11 +332,10 @@ impl DatasetBuilder {
             object_store,
             base_path,
             table_uri,
-            manifest,
+            Arc::new(manifest),
             location,
             session,
             commit_handler,
         )
-        .await
     }
 }

@@ -1155,4 +1155,41 @@ mod tests {
             .unwrap();
         assert_eq!(actual_files, expected_files);
     }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn test_list_manifests_sorted(
+        #[values(true, false)] lexical_list_store: bool,
+        #[values(ManifestNamingScheme::V1, ManifestNamingScheme::V2)]
+        naming_scheme: ManifestNamingScheme,
+    ) {
+        let tempdir;
+        let (object_store, base) = if lexical_list_store {
+            (Box::new(ObjectStore::memory()), Path::from("base"))
+        } else {
+            tempdir = Some(tempfile::tempdir().unwrap());
+            let base = Path::from(tempdir.as_ref().unwrap().path().to_str().unwrap());
+            let store = Box::new(ObjectStore::local());
+            assert!(!store.list_is_lexically_ordered);
+            (store, base)
+        };
+
+        // Write 12 manifest files
+        let mut expected_paths = Vec::new();
+        for i in 0..12 {
+            let path = naming_scheme.manifest_path(&base, i);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+            expected_paths.push(path);
+        }
+        expected_paths.reverse();
+
+        let actual_versions = ConditionalPutCommitHandler
+            .list_manifest_locations(&base, &object_store, true)
+            .map_ok(|location| location.path)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(actual_versions, expected_paths);
+    }
 }

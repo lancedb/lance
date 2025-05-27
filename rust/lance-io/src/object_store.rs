@@ -141,6 +141,29 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
 }
 
+#[derive(Debug, Clone)]
+pub struct ChainedWrappingObjectStore {
+    wrappers: Vec<Arc<dyn WrappingObjectStore>>,
+}
+
+impl ChainedWrappingObjectStore {
+    pub fn new(wrappers: Vec<Arc<dyn WrappingObjectStore>>) -> Self {
+        Self { wrappers }
+    }
+
+    pub fn add_wrapper(&mut self, wrapper: Arc<dyn WrappingObjectStore>) {
+        self.wrappers.push(wrapper);
+    }
+}
+
+impl WrappingObjectStore for ChainedWrappingObjectStore {
+    fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+        self.wrappers
+            .iter()
+            .fold(original, |acc, wrapper| wrapper.wrap(acc))
+    }
+}
+
 /// Parameters to create an [ObjectStore]
 ///
 #[derive(Debug, Clone)]

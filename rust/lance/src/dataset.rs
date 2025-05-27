@@ -7,7 +7,6 @@
 use arrow_array::{RecordBatch, RecordBatchReader};
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{prelude::*, Duration};
-use datafusion::execution::cache;
 use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -27,7 +26,6 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
-use lance_table::format::pb::manifest;
 use lance_table::format::{
     DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
 };
@@ -43,7 +41,6 @@ use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -574,7 +571,7 @@ impl Dataset {
                 self.object_store.clone(),
                 blobs_path,
                 format!("{}/{}", self.uri, BLOB_DIR),
-                manifest,
+                Arc::new(manifest),
                 blob_manifest_location,
                 self.session.clone(),
                 self.commit_handler.clone(),
@@ -1461,7 +1458,7 @@ impl Dataset {
     }
 }
 
-struct NewTransactionResult<'a> {
+pub(crate) struct NewTransactionResult<'a> {
     pub dataset: BoxFuture<'a, Result<Dataset>>,
     pub new_transactions: BoxStream<'a, Result<(u64, Arc<Transaction>)>>,
 }
@@ -1470,30 +1467,34 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     // Re-use the same list call for getting the latest manifest and the metadata
     // for all manifests in between.
     let io_parallelism = dataset.object_store().io_parallelism();
-    let commit_handler = dataset.commit_handler.clone();
-    let session = dataset.session.clone();
-    let locations =
-        commit_handler.list_manifest_locations(&dataset.base, dataset.object_store(), true);
+    let latest_version = dataset.manifest.version;
+    let locations = dataset
+        .commit_handler
+        .list_manifest_locations(&dataset.base, dataset.object_store(), true)
+        .try_take_while(move |location| {
+            futures::future::ready(Ok(location.version > latest_version))
+        });
 
     // Will send the latest manifest via a channel.
     let (latest_tx, latest_rx) = tokio::sync::oneshot::channel();
-    let latest_tx = Some(latest_tx);
+    let mut latest_tx = Some(latest_tx);
 
     // TODO: also have a channel to send the error.
 
     let manifests = locations
-        .map_ok(|location| {
+        .map_ok(move |location| {
             let latest_tx = latest_tx.take();
             async move {
                 let cache_path = manifest_cache_path(&location);
-                let manifest = session
+                let manifest = dataset
+                    .session
                     .file_metadata_cache
                     .get_or_insert(&cache_path, |_| {
                         Dataset::load_manifest(
                             dataset.object_store(),
                             &location,
                             &dataset.base,
-                            session.as_ref(),
+                            dataset.session.as_ref(),
                         )
                     })
                     .await?;
@@ -1508,19 +1509,21 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         })
         .try_buffer_unordered(io_parallelism / 2);
     let transactions = manifests
-        .map_ok(|(manifest, location)| async move {
+        .map_ok(move |(manifest, location)| async move {
             let cache_path = transaction_file_cache_path(&dataset.base, manifest.version);
-            let transaction = session
+            let manifest_copy = manifest.clone();
+            let transaction = dataset
+                .session
                 .file_metadata_cache
                 .get_or_insert(&cache_path, |_| async move {
                     let dataset_version = Dataset::checkout_manifest(
                         dataset.object_store.clone(),
                         dataset.base.clone(),
-                        dataset.uri,
-                        manifest,
+                        dataset.uri.clone(),
+                        manifest_copy.clone(),
                         location,
-                        session.clone(),
-                        commit_handler.clone(),
+                        dataset.session(),
+                        dataset.commit_handler.clone(),
                     )?;
                     let object_store = dataset_version.object_store();
                     let path = dataset_version
@@ -1530,7 +1533,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         .ok_or_else(|| Error::Internal {
                             message: format!(
                                 "Dataset version {} does not have a transaction file",
-                                manifest.version
+                                manifest_copy.version
                             ),
                             location: location!(),
                         })?;
@@ -1545,19 +1548,22 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .try_buffer_unordered(io_parallelism / 2);
 
     let dataset = async move {
-        let (latest_manifest, location) = latest_rx.await.map_err(|err| Error::Internal {
-            message: "An unknown error prevented reading the latest dataset version.".into(),
-            location: location!(),
-        })?;
-        Dataset::checkout_manifest(
-            dataset.object_store.clone(),
-            dataset.base.clone(),
-            dataset.uri,
-            latest_manifest,
-            location,
-            session.clone(),
-            commit_handler.clone(),
-        )
+        if let Ok((latest_manifest, location)) = latest_rx.await {
+            // If we got the latest manifest, we can checkout the dataset.
+            Dataset::checkout_manifest(
+                dataset.object_store.clone(),
+                dataset.base.clone(),
+                dataset.uri.clone(),
+                latest_manifest,
+                location,
+                dataset.session(),
+                dataset.commit_handler.clone(),
+            )
+        } else {
+            // If we didn't get the latest manifest, we can still return the dataset
+            // with the current manifest.
+            Ok(dataset.clone())
+        }
     }
     .boxed();
 
@@ -6019,7 +6025,7 @@ mod tests {
             Operation::DataReplacement {
                 replacements: vec![DataReplacementGroup(0, new_data_file)],
             },
-            Some(5),
+            Some(4),
             None,
             None,
             Arc::new(Default::default()),
@@ -6289,7 +6295,7 @@ mod tests {
             Operation::DataReplacement {
                 replacements: vec![DataReplacementGroup(0, new_data_file)],
             },
-            Some(4),
+            Some(2),
             None,
             None,
             Arc::new(Default::default()),
@@ -6297,9 +6303,12 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Expected to modify the fragment but no changes were made"));
+        assert!(
+            err.to_string()
+                .contains("Expected to modify the fragment but no changes were made"),
+            "Expected Error::DataFileReplacementError, got {:?}",
+            err
+        );
     }
 
     #[tokio::test]

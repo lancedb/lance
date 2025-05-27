@@ -41,7 +41,7 @@ use rand::{thread_rng, Rng};
 use snafu::location;
 
 use futures::future::Either;
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::DatasetIndexExt;
 use log;
@@ -52,7 +52,9 @@ use super::ObjectStore;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::{write_manifest_file, ManifestWriteConfig, BLOB_DIR};
+use crate::dataset::{
+    load_new_transactions, write_manifest_file, ManifestWriteConfig, NewTransactionResult, BLOB_DIR,
+};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
@@ -91,36 +93,6 @@ pub(crate) fn manifest_cache_path(location: &ManifestLocation) -> Path {
         buf = buf.child(e_tag.as_str());
     }
     buf
-}
-
-async fn read_dataset_transaction_file(
-    dataset: &Dataset,
-    version: u64,
-) -> Result<Arc<Transaction>> {
-    let cache_path = transaction_file_cache_path(&dataset.base, version);
-    dataset
-        .session
-        .file_metadata_cache
-        .get_or_insert(&cache_path, |_| async move {
-            let dataset_version = dataset.checkout_version(version).await?;
-            let object_store = dataset_version.object_store();
-            let path = dataset_version
-                .manifest
-                .transaction_file
-                .as_ref()
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
-                        "Dataset version {} does not have a transaction file",
-                        version
-                    ),
-                    location: location!(),
-                })?;
-            let transaction = read_transaction_file(object_store, &dataset.base, path)
-                .await
-                .unwrap();
-            Ok(transaction)
-        })
-        .await
 }
 
 /// Write a transaction to a file and return the relative path.
@@ -752,17 +724,17 @@ pub(crate) async fn commit_transaction(
     let mut target_version = read_version + 1;
     let original_dataset = dataset.clone();
 
-    let mut dataset = if matches!(transaction.operation, Operation::Overwrite { .. })
-        && commit_config.num_retries == 0
+    // read_version sometimes defaults to zero for overwrite.
+    // If num_retries is zero, we are in "strict overwrite" mode.
+    let mut dataset = if dataset.manifest.version != read_version
+        && (read_version != 0 || commit_config.num_retries == 0)
     {
-        dataset.checkout_version(transaction.read_version).await?
+        // If the dataset version is not the same as the read version, we need to
+        // checkout the read version.
+        dataset.checkout_version(read_version).await?
     } else {
-        // We need to checkout the latest version, because any fixes we apply
-        // (like computing the new row ids) needs to be done based on the most
-        // recent manifest.
-        let mut dataset = dataset.clone();
-        dataset.checkout_latest().await?;
-        dataset
+        // If the dataset version is the same as the read version, we can use it directly.
+        dataset.clone()
     };
 
     let mut transaction = transaction.clone();
@@ -770,7 +742,28 @@ pub(crate) async fn commit_transaction(
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
     let mut backoff = SlotBackoff::default();
     let start = Instant::now();
+
+    // Other transactions that may have been committed since the read_version.
+    // We keep pair of (version, transaction). No other transactions to check initially
+    let mut other_transactions: Vec<(u64, Arc<Transaction>)>;
+
     while backoff.attempt() < num_attempts {
+        // We are pessimistic here and assume there may be other transactions
+        // we need to check for. We could be optimistic here and blindly
+        // attempt to commit, giving faster performance for sequence writes and
+        // slower performance for concurrent writes. But that makes the fast path
+        // faster and the slow path slower, which makes performance less predictable
+        // for users. So we always check for other transactions.
+        (dataset, other_transactions) = {
+            // Load new dataset and other transactions concurrently
+            let NewTransactionResult {
+                dataset: new_ds,
+                new_transactions,
+            } = load_new_transactions(&dataset);
+            let new_transactions = new_transactions.try_collect::<Vec<_>>();
+            futures::future::try_join(new_ds, new_transactions).await?
+        };
+
         // See if we can retry the commit. Try to account for all
         // transactions that have been committed since the read_version.
         // Use small amount of backoff to handle transactions that all
@@ -779,27 +772,9 @@ pub(crate) async fn commit_transaction(
         let mut rebase =
             TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
 
-        let mut concurrent_txns = futures::stream::iter(target_version..=dataset.manifest.version)
-            .map(|version| {
-                read_dataset_transaction_file(&dataset, version)
-                    .map(move |res| res.map(|tx| (version, tx)))
-            })
-            .buffer_unordered(dataset.object_store().io_parallelism())
-            .take_while(|res| {
-                futures::future::ready(
-                    backoff.attempt() > 0
-                        || !matches!(
-                            res,
-                            Err(crate::Error::NotFound { .. })
-                                | Err(crate::Error::DatasetNotFound { .. })
-                        ),
-                )
-            });
-
-        while let Some((other_version, other_transaction)) = concurrent_txns.try_next().await? {
-            rebase.check_txn(&other_transaction, other_version)?;
+        for (other_version, other_transaction) in other_transactions.iter() {
+            rebase.check_txn(other_transaction, *other_version)?;
         }
-        drop(concurrent_txns);
 
         transaction = rebase.finish(&dataset).await?;
 
@@ -905,7 +880,7 @@ pub(crate) async fn commit_transaction(
 
                 if next_attempt_i < num_attempts {
                     tokio::time::sleep(backoff.next_backoff()).await;
-                    dataset.checkout_latest().await?;
+                    continue;
                 } else {
                     break;
                 }

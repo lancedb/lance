@@ -417,8 +417,13 @@ pub struct BatchCommitResult {
 mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use lance_io::utils::CachedFileSize;
+    use lance_io::{object_store::ChainedWrappingObjectStore, utils::CachedFileSize};
     use lance_table::format::{DataFile, Fragment};
+    use std::time::Duration;
+
+    use object_store::throttle::ThrottleConfig;
+
+    use crate::utils::test::ThrottledStoreWrapper;
 
     use crate::{
         dataset::{InsertBuilder, WriteParams},
@@ -482,12 +487,13 @@ mod tests {
             .with_params(&WriteParams {
                 store_params: Some(store_params.clone()),
                 session: Some(session.clone()),
+                enable_v2_manifest_paths: true,
                 ..Default::default()
             })
             .execute(vec![batch])
             .await
             .unwrap();
-        let mut dataset = Arc::new(dataset);
+        let dataset = Arc::new(dataset);
 
         let reset_iops = || {
             io_stats.lock().unwrap().read_iops = 0;
@@ -510,8 +516,7 @@ mod tests {
                 .execute(sample_transaction(1))
                 .await
                 .unwrap();
-            dataset = Arc::new(new_ds);
-            assert_eq!(dataset.manifest().version, i + 2);
+            assert_eq!(new_ds.manifest.version, i + 2);
 
             // Because we are writing transactions sequentially, and caching them,
             // we shouldn't need to read anything from disk. Except we do need
@@ -534,10 +539,10 @@ mod tests {
             .unwrap();
         assert_eq!(new_ds.manifest().version, 7);
         // Session should still be re-used
-        // However, the dataset needs to be loaded, so an additional two IOPs
-        // are needed.
+        // However, the dataset needs to be loaded and the read version checked out,
+        // so an additional 4 IOPs are needed.
         let (reads, writes) = get_new_iops();
-        assert_eq!(reads, 3);
+        assert_eq!(reads, 5);
         assert_eq!(writes, 2);
 
         // Commit transaction with URI and new session. Re-use the store
@@ -552,7 +557,7 @@ mod tests {
         assert_eq!(new_ds.manifest().version, 8);
         // Now we have to load all previous transactions.
         let (reads, writes) = get_new_iops();
-        assert!(reads > 20);
+        assert!(reads > 10);
         assert_eq!(writes, 2);
     }
 
@@ -595,11 +600,14 @@ mod tests {
 
         // Assert io requests
         let io_stats = io_tracker.incremental_stats();
-        assert_eq!(io_stats.read_iops, 0);
+        // This could be zero, if we decided to be optimistic. However, that
+        // would mean two wasted write requests (txn + manifest) if there was
+        // a conflict. We choose to be pessimistic for more consistent performance.
+        assert_eq!(io_stats.read_iops, 1);
         assert_eq!(io_stats.write_iops, 2);
         // We can't write them in parallel. The transaction file must exist before
         // we can write the manifest.
-        assert_eq!(io_stats.num_hops, 2);
+        assert_eq!(io_stats.num_hops, 3);
     }
 
     #[tokio::test]
@@ -608,9 +616,23 @@ mod tests {
         let cache_size = if use_cache { 10_000 } else { 0 };
         let session = Arc::new(Session::new(0, cache_size, Default::default()));
         let io_tracker = Arc::new(StatsHolder::default());
+        // We need throttled to correctly count num hops. Otherwise, memory store
+        // returns synchronously, and each request is 1 hop.
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                // For benchmarking: Increase this to simulate object storage.
+                wait_list_per_call: Duration::from_millis(10),
+                wait_get_per_call: Duration::from_millis(10),
+                wait_put_per_call: Duration::from_millis(10),
+                ..Default::default()
+            },
+        });
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_tracker.clone()),
+                object_store_wrapper: Some(Arc::new(ChainedWrappingObjectStore::new(vec![
+                    throttled,
+                    io_tracker.clone(),
+                ]))),
                 ..Default::default()
             }),
             session: Some(session.clone()),
