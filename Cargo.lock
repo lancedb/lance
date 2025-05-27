@@ -2816,7 +2816,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -3787,7 +3787,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "all_asserts",
  "approx",
@@ -3873,7 +3873,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3890,7 +3890,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3929,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3960,7 +3960,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3977,7 +3977,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "arrayref",
  "arrow",
@@ -4025,7 +4025,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding-datafusion"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4058,7 +4058,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4101,7 +4101,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "approx",
  "arrow",
@@ -4169,7 +4169,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4215,7 +4215,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "approx",
  "arrow-arith",
@@ -4268,7 +4268,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4313,7 +4313,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4322,7 +4322,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
