@@ -53,7 +53,6 @@ impl Stream for StaticListStream {
         match this.rx.poll_recv(cx) {
             Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending if this.handle.is_finished() => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
     }
