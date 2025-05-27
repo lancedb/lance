@@ -14,7 +14,6 @@ use std::{any::Any, sync::Arc};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
-use lance_table::format::INIT_INDEX_VERSION;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -70,10 +69,6 @@ pub trait Index: Send + Sync + DeepSizeOf {
     /// This is a kind of slow operation.  It's better to use the fragment_bitmap.  This
     /// only exists for cases where the fragment_bitmap has become corrupted or missing.
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap>;
-
-    fn latest_version(&self) -> semver::Version {
-        INIT_INDEX_VERSION
-    }
 }
 
 /// Index Type

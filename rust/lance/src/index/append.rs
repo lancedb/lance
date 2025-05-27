@@ -128,7 +128,7 @@ pub async fn merge_indices<'a>(
             let new_store = LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string());
             index.update(new_data_stream.into(), &new_store).await?;
 
-            Ok((new_uuid, 1, index.latest_version()))
+            Ok((new_uuid, 1, index.version()))
         }
         it if it.is_vector() => {
             let start_pos = old_indices

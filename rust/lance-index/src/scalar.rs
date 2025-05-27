@@ -22,6 +22,7 @@ use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
+use lance_table::format::INIT_INDEX_VERSION;
 use snafu::location;
 
 use crate::metrics::MetricsCollector;
@@ -599,4 +600,8 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()>;
+
+    fn version(&self) -> semver::Version {
+        INIT_INDEX_VERSION
+    }
 }

@@ -18,7 +18,6 @@ use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR, TRACE
 use lance_file::reader::FileReader;
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
-use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
     FtsQueryParser, IndexInformationProvider, LabelListQueryParser, MultiQueryParser,
     SargableQueryParser, ScalarQueryParser, TextQueryParser,
@@ -41,6 +40,7 @@ use lance_index::{
     vector::VectorIndex,
     DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME,
 };
+use lance_index::{pb::index::Implementation, scalar::inverted::InvertedIndex};
 use lance_index::{ScalarIndexCriteria, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
@@ -54,8 +54,7 @@ use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::{
     build_inverted_index, detect_scalar_index_type, index_matches_criteria, inverted_index_details,
-    LANCE_VERSION,
-    TrainingRequest,
+    TrainingRequest, LANCE_VERSION,
 };
 use serde_json::json;
 use snafu::location;
@@ -312,7 +311,7 @@ impl DatasetIndexExt for Dataset {
                     })?;
 
                 build_inverted_index(self, column, &index_id.to_string(), inverted_params).await?;
-                (inverted_index_details(), INIT_INDEX_VERSION)
+                (inverted_index_details(), InvertedIndex::version())
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.
