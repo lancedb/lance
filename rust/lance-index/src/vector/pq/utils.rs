@@ -91,7 +91,7 @@ mod tests {
         assert_eq!(sub_vectors[0].len(), 10 * 8);
 
         assert_eq!(
-            sub_vectors[0],
+            sub_vectors[0].values().to_vec(),
             (0..10)
                 .flat_map(|i| (0..8).map(move |c| 32.0 * i as f32 + c as f32))
                 .collect::<Vec<_>>()
