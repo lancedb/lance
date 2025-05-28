@@ -11,7 +11,9 @@ use uuid::Uuid;
 use super::pb;
 use lance_core::{Error, Result};
 
-pub const INIT_INDEX_VERSION: semver::Version = semver::Version::new(0, 27, 0);
+/// The default index version, which is used for legacy indices that do not have a version specified.
+/// We've introduced index version since Lance 0.28.0, so this is the initial version.
+pub const INIT_INDEX_VERSION: semver::Version = semver::Version::new(0, 28, 0);
 
 /// Index metadata
 #[derive(Debug, Clone, PartialEq)]
@@ -39,10 +41,7 @@ pub struct Index {
     /// be present in newer versions.
     pub index_details: Option<prost_types::Any>,
 
-    /// The lance version which introduced this index format,
-    /// bump this when the index format changes.
-    /// This is used to determine if the index can be read by the current version of lance.
-    /// if the lance version is less than the index version, then the index cannot be read.
+    /// The minimum lance version that this index is compatible with.
     pub index_version: semver::Version,
 }
 

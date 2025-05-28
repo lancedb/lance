@@ -195,7 +195,7 @@ message IndexMetadata {
   /// bloat the manifest.
   google.protobuf.Any index_details = 6;
 
-  /// The lance version which introduced this index format.
+  /// The minimum lance version that this index is compatible with.
   optional string index_version = 7;
 }
 

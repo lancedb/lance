@@ -446,12 +446,26 @@ impl DatasetIndexExt for Dataset {
             return Ok(indices);
         }
 
-        let loaded_indices: Vec<IndexMetadata> =
-            read_manifest_indexes(&self.object_store, &self.manifest_location, &self.manifest)
-                .await?
-                .into_iter()
-                .filter(|idx| idx.index_version <= *LANCE_VERSION)
-                .collect();
+        let loaded_indices: Vec<IndexMetadata> = read_manifest_indexes(
+            &self.object_store,
+            &self.manifest_location,
+            &self.manifest,
+        )
+        .await?
+        .into_iter()
+        .filter(|idx| {
+            let is_valid = idx.index_version <= *LANCE_VERSION;
+            if !is_valid {
+                log::warn!(
+                    "Index {} has version {}, which is not supported by this Lance version {}, ignoring it",
+                    idx.name,
+                    idx.index_version,
+                    std::env!("CARGO_PKG_VERSION"),
+                );
+            }
+            is_valid
+        })
+        .collect();
         let loaded_indices = Arc::new(loaded_indices);
 
         self.session.index_cache.insert_metadata(
