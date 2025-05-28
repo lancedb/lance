@@ -333,6 +333,7 @@ impl Dataset {
         // We check the e_tag here just in case it has been overwritten. This can
         // happen if the table has been dropped then re-created recently.
         self.manifest.version == location.version
+            && self.manifest_location.naming_scheme == location.naming_scheme
             && location.e_tag.as_ref().is_some_and(|e_tag| {
                 self.manifest_location
                     .e_tag
@@ -6249,5 +6250,26 @@ mod tests {
         drop(dataset2);
         drop(dataset);
         assert_eq!(registry.active_stores().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_v2_manifest_paths() {
+        let tmp_dir = tempdir().unwrap();
+        let test_uri = tmp_dir.path().to_str().unwrap();
+
+        let data = lance_datagen::gen()
+            .col("key", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, test_uri, None).await.unwrap();
+        assert_eq!(
+            dataset.manifest_location().naming_scheme,
+            ManifestNamingScheme::V1
+        );
+
+        dataset.migrate_manifest_paths_v2().await.unwrap();
+        assert_eq!(
+            dataset.manifest_location().naming_scheme,
+            ManifestNamingScheme::V2
+        );
     }
 }
