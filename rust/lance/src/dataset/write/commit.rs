@@ -620,9 +620,9 @@ mod tests {
         // returns synchronously, and each request is 1 hop.
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
-                wait_list_per_call: Duration::from_millis(20),
-                wait_get_per_call: Duration::from_millis(20),
-                wait_put_per_call: Duration::from_millis(20),
+                wait_list_per_call: Duration::from_millis(5),
+                wait_get_per_call: Duration::from_millis(5),
+                wait_put_per_call: Duration::from_millis(5),
                 ..Default::default()
             },
         });
