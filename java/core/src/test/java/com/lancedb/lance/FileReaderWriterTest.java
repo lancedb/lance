@@ -67,8 +67,7 @@ public class FileReaderWriterTest {
 
   void createSimpleFile(String filePath) throws Exception {
     BufferAllocator allocator = new RootAllocator();
-    try (LanceFileWriter writer =
-        LanceFileWriter.open(filePath, allocator, null, Collections.emptyMap())) {
+    try (LanceFileWriter writer = LanceFileWriter.open(filePath, allocator, null)) {
       try (VectorSchemaRoot batch = createBatch(allocator)) {
         writer.write(batch);
       }
@@ -209,8 +208,7 @@ public class FileReaderWriterTest {
     String filePath = tempDir.resolve("no_data.lance").toString();
     BufferAllocator allocator = new RootAllocator();
 
-    LanceFileWriter writer =
-        LanceFileWriter.open(filePath, allocator, null, Collections.emptyMap());
+    LanceFileWriter writer = LanceFileWriter.open(filePath, allocator, null);
 
     try {
       writer.close();
