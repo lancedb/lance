@@ -49,7 +49,6 @@ async-priority-channel = "0.2.0"
 
 [dev-dependencies]
 criterion.workspace = true
-parquet.workspace = true
 tempfile.workspace = true
 test-log.workspace = true
 mockall.workspace = true

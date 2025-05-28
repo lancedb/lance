@@ -4318,7 +4318,6 @@ dependencies = [
  "log",
  "mockall",
  "object_store 0.11.2",
- "parquet",
  "path_abs",
  "pin-project",
  "pprof",
