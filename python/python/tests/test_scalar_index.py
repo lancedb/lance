@@ -997,6 +997,36 @@ def test_bitmap_remap(tmp_path: Path):
 
 def test_ngram_index(tmp_path: Path):
     """Test create ngram index"""
+
+    def test_with(tbl: pa.Table):
+        dataset = lance.write_dataset(tbl, tmp_path / "dataset", mode="overwrite")
+        dataset.create_scalar_index("words", index_type="NGRAM")
+        indices = dataset.list_indices()
+        assert len(indices) == 1
+        assert indices[0]["type"] == "NGram"
+
+        scan_plan = dataset.scanner(filter="contains(words, 'apple')").explain_plan(
+            True
+        )
+        assert "MaterializeIndex" in scan_plan
+
+        assert dataset.to_table(filter="contains(words, 'apple')").num_rows == 50
+        assert dataset.to_table(filter="contains(words, 'banana')").num_rows == 25
+        assert dataset.to_table(filter="contains(words, 'coconut')").num_rows == 25
+        assert dataset.to_table(filter="contains(words, 'apples')").num_rows == 25
+        assert (
+            dataset.to_table(
+                filter="contains(words, 'apple') AND contains(words, 'banana')"
+            ).num_rows
+            == 0
+        )
+        assert (
+            dataset.to_table(
+                filter="contains(words, 'apple') OR contains(words, 'banana')"
+            ).num_rows
+            == 75
+        )
+
     tbl = pa.Table.from_arrays(
         [
             pa.array(
@@ -1005,31 +1035,19 @@ def test_ngram_index(tmp_path: Path):
         ],
         names=["words"],
     )
-    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
-    dataset.create_scalar_index("words", index_type="NGRAM")
-    indices = dataset.list_indices()
-    assert len(indices) == 1
-    assert indices[0]["type"] == "NGram"
+    test_with(tbl)
 
-    scan_plan = dataset.scanner(filter="contains(words, 'apple')").explain_plan(True)
-    assert "MaterializeIndex" in scan_plan
-
-    assert dataset.to_table(filter="contains(words, 'apple')").num_rows == 50
-    assert dataset.to_table(filter="contains(words, 'banana')").num_rows == 25
-    assert dataset.to_table(filter="contains(words, 'coconut')").num_rows == 25
-    assert dataset.to_table(filter="contains(words, 'apples')").num_rows == 25
-    assert (
-        dataset.to_table(
-            filter="contains(words, 'apple') AND contains(words, 'banana')"
-        ).num_rows
-        == 0
+    # Test with large string
+    tbl = pa.Table.from_arrays(
+        [
+            pa.array(
+                [["apple", "apples", "banana", "coconut"][i % 4] for i in range(100)],
+                type=pa.large_string(),
+            )
+        ],
+        names=["words"],
     )
-    assert (
-        dataset.to_table(
-            filter="contains(words, 'apple') OR contains(words, 'banana')"
-        ).num_rows
-        == 75
-    )
+    test_with(tbl)
 
 
 def test_null_handling(tmp_path: Path):

@@ -1806,7 +1806,9 @@ class LanceDataset(pa.dataset.Dataset):
             if not pa.types.is_list(field_type):
                 raise TypeError(f"LABEL_LIST index column {column} must be a list")
         elif index_type == "NGRAM":
-            if not pa.types.is_string(field_type):
+            if not pa.types.is_string(field_type) and not pa.types.is_large_string(
+                field_type
+            ):
                 raise TypeError(f"NGRAM index column {column} must be a string")
         elif index_type in ["INVERTED", "FTS"]:
             value_type = field_type
