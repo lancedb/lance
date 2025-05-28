@@ -1,5 +1,4 @@
 use std::ops::Range;
-use std::ptr::read;
 use std::sync::{Arc, Mutex};
 
 use crate::{error::{Error, Result}, traits::IntoJava, JNIEnvExt, RT};
