@@ -1,10 +1,10 @@
 use std::ops::Range;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::ptr::read;
+use std::sync::{Arc, Mutex};
 
 use crate::{error::{Error, Result}, traits::IntoJava, JNIEnvExt, RT};
 use arrow::{array::RecordBatchReader, ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
-use jni::objects::JIntArray;
 use jni::{
     objects::{JObject, JString},
     sys::{jint, jlong},
@@ -15,7 +15,6 @@ use lance_core::cache::FileMetadataCache;
 use lance_core::datatypes::Schema;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::{FileReader, FileReaderOptions, ReaderProjection};
-use lance_index::scalar::IndexReader;
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
@@ -195,6 +194,7 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
         let mut reader_projection: Option<ReaderProjection> = None;
         // We get reader here not from env.get_rust_field, because we need reader: MutexGuard<BlockingFileReader> has no relationship with the env lifecycle.
         // If we get reader from env.get_rust_field, we can't use env (can't borrow again) until we drop the reader.
+        #[allow(unused_variables)]
         let reader = unsafe {
             let reader_ref = reader.as_ref();
             let ptr = env.get_field(reader_ref, NATIVE_READER, "J")?.j()? as *mut Mutex<BlockingFileReader>;
@@ -214,27 +214,49 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
         }
 
         if !selection_ranges.is_null() {
-            let jarry: JIntArray = selection_ranges.into();
-            let array_length = env.get_array_length(&jarry)?;
-            if (array_length > 0) {
-                let mut ranges: Vec<Range<u64>> = Vec::with_capacity((array_length / 2) as usize);
-                let mut rust_buffer: Vec<i32> = vec![0; array_length as usize];
-                env.get_int_array_region(&jarry, 0, &mut rust_buffer)?;
-                for i in (0..array_length as usize).step_by(2) {
-                    let start_i32 = rust_buffer[i];
-                    let end_i32 = rust_buffer[i + 1];
-                    if start_i32 < 0 || end_i32 < 0 {
-                        return Err(Error::input_error("Range values must be non-negative".to_string()))
-                    }
-                    if start_i32 > end_i32 {
-                        return Err(Error::input_error("Range start must be less than or equal to end".to_string()))
-                    }
-                    let start: u64 = start_i32 as u64;
-                    let end: u64 = end_i32 as u64;
-                    ranges.push(Range { start, end });
+            let mut ranges: Vec<Range<u64>> = Vec::new();
+            let jlist = env.get_list(&selection_ranges)?;
+            let mut j_list_iter = jlist.iter(&mut env)?;
+
+            loop {
+                let item = j_list_iter.next(&mut env)?;
+                if item.is_none() {
+                    break; // End of the list
                 }
-                read_parameter = ReadBatchParams::Ranges(ranges.into_boxed_slice().into());
+
+                let item_obj = item.unwrap();
+                if item_obj.is_null() {
+                    continue;
+                }
+
+                let start_val = match env.call_method(&item_obj, "getStart", "()I", &[]).and_then(|v| v.i()) {
+                    Ok(val) => val,
+                    Err(e) => {
+                        return Err(e.into());
+                    }
+                };
+                let end_val = match env.call_method(&item_obj, "getEnd", "()I", &[]).and_then(|v| v.i()) {
+                    Ok(val) => val,
+                    Err(e) => {
+                        return Err(e.into());
+                    }
+                };
+
+                if start_val < 0 || end_val < 0 {
+                    return Err(Error::input_error(format!("Invalid range values (negative): start={}, end={}", start_val, end_val)));
+                }
+                if start_val > end_val {
+                    return Err(Error::input_error(format!("Invalid range (start > end): start={}, end={}", start_val, end_val)));
+                }
+
+                ranges.push(Range {
+                    start: start_val as u64,
+                    end: end_val as u64,
+                });
+
+                env.delete_local_ref(item_obj)?;
             }
+            read_parameter = ReadBatchParams::Ranges(ranges.into_boxed_slice().into());
         }
         inner_read_all(&reader, batch_size, read_parameter, reader_projection, FilterExpression::no_filter(), stream_addr)
     })();

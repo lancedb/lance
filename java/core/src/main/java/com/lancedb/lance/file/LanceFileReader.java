@@ -14,6 +14,7 @@
 package com.lancedb.lance.file;
 
 import com.lancedb.lance.JniLoader;
+import com.lancedb.lance.util.Range;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
@@ -49,7 +50,7 @@ public class LanceFileReader implements AutoCloseable {
   private native void readAllNative(
       int batchSize,
       @Nullable List<String> projectedNames,
-      @Nullable int[] ranges,
+      @Nullable List<Range> ranges,
       long streamMemoryAddress)
       throws IOException;
 
@@ -75,7 +76,7 @@ public class LanceFileReader implements AutoCloseable {
    * <p>This method must be called to release resources when the reader is no longer needed.
    */
   @Override
-  public void close() throws IOException {
+  public void close() throws Exception {
     closeNative(nativeFileReaderHandle);
   }
 
@@ -110,17 +111,12 @@ public class LanceFileReader implements AutoCloseable {
    *
    * @param batchSize the maximum number of rows to read in a single batch
    * @param projectedNames optional list of column names to project; if null, all columns are read
-   * @param ranges optional array of ranges to read; if null, all rows are read. The array must be
-   *     even, with pattern [start1, end1, start2, end2, ...], where each pair defines a range of
-   *     row indices to read. The starts are inclusive and ends are exclusive.
+   * @param ranges optional array of ranges to read; if null, all rows are read.
    * @return an ArrowReader for the Lance file
    */
   public ArrowReader readAll(
-      @Nullable List<String> projectedNames, @Nullable int[] ranges, int batchSize)
+      @Nullable List<String> projectedNames, @Nullable List<Range> ranges, int batchSize)
       throws IOException {
-    if (ranges != null && ranges.length % 2 != 0) {
-      throw new IllegalArgumentException("Ranges must be an even-length array.");
-    }
     try (ArrowArrayStream ffiArrowArrayStream = ArrowArrayStream.allocateNew(allocator)) {
       readAllNative(batchSize, projectedNames, ranges, ffiArrowArrayStream.memoryAddress());
       return Data.importArrayStream(allocator, ffiArrowArrayStream);

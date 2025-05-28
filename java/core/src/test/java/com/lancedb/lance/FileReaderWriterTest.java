@@ -15,6 +15,7 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.file.LanceFileReader;
 import com.lancedb.lance.file.LanceFileWriter;
+import com.lancedb.lance.util.Range;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -66,7 +67,8 @@ public class FileReaderWriterTest {
 
   void createSimpleFile(String filePath) throws Exception {
     BufferAllocator allocator = new RootAllocator();
-    try (LanceFileWriter writer = LanceFileWriter.open(filePath, allocator, null)) {
+    try (LanceFileWriter writer =
+        LanceFileWriter.open(filePath, allocator, null, Collections.emptyMap())) {
       try (VectorSchemaRoot batch = createBatch(allocator)) {
         writer.write(batch);
       }
@@ -159,7 +161,9 @@ public class FileReaderWriterTest {
       assertFalse(batches.loadNextBatch());
     }
 
-    try (ArrowReader batches = reader.readAll(null, new int[] {1, 11, 14, 19, 20, 21}, 100)) {
+    try (ArrowReader batches =
+        reader.readAll(
+            null, Arrays.asList(Range.of(1, 11), Range.of(14, 19), Range.of(20, 21)), 100)) {
       assertTrue(batches.loadNextBatch());
       VectorSchemaRoot batch = batches.getVectorSchemaRoot();
       assertEquals(16, batch.getRowCount());
@@ -168,7 +172,10 @@ public class FileReaderWriterTest {
     }
 
     try (ArrowReader batches =
-        reader.readAll(Collections.singletonList("x"), new int[] {23, 25, 27, 29}, 100)) {
+        reader.readAll(
+            Collections.singletonList("x"),
+            Arrays.asList(Range.of(23, 25), Range.of(27, 29)),
+            100)) {
       assertTrue(batches.loadNextBatch());
       VectorSchemaRoot batch = batches.getVectorSchemaRoot();
       assertEquals(4, batch.getRowCount());
@@ -177,7 +184,10 @@ public class FileReaderWriterTest {
     }
 
     try (ArrowReader batches =
-        reader.readAll(Collections.singletonList("y"), new int[] {23, 25, 27, 29}, 100)) {
+        reader.readAll(
+            Collections.singletonList("y"),
+            Arrays.asList(Range.of(23, 25), Range.of(27, 29)),
+            100)) {
       assertTrue(batches.loadNextBatch());
       VectorSchemaRoot batch = batches.getVectorSchemaRoot();
       assertEquals(4, batch.getRowCount());
@@ -199,7 +209,8 @@ public class FileReaderWriterTest {
     String filePath = tempDir.resolve("no_data.lance").toString();
     BufferAllocator allocator = new RootAllocator();
 
-    LanceFileWriter writer = LanceFileWriter.open(filePath, allocator, null);
+    LanceFileWriter writer =
+        LanceFileWriter.open(filePath, allocator, null, Collections.emptyMap());
 
     try {
       writer.close();
