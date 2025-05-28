@@ -402,8 +402,7 @@ impl Planner {
 
     fn parse_function(&self, function: SQLExpr) -> Result<Expr> {
         if let SQLExpr::Function(function) = &function {
-            if !function.name.0.is_empty() {
-                let ObjectNamePart::Identifier(name) = &function.name.0[0];
+            if let Some(ObjectNamePart::Identifier(name)) = &function.name.0.first() {
                 if &name.value == "is_valid" {
                     return self.legacy_parse_function(function);
                 }

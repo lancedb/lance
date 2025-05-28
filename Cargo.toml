@@ -114,6 +114,7 @@ datafusion-execution = "47.0"
 datafusion-optimizer = "47.0"
 datafusion-physical-expr = { version = "47.0" }
 datafusion-physical-plan = { version = "47.0" }
+datafusion-substrait = { version = "47.0" }
 deepsize = "0.2.0"
 dirs = "5.0.0"
 either = "1.0"
@@ -133,7 +134,7 @@ moka = { version = "0.12", features = ["future", "sync"] }
 num-traits = "0.2"
 # Set min to prevent use of versions with CVE-2024-41178
 object_store = { version = "0.11.0" }
-parquet = "54.1"
+parquet = "55.1"
 pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.14.0", features = ["flamegraph", "criterion"] }
