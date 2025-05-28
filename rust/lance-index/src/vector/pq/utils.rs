@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{cast::AsArray, types::ArrowPrimitiveType, Array, FixedSizeListArray};
+use arrow_array::{
+    cast::AsArray, types::ArrowPrimitiveType, Array, FixedSizeListArray, PrimitiveArray,
+};
 use lance_core::{Error, Result};
 use snafu::location;
 
@@ -12,7 +14,10 @@ use snafu::location;
 pub(super) fn divide_to_subvectors<T: ArrowPrimitiveType>(
     fsl: &FixedSizeListArray,
     m: usize,
-) -> Result<Vec<Vec<T::Native>>> {
+) -> Result<Vec<PrimitiveArray<T>>>
+where
+    PrimitiveArray<T>: From<Vec<T::Native>>,
+{
     let dim = fsl.value_length() as usize;
     if dim % m != 0 {
         return Err(Error::invalid_input(
@@ -40,7 +45,7 @@ pub(super) fn divide_to_subvectors<T: ArrowPrimitiveType>(
                     .extend_from_slice(&vec[i * sub_vector_length..(i + 1) * sub_vector_length]);
             }
         });
-    Ok(subarrays)
+    Ok(subarrays.into_iter().map(Into::into).collect())
 }
 
 /// Number of PQ centroids, for the corresponding number of PQ bits.
