@@ -229,18 +229,8 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
                     continue;
                 }
 
-                let start_val = match env.call_method(&item_obj, "getStart", "()I", &[]).and_then(|v| v.i()) {
-                    Ok(val) => val,
-                    Err(e) => {
-                        return Err(e.into());
-                    }
-                };
-                let end_val = match env.call_method(&item_obj, "getEnd", "()I", &[]).and_then(|v| v.i()) {
-                    Ok(val) => val,
-                    Err(e) => {
-                        return Err(e.into());
-                    }
-                };
+                let start_val = env.call_method(&item_obj, "getStart", "()I", &[]).and_then(|v| v.i())?;
+                let end_val = env.call_method(&item_obj, "getEnd", "()I", &[]).and_then(|v| v.i())?;
 
                 if start_val < 0 || end_val < 0 {
                     return Err(Error::input_error(format!("Invalid range values (negative): start={}, end={}", start_val, end_val)));
