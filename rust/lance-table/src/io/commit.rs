@@ -1165,7 +1165,8 @@ mod tests {
             (Box::new(ObjectStore::memory()), Path::from("base"))
         } else {
             tempdir = Some(tempfile::tempdir().unwrap());
-            let base = Path::from(tempdir.as_ref().unwrap().path().to_str().unwrap());
+            let base = Path::from_absolute_path(tempdir.as_ref().unwrap().path().to_str().unwrap())
+                .unwrap();
             let store = Box::new(ObjectStore::local());
             assert!(!store.list_is_lexically_ordered);
             (store, base)
