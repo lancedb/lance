@@ -597,7 +597,7 @@ impl DatasetIndexExt for Dataset {
                 index_version: res.new_index_version,
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
-            if deltas.len() > res.removed_indices.len() {
+            if deltas.len() > removed_indices.len() {
                 new_indices.extend(
                     deltas[0..(deltas.len() - res.removed_indices.len())]
                         .iter()
