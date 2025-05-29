@@ -14,10 +14,13 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::parse::str_is_truthy;
-use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS};
+use lance_core::utils::tracing::{
+    IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS,
+};
 use lance_file::reader::FileReader;
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
+use lance_index::frag_reuse::{FragReuseIndex, FRAG_REUSE_INDEX_NAME};
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
     FtsQueryParser, IndexInformationProvider, LabelListQueryParser, MultiQueryParser,
@@ -65,6 +68,7 @@ use vector::utils::get_vector_type;
 
 pub(crate) mod append;
 pub(crate) mod cache;
+pub mod frag_reuse;
 pub mod prefilter;
 pub mod scalar;
 pub mod vector;
@@ -360,6 +364,13 @@ impl DatasetIndexExt for Dataset {
                     .await?;
                 vector_index_details()
             }
+            (IndexType::FragmentReuse, _) => {
+                return Err(Error::Index {
+                    message: "Fragment reuse index can only be created through compaction"
+                        .to_string(),
+                    location: location!(),
+                })
+            }
             (index_type, index_name) => {
                 return Err(Error::Index {
                     message: format!(
@@ -555,6 +566,7 @@ impl DatasetIndexExt for Dataset {
                 indices_to_optimize
                     .as_ref()
                     .is_none_or(|names| names.contains(&idx.name))
+                    && idx.name != FRAG_REUSE_INDEX_NAME
             })
             .map(|idx| (idx.name.clone(), idx))
             .into_group_map();
@@ -803,6 +815,14 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>>;
+
+    /// Opens the fragment reuse index
+    async fn open_frag_reuse_index(
+        &self,
+        uuid: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<FragReuseIndex>>;
+
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
 
@@ -826,6 +846,9 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(index.as_index());
         }
         if let Some(index) = self.session.index_cache.get_vector(uuid) {
+            return Ok(index.as_index());
+        }
+        if let Some(index) = self.session.index_cache.get_frag_reuse(uuid) {
             return Ok(index.as_index());
         }
 
@@ -1040,6 +1063,34 @@ impl DatasetIndexInternalExt for Dataset {
         let index = index?;
         metrics.record_index_load();
         self.session.index_cache.insert_vector(uuid, index.clone());
+        Ok(index)
+    }
+
+    async fn open_frag_reuse_index(
+        &self,
+        uuid: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<FragReuseIndex>> {
+        if let Some(index) = self.session.index_cache.get_frag_reuse(uuid) {
+            log::debug!("Found vector index in cache uuid: {}", uuid);
+            return Ok(index);
+        }
+
+        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
+        let index_details = frag_reuse::load_frag_reuse_index_details(self, &index_meta).await?;
+        let index =
+            frag_reuse::open_frag_reuse_index(index_details.as_ref(), self.fragments().as_slice())
+                .await?;
+
+        info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_FRAG_REUSE);
+        metrics.record_index_load();
+
+        self.session
+            .index_cache
+            .insert_frag_reuse(uuid, index.clone());
         Ok(index)
     }
 
