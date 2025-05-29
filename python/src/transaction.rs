@@ -118,6 +118,8 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let op = Operation::Rewrite {
                     groups,
                     rewritten_indices,
+                    // TODO: pass frag_reuse_index when available
+                    frag_reuse_index: None,
                 };
                 Ok(Self(op))
             }
