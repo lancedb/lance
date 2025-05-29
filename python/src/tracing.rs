@@ -95,8 +95,9 @@ impl tracing_subscriber::Layer<Registry> for LoggingPassthroughRef {
         event.record(&mut fields);
         log::log!(target: "lance::events", state.level, "target=\"{}\" {}", event.metadata().target(), fields.str);
 
-        let inner = state.inner.as_ref().unwrap();
-        inner.on_event(event, ctx);
+        if let Some(inner) = state.inner.as_ref() {
+            inner.on_event(event, ctx);
+        }
     }
 
     fn on_exit(&self, id: &span::Id, ctx: Context<'_, Registry>) {

@@ -90,7 +90,6 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_index::DatasetIndexExt;
-use lance_table::io::deletion::read_deletion_file;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 
@@ -108,6 +107,7 @@ use super::{write_fragments_internal, WriteMode, WriteParams};
 
 mod remapping;
 
+use crate::io::deletion::read_dataset_deletion_file;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Options to be passed to [compact_files].
@@ -605,6 +605,7 @@ async fn reserve_fragment_ids(
         &Default::default(),
         &Default::default(),
         dataset.manifest_location.naming_scheme,
+        None,
     )
     .await?;
 
@@ -788,10 +789,11 @@ async fn rechunk_stable_row_ids(
     futures::stream::iter(old_sequences.iter_mut().zip(old_fragments.iter()))
         .map(Ok)
         .try_for_each(|((_, seq), frag)| async move {
-            let deletions = read_deletion_file(&dataset.base, frag, dataset.object_store()).await?;
-            if let Some(deletions) = deletions {
+            if let Some(deletion_file) = &frag.deletion_file {
+                let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
+
                 let mut new_seq = seq.as_ref().clone();
-                new_seq.mask(deletions.into_iter())?;
+                new_seq.mask(deletions.to_sorted_iter())?;
                 *seq = Arc::new(new_seq);
             }
             Ok::<(), crate::Error>(())

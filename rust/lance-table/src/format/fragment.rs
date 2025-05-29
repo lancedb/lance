@@ -322,6 +322,32 @@ impl Fragment {
         }
     }
 
+    pub fn with_file(
+        mut self,
+        path: impl Into<String>,
+        field_ids: Vec<i32>,
+        column_indices: Vec<i32>,
+        version: &LanceFileVersion,
+        file_size_bytes: Option<NonZero<u64>>,
+    ) -> Self {
+        let (major, minor) = version.to_numbers();
+        let data_file = DataFile::new(
+            path,
+            field_ids,
+            column_indices,
+            major,
+            minor,
+            file_size_bytes,
+        );
+        self.files.push(data_file);
+        self
+    }
+
+    pub fn with_physical_rows(mut self, physical_rows: usize) -> Self {
+        self.physical_rows = Some(physical_rows);
+        self
+    }
+
     pub fn add_file(
         &mut self,
         path: impl Into<String>,

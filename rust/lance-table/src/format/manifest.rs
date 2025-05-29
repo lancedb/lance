@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::prelude::*;
+use deepsize::DeepSizeOf;
 use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
 use lance_file::reader::FileReader;
 use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
@@ -31,7 +32,7 @@ use snafu::location;
 ///  * Version
 ///  * Fragments.
 ///  * Indices.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
@@ -339,13 +340,13 @@ impl Manifest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct WriterVersion {
     pub library: String,
     pub version: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DataStorageFormat {
     pub file_format: String,
     pub version: String,

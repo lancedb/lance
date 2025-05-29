@@ -29,10 +29,10 @@ use lance_datafusion::chunker::break_stream;
 use lance_index::{
     metrics::MetricsCollector,
     scalar::{
-        expression::{IndexExprResult, ScalarIndexExpr, ScalarIndexLoader},
+        expression::{IndexExprResult, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
         SargableQuery, ScalarIndex,
     },
-    DatasetIndexExt,
+    DatasetIndexExt, ScalarIndexCriteria,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -55,17 +55,18 @@ lazy_static::lazy_static! {
 impl ScalarIndexLoader for Dataset {
     async fn load_index(
         &self,
-        name: &str,
+        column: &str,
+        index_name: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let idx = self
-            .load_scalar_index_for_column(name)
+            .load_scalar_index(ScalarIndexCriteria::default().with_name(index_name))
             .await?
             .ok_or_else(|| Error::Internal {
-                message: format!("Scanner created plan for index query on {} but no index on dataset for that column", name),
+                message: format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column),
                 location: location!()
             })?;
-        self.open_scalar_index(name, &idx.uuid.to_string(), metrics)
+        self.open_scalar_index(index_name, &idx.uuid.to_string(), metrics)
             .await
     }
 }
@@ -204,6 +205,7 @@ lazy_static::lazy_static! {
 pub struct MapIndexExec {
     dataset: Arc<Dataset>,
     column_name: String,
+    index_name: String,
     input: Arc<dyn ExecutionPlan>,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -220,7 +222,12 @@ impl DisplayAs for MapIndexExec {
 }
 
 impl MapIndexExec {
-    pub fn new(dataset: Arc<Dataset>, column_name: String, input: Arc<dyn ExecutionPlan>) -> Self {
+    pub fn new(
+        dataset: Arc<Dataset>,
+        column_name: String,
+        index_name: String,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(INDEX_LOOKUP_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -230,6 +237,7 @@ impl MapIndexExec {
         Self {
             dataset,
             column_name,
+            index_name,
             input,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -238,6 +246,7 @@ impl MapIndexExec {
 
     async fn map_batch(
         column_name: String,
+        index_name: String,
         dataset: Arc<Dataset>,
         deletion_mask: Option<Arc<RowIdMask>>,
         batch: RecordBatch,
@@ -247,10 +256,11 @@ impl MapIndexExec {
         let index_vals = (0..index_vals.len())
             .map(|idx| ScalarValue::try_from_array(index_vals, idx))
             .collect::<datafusion::error::Result<Vec<_>>>()?;
-        let query = ScalarIndexExpr::Query(
-            column_name.clone(),
-            Arc::new(SargableQuery::IsIn(index_vals)),
-        );
+        let query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: column_name,
+            index_name,
+            query: Arc::new(SargableQuery::IsIn(index_vals)),
+        });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
         let IndexExprResult::Exact(mut row_id_mask) = query_result else {
             todo!("Support for non-exact query results as input for merge_insert")
@@ -289,12 +299,13 @@ impl MapIndexExec {
         input: datafusion::physical_plan::SendableRecordBatchStream,
         dataset: Arc<Dataset>,
         column_name: String,
+        index_name: String,
         metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<
         impl Stream<Item = datafusion::error::Result<RecordBatch>> + Send + 'static,
     > {
         let index = dataset
-            .load_scalar_index_for_column(&column_name)
+            .load_scalar_index(ScalarIndexCriteria::default().with_name(&index_name))
             .await?
             .unwrap();
         let deletion_mask_fut =
@@ -306,10 +317,18 @@ impl MapIndexExec {
         };
         Ok(input.and_then(move |res| {
             let column_name = column_name.clone();
+            let index_name = index_name.clone();
             let dataset = dataset.clone();
             let deletion_mask = deletion_mask.clone();
             let metrics = metrics.clone();
-            Self::map_batch(column_name, dataset, deletion_mask, res, metrics)
+            Self::map_batch(
+                column_name,
+                index_name,
+                dataset,
+                deletion_mask,
+                res,
+                metrics,
+            )
         }))
     }
 }
@@ -343,6 +362,7 @@ impl ExecutionPlan for MapIndexExec {
             Ok(Arc::new(Self::new(
                 self.dataset.clone(),
                 self.column_name.clone(),
+                self.index_name.clone(),
                 children.into_iter().next().unwrap(),
             )))
         }
@@ -359,6 +379,7 @@ impl ExecutionPlan for MapIndexExec {
             index_vals,
             self.dataset.clone(),
             self.column_name.clone(),
+            self.index_name.clone(),
             metrics,
         );
         let stream = futures::stream::iter(vec![stream_fut])
@@ -701,7 +722,10 @@ mod tests {
     use futures::TryStreamExt;
     use lance_datagen::gen;
     use lance_index::{
-        scalar::{expression::ScalarIndexExpr, SargableQuery, ScalarIndexParams},
+        scalar::{
+            expression::{ScalarIndexExpr, ScalarIndexSearch},
+            SargableQuery, ScalarIndexParams,
+        },
         DatasetIndexExt, IndexType,
     };
     use tempfile::{tempdir, TempDir};
@@ -757,13 +781,14 @@ mod tests {
             _tmp_dir_guard,
         } = test_fixture().await;
 
-        let query = ScalarIndexExpr::Query(
-            "ordered".to_string(),
-            Arc::new(SargableQuery::Range(
+        let query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "ordered".to_string(),
+            index_name: "ordered_idx".to_string(),
+            query: Arc::new(SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
-        );
+        });
 
         let fragments = dataset.fragments().clone();
 
@@ -793,20 +818,26 @@ mod tests {
         let fixture = NoContextTestFixture::new();
         let arc_dasaset = Arc::new(fixture.dataset);
 
-        let query = ScalarIndexExpr::Query(
-            "ordered".to_string(),
-            Arc::new(SargableQuery::Range(
+        let query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "ordered".to_string(),
+            index_name: "ordered_idx".to_string(),
+            query: Arc::new(SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
-        );
+        });
 
         // These plans aren't even valid but it appears we defer all work (even validation) until
         // read time.
         let plan = ScalarIndexExec::new(arc_dasaset.clone(), query.clone());
         plan.execute(0, Arc::new(TaskContext::default())).unwrap();
 
-        let plan = MapIndexExec::new(arc_dasaset.clone(), "ordered".to_string(), Arc::new(plan));
+        let plan = MapIndexExec::new(
+            arc_dasaset.clone(),
+            "ordered".to_string(),
+            "ordered_idx".to_string(),
+            Arc::new(plan),
+        );
         plan.execute(0, Arc::new(TaskContext::default())).unwrap();
 
         let plan =

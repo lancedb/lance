@@ -12,7 +12,7 @@ use super::pb;
 use lance_core::{Error, Result};
 
 /// Index metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Index {
     /// Unique ID across all dataset versions.
     pub uuid: Uuid,

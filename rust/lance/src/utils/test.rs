@@ -3,6 +3,7 @@
 
 use std::fmt::{Display, Formatter};
 use std::ops::Range;
+use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
@@ -277,6 +278,8 @@ pub struct IoStats {
     pub read_bytes: u64,
     pub write_iops: u64,
     pub write_bytes: u64,
+    /// Number of disjoint periods where at least one IO is in-flight.
+    pub num_hops: u64,
 }
 
 impl Display for IoStats {
@@ -289,6 +292,7 @@ impl Display for IoStats {
 pub struct IoTrackingStore {
     target: Arc<dyn ObjectStore>,
     stats: Arc<Mutex<IoStats>>,
+    active_requests: Arc<AtomicU16>,
 }
 
 impl Display for IoTrackingStore {
@@ -311,6 +315,7 @@ impl WrappingObjectStore for StatsHolder {
         Arc::new(IoTrackingStore {
             target,
             stats: self.0.clone(),
+            active_requests: Arc::new(AtomicU16::new(0)),
         })
     }
 }
@@ -332,12 +337,17 @@ impl IoTrackingStore {
         stats.write_iops += 1;
         stats.write_bytes += num_bytes;
     }
+
+    fn hop_guard(&self) -> HopGuard {
+        HopGuard::new(self.active_requests.clone(), self.stats.clone())
+    }
 }
 
 #[async_trait::async_trait]
 #[deny(clippy::missing_trait_methods)]
 impl ObjectStore for IoTrackingStore {
     async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
+        let _guard = self.hop_guard();
         self.record_write(bytes.content_length() as u64);
         self.target.put(location, bytes).await
     }
@@ -348,15 +358,18 @@ impl ObjectStore for IoTrackingStore {
         bytes: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
+        let _guard = self.hop_guard();
         self.record_write(bytes.content_length() as u64);
         self.target.put_opts(location, bytes, opts).await
     }
 
     async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
+        let _guard = self.hop_guard();
         let target = self.target.put_multipart(location).await?;
         Ok(Box::new(IoTrackingMultipartUpload {
             target,
             stats: self.stats.clone(),
+            _guard,
         }))
     }
 
@@ -365,14 +378,17 @@ impl ObjectStore for IoTrackingStore {
         location: &Path,
         opts: PutMultipartOpts,
     ) -> OSResult<Box<dyn MultipartUpload>> {
+        let _guard = self.hop_guard();
         let target = self.target.put_multipart_opts(location, opts).await?;
         Ok(Box::new(IoTrackingMultipartUpload {
             target,
             stats: self.stats.clone(),
+            _guard,
         }))
     }
 
     async fn get(&self, location: &Path) -> OSResult<GetResult> {
+        let _guard = self.hop_guard();
         let result = self.target.get(location).await;
         if let Ok(result) = &result {
             let num_bytes = result.range.end - result.range.start;
@@ -382,6 +398,7 @@ impl ObjectStore for IoTrackingStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        let _guard = self.hop_guard();
         let result = self.target.get_opts(location, options).await;
         if let Ok(result) = &result {
             let num_bytes = result.range.end - result.range.start;
@@ -391,6 +408,7 @@ impl ObjectStore for IoTrackingStore {
     }
 
     async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
+        let _guard = self.hop_guard();
         let result = self.target.get_range(location, range).await;
         if let Ok(result) = &result {
             self.record_read(result.len() as u64);
@@ -399,6 +417,7 @@ impl ObjectStore for IoTrackingStore {
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
+        let _guard = self.hop_guard();
         let result = self.target.get_ranges(location, ranges).await;
         if let Ok(result) = &result {
             self.record_read(result.iter().map(|b| b.len() as u64).sum());
@@ -407,11 +426,13 @@ impl ObjectStore for IoTrackingStore {
     }
 
     async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
+        let _guard = self.hop_guard();
         self.record_read(0);
         self.target.head(location).await
     }
 
     async fn delete(&self, location: &Path) -> OSResult<()> {
+        let _guard = self.hop_guard();
         self.record_write(0);
         self.target.delete(location).await
     }
@@ -424,6 +445,7 @@ impl ObjectStore for IoTrackingStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
+        let _guard = self.hop_guard();
         self.record_read(0);
         self.target.list(prefix)
     }
@@ -438,26 +460,31 @@ impl ObjectStore for IoTrackingStore {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        let _guard = self.hop_guard();
         self.record_read(0);
         self.target.list_with_delimiter(prefix).await
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+        let _guard = self.hop_guard();
         self.record_write(0);
         self.target.copy(from, to).await
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+        let _guard = self.hop_guard();
         self.record_write(0);
         self.target.rename(from, to).await
     }
 
     async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+        let _guard = self.hop_guard();
         self.record_write(0);
         self.target.rename_if_not_exists(from, to).await
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+        let _guard = self.hop_guard();
         self.record_write(0);
         self.target.copy_if_not_exists(from, to).await
     }
@@ -467,6 +494,7 @@ impl ObjectStore for IoTrackingStore {
 struct IoTrackingMultipartUpload {
     target: Box<dyn MultipartUpload>,
     stats: Arc<Mutex<IoStats>>,
+    _guard: HopGuard,
 }
 
 #[async_trait::async_trait]
@@ -486,6 +514,35 @@ impl MultipartUpload for IoTrackingMultipartUpload {
             stats.write_bytes += payload.content_length() as u64;
         }
         self.target.put_part(payload)
+    }
+}
+
+#[derive(Debug)]
+struct HopGuard {
+    active_requests: Arc<AtomicU16>,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+impl HopGuard {
+    fn new(active_requests: Arc<AtomicU16>, stats: Arc<Mutex<IoStats>>) -> Self {
+        active_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            active_requests,
+            stats,
+        }
+    }
+}
+
+impl Drop for HopGuard {
+    fn drop(&mut self) {
+        if self
+            .active_requests
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            let mut stats = self.stats.lock().unwrap();
+            stats.num_hops += 1;
+        }
     }
 }
 
@@ -513,6 +570,18 @@ pub trait DatagenExt {
         frag_count: FragmentCount,
         rows_per_fragment: FragmentRowCount,
     ) -> crate::Result<Dataset>;
+
+    async fn into_ram_dataset(
+        self,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+    ) -> crate::Result<Dataset>
+    where
+        Self: Sized,
+    {
+        self.into_dataset("memory://", frag_count, rows_per_fragment)
+            .await
+    }
 }
 
 #[async_trait::async_trait]

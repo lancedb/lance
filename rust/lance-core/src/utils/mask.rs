@@ -455,6 +455,14 @@ impl RowIdTreeMap {
         self.inner.insert(fragment_id, RowIdSelection::Full);
     }
 
+    pub fn get_fragment_bitmap(&self, fragment_id: u32) -> Option<&RoaringBitmap> {
+        match self.inner.get(&fragment_id) {
+            None => None,
+            Some(RowIdSelection::Full) => None,
+            Some(RowIdSelection::Partial(set)) => Some(set),
+        }
+    }
+
     /// Returns whether the set contains the given value
     pub fn contains(&self, value: u64) -> bool {
         let upper = (value >> 32) as u32;

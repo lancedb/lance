@@ -78,7 +78,6 @@ use lance_linalg::{
 };
 use log::{info, warn};
 use object_store::path::Path;
-use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
@@ -1723,7 +1722,7 @@ async fn write_ivf_hnsw_file(
 
 async fn do_train_ivf_model<T: ArrowPrimitiveType>(
     centroids: Option<Arc<FixedSizeListArray>>,
-    data: &[T::Native],
+    data: &PrimitiveArray<T>,
     dimension: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
@@ -1732,7 +1731,6 @@ where
     <T as ArrowPrimitiveType>::Native: Dot + L2 + Normalize,
     PrimitiveArray<T>: From<Vec<T::Native>>,
 {
-    let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
     let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
         centroids,
@@ -1741,7 +1739,6 @@ where
         params.num_partitions,
         params.max_iters as u32,
         REDOS,
-        rng,
         metric_type,
         params.sample_rate,
     )?;
@@ -1768,7 +1765,7 @@ async fn train_ivf_model(
         (DataType::Float16, _) => {
             do_train_ivf_model::<Float16Type>(
                 centroids,
-                values.as_primitive::<Float16Type>().values(),
+                values.as_primitive::<Float16Type>(),
                 dim,
                 distance_type,
                 params,
@@ -1778,7 +1775,7 @@ async fn train_ivf_model(
         (DataType::Float32, _) => {
             do_train_ivf_model::<Float32Type>(
                 centroids,
-                values.as_primitive::<Float32Type>().values(),
+                values.as_primitive::<Float32Type>(),
                 dim,
                 distance_type,
                 params,
@@ -1788,7 +1785,7 @@ async fn train_ivf_model(
         (DataType::Float64, _) => {
             do_train_ivf_model::<Float64Type>(
                 centroids,
-                values.as_primitive::<Float64Type>().values(),
+                values.as_primitive::<Float64Type>(),
                 dim,
                 distance_type,
                 params,
@@ -1802,8 +1799,7 @@ async fn train_ivf_model(
                 centroids,
                 data.convert_to_floating_point()?
                     .values()
-                    .as_primitive::<Float32Type>()
-                    .values(),
+                    .as_primitive::<Float32Type>(),
                 dim,
                 distance_type,
                 params,
@@ -1813,7 +1809,7 @@ async fn train_ivf_model(
         (DataType::UInt8, DistanceType::Hamming) => {
             do_train_ivf_model::<UInt8Type>(
                 centroids,
-                values.as_primitive::<UInt8Type>().values(),
+                values.as_primitive::<UInt8Type>(),
                 dim,
                 distance_type,
                 params,

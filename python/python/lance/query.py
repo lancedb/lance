@@ -14,11 +14,17 @@ class FullTextQueryType(Enum):
     MATCH_PHRASE = "match_phrase"
     BOOST = "boost"
     MULTI_MATCH = "multi_match"
+    BOOLEAN = "boolean"
 
 
 class FullTextOperator(Enum):
     AND = "AND"
     OR = "OR"
+
+
+class Occur(Enum):
+    MUST = "MUST"
+    SHOULD = "SHOULD"
 
 
 class FullTextQuery(abc.ABC):
@@ -46,6 +52,38 @@ class FullTextQuery(abc.ABC):
         str
             The type of the query.
         """
+
+    def __and__(self, other: "FullTextQuery") -> "FullTextQuery":
+        """
+        Combine two queries with a logical AND operation.
+
+        Parameters
+        ----------
+        other : FullTextQuery
+            The other query to combine with.
+
+        Returns
+        -------
+        FullTextQuery
+            A new query that combines both queries with AND.
+        """
+        return BooleanQuery([(Occur.MUST, self), (Occur.MUST, other)])
+
+    def __or__(self, other: "FullTextQuery") -> "FullTextQuery":
+        """
+        Combine two queries with a logical OR operation.
+
+        Parameters
+        ----------
+        other : FullTextQuery
+            The other query to combine with.
+
+        Returns
+        -------
+        FullTextQuery
+            A new query that combines both queries with OR.
+        """
+        return BooleanQuery([(Occur.SHOULD, self), (Occur.SHOULD, other)])
 
 
 class MatchQuery(FullTextQuery):
@@ -96,7 +134,7 @@ class MatchQuery(FullTextQuery):
 
 
 class PhraseQuery(FullTextQuery):
-    def __init__(self, query: str, column: str):
+    def __init__(self, query: str, column: str, *, slop: int = 0):
         """
         Phrase query for full-text search.
 
@@ -107,7 +145,7 @@ class PhraseQuery(FullTextQuery):
         column : str
             The name of the column to match against.
         """
-        self._inner = PyFullTextQuery.phrase_query(query, column)
+        self._inner = PyFullTextQuery.phrase_query(query, column, slop)
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MATCH_PHRASE
@@ -157,10 +195,8 @@ class MultiMatchQuery(FullTextQuery):
         ----------
         query : str | list[Query]
             If a string, the query string to match against.
-
         columns : list[str]
             The list of columns to match against.
-
         boosts : list[float], optional
             The list of boost factors for each column. If not provided,
             all columns will have the same boost factor.
@@ -178,3 +214,21 @@ class MultiMatchQuery(FullTextQuery):
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MULTI_MATCH
+
+
+class BooleanQuery(FullTextQuery):
+    def __init__(self, queries: list[tuple[Occur, FullTextQuery]]):
+        """
+        Boolean query for full-text search.
+
+        Parameters
+        ----------
+        queries : list[tuple(Occur, FullTextQuery)]
+            The list of queries with their occurrence requirements.
+        """
+        self._inner = PyFullTextQuery.boolean_query(
+            [(occur.value, query.inner) for occur, query in queries]
+        )
+
+    def query_type(self) -> FullTextQueryType:
+        return FullTextQueryType.BOOLEAN

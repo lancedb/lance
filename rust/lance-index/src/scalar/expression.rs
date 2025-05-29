@@ -61,16 +61,16 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     fn visit_between(
         &self,
         column: &str,
-        low: ScalarValue,
-        high: ScalarValue,
+        low: &ScalarValue,
+        high: &ScalarValue,
     ) -> Option<IndexedExpression>;
-    fn visit_in_list(&self, column: &str, in_list: Vec<ScalarValue>) -> Option<IndexedExpression>;
+    fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression>;
     fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression>;
     fn visit_is_null(&self, column: &str) -> Option<IndexedExpression>;
     fn visit_comparison(
         &self,
         column: &str,
-        value: ScalarValue,
+        value: &ScalarValue,
         op: &Operator,
     ) -> Option<IndexedExpression>;
     fn visit_scalar_function(
@@ -82,27 +82,110 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     ) -> Option<IndexedExpression>;
 }
 
-#[derive(Debug, Default)]
-pub struct SargableQueryParser {}
+/// A generic parser that wraps multiple scalar query parsers
+///
+/// It will search each parser in order and return the first non-None result
+#[derive(Debug)]
+pub struct MultiQueryParser {
+    parsers: Vec<Box<dyn ScalarQueryParser>>,
+}
+
+impl MultiQueryParser {
+    /// Create a new MultiQueryParser with a single parser
+    pub fn single(parser: Box<dyn ScalarQueryParser>) -> Self {
+        Self {
+            parsers: vec![parser],
+        }
+    }
+
+    /// Add a new parser to the MultiQueryParser
+    pub fn add(&mut self, other: Box<dyn ScalarQueryParser>) {
+        self.parsers.push(other);
+    }
+}
+
+impl ScalarQueryParser for MultiQueryParser {
+    fn visit_between(
+        &self,
+        column: &str,
+        low: &ScalarValue,
+        high: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_between(column, low, high))
+    }
+    fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_in_list(column, in_list))
+    }
+    fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_is_bool(column, value))
+    }
+    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_is_null(column))
+    }
+    fn visit_comparison(
+        &self,
+        column: &str,
+        value: &ScalarValue,
+        op: &Operator,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_comparison(column, value, op))
+    }
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_scalar_function(column, data_type, func, args))
+    }
+}
+
+/// A parser for indices that handle SARGable queries
+#[derive(Debug)]
+pub struct SargableQueryParser {
+    index_name: String,
+}
+
+impl SargableQueryParser {
+    pub fn new(index_name: String) -> Self {
+        Self { index_name }
+    }
+}
 
 impl ScalarQueryParser for SargableQueryParser {
     fn visit_between(
         &self,
         column: &str,
-        low: ScalarValue,
-        high: ScalarValue,
+        low: &ScalarValue,
+        high: &ScalarValue,
     ) -> Option<IndexedExpression> {
-        let query = SargableQuery::Range(Bound::Included(low), Bound::Included(high));
+        let query =
+            SargableQuery::Range(Bound::Included(low.clone()), Bound::Included(high.clone()));
         Some(IndexedExpression::index_query(
             column.to_string(),
+            self.index_name.clone(),
             Arc::new(query),
         ))
     }
 
-    fn visit_in_list(&self, column: &str, in_list: Vec<ScalarValue>) -> Option<IndexedExpression> {
-        let query = SargableQuery::IsIn(in_list);
+    fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
+        let query = SargableQuery::IsIn(in_list.to_vec());
         Some(IndexedExpression::index_query(
             column.to_string(),
+            self.index_name.clone(),
             Arc::new(query),
         ))
     }
@@ -110,6 +193,7 @@ impl ScalarQueryParser for SargableQueryParser {
     fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
         Some(IndexedExpression::index_query(
             column.to_string(),
+            self.index_name.clone(),
             Arc::new(SargableQuery::Equals(ScalarValue::Boolean(Some(value)))),
         ))
     }
@@ -117,6 +201,7 @@ impl ScalarQueryParser for SargableQueryParser {
     fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
         Some(IndexedExpression::index_query(
             column.to_string(),
+            self.index_name.clone(),
             Arc::new(SargableQuery::IsNull()),
         ))
     }
@@ -124,21 +209,26 @@ impl ScalarQueryParser for SargableQueryParser {
     fn visit_comparison(
         &self,
         column: &str,
-        value: ScalarValue,
+        value: &ScalarValue,
         op: &Operator,
     ) -> Option<IndexedExpression> {
         let query = match op {
-            Operator::Lt => SargableQuery::Range(Bound::Unbounded, Bound::Excluded(value)),
-            Operator::LtEq => SargableQuery::Range(Bound::Unbounded, Bound::Included(value)),
-            Operator::Gt => SargableQuery::Range(Bound::Excluded(value), Bound::Unbounded),
-            Operator::GtEq => SargableQuery::Range(Bound::Included(value), Bound::Unbounded),
-            Operator::Eq => SargableQuery::Equals(value),
+            Operator::Lt => SargableQuery::Range(Bound::Unbounded, Bound::Excluded(value.clone())),
+            Operator::LtEq => {
+                SargableQuery::Range(Bound::Unbounded, Bound::Included(value.clone()))
+            }
+            Operator::Gt => SargableQuery::Range(Bound::Excluded(value.clone()), Bound::Unbounded),
+            Operator::GtEq => {
+                SargableQuery::Range(Bound::Included(value.clone()), Bound::Unbounded)
+            }
+            Operator::Eq => SargableQuery::Equals(value.clone()),
             // This will be negated by the caller
-            Operator::NotEq => SargableQuery::Equals(value),
+            Operator::NotEq => SargableQuery::Equals(value.clone()),
             _ => unreachable!(),
         };
         Some(IndexedExpression::index_query(
             column.to_string(),
+            self.index_name.clone(),
             Arc::new(query),
         ))
     }
@@ -154,15 +244,29 @@ impl ScalarQueryParser for SargableQueryParser {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct LabelListQueryParser {}
+/// A parser for indices that handle label list queries
+#[derive(Debug)]
+pub struct LabelListQueryParser {
+    index_name: String,
+}
+
+impl LabelListQueryParser {
+    pub fn new(index_name: String) -> Self {
+        Self { index_name }
+    }
+}
 
 impl ScalarQueryParser for LabelListQueryParser {
-    fn visit_between(&self, _: &str, _: ScalarValue, _: ScalarValue) -> Option<IndexedExpression> {
+    fn visit_between(
+        &self,
+        _: &str,
+        _: &ScalarValue,
+        _: &ScalarValue,
+    ) -> Option<IndexedExpression> {
         None
     }
 
-    fn visit_in_list(&self, _: &str, _: Vec<ScalarValue>) -> Option<IndexedExpression> {
+    fn visit_in_list(&self, _: &str, _: &[ScalarValue]) -> Option<IndexedExpression> {
         None
     }
 
@@ -174,7 +278,12 @@ impl ScalarQueryParser for LabelListQueryParser {
         None
     }
 
-    fn visit_comparison(&self, _: &str, _: ScalarValue, _: &Operator) -> Option<IndexedExpression> {
+    fn visit_comparison(
+        &self,
+        _: &str,
+        _: &ScalarValue,
+        _: &Operator,
+    ) -> Option<IndexedExpression> {
         None
     }
 
@@ -199,12 +308,14 @@ impl ScalarQueryParser for LabelListQueryParser {
                 let query = LabelListQuery::HasAllLabels(scalars);
                 Some(IndexedExpression::index_query(
                     column.to_string(),
+                    self.index_name.clone(),
                     Arc::new(query),
                 ))
             } else if func.name() == "array_has_any" {
                 let query = LabelListQuery::HasAnyLabel(scalars);
                 Some(IndexedExpression::index_query(
                     column.to_string(),
+                    self.index_name.clone(),
                     Arc::new(query),
                 ))
             } else {
@@ -216,15 +327,29 @@ impl ScalarQueryParser for LabelListQueryParser {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct TextQueryParser {}
+/// A parser for indices that handle string contains queries
+#[derive(Debug, Clone)]
+pub struct TextQueryParser {
+    index_name: String,
+}
+
+impl TextQueryParser {
+    pub fn new(index_name: String) -> Self {
+        Self { index_name }
+    }
+}
 
 impl ScalarQueryParser for TextQueryParser {
-    fn visit_between(&self, _: &str, _: ScalarValue, _: ScalarValue) -> Option<IndexedExpression> {
+    fn visit_between(
+        &self,
+        _: &str,
+        _: &ScalarValue,
+        _: &ScalarValue,
+    ) -> Option<IndexedExpression> {
         None
     }
 
-    fn visit_in_list(&self, _: &str, _: Vec<ScalarValue>) -> Option<IndexedExpression> {
+    fn visit_in_list(&self, _: &str, _: &[ScalarValue]) -> Option<IndexedExpression> {
         None
     }
 
@@ -236,7 +361,87 @@ impl ScalarQueryParser for TextQueryParser {
         None
     }
 
-    fn visit_comparison(&self, _: &str, _: ScalarValue, _: &Operator) -> Option<IndexedExpression> {
+    fn visit_comparison(
+        &self,
+        _: &str,
+        _: &ScalarValue,
+        _: &Operator,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        if args.len() != 2 {
+            return None;
+        }
+        let scalar = maybe_scalar(&args[1], data_type)?;
+        match scalar {
+            ScalarValue::Utf8(Some(scalar_str)) | ScalarValue::LargeUtf8(Some(scalar_str)) => {
+                if func.name() == "contains" {
+                    let query = TextQuery::StringContains(scalar_str);
+                    Some(IndexedExpression::index_query(
+                        column.to_string(),
+                        self.index_name.clone(),
+                        Arc::new(query),
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                // If the scalar is not a string, we cannot handle it
+                None
+            }
+        }
+    }
+}
+
+/// A parser for indices that handle queries with the contains_tokens function
+#[derive(Debug, Clone)]
+pub struct FtsQueryParser {
+    index_name: String,
+}
+
+impl FtsQueryParser {
+    pub fn new(index_name: String) -> Self {
+        Self { index_name }
+    }
+}
+
+impl ScalarQueryParser for FtsQueryParser {
+    fn visit_between(
+        &self,
+        _: &str,
+        _: &ScalarValue,
+        _: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_in_list(&self, _: &str, _: &[ScalarValue]) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_bool(&self, _: &str, _: bool) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_null(&self, _: &str) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_comparison(
+        &self,
+        _: &str,
+        _: &ScalarValue,
+        _: &Operator,
+    ) -> Option<IndexedExpression> {
         None
     }
 
@@ -252,10 +457,14 @@ impl ScalarQueryParser for TextQueryParser {
         }
         let scalar = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
-            if func.name() == "contains" {
+            // TODO(https://github.com/lancedb/lance/issues/3855):
+            //
+            // Create the contains_tokens UDF
+            if func.name() == "contains_tokens" {
                 let query = TextQuery::StringContains(scalar_str);
                 Some(IndexedExpression::index_query(
                     column.to_string(),
+                    self.index_name.clone(),
                     Arc::new(query),
                 ))
             } else {
@@ -277,9 +486,13 @@ impl IndexedExpression {
     }
 
     /// Create an expression that is only an index query
-    fn index_query(column: String, query: Arc<dyn AnyQuery>) -> Self {
+    fn index_query(column: String, index_name: String, query: Arc<dyn AnyQuery>) -> Self {
         Self {
-            scalar_query: Some(ScalarIndexExpr::Query(column, query)),
+            scalar_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
+                column,
+                index_name,
+                query,
+            })),
             refine_expr: None,
         }
     }
@@ -396,9 +609,29 @@ pub trait ScalarIndexLoader: Send + Sync {
     /// Load the index with the given name
     async fn load_index(
         &self,
-        name: &str,
+        column: &str,
+        index_name: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>>;
+}
+
+/// This represents a search into a scalar index
+#[derive(Debug, Clone)]
+pub struct ScalarIndexSearch {
+    /// The column to search (redundant, used for debugging messages)
+    pub column: String,
+    /// The name of the index to search
+    pub index_name: String,
+    /// The query to search for
+    pub query: Arc<dyn AnyQuery>,
+}
+
+impl PartialEq for ScalarIndexSearch {
+    fn eq(&self, other: &Self) -> bool {
+        self.column == other.column
+            && self.index_name == other.index_name
+            && self.query.as_ref().eq(other.query.as_ref())
+    }
 }
 
 /// This represents a lookup into one or more scalar indices
@@ -410,7 +643,7 @@ pub enum ScalarIndexExpr {
     Not(Box<ScalarIndexExpr>),
     And(Box<ScalarIndexExpr>, Box<ScalarIndexExpr>),
     Or(Box<ScalarIndexExpr>, Box<ScalarIndexExpr>),
-    Query(String, Arc<dyn AnyQuery>),
+    Query(ScalarIndexSearch),
 }
 
 impl PartialEq for ScalarIndexExpr {
@@ -419,7 +652,7 @@ impl PartialEq for ScalarIndexExpr {
             (Self::Not(l0), Self::Not(r0)) => l0 == r0,
             (Self::And(l0, l1), Self::And(r0, r1)) => l0 == r0 && l1 == r1,
             (Self::Or(l0, l1), Self::Or(r0, r1)) => l0 == r0 && l1 == r1,
-            (Self::Query(l0, l1), Self::Query(r0, r1)) => l0 == r0 && l1 == r1,
+            (Self::Query(l_search), Self::Query(r_search)) => l_search == r_search,
             _ => false,
         }
     }
@@ -431,7 +664,12 @@ impl std::fmt::Display for ScalarIndexExpr {
             Self::Not(inner) => write!(f, "NOT({})", inner),
             Self::And(lhs, rhs) => write!(f, "AND({},{})", lhs, rhs),
             Self::Or(lhs, rhs) => write!(f, "OR({},{})", lhs, rhs),
-            Self::Query(column, query) => write!(f, "{}", query.format(column)),
+            Self::Query(search) => write!(
+                f,
+                "[{}]@{}",
+                search.query.format(&search.column),
+                search.index_name
+            ),
         }
     }
 }
@@ -543,9 +781,11 @@ impl ScalarIndexExpr {
                     }
                 }
             }
-            Self::Query(column, query) => {
-                let index = index_loader.load_index(column, metrics).await?;
-                let search_result = index.search(query.as_ref(), metrics).await?;
+            Self::Query(search) => {
+                let index = index_loader
+                    .load_index(&search.column, &search.index_name, metrics)
+                    .await?;
+                let search_result = index.search(search.query.as_ref(), metrics).await?;
                 match search_result {
                     SearchResult::Exact(matching_row_ids) => {
                         Ok(IndexExprResult::Exact(RowIdMask {
@@ -579,7 +819,7 @@ impl ScalarIndexExpr {
                 let rhs = rhs.to_expr();
                 lhs.or(rhs)
             }
-            Self::Query(column, query) => query.to_expr(column.clone()),
+            Self::Query(search) => search.query.to_expr(search.column.clone()),
         }
     }
 
@@ -587,7 +827,7 @@ impl ScalarIndexExpr {
         match self {
             Self::Not(inner) => inner.needs_recheck(),
             Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.needs_recheck() || rhs.needs_recheck(),
-            Self::Query(_, query) => query.needs_recheck(),
+            Self::Query(search) => search.query.needs_recheck(),
         }
     }
 }
@@ -680,7 +920,7 @@ fn visit_between(
     let low = maybe_scalar(&between.low, col_type)?;
     let high = maybe_scalar(&between.high, col_type)?;
 
-    let indexed_expr = query_parser.visit_between(column, low, high)?;
+    let indexed_expr = query_parser.visit_between(column, &low, &high)?;
 
     if between.negated {
         indexed_expr.maybe_not()
@@ -696,7 +936,7 @@ fn visit_in_list(
     let (column, col_type, query_parser) = maybe_indexed_column(&in_list.expr, index_info)?;
     let values = maybe_scalar_list(&in_list.list, col_type)?;
 
-    let indexed_expr = query_parser.visit_in_list(column, values)?;
+    let indexed_expr = query_parser.visit_in_list(column, &values)?;
 
     if in_list.negated {
         indexed_expr.maybe_not()
@@ -757,7 +997,7 @@ fn visit_comparison(
     let left_col = maybe_indexed_column(&expr.left, index_info);
     if let Some((column, col_type, query_parser)) = left_col {
         let scalar = maybe_scalar(&expr.right, col_type)?;
-        query_parser.visit_comparison(column, scalar, &expr.op)
+        query_parser.visit_comparison(column, &scalar, &expr.op)
     } else {
         // Datafusion's query simplifier will canonicalize expressions and so we shouldn't reach this case.  If, for some reason, we
         // do reach this case we can handle it in the future by inverting expr.op and swapping the left and right sides
@@ -912,6 +1152,7 @@ fn visit_node(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<
 /// A trait to be used in `apply_scalar_indices` to inform the function which columns are indexeds
 pub trait IndexInformationProvider {
     /// Check if an index exists for `col` and, if so, return the data type of col
+    /// as well as a query parser that can parse queries for that column
     fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)>;
 }
 
@@ -1098,6 +1339,7 @@ mod tests {
             expr,
             Some(IndexedExpression::index_query(
                 col.to_string(),
+                format!("{}_idx", col),
                 Arc::new(query),
             )),
         )
@@ -1113,9 +1355,13 @@ mod tests {
             index_info,
             expr,
             Some(
-                IndexedExpression::index_query(col.to_string(), Arc::new(query))
-                    .maybe_not()
-                    .unwrap(),
+                IndexedExpression::index_query(
+                    col.to_string(),
+                    format!("{}_idx", col),
+                    Arc::new(query),
+                )
+                .maybe_not()
+                .unwrap(),
             ),
         )
     }
@@ -1125,19 +1371,31 @@ mod tests {
         let index_info = MockIndexInfoProvider::new(vec![
             (
                 "color",
-                ColInfo::new(DataType::Utf8, Box::<SargableQueryParser>::default()),
+                ColInfo::new(
+                    DataType::Utf8,
+                    Box::new(SargableQueryParser::new("color_idx".to_string())),
+                ),
             ),
             (
                 "aisle",
-                ColInfo::new(DataType::UInt32, Box::<SargableQueryParser>::default()),
+                ColInfo::new(
+                    DataType::UInt32,
+                    Box::new(SargableQueryParser::new("aisle_idx".to_string())),
+                ),
             ),
             (
                 "on_sale",
-                ColInfo::new(DataType::Boolean, Box::<SargableQueryParser>::default()),
+                ColInfo::new(
+                    DataType::Boolean,
+                    Box::new(SargableQueryParser::new("on_sale_idx".to_string())),
+                ),
             ),
             (
                 "price",
-                ColInfo::new(DataType::Float32, Box::<SargableQueryParser>::default()),
+                ColInfo::new(
+                    DataType::Float32,
+                    Box::new(SargableQueryParser::new("price_idx".to_string())),
+                ),
             ),
         ]);
 
@@ -1326,16 +1584,18 @@ mod tests {
             SargableQuery::Equals(ScalarValue::UInt32(Some(10))),
         );
         // // Common compound case, AND'd clauses
-        let left = Box::new(ScalarIndexExpr::Query(
-            "aisle".to_string(),
-            Arc::new(SargableQuery::Equals(ScalarValue::UInt32(Some(10)))),
-        ));
-        let right = Box::new(ScalarIndexExpr::Query(
-            "color".to_string(),
-            Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+        let left = Box::new(ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "aisle".to_string(),
+            index_name: "aisle_idx".to_string(),
+            query: Arc::new(SargableQuery::Equals(ScalarValue::UInt32(Some(10)))),
+        }));
+        let right = Box::new(ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "color".to_string(),
+            index_name: "color_idx".to_string(),
+            query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                 "blue".to_string(),
             )))),
-        ));
+        }));
         check(
             &index_info,
             "aisle = 10 AND color = 'blue'",

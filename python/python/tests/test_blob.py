@@ -133,6 +133,55 @@ def test_blob_file_seek(tmp_path, dataset_with_blobs):
         assert f.read(1) == b"a"
 
 
+def test_null_blobs(tmp_path):
+    table = pa.table(
+        {
+            "id": range(100),
+            "blob": pa.array([None] * 100, pa.large_binary()),
+        },
+        schema=pa.schema(
+            [
+                pa.field("id", pa.uint64()),
+                pa.field(
+                    "blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                ),
+            ]
+        ),
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds")
+
+    blobs = ds.take_blobs("blob", ids=range(100))
+    for blob in blobs:
+        assert blob.size() == 0
+
+    ds.insert(pa.table({"id": pa.array(range(100, 200), pa.uint64())}))
+
+    ds.add_columns(
+        pa.field(
+            "more_blob",
+            pa.large_binary(),
+            metadata={"lance-encoding:blob": "true"},
+        )
+    )
+
+    for blob_col in ["blob", "more_blob"]:
+        blobs = ds.take_blobs(blob_col, indices=range(100, 200))
+        for blob in blobs:
+            assert blob.size() == 0
+
+        blobs = ds.to_table(columns=[blob_col])
+        for blob in blobs.column(blob_col):
+            py_blob = blob.as_py()
+            # When we write blobs to a file we store the position as 1 and size as 0
+            # to avoid needing a validity buffer.
+            #
+            # TODO: We should probably convert these to null on read.
+            assert py_blob == {"position": None, "size": None} or py_blob == {
+                "position": 1,
+                "size": 0,
+            }
+
+
 def test_blob_file_read_middle(tmp_path, dataset_with_blobs):
     # This regresses an issue where we were not setting the cursor
     # correctly after a call to `read` when the blob was not the
@@ -162,3 +211,8 @@ def test_take_deleted_blob(tmp_path, dataset_with_blobs):
         match="A take operation that includes row addresses must not target deleted",
     ):
         dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+
+
+def test_scan_blob(tmp_path, dataset_with_blobs):
+    ds = dataset_with_blobs.scanner(filter="idx = 2").to_table()
+    assert ds.num_rows == 1

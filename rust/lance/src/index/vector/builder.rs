@@ -723,7 +723,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
         let scheduler = ScanScheduler::new(obj_store, scheduler_config);
         for (part_id, (storage_size, index_size)) in partition_sizes.into_iter().enumerate() {
-            log::info!("merging partition {}/{}", part_id, ivf.num_partitions());
+            log::info!("merging partition {}/{}", part_id + 1, ivf.num_partitions());
             if storage_size == 0 {
                 storage_ivf.add_partition(0);
             } else {
@@ -797,7 +797,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         .unwrap_or_default(),
                 );
             }
-            log::info!("merged partition {}/{}", part_id, ivf.num_partitions());
         }
 
         let mut storage_writer = storage_writer.unwrap();
