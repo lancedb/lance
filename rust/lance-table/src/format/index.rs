@@ -10,11 +10,6 @@ use uuid::Uuid;
 
 use super::pb;
 use lance_core::{Error, Result};
-
-/// The default index version, which is used for legacy indices that do not have a version specified.
-/// We've introduced index version since Lance 0.28.0, so this is the initial version.
-pub const INIT_INDEX_VERSION: semver::Version = semver::Version::new(0, 28, 0);
-
 /// Index metadata
 #[derive(Debug, Clone, PartialEq)]
 pub struct Index {
@@ -41,8 +36,8 @@ pub struct Index {
     /// be present in newer versions.
     pub index_details: Option<prost_types::Any>,
 
-    /// The minimum lance version that this index is compatible with.
-    pub index_version: semver::Version,
+    /// The index version.
+    pub index_version: i32,
 }
 
 impl DeepSizeOf for Index {
@@ -83,15 +78,7 @@ impl TryFrom<pb::IndexMetadata> for Index {
             dataset_version: proto.dataset_version,
             fragment_bitmap,
             index_details: proto.index_details,
-            index_version: proto
-                .index_version
-                .map(|v| semver::Version::parse(&v))
-                .transpose()
-                .map_err(|e| Error::Index {
-                    message: format!("failed to parse the index version: {}", e),
-                    location: location!(),
-                })?
-                .unwrap_or(INIT_INDEX_VERSION),
+            index_version: proto.index_version.unwrap_or_default(),
         })
     }
 }
@@ -115,7 +102,7 @@ impl From<&Index> for pb::IndexMetadata {
             dataset_version: idx.dataset_version,
             fragment_bitmap,
             index_details: idx.index_details.clone(),
-            index_version: Some(idx.index_version.to_string()),
+            index_version: Some(idx.index_version),
         }
     }
 }

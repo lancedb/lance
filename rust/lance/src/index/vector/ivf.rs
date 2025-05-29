@@ -77,7 +77,6 @@ use lance_linalg::{
     distance::Normalize,
     kernels::{normalize_arrow, normalize_fsl},
 };
-use lance_table::format::INIT_INDEX_VERSION;
 use log::{info, warn};
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -260,7 +259,7 @@ pub(crate) async fn optimize_vector_indices(
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
-) -> Result<(Uuid, usize, semver::Version)> {
+) -> Result<(Uuid, usize)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::Index {
@@ -347,7 +346,7 @@ pub(crate) async fn optimize_vector_indices(
 
     // never change the index version,
     // because we won't update the legacy vector index format
-    Ok((new_uuid, merged, INIT_INDEX_VERSION))
+    Ok((new_uuid, merged))
 }
 
 pub(crate) async fn optimize_vector_indices_v2(
@@ -356,7 +355,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
-) -> Result<(Uuid, usize, semver::Version)> {
+) -> Result<(Uuid, usize)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::Index {
@@ -508,12 +507,7 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
     }
 
-    Ok((
-        new_uuid,
-        merged_num,
-        // the sub index type and quantizer doesn't matter here
-        IvfIndexBuilder::<FlatIndex, FlatQuantizer>::version(),
-    ))
+    Ok((new_uuid, merged_num))
 }
 
 #[allow(clippy::too_many_arguments)]

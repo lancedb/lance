@@ -163,6 +163,31 @@ impl IndexType {
                 | Self::IvfSq
         )
     }
+
+    /// Returns the current format version of the index type,
+    /// bump this when the index format changes.
+    /// Indices which higher version than these will be ignored for compatibility,
+    /// This would happen when creating index in a newer version of Lance,
+    /// but then opening the index in older version of Lance
+    pub fn version(&self) -> i32 {
+        match self {
+            Self::Scalar => 0,
+            Self::BTree => 0,
+            Self::Bitmap => 0,
+            Self::LabelList => 0,
+            Self::Inverted => 0,
+            Self::NGram => 0,
+
+            // for now all vector indices are built by the same builder,
+            // so they share the same version.
+            Self::Vector
+            | Self::IvfFlat
+            | Self::IvfSq
+            | Self::IvfPq
+            | Self::IvfHnswSq
+            | Self::IvfHnswPq => 0,
+        }
+    }
 }
 
 pub trait IndexParams: Send + Sync {

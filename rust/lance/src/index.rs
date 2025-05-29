@@ -18,6 +18,7 @@ use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR, TRACE
 use lance_file::reader::FileReader;
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
+use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
     FtsQueryParser, IndexInformationProvider, LabelListQueryParser, MultiQueryParser,
     SargableQueryParser, ScalarQueryParser, TextQueryParser,
@@ -40,7 +41,6 @@ use lance_index::{
     vector::VectorIndex,
     DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME,
 };
-use lance_index::{pb::index::Implementation, scalar::inverted::InvertedIndex};
 use lance_index::{ScalarIndexCriteria, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
@@ -48,13 +48,13 @@ use lance_io::utils::{
     read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
     CachedFileSize,
 };
+use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
-use lance_table::format::{Index as IndexMetadata, INIT_INDEX_VERSION};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::{
-    build_inverted_index, detect_scalar_index_type, index_matches_criteria, inverted_index_details,
-    TrainingRequest, LANCE_VERSION,
+    build_inverted_index, detect_scalar_index_type, index_matches_criteria, infer_index_type,
+    inverted_index_details, TrainingRequest,
 };
 use serde_json::json;
 use snafu::location;
@@ -277,7 +277,7 @@ impl DatasetIndexExt for Dataset {
         }
 
         let index_id = Uuid::new_v4();
-        let (index_details, version) = match (index_type, params.index_name()) {
+        let index_details = match (index_type, params.index_name()) {
             (
                 IndexType::Bitmap
                 | IndexType::BTree
@@ -311,7 +311,7 @@ impl DatasetIndexExt for Dataset {
                     })?;
 
                 build_inverted_index(self, column, &index_id.to_string(), inverted_params).await?;
-                (inverted_index_details(), InvertedIndex::version())
+                inverted_index_details()
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.
@@ -332,7 +332,7 @@ impl DatasetIndexExt for Dataset {
                     vec_params,
                 ))
                 .await?;
-                (vector_index_details(), INIT_INDEX_VERSION)
+                vector_index_details()
             }
             // Can't use if let Some(...) here because it's not stable yet.
             // TODO: fix after https://github.com/rust-lang/rust/issues/51114
@@ -358,7 +358,7 @@ impl DatasetIndexExt for Dataset {
 
                 ext.create_index(self, column, &index_id.to_string(), params)
                     .await?;
-                (vector_index_details(), INIT_INDEX_VERSION)
+                vector_index_details()
             }
             (index_type, index_name) => {
                 return Err(Error::Index {
@@ -377,7 +377,7 @@ impl DatasetIndexExt for Dataset {
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
             index_details: Some(index_details),
-            index_version: version,
+            index_version: index_type.version(),
         };
         let transaction = Transaction::new(
             self.manifest.version,
@@ -446,26 +446,26 @@ impl DatasetIndexExt for Dataset {
             return Ok(indices);
         }
 
-        let loaded_indices: Vec<IndexMetadata> = read_manifest_indexes(
-            &self.object_store,
-            &self.manifest_location,
-            &self.manifest,
-        )
-        .await?
-        .into_iter()
-        .filter(|idx| {
-            let is_valid = idx.index_version <= *LANCE_VERSION;
-            if !is_valid {
-                log::warn!(
-                    "Index {} has version {}, which is not supported by this Lance version {}, ignoring it",
-                    idx.name,
-                    idx.index_version,
-                    std::env!("CARGO_PKG_VERSION"),
-                );
-            }
-            is_valid
-        })
-        .collect();
+        let loaded_indices: Vec<IndexMetadata> =
+            read_manifest_indexes(&self.object_store, &self.manifest_location, &self.manifest)
+                .await?
+                .into_iter()
+                .filter(|idx| {
+                    let max_valid_version = infer_index_type(idx)
+                        .map(|t| t.version())
+                        .unwrap_or_default();
+                    let is_valid = idx.index_version <= max_valid_version;
+                    if !is_valid {
+                        log::warn!(
+                            "Index {} has version {}, which is not supported (<={}), ignoring it",
+                            idx.name,
+                            idx.index_version,
+                            max_valid_version,
+                        );
+                    }
+                    is_valid
+                })
+                .collect();
         let loaded_indices = Arc::new(loaded_indices);
 
         self.session.index_cache.insert_metadata(
@@ -499,7 +499,7 @@ impl DatasetIndexExt for Dataset {
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
             index_details: None,
-            index_version: INIT_INDEX_VERSION,
+            index_version: 0,
         };
 
         let transaction = Transaction::new(
@@ -1073,7 +1073,8 @@ impl DatasetIndexInternalExt for Dataset {
             let is_vector_index = idx_schema
                 .fields
                 .iter()
-                .any(|f| matches!(f.data_type(), DataType::FixedSizeList(_, _)));
+                .any(|f| is_vector_field(f.data_type()));
+
             idx.fields.len() == 1 && !is_vector_index
         }) {
             let field = index.fields[0];
@@ -1174,6 +1175,17 @@ impl DatasetIndexInternalExt for Dataset {
                 Ok(indexed_frags)
             })
             .collect()
+    }
+}
+
+fn is_vector_field(data_type: DataType) -> bool {
+    match data_type {
+        DataType::FixedSizeList(_, _) => true,
+        DataType::List(inner) => {
+            // If the inner type is a fixed size list, then it is a multivector field
+            matches!(inner.data_type(), DataType::FixedSizeList(_, _))
+        }
+        _ => false,
     }
 }
 

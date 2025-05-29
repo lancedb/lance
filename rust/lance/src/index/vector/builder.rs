@@ -52,7 +52,6 @@ use lance_io::{
     ReadBatchParams,
 };
 use lance_linalg::distance::DistanceType;
-use lance_table::format::INIT_INDEX_VERSION;
 use log::info;
 use object_store::path::Path;
 use prost::Message;
@@ -190,11 +189,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             partition_sizes: Vec::new(),
             existing_indices: vec![index],
         })
-    }
-
-    pub fn version() -> semver::Version {
-        // bump it when the index format changes
-        INIT_INDEX_VERSION
     }
 
     // build the index with the all data in the dataset,

@@ -270,11 +270,6 @@ impl InvertedIndex {
     pub fn is_legacy(&self) -> bool {
         self.partitions.len() == 1 && self.partitions[0].is_legacy()
     }
-
-    /// Returns the lance version that introduced the index format.
-    pub fn version() -> semver::Version {
-        semver::Version::new(0, 28, 0)
-    }
 }
 
 #[async_trait]
@@ -413,10 +408,6 @@ impl ScalarIndex for InvertedIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         self.to_builder().update(new_data, dest_store).await
-    }
-
-    fn version(&self) -> semver::Version {
-        Self::version()
     }
 }
 

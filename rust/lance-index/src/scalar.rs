@@ -22,7 +22,6 @@ use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
-use lance_table::format::INIT_INDEX_VERSION;
 use snafu::location;
 
 use crate::metrics::MetricsCollector;
@@ -64,6 +63,18 @@ impl TryFrom<IndexType> for ScalarIndexType {
                 source: format!("Index type {:?} is not a scalar index", value).into(),
                 location: location!(),
             }),
+        }
+    }
+}
+
+impl Into<IndexType> for ScalarIndexType {
+    fn into(self) -> IndexType {
+        match self {
+            ScalarIndexType::BTree => IndexType::BTree,
+            ScalarIndexType::Bitmap => IndexType::Bitmap,
+            ScalarIndexType::LabelList => IndexType::LabelList,
+            ScalarIndexType::NGram => IndexType::NGram,
+            ScalarIndexType::Inverted => IndexType::Inverted,
         }
     }
 }
@@ -600,8 +611,4 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()>;
-
-    fn version(&self) -> semver::Version {
-        INIT_INDEX_VERSION
-    }
 }
