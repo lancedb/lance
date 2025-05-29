@@ -69,27 +69,28 @@ pub trait ObjectStoreExt {
     /// Read all files (start from base directory) recursively
     ///
     /// unmodified_since can be specified to only return files that have not been modified since the given time.
-    async fn read_dir_all<'a>(
+    fn read_dir_all<'a, 'b>(
         &'a self,
-        dir_path: impl Into<&Path> + Send,
+        dir_path: impl Into<&'b Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<'a, Result<ObjectMeta>>>;
+    ) -> BoxStream<'a, Result<ObjectMeta>>;
 }
 
 #[async_trait]
 impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
-    async fn read_dir_all<'a>(
+    fn read_dir_all<'a, 'b>(
         &'a self,
-        dir_path: impl Into<&Path> + Send,
+        dir_path: impl Into<&'b Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<'a, Result<ObjectMeta>>> {
-        let mut output = self.list(Some(dir_path.into()));
+    ) -> BoxStream<'a, Result<ObjectMeta>> {
+        let output = self.list(Some(dir_path.into())).map_err(|e| e.into());
         if let Some(unmodified_since_val) = unmodified_since {
-            output = output
+            output
                 .try_filter(move |file| future::ready(file.last_modified < unmodified_since_val))
-                .boxed();
+                .boxed()
+        } else {
+            output.boxed()
         }
-        Ok(output.map_err(|e| e.into()).boxed())
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {
@@ -138,6 +139,29 @@ impl std::fmt::Display for ObjectStore {
 
 pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ChainedWrappingObjectStore {
+    wrappers: Vec<Arc<dyn WrappingObjectStore>>,
+}
+
+impl ChainedWrappingObjectStore {
+    pub fn new(wrappers: Vec<Arc<dyn WrappingObjectStore>>) -> Self {
+        Self { wrappers }
+    }
+
+    pub fn add_wrapper(&mut self, wrapper: Arc<dyn WrappingObjectStore>) {
+        self.wrappers.push(wrapper);
+    }
+}
+
+impl WrappingObjectStore for ChainedWrappingObjectStore {
+    fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+        self.wrappers
+            .iter()
+            .fold(original, |acc, wrapper| wrapper.wrap(acc))
+    }
 }
 
 /// Parameters to create an [ObjectStore]
@@ -483,12 +507,12 @@ impl ObjectStore {
     /// Read all files (start from base directory) recursively
     ///
     /// unmodified_since can be specified to only return files that have not been modified since the given time.
-    pub async fn read_dir_all(
-        &self,
-        dir_path: impl Into<&Path> + Send,
+    pub fn read_dir_all<'a, 'b>(
+        &'a self,
+        dir_path: impl Into<&'b Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<Result<ObjectMeta>>> {
-        self.inner.read_dir_all(dir_path, unmodified_since).await
+    ) -> BoxStream<'a, Result<ObjectMeta>> {
+        self.inner.read_dir_all(dir_path, unmodified_since)
     }
 
     /// Remove a directory recursively.
