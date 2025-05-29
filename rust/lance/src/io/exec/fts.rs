@@ -18,7 +18,7 @@ use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::ROW_ID;
+use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
 use lance_index::scalar::inverted::query::{
     collect_tokens, BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery,
 };
@@ -250,7 +250,7 @@ impl ExecutionPlan for MatchQueryExec {
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed(),
+            stream.stream_in_current_span().boxed(),
         )))
     }
 
@@ -397,7 +397,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         .try_flatten_unordered(None);
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed(),
+            stream.stream_in_current_span().boxed(),
             partition,
             &self.metrics,
         )))
@@ -608,7 +608,7 @@ impl ExecutionPlan for PhraseQueryExec {
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed(),
+            stream.stream_in_current_span().boxed(),
         )))
     }
 
@@ -769,7 +769,7 @@ impl ExecutionPlan for BoostQueryExec {
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed(),
+            stream.stream_in_current_span().boxed(),
         )))
     }
 
@@ -803,7 +803,7 @@ impl DisplayAs for BooleanQueryExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "BoolQuery: must={}, should={}",
+                    "BooleanQuery: must={}, should={}",
                     self.query.must.len(),
                     self.query.should.len()
                 )
@@ -919,9 +919,10 @@ impl ExecutionPlan for BooleanQueryExec {
             while let Some(batch) = must.try_next().await? {
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
                 let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
-                for (row_id, score) in std::iter::zip(row_ids, scores) {
-                    res.insert(*row_id, *score);
-                }
+                res.extend(std::iter::zip(
+                    row_ids.iter().copied(),
+                    scores.iter().copied(),
+                ));
             }
 
             while let Some(batch) = should.try_next().await? {
@@ -950,7 +951,7 @@ impl ExecutionPlan for BooleanQueryExec {
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed(),
+            stream.stream_in_current_span().boxed(),
         )))
     }
 
