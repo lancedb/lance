@@ -381,19 +381,23 @@ impl ScalarQueryParser for TextQueryParser {
             return None;
         }
         let scalar = maybe_scalar(&args[1], data_type)?;
-        if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
-            if func.name() == "contains" {
-                let query = TextQuery::StringContains(scalar_str);
-                Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    Arc::new(query),
-                ))
-            } else {
+        match scalar {
+            ScalarValue::Utf8(Some(scalar_str)) | ScalarValue::LargeUtf8(Some(scalar_str)) => {
+                if func.name() == "contains" {
+                    let query = TextQuery::StringContains(scalar_str);
+                    Some(IndexedExpression::index_query(
+                        column.to_string(),
+                        self.index_name.clone(),
+                        Arc::new(query),
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                // If the scalar is not a string, we cannot handle it
                 None
             }
-        } else {
-            None
         }
     }
 }

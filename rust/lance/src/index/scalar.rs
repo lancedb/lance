@@ -297,9 +297,9 @@ pub(super) async fn build_scalar_index(
             Ok(inverted_index_details())
         }
         Some(ScalarIndexType::NGram) => {
-            if field.data_type() != DataType::Utf8 {
+            if field.data_type() != DataType::Utf8 && field.data_type() != DataType::LargeUtf8 {
                 return Err(Error::InvalidInput {
-                    source: "NGram index can only be created on Utf8 type columns".into(),
+                    source: "NGram index can only be created on Utf8/LargeUtf8 type columns".into(),
                     location: location!(),
                 });
             }
