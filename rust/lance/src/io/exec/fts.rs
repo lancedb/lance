@@ -824,6 +824,14 @@ impl DisplayAs for BooleanQueryExec {
                     self.query.should.len()
                 )
             }
+            DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "BooleanQuery\nmust={}\nshould={}",
+                    self.query.must.len(),
+                    self.query.should.len()
+                )
+            }
         }
     }
 }
