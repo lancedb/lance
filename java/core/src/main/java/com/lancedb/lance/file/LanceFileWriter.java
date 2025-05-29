@@ -55,10 +55,8 @@ public class LanceFileWriter implements AutoCloseable {
    * @return a new LanceFileWriter
    */
   public static LanceFileWriter open(
-          String path,
-          BufferAllocator allocator,
-          DictionaryProvider dictionaryProvider)
-          throws IOException {
+      String path, BufferAllocator allocator, DictionaryProvider dictionaryProvider)
+      throws IOException {
     return open(path, allocator, dictionaryProvider, Collections.emptyMap());
   }
 
