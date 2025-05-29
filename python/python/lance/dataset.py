@@ -3988,7 +3988,7 @@ def write_dataset(
         lance.auto_cleanup.interval and lance.auto_cleanup.older_than.
         Both parameters must be set to invoke autocleaning.
         If you do not set this parameter(default behavior),
-        the autocleaning will be closed.
+        then no autocleaning will be performed.
         Note: this config options only take effect when creating a new dataset,
         it has no effect on existing datasets.
     """
