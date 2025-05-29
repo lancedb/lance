@@ -279,33 +279,6 @@ impl DecodeArrayTask for BlobArrayDecodeTask {
     }
 }
 
-// impl DecodeArrayTask for BlobFieldDecodeTask {
-//     fn decode(self: Box<Self>) -> Result<ArrayRef> {
-//     }
-// }
-
-// impl LogicalPageDecoder for PrimitiveFieldDecoder {
-//     // TODO: In the future, at some point, we may consider partially waiting for primitive pages by
-//     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
-//     fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
-//     }
-
-//     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
-//     }
-
-//     fn rows_loaded(&self) -> u64 {
-//     }
-
-//     fn rows_drained(&self) -> u64 {
-//     }
-
-//     fn num_rows(&self) -> u64 {
-//     }
-
-//     fn data_type(&self) -> &DataType {
-//     }
-// }
-
 pub struct BlobFieldEncoder {
     description_encoder: Box<dyn FieldEncoder>,
 }

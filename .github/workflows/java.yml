@@ -42,7 +42,7 @@ jobs:
       # pin the toolchain version to avoid surprises
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          components: clippy, rustfmt
       - uses: rui314/setup-mold@v1
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -86,50 +86,8 @@ jobs:
       - name: Running code style check with Java ${{ matrix.java-version }}
         working-directory: java
         run: |
-          if [ "${{ matrix.java-version }}" == "17" ]; then
-            export JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS \
-            -XX:+IgnoreUnrecognizedVMOptions \
-            --add-opens=java.base/java.lang=ALL-UNNAMED \
-            --add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
-            --add-opens=java.base/java.lang.reflect=ALL-UNNAMED \
-            --add-opens=java.base/java.io=ALL-UNNAMED \
-            --add-opens=java.base/java.net=ALL-UNNAMED \
-            --add-opens=java.base/java.nio=ALL-UNNAMED \
-            --add-opens=java.base/java.util=ALL-UNNAMED \
-            --add-opens=java.base/java.util.concurrent=ALL-UNNAMED \
-            --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED \
-            --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED \
-            --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
-            --add-opens=java.base/sun.nio.cs=ALL-UNNAMED \
-            --add-opens=java.base/sun.security.action=ALL-UNNAMED \
-            --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
-            --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED \
-            -Djdk.reflect.useDirectMethodHandle=false \
-            -Dio.netty.tryReflectionSetAccessible=true"
-          fi
           mvn spotless:check
       - name: Running tests with Java ${{ matrix.java-version }}
         working-directory: java
         run: |
-          if [ "${{ matrix.java-version }}" == "17" ]; then
-            export JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS \
-            -XX:+IgnoreUnrecognizedVMOptions \
-            --add-opens=java.base/java.lang=ALL-UNNAMED \
-            --add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
-            --add-opens=java.base/java.lang.reflect=ALL-UNNAMED \
-            --add-opens=java.base/java.io=ALL-UNNAMED \
-            --add-opens=java.base/java.net=ALL-UNNAMED \
-            --add-opens=java.base/java.nio=ALL-UNNAMED \
-            --add-opens=java.base/java.util=ALL-UNNAMED \
-            --add-opens=java.base/java.util.concurrent=ALL-UNNAMED \
-            --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED \
-            --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED \
-            --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
-            --add-opens=java.base/sun.nio.cs=ALL-UNNAMED \
-            --add-opens=java.base/sun.security.action=ALL-UNNAMED \
-            --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
-            --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED \
-            -Djdk.reflect.useDirectMethodHandle=false \
-            -Dio.netty.tryReflectionSetAccessible=true"
-          fi
           mvn install

@@ -18,7 +18,7 @@
 
 use futures::FutureExt;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     future::Future,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -62,7 +62,10 @@ use futures::{
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::{backoff::SlotBackoff, futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::{
+        backoff::SlotBackoff, futures::Capacity, mask::RowIdTreeMap,
+        tokio::get_num_compute_intensive_cpus,
+    },
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -70,7 +73,7 @@ use lance_datafusion::{
     utils::StreamingWriteSource,
 };
 use lance_file::version::LanceFileVersion;
-use lance_index::DatasetIndexExt;
+use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
 use lance_table::format::{Fragment, Index};
 use log::info;
 use roaring::RoaringTreemap;
@@ -438,7 +441,14 @@ impl MergeInsertJob {
             Ok(None)
         } else {
             let col = &self.params.on[0];
-            self.dataset.load_scalar_index_for_column(col).await
+            self.dataset
+                .load_scalar_index(
+                    ScalarIndexCriteria::default()
+                        .for_column(col)
+                        // Unclear if this would work if the index does not support exact equality
+                        .supports_exact_equality(),
+                )
+                .await
         }
     }
 
@@ -478,6 +488,7 @@ impl MergeInsertJob {
             // create index from original data and key column
             self.dataset.clone(),
             index_column.clone(),
+            index.name.clone(),
             index_mapper_input,
         ));
 
@@ -695,7 +706,7 @@ impl MergeInsertJob {
     async fn update_fragments(
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
-    ) -> Result<(Vec<Fragment>, Vec<Fragment>)> {
+    ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
         let session_ctx = get_session_context(&LanceExecutionOptions {
@@ -1001,10 +1012,17 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
+        // We keep track of all fields that are updated so we can prune the indices.
+        // We could maybe be more precise since some fields are not modified in some
+        // fragments (if they were already null) but this is simpler and good enough
+        // for now.
+        let mut all_fields_updated = HashSet::new();
+
         // Collect the updated fragments, and map the field ids. Tombstone old ones
         // as needed.
         for fragment in &mut updated_fragments {
             let updated_fields = fragment.files.last().unwrap().fields.clone();
+            all_fields_updated.extend(updated_fields.iter().map(|&f| f as u32));
             for data_file in &mut fragment.files.iter_mut().rev().skip(1) {
                 for field in &mut data_file.fields {
                     if updated_fields.contains(field) {
@@ -1020,7 +1038,11 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        Ok((updated_fragments, new_fragments))
+        Ok((
+            updated_fragments,
+            new_fragments,
+            all_fields_updated.into_iter().collect(),
+        ))
     }
 
     /// Executes the merge insert job
@@ -1076,10 +1098,18 @@ impl MergeInsertJob {
                 .execute_uncommitted_impl(source_iter.next().unwrap());
             let execute_fut =
                 maybe_timeout(&backoff, start, self.params.retry_timeout, execute_fut);
-            let (transaction, mut stats) = execute_fut.await??;
+            let UncommittedMergeInsert {
+                transaction,
+                mut stats,
+                affected_rows,
+            } = execute_fut.await??;
             stats.num_attempts = backoff.attempt() + 1;
 
-            let commit_future = CommitBuilder::new(ds.clone()).execute(transaction);
+            let mut commit_builder = CommitBuilder::new(ds.clone());
+            if let Some(affected_rows) = affected_rows {
+                commit_builder = commit_builder.with_affected_rows(affected_rows);
+            }
+            let commit_future = commit_builder.execute(transaction);
             let commit_future =
                 maybe_timeout(&backoff, start, self.params.retry_timeout, commit_future);
             match commit_future.await? {
@@ -1131,7 +1161,7 @@ impl MergeInsertJob {
     pub async fn execute_uncommitted(
         self,
         source: impl StreamingWriteSource,
-    ) -> Result<(Transaction, MergeStats)> {
+    ) -> Result<UncommittedMergeInsert> {
         let stream = source.into_stream();
         self.execute_uncommitted_impl(stream).await
     }
@@ -1139,7 +1169,7 @@ impl MergeInsertJob {
     async fn execute_uncommitted_impl(
         self,
         source: SendableRecordBatchStream,
-    ) -> Result<(Transaction, MergeStats)> {
+    ) -> Result<UncommittedMergeInsert> {
         // Erase metadata on source / dataset schemas to avoid comparing metadata
         let schema = lance_core::datatypes::Schema::try_from(source.schema().as_ref())?;
         let full_schema = self.dataset.local_schema();
@@ -1162,7 +1192,7 @@ impl MergeInsertJob {
             .try_flatten();
         let stream = RecordBatchStreamAdapter::new(merger_schema, stream);
 
-        let operation = if !is_full_schema {
+        let (operation, affected_rows) = if !is_full_schema {
             if !matches!(
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
@@ -1173,14 +1203,18 @@ impl MergeInsertJob {
 
             // We will have a different commit path here too, as we are modifying
             // fragments rather than writing new ones
-            let (updated_fragments, new_fragments) =
+            let (updated_fragments, new_fragments, fields_modified) =
                 Self::update_fragments(self.dataset.clone(), Box::pin(stream)).await?;
 
-            Operation::Update {
+            let operation = Operation::Update {
                 removed_fragment_ids: Vec::new(),
                 updated_fragments,
                 new_fragments,
-            }
+                fields_modified,
+            };
+            // We have rewritten the fragments, not just the deletion files, so
+            // we can't use affected rows here.
+            (operation, None)
         } else {
             let written = write_fragments_internal(
                 Some(&self.dataset),
@@ -1202,11 +1236,17 @@ impl MergeInsertJob {
                 Self::apply_deletions(&self.dataset, &removed_row_ids).await?;
 
             // Commit updated and new fragments
-            Operation::Update {
+            let operation = Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: old_fragments,
                 new_fragments,
-            }
+                // On this path we only make deletions against updated_fragments and will not
+                // modify any field values.
+                fields_modified: vec![],
+            };
+
+            let affected_rows = Some(RowIdTreeMap::from(removed_row_ids));
+            (operation, affected_rows)
         };
 
         let stats = Arc::into_inner(merge_statistics)
@@ -1221,7 +1261,11 @@ impl MergeInsertJob {
             None,
         );
 
-        Ok((transaction, stats))
+        Ok(UncommittedMergeInsert {
+            transaction,
+            affected_rows,
+            stats,
+        })
     }
 
     // Delete a batch of rows by id, returns the fragments modified and the fragments removed
@@ -1287,6 +1331,12 @@ pub struct MergeStats {
     ///
     /// See [`MergeInsertBuilder::conflict_retries`] for more information.
     pub num_attempts: u32,
+}
+
+pub struct UncommittedMergeInsert {
+    pub transaction: Transaction,
+    pub affected_rows: Option<RowIdTreeMap>,
+    pub stats: MergeStats,
 }
 
 // A sync-safe structure that is shared by all of the "process batch" tasks.
@@ -1570,18 +1620,19 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
     use futures::future::try_join_all;
-    use lance_datafusion::utils::reader_to_stream;
+    use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use lance_io::object_store::ObjectStoreParams;
     use object_store::throttle::ThrottleConfig;
+    use roaring::RoaringBitmap;
     use tempfile::tempdir;
     use tokio::sync::{Barrier, Notify};
 
     use crate::{
         dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
         session::Session,
-        utils::test::ThrottledStoreWrapper,
+        utils::test::{DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper},
     };
 
     use super::*;
@@ -2235,6 +2286,9 @@ mod tests {
             Field::new("id", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
         ]));
+        // To benchmark scaling curve: measure how long to run
+        //
+        // And vary `concurrency` to see how it scales. Compare this again `main`.
         let concurrency = 10;
         let initial_data = RecordBatch::try_new(
             schema.clone(),
@@ -2251,8 +2305,10 @@ mod tests {
         // Increase likelihood of contention by throttling the store
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
-                wait_list_per_call: Duration::from_millis(1),
-                wait_get_per_call: Duration::from_millis(1),
+                // For benchmarking: Increase this to simulate object storage.
+                wait_list_per_call: Duration::from_millis(20),
+                wait_get_per_call: Duration::from_millis(20),
+                wait_put_per_call: Duration::from_millis(20),
                 ..Default::default()
             },
         });
@@ -2271,8 +2327,8 @@ mod tests {
             .await
             .unwrap();
 
-        // do 10 merge inserts in parallel. Each will open the dataset, signal
-        // they have opened, and then wait for a signal to proceed. Once the signal
+        // do merge inserts in parallel based on the concurrency. Each will open the dataset,
+        // signal they have opened, and then wait for a signal to proceed. Once the signal
         // is received, they will do a merge insert and close the dataset.
 
         let barrier = Arc::new(Barrier::new(concurrency as usize));
@@ -2409,19 +2465,21 @@ mod tests {
             ],
         )
         .unwrap();
-        let (transaction1, _stats) =
-            MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
-                .unwrap()
-                .when_matched(WhenMatched::UpdateAll)
-                .when_not_matched(WhenNotMatched::InsertAll)
-                .try_build()
-                .unwrap()
-                .execute_uncommitted(RecordBatchIterator::new(
-                    vec![Ok(new_data1)],
-                    schema.clone(),
-                ))
-                .await
-                .unwrap();
+        let UncommittedMergeInsert {
+            transaction: transaction1,
+            ..
+        } = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted(RecordBatchIterator::new(
+                vec![Ok(new_data1)],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
 
         // Setup a "large" merge insert, with many batches
         let new_data2 = RecordBatch::try_new(
@@ -2485,5 +2543,174 @@ mod tests {
             "All values should be 1 after merge insert. Got: {:?}",
             values
         );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_updates_indices() {
+        let test_dataset = async || {
+            let mut dataset = lance_datagen::gen()
+                .col("id", array::step::<UInt32Type>())
+                .col("value", array::step::<UInt32Type>())
+                .col("other_value", array::step::<UInt32Type>())
+                .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(20))
+                .await
+                .unwrap();
+
+            dataset
+                .create_index(
+                    &["id"],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            dataset
+                .create_index(
+                    &["value"],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            dataset
+                .create_index(
+                    &["other_value"],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            Arc::new(dataset)
+        };
+
+        let check_indices = async |dataset: &Dataset, id_frags: &[u32], value_frags: &[u32]| {
+            let id_index = dataset
+                .load_scalar_index(ScalarIndexCriteria::default().with_name("id_idx"))
+                .await
+                .unwrap();
+
+            if id_frags.is_empty() {
+                assert!(id_index.is_none());
+            } else {
+                let id_index = id_index.unwrap();
+                let id_frags_bitmap = RoaringBitmap::from_iter(id_frags.iter().copied());
+                assert_eq!(id_index.fragment_bitmap.unwrap(), id_frags_bitmap);
+            }
+
+            let value_index = dataset
+                .load_scalar_index(ScalarIndexCriteria::default().with_name("value_idx"))
+                .await
+                .unwrap();
+
+            if value_frags.is_empty() {
+                assert!(value_index.is_none());
+            } else {
+                let value_index = value_index.unwrap();
+                let value_frags_bitmap = RoaringBitmap::from_iter(value_frags.iter().copied());
+                assert_eq!(value_index.fragment_bitmap.unwrap(), value_frags_bitmap);
+            }
+
+            let other_value_index = dataset
+                .load_scalar_index(ScalarIndexCriteria::default().with_name("other_value_idx"))
+                .await
+                .unwrap()
+                .unwrap();
+
+            // We should never remove any fragments from the other_value index.
+            assert_eq!(other_value_index.fragment_bitmap.as_ref().unwrap().len(), 4);
+        };
+
+        let dataset = test_dataset().await;
+
+        // Sanity test on the initial dataset
+        check_indices(&dataset, &[0, 1, 2, 3], &[0, 1, 2, 3]).await;
+
+        // Vertical merge insert (full schema), one fragment is deleted and should be removed from
+        // the index.
+        let merge_insert = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let (dataset, _) = merge_insert
+            .execute_reader(
+                lance_datagen::gen()
+                    .col("id", array::step_custom::<UInt32Type>(50, 1))
+                    .col("value", array::step_custom::<UInt32Type>(50, 1))
+                    .col("other_value", array::step_custom::<UInt32Type>(50, 1))
+                    .into_df_stream(RowCount::from(40), BatchCount::from(1)),
+            )
+            .await
+            .unwrap();
+
+        // Fragment 3 removed but we don't remove it from the index bitmap since it is
+        // fully deleted and can't be searched anymore anyways.
+        check_indices(&dataset, &[0, 1, 2, 3], &[0, 1, 2, 3]).await;
+
+        // Now we do the same thing with a partial merge insert (only id and value)
+        let dataset = test_dataset().await;
+
+        // Vertical merge insert (full schema), one fragment is deleted and should be removed from
+        // the index.
+        let merge_insert = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let (dataset, _) = merge_insert
+            .execute_reader(
+                lance_datagen::gen()
+                    .col("id", array::step_custom::<UInt32Type>(50, 1))
+                    .col("value", array::step_custom::<UInt32Type>(50, 1))
+                    .into_df_stream(RowCount::from(40), BatchCount::from(1)),
+            )
+            .await
+            .unwrap();
+
+        // Fragment 3 is fully removed.  We could keep it technically but today it is removed
+        // which is also fine.  Fragment 2 is partially and must be removed.
+        //
+        // TODO: We should not be modifying the id_index here.  A merge_insert should not need
+        // to rewrite the id field.  However, it seems we are doing that today.  This should be
+        // fixed in
+        check_indices(&dataset, &[0, 1], &[0, 1]).await;
+
+        // One more test but this time we touch all fragments which causes the index to be removed
+        // entirely.
+        let dataset = test_dataset().await;
+
+        // Vertical merge insert (full schema), one fragment is deleted and should be removed from
+        // the index.
+        let merge_insert = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let (dataset, _) = merge_insert
+            .execute_reader(
+                lance_datagen::gen()
+                    .col("id", array::step_custom::<UInt32Type>(10, 1))
+                    .col("value", array::step_custom::<UInt32Type>(10, 1))
+                    .into_df_stream(RowCount::from(80), BatchCount::from(1)),
+            )
+            .await
+            .unwrap();
+
+        check_indices(&dataset, &[], &[]).await;
     }
 }

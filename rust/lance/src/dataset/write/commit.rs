@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::{
@@ -40,6 +41,7 @@ pub struct CommitBuilder<'a> {
     session: Option<Arc<Session>>,
     detached: bool,
     commit_config: CommitConfig,
+    affected_rows: Option<RowIdTreeMap>,
 }
 
 impl<'a> CommitBuilder<'a> {
@@ -55,6 +57,7 @@ impl<'a> CommitBuilder<'a> {
             session: None,
             detached: false,
             commit_config: Default::default(),
+            affected_rows: None,
         }
     }
 
@@ -145,6 +148,13 @@ impl<'a> CommitBuilder<'a> {
     /// If a commit operation fails, it will be retried up to `max_retries` times.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.commit_config.num_retries = max_retries;
+        self
+    }
+
+    /// Provide the set of row addresses that were deleted or updated. This is
+    /// used to perform fast conflict resolution.
+    pub fn with_affected_rows(mut self, affected_rows: RowIdTreeMap) -> Self {
+        self.affected_rows = Some(affected_rows);
         self
     }
 
@@ -285,6 +295,7 @@ impl<'a> CommitBuilder<'a> {
                     &manifest_config,
                     &self.commit_config,
                     manifest_naming_scheme,
+                    self.affected_rows.as_ref(),
                 )
                 .await?
             }
@@ -409,7 +420,10 @@ mod tests {
     use lance_io::utils::CachedFileSize;
     use lance_table::format::{DataFile, Fragment};
 
-    use crate::dataset::{InsertBuilder, WriteParams};
+    use crate::{
+        dataset::{InsertBuilder, WriteParams},
+        utils::test::StatsHolder,
+    };
 
     use super::*;
 
@@ -543,6 +557,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_commit_iops() {
+        // If there's no conflicts, we should be able to commit in 2 io requests:
+        // * write txn file (this could be optional one day)
+        // * write manifest
+        let session = Arc::new(Session::default());
+        let io_tracker = Arc::new(StatsHolder::default());
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(io_tracker.clone()),
+                ..Default::default()
+            }),
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        let data = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![0; 5]))],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&write_params)
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        io_tracker.incremental_stats(); // Reset the stats
+        let read_version = dataset.manifest().version;
+        let _ = CommitBuilder::new(Arc::new(dataset))
+            .execute(sample_transaction(read_version))
+            .await
+            .unwrap();
+
+        // Assert io requests
+        let io_stats = io_tracker.incremental_stats();
+        // this can be minimized to 0 by avoiding the initial listing from check_latest(),
+        // but it will result in 2 more iops when retrying,
+        // so we will keep the iops at 1 for now
+        assert_eq!(io_stats.read_iops, 1);
+        assert_eq!(io_stats.write_iops, 2);
+        // We can't write them in parallel. The transaction file must exist before
+        // we can write the manifest.
+        assert_eq!(io_stats.num_hops, 3);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn test_commit_conflict_iops(#[values(true, false)] use_cache: bool) {
+        let cache_size = if use_cache { 10_000 } else { 0 };
+        let session = Arc::new(Session::new(0, cache_size, Default::default()));
+        let io_tracker = Arc::new(StatsHolder::default());
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(io_tracker.clone()),
+                ..Default::default()
+            }),
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        let data = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![0; 5]))],
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&write_params)
+            .execute(vec![data])
+            .await
+            .unwrap();
+        let original_dataset = Arc::new(dataset.clone());
+
+        // Create 3 other transactions that happen concurrently.
+        let num_other_txns = 3;
+        for _ in 0..num_other_txns {
+            dataset = CommitBuilder::new(original_dataset.clone())
+                .execute(sample_transaction(dataset.manifest().version))
+                .await
+                .unwrap();
+        }
+        io_tracker.incremental_stats();
+
+        let _ = CommitBuilder::new(original_dataset.clone())
+            .execute(sample_transaction(original_dataset.manifest().version))
+            .await
+            .unwrap();
+
+        let io_stats = io_tracker.incremental_stats();
+
+        // If there is a conflict with two transaction, the retry should require io requests:
+        // * 1 list version
+        // * num_other_txns read manifests (cache-able)
+        // * num_other_txns read txn files (cache-able)
+        // * 1 write txn file
+        // * 1 write manifest
+        // For total of 3 + 2 * num_other_txns io requests. If we have caching enabled, we can skip 2 * num_other_txns
+        // of those. We should be able to read in 5 hops.
+        if use_cache {
+            assert_eq!(io_stats.read_iops, 1); // Just list versions
+            assert_eq!(io_stats.num_hops, 3);
+        } else {
+            // We need to read the other manifests and transactions.
+            // TODO: currently there is a high read and write amplification without caching
+            //  when data is not cached, some operations like checkout and read are repeatedly performed
+            //  so we cannot really get to the ideal 1 + num_other_txns * 2 situation
+            assert_eq!(io_stats.read_iops, 14);
+            assert_eq!(io_stats.num_hops, 16);
+        }
+        assert_eq!(io_stats.write_iops, 2); // txn + manifest
+    }
+
+    #[tokio::test]
     async fn test_commit_batch() {
         // Create a dataset
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -574,6 +706,7 @@ mod tests {
                 updated_fragments: vec![],
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
+                fields_modified: vec![],
             },
             read_version: 1,
             blobs_op: None,

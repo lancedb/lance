@@ -7,9 +7,53 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::Result;
 
-use crate::{optimize::OptimizeOptions, IndexParams, IndexType};
+use crate::{optimize::OptimizeOptions, scalar::ScalarIndexType, IndexParams, IndexType};
 use lance_table::format::Index;
 use uuid::Uuid;
+
+/// A set of criteria used to filter potential indices to use for a query
+#[derive(Debug, Default)]
+pub struct ScalarIndexCriteria<'a> {
+    /// Only consider indices for this column (this also means the index
+    /// maps to a single column)
+    pub for_column: Option<&'a str>,
+    /// Only consider indices with this name
+    pub has_name: Option<&'a str>,
+    /// Only consider indices with this type
+    pub has_type: Option<ScalarIndexType>,
+    /// Only consider indices that support exact equality
+    pub supports_exact_equality: bool,
+}
+
+impl<'a> ScalarIndexCriteria<'a> {
+    /// Only consider indices for this column (this also means the index
+    /// maps to a single column)
+    pub fn for_column(mut self, column: &'a str) -> Self {
+        self.for_column = Some(column);
+        self
+    }
+
+    /// Only consider indices with this name
+    pub fn with_name(mut self, name: &'a str) -> Self {
+        self.has_name = Some(name);
+        self
+    }
+
+    /// Only consider indices with this type
+    pub fn with_type(mut self, ty: ScalarIndexType) -> Self {
+        self.has_type = Some(ty);
+        self
+    }
+
+    /// Only consider indices that support exact equality
+    ///
+    /// This will disqualify, for example, the ngram and inverted indices
+    /// or an index like a bloom filter
+    pub fn supports_exact_equality(mut self) -> Self {
+        self.supports_exact_equality = true;
+        self
+    }
+}
 
 // Extends Lance Dataset with secondary index.
 #[async_trait]
@@ -93,7 +137,10 @@ pub trait DatasetIndexExt {
     }
 
     /// Loads a specific index with the given index name.
-    async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<Index>>;
+    async fn load_scalar_index<'a, 'b>(
+        &'a self,
+        criteria: ScalarIndexCriteria<'b>,
+    ) -> Result<Option<Index>>;
 
     /// Optimize indices.
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()>;

@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
+use lance_arrow::iter_str_array;
 use lance_core::cache::FileMetadataCache;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
@@ -667,9 +668,11 @@ impl NGramIndexBuilder {
                 location: location!(),
             });
         }
-        if *schema.field(0).data_type() != DataType::Utf8 {
+        if *schema.field(0).data_type() != DataType::Utf8
+            && *schema.field(0).data_type() != DataType::LargeUtf8
+        {
             return Err(Error::InvalidInput {
-                source: "First field in ngram index schema must be of type Utf8".into(),
+                source: "First field in ngram index schema must be of type Utf8/LargeUtf8".into(),
                 location: location!(),
             });
         }
@@ -771,12 +774,12 @@ impl NGramIndexBuilder {
         batch: RecordBatch,
         num_workers: usize,
     ) -> Vec<Vec<(u32, u64)>> {
-        let text_col = batch.column(0).as_string::<i32>();
+        let text_iter = iter_str_array(batch.column(0));
         let row_id_col = batch.column(1).as_primitive::<UInt64Type>();
         // Guessing 1000 tokens per row to at least avoid some of the earlier allocations
         let mut partitions = vec![Vec::with_capacity(batch.num_rows() * 1000); num_workers];
         let divisor = (MAX_TOKEN - MIN_TOKEN) / num_workers;
-        for (text, row_id) in text_col.iter().zip(row_id_col.values()) {
+        for (text, row_id) in text_iter.zip(row_id_col.values()) {
             if let Some(text) = text {
                 tokenize_visitor(tokenizer, text, |token| {
                     let token = ngram_to_token(token, NGRAM_N);

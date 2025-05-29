@@ -12,6 +12,11 @@ use snafu::location;
 pub struct FtsSearchParams {
     pub limit: Option<usize>,
     pub wand_factor: f32,
+    pub fuzziness: Option<u32>,
+    pub max_expansions: usize,
+    // None means not a phrase query
+    // Some(n) means a phrase query with slop n
+    pub phrase_slop: Option<u32>,
 }
 
 impl FtsSearchParams {
@@ -19,6 +24,9 @@ impl FtsSearchParams {
         Self {
             limit: None,
             wand_factor: 1.0,
+            fuzziness: Some(0),
+            max_expansions: 50,
+            phrase_slop: None,
         }
     }
 
@@ -29,6 +37,21 @@ impl FtsSearchParams {
 
     pub fn with_wand_factor(mut self, factor: f32) -> Self {
         self.wand_factor = factor;
+        self
+    }
+
+    pub fn with_fuzziness(mut self, fuzziness: Option<u32>) -> Self {
+        self.fuzziness = fuzziness;
+        self
+    }
+
+    pub fn with_max_expansions(mut self, max_expansions: usize) -> Self {
+        self.max_expansions = max_expansions;
+        self
+    }
+
+    pub fn with_phrase_slop(mut self, phrase_slop: Option<u32>) -> Self {
+        self.phrase_slop = phrase_slop;
         self
     }
 }
@@ -79,6 +102,7 @@ pub enum FtsQuery {
     // compound queries
     Boost(BoostQuery),
     MultiMatch(MultiMatchQuery),
+    Boolean(BooleanQuery),
 }
 
 impl std::fmt::Display for FtsQuery {
@@ -92,6 +116,13 @@ impl std::fmt::Display for FtsQuery {
                 query.positive, query.negative, query.negative_boost
             ),
             Self::MultiMatch(query) => write!(f, "MultiMatch({:?})", query),
+            Self::Boolean(query) => {
+                write!(
+                    f,
+                    "Boolean(must={:?}, should={:?})",
+                    query.must, query.should
+                )
+            }
         }
     }
 }
@@ -113,6 +144,16 @@ impl FtsQueryNode for FtsQuery {
                 }
                 columns
             }
+            Self::Boolean(query) => {
+                let mut columns = HashSet::new();
+                for query in &query.must {
+                    columns.extend(query.columns());
+                }
+                for query in &query.should {
+                    columns.extend(query.columns());
+                }
+                columns
+            }
         }
     }
 }
@@ -124,6 +165,10 @@ impl FtsQuery {
             Self::Phrase(query) => format!("\"{}\"", query.terms), // Phrase queries are quoted
             Self::Boost(query) => query.positive.query(),
             Self::MultiMatch(query) => query.match_queries[0].terms.clone(),
+            Self::Boolean(_) => {
+                // Bool queries don't have a single query string, they are composed of multiple queries
+                String::new()
+            }
         }
     }
 
@@ -135,6 +180,10 @@ impl FtsQuery {
                 query.positive.is_missing_column() || query.negative.is_missing_column()
             }
             Self::MultiMatch(query) => query.match_queries.iter().any(|q| q.column.is_none()),
+            Self::Boolean(query) => {
+                query.must.iter().any(|q| q.is_missing_column())
+                    || query.should.iter().any(|q| q.is_missing_column())
+            }
         }
     }
 
@@ -158,6 +207,19 @@ impl FtsQuery {
                     .map(|q| q.with_column(Some(column.clone())))
                     .collect();
                 Self::MultiMatch(MultiMatchQuery { match_queries })
+            }
+            Self::Boolean(query) => {
+                let must = query
+                    .must
+                    .into_iter()
+                    .map(|q| q.with_column(column.clone()))
+                    .collect();
+                let should = query
+                    .should
+                    .into_iter()
+                    .map(|q| q.with_column(column.clone()))
+                    .collect();
+                Self::Boolean(BooleanQuery { must, should })
             }
         }
     }
@@ -184,6 +246,12 @@ impl From<BoostQuery> for FtsQuery {
 impl From<MultiMatchQuery> for FtsQuery {
     fn from(query: MultiMatchQuery) -> Self {
         Self::MultiMatch(query)
+    }
+}
+
+impl From<BooleanQuery> for FtsQuery {
+    fn from(query: BooleanQuery) -> Self {
+        Self::Boolean(query)
     }
 }
 
@@ -289,6 +357,7 @@ pub struct PhraseQuery {
     // If None, it will be determined at query time.
     pub column: Option<String>,
     pub terms: String,
+    pub slop: u32,
 }
 
 impl PhraseQuery {
@@ -296,11 +365,17 @@ impl PhraseQuery {
         Self {
             column: None,
             terms,
+            slop: 0,
         }
     }
 
     pub fn with_column(mut self, column: Option<String>) -> Self {
         self.column = column;
+        self
+    }
+
+    pub fn with_slop(mut self, slop: u32) -> Self {
+        self.slop = slop;
         self
     }
 }
@@ -448,6 +523,69 @@ impl FtsQueryNode for MultiMatchQuery {
     }
 }
 
+pub enum Occur {
+    Should,
+    Must,
+}
+
+impl TryFrom<&str> for Occur {
+    type Error = Error;
+    fn try_from(value: &str) -> Result<Self> {
+        match value.to_ascii_uppercase().as_str() {
+            "SHOULD" => Ok(Self::Should),
+            "MUST" => Ok(Self::Must),
+            _ => Err(Error::invalid_input(
+                format!("Invalid occur value: {}", value),
+                location!(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BooleanQuery {
+    pub should: Vec<FtsQuery>,
+    pub must: Vec<FtsQuery>,
+    // TODO: support must_not
+}
+
+impl BooleanQuery {
+    pub fn new(iter: impl IntoIterator<Item = (Occur, FtsQuery)>) -> Self {
+        let mut should = Vec::new();
+        let mut must = Vec::new();
+        for (occur, query) in iter {
+            match occur {
+                Occur::Should => should.push(query),
+                Occur::Must => must.push(query),
+            }
+        }
+        Self { should, must }
+    }
+
+    pub fn with_should(mut self, query: FtsQuery) -> Self {
+        self.should.push(query);
+        self
+    }
+
+    pub fn with_must(mut self, query: FtsQuery) -> Self {
+        self.must.push(query);
+        self
+    }
+}
+
+impl FtsQueryNode for BooleanQuery {
+    fn columns(&self) -> HashSet<String> {
+        let mut columns = HashSet::new();
+        for query in &self.should {
+            columns.extend(query.columns());
+        }
+        for query in &self.must {
+            columns.extend(query.columns());
+        }
+        columns
+    }
+}
+
 pub fn collect_tokens(
     text: &str,
     tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
@@ -543,6 +681,19 @@ pub fn fill_fts_query_column(
                 .collect::<Result<Vec<_>>>()?;
             Ok(FtsQuery::MultiMatch(MultiMatchQuery { match_queries }))
        }
+        FtsQuery::Boolean(bool_query) => {
+            let must = bool_query
+                .must
+                .iter()
+                .map(|query| fill_fts_query_column(query, columns, replace))
+                .collect::<Result<Vec<_>>>()?;
+            let should = bool_query
+                .should
+                .iter()
+                .map(|query| fill_fts_query_column(query, columns, replace))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(FtsQuery::Boolean(BooleanQuery { must, should }))
+        }
     }
 }
 

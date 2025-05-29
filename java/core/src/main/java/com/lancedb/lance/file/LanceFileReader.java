@@ -14,6 +14,7 @@
 package com.lancedb.lance.file;
 
 import com.lancedb.lance.JniLoader;
+import com.lancedb.lance.util.Range;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
@@ -22,7 +23,10 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import javax.annotation.Nullable;
+
 import java.io.IOException;
+import java.util.List;
 
 public class LanceFileReader implements AutoCloseable {
 
@@ -43,7 +47,12 @@ public class LanceFileReader implements AutoCloseable {
 
   private native void populateSchemaNative(long arrowSchemaMemoryAddress);
 
-  private native void readAllNative(int batchSize, long streamMemoryAddress) throws IOException;
+  private native void readAllNative(
+      int batchSize,
+      @Nullable List<String> projectedNames,
+      @Nullable List<Range> ranges,
+      long streamMemoryAddress)
+      throws IOException;
 
   private LanceFileReader() {}
 
@@ -101,11 +110,15 @@ public class LanceFileReader implements AutoCloseable {
    * Read all rows from the Lance file
    *
    * @param batchSize the maximum number of rows to read in a single batch
+   * @param projectedNames optional list of column names to project; if null, all columns are read
+   * @param ranges optional array of ranges to read; if null, all rows are read.
    * @return an ArrowReader for the Lance file
    */
-  public ArrowReader readAll(int batchSize) throws IOException {
+  public ArrowReader readAll(
+      @Nullable List<String> projectedNames, @Nullable List<Range> ranges, int batchSize)
+      throws IOException {
     try (ArrowArrayStream ffiArrowArrayStream = ArrowArrayStream.allocateNew(allocator)) {
-      readAllNative(batchSize, ffiArrowArrayStream.memoryAddress());
+      readAllNative(batchSize, projectedNames, ranges, ffiArrowArrayStream.memoryAddress());
       return Data.importArrayStream(allocator, ffiArrowArrayStream);
     }
   }

@@ -77,7 +77,7 @@ use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments,
+    detect_overlapping_fragments, manifest_cache_path,
 };
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
@@ -91,8 +91,8 @@ pub use schema_evolution::{
 };
 pub use take::TakeBuilder;
 pub use write::merge_insert::{
-    MergeInsertBuilder, MergeInsertJob, MergeStats, WhenMatched, WhenNotMatched,
-    WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertJob, MergeStats, UncommittedMergeInsert, WhenMatched,
+    WhenNotMatched, WhenNotMatchedBySource,
 };
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
@@ -324,7 +324,7 @@ impl Dataset {
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
         let (manifest, manifest_location) = self.latest_manifest().await?;
-        self.manifest = Arc::new(manifest);
+        self.manifest = manifest;
         self.manifest_location = manifest_location;
         Ok(())
     }
@@ -333,6 +333,7 @@ impl Dataset {
         // We check the e_tag here just in case it has been overwritten. This can
         // happen if the table has been dropped then re-created recently.
         self.manifest.version == location.version
+            && self.manifest_location.naming_scheme == location.naming_scheme
             && location.e_tag.as_ref().is_some_and(|e_tag| {
                 self.manifest_location
                     .e_tag
@@ -591,17 +592,21 @@ impl Dataset {
             == LanceFileVersion::Legacy
     }
 
-    pub async fn latest_manifest(&self) -> Result<(Manifest, ManifestLocation)> {
+    pub async fn latest_manifest(&self) -> Result<(Arc<Manifest>, ManifestLocation)> {
         let location = self
             .commit_handler
             .resolve_latest_location(&self.base, &self.object_store)
             .await?;
 
+        // Check if manifest is in cache before reading from storage
+        let cache_path = manifest_cache_path(&location);
+        let cached_manifest = self.session.file_metadata_cache.get(&cache_path);
+        if let Some(cached_manifest) = cached_manifest {
+            return Ok((cached_manifest, location));
+        }
+
         if self.already_checked_out(&location) {
-            return Ok((
-                self.manifest.as_ref().clone(),
-                self.manifest_location.clone(),
-            ));
+            return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
         if manifest.schema.has_dictionary_types() {
@@ -614,7 +619,7 @@ impl Dataset {
             };
             populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         }
-        Ok((manifest, location))
+        Ok((Arc::new(manifest), location))
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -835,6 +840,7 @@ impl Dataset {
             write_config,
             commit_config,
             self.manifest_location.naming_scheme,
+            None,
         )
         .await?;
 
@@ -1796,16 +1802,17 @@ mod tests {
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
-    use lance_index::scalar::inverted::query::{MatchQuery, Operator, PhraseQuery};
-    use lance_index::scalar::inverted::TokenizerConfig;
-    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
+    use lance_index::scalar::inverted::{
+        query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
+        tokenizer::InvertedIndexParams,
+    };
+    use lance_index::scalar::FullTextSearchQuery;
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_io::utils::CachedFileSize;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
 
-    use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -3640,27 +3647,19 @@ mod tests {
 
         // The deletion file should contain 20 rows
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);
-        let store = dataset.object_store().clone();
-        let path = Path::from_filesystem_path(test_uri).unwrap();
         // First fragment has 0..10 deleted
-        let deletion_vector = read_deletion_file(&path, &fragments[0].metadata, &store)
-            .await
-            .unwrap()
-            .unwrap();
+        let deletion_vector = fragments[0].get_deletion_vector().await.unwrap().unwrap();
         assert_eq!(deletion_vector.len(), 10);
         assert_eq!(
-            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            deletion_vector.iter().collect::<HashSet<_>>(),
             (0..10).collect::<HashSet<_>>()
         );
         // Second fragment has 90..100 deleted
-        let deletion_vector = read_deletion_file(&path, &fragments[1].metadata, &store)
-            .await
-            .unwrap()
-            .unwrap();
+        let deletion_vector = fragments[1].get_deletion_vector().await.unwrap().unwrap();
         assert_eq!(deletion_vector.len(), 10);
         // The second fragment starts at 50, so 90..100 becomes 40..50 in local row ids.
         assert_eq!(
-            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            deletion_vector.iter().collect::<HashSet<_>>(),
             (40..50).collect::<HashSet<_>>()
         );
         let second_deletion_file = fragments[1].metadata.deletion_file.clone().unwrap();
@@ -3674,13 +3673,10 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert!(fragments[0].metadata.deletion_file.is_some());
-        let deletion_vector = read_deletion_file(&path, &fragments[0].metadata, &store)
-            .await
-            .unwrap()
-            .unwrap();
+        let deletion_vector = fragments[0].get_deletion_vector().await.unwrap().unwrap();
         assert_eq!(deletion_vector.len(), 20);
         assert_eq!(
-            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            deletion_vector.iter().collect::<HashSet<_>>(),
             (0..20).collect::<HashSet<_>>()
         );
         // Second deletion vector was not rewritten
@@ -5090,26 +5086,22 @@ mod tests {
     >(
         is_list: bool,
         with_position: bool,
-        tokenizer: TokenizerConfig,
+        params: InvertedIndexParams,
     ) -> Dataset {
         let tempdir = tempfile::tempdir().unwrap();
         let uri = tempdir.path().to_str().unwrap().to_owned();
         tempdir.close().unwrap();
 
-        let mut params = InvertedIndexParams::default().with_position(with_position);
-        params.tokenizer_config = tokenizer;
+        let params = params.with_position(with_position);
         let doc_col: Arc<dyn Array> = if is_list {
             let string_builder = GenericStringBuilder::<Offset>::new();
             let mut list_col = GenericListBuilder::<ListOffset, _>::new(string_builder);
             // Create a list of strings
-            list_col.values().append_value("lance database"); // for testing phrase query
-            list_col.values().append_value("the");
-            list_col.values().append_value("search");
+            list_col.values().append_value("lance database the search"); // for testing phrase query
             list_col.append(true);
             list_col.values().append_value("lance database"); // for testing phrase query
             list_col.append(true);
-            list_col.values().append_value("lance");
-            list_col.values().append_value("search");
+            list_col.values().append_value("lance search");
             list_col.append(true);
             list_col.values().append_value("database");
             list_col.values().append_value("search");
@@ -5162,9 +5154,12 @@ mod tests {
     >(
         is_list: bool,
     ) {
-        let ds =
-            create_fts_dataset::<Offset, ListOffset>(is_list, false, TokenizerConfig::default())
-                .await;
+        let ds = create_fts_dataset::<Offset, ListOffset>(
+            is_list,
+            false,
+            InvertedIndexParams::default(),
+        )
+        .await;
         let result = ds
             .scan()
             .project(&["id"])
@@ -5174,11 +5169,11 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 3);
+        assert_eq!(result.num_rows(), 3, "{:?}", result);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert!(ids.contains(&0));
-        assert!(ids.contains(&1));
-        assert!(ids.contains(&2));
+        assert!(ids.contains(&0), "{:?}", result);
+        assert!(ids.contains(&1), "{:?}", result);
+        assert!(ids.contains(&2), "{:?}", result);
 
         let result = ds
             .scan()
@@ -5191,9 +5186,9 @@ mod tests {
             .unwrap();
         assert_eq!(result.num_rows(), 3);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert!(ids.contains(&0));
-        assert!(ids.contains(&1));
-        assert!(ids.contains(&3));
+        assert!(ids.contains(&0), "{:?}", result);
+        assert!(ids.contains(&1), "{:?}", result);
+        assert!(ids.contains(&3), "{:?}", result);
 
         let result = ds
             .scan()
@@ -5211,7 +5206,10 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_rows(), 2, "{:?}", result);
+        let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert!(ids.contains(&0), "{:?}", result);
+        assert!(ids.contains(&1), "{:?}", result);
 
         let result = ds
             .scan()
@@ -5247,7 +5245,7 @@ mod tests {
 
         // recreate the index with position
         let ds =
-            create_fts_dataset::<Offset, ListOffset>(is_list, true, TokenizerConfig::default())
+            create_fts_dataset::<Offset, ListOffset>(is_list, true, InvertedIndexParams::default())
                 .await;
         let result = ds
             .scan()
@@ -5327,6 +5325,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.num_rows(), 0);
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(PhraseQuery::new("lance search".to_owned()).into())
+                    .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    PhraseQuery::new("lance search".to_owned())
+                        .with_slop(2)
+                        .into(),
+                )
+                .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    PhraseQuery::new("search lance".to_owned())
+                        .with_slop(2)
+                        .into(),
+                )
+                .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 0);
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                // must contain "lance" and "database", and may contain "search"
+                FullTextSearchQuery::new_query(
+                    BooleanQuery::new([
+                        (
+                            Occur::Should,
+                            MatchQuery::new("search".to_owned())
+                                .with_operator(Operator::And)
+                                .into(),
+                        ),
+                        (
+                            Occur::Must,
+                            MatchQuery::new("lance database".to_owned())
+                                .with_operator(Operator::And)
+                                .into(),
+                        ),
+                    ])
+                    .into(),
+                )
+                .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2, "{:?}", result);
+        let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert!(ids.contains(&0), "{:?}", result);
+        assert!(ids.contains(&1), "{:?}", result);
     }
 
     #[tokio::test]
@@ -5345,7 +5427,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fts_accented_chars() {
-        let ds = create_fts_dataset::<i32, i32>(false, false, TokenizerConfig::default()).await;
+        let ds = create_fts_dataset::<i32, i32>(false, false, InvertedIndexParams::default()).await;
         let result = ds
             .scan()
             .project(&["id"])
@@ -5372,7 +5454,9 @@ mod tests {
         let ds = create_fts_dataset::<i32, i32>(
             false,
             false,
-            TokenizerConfig::default().ascii_folding(true),
+            InvertedIndexParams::default()
+                .stem(false)
+                .ascii_folding(true),
         )
         .await;
         let result = ds
@@ -6213,5 +6297,26 @@ mod tests {
         drop(dataset2);
         drop(dataset);
         assert_eq!(registry.active_stores().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_v2_manifest_paths() {
+        let tmp_dir = tempdir().unwrap();
+        let test_uri = tmp_dir.path().to_str().unwrap();
+
+        let data = lance_datagen::gen()
+            .col("key", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, test_uri, None).await.unwrap();
+        assert_eq!(
+            dataset.manifest_location().naming_scheme,
+            ManifestNamingScheme::V1
+        );
+
+        dataset.migrate_manifest_paths_v2().await.unwrap();
+        assert_eq!(
+            dataset.manifest_location().naming_scheme,
+            ManifestNamingScheme::V2
+        );
     }
 }

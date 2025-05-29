@@ -161,6 +161,78 @@ def test_dataset_from_record_batch_iterable(tmp_path: Path):
     assert list(dataset.to_batches())[0].to_pylist() == test_pylist
 
 
+def test_to_batches_with_partial_last_batch(tmp_path: Path):
+    base_dir = tmp_path / "test_batches"
+    row_count_per_file = 32
+    batch_size = 5
+
+    # Generate 3 batches of 32 rows each (96 total)
+    pylist = [{"colA": f"Row{i}", "colB": i} for i in range(row_count_per_file * 3)]
+    batches = [
+        pa.RecordBatch.from_pylist(
+            pylist[i * row_count_per_file : (i + 1) * row_count_per_file]
+        )
+        for i in range(3)
+    ]
+
+    # Write dataset
+    schema = pa.schema([pa.field("colA", pa.string()), pa.field("colB", pa.int64())])
+    lance.write_dataset(batches, base_dir, schema, max_rows_per_file=row_count_per_file)
+    dataset = lance.dataset(base_dir)
+
+    # Check batch sizes
+    # strict_batch_size = True, batch_size = 5(batch_size < row_count_per_file),
+    all_batches = list(
+        dataset.to_batches(batch_size=batch_size, strict_batch_size=True)
+    )
+    assert sum(b.num_rows for b in all_batches) == row_count_per_file * 3  # Total rows
+    assert all(b.num_rows == batch_size for b in all_batches[:-1])  # Full batches
+    assert all_batches[-1].num_rows == 1  # Final partial batch
+    # Verify data integrity
+    combined = [row for batch in all_batches for row in batch.to_pylist()]
+    assert combined == pylist
+
+    # strict_batch_size = True, batch_size = 5*10 (batch_size > row_count_per_file),
+    large_batch_size = 10 * batch_size
+    all_batches = list(
+        dataset.to_batches(batch_size=large_batch_size, strict_batch_size=True)
+    )
+    assert sum(b.num_rows for b in all_batches) == row_count_per_file * 3  # Total rows
+    assert all(b.num_rows == large_batch_size for b in all_batches[:-1])  # Full batches
+    assert all_batches[-1].num_rows == 46  # Final partial batch
+
+    # strict_batch_size = False
+    # fragment 32 rows --> [5,5,5,5,5,5,2]
+    all_batches = list(
+        dataset.to_batches(batch_size=batch_size, strict_batch_size=False)
+    )
+    assert sum(b.num_rows for b in all_batches) == row_count_per_file * 3  # Total rows
+    partial_batches = [b for b in all_batches if b.num_rows < batch_size]
+    partial_batch_count = 3
+    assert len(partial_batches) == partial_batch_count
+    assert all(b.num_rows == 2 for b in partial_batches[:-1])
+
+    # strict_batch_size = False, batch_size = 5*10 (batch_size > row_count_per_file),
+    all_batches = list(
+        dataset.to_batches(batch_size=large_batch_size, strict_batch_size=False)
+    )
+    assert sum(b.num_rows for b in all_batches) == row_count_per_file * 3  # Total rows
+    assert all(b.num_rows == 32 for b in all_batches)  # Full batches
+    # 32 rows, 1 row per file
+    ds = lance.write_dataset(
+        pa.table({"a": range(32)}), base_dir, max_rows_per_file=1, mode="overwrite"
+    )
+    # 1 row per batch if strict_batch_size is False (regardless of batch_size)
+    for batch in ds.to_batches():
+        assert batch.num_rows == 1
+    for batch in ds.to_batches(batch_size=8):
+        assert batch.num_rows == 1
+
+    # We should get 8 rows per batch if strict_batch_size is True
+    for batch in ds.to_batches(batch_size=8, strict_batch_size=True):
+        assert batch.num_rows == 8
+
+
 def test_schema_metadata(tmp_path: Path):
     schema = pa.schema(
         [
@@ -779,6 +851,25 @@ def test_count_rows(tmp_path: Path):
     assert dataset.count_rows(filter="a < 50") == 50
 
 
+def test_count_rows_via_scanner(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"a": range(100), "b": range(100)}), tmp_path)
+
+    assert ds.scanner(filter="a < 50", columns=[], with_row_id=True).count_rows() == 50
+
+    with pytest.raises(
+        ValueError, match="should not be called on a plan selecting columns"
+    ):
+        ds.scanner(filter="a < 50", columns=["a"], with_row_id=True).count_rows()
+
+    with pytest.raises(
+        ValueError, match="should not be called on a plan selecting columns"
+    ):
+        ds.scanner(with_row_id=True).count_rows()
+
+    with pytest.raises(ValueError, match="with_row_id is false"):
+        ds.scanner(columns=[]).count_rows()
+
+
 def test_select_none(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -804,7 +895,10 @@ def test_analyze_index_scan(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("filter", "BTREE")
     plan = dataset.scanner(filter="filter = 10").analyze_plan()
-    assert "MaterializeIndex: query=filter = 10, metrics=[output_rows=1" in plan
+    assert (
+        "MaterializeIndex: query=[filter = 10]@filter_idx, metrics=[output_rows=1"
+        in plan
+    )
 
 
 def test_analyze_scan(tmp_path: Path):
@@ -3122,12 +3216,16 @@ def test_dataset_schema(tmp_path: Path):
 
 
 def test_data_replacement(tmp_path: Path):
-    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    table = pa.Table.from_pydict({"a": range(100), "b": [str(i) for i in range(100)]})
     base_dir = tmp_path / "test"
 
     dataset = lance.write_dataset(table, base_dir)
 
-    table = pa.Table.from_pydict({"a": range(100, 200), "b": range(100, 200)})
+    # Note: by using a string column here we are making sure the new file has a
+    # different size than the old file (this regresses a bug).
+    table = pa.Table.from_pydict(
+        {"a": range(100, 200), "b": [str(i) for i in range(100, 200)]}
+    )
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
     data_file = fragment.files[0]
     data_replacement = lance.LanceOperation.DataReplacement(
@@ -3140,7 +3238,7 @@ def test_data_replacement(tmp_path: Path):
     expected = pa.Table.from_pydict(
         {
             "a": list(range(100, 200)),
-            "b": list(range(100, 200)),
+            "b": list([str(i) for i in range(100, 200)]),
         }
     )
     assert tbl == expected

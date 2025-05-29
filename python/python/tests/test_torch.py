@@ -5,6 +5,9 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+
+pytest.importorskip("torch")
+
 from lance.torch.data import SafeLanceDataset, get_safe_loader  # noqa: E402
 
 

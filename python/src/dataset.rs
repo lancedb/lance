@@ -43,8 +43,8 @@ use lance::dataset::{
     scanner::Scanner as LanceScanner,
     transaction::{Operation, Transaction},
     Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
-    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
-    WriteParams,
+    UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource, WriteMode, WriteParams,
 };
 use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
@@ -54,10 +54,10 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::inverted::query::{
-    BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
+    BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
+use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::query::Occur};
 use lance_index::{
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams, ScalarIndexType},
@@ -236,7 +236,9 @@ impl MergeInsertBuilder {
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let (transaction, stats) = RT
+        let UncommittedMergeInsert {
+            transaction, stats, ..
+        } = RT
             .spawn(Some(py), job.execute_uncommitted(new_data))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
@@ -354,7 +356,16 @@ impl Dataset {
                 ));
             };
         }
-        if let Some(storage_options) = storage_options {
+        if let Some(mut storage_options) = storage_options {
+            if let Some(user_agent) = storage_options.get_mut("user_agent") {
+                user_agent.push_str(&format!(" pylance/{}", env!("CARGO_PKG_VERSION")));
+            } else {
+                storage_options.insert(
+                    "user_agent".to_string(),
+                    format!("pylance/{}", env!("CARGO_PKG_VERSION")),
+                );
+            }
+
             builder = builder.with_storage_options(storage_options);
         }
         if let Some(manifest) = manifest {
@@ -502,7 +513,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -528,6 +539,7 @@ impl Dataset {
         use_scalar_index: Option<bool>,
         include_deleted_rows: Option<bool>,
         scan_stats_callback: Option<&Bound<'_, PyAny>>,
+        strict_batch_size: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -704,6 +716,10 @@ impl Dataset {
 
         if let Some(use_scalar_index) = use_scalar_index {
             scanner.use_scalar_index(use_scalar_index);
+        }
+
+        if let Some(strict_batch_size) = strict_batch_size {
+            scanner.strict_batch_size(strict_batch_size);
         }
 
         if let Some(nearest) = nearest {
@@ -1283,45 +1299,35 @@ impl Dataset {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
                     if let Some(with_position) = kwargs.get_item("with_position")? {
-                        params.with_position = with_position.extract()?;
+                        params = params.with_position(with_position.extract()?);
                     }
                     if let Some(base_tokenizer) = kwargs.get_item("base_tokenizer")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .base_tokenizer(base_tokenizer.extract()?);
+                        params = params.base_tokenizer(base_tokenizer.extract()?);
                     }
                     if let Some(language) = kwargs.get_item("language")? {
                         let language: PyBackedStr =
                             language.downcast::<PyString>()?.clone().try_into()?;
-                        params.tokenizer_config =
-                            params.tokenizer_config.language(&language).map_err(|e| {
-                                PyValueError::new_err(format!(
-                                    "can't set tokenizer language to {}: {:?}",
-                                    language, e
-                                ))
-                            })?;
+                        params = params.language(&language).map_err(|e| {
+                            PyValueError::new_err(format!(
+                                "can't set tokenizer language to {}: {:?}",
+                                language, e
+                            ))
+                        })?;
                     }
                     if let Some(max_token_length) = kwargs.get_item("max_token_length")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .max_token_length(max_token_length.extract()?);
+                        params = params.max_token_length(max_token_length.extract()?);
                     }
                     if let Some(lower_case) = kwargs.get_item("lower_case")? {
-                        params.tokenizer_config =
-                            params.tokenizer_config.lower_case(lower_case.extract()?);
+                        params = params.lower_case(lower_case.extract()?);
                     }
                     if let Some(stem) = kwargs.get_item("stem")? {
-                        params.tokenizer_config = params.tokenizer_config.stem(stem.extract()?);
+                        params = params.stem(stem.extract()?);
                     }
                     if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .remove_stop_words(remove_stop_words.extract()?);
+                        params = params.remove_stop_words(remove_stop_words.extract()?);
                     }
                     if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .ascii_folding(ascii_folding.extract()?);
+                        params = params.ascii_folding(ascii_folding.extract()?);
                     }
                 }
                 Box::new(params)
@@ -2216,10 +2222,13 @@ impl PyFullTextQuery {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (query, column))]
-    fn phrase_query(query: String, column: String) -> PyResult<Self> {
+    #[pyo3(signature = (query, column, slop))]
+    fn phrase_query(query: String, column: String, slop: u32) -> PyResult<Self> {
         Ok(Self {
-            inner: PhraseQuery::new(query).with_column(Some(column)).into(),
+            inner: PhraseQuery::new(query)
+                .with_column(Some(column))
+                .with_slop(slop)
+                .into(),
         })
     }
 
@@ -2253,6 +2262,21 @@ impl PyFullTextQuery {
 
         Ok(Self {
             inner: q.with_operator(op).into(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (queries))]
+    fn boolean_query(queries: Vec<(String, Self)>) -> PyResult<Self> {
+        let mut sub_queries = Vec::with_capacity(queries.len());
+        for (occur, q) in queries {
+            let occur = Occur::try_from(occur.as_str())
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            sub_queries.push((occur, q.inner));
+        }
+
+        Ok(Self {
+            inner: BooleanQuery::new(sub_queries).into(),
         })
     }
 }

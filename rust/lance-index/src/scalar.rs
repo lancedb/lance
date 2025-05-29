@@ -20,10 +20,8 @@ use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
-use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
-use serde::{Deserialize, Serialize};
 use snafu::location;
 
 use crate::metrics::MetricsCollector;
@@ -38,9 +36,11 @@ pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
 
+pub use inverted::tokenizer::InvertedIndexParams;
+
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ScalarIndexType {
     BTree,
     Bitmap,
@@ -98,48 +98,6 @@ impl IndexParams for ScalarIndexParams {
 
     fn index_name(&self) -> &str {
         LANCE_SCALAR_INDEX
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct InvertedIndexParams {
-    /// If true, store the position of the term in the document
-    /// This can significantly increase the size of the index
-    /// If false, only store the frequency of the term in the document
-    /// Default is true
-    pub with_position: bool,
-
-    #[serde(flatten)]
-    pub tokenizer_config: TokenizerConfig,
-}
-
-impl Debug for InvertedIndexParams {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InvertedIndexParams")
-            .field("with_position", &self.with_position)
-            .finish()
-    }
-}
-
-impl DeepSizeOf for InvertedIndexParams {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        0
-    }
-}
-
-impl Default for InvertedIndexParams {
-    fn default() -> Self {
-        Self {
-            with_position: true,
-            tokenizer_config: TokenizerConfig::default(),
-        }
-    }
-}
-
-impl InvertedIndexParams {
-    pub fn with_position(mut self, with_position: bool) -> Self {
-        self.with_position = with_position;
-        self
     }
 }
 
@@ -329,9 +287,12 @@ impl FullTextSearchQuery {
     }
 
     pub fn params(&self) -> FtsSearchParams {
-        FtsSearchParams {
-            limit: self.limit.map(|limit| limit as usize),
-            wand_factor: self.wand_factor.unwrap_or(1.0),
+        let params = FtsSearchParams::new()
+            .with_limit(self.limit.map(|limit| limit as usize))
+            .with_wand_factor(self.wand_factor.unwrap_or(1.0));
+        match self.query {
+            FtsQuery::Phrase(ref query) => params.with_phrase_slop(Some(query.slop)),
+            _ => params,
         }
     }
 }

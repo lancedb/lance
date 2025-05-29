@@ -25,6 +25,7 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatchIterator;
 use arrow_schema::DataType;
+use arrow_schema::Schema as ArrowSchema;
 use jni::objects::{JMap, JString, JValue};
 use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
@@ -1117,6 +1118,37 @@ fn inner_add_columns_by_reader(
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
     RT.block_on(dataset_guard.inner.add_columns(transform, None, batch_size))?;
+
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAddColumnsBySchema(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    schema_ptr: jlong, // Schema pointer
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_add_columns_by_schema(&mut env, java_dataset, schema_ptr)
+    )
+}
+
+fn inner_add_columns_by_schema(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    schema_ptr: jlong,
+) -> Result<()> {
+    let c_schema = unsafe { FFI_ArrowSchema::from_raw(schema_ptr as *mut _) };
+
+    let schema = ArrowSchema::try_from(&c_schema)
+        .map_err(|_| Error::input_error("ArrowSchema conversion error".to_string()))?;
+
+    let transform = NewColumnTransform::AllNulls(Arc::new(schema));
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+    RT.block_on(dataset_guard.inner.add_columns(transform, None, None))?;
 
     Ok(())
 }

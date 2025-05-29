@@ -335,9 +335,9 @@ must be atomic and consistent for all writers. If two writers try to commit
 using different mechanisms, they may overwrite each other's changes. For any
 storage system that natively supports atomic rename-if-not-exists or
 put-if-not-exists, these operations should be used. This is true of local file
-systems and cloud object stores, with the notable except of AWS S3. For ones
-that lack this functionality, an external locking mechanism can be configured
-by the user.
+systems and most cloud object stores including Amazon S3, Google Cloud Storage,
+Microsoft Azure Blob Storage. For ones that lack this functionality,
+an external locking mechanism can be configured by the user.
 
 Manifest Naming Schemes
 ~~~~~~~~~~~~~~~~~~~~~~~
