@@ -67,14 +67,14 @@ impl TryFrom<IndexType> for ScalarIndexType {
     }
 }
 
-impl Into<IndexType> for ScalarIndexType {
-    fn into(self) -> IndexType {
-        match self {
-            ScalarIndexType::BTree => IndexType::BTree,
-            ScalarIndexType::Bitmap => IndexType::Bitmap,
-            ScalarIndexType::LabelList => IndexType::LabelList,
-            ScalarIndexType::NGram => IndexType::NGram,
-            ScalarIndexType::Inverted => IndexType::Inverted,
+impl From<ScalarIndexType> for IndexType {
+    fn from(val: ScalarIndexType) -> Self {
+        match val {
+            ScalarIndexType::BTree => Self::BTree,
+            ScalarIndexType::Bitmap => Self::Bitmap,
+            ScalarIndexType::LabelList => Self::LabelList,
+            ScalarIndexType::NGram => Self::NGram,
+            ScalarIndexType::Inverted => Self::Inverted,
         }
     }
 }
