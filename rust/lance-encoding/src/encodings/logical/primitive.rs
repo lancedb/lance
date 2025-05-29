@@ -17,7 +17,7 @@ use arrow_buffer::{bit_util, BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt, TryStreamExt};
 use itertools::Itertools;
-use lance_arrow::deepcopy::deep_copy_array;
+use lance_arrow::deepcopy::{deep_copy_array, deep_copy_nulls};
 use lance_core::{
     cache::{Context, DeepSizeOf},
     datatypes::{
@@ -4531,15 +4531,23 @@ impl PrimitiveStructuralEncoder {
         Ok(vec![task])
     }
 
-    fn extract_validity_buf(array: &dyn Array, repdef: &mut RepDefBuilder) {
+    fn extract_validity_buf(
+        array: &dyn Array,
+        repdef: &mut RepDefBuilder,
+        keep_original_array: bool,
+    ) {
         if let Some(validity) = array.nulls() {
-            repdef.add_validity_bitmap(validity.clone());
+            if keep_original_array {
+                repdef.add_validity_bitmap(Some(validity.clone()).unwrap());
+            } else {
+                repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap());
+            }
         } else {
             repdef.add_no_null(array.len());
         }
     }
 
-    fn extract_validity(array: &dyn Array, repdef: &mut RepDefBuilder) {
+    fn extract_validity(array: &dyn Array, repdef: &mut RepDefBuilder, keep_original_array: bool) {
         match array.data_type() {
             DataType::Null => {
                 repdef.add_validity_bitmap(NullBuffer::new(BooleanBuffer::new_unset(array.len())));
@@ -4555,7 +4563,7 @@ impl PrimitiveStructuralEncoder {
             // had thousands of vectors and some were null but no vector contained null items.  If
             // we treated the vectors (primitive FSL) like we treat structural FSL we would end up
             // with a rep/def value for every single item in the vector.
-            _ => Self::extract_validity_buf(array, repdef),
+            _ => Self::extract_validity_buf(array, repdef, keep_original_array),
         }
     }
 }
@@ -4570,7 +4578,11 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        Self::extract_validity(array.as_ref(), &mut repdef);
+        Self::extract_validity(
+            array.as_ref(),
+            &mut repdef,
+            self.accumulation_queue.keep_original_array,
+        );
         self.accumulated_repdefs.push(repdef);
 
         if let Some((arrays, row_number, num_rows)) =
