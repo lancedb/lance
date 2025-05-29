@@ -2020,8 +2020,8 @@ mod tests {
                 ..Default::default()
             }),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let options = CompactionOptions {
             target_rows_per_fragment: 2_000,
@@ -2031,9 +2031,14 @@ mod tests {
 
         let mut compact_read_versions = Vec::new();
         for i in 0..10 {
-            dataset.delete(&format!("i < {}", 500 * (i + 1))).await.unwrap();
+            dataset
+                .delete(&format!("i < {}", 500 * (i + 1)))
+                .await
+                .unwrap();
             compact_read_versions.push(dataset.manifest.version);
-            compact_files(&mut dataset, options.clone(), None).await.unwrap();
+            compact_files(&mut dataset, options.clone(), None)
+                .await
+                .unwrap();
 
             let indices_after_compact = dataset.load_indices().await.unwrap();
             let frag_reuse_indices: Vec<_> = indices_after_compact
@@ -2054,7 +2059,11 @@ mod tests {
 
             // Verify the index has one version with the correct dataset version
             assert_eq!(
-                frag_reuse_index.details.versions.iter().map(|v| v.dataset_version)
+                frag_reuse_index
+                    .details
+                    .versions
+                    .iter()
+                    .map(|v| v.dataset_version)
                     .collect::<Vec<_>>(),
                 compact_read_versions
             );

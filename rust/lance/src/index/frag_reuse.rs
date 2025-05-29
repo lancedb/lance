@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use crate::dataset::optimize::remapping::transpose_row_ids;
 use crate::Dataset;
 use lance_core::Error;
@@ -152,7 +155,6 @@ pub async fn build_new_frag_reuse_index(
             offset: 0,
             size: new_index_details_proto.encoded_len() as u64,
         };
-        println!("external file written: {:?}", external_file);
         FragmentReuseIndexDetails {
             content: Some(Content::External(external_file)),
         }

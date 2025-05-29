@@ -55,6 +55,7 @@ use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 use lance_table::{
@@ -72,7 +73,6 @@ use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
-use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 
 /// A change to a dataset that can be retried
 ///
@@ -1772,8 +1772,8 @@ impl Transaction {
             existing_index
                 .fields
                 .iter()
-                .all(|field_id| field_ids.contains(field_id)) ||
-            existing_index.name == FRAG_REUSE_INDEX_NAME
+                .all(|field_id| field_ids.contains(field_id))
+                || existing_index.name == FRAG_REUSE_INDEX_NAME
         });
 
         let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
@@ -1785,8 +1785,8 @@ impl Transaction {
                 .fragment_bitmap
                 .as_ref()
                 .map(|bitmap| bitmap.iter().any(|id| fragment_ids.contains(&(id as u64))))
-                .unwrap_or(true) ||
-            existing_index.name == FRAG_REUSE_INDEX_NAME
+                .unwrap_or(true)
+                || existing_index.name == FRAG_REUSE_INDEX_NAME
         });
     }
 
