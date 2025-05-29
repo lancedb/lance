@@ -288,10 +288,7 @@ pub fn get_index_params(
     }
 }
 
-pub fn to_rust_map<'local>(
-    env: &mut JNIEnv<'local>,
-    jmap: &JMap,
-) -> Result<HashMap<String, String>> {
+pub fn to_rust_map(env: &mut JNIEnv, jmap: &JMap) -> Result<HashMap<String, String>> {
     env.with_local_frame(16, |env| {
         let mut map = HashMap::new();
         let mut iter = jmap.iter(env)?;

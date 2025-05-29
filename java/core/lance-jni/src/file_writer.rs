@@ -79,8 +79,10 @@ fn inner_open<'local>(
     let storage_options = to_rust_map(env, &jmap)?;
 
     let writer = RT.block_on(async move {
-        let mut object_params = ObjectStoreParams::default();
-        object_params.storage_options = Some(storage_options);
+        let object_params = ObjectStoreParams {
+            storage_options: Some(storage_options),
+            ..Default::default()
+        };
         let (obj_store, path) = ObjectStore::from_uri_and_params(
             Arc::new(ObjectStoreRegistry::default()),
             &file_uri_str,
