@@ -15,7 +15,7 @@
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
-use crate::utils::{extract_storage_options, extract_write_params, get_index_params};
+use crate::utils::{extract_storage_options, extract_write_params, get_index_params, to_rust_map};
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
@@ -439,19 +439,7 @@ pub fn inner_commit_overwrite<'local>(
     let path_str = path.extract(env)?;
     let read_version = env.get_u64_opt(&read_version_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
-    let storage_options: HashMap<String, String> = env.with_local_frame(16, |env| {
-        let mut map = HashMap::new();
-        let mut iter = jmap.iter(env)?;
-        while let Some((key, value)) = iter.next(env)? {
-            let key_jstring = JString::from(key);
-            let value_jstring = JString::from(value);
-            let key_string: String = env.get_string(&key_jstring)?.into();
-            let value_string: String = env.get_string(&value_jstring)?.into();
-            map.insert(key_string, value_string);
-        }
-        Ok::<_, Error>(map)
-    })?;
-
+    let storage_options = to_rust_map(env, &jmap)?;
     let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options)?;
     dataset.into_java(env)
 }
@@ -556,20 +544,7 @@ fn inner_open_native<'local>(
     let version = env.get_int_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
-    let storage_options: HashMap<String, String> = env.with_local_frame(16, |env| {
-        let mut map = HashMap::new();
-        let mut iter = jmap.iter(env)?;
-
-        while let Some((key, value)) = iter.next(env)? {
-            let key_jstring = JString::from(key);
-            let value_jstring = JString::from(value);
-            let key_string: String = env.get_string(&key_jstring)?.into();
-            let value_string: String = env.get_string(&value_jstring)?.into();
-            map.insert(key_string, value_string);
-        }
-
-        Ok::<_, Error>(map)
-    })?;
+    let storage_options = to_rust_map(env, &jmap)?;
     let dataset = BlockingDataset::open(
         &path_str,
         version,

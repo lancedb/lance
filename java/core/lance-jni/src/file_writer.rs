@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use crate::utils::to_rust_map;
 use crate::{
     error::{Error, Result},
     traits::IntoJava,
@@ -10,6 +11,7 @@ use arrow::{
     ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema},
 };
 use arrow_schema::DataType;
+use jni::objects::JMap;
 use jni::{
     objects::{JObject, JString},
     sys::jlong,
@@ -20,6 +22,7 @@ use lance_file::{
     v2::writer::{FileWriter, FileWriterOptions},
     version::LanceFileVersion,
 };
+use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
 
 pub const NATIVE_WRITER: &str = "nativeFileWriterHandle";
 
@@ -61,15 +64,29 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_openNative<'l
     mut env: JNIEnv<'local>,
     _writer_class: JObject,
     file_uri: JString,
+    storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
-    ok_or_throw!(env, inner_open(&mut env, file_uri,))
+    ok_or_throw!(env, inner_open(&mut env, file_uri, storage_options_obj))
 }
 
-fn inner_open<'local>(env: &mut JNIEnv<'local>, file_uri: JString) -> Result<JObject<'local>> {
+fn inner_open<'local>(
+    env: &mut JNIEnv<'local>,
+    file_uri: JString,
+    storage_options_obj: JObject,
+) -> Result<JObject<'local>> {
     let file_uri_str: String = env.get_string(&file_uri)?.into();
+    let jmap = JMap::from_env(env, &storage_options_obj)?;
+    let storage_options = to_rust_map(env, &jmap)?;
 
     let writer = RT.block_on(async move {
-        let (obj_store, path) = ObjectStore::from_uri(&file_uri_str).await?;
+        let mut object_params = ObjectStoreParams::default();
+        object_params.storage_options = Some(storage_options);
+        let (obj_store, path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            &file_uri_str,
+            &object_params,
+        )
+        .await?;
         let obj_store = Arc::new(obj_store);
         let obj_writer = obj_store.create(&path).await?;
 
