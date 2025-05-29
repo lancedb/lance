@@ -581,29 +581,25 @@ impl DatasetIndexExt for Dataset {
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
-            let Some((new_id, removed, mut new_frag_ids, new_version)) =
-                merge_indices(dataset.clone(), deltas.as_slice(), options).await?
+            let Some(res) = merge_indices(dataset.clone(), deltas.as_slice(), options).await?
             else {
                 continue;
             };
-            for removed_idx in removed.iter() {
-                new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
-            }
 
             let last_idx = deltas.last().expect("Delta indices should not be empty");
             let new_idx = IndexMetadata {
-                uuid: new_id,
+                uuid: res.new_uuid,
                 name: last_idx.name.clone(), // Keep the same name
                 fields: last_idx.fields.clone(),
                 dataset_version: self.manifest.version,
-                fragment_bitmap: Some(new_frag_ids),
+                fragment_bitmap: Some(res.new_fragment_bitmap),
                 index_details: last_idx.index_details.clone(),
-                index_version: new_version,
+                index_version: res.new_index_version,
             };
-            removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
-            if deltas.len() > removed.len() {
+            removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
+            if deltas.len() > res.removed_indices.len() {
                 new_indices.extend(
-                    deltas[0..(deltas.len() - removed.len())]
+                    deltas[0..(deltas.len() - res.removed_indices.len())]
                         .iter()
                         .map(|&idx| idx.clone()),
                 );
