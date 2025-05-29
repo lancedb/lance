@@ -134,7 +134,7 @@ impl IndexCache {
         (self.scalar_cache.entry_count()
             + self.vector_cache.entry_count()
             + self.vector_partition_cache.entry_count()
-            + self.metadata_cache.entry_count()
+            + self.frag_reuse_cache.entry_count()
             + self.metadata_cache.entry_count()) as usize
     }
 
