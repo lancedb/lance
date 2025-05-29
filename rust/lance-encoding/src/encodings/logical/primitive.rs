@@ -4538,7 +4538,7 @@ impl PrimitiveStructuralEncoder {
     ) {
         if let Some(validity) = array.nulls() {
             if keep_original_array {
-                repdef.add_validity_bitmap(Some(validity.clone()).unwrap());
+                repdef.add_validity_bitmap(validity.clone());
             } else {
                 repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap());
             }
