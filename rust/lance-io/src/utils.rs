@@ -176,10 +176,10 @@ pub fn read_struct_from_buf<
 /// Read the size of given directory.
 pub fn read_dir_size(path: impl AsRef<Path>) -> Result<usize> {
     let path = path.as_ref();
-    let mut entries = std::fs::read_dir(path)
+    let entries = std::fs::read_dir(path)
         .map_err(|e| Error::io(format!("{:?}:{:?}", e, path), location!()))?;
     let mut size = 0;
-    while let Some(entry) = entries.next() {
+    for entry in entries {
         let entry = entry.map_err(|e| Error::io(e.to_string(), location!()))?;
         let metadata = entry
             .metadata()

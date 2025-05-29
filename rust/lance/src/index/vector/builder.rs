@@ -872,6 +872,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     // for testing purpose
     #[inline(always)]
+    #[cfg(debug_assertions)]
     async fn assert_disk_size(&self, expected: Option<usize>) -> Result<()> {
         // don't check HNSW  for now,
         // because the size of HNSW index is not deterministic
