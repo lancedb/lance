@@ -3982,7 +3982,7 @@ def write_dataset(
         secondary indices need to be updated to point to new row ids.
     auto_cleanup_options: optional, AutoCleanupConfig
         Config options for automatic cleanup of the dataset.
-        If some and this is a new dataset, old dataset versions will be automatically
+        If set, and this is a new dataset, old dataset versions will be automatically
         cleaned up according to this parameter.
         To add autocleaning to an existing dataset, use Dataset::update_config to set
         lance.auto_cleanup.interval and lance.auto_cleanup.older_than.
