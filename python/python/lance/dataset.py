@@ -3989,7 +3989,7 @@ def write_dataset(
         Both parameters must be set to invoke autocleaning.
         If you do not set this parameter(default behavior),
         then no autocleaning will be performed.
-        Note: this config options only take effect when creating a new dataset,
+        Note: this option only takes effect when creating a new dataset,
         it has no effect on existing datasets.
     """
     if use_legacy_format is not None:
