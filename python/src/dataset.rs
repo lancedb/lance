@@ -54,10 +54,10 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::inverted::query::{
-    BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
+    BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
+use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::query::Occur};
 use lance_index::{
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams, ScalarIndexType},
@@ -2262,6 +2262,21 @@ impl PyFullTextQuery {
 
         Ok(Self {
             inner: q.with_operator(op).into(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (queries))]
+    fn boolean_query(queries: Vec<(String, Self)>) -> PyResult<Self> {
+        let mut sub_queries = Vec::with_capacity(queries.len());
+        for (occur, q) in queries {
+            let occur = Occur::try_from(occur.as_str())
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            sub_queries.push((occur, q.inner));
+        }
+
+        Ok(Self {
+            inner: BooleanQuery::new(sub_queries).into(),
         })
     }
 }

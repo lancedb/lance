@@ -18,8 +18,7 @@ use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::ROW_ID;
-use lance_index::prefilter::PreFilter;
+use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
 use lance_index::scalar::inverted::query::{
     collect_tokens, BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery,
 };
@@ -27,6 +26,7 @@ use lance_index::scalar::inverted::{
     flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
 };
 use lance_index::scalar::ScalarIndexType;
+use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
 use tracing::instrument;
 
@@ -250,7 +250,7 @@ impl ExecutionPlan for MatchQueryExec {
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed(),
+            stream.stream_in_current_span().boxed(),
         )))
     }
 
@@ -397,7 +397,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         .try_flatten_unordered(None);
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed(),
+            stream.stream_in_current_span().boxed(),
             partition,
             &self.metrics,
         )))
@@ -608,7 +608,7 @@ impl ExecutionPlan for PhraseQueryExec {
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed(),
+            stream.stream_in_current_span().boxed(),
         )))
     }
 
@@ -769,7 +769,189 @@ impl ExecutionPlan for BoostQueryExec {
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed(),
+            stream.stream_in_current_span().boxed(),
+        )))
+    }
+
+    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
+        Ok(Statistics::new_unknown(&FTS_SCHEMA))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+}
+
+#[derive(Debug)]
+pub struct BooleanQueryExec {
+    query: BooleanQuery,
+    params: FtsSearchParams,
+    should: Arc<dyn ExecutionPlan>,
+    must: Option<Arc<dyn ExecutionPlan>>,
+
+    properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl DisplayAs for BooleanQueryExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "BooleanQuery: must={}, should={}",
+                    self.query.must.len(),
+                    self.query.should.len()
+                )
+            }
+        }
+    }
+}
+
+impl BooleanQueryExec {
+    pub fn new(
+        query: BooleanQuery,
+        params: FtsSearchParams,
+        should: Arc<dyn ExecutionPlan>,
+        must: Option<Arc<dyn ExecutionPlan>>,
+    ) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            query,
+            params,
+            must,
+            should,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
+
+impl ExecutionPlan for BooleanQueryExec {
+    fn name(&self) -> &str {
+        "BooleanQueryExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        match &self.must {
+            Some(must) => vec![&self.should, must],
+            None => vec![&self.should],
+        }
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // This node fully consumes and re-orders the input rows.
+        // It must be run on a single partition.
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        match children.len() {
+            1 => {
+                let should = children.pop().unwrap();
+                Ok(Arc::new(Self {
+                    query: self.query.clone(),
+                    params: self.params.clone(),
+                    should,
+                    must: None,
+                    properties: self.properties.clone(),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                }))
+            }
+            2 => {
+                let should = children.pop().unwrap();
+                let must = children.pop().unwrap();
+                Ok(Arc::new(Self {
+                    query: self.query.clone(),
+                    params: self.params.clone(),
+                    should,
+                    must: Some(must),
+                    properties: self.properties.clone(),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                }))
+            }
+            _ => Err(DataFusionError::Internal(
+                "Unexpected number of children".to_string(),
+            )),
+        }
+    }
+
+    #[instrument(name = "bool_query_exec", level = "debug", skip_all)]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let params = self.params.clone();
+        let must = self
+            .must
+            .as_ref()
+            .map(|m| m.execute(partition, context.clone()))
+            .transpose()?;
+        let mut should = self.should.execute(partition, context)?;
+
+        let Some(mut must) = must else {
+            // If there is no must clause, we can just return the should clause
+            return Ok(should);
+        };
+
+        let stream = stream::once(async move {
+            let mut res = HashMap::new();
+            while let Some(batch) = must.try_next().await? {
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+                let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+                res.extend(std::iter::zip(
+                    row_ids.iter().copied(),
+                    scores.iter().copied(),
+                ));
+            }
+
+            while let Some(batch) = should.try_next().await? {
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+                let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+                for (row_id, score) in std::iter::zip(row_ids, scores) {
+                    if let Some(existing_score) = res.get_mut(row_id) {
+                        *existing_score += score;
+                    }
+                }
+            }
+
+            let (row_ids, scores): (Vec<_>, Vec<_>) = res
+                .into_iter()
+                .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
+                .take(params.limit.unwrap_or(usize::MAX))
+                .unzip();
+            let batch = RecordBatch::try_new(
+                FTS_SCHEMA.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(row_ids)),
+                    Arc::new(Float32Array::from(scores)),
+                ],
+            )?;
+            Ok::<_, DataFusionError>(batch)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream.stream_in_current_span().boxed(),
         )))
     }
 
