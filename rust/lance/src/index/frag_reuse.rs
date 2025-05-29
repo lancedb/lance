@@ -54,23 +54,19 @@ pub async fn load_frag_reuse_index_details(
                 .child(index.uuid.to_string())
                 .child(external_file.path.clone());
 
-            dataset
-                .session
-                .file_metadata_cache
-                .get_or_insert(&file_path, |_path| async {
-                    let range = external_file.offset as usize
-                        ..(external_file.offset as usize + external_file.size as usize);
-                    let data = dataset
-                        .object_store
-                        .open(&file_path)
-                        .await?
-                        .get_range(range)
-                        .await?;
+            // the file content will be cached in the index cache later
+            // so we do not put it to the file cache
+            let range = external_file.offset as usize
+                ..(external_file.offset as usize + external_file.size as usize);
+            let data = dataset
+                .object_store
+                .open(&file_path)
+                .await?
+                .get_range(range)
+                .await?;
 
-                    let pb_sequence = InlineContent::decode(data)?;
-                    FragReuseIndexDetails::try_from(pb_sequence)
-                })
-                .await
+            let pb_sequence = InlineContent::decode(data)?;
+            Ok(Arc::new(FragReuseIndexDetails::try_from(pb_sequence)?))
         }
     }
 }
