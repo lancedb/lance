@@ -179,7 +179,7 @@ pub async fn merge_indices<'a>(
         }),
     }?;
 
-    let removed_indices = old_indices[..old_indices.len() - indices_merged].to_vec();
+    let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();
     for removed in removed_indices.iter() {
         frag_bitmap |= removed.fragment_bitmap.as_ref().unwrap();
     }
