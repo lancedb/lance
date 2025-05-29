@@ -1,7 +1,11 @@
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use crate::{error::{Error, Result}, traits::IntoJava, JNIEnvExt, RT};
+use crate::{
+    error::{Error, Result},
+    traits::IntoJava,
+    JNIEnvExt, RT,
+};
 use arrow::{array::RecordBatchReader, ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
 use jni::{
@@ -38,7 +42,7 @@ impl BlockingFileReader {
         batch_size: u32,
         read_batch_params: ReadBatchParams,
         reader_projection: Option<ReaderProjection>,
-        filter_expression: FilterExpression
+        filter_expression: FilterExpression,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         Ok(self.inner.read_stream_projected_blocking(
             read_batch_params,
@@ -183,12 +187,11 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
     mut env: JNIEnv<'_>,
     reader: JObject,
     batch_size: jint,
-    projected_names:JObject,
+    projected_names: JObject,
     selection_ranges: JObject,
     stream_addr: jlong,
 ) {
-    let result = (|| -> Result<()>
-    {
+    let result = (|| -> Result<()> {
         let mut read_parameter = ReadBatchParams::default();
         let mut reader_projection: Option<ReaderProjection> = None;
         // We get reader here not from env.get_rust_field, because we need reader: MutexGuard<BlockingFileReader> has no relationship with the env lifecycle.
@@ -196,20 +199,25 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
         #[allow(unused_variables)]
         let reader = unsafe {
             let reader_ref = reader.as_ref();
-            let ptr = env.get_field(reader_ref, NATIVE_READER, "J")?.j()? as *mut Mutex<BlockingFileReader>;
+            let ptr = env.get_field(reader_ref, NATIVE_READER, "J")?.j()?
+                as *mut Mutex<BlockingFileReader>;
             let guard = env.lock_obj(reader_ref)?;
             if ptr.is_null() {
-                return Err(Error::io_error("FileReader has already been closed".to_string()));
+                return Err(Error::io_error(
+                    "FileReader has already been closed".to_string(),
+                ));
             }
             (*ptr).lock().unwrap()
         };
-        
+
         if !projected_names.is_null() {
             let schema = Schema::try_from(reader.schema()?.as_ref())?;
-            let column_names: Vec<String> = env
-                .get_strings(&projected_names)?;
+            let column_names: Vec<String> = env.get_strings(&projected_names)?;
             let names: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
-            reader_projection = Some(ReaderProjection::from_column_names(&schema, names.as_slice())?);
+            reader_projection = Some(ReaderProjection::from_column_names(
+                &schema,
+                names.as_slice(),
+            )?);
         }
 
         if !selection_ranges.is_null() {
@@ -228,14 +236,24 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
                     continue;
                 }
 
-                let start_val = env.call_method(&item_obj, "getStart", "()I", &[]).and_then(|v| v.i())?;
-                let end_val = env.call_method(&item_obj, "getEnd", "()I", &[]).and_then(|v| v.i())?;
+                let start_val = env
+                    .call_method(&item_obj, "getStart", "()I", &[])
+                    .and_then(|v| v.i())?;
+                let end_val = env
+                    .call_method(&item_obj, "getEnd", "()I", &[])
+                    .and_then(|v| v.i())?;
 
                 if start_val < 0 || end_val < 0 {
-                    return Err(Error::input_error(format!("Invalid range values (negative): start={}, end={}", start_val, end_val)));
+                    return Err(Error::input_error(format!(
+                        "Invalid range values (negative): start={}, end={}",
+                        start_val, end_val
+                    )));
                 }
                 if start_val > end_val {
-                    return Err(Error::input_error(format!("Invalid range (start > end): start={}, end={}", start_val, end_val)));
+                    return Err(Error::input_error(format!(
+                        "Invalid range (start > end): start={}, end={}",
+                        start_val, end_val
+                    )));
                 }
 
                 ranges.push(Range {
@@ -247,7 +265,14 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
             }
             read_parameter = ReadBatchParams::Ranges(ranges.into_boxed_slice().into());
         }
-        inner_read_all(&reader, batch_size, read_parameter, reader_projection, FilterExpression::no_filter(), stream_addr)
+        inner_read_all(
+            &reader,
+            batch_size,
+            read_parameter,
+            reader_projection,
+            FilterExpression::no_filter(),
+            stream_addr,
+        )
     })();
     if let Err(e) = result {
         e.throw(&mut env);
@@ -262,7 +287,12 @@ fn inner_read_all(
     filter_expression: FilterExpression,
     stream_addr: jlong,
 ) -> Result<()> {
-    let arrow_stream = reader.open_stream(batch_size as u32, read_batch_params, reader_projection, filter_expression)?;
+    let arrow_stream = reader.open_stream(
+        batch_size as u32,
+        read_batch_params,
+        reader_projection,
+        filter_expression,
+    )?;
     let ffi_stream = FFI_ArrowArrayStream::new(arrow_stream);
     unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
     Ok(())
