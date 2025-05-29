@@ -19,7 +19,7 @@ use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
 
-pub(crate) struct IndexMergeResults<'a> {
+pub struct IndexMergeResults<'a> {
     pub new_uuid: Uuid,
     pub removed_indices: Vec<&'a IndexMetadata>,
     pub new_fragment_bitmap: RoaringBitmap,
