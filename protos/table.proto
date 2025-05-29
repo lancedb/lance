@@ -394,9 +394,10 @@ message FragmentReuseIndexDetails {
     bytes changed_row_addrs = 2;
 
     // Store the full content of old fragments to be used for indexed queries
+    // This should be exactly in the order that a rewrite_files takes in the old fragments
     repeated DataFragment old_fragments = 3;
 
-    // This could use a bitmap, but might be overkill because new fragment count is typically small
+    // This must be exactly in the order that a rewrite_files produces the new fragments
     repeated uint64 new_fragments = 4;
   }
 }
