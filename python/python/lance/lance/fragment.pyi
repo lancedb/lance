@@ -88,6 +88,9 @@ class DeletionFile:
     def __reduce__(self) -> tuple: ...
 
 class RowIdMeta:
+    def asdict(self) -> dict:
+        """Get a dictionary representation of the deletion file."""
+        ...
     def json(self) -> str:
         """Get a JSON representation of the row id metadata.
 
