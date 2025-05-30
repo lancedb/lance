@@ -398,9 +398,10 @@ impl DisplayAs for ANNIvfPartitionExec {
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "ANNIvfPartition\nuuid={}\nnprobes={}\ndeltas={}",
+                    "ANNIvfPartition\nuuid={}\nminimum_nprobes={}\nmaximum_nprobes={:?}\ndeltas={}",
                     self.index_uuids[0],
-                    self.query.nprobes,
+                    self.query.minimum_nprobes,
+                    self.query.maximum_nprobes,
                     self.index_uuids.len()
                 )
             }
