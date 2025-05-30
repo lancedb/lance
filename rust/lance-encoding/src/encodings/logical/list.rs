@@ -1295,10 +1295,7 @@ impl FieldEncoder for ListStructuralEncoder {
                 repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned())
             } else {
                 // there is no need to deep copy offsets, because offset buffers will be cast to a common type (i64).
-                repdef.add_offsets(
-                    list_arr.offsets().clone(),
-                    deep_copy_nulls(Some(array.nulls().unwrap())),
-                )
+                repdef.add_offsets(list_arr.offsets().clone(), deep_copy_nulls(array.nulls()))
             };
             if has_garbage_values {
                 list_arr.filter_garbage_nulls().trimmed_values()
@@ -1309,10 +1306,7 @@ impl FieldEncoder for ListStructuralEncoder {
             let has_garbage_values = if self.keep_original_array {
                 repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned())
             } else {
-                repdef.add_offsets(
-                    list_arr.offsets().clone(),
-                    deep_copy_nulls(Some(array.nulls().unwrap())),
-                )
+                repdef.add_offsets(list_arr.offsets().clone(), deep_copy_nulls(array.nulls()))
             };
             if has_garbage_values {
                 list_arr.filter_garbage_nulls().trimmed_values()
