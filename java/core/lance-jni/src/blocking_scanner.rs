@@ -190,8 +190,13 @@ fn inner_create_scanner<'local>(
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
         let _ = scanner.nearest(&column, &key, k);
 
-        let nprobes = env.get_int_as_usize_from_method(&java_obj, "getNprobes")?;
-        scanner.nprobs(nprobes);
+        let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNProbes")?;
+        scanner.minimum_nprobes(minimum_nprobes);
+
+        let maximum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMaximumNProbes")?;
+        if let Some(maximum_nprobes) = maximum_nprobes {
+            scanner.maximum_nprobes(maximum_nprobes);
+        }
 
         if let Some(ef) = env.get_optional_usize_from_method(&java_obj, "getEf")? {
             scanner.ef(ef);

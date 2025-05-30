@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
+use std::iter;
 use std::ops::{Range, RangeBounds};
 use std::{collections::BTreeMap, io::Read};
 
@@ -203,6 +204,66 @@ impl RowIdMask {
             block_list,
             allow_list,
         })
+    }
+
+    /// Return the maximum number of row ids that could be selected by this mask
+    ///
+    /// Will be None if there is no allow list
+    pub fn max_len(&self) -> Option<u64> {
+        if let Some(allow_list) = &self.allow_list {
+            // If there is a block list we could theoretically intersect the two
+            // but it's not clear if that is worth the effort.  Feel free to add later.
+            allow_list.len()
+        } else {
+            None
+        }
+    }
+
+    /// Iterate over the row ids that are selected by the mask
+    ///
+    /// This is only possible if there is an allow list and neither the
+    /// allow list nor the block list contain any "full fragment" blocks.
+    ///
+    /// TODO: We could probably still iterate efficiently even if the block
+    /// list contains "full fragment" blocks but that would require some
+    /// extra logic.
+    pub fn iter_ids(&self) -> Option<Box<dyn Iterator<Item = RowAddress> + '_>> {
+        if let Some(allow_list) = &self.allow_list {
+            if let Some(mut allow_iter) = allow_list.row_ids() {
+                if let Some(block_list) = &self.block_list {
+                    if let Some(block_iter) = block_list.row_ids() {
+                        let mut block_iter = block_iter.peekable();
+                        Some(Box::new(iter::from_fn(move || {
+                            for allow_id in allow_iter.by_ref() {
+                                while let Some(block_id) = block_iter.peek() {
+                                    if *block_id >= allow_id {
+                                        break;
+                                    }
+                                    block_iter.next();
+                                }
+                                if let Some(block_id) = block_iter.peek() {
+                                    if *block_id == allow_id {
+                                        continue;
+                                    }
+                                }
+                                return Some(allow_id);
+                            }
+                            None
+                        })))
+                    } else {
+                        // There is a block list but we can't iterate over it, give up
+                        None
+                    }
+                } else {
+                    // There is no block list, use the allow list
+                    Some(Box::new(allow_iter))
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 }
 
@@ -1072,5 +1133,54 @@ mod tests {
             left -= &right;
             prop_assert_eq!(expected, left);
         }
+
+    }
+
+    #[test]
+    fn test_iter_ids() {
+        let mut mask = RowIdMask::default();
+        assert!(mask.iter_ids().is_none());
+
+        // Test with just an allow list
+        let mut allow_list = RowIdTreeMap::default();
+        allow_list.extend([1, 5, 10].iter().copied());
+        mask.allow_list = Some(allow_list);
+
+        let ids: Vec<_> = mask.iter_ids().unwrap().collect();
+        assert_eq!(
+            ids,
+            vec![
+                RowAddress::new_from_parts(0, 1),
+                RowAddress::new_from_parts(0, 5),
+                RowAddress::new_from_parts(0, 10)
+            ]
+        );
+
+        // Test with both allow list and block list
+        let mut block_list = RowIdTreeMap::default();
+        block_list.extend([5].iter().copied());
+        mask.block_list = Some(block_list);
+
+        let ids: Vec<_> = mask.iter_ids().unwrap().collect();
+        assert_eq!(
+            ids,
+            vec![
+                RowAddress::new_from_parts(0, 1),
+                RowAddress::new_from_parts(0, 10)
+            ]
+        );
+
+        // Test with full fragment in block list
+        let mut block_list = RowIdTreeMap::default();
+        block_list.insert_fragment(0);
+        mask.block_list = Some(block_list);
+        assert!(mask.iter_ids().is_none());
+
+        // Test with full fragment in allow list
+        mask.block_list = None;
+        let mut allow_list = RowIdTreeMap::default();
+        allow_list.insert_fragment(0);
+        mask.allow_list = Some(allow_list);
+        assert!(mask.iter_ids().is_none());
     }
 }

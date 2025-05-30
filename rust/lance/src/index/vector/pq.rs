@@ -286,6 +286,10 @@ impl VectorIndex for PQIndex {
         unimplemented!("only for IVF")
     }
 
+    fn total_partitions(&self) -> usize {
+        1
+    }
+
     async fn search_in_partition(
         &self,
         _: usize,
@@ -390,10 +394,6 @@ impl VectorIndex for PQIndex {
 
     fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
-    }
-
-    fn check_can_remap(&self) -> Result<()> {
-        Ok(())
     }
 
     async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
