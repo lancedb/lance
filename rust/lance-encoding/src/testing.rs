@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-    ops::Range,
-    sync::Arc,
-};
+use std::{cmp::Ordering, collections::HashMap, ops::Range, ptr::NonNull, sync::Arc};
 
 use arrow::array::make_comparator;
 use arrow_array::{Array, StructArray, UInt64Array};
@@ -499,19 +494,28 @@ impl SimulatedWriter {
     }
 }
 
-fn get_data_buffer_addrs_helper(arr: &ArrayData, buffers: &mut HashSet<u64>) {
+fn get_data_buffer_addrs_helper(arr: &ArrayData, buffers: &mut HashMap<NonNull<u8>, usize>) {
     for buffer in arr.buffers() {
-        buffers.insert(buffer.as_ptr() as u64);
+        buffers.insert(buffer.data_ptr(), buffer.strong_count());
+    }
+    if let Some(nulls) = arr.nulls() {
+        let buffer = nulls.inner().inner();
+        buffers.insert(buffer.data_ptr(), buffer.strong_count());
     }
     for child in arr.child_data() {
         get_data_buffer_addrs_helper(child, buffers);
     }
 }
 
-fn get_data_buffer_addrs(arr: &dyn Array) -> HashSet<u64> {
-    let mut buffers = HashSet::<u64>::new();
+fn get_data_buffer_addrs(arr: &dyn Array) -> HashMap<NonNull<u8>, usize> {
+    let mut buffers = HashMap::<NonNull<u8>, usize>::new();
     get_data_buffer_addrs_helper(&arr.to_data(), &mut buffers);
     buffers
+}
+
+fn verify_data_buffer_addrs(arr: &dyn Array, snapshot: &HashMap<NonNull<u8>, usize>) {
+    let data_buffer_addrs = get_data_buffer_addrs(arr);
+    assert_eq!(data_buffer_addrs, *snapshot);
 }
 
 /// This is the inner-most check function that actually runs the round trip and tests it
@@ -525,7 +529,7 @@ async fn check_round_trip_encoding_inner(
 
     let mut row_number = 0;
     for arr in &data {
-        let data_buffer_addrs = get_data_buffer_addrs(arr);
+        let data_buffer_snapshot = get_data_buffer_addrs(arr);
 
         let mut external_buffers = writer.new_external_buffers();
         let repdef = RepDefBuilder::default();
@@ -539,6 +543,8 @@ async fn check_round_trip_encoding_inner(
                 num_rows,
             )
             .unwrap();
+
+        verify_data_buffer_addrs(arr, &data_buffer_snapshot);
         for buffer in external_buffers.take_buffers() {
             writer.write_lance_buffer(buffer);
         }

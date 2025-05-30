@@ -192,47 +192,111 @@ version = "54.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc208515aa0151028e464cc94a692156e945ce5126abd3537bb7fd6ba2143ed1"
 dependencies = [
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-csv",
- "arrow-data",
- "arrow-ipc",
- "arrow-json",
- "arrow-ord",
- "arrow-row",
- "arrow-schema",
- "arrow-select",
- "arrow-string",
+ "arrow-arith 54.3.1",
+ "arrow-array 54.3.1",
+ "arrow-buffer 54.3.1",
+ "arrow-cast 54.3.1",
+ "arrow-csv 54.3.1",
+ "arrow-data 54.3.1",
+ "arrow-ipc 54.3.1",
+ "arrow-json 54.3.1",
+ "arrow-ord 54.2.1",
+ "arrow-row 54.2.1",
+ "arrow-schema 54.3.1",
+ "arrow-select 54.3.1",
+ "arrow-string 54.2.1",
+]
+
+[[package]]
+name = "arrow"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
+dependencies = [
+ "arrow-arith 55.1.0",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-cast 55.1.0",
+ "arrow-csv 55.1.0",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-ipc 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-json 55.1.0",
+ "arrow-ord 55.1.0",
+ "arrow-row 55.1.0",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-select 55.1.0",
+ "arrow-string 55.1.0",
 ]
 
 [[package]]
 name = "arrow-arith"
-version = "54.2.1"
+version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e07e726e2b3f7816a85c6a45b6ec118eeeabf0b2a8c208122ad949437181f49a"
+checksum = "8fc766fdacaf804cb10c7c70580254fcdb5d55cdfda2bc57b02baf5223a3af9e"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 54.3.1",
+ "arrow-buffer 54.3.1",
+ "arrow-data 54.3.1",
+ "arrow-schema 54.3.1",
+ "chrono",
+ "num",
+]
+
+[[package]]
+name = "arrow-arith"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
+dependencies = [
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "chrono",
  "num",
 ]
 
 [[package]]
 name = "arrow-array"
-version = "54.2.1"
+version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2262eba4f16c78496adfd559a29fe4b24df6088efc9985a873d58e92be022d5"
+checksum = "a12fcdb3f1d03f69d3ec26ac67645a8fe3f878d77b5ebb0b15d64a116c212985"
 dependencies = [
  "ahash",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-buffer 54.3.1",
+ "arrow-data 54.3.1",
+ "arrow-schema 54.3.1",
  "chrono",
  "chrono-tz",
+ "half",
+ "hashbrown 0.15.2",
+ "num",
+]
+
+[[package]]
+name = "arrow-array"
+version = "55.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29ed77e22744475a9a53d00026cf8e166fe73cf42d89c4c4ae63607ee1cfcc3f"
+dependencies = [
+ "ahash",
+ "arrow-buffer 55.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "arrow-data 55.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "arrow-schema 55.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "chrono",
+ "half",
+ "hashbrown 0.15.2",
+ "num",
+]
+
+[[package]]
+name = "arrow-array"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
+dependencies = [
+ "ahash",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "chrono",
  "half",
  "hashbrown 0.15.2",
  "num",
@@ -250,16 +314,57 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrow-cast"
-version = "54.2.1"
+name = "arrow-buffer"
+version = "55.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4103d88c5b441525ed4ac23153be7458494c2b0c9a11115848fdb9b81f6f886a"
+checksum = "b0391c96eb58bf7389171d1e103112d3fc3e5625ca6b372d606f2688f1ea4cce"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "bytes",
+ "half",
+ "num",
+]
+
+[[package]]
+name = "arrow-buffer"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
+dependencies = [
+ "bytes",
+ "half",
+ "num",
+]
+
+[[package]]
+name = "arrow-cast"
+version = "54.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ede6175fbc039dfc946a61c1b6d42fd682fcecf5ab5d148fbe7667705798cac9"
+dependencies = [
+ "arrow-array 54.3.1",
+ "arrow-buffer 54.3.1",
+ "arrow-data 54.3.1",
+ "arrow-schema 54.3.1",
+ "arrow-select 54.3.1",
+ "atoi",
+ "base64 0.22.1",
+ "chrono",
+ "comfy-table",
+ "half",
+ "lexical-core",
+ "num",
+ "ryu",
+]
+
+[[package]]
+name = "arrow-cast"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
+dependencies = [
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-select 55.1.0",
  "atoi",
  "base64 0.22.1",
  "chrono",
@@ -272,13 +377,28 @@ dependencies = [
 
 [[package]]
 name = "arrow-csv"
-version = "54.2.1"
+version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43d3cb0914486a3cae19a5cad2598e44e225d53157926d0ada03c20521191a65"
+checksum = "1644877d8bc9a0ef022d9153dc29375c2bda244c39aec05a91d0e87ccf77995f"
 dependencies = [
- "arrow-array",
- "arrow-cast",
- "arrow-schema",
+ "arrow-array 54.3.1",
+ "arrow-cast 54.3.1",
+ "arrow-schema 54.3.1",
+ "chrono",
+ "csv",
+ "csv-core",
+ "lazy_static",
+ "regex",
+]
+
+[[package]]
+name = "arrow-csv"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
+dependencies = [
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-cast 55.1.0",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "chrono",
  "csv",
  "csv-core",
@@ -292,45 +412,116 @@ version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61cfdd7d99b4ff618f167e548b2411e5dd2c98c0ddebedd7df433d34c20a4429"
 dependencies = [
- "arrow-buffer",
- "arrow-schema",
+ "arrow-buffer 54.3.1",
+ "arrow-schema 54.3.1",
+ "half",
+ "num",
+]
+
+[[package]]
+name = "arrow-data"
+version = "55.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf75ac27a08c7f48b88e5c923f267e980f27070147ab74615ad85b5c5f90473d"
+dependencies = [
+ "arrow-buffer 55.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "arrow-schema 55.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "half",
+ "num",
+]
+
+[[package]]
+name = "arrow-data"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
+dependencies = [
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "half",
  "num",
 ]
 
 [[package]]
 name = "arrow-ipc"
-version = "54.2.1"
+version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddecdeab02491b1ce88885986e25002a3da34dd349f682c7cfe67bab7cc17b86"
+checksum = "62ff528658b521e33905334723b795ee56b393dbe9cf76c8b1f64b648c65a60c"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
- "flatbuffers",
+ "arrow-array 54.3.1",
+ "arrow-buffer 54.3.1",
+ "arrow-data 54.3.1",
+ "arrow-schema 54.3.1",
+ "flatbuffers 24.12.23",
  "lz4_flex",
+]
+
+[[package]]
+name = "arrow-ipc"
+version = "55.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a222f0d93772bd058d1268f4c28ea421a603d66f7979479048c429292fac7b2e"
+dependencies = [
+ "arrow-array 55.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "arrow-buffer 55.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "arrow-data 55.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "arrow-schema 55.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "flatbuffers 25.2.10",
  "zstd",
 ]
 
 [[package]]
-name = "arrow-json"
-version = "54.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d03b9340013413eb84868682ace00a1098c81a5ebc96d279f7ebf9a4cac3c0fd"
+name = "arrow-ipc"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "flatbuffers 25.2.10",
+]
+
+[[package]]
+name = "arrow-json"
+version = "54.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ee5b4ca98a7fb2efb9ab3309a5d1c88b5116997ff93f3147efdc1062a6158e9"
+dependencies = [
+ "arrow-array 54.3.1",
+ "arrow-buffer 54.3.1",
+ "arrow-cast 54.3.1",
+ "arrow-data 54.3.1",
+ "arrow-schema 54.3.1",
  "chrono",
  "half",
  "indexmap",
  "lexical-core",
+ "memchr",
  "num",
  "serde",
  "serde_json",
+ "simdutf8",
+]
+
+[[package]]
+name = "arrow-json"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
+dependencies = [
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-cast 55.1.0",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "chrono",
+ "half",
+ "indexmap",
+ "lexical-core",
+ "memchr",
+ "num",
+ "serde",
+ "serde_json",
+ "simdutf8",
 ]
 
 [[package]]
@@ -339,11 +530,23 @@ version = "54.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f841bfcc1997ef6ac48ee0305c4dfceb1f7c786fe31e67c1186edf775e1f1160"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "arrow-array 54.3.1",
+ "arrow-buffer 54.3.1",
+ "arrow-data 54.3.1",
+ "arrow-schema 54.3.1",
+ "arrow-select 54.3.1",
+]
+
+[[package]]
+name = "arrow-ord"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
+dependencies = [
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-select 55.1.0",
 ]
 
 [[package]]
@@ -352,10 +555,22 @@ version = "54.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1eeb55b0a0a83851aa01f2ca5ee5648f607e8506ba6802577afdda9d75cdedcd"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 54.3.1",
+ "arrow-buffer 54.3.1",
+ "arrow-data 54.3.1",
+ "arrow-schema 54.3.1",
+ "half",
+]
+
+[[package]]
+name = "arrow-row"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
+dependencies = [
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "half",
 ]
 
@@ -364,21 +579,45 @@ name = "arrow-schema"
 version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cfaf5e440be44db5413b75b72c2a87c1f8f0627117d110264048f2969b99e9"
+
+[[package]]
+name = "arrow-schema"
+version = "55.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73a47aa0c771b5381de2b7f16998d351a6f4eb839f1e13d48353e17e873d969b"
+
+[[package]]
+name = "arrow-schema"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
 dependencies = [
  "bitflags 2.9.0",
 ]
 
 [[package]]
 name = "arrow-select"
-version = "54.2.1"
+version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e2932aece2d0c869dd2125feb9bd1709ef5c445daa3838ac4112dcfa0fda52c"
+checksum = "69efcd706420e52cd44f5c4358d279801993846d1c2a8e52111853d61d55a619"
 dependencies = [
  "ahash",
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 54.3.1",
+ "arrow-buffer 54.3.1",
+ "arrow-data 54.3.1",
+ "arrow-schema 54.3.1",
+ "num",
+]
+
+[[package]]
+name = "arrow-select"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
+dependencies = [
+ "ahash",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "num",
 ]
 
@@ -388,11 +627,27 @@ version = "54.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "912e38bd6a7a7714c1d9b61df80315685553b7455e8a6045c27531d8ecd5b458"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "arrow-array 54.3.1",
+ "arrow-buffer 54.3.1",
+ "arrow-data 54.3.1",
+ "arrow-schema 54.3.1",
+ "arrow-select 54.3.1",
+ "memchr",
+ "num",
+ "regex",
+ "regex-syntax 0.8.5",
+]
+
+[[package]]
+name = "arrow-string"
+version = "55.1.0"
+source = "git+https://github.com/westonpace/arrow-rs.git?tag=strong-count#ea361a67923f53532a67ef23a41f40d9b8579297"
+dependencies = [
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-select 55.1.0",
  "memchr",
  "num",
  "regex",
@@ -1355,15 +1610,15 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chrono"
-version = "0.4.39"
+version = "0.4.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e36cc9d416881d2e24f9a963be5fb1cd90966419ac844274161d10488b3e825"
+checksum = "c469d952047f47f91b68d1cba3f10d63c11d73e4636f24f08daf0278abf01c4d"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
  "num-traits",
  "serde",
- "windows-targets 0.52.6",
+ "windows-link",
 ]
 
 [[package]]
@@ -1846,9 +2101,9 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "914e6f9525599579abbd90b0f7a55afcaaaa40350b9e9ed52563f126dfe45fd3"
 dependencies = [
- "arrow",
- "arrow-ipc",
- "arrow-schema",
+ "arrow 54.2.1",
+ "arrow-ipc 54.3.1",
+ "arrow-schema 54.3.1",
  "async-trait",
  "bytes",
  "chrono",
@@ -1893,7 +2148,7 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "998a6549e6ee4ee3980e05590b2960446a56b343ea30199ef38acd0e0b9036e2"
 dependencies = [
- "arrow",
+ "arrow 54.2.1",
  "async-trait",
  "dashmap",
  "datafusion-common",
@@ -1913,7 +2168,7 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5ac10096a5b3c0d8a227176c0e543606860842e943594ccddb45cf42a526e43"
 dependencies = [
- "arrow",
+ "arrow 54.2.1",
  "async-trait",
  "datafusion-catalog",
  "datafusion-common",
@@ -1936,8 +2191,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f53d7ec508e1b3f68bd301cee3f649834fad51eff9240d898a4b2614cfd0a7a"
 dependencies = [
  "ahash",
- "arrow",
- "arrow-ipc",
+ "arrow 54.2.1",
+ "arrow-ipc 54.3.1",
  "base64 0.22.1",
  "half",
  "hashbrown 0.14.5",
@@ -1968,7 +2223,7 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf7f37ad8b6e88b46c7eeab3236147d32ea64b823544f498455a8d9042839c92"
 dependencies = [
- "arrow",
+ "arrow 54.2.1",
  "async-trait",
  "bytes",
  "chrono",
@@ -2002,7 +2257,7 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0938f9e5b6bc5782be4111cdfb70c02b7b5451bf34fd57e4de062a7f7c4e31f1"
 dependencies = [
- "arrow",
+ "arrow 54.2.1",
  "dashmap",
  "datafusion-common",
  "datafusion-expr",
@@ -2021,7 +2276,7 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b36c28b00b00019a8695ad7f1a53ee1673487b90322ecbd604e2cf32894eb14f"
 dependencies = [
- "arrow",
+ "arrow 54.2.1",
  "chrono",
  "datafusion-common",
  "datafusion-doc",
@@ -2041,7 +2296,7 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "18f0a851a436c5a2139189eb4617a54e6a9ccb9edc96c4b3c83b3bb7c58b950e"
 dependencies = [
- "arrow",
+ "arrow 54.2.1",
  "datafusion-common",
  "indexmap",
  "itertools 0.14.0",
@@ -2054,8 +2309,8 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3196e37d7b65469fb79fee4f05e5bb58a456831035f9a38aa5919aeb3298d40"
 dependencies = [
- "arrow",
- "arrow-buffer",
+ "arrow 54.2.1",
+ "arrow-buffer 54.3.1",
  "base64 0.22.1",
  "blake2",
  "blake3",
@@ -2084,7 +2339,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adfc2d074d5ee4d9354fdcc9283d5b2b9037849237ddecb8942a29144b77ca05"
 dependencies = [
  "ahash",
- "arrow",
+ "arrow 54.2.1",
  "datafusion-common",
  "datafusion-doc",
  "datafusion-execution",
@@ -2105,7 +2360,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1cbceba0f98d921309a9121b702bcd49289d383684cccabf9a92cda1602f3bbb"
 dependencies = [
  "ahash",
- "arrow",
+ "arrow 54.2.1",
  "datafusion-common",
  "datafusion-expr-common",
  "datafusion-physical-expr-common",
@@ -2117,8 +2372,8 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "170e27ce4baa27113ddf5f77f1a7ec484b0dbeda0c7abbd4bad3fc609c8ab71a"
 dependencies = [
- "arrow",
- "arrow-ord",
+ "arrow 54.2.1",
+ "arrow-ord 54.2.1",
  "datafusion-common",
  "datafusion-doc",
  "datafusion-execution",
@@ -2138,7 +2393,7 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d3a06a7f0817ded87b026a437e7e51de7f59d48173b0a4e803aa896a7bd6bb5"
 dependencies = [
- "arrow",
+ "arrow 54.2.1",
  "async-trait",
  "datafusion-catalog",
  "datafusion-common",
@@ -2192,7 +2447,7 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "971c51c54cd309001376fae752fb15a6b41750b6d1552345c46afbfb6458801b"
 dependencies = [
- "arrow",
+ "arrow 54.2.1",
  "chrono",
  "datafusion-common",
  "datafusion-expr",
@@ -2211,7 +2466,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1447c2c6bc8674a16be4786b4abf528c302803fafa186aa6275692570e64d85"
 dependencies = [
  "ahash",
- "arrow",
+ "arrow 54.2.1",
  "datafusion-common",
  "datafusion-expr",
  "datafusion-expr-common",
@@ -2233,7 +2488,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69f8c25dcd069073a75b3d2840a79d0f81e64bdd2c05f2d3d18939afb36a7dcb"
 dependencies = [
  "ahash",
- "arrow",
+ "arrow 54.2.1",
  "datafusion-common",
  "datafusion-expr-common",
  "hashbrown 0.14.5",
@@ -2246,7 +2501,7 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68da5266b5b9847c11d1b3404ee96b1d423814e1973e1ad3789131e5ec912763"
 dependencies = [
- "arrow",
+ "arrow 54.2.1",
  "datafusion-common",
  "datafusion-execution",
  "datafusion-expr",
@@ -2265,9 +2520,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88cc160df00e413e370b3b259c8ea7bfbebc134d32de16325950e9e923846b7f"
 dependencies = [
  "ahash",
- "arrow",
- "arrow-ord",
- "arrow-schema",
+ "arrow 54.2.1",
+ "arrow-ord 54.2.1",
+ "arrow-schema 54.3.1",
  "async-trait",
  "chrono",
  "datafusion-common",
@@ -2294,7 +2549,7 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "325a212b67b677c0eb91447bf9a11b630f9fc4f62d8e5d145bf859f5a6b29e64"
 dependencies = [
- "arrow",
+ "arrow 54.2.1",
  "bigdecimal",
  "datafusion-common",
  "datafusion-expr",
@@ -2762,6 +3017,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flatbuffers"
+version = "25.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1045398c1bfd89168b5fd3f1fc11f6e70b34f6f66300c87d44d3de849463abf1"
+dependencies = [
+ "bitflags 2.9.0",
+ "rustc_version",
+]
+
+[[package]]
 name = "flate2"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2818,7 +3083,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 name = "fsst"
 version = "0.29.0"
 dependencies = [
- "arrow-array",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "lance-datagen",
  "rand 0.8.5",
  "rand_xoshiro",
@@ -3791,15 +4056,15 @@ version = "0.29.0"
 dependencies = [
  "all_asserts",
  "approx",
- "arrow",
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-ipc",
- "arrow-ord",
- "arrow-row",
- "arrow-schema",
- "arrow-select",
+ "arrow 55.1.0",
+ "arrow-arith 55.1.0",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-ipc 55.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "arrow-ord 55.1.0",
+ "arrow-row 55.1.0",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-select 55.1.0",
  "async-recursion",
  "async-trait",
  "async_cell",
@@ -3875,12 +4140,12 @@ dependencies = [
 name = "lance-arrow"
 version = "0.29.0"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-cast 55.1.0",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-select 55.1.0",
  "bytes",
  "getrandom 0.2.15",
  "half",
@@ -3892,9 +4157,9 @@ dependencies = [
 name = "lance-core"
 version = "0.29.0"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-schema",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "async-trait",
  "byteorder",
  "bytes",
@@ -3931,12 +4196,12 @@ dependencies = [
 name = "lance-datafusion"
 version = "0.29.0"
 dependencies = [
- "arrow",
- "arrow-array",
- "arrow-buffer",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
+ "arrow 55.1.0",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-ord 55.1.0",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-select 55.1.0",
  "async-trait",
  "datafusion",
  "datafusion-common",
@@ -3962,10 +4227,10 @@ dependencies = [
 name = "lance-datagen"
 version = "0.29.0"
 dependencies = [
- "arrow",
- "arrow-array",
- "arrow-cast",
- "arrow-schema",
+ "arrow 55.1.0",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-cast 55.1.0",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "chrono",
  "criterion",
  "futures",
@@ -3980,14 +4245,14 @@ name = "lance-encoding"
 version = "0.29.0"
 dependencies = [
  "arrayref",
- "arrow",
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "arrow 55.1.0",
+ "arrow-arith 55.1.0",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-cast 55.1.0",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-select 55.1.0",
  "bytemuck",
  "byteorder",
  "bytes",
@@ -4027,9 +4292,9 @@ dependencies = [
 name = "lance-encoding-datafusion"
 version = "0.29.0"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-schema",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "bytes",
  "datafusion",
  "datafusion-common",
@@ -4060,12 +4325,12 @@ dependencies = [
 name = "lance-file"
 version = "0.29.0"
 dependencies = [
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "arrow-arith 55.1.0",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-select 55.1.0",
  "async-recursion",
  "async-trait",
  "byteorder",
@@ -4104,11 +4369,11 @@ name = "lance-index"
 version = "0.29.0"
 dependencies = [
  "approx",
- "arrow",
- "arrow-array",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
+ "arrow 55.1.0",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-ord 55.1.0",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-select 55.1.0",
  "async-channel 2.3.1",
  "async-recursion",
  "async-trait",
@@ -4171,14 +4436,14 @@ dependencies = [
 name = "lance-io"
 version = "0.29.0"
 dependencies = [
- "arrow",
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "arrow 55.1.0",
+ "arrow-arith 55.1.0",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-cast 55.1.0",
+ "arrow-data 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-select 55.1.0",
  "async-priority-channel",
  "async-recursion",
  "async-trait",
@@ -4217,8 +4482,8 @@ dependencies = [
 name = "lance-jni"
 version = "0.29.0"
 dependencies = [
- "arrow",
- "arrow-schema",
+ "arrow 55.1.0",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "datafusion",
  "env_logger",
  "jni",
@@ -4244,10 +4509,10 @@ name = "lance-linalg"
 version = "0.29.0"
 dependencies = [
  "approx",
- "arrow-arith",
- "arrow-array",
- "arrow-ord",
- "arrow-schema",
+ "arrow-arith 55.1.0",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-ord 55.1.0",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "bitvec",
  "cc",
  "criterion",
@@ -4272,11 +4537,11 @@ dependencies = [
 name = "lance-table"
 version = "0.29.0"
 dependencies = [
- "arrow",
- "arrow-array",
- "arrow-buffer",
- "arrow-ipc",
- "arrow-schema",
+ "arrow 55.1.0",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-buffer 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-ipc 55.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "async-trait",
  "aws-credential-types",
  "aws-sdk-dynamodb",
@@ -4328,8 +4593,8 @@ dependencies = [
 name = "lance-testing"
 version = "0.29.0"
 dependencies = [
- "arrow-array",
- "arrow-schema",
+ "arrow-array 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
+ "arrow-schema 55.1.0 (git+https://github.com/westonpace/arrow-rs.git?tag=strong-count)",
  "lance-arrow",
  "num-traits",
  "rand 0.8.5",
@@ -5086,18 +5351,18 @@ dependencies = [
 
 [[package]]
 name = "parquet"
-version = "54.2.1"
+version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f88838dca3b84d41444a0341b19f347e8098a3898b0f21536654b8b799e11abd"
+checksum = "bfb15796ac6f56b429fd99e33ba133783ad75b27c36b4b5ce06f1f82cc97754e"
 dependencies = [
  "ahash",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-ipc",
- "arrow-schema",
- "arrow-select",
+ "arrow-array 54.3.1",
+ "arrow-buffer 54.3.1",
+ "arrow-cast 54.3.1",
+ "arrow-data 54.3.1",
+ "arrow-ipc 54.3.1",
+ "arrow-schema 54.3.1",
+ "arrow-select 54.3.1",
  "base64 0.22.1",
  "brotli 7.0.0",
  "bytes",
@@ -5118,7 +5383,6 @@ dependencies = [
  "tokio",
  "twox-hash",
  "zstd",
- "zstd-sys",
 ]
 
 [[package]]

@@ -61,17 +61,17 @@ lance-test-macros = { version = "=0.29.0", path = "./rust/lance-test-macros" }
 lance-testing = { version = "=0.29.0", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "54.1", optional = false, features = ["prettyprint"] }
-arrow-arith = "54.1"
-arrow-array = "54.1"
-arrow-buffer = "54.1"
-arrow-cast = "54.1"
-arrow-data = "54.1"
-arrow-ipc = { version = "54.1", features = ["zstd"] }
-arrow-ord = "54.1"
-arrow-row = "54.1"
-arrow-schema = "54.1"
-arrow-select = "54.1"
+arrow = { version = "55.1", git = "https://github.com/westonpace/arrow-rs.git", tag="strong-count", optional = false, features = ["prettyprint"] }
+arrow-arith = { version = "55.1", git = "https://github.com/westonpace/arrow-rs.git", tag="strong-count" }
+arrow-array = { version = "55.1", git = "https://github.com/westonpace/arrow-rs.git", tag="strong-count" }
+arrow-buffer = { version = "55.1", git = "https://github.com/westonpace/arrow-rs.git", tag="strong-count" }
+arrow-cast = { version = "55.1", git = "https://github.com/westonpace/arrow-rs.git", tag="strong-count" }
+arrow-data = { version = "55.1", git = "https://github.com/westonpace/arrow-rs.git", tag="strong-count" }
+arrow-ipc = { version = "55.1", features = ["zstd"] }
+arrow-ord = { version = "55.1", git = "https://github.com/westonpace/arrow-rs.git", tag="strong-count" }
+arrow-row = { version = "55.1", git = "https://github.com/westonpace/arrow-rs.git", tag="strong-count" }
+arrow-schema = { version = "55.1", git = "https://github.com/westonpace/arrow-rs.git", tag="strong-count" }
+arrow-select = { version = "55.1", git = "https://github.com/westonpace/arrow-rs.git", tag="strong-count" }
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "1.2.0"
@@ -88,7 +88,7 @@ byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
 # Version temporarily pinned to work around unlabeled breaking change
 # https://github.com/apache/arrow-rs/commit/2fddf85afcd20110ce783ed5b4cdeb82293da30b
-chrono = { version = "=0.4.39", default-features = false, features = [
+chrono = { version = "0.4.39", default-features = false, features = [
     "std",
     "now",
 ] }
