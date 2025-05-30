@@ -805,7 +805,7 @@ impl Scanner {
             k,
             lower_bound: None,
             upper_bound: None,
-            minimum_nprobes: 1,
+            minimum_nprobes: 20,
             maximum_nprobes: None,
             ef: None,
             refine_factor: None,
@@ -5630,7 +5630,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=42), expr=...
         ANNSubIndex: name=..., k=42, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5647,7 +5647,7 @@ mod test {
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=40), expr=...
                   ANNSubIndex: name=..., k=40, deltas=1
-                    ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
+                    ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5683,7 +5683,7 @@ mod test {
           CoalesceBatchesExec: target_batch_size=8192
             SortExec: TopK(fetch=17), expr=...
               ANNSubIndex: name=..., k=17, deltas=1
-                ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
+                ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5701,7 +5701,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=17), expr=...
         ANNSubIndex: name=..., k=17, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
           FilterExec: i@0 > 10
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
@@ -5730,7 +5730,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=6), expr=...
                       ANNSubIndex: name=..., k=6, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5758,7 +5758,7 @@ mod test {
                         CoalesceBatchesExec: target_batch_size=8192
                           SortExec: TopK(fetch=15), expr=...
                             ANNSubIndex: name=..., k=15, deltas=1
-                              ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
+                              ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5791,7 +5791,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
                       ANNSubIndex: name=..., k=5, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
                         FilterExec: i@0 > 10
                           LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
@@ -5816,7 +5816,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
           ScalarIndexQuery: query=[i > 10]@i_idx",
         )
         .await?;
@@ -5835,7 +5835,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
           FilterExec: i@0 > 10
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
@@ -5869,7 +5869,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=8), expr=...
                       ANNSubIndex: name=..., k=8, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
                         ScalarIndexQuery: query=[i > 10]@i_idx",
         )
         .await?;
@@ -5902,7 +5902,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=11), expr=...
                       ANNSubIndex: name=..., k=11, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
                         ScalarIndexQuery: query=[i > 10]@i_idx",
         )
         .await?;
@@ -6180,7 +6180,7 @@ mod test {
             "ProjectionExec: expr=[_rowid@1 as _rowid, _distance@0 as _distance]
   SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
-      ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
+      ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await
         .unwrap();
@@ -6196,7 +6196,7 @@ mod test {
             "ProjectionExec: expr=[_rowid@1 as _rowid, _distance@0 as _distance]
   SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
-      ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
+      ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await
         .unwrap();
@@ -6224,7 +6224,7 @@ mod test {
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]...
                   ANNSubIndex: name=idx, k=34, deltas=1
-                    ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
+                    ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await
         .unwrap();

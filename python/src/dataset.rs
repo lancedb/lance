@@ -92,7 +92,7 @@ pub mod commit;
 pub mod optimize;
 pub mod stats;
 
-const DEFAULT_NPROBS: usize = 1;
+const DEFAULT_NPROBS: usize = 20;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 
