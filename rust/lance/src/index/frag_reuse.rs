@@ -106,7 +106,6 @@ pub async fn build_new_frag_reuse_index(
     new_fragment_bitmap: RoaringBitmap,
     changed_row_addrs: RoaringTreemap,
 ) -> lance_core::Result<Index> {
-    let index_id = uuid::Uuid::new_v4();
     let mut serialized = Vec::with_capacity(changed_row_addrs.serialized_size());
     changed_row_addrs.serialize_into(&mut serialized)?;
 
@@ -136,6 +135,15 @@ pub async fn build_new_frag_reuse_index(
         }
     };
 
+    build_frag_reuse_index_metadata(dataset, new_index_details, new_fragment_bitmap).await
+}
+
+pub(crate) async fn build_frag_reuse_index_metadata(
+    dataset: &mut Dataset,
+    new_index_details: FragReuseIndexDetails,
+    new_fragment_bitmap: RoaringBitmap,
+) -> lance_core::Result<Index> {
+    let index_id = uuid::Uuid::new_v4();
     let new_index_details_proto = InlineContent::from(&new_index_details);
     let proto = if new_index_details_proto.encoded_len() > 204800 {
         let file_path = dataset
