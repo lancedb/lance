@@ -1282,7 +1282,7 @@ async fn scan_index_field_stream(
     scanner.try_into_stream().await
 }
 
-async fn load_precomputed_partitions_if_available(
+pub async fn load_precomputed_partitions_if_available(
     ivf_params: &IvfBuildParams,
 ) -> Result<Option<HashMap<u64, u32>>> {
     match &ivf_params.precomputed_partitions_file {
