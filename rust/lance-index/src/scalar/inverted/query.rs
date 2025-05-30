@@ -357,6 +357,7 @@ pub struct PhraseQuery {
     // If None, it will be determined at query time.
     pub column: Option<String>,
     pub terms: String,
+    #[serde(default = "u32::default")]
     pub slop: u32,
 }
 
@@ -734,5 +735,35 @@ mod tests {
         assert_eq!(query.fuzziness, Some(0));
         assert_eq!(query.max_expansions, 50);
         assert_eq!(query.operator, Operator::Or);
+    }
+
+    #[test]
+    fn test_phrase_query_serde() {
+        use super::*;
+        use serde_json::json;
+
+        let query = json!({
+            "terms": "hello world",
+        });
+        let expected = PhraseQuery {
+            column: None,
+            terms: "hello world".to_string(),
+            slop: 0,
+        };
+        let query: PhraseQuery = serde_json::from_value(query).unwrap();
+        assert_eq!(query, expected);
+
+        let query = json!({
+            "terms": "hello world",
+            "column": "text",
+            "slop": 2,
+        });
+        let expected = PhraseQuery {
+            column: Some("text".to_string()),
+            terms: "hello world".to_string(),
+            slop: 2,
+        };
+        let query: PhraseQuery = serde_json::from_value(query).unwrap();
+        assert_eq!(query, expected);
     }
 }
