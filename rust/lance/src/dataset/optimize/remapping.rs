@@ -4,16 +4,21 @@
 //! Utilities for remapping row ids. Necessary before move-stable row ids.
 //!
 
+use crate::dataset::transaction::{Operation, Transaction};
+use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+use crate::Result;
+use crate::{index, Dataset};
 use async_trait::async_trait;
 use lance_core::utils::address::RowAddress;
-use lance_table::format::Fragment;
+use lance_core::Error;
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_index::DatasetIndexExt;
+use lance_table::format::{Fragment, Index};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
+use snafu::location;
 use std::collections::HashMap;
 use uuid::Uuid;
-
-use crate::Dataset;
-use crate::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemappedIndex {
@@ -174,6 +179,152 @@ pub fn transpose_row_ids(
         mapping.insert(id, None);
     });
     mapping
+}
+
+/// Remap a given index using the fragment reuse index if possible.
+/// If the frag reuse index does not exist, the operation fails with [Error::NotSupported]
+/// If the frag reuse index exists but is empty, the operation succeeds without a commit.
+async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
+    let indices = dataset.load_indices().await.unwrap();
+    let frag_reuse_index_meta = match indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
+        None => Err(Error::NotSupported {
+            source: "Fragment reuse index not found, cannot remap an index post compaction".into(),
+            location: location!(),
+        }),
+        Some(frag_reuse_index_meta) => Ok(frag_reuse_index_meta),
+    }?;
+
+    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta)
+        .await
+        .unwrap();
+    let frag_reuse_index =
+        open_frag_reuse_index(frag_reuse_details.as_ref(), dataset.fragments().as_slice())
+            .await
+            .unwrap();
+
+    if frag_reuse_index.row_id_maps.is_empty() {
+        return Ok(());
+    }
+
+    // Sequentially apply the row id maps from oldest to latest
+    let mut curr_index_id = *index_id;
+    for (i, row_id_map) in frag_reuse_index.row_id_maps.iter().enumerate() {
+        let version = &frag_reuse_index.details.versions[i];
+        let curr_index_meta = dataset
+            .load_index(&curr_index_id.to_string())
+            .await?
+            .unwrap();
+
+        let maybe_index_bitmap = curr_index_meta.fragment_bitmap.clone();
+        let (should_remap, bitmap_after_remap) = match maybe_index_bitmap {
+            Some(mut index_frag_bitmap) => {
+                let mut old_frag_in_index = 0;
+                for old_frag in version.old_frags.iter() {
+                    if index_frag_bitmap.remove(old_frag.id as u32) {
+                        old_frag_in_index += 1;
+                    }
+                }
+
+                if old_frag_in_index == 0 {
+                    (false, Some(index_frag_bitmap))
+                } else {
+                    if old_frag_in_index != version.old_frags.len() {
+                        // this should never happen because we always commit a full rewrite group
+                        // and we always reindex either the entire group or nothing.
+                        // We use invalid input to be consistent with
+                        // dataset::transaction::recalculate_fragment_bitmap
+                        return Err(Error::invalid_input(
+                            "The compaction plan included a rewrite group that was a split of indexed and non-indexed data",
+                            location!()));
+                    }
+                    index_frag_bitmap
+                        .extend(version.new_frags.clone().into_iter().map(|f| f as u32));
+                    (true, Some(index_frag_bitmap))
+                }
+            }
+            // if there is no fragment bitmap for the index,
+            // we attempt remapping but will not update the fragment bitmap.
+            None => (true, None),
+        };
+
+        if should_remap {
+            let new_index_id = index::remap_index(dataset, &curr_index_id, row_id_map).await?;
+
+            let new_index_meta = Index {
+                uuid: new_index_id,
+                name: curr_index_meta.name.clone(),
+                fields: curr_index_meta.fields.clone(),
+                dataset_version: dataset.manifest.version,
+                fragment_bitmap: bitmap_after_remap,
+                index_details: curr_index_meta.index_details.clone(),
+            };
+
+            let transaction = Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![new_index_meta],
+                    removed_indices: vec![curr_index_meta],
+                },
+                None,
+                None,
+            );
+
+            dataset
+                .apply_commit(transaction, &Default::default(), &Default::default())
+                .await?;
+
+            curr_index_id = new_index_id;
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn remap_column_index(
+    dataset: &mut Dataset,
+    columns: &[&str],
+    name: Option<String>,
+) -> Result<()> {
+    if columns.len() != 1 {
+        return Err(Error::Index {
+            message: "Only support remapping index on 1 column at the moment".to_string(),
+            location: location!(),
+        });
+    }
+
+    let column = columns[0];
+    let Some(field) = dataset.schema().field(column) else {
+        return Err(Error::Index {
+            message: format!("RemapIndex: column '{column}' does not exist"),
+            location: location!(),
+        });
+    };
+
+    let indices = dataset.load_indices().await?;
+    let index_name = name.unwrap_or(format!("{column}_idx"));
+    let index = match indices.iter().find(|i| i.name == index_name) {
+        None => {
+            return Err(Error::Index {
+                message: format!("Index with name {} not found", index_name),
+                location: location!(),
+            });
+        }
+        Some(index) => {
+            if index.fields != [field.id] {
+                Err(Error::Index {
+                    message: format!(
+                        "Index name {} already exists with different fields",
+                        index_name
+                    ),
+                    location: location!(),
+                })
+            } else {
+                Ok(index)
+            }
+        }
+    }?;
+
+    remap_index(dataset, &index.uuid).await
 }
 
 #[cfg(test)]
