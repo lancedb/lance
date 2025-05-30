@@ -425,8 +425,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let stream = match self
             .ivf_params
             .as_ref()
-            .map(|p| p.precomputed_shuffle_buffers.as_ref())
-            .flatten()
+            .and_then(|p| p.precomputed_shuffle_buffers.as_ref())
         {
             Some((uri, _)) => {
                 let uri = to_local_path(uri);
@@ -434,7 +433,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 // so need to trim the "/data" suffix for reading the dataset
                 let uri = uri.trim_end_matches("/data");
                 log::info!("shuffle with precomputed shuffle buffers from {}", uri);
-                let ds = Dataset::open(&uri).await?;
+                let ds = Dataset::open(uri).await?;
                 ds.scan().try_into_stream().await?
             }
             _ => {
