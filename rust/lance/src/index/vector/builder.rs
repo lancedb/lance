@@ -430,8 +430,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             Some((uri, _)) => {
                 let uri = to_local_path(uri);
                 // the uri points to data directory,
-                // so need to trim the "/data" suffix for reading the dataset
-                let uri = uri.trim_end_matches("/data");
+                // so need to trim the "data" suffix for reading the dataset
+                let uri = uri.trim_end_matches("data");
                 log::info!("shuffle with precomputed shuffle buffers from {}", uri);
                 let ds = Dataset::open(uri).await?;
                 ds.scan().try_into_stream().await?
