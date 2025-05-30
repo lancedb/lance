@@ -885,6 +885,13 @@ impl Field {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false)
     }
+
+    /// Return true if the field is a leaf field.
+    ///
+    /// A leaf field is a field that is not a struct or a list.
+    pub fn is_leaf(&self) -> bool {
+        self.children.is_empty()
+    }
 }
 
 impl fmt::Display for Field {

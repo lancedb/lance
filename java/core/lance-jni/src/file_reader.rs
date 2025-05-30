@@ -210,11 +210,14 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
             (*ptr).lock().unwrap()
         };
 
+        let file_version = reader.inner.metadata().version();
+
         if !projected_names.is_null() {
             let schema = Schema::try_from(reader.schema()?.as_ref())?;
             let column_names: Vec<String> = env.get_strings(&projected_names)?;
             let names: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
             reader_projection = Some(ReaderProjection::from_column_names(
+                file_version,
                 &schema,
                 names.as_slice(),
             )?);

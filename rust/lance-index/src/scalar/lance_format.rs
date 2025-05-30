@@ -160,7 +160,11 @@ impl IndexReader for v2::reader::FileReader {
             )));
         }
         let projection = if let Some(projection) = projection {
-            v2::reader::ReaderProjection::from_column_names(self.schema(), projection)?
+            v2::reader::ReaderProjection::from_column_names(
+                self.metadata().version(),
+                self.schema(),
+                projection,
+            )?
         } else {
             v2::reader::ReaderProjection::from_whole_schema(
                 self.schema(),

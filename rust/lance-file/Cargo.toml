@@ -45,6 +45,7 @@ lance-datagen.workspace = true
 lance-testing.workspace = true
 criterion.workspace = true
 rand.workspace = true
+rstest.workspace = true
 proptest.workspace = true
 pretty_assertions.workspace = true
 test-log.workspace = true
