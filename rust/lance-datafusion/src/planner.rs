@@ -26,15 +26,15 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
-    WindowUDF,
+    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
 use datafusion::sql::sqlparser::ast::{
     AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
-    Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Subscript,
-    TimezoneInfo, UnaryOperator, Value,
+    Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+    ObjectNamePart, Subscript, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
 };
 use datafusion::{
     common::Column,
@@ -47,6 +47,7 @@ use datafusion::{
 use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::cast::cast_with_options;
 use lance_core::datatypes::Schema;
+use lance_core::error::LanceOptionExt;
 use snafu::location;
 
 use lance_core::{Error, Result};
@@ -117,8 +118,8 @@ impl ScalarUDFImpl for CastListF16Udf {
         }
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
-        let ColumnarValue::Array(arr) = &args[0] else {
+    fn invoke_with_args(&self, func_args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let ColumnarValue::Array(arr) = &func_args.args[0] else {
             return Err(datafusion::error::DataFusionError::Execution(
                 "cast_list_f16 only supports array arguments".to_string(),
             ));
@@ -303,7 +304,7 @@ impl Planner {
             UnaryOperator::Minus => {
                 use datafusion::logical_expr::lit;
                 match expr {
-                    SQLExpr::Value(Value::Number(n, _)) => match n.parse::<i64>() {
+                    SQLExpr::Value(ValueWithSpan { value: Value::Number(n, _), ..}) => match n.parse::<i64>() {
                         Ok(n) => lit(-n),
                         Err(_) => lit(-n
                             .parse::<f64>()
@@ -401,8 +402,10 @@ impl Planner {
 
     fn parse_function(&self, function: SQLExpr) -> Result<Expr> {
         if let SQLExpr::Function(function) = &function {
-            if !function.name.0.is_empty() && function.name.0[0].value == "is_valid" {
-                return self.legacy_parse_function(function);
+            if let Some(ObjectNamePart::Identifier(name)) = &function.name.0.first() {
+                if &name.value == "is_valid" {
+                    return self.legacy_parse_function(function);
+                }
             }
         }
         let sql_to_rel = SqlToRel::new_with_options(
@@ -413,6 +416,7 @@ impl Planner {
                 support_varchar_with_length: false,
                 enable_options_value_normalization: false,
                 collect_spans: false,
+                map_varchar_to_utf8view: false,
             },
         );
 
@@ -447,12 +451,12 @@ impl Planner {
             SQLDataType::SmallInt(_) => Ok(ArrowDataType::Int16),
             SQLDataType::Int(_) | SQLDataType::Integer(_) => Ok(ArrowDataType::Int32),
             SQLDataType::BigInt(_) => Ok(ArrowDataType::Int64),
-            SQLDataType::UnsignedTinyInt(_) => Ok(ArrowDataType::UInt8),
-            SQLDataType::UnsignedSmallInt(_) => Ok(ArrowDataType::UInt16),
-            SQLDataType::UnsignedInt(_) | SQLDataType::UnsignedInteger(_) => {
+            SQLDataType::TinyIntUnsigned(_) => Ok(ArrowDataType::UInt8),
+            SQLDataType::SmallIntUnsigned(_) => Ok(ArrowDataType::UInt16),
+            SQLDataType::IntUnsigned(_) | SQLDataType::IntegerUnsigned(_) => {
                 Ok(ArrowDataType::UInt32)
             }
-            SQLDataType::UnsignedBigInt(_) => Ok(ArrowDataType::UInt64),
+            SQLDataType::BigIntUnsigned(_) => Ok(ArrowDataType::UInt64),
             SQLDataType::Date => Ok(ArrowDataType::Date32),
             SQLDataType::Timestamp(resolution, tz) => {
                 match tz {
@@ -552,7 +556,7 @@ impl Planner {
             SQLExpr::CompoundIdentifier(ids) => Ok(Self::column(ids.as_slice())),
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
-            SQLExpr::Value(value) => self.value(value),
+            SQLExpr::Value(value) => self.value(&value.value),
             SQLExpr::Array(SQLArray { elem, .. }) => {
                 let mut values = vec![];
 
@@ -569,7 +573,7 @@ impl Planner {
                 for (pos, expr) in elem.iter().enumerate() {
                     match expr {
                         SQLExpr::Value(value) => {
-                            if let Expr::Literal(value) = self.value(value)? {
+                            if let Expr::Literal(value) = self.value(&value.value)? {
                                 values.push(value);
                             } else {
                                 return array_literal_error(pos, expr);
@@ -579,7 +583,11 @@ impl Planner {
                             op: UnaryOperator::Minus,
                             expr,
                         } => {
-                            if let SQLExpr::Value(Value::Number(number, _)) = expr.as_ref() {
+                            if let SQLExpr::Value(ValueWithSpan {
+                                value: Value::Number(number, _),
+                                ..
+                            }) = expr.as_ref()
+                            {
                                 if let Expr::Literal(value) = self.number(number, true)? {
                                     values.push(value);
                                 } else {
@@ -628,8 +636,9 @@ impl Planner {
             }
             // For example, DATE '2020-01-01'
             SQLExpr::TypedString { data_type, value } => {
+                let value = value.clone().into_string().expect_ok()?;
                 Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value.clone())))),
+                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)))),
                     data_type: self.parse_type(data_type)?,
                 }))
             }
@@ -698,9 +707,11 @@ impl Planner {
                         AccessExpr::Dot(SQLExpr::Identifier(Ident { value: s, .. }))
                         | AccessExpr::Subscript(Subscript::Index {
                             index:
-                                SQLExpr::Value(
-                                    Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
-                                ),
+                                SQLExpr::Value(ValueWithSpan {
+                                    value:
+                                        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+                                    ..
+                                }),
                         }) => GetFieldAccess::NamedStructField {
                             name: ScalarValue::from(s.as_str()),
                         },
