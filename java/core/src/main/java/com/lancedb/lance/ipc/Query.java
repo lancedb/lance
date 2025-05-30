@@ -25,7 +25,8 @@ public class Query {
   private final String column;
   private final float[] key;
   private final int k;
-  private final int nprobes;
+  private final int minimumNprobes;
+  private final Optional<Integer> maximumNprobes;
   private final Optional<Integer> ef;
   private final Optional<Integer> refineFactor;
   private final DistanceType distanceType;
@@ -39,7 +40,8 @@ public class Query {
     Preconditions.checkArgument(
         builder.minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
     Preconditions.checkArgument(
-        builder.maximumNprobes.isEmpty() || builder.maximumNprobes.get() > builder.minimumNprobes,
+        !builder.maximumNprobes.isPresent()
+            || builder.maximumNprobes.get() > builder.minimumNprobes,
         "Maximum Nprobes must be greater than minimum Nprobes");
     this.k = builder.k;
     this.minimumNprobes = builder.minimumNprobes;
@@ -62,12 +64,12 @@ public class Query {
     return k;
   }
 
-  public int getMinimumNProbes() {
-    return minimumNProbes;
+  public int getMinimumNprobes() {
+    return minimumNprobes;
   }
 
-  public Optional<Integer> getMaximumNProbes() {
-    return maximumNProbes;
+  public Optional<Integer> getMaximumNprobes() {
+    return maximumNprobes;
   }
 
   public Optional<Integer> getEf() {
@@ -166,11 +168,11 @@ public class Query {
      * <p>This many partitions will always be loaded and searched on the query. Increasing this
      * number can improve recall at the cost of latency.
      *
-     * @param minimumNProbes The minimum number of partitions to search.
+     * @param minimumNrobes The minimum number of partitions to search.
      * @return The Builder instance for method chaining.
      */
-    public Builder setMinimumNprobes(int minimumNProbes) {
-      this.minimumNprobes = minimumNProbes;
+    public Builder setMinimumNprobes(int minimumNprobes) {
+      this.minimumNprobes = minimumNprobes;
       return this;
     }
 
@@ -183,11 +185,11 @@ public class Query {
      * the recall of the query and will only affect the latency if the prefilter is highly
      * selective.
      *
-     * @param maximumNProbes The maximum number of partitions to search.
+     * @param maximumNprobes The maximum number of partitions to search.
      * @return The Builder instance for method chaining.
      */
-    public Builder setMaximumNprobes(int maximumNProbes) {
-      this.maximumNprobes = Optional.of(maximumNProbes);
+    public Builder setMaximumNprobes(int maximumNprobes) {
+      this.maximumNprobes = Optional.of(maximumNprobes);
       return this;
     }
 
