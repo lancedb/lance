@@ -4467,7 +4467,7 @@ impl PrimitiveStructuralEncoder {
                     }
                 }
 
-                let dictionary_encoding_threshold: u64 = 100.max(data_block.num_values() / 4);
+                let dictionary_encoding_threshold: u64 = 100.min(data_block.num_values() / 4);
                 let cardinality =
                     if let Some(cardinality_array) = data_block.get_stat(Stat::Cardinality) {
                         cardinality_array.as_primitive::<UInt64Type>().value(0)
