@@ -50,10 +50,14 @@ use std::{
     sync::Arc,
 };
 
+use super::ManifestWriteConfig;
+use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_io::object_store::ObjectStore;
+use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
@@ -69,10 +73,6 @@ use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
-
-use super::ManifestWriteConfig;
-use crate::utils::temporal::timestamp_to_nanos;
-use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 
 /// A change to a dataset that can be retried
 ///
@@ -144,6 +144,8 @@ pub enum Operation {
         groups: Vec<RewriteGroup>,
         /// Indices that have been updated with the new row addresses
         rewritten_indices: Vec<RewrittenIndex>,
+        /// The fragment reuse index to be created or updated to
+        frag_reuse_index: Option<Index>,
     },
     /// Replace data in a column in the dataset with a new data. This is used for
     /// null column population where we replace an entirely null column with a
@@ -293,12 +295,18 @@ impl PartialEq for Operation {
                 Self::Rewrite {
                     groups: a_groups,
                     rewritten_indices: a_indices,
+                    frag_reuse_index: a_frag_reuse_index,
                 },
                 Self::Rewrite {
                     groups: b_groups,
                     rewritten_indices: b_indices,
+                    frag_reuse_index: b_frag_reuse_index,
                 },
-            ) => compare_vec(a_groups, b_groups) && compare_vec(a_indices, b_indices),
+            ) => {
+                compare_vec(a_groups, b_groups)
+                    && compare_vec(a_indices, b_indices)
+                    && a_frag_reuse_index == b_frag_reuse_index
+            }
             (
                 Self::Merge {
                     fragments: a_fragments,
@@ -1443,6 +1451,7 @@ impl Transaction {
             Operation::Rewrite {
                 ref groups,
                 ref rewritten_indices,
+                ref frag_reuse_index,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
@@ -1464,6 +1473,11 @@ impl Transaction {
                     }
                 } else {
                     Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+                }
+
+                if let Some(frag_reuse_index) = frag_reuse_index {
+                    final_indices.retain(|idx| idx.name != frag_reuse_index.name);
+                    final_indices.push(frag_reuse_index.clone());
                 }
             }
             Operation::CreateIndex {
@@ -1759,6 +1773,7 @@ impl Transaction {
                 .fields
                 .iter()
                 .all(|field_id| field_ids.contains(field_id))
+                || existing_index.name == FRAG_REUSE_INDEX_NAME
         });
 
         let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
@@ -1771,6 +1786,7 @@ impl Transaction {
                 .as_ref()
                 .map(|bitmap| bitmap.iter().any(|id| fragment_ids.contains(&(id as u64))))
                 .unwrap_or(true)
+                || existing_index.name == FRAG_REUSE_INDEX_NAME
         });
     }
 
@@ -2014,6 +2030,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 Operation::Rewrite {
                     groups,
                     rewritten_indices,
+                    frag_reuse_index: None,
                 }
             }
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
@@ -2254,6 +2271,7 @@ impl From<&Transaction> for pb::Transaction {
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
+                frag_reuse_index: _,
             } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 groups: groups
                     .iter()
@@ -2528,6 +2546,7 @@ mod tests {
                     new_fragments: vec![fragment1.clone()],
                 }],
                 rewritten_indices: vec![],
+                frag_reuse_index: None,
             },
             Operation::ReserveFragments { num_fragments: 3 },
             Operation::Update {
@@ -2650,6 +2669,7 @@ mod tests {
                         new_fragments: vec![fragment0.clone()],
                     }],
                     rewritten_indices: Vec::new(),
+                    frag_reuse_index: None,
                 },
                 [
                     Compatible,    // append
@@ -2671,6 +2691,7 @@ mod tests {
                         new_fragments: vec![fragment0.clone()],
                     }],
                     rewritten_indices: Vec::new(),
+                    frag_reuse_index: None,
                 },
                 [
                     Compatible,    // append

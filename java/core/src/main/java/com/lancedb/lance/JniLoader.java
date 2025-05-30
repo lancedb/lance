@@ -25,4 +25,11 @@ public class JniLoader {
   public static void ensureLoaded() {}
 
   private JniLoader() {}
+
+  static native void initLanceLogger();
+
+  /** Init rust logger, which can be controlled by env `export LANCE_LOG=debug` */
+  static {
+    initLanceLogger();
+  }
 }

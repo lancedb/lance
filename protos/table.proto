@@ -370,3 +370,34 @@ message LabelListIndexDetails {}
 message InvertedIndexDetails {}
 message NGramIndexDetails {}
 message VectorIndexDetails {}
+
+message FragmentReuseIndexDetails {
+
+  oneof content {
+    // if < 200KB, store the content inline, otherwise store the InlineContent bytes in external file
+    InlineContent inline = 1;
+    ExternalFile external = 2;
+  }
+
+  message InlineContent {
+    repeated Version versions = 1;
+  }
+
+  message Version {
+    // The dataset_version at the time the index adds this version entry
+    uint64 dataset_version = 1;
+
+    // A roaring treemap of the changed row addresses.
+    // When combined with the old fragment IDs and new fragment IDs,
+    // it can recover the full mapping of old row addresses to either new row addresses or deleted.
+    // this mapping can then be used to remap indexes or satisfy index queries for the new unindexed fragments.
+    bytes changed_row_addrs = 2;
+
+    // Store the full content of old fragments to be used for indexed queries
+    // This should be exactly in the order that a rewrite_files takes in the old fragments
+    repeated DataFragment old_fragments = 3;
+
+    // This must be exactly in the order that a rewrite_files produces the new fragments
+    repeated uint64 new_fragments = 4;
+  }
+}

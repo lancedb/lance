@@ -23,10 +23,13 @@
 //! alternative to [CommitHandler].
 
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::{fmt::Debug, fs::DirEntry};
 
+use futures::future::Either;
+use futures::Stream;
 use futures::{
     future::{self, BoxFuture},
     stream::BoxStream,
@@ -422,13 +425,12 @@ fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
     0
 }
 
-async fn list_manifests<'a>(
+fn list_manifests<'a>(
     base_path: &Path,
     object_store: &'a dyn OSObjectStore,
-) -> Result<BoxStream<'a, Result<ManifestLocation>>> {
-    Ok(object_store
+) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
+    object_store
         .read_dir_all(&base_path.child(VERSIONS_DIR), None)
-        .await?
         .filter_map(|obj_meta| {
             futures::future::ready(
                 obj_meta
@@ -436,7 +438,7 @@ async fn list_manifests<'a>(
                     .transpose(),
             )
         })
-        .boxed())
+        .boxed()
 }
 
 fn make_staging_manifest_path(base: &Path) -> Result<Path> {
@@ -477,12 +479,65 @@ pub trait CommitHandler: Debug + Send + Sync {
         default_resolve_version(base_path, version, object_store).await
     }
 
-    async fn list_manifest_locations<'a>(
+    /// If `sorted_descending` is `true`, the stream will yield manifests in descending
+    /// order of version. When the object store has a lexicographically
+    /// ordered list and the naming scheme is V2, this will use an optimized
+    /// list operation. Otherwise, it will list all manifests and sort them
+    /// in memory. When `sorted_descending` is `false`, the stream will yield manifests
+    /// in arbitrary order.
+    fn list_manifest_locations<'a>(
         &self,
         base_path: &Path,
-        object_store: &'a dyn OSObjectStore,
-    ) -> Result<BoxStream<'a, Result<ManifestLocation>>> {
-        list_manifests(base_path, object_store).await
+        object_store: &'a ObjectStore,
+        sorted_descending: bool,
+    ) -> BoxStream<'a, Result<ManifestLocation>> {
+        let underlying_stream = list_manifests(base_path, &object_store.inner);
+
+        if !sorted_descending {
+            return underlying_stream.boxed();
+        }
+
+        async fn sort_stream(
+            input_stream: impl futures::Stream<Item = Result<ManifestLocation>> + Unpin,
+        ) -> Result<impl Stream<Item = Result<ManifestLocation>> + Unpin> {
+            let mut locations = input_stream.try_collect::<Vec<_>>().await?;
+            locations.sort_by_key(|m| std::cmp::Reverse(m.version));
+            Ok(futures::stream::iter(locations.into_iter().map(Ok)))
+        }
+
+        // If the object store supports lexicographically ordered lists and
+        // the naming scheme is V2, we can use an optimized list operation.
+        if object_store.list_is_lexically_ordered {
+            // We don't know the naming scheme until we see the first manifest.
+            let mut peekable = underlying_stream.peekable();
+
+            futures::stream::once(async move {
+                let naming_scheme = match Pin::new(&mut peekable).peek().await {
+                    Some(Ok(m)) => m.naming_scheme,
+                    // If we get an error or no manifests are found, we default
+                    // to V2 naming scheme, since it doesn't matter.
+                    Some(Err(_)) => ManifestNamingScheme::V2,
+                    None => ManifestNamingScheme::V2,
+                };
+
+                if naming_scheme == ManifestNamingScheme::V2 {
+                    // If the first manifest is V2, we can use the optimized list operation.
+                    Ok(Either::Left(peekable))
+                } else {
+                    sort_stream(peekable).await.map(Either::Right)
+                }
+            })
+            .try_flatten()
+            .boxed()
+        } else {
+            // If the object store does not support lexicographically ordered lists,
+            // we need to sort the manifests in memory. Systems where this isn't
+            // supported (local fs, S3 express) are typically fast enough
+            // that this is not a problem.
+            futures::stream::once(sort_stream(underlying_stream))
+                .try_flatten()
+                .boxed()
+        }
     }
 
     /// Commit a manifest.
@@ -1096,5 +1151,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(actual_files, expected_files);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn test_list_manifests_sorted(
+        #[values(true, false)] lexical_list_store: bool,
+        #[values(ManifestNamingScheme::V1, ManifestNamingScheme::V2)]
+        naming_scheme: ManifestNamingScheme,
+    ) {
+        let tempdir;
+        let (object_store, base) = if lexical_list_store {
+            (Box::new(ObjectStore::memory()), Path::from("base"))
+        } else {
+            tempdir = Some(tempfile::tempdir().unwrap());
+            let base = Path::from_absolute_path(tempdir.as_ref().unwrap().path().to_str().unwrap())
+                .unwrap();
+            let store = Box::new(ObjectStore::local());
+            assert!(!store.list_is_lexically_ordered);
+            (store, base)
+        };
+
+        // Write 12 manifest files, latest first
+        let mut expected_paths = Vec::new();
+        for i in (0..12).rev() {
+            let path = naming_scheme.manifest_path(&base, i);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+            expected_paths.push(path);
+        }
+
+        let actual_versions = ConditionalPutCommitHandler
+            .list_manifest_locations(&base, &object_store, true)
+            .map_ok(|location| location.path)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(actual_versions, expected_paths);
     }
 }
