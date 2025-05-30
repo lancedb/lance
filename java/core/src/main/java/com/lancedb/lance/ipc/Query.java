@@ -41,7 +41,7 @@ public class Query {
         builder.minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
     Preconditions.checkArgument(
         !builder.maximumNprobes.isPresent()
-            || builder.maximumNprobes.get() > builder.minimumNprobes,
+            || builder.maximumNprobes.get() >= builder.minimumNprobes,
         "Maximum Nprobes must be greater than minimum Nprobes");
     this.k = builder.k;
     this.minimumNprobes = builder.minimumNprobes;
