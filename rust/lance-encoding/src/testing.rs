@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    ops::Range,
+    sync::Arc,
+};
 
 use arrow::array::make_comparator;
 use arrow_array::{Array, StructArray, UInt64Array};
+use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
@@ -287,7 +293,7 @@ pub async fn check_round_trip_encoding_generated(
             let encoding_options = EncodingOptions {
                 max_page_bytes: MAX_PAGE_BYTES,
                 cache_bytes_per_column: page_size,
-                keep_original_array: true,
+                keep_original_array: false,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
             };
             encoding_strategy
@@ -300,7 +306,6 @@ pub async fn check_round_trip_encoding_generated(
                 .unwrap()
         };
 
-        // let array_generator_provider = RandomArrayGeneratorProvider{field: field.clone()};
         check_round_trip_field_encoding_random(
             encoder_factory,
             field.clone(),
@@ -494,6 +499,21 @@ impl SimulatedWriter {
     }
 }
 
+fn get_data_buffer_addrs_helper(arr: &ArrayData, buffers: &mut HashSet<u64>) {
+    for buffer in arr.buffers() {
+        buffers.insert(buffer.as_ptr() as u64);
+    }
+    for child in arr.child_data() {
+        get_data_buffer_addrs_helper(child, buffers);
+    }
+}
+
+fn get_data_buffer_addrs(arr: &dyn Array) -> HashSet<u64> {
+    let mut buffers = HashSet::<u64>::new();
+    get_data_buffer_addrs_helper(&arr.to_data(), &mut buffers);
+    buffers
+}
+
 /// This is the inner-most check function that actually runs the round trip and tests it
 async fn check_round_trip_encoding_inner(
     mut encoder: Box<dyn FieldEncoder>,
@@ -505,6 +525,8 @@ async fn check_round_trip_encoding_inner(
 
     let mut row_number = 0;
     for arr in &data {
+        let data_buffer_addrs = get_data_buffer_addrs(arr);
+
         let mut external_buffers = writer.new_external_buffers();
         let repdef = RepDefBuilder::default();
         let num_rows = arr.len() as u64;
