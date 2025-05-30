@@ -156,6 +156,39 @@ public class DatasetTest {
   }
 
   @Test
+  void testDatasetCheckoutVersion() {
+    String datasetPath = tempDir.resolve("dataset_checkout_version").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      // version 1, empty dataset
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(1, dataset.version());
+        assertEquals(1, dataset.latestVersion());
+        assertEquals(0, dataset.countRows());
+      }
+
+      // write first batch of data, version 2
+      try (Dataset dataset2 = testDataset.write(1, 5)) {
+        assertEquals(1, dataset.version());
+        assertEquals(2, dataset.latestVersion());
+        assertEquals(0, dataset.countRows());
+        assertEquals(2, dataset2.version());
+        assertEquals(2, dataset2.latestVersion());
+        assertEquals(5, dataset2.countRows());
+      }
+
+      // checkout the dataset at version 1
+      try (Dataset checkoutV1 = dataset.checkoutVersion(1)) {
+        assertEquals(1, checkoutV1.version());
+        assertEquals(2, checkoutV1.latestVersion());
+        assertEquals(0, checkoutV1.countRows());
+      }
+    }
+  }
+
+  @Test
   void testDatasetUri() {
     String datasetPath = tempDir.resolve("dataset_uri").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
