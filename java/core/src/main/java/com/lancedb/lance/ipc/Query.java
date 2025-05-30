@@ -36,7 +36,8 @@ public class Query {
     Preconditions.checkArgument(!builder.column.isEmpty(), "Column must not be empty");
     this.key = Preconditions.checkNotNull(builder.key, "Key must be set");
     Preconditions.checkArgument(builder.k > 0, "K must be greater than 0");
-    Preconditions.checkArgument(builder.minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
+    Preconditions.checkArgument(
+        builder.minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
     Preconditions.checkArgument(
         builder.maximumNprobes.isEmpty() || builder.maximumNprobes.get() > builder.minimumNprobes,
         "Maximum Nprobes must be greater than minimum Nprobes");
@@ -146,8 +147,9 @@ public class Query {
 
     /**
      * Sets the number of probes to load and search.
-     * 
-     * This is a convenience method that sets both the minimum and maximum number of probes to the same value.
+     *
+     * <p>This is a convenience method that sets both the minimum and maximum number of probes to
+     * the same value.
      *
      * @param nprobes The number of probes.
      * @return The Builder instance for method chaining.
@@ -160,9 +162,9 @@ public class Query {
 
     /**
      * Sets the minimum number of partitions to search.
-     * 
-     * This many partitions will always be loaded and searched on the query.  Increasing this number
-     * can improve recall at the cost of latency.
+     *
+     * <p>This many partitions will always be loaded and searched on the query. Increasing this
+     * number can improve recall at the cost of latency.
      *
      * @param minimumNProbes The minimum number of partitions to search.
      * @return The Builder instance for method chaining.
@@ -175,11 +177,12 @@ public class Query {
     /**
      * Sets the maximum number of partitions to search.
      *
-     * These partitions will only be loaded and searched if we have not found the desired number of results
-     * after searching the minimum number of partitions.  Increasing this number can avoid false negatives
-     * on queries with a highly selective prefilter.  This setting does not affect the recall of the query
-     * and will only affect the latency if the prefilter is highly selective.
-     * 
+     * <p>These partitions will only be loaded and searched if we have not found the desired number
+     * of results after searching the minimum number of partitions. Increasing this number can avoid
+     * false negatives on queries with a highly selective prefilter. This setting does not affect
+     * the recall of the query and will only affect the latency if the prefilter is highly
+     * selective.
+     *
      * @param maximumNProbes The maximum number of partitions to search.
      * @return The Builder instance for method chaining.
      */
