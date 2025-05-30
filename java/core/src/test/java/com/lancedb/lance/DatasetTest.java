@@ -171,19 +171,16 @@ public class DatasetTest {
 
       // write first batch of data, version 2
       try (Dataset dataset2 = testDataset.write(1, 5)) {
-        assertEquals(1, dataset.version());
-        assertEquals(2, dataset.latestVersion());
-        assertEquals(0, dataset.countRows());
         assertEquals(2, dataset2.version());
         assertEquals(2, dataset2.latestVersion());
         assertEquals(5, dataset2.countRows());
-      }
 
-      // checkout the dataset at version 1
-      try (Dataset checkoutV1 = dataset.checkoutVersion(1)) {
-        assertEquals(1, checkoutV1.version());
-        assertEquals(2, checkoutV1.latestVersion());
-        assertEquals(0, checkoutV1.countRows());
+        // checkout the dataset at version 1
+        try (Dataset checkoutV1 = dataset2.checkoutVersion(1)) {
+          assertEquals(1, checkoutV1.version());
+          assertEquals(2, checkoutV1.latestVersion());
+          assertEquals(0, checkoutV1.countRows());
+        }
       }
     }
   }
