@@ -29,6 +29,7 @@ pub const FLAT_COLUMN: &str = "flat";
 /// All data are stored in memory
 #[derive(Debug, Clone)]
 pub struct FlatFloatStorage {
+    metadata: FlatMetadata,
     batch: RecordBatch,
     distance_type: DistanceType,
 
@@ -46,6 +47,45 @@ impl DeepSizeOf for FlatFloatStorage {
 #[async_trait::async_trait]
 impl QuantizerStorage for FlatFloatStorage {
     type Metadata = FlatMetadata;
+
+    fn try_from_batch(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+    ) -> Result<Self> {
+        let row_ids = Arc::new(
+            batch
+                .column_by_name(ROW_ID)
+                .ok_or(Error::Schema {
+                    message: format!("column {} not found", ROW_ID),
+                    location: location!(),
+                })?
+                .as_primitive::<UInt64Type>()
+                .clone(),
+        );
+        let vectors = Arc::new(
+            batch
+                .column_by_name(FLAT_COLUMN)
+                .ok_or(Error::Schema {
+                    message: "column flat not found".to_string(),
+                    location: location!(),
+                })?
+                .as_fixed_size_list()
+                .clone(),
+        );
+        Ok(Self {
+            metadata: metadata.clone(),
+            batch,
+            distance_type,
+            row_ids,
+            vectors,
+        })
+    }
+
+    fn metadata(&self) -> &Self::Metadata {
+        &self.metadata
+    }
+
     async fn load_partition(
         _: &FileReader,
         _: std::ops::Range<usize>,
@@ -69,6 +109,9 @@ impl FlatFloatStorage {
         .unwrap();
 
         Self {
+            metadata: FlatMetadata {
+                dim: vectors.value_length() as usize,
+            },
             batch,
             distance_type,
             row_ids,
@@ -83,35 +126,6 @@ impl FlatFloatStorage {
 
 impl VectorStore for FlatFloatStorage {
     type DistanceCalculator<'a> = FlatDistanceCal<'a, Float32Type>;
-
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self> {
-        let row_ids = Arc::new(
-            batch
-                .column_by_name(ROW_ID)
-                .ok_or(Error::Schema {
-                    message: format!("column {} not found", ROW_ID),
-                    location: location!(),
-                })?
-                .as_primitive::<UInt64Type>()
-                .clone(),
-        );
-        let vectors = Arc::new(
-            batch
-                .column_by_name(FLAT_COLUMN)
-                .ok_or(Error::Schema {
-                    message: "column flat not found".to_string(),
-                    location: location!(),
-                })?
-                .as_fixed_size_list()
-                .clone(),
-        );
-        Ok(Self {
-            batch,
-            distance_type,
-            row_ids,
-            vectors,
-        })
-    }
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         Ok([self.batch.clone()].into_iter())
@@ -165,6 +179,7 @@ impl VectorStore for FlatFloatStorage {
 /// All data are stored in memory
 #[derive(Debug, Clone)]
 pub struct FlatBinStorage {
+    metadata: FlatMetadata,
     batch: RecordBatch,
     distance_type: DistanceType,
 
@@ -182,26 +197,12 @@ impl DeepSizeOf for FlatBinStorage {
 #[async_trait::async_trait]
 impl QuantizerStorage for FlatBinStorage {
     type Metadata = FlatMetadata;
-    async fn load_partition(
-        _: &FileReader,
-        _: std::ops::Range<usize>,
-        _: DistanceType,
-        _: &Self::Metadata,
+
+    fn try_from_batch(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
     ) -> Result<Self> {
-        unimplemented!("Flat will be used in new index builder which doesn't require this")
-    }
-}
-
-impl FlatBinStorage {
-    pub fn vector(&self, id: u32) -> ArrayRef {
-        self.vectors.value(id as usize)
-    }
-}
-
-impl VectorStore for FlatBinStorage {
-    type DistanceCalculator<'a> = FlatDistanceCal<'a, UInt8Type>;
-
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self> {
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)
@@ -223,12 +224,36 @@ impl VectorStore for FlatBinStorage {
                 .clone(),
         );
         Ok(Self {
+            metadata: metadata.clone(),
             batch,
             distance_type,
             row_ids,
             vectors,
         })
     }
+
+    fn metadata(&self) -> &Self::Metadata {
+        &self.metadata
+    }
+
+    async fn load_partition(
+        _: &FileReader,
+        _: std::ops::Range<usize>,
+        _: DistanceType,
+        _: &Self::Metadata,
+    ) -> Result<Self> {
+        unimplemented!("Flat will be used in new index builder which doesn't require this")
+    }
+}
+
+impl FlatBinStorage {
+    pub fn vector(&self, id: u32) -> ArrayRef {
+        self.vectors.value(id as usize)
+    }
+}
+
+impl VectorStore for FlatBinStorage {
+    type DistanceCalculator<'a> = FlatDistanceCal<'a, UInt8Type>;
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         Ok([self.batch.clone()].into_iter())
