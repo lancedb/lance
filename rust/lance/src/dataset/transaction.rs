@@ -2510,6 +2510,7 @@ mod tests {
             dataset_version: 1,
             fragment_bitmap: None,
             index_details: None,
+            index_version: 0,
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);

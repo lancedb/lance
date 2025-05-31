@@ -56,8 +56,8 @@ use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::{
-    build_inverted_index, detect_scalar_index_type, index_matches_criteria, inverted_index_details,
-    TrainingRequest,
+    build_inverted_index, detect_scalar_index_type, index_matches_criteria, infer_index_type,
+    inverted_index_details, TrainingRequest,
 };
 use serde_json::json;
 use snafu::location;
@@ -281,7 +281,7 @@ impl DatasetIndexExt for Dataset {
         }
 
         let index_id = Uuid::new_v4();
-        let index_details: prost_types::Any = match (index_type, params.index_name()) {
+        let index_details = match (index_type, params.index_name()) {
             (
                 IndexType::Bitmap
                 | IndexType::BTree
@@ -388,6 +388,7 @@ impl DatasetIndexExt for Dataset {
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
             index_details: Some(index_details),
+            index_version: index_type.version(),
         };
         let transaction = Transaction::new(
             self.manifest.version,
@@ -456,10 +457,27 @@ impl DatasetIndexExt for Dataset {
             return Ok(indices);
         }
 
-        let loaded_indices: Arc<Vec<IndexMetadata>> =
+        let loaded_indices: Vec<IndexMetadata> =
             read_manifest_indexes(&self.object_store, &self.manifest_location, &self.manifest)
                 .await?
-                .into();
+                .into_iter()
+                .filter(|idx| {
+                    let max_valid_version = infer_index_type(idx)
+                        .map(|t| t.version())
+                        .unwrap_or_default();
+                    let is_valid = idx.index_version <= max_valid_version;
+                    if !is_valid {
+                        log::warn!(
+                            "Index {} has version {}, which is not supported (<={}), ignoring it",
+                            idx.name,
+                            idx.index_version,
+                            max_valid_version,
+                        );
+                    }
+                    is_valid
+                })
+                .collect();
+        let loaded_indices = Arc::new(loaded_indices);
 
         self.session.index_cache.insert_metadata(
             self.base.as_ref(),
@@ -492,6 +510,7 @@ impl DatasetIndexExt for Dataset {
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
             index_details: None,
+            index_version: 0,
         };
 
         let transaction = Transaction::new(
@@ -574,28 +593,25 @@ impl DatasetIndexExt for Dataset {
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
-            let Some((new_id, removed, mut new_frag_ids)) =
-                merge_indices(dataset.clone(), deltas.as_slice(), options).await?
+            let Some(res) = merge_indices(dataset.clone(), deltas.as_slice(), options).await?
             else {
                 continue;
             };
-            for removed_idx in removed.iter() {
-                new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
-            }
 
             let last_idx = deltas.last().expect("Delta indices should not be empty");
             let new_idx = IndexMetadata {
-                uuid: new_id,
+                uuid: res.new_uuid,
                 name: last_idx.name.clone(), // Keep the same name
                 fields: last_idx.fields.clone(),
                 dataset_version: self.manifest.version,
-                fragment_bitmap: Some(new_frag_ids),
+                fragment_bitmap: Some(res.new_fragment_bitmap),
                 index_details: last_idx.index_details.clone(),
+                index_version: res.new_index_version,
             };
-            removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
-            if deltas.len() > removed.len() {
+            removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
+            if deltas.len() > removed_indices.len() {
                 new_indices.extend(
-                    deltas[0..(deltas.len() - removed.len())]
+                    deltas[0..(deltas.len() - res.removed_indices.len())]
                         .iter()
                         .map(|&idx| idx.clone()),
                 );
@@ -1104,7 +1120,8 @@ impl DatasetIndexInternalExt for Dataset {
             let is_vector_index = idx_schema
                 .fields
                 .iter()
-                .any(|f| matches!(f.data_type(), DataType::FixedSizeList(_, _)));
+                .any(|f| is_vector_field(f.data_type()));
+
             idx.fields.len() == 1 && !is_vector_index
         }) {
             let field = index.fields[0];
@@ -1205,6 +1222,17 @@ impl DatasetIndexInternalExt for Dataset {
                 Ok(indexed_frags)
             })
             .collect()
+    }
+}
+
+fn is_vector_field(data_type: DataType) -> bool {
+    match data_type {
+        DataType::FixedSizeList(_, _) => true,
+        DataType::List(inner) => {
+            // If the inner type is a fixed size list, then it is a multivector field
+            matches!(inner.data_type(), DataType::FixedSizeList(_, _))
+        }
+        _ => false,
     }
 }
 
