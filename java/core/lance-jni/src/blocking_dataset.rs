@@ -686,6 +686,32 @@ fn inner_latest_version(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> 
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCheckoutVersion<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    version: jlong,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_checkout_version(&mut env, java_dataset, version))
+}
+
+fn inner_checkout_version<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    version: jlong,
+) -> Result<JObject<'local>> {
+    let new_dataset = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+        let version_u64 = version as u64;
+        RT.block_on(dataset_guard.inner.checkout_version(version_u64))?
+    };
+
+    let blocking_dataset = BlockingDataset { inner: new_dataset };
+    blocking_dataset.into_java(env)
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCountRows(
     mut env: JNIEnv,
     java_dataset: JObject,
