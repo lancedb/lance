@@ -695,10 +695,7 @@ impl FileReader {
             .collect::<Vec<_>>()
     }
 
-    fn validate_projection(
-        projection: &ReaderProjection,
-        metadata: &CachedFileMetadata,
-    ) -> Result<()> {
+    fn validate_projection(projection: &ReaderProjection) -> Result<()> {
         if projection.schema.fields.is_empty() {
             return Err(Error::invalid_input(
                 "Attempt to read zero columns from the file, at least one column must be specified"
@@ -716,9 +713,6 @@ impl FileReader {
                     ),
                     location!(),
                 ));
-            }
-            if *column_index >= metadata.column_infos.len() as u32 {
-                return Err(Error::invalid_input(format!("The projection specified the column index {} but there are only {} columns in the file", column_index, metadata.column_infos.len()), location!()));
             }
         }
         Ok(())
@@ -768,7 +762,7 @@ impl FileReader {
         let cache = Arc::new(cache.with_base_path(path));
 
         if let Some(base_projection) = base_projection.as_ref() {
-            Self::validate_projection(base_projection, &file_metadata)?;
+            Self::validate_projection(base_projection)?;
         }
         let num_rows = file_metadata.num_rows;
         Ok(Self {
@@ -1011,7 +1005,7 @@ impl FileReader {
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
         let projection = projection.unwrap_or_else(|| self.base_projection.clone());
-        Self::validate_projection(&projection, &self.metadata)?;
+        Self::validate_projection(&projection)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
             if bound > self.num_rows || bound == self.num_rows && inclusive {
                 Err(Error::invalid_input(
@@ -1254,7 +1248,7 @@ impl FileReader {
         filter: FilterExpression,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let projection = projection.unwrap_or_else(|| self.base_projection.clone());
-        Self::validate_projection(&projection, &self.metadata)?;
+        Self::validate_projection(&projection)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
             if bound > self.num_rows || bound == self.num_rows && inclusive {
                 Err(Error::invalid_input(
