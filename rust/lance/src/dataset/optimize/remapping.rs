@@ -4,12 +4,9 @@
 //! Utilities for remapping row ids. Necessary before move-stable row ids.
 //!
 
+use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::Result;
-use crate::{
-    dataset::transaction::{Operation, Transaction},
-    index::scalar::infer_index_type,
-};
 use crate::{index, Dataset};
 use async_trait::async_trait;
 use lance_core::utils::address::RowAddress;
@@ -260,9 +257,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                 dataset_version: dataset.manifest.version,
                 fragment_bitmap: bitmap_after_remap,
                 index_details: curr_index_meta.index_details.clone(),
-                index_version: infer_index_type(&curr_index_meta)
-                    .map(|index_type| index_type.version())
-                    .unwrap_or_default(),
+                index_version: 0,
             };
 
             let transaction = Transaction::new(
