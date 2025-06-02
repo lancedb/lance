@@ -345,6 +345,10 @@ def test_create_index_using_cuda(tmp_path, nullify):
 
 
 def test_create_index_unsupported_accelerator(tmp_path):
+    # Even attempting to use an accelerator will trigger torch import
+    # so make sure it's available
+    pytest.importorskip("torch")
+
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
     with pytest.raises(ValueError):
