@@ -3141,7 +3141,6 @@ mod test {
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::DistanceType;
-    use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
 
@@ -3152,7 +3151,9 @@ mod test {
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
     use crate::index::vector::{StageParams, VectorIndexParams};
-    use crate::utils::test::{IoStats, IoTrackingStore};
+    use crate::utils::test::{
+        DatagenExt, FragmentCount, FragmentRowCount, IoStats, IoTrackingStore,
+    };
 
     #[tokio::test]
     async fn test_batch_size() {
@@ -4489,19 +4490,20 @@ mod test {
     ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut data_gen = BatchGenerator::new().col(Box::new(
-            IncrementingInt32::new().named("Filter_me".to_owned()),
-        ));
-        Dataset::write(
-            data_gen.batch(32),
-            test_uri,
-            Some(WriteParams {
-                data_storage_version: Some(data_storage_version),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+
+        gen()
+            .col("Filter_me", array::step::<Int32Type>())
+            .into_dataset(
+                test_uri,
+                FragmentCount::from(1),
+                FragmentRowCount::from(32),
+                Some(WriteParams {
+                    data_storage_version: Some(data_storage_version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(32, dataset.count_rows(None).await.unwrap());
@@ -4522,18 +4524,19 @@ mod test {
     ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut data_gen =
-            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
-        Dataset::write(
-            data_gen.batch(32),
-            test_uri,
-            Some(WriteParams {
-                data_storage_version: Some(data_storage_version),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        gen()
+            .col("i", array::step::<Int32Type>())
+            .into_dataset(
+                test_uri,
+                FragmentCount::from(1),
+                FragmentRowCount::from(32),
+                Some(WriteParams {
+                    data_storage_version: Some(data_storage_version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 32);
@@ -4570,18 +4573,19 @@ mod test {
     ) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut data_gen =
-            BatchGenerator::new().col(Box::new(RandomVector::new().named("vec".to_owned())));
-        Dataset::write(
-            data_gen.batch(32),
-            test_uri,
-            Some(WriteParams {
-                data_storage_version: Some(data_storage_version),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        gen()
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(128)))
+            .into_dataset(
+                test_uri,
+                FragmentCount::from(1),
+                FragmentRowCount::from(32),
+                Some(WriteParams {
+                    data_storage_version: Some(data_storage_version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 32);

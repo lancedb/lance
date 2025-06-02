@@ -1214,6 +1214,7 @@ mod tests {
                     tmp_path.path().to_str().unwrap(),
                     FragmentCount::from(2),
                     FragmentRowCount::from(100),
+                    None,
                 )
                 .await
                 .unwrap();

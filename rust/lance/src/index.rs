@@ -1343,6 +1343,7 @@ mod tests {
                 test_dir.path().to_str().unwrap(),
                 FragmentCount::from(1),
                 FragmentRowCount::from(256),
+                None,
             )
             .await
             .unwrap();

@@ -228,6 +228,7 @@ pub mod tests {
                 test_uri,
                 FragmentCount::from(10),
                 FragmentRowCount::from(10),
+                None,
             )
             .await
             .unwrap();

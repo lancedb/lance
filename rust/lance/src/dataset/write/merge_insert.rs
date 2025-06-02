@@ -2552,7 +2552,7 @@ mod tests {
                 .col("id", array::step::<UInt32Type>())
                 .col("value", array::step::<UInt32Type>())
                 .col("other_value", array::step::<UInt32Type>())
-                .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(20))
+                .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(20), None)
                 .await
                 .unwrap();
 
