@@ -124,12 +124,12 @@ pub async fn build_new_frag_reuse_index(
             .cloned()
     })?;
 
-    let new_index_details = match index_meta {
+    let new_index_details = match &index_meta {
         None => FragReuseIndexDetails {
             versions: Vec::from([new_version]),
         },
-        Some(index_meta) => {
-            let current_details = load_frag_reuse_index_details(dataset, &index_meta).await?;
+        Some(ref index_meta) => {
+            let current_details = load_frag_reuse_index_details(dataset, index_meta).await?;
             let mut versions = current_details.versions.clone();
             versions.push(new_version);
             FragReuseIndexDetails { versions }
@@ -167,6 +167,8 @@ pub async fn build_new_frag_reuse_index(
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(new_fragment_bitmap),
         index_details: Some(prost_types::Any::from_msg(&proto)?),
-        index_version: 0,
+        index_version: index_meta
+            .as_ref()
+            .map_or(0, |index_meta| index_meta.index_version),
     })
 }
