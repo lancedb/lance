@@ -168,7 +168,7 @@ public class Query {
      * <p>This many partitions will always be loaded and searched on the query. Increasing this
      * number can improve recall at the cost of latency.
      *
-     * @param minimumNrobes The minimum number of partitions to search.
+     * @param minimumNprobes The minimum number of partitions to search.
      * @return The Builder instance for method chaining.
      */
     public Builder setMinimumNprobes(int minimumNprobes) {

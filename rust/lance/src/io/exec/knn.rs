@@ -759,13 +759,13 @@ impl ANNIvfSubIndexExec {
                     let state = state.clone();
                     let index = index.clone();
                     async move {
+                        let _timer = metrics.baseline_metrics.elapsed_compute().timer();
                         let mut query = query.clone();
                         if index.metric_type() == DistanceType::Cosine {
                             let key = normalize_arrow(&query.key)?;
                             query.key = key;
                         };
 
-                        let _timer = metrics.baseline_metrics.elapsed_compute().timer();
                         metrics.partitions_searched.add(1);
                         let batch = index
                             .search_in_partition(
@@ -818,13 +818,13 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 async move {
+                    let _timer = metrics.baseline_metrics.elapsed_compute().timer();
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
                         let key = normalize_arrow(&query.key)?;
                         query.key = key;
                     };
 
-                    let _timer = metrics.baseline_metrics.elapsed_compute().timer();
                     let batch = index
                         .search_in_partition(
                             part_id as usize,

@@ -832,7 +832,7 @@ impl Scanner {
     ///
     /// This method is a convenience method that sets both [Self::minimum_nprobes] and
     /// [Self::maximum_nprobes] to the same value.
-    pub fn nprobes(&mut self, n: usize) -> &mut Self {
+    pub fn nprobs(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.minimum_nprobes = n;
             q.maximum_nprobes = Some(n);

@@ -4657,7 +4657,7 @@ mod tests {
         let batches = scan
             .nearest("vector", &query_vec, 2000)
             .unwrap()
-            .minimum_nprobes(4)
+            .nprobs(4)
             .prefilter(true)
             .try_into_stream()
             .await
