@@ -383,6 +383,7 @@ class LanceDataset(pa.dataset.Dataset):
         metadata_cache_size_bytes: Optional[int] = None,
         index_cache_size_bytes: Optional[int] = None,
         read_params: Optional[Dict[str, Any]] = None,
+        session: Optional[Session] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -412,6 +413,7 @@ class LanceDataset(pa.dataset.Dataset):
             metadata_cache_size_bytes=metadata_cache_size_bytes,
             index_cache_size_bytes=index_cache_size_bytes,
             read_params=read_params,
+            session=session,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params

@@ -386,7 +386,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None))]
     fn new(
         py: Python,
         uri: String,
@@ -400,6 +400,7 @@ impl Dataset {
         metadata_cache_size_bytes: Option<usize>,
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -482,7 +483,11 @@ impl Dataset {
             builder = builder.with_serialized_manifest(manifest).infer_error()?;
         }
 
-        let dataset = RT.block_on(Some(py), builder.load())?;
+        if let Some(session) = session {
+            builder = builder.with_session(session.inner.clone());
+        }
+
+        let dataset = RT.runtime.block_on(builder.load());
 
         match dataset {
             Ok(ds) => Ok(Self {
