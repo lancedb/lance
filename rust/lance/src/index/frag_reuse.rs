@@ -167,5 +167,6 @@ pub async fn build_new_frag_reuse_index(
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(new_fragment_bitmap),
         index_details: Some(prost_types::Any::from_msg(&proto)?),
+        index_version: 0,
     })
 }
