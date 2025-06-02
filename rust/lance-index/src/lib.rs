@@ -191,6 +191,8 @@ impl IndexType {
             | Self::IvfPq
             | Self::IvfHnswSq
             | Self::IvfHnswPq => 0,
+
+            Self::FragmentReuse => 0,
         }
     }
 }

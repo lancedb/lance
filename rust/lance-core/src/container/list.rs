@@ -157,6 +157,17 @@ impl<T> FromIterator<T> for ExpLinkedList<T> {
     }
 }
 
+impl<T> PartialEq for ExpLinkedList<T>
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().zip(other.iter()).all(|(a, b)| a == b)
+    }
+}
+
+impl<T> Eq for ExpLinkedList<T> where T: Eq {}
+
 pub struct ExpLinkedListIter<'a, T> {
     inner: std::collections::linked_list::Iter<'a, Vec<T>>,
     inner_iter: Option<std::slice::Iter<'a, T>>,

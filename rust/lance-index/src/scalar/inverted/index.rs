@@ -1474,6 +1474,14 @@ impl Default for PositionBuilder {
     }
 }
 
+impl PartialEq for PositionBuilder {
+    fn eq(&self, other: &Self) -> bool {
+        self.positions == other.positions && self.offsets == other.offsets
+    }
+}
+
+impl Eq for PositionBuilder {}
+
 impl PositionBuilder {
     pub fn new() -> Self {
         Self {
@@ -1934,4 +1942,49 @@ pub fn flat_bm25_search_stream(
 
 pub fn is_phrase_query(query: &str) -> bool {
     query.starts_with('\"') && query.ends_with('\"')
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::scalar::inverted::encoding::decompress_posting_list;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_posting_builder_remap() {
+        let mut builder = PostingListBuilder::new(false);
+        let n = BLOCK_SIZE + 3;
+        for i in 0..n {
+            builder.add(i as u32, PositionRecorder::Count(1));
+        }
+        let removed = vec![5, 7];
+        builder.remap(&removed);
+
+        let mut expected = PostingListBuilder::new(false);
+        for i in 0..n - removed.len() {
+            expected.add(i as u32, PositionRecorder::Count(1));
+        }
+        assert_eq!(builder.doc_ids, expected.doc_ids);
+        assert_eq!(builder.frequencies, expected.frequencies);
+
+        // BLOCK_SIZE + 3 elements should be reduced to BLOCK_SIZE + 1,
+        // there are still 2 blocks.
+        let batch = builder.to_batch(vec![1.0, 2.0]).unwrap();
+        let (doc_ids, freqs) = decompress_posting_list(
+            (n - removed.len()) as u32,
+            batch[POSTING_COL]
+                .as_list::<i32>()
+                .value(0)
+                .as_binary::<i64>(),
+        )
+        .unwrap();
+        assert!(doc_ids
+            .iter()
+            .zip(expected.doc_ids.iter())
+            .all(|(a, b)| a == b));
+        assert!(freqs
+            .iter()
+            .zip(expected.frequencies.iter())
+            .all(|(a, b)| a == b));
+    }
 }
