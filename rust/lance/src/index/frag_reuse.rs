@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::dataset::optimize::remapping::transpose_row_ids;
 use crate::Dataset;
+use crate::{dataset::optimize::remapping::transpose_row_ids, index::scalar::infer_index_type};
 use lance_core::Error;
 use lance_index::frag_reuse::{
     FragReuseIndex, FragReuseIndexDetails, FragReuseVersion, FRAG_REUSE_DETAILS_FILE_NAME,
@@ -167,5 +167,6 @@ pub async fn build_new_frag_reuse_index(
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(new_fragment_bitmap),
         index_details: Some(prost_types::Any::from_msg(&proto)?),
+        index_version: 0,
     })
 }
