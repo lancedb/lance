@@ -1474,14 +1474,6 @@ impl Default for PositionBuilder {
     }
 }
 
-impl PartialEq for PositionBuilder {
-    fn eq(&self, other: &Self) -> bool {
-        self.positions == other.positions && self.offsets == other.offsets
-    }
-}
-
-impl Eq for PositionBuilder {}
-
 impl PositionBuilder {
     pub fn new() -> Self {
         Self {
