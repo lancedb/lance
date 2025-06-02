@@ -1406,8 +1406,8 @@ impl PostingListBuilder {
         }
         let compressed = compress_posting_list(
             self.doc_ids.len(),
-            self.doc_ids.block_iter(),
-            self.frequencies.block_iter(),
+            self.doc_ids.iter(),
+            self.frequencies.iter(),
             block_max_scores.into_iter(),
         )?;
         let schema = inverted_list_schema(self.has_positions());
