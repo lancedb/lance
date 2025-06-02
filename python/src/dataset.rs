@@ -316,7 +316,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, session=None))]
     fn new(
         py: Python,
         uri: String,
@@ -327,6 +327,7 @@ impl Dataset {
         commit_handler: Option<PyObject>,
         storage_options: Option<HashMap<String, String>>,
         manifest: Option<&[u8]>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         let mut params = ReadParams {
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
@@ -371,6 +372,10 @@ impl Dataset {
         }
         if let Some(manifest) = manifest {
             builder = builder.with_serialized_manifest(manifest).infer_error()?;
+        }
+
+        if let Some(session) = session {
+            builder = builder.with_session(session.inner.clone());
         }
 
         let dataset = RT.runtime.block_on(builder.load());

@@ -17,6 +17,7 @@ from .dataset import (
     LanceOperation,
     LanceScanner,
     MergeInsertBuilder,
+    Session,
     Transaction,
     __version__,
     batch_udf,
@@ -77,6 +78,7 @@ def dataset(
     index_cache_size: Optional[int] = None,
     storage_options: Optional[Dict[str, str]] = None,
     default_scan_options: Optional[Dict[str, str]] = None,
+    session: Optional[Session] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -122,6 +124,10 @@ def dataset(
         fields such as ``_rowid`` or ``_rowaddr``.  If ``default_scan_options`` is
         provided then the schema returned by :py:meth:`lance.LanceDataset.schema` will
         include these fields if the appropriate scan options are set.
+    session : optional, lance.Session
+        A session to use for this dataset. This contains the caches used by the
+        dataset, such as the index cache. Pass this in to share the same session
+        across multiple datasets.
     """
     ds = LanceDataset(
         uri,
@@ -131,6 +137,7 @@ def dataset(
         index_cache_size=index_cache_size,
         storage_options=storage_options,
         default_scan_options=default_scan_options,
+        session=session,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -149,6 +156,7 @@ def dataset(
                 block_size,
                 commit_lock=commit_lock,
                 index_cache_size=index_cache_size,
+                session=session,
             )
     else:
         return ds
