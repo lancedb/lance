@@ -684,7 +684,10 @@ mod tests {
         } else {
             // We need to read the other manifests and transactions.
             assert_eq!(io_stats.read_iops, 1 + num_other_txns * 2);
-            assert_eq!(io_stats.num_hops, 5);
+            // It's possible to read the txns for some versions before we
+            // finish reading later versions and so the entire "read versions
+            // and txs" may appear as 1 hop instead of 2.
+            assert!(io_stats.num_hops <= 5);
         }
         assert_eq!(io_stats.write_iops, 2); // txn + manifest
     }
