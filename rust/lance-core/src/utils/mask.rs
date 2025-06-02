@@ -228,38 +228,34 @@ impl RowIdMask {
     /// list contains "full fragment" blocks but that would require some
     /// extra logic.
     pub fn iter_ids(&self) -> Option<Box<dyn Iterator<Item = RowAddress> + '_>> {
-        if let Some(allow_list) = &self.allow_list {
-            if let Some(mut allow_iter) = allow_list.row_ids() {
-                if let Some(block_list) = &self.block_list {
-                    if let Some(block_iter) = block_list.row_ids() {
-                        let mut block_iter = block_iter.peekable();
-                        Some(Box::new(iter::from_fn(move || {
-                            for allow_id in allow_iter.by_ref() {
-                                while let Some(block_id) = block_iter.peek() {
-                                    if *block_id >= allow_id {
-                                        break;
-                                    }
-                                    block_iter.next();
+        if let Some(mut allow_iter) = self.allow_list.as_ref().and_then(|list| list.row_ids()) {
+            if let Some(block_list) = &self.block_list {
+                if let Some(block_iter) = block_list.row_ids() {
+                    let mut block_iter = block_iter.peekable();
+                    Some(Box::new(iter::from_fn(move || {
+                        for allow_id in allow_iter.by_ref() {
+                            while let Some(block_id) = block_iter.peek() {
+                                if *block_id >= allow_id {
+                                    break;
                                 }
-                                if let Some(block_id) = block_iter.peek() {
-                                    if *block_id == allow_id {
-                                        continue;
-                                    }
-                                }
-                                return Some(allow_id);
+                                block_iter.next();
                             }
-                            None
-                        })))
-                    } else {
-                        // There is a block list but we can't iterate over it, give up
+                            if let Some(block_id) = block_iter.peek() {
+                                if *block_id == allow_id {
+                                    continue;
+                                }
+                            }
+                            return Some(allow_id);
+                        }
                         None
-                    }
+                    })))
                 } else {
-                    // There is no block list, use the allow list
-                    Some(Box::new(allow_iter))
+                    // There is a block list but we can't iterate over it, give up
+                    None
                 }
             } else {
-                None
+                // There is no block list, use the allow list
+                Some(Box::new(allow_iter))
             }
         } else {
             None
