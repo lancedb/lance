@@ -99,8 +99,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let key = Arc::new(Float32Array::from(key_array));
 
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
-        let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNProbes")?;
-        let maximum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMaximumNProbes")?;
+        let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
+        let maximum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMaximumNprobes")?;
 
         let ef = env.get_optional_usize_from_method(&java_obj, "getEf")?;
 

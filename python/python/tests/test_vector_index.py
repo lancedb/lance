@@ -898,6 +898,7 @@ def test_index_cache_size(tmp_path):
                 nearest={
                     "column": "vector",
                     "q": q if q is not None else rng.standard_normal(ndim),
+                    "minimum_nprobes": 1,
                 },
             )
 
@@ -1309,7 +1310,7 @@ def test_vector_index_with_nprobes(indexed_dataset):
             "column": "vector",
             "q": np.random.randn(128),
             "k": 10,
-            "maximum_nprobes": 10,
+            "maximum_nprobes": 30,
         }
     ).analyze_plan()
 
