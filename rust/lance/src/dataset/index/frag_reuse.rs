@@ -73,9 +73,13 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         versions: retained_versions,
     };
 
-    let new_index_meta =
-        build_frag_reuse_index_metadata(dataset, frag_reuse_index_details, fragment_bitmaps)
-            .await?;
+    let new_index_meta = build_frag_reuse_index_metadata(
+        dataset,
+        Some(frag_reuse_index_meta),
+        frag_reuse_index_details,
+        fragment_bitmaps,
+    )
+    .await?;
 
     let transaction = Transaction::new(
         dataset.manifest.version,
