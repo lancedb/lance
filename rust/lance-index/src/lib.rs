@@ -182,6 +182,7 @@ impl IndexType {
             Self::LabelList => 0,
             Self::Inverted => 0,
             Self::NGram => 0,
+            Self::FragmentReuse => 0,
 
             // for now all vector indices are built by the same builder,
             // so they share the same version.
@@ -191,8 +192,6 @@ impl IndexType {
             | Self::IvfPq
             | Self::IvfHnswSq
             | Self::IvfHnswPq => 0,
-
-            Self::FragmentReuse => 0,
         }
     }
 }

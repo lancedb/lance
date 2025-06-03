@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+pub mod frag_reuse;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
