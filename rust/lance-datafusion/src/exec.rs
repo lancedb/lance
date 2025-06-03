@@ -3,7 +3,10 @@
 
 //! Utilities for working with datafusion execution plans
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
@@ -294,42 +297,45 @@ fn get_task_context(
     state.task_ctx()
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionSummaryCounts {
+    /// The number of I/O operations performed
     pub iops: usize,
+    /// The number of requests made to the storage layer (may be larger or smaller than iops
+    /// depending on coalescing configuration)
     pub requests: usize,
+    /// The number of bytes read during the execution of the plan
     pub bytes_read: usize,
+    /// The number of top-level indices loaded
     pub indices_loaded: usize,
+    /// The number of index partitions loaded
     pub parts_loaded: usize,
+    /// The number of index comparisons performed (the exact meaning depends on the index type)
     pub index_comparisons: usize,
+    /// Additional metrics for more detailed statistics.  These are subject to change in the future
+    /// and should only be used for debugging purposes.
+    pub all_counts: HashMap<String, usize>,
 }
 
 fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
-        counts.iops += metrics
-            .find_count(IOPS_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.requests += metrics
-            .find_count(REQUESTS_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.bytes_read += metrics
-            .find_count(BYTES_READ_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.indices_loaded += metrics
-            .find_count(INDICES_LOADED_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.parts_loaded += metrics
-            .find_count(PARTS_LOADED_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.index_comparisons += metrics
-            .find_count(INDEX_COMPARISONS_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
+        for (metric_name, count) in metrics.iter_counts() {
+            match metric_name.as_ref() {
+                IOPS_METRIC => counts.iops += count.value(),
+                REQUESTS_METRIC => counts.requests += count.value(),
+                BYTES_READ_METRIC => counts.bytes_read += count.value(),
+                INDICES_LOADED_METRIC => counts.indices_loaded += count.value(),
+                PARTS_LOADED_METRIC => counts.parts_loaded += count.value(),
+                INDEX_COMPARISONS_METRIC => counts.index_comparisons += count.value(),
+                _ => {
+                    let existing = counts
+                        .all_counts
+                        .entry(metric_name.as_ref().to_string())
+                        .or_insert(0);
+                    *existing += count.value();
+                }
+            }
+        }
     }
     for child in node.children() {
         visit_node(child.as_ref(), counts);

@@ -10,20 +10,17 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use arrow::{
-    array::as_struct_array,
-    compute::{concat_batches, sort_to_indices, take},
-};
+use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
-use arrow_array::{RecordBatch, StructArray, UInt32Array};
+use arrow_array::{RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
-use futures::prelude::stream::{self, StreamExt, TryStreamExt};
+use futures::prelude::stream::{self, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::FileMetadataCache;
-use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -42,7 +39,7 @@ use lance_index::{
     pb,
     vector::{
         ivf::storage::IVF_METADATA_KEY, quantizer::Quantization, storage::IvfQuantizationStorage,
-        v3::subindex::IvfSubIndex, Query, DISTANCE_TYPE_KEY, DIST_COL,
+        v3::subindex::IvfSubIndex, Query, DISTANCE_TYPE_KEY,
     },
     Index, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
@@ -53,7 +50,7 @@ use lance_io::utils::CachedFileSize;
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader, ReadBatchParams,
 };
-use lance_linalg::{distance::DistanceType, kernels::normalize_arrow};
+use lance_linalg::distance::DistanceType;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -428,44 +425,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFIndex<S, Q> {
     async fn search(
         &self,
-        query: &Query,
-        pre_filter: Arc<dyn PreFilter>,
-        metrics: &dyn MetricsCollector,
+        _query: &Query,
+        _pre_filter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        let mut query = query.clone();
-        if self.distance_type == DistanceType::Cosine {
-            let key = normalize_arrow(&query.key)?;
-            query.key = key;
-        };
-
-        let partition_ids = self.find_partitions(&query)?;
-        assert!(partition_ids.len() <= query.nprobes);
-        let part_ids = partition_ids.values().to_vec();
-        let batches = stream::iter(part_ids)
-            .map(|part_id| {
-                self.search_in_partition(part_id as usize, &query, pre_filter.clone(), metrics)
-            })
-            .buffer_unordered(get_num_compute_intensive_cpus())
-            .try_collect::<Vec<_>>()
-            .await?;
-        let batch = concat_batches(&batches[0].schema(), &batches)?;
-
-        let dist_col = batch.column_by_name(DIST_COL).ok_or_else(|| {
-            Error::io(
-                format!(
-                    "_distance column does not exist in batch: {}",
-                    batch.schema()
-                ),
-                location!(),
-            )
-        })?;
-
-        // TODO: Use a heap sort to get the top-k.
-        let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
-        let selection = sort_to_indices(dist_col, None, Some(limit))?;
-        let struct_arr = StructArray::from(batch);
-        let taken_distances = take(&struct_arr, &selection, None)?;
-        Ok(as_struct_array(&taken_distances).into())
+        unimplemented!("IVFIndex not currently used as sub-index and top-level indices do partition-aware search")
     }
 
     fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
@@ -475,7 +439,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             self.distance_type
         };
 
-        self.ivf.find_partitions(&query.key, query.nprobes, dt)
+        let max_nprobes = query.maximum_nprobes.unwrap_or(self.ivf.num_partitions());
+
+        self.ivf.find_partitions(&query.key, max_nprobes, dt)
+    }
+
+    fn total_partitions(&self) -> usize {
+        self.ivf.num_partitions()
     }
 
     #[instrument(level = "debug", skip(self, pre_filter, metrics))]
@@ -525,10 +495,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
     fn use_residual(&self) -> bool {
         false
-    }
-
-    fn check_can_remap(&self) -> Result<()> {
-        Ok(())
     }
 
     async fn load(
@@ -900,7 +866,7 @@ mod tests {
             .scan()
             .nearest(vector_column, query.as_primitive::<T>(), k)
             .unwrap()
-            .nprobs(nlist)
+            .minimum_nprobes(nlist)
             .with_row_id()
             .try_into_batch()
             .await
@@ -1001,7 +967,7 @@ mod tests {
             .scan()
             .nearest(vector_column, query.as_primitive::<T>(), 100)
             .unwrap()
-            .nprobs(nlist)
+            .minimum_nprobes(nlist)
             .with_row_id()
             .try_into_batch()
             .await
@@ -1032,7 +998,7 @@ mod tests {
             .scan()
             .nearest(vector_column, query.as_primitive::<T>(), 100)
             .unwrap()
-            .nprobs(nlist)
+            .minimum_nprobes(nlist)
             .with_row_id()
             .try_into_batch()
             .await
@@ -1395,7 +1361,7 @@ mod tests {
             .scan()
             .nearest("vector", &query, k)
             .unwrap()
-            .nprobs(nlist)
+            .minimum_nprobes(nlist)
             .with_row_id()
             .try_into_batch()
             .await
@@ -1624,7 +1590,7 @@ mod tests {
             .scan()
             .nearest(vector_column, query.as_primitive::<T>(), k)
             .unwrap()
-            .nprobs(nlist)
+            .minimum_nprobes(nlist)
             .with_row_id()
             .try_into_batch()
             .await
@@ -1640,7 +1606,7 @@ mod tests {
             .scan()
             .nearest(vector_column, query.as_primitive::<T>(), part_idx)
             .unwrap()
-            .nprobs(nlist)
+            .minimum_nprobes(nlist)
             .with_row_id()
             .distance_range(None, Some(part_dist))
             .try_into_batch()
@@ -1650,7 +1616,7 @@ mod tests {
             .scan()
             .nearest(vector_column, query.as_primitive::<T>(), k - part_idx)
             .unwrap()
-            .nprobs(nlist)
+            .minimum_nprobes(nlist)
             .with_row_id()
             .distance_range(Some(part_dist), None)
             .try_into_batch()
@@ -1684,7 +1650,7 @@ mod tests {
             .scan()
             .nearest(vector_column, query.as_primitive::<T>(), k)
             .unwrap()
-            .nprobs(nlist)
+            .minimum_nprobes(nlist)
             .with_row_id()
             .distance_range(dists.first().copied(), dists.last().copied())
             .try_into_batch()

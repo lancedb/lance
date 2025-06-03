@@ -14,8 +14,6 @@ import pyarrow.compute as pc
 import pytest
 from lance import LanceFragment
 from lance.dataset import VectorIndexReader
-
-torch = pytest.importorskip("torch")
 from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
@@ -255,6 +253,8 @@ def test_index_with_nans(tmp_path):
 
 
 def test_torch_index_with_nans(tmp_path):
+    torch = pytest.importorskip("torch")
+
     # 1024 rows, the entire table should be sampled
     tbl = create_table(nvec=1000, nans=24)
 
@@ -271,6 +271,8 @@ def test_torch_index_with_nans(tmp_path):
 
 
 def test_index_with_no_centroid_movement(tmp_path):
+    torch = pytest.importorskip("torch")
+
     # this test makes the centroids essentially [1..]
     # this makes sure the early stop condition in the index building code
     # doesn't do divide by zero
@@ -343,6 +345,10 @@ def test_create_index_using_cuda(tmp_path, nullify):
 
 
 def test_create_index_unsupported_accelerator(tmp_path):
+    # Even attempting to use an accelerator will trigger torch import
+    # so make sure it's available
+    pytest.importorskip("torch")
+
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
     with pytest.raises(ValueError):
@@ -896,6 +902,7 @@ def test_index_cache_size(tmp_path):
                 nearest={
                     "column": "vector",
                     "q": q if q is not None else rng.standard_normal(ndim),
+                    "minimum_nprobes": 1,
                 },
             )
 
@@ -1033,6 +1040,8 @@ def test_dynamic_projection_with_vectors_index(tmp_path: Path):
 
 
 def test_index_cast_centroids(tmp_path):
+    torch = pytest.importorskip("torch")
+
     tbl = create_table(nvec=1000)
 
     dataset = lance.write_dataset(tbl, tmp_path)
@@ -1260,3 +1269,53 @@ def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
         prefilter=True,
     )
     assert len(res) == 10
+
+
+def test_vector_index_with_nprobes(indexed_dataset):
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "nprobes": 7,
+        }
+    ).explain_plan()
+
+    assert "minimum_nprobes=7" in res
+    assert "maximum_nprobes=Some(7)" in res
+
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "minimum_nprobes": 7,
+        }
+    ).explain_plan()
+
+    assert "minimum_nprobes=7" in res
+    assert "maximum_nprobes=None" in res
+
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "minimum_nprobes": 7,
+            "maximum_nprobes": 10,
+        }
+    ).explain_plan()
+
+    assert "minimum_nprobes=7" in res
+    assert "maximum_nprobes=Some(10)" in res
+
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "maximum_nprobes": 30,
+        }
+    ).analyze_plan()
+
+    print(res)
