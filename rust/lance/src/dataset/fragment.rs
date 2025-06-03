@@ -328,7 +328,7 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
             let projection = ReaderProjection::from_field_ids(
-                self.reader.as_ref(),
+                self.reader.metadata().version(),
                 projection.as_ref(),
                 self.field_id_to_column_idx.as_ref(),
             )?;
@@ -354,7 +354,7 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
             let projection = ReaderProjection::from_field_ids(
-                self.reader.as_ref(),
+                self.reader.metadata().version(),
                 projection.as_ref(),
                 self.field_id_to_column_idx.as_ref(),
             )?;
@@ -379,7 +379,7 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
             let projection = ReaderProjection::from_field_ids(
-                self.reader.as_ref(),
+                self.reader.metadata().version(),
                 projection.as_ref(),
                 self.field_id_to_column_idx.as_ref(),
             )?;
@@ -407,7 +407,7 @@ mod v2_adapter {
         ) -> Result<ReadBatchTaskStream> {
             let indices = UInt32Array::from(indices.to_vec());
             let projection = ReaderProjection::from_field_ids(
-                self.reader.as_ref(),
+                self.reader.metadata().version(),
                 projection.as_ref(),
                 self.field_id_to_column_idx.as_ref(),
             )?;
