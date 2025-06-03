@@ -2747,6 +2747,11 @@ class Index(TypedDict):
     fragment_ids: Set[int]
 
 
+class AutoCleanupConfig(TypedDict):
+    interval: int
+    older_than_seconds: int
+
+
 # LanceOperation is a namespace for operations that can be applied to a dataset.
 class LanceOperation:
     @staticmethod
@@ -3094,6 +3099,7 @@ class LanceOperation:
         fields: List[int]
         dataset_version: int
         fragment_ids: Set[int]
+        index_version: int
 
     @dataclass
     class DataReplacementGroup:
@@ -3923,6 +3929,7 @@ def write_dataset(
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
     enable_move_stable_row_ids: bool = False,
+    auto_cleanup_options: Optional[AutoCleanupConfig] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -3981,6 +3988,17 @@ def write_dataset(
         These row ids are stable after compaction operations, but not after updates.
         This makes compaction more efficient, since with stable row ids no
         secondary indices need to be updated to point to new row ids.
+    auto_cleanup_options: optional, AutoCleanupConfig
+        Config options for automatic cleanup of the dataset.
+        If set, and this is a new dataset, old dataset versions will be automatically
+        cleaned up according to this parameter.
+        To add autocleaning to an existing dataset, use Dataset::update_config to set
+        lance.auto_cleanup.interval and lance.auto_cleanup.older_than.
+        Both parameters must be set to invoke autocleaning.
+        If you do not set this parameter(default behavior),
+        then no autocleaning will be performed.
+        Note: this option only takes effect when creating a new dataset,
+        it has no effect on existing datasets.
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -4015,6 +4033,7 @@ def write_dataset(
         "data_storage_version": data_storage_version,
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
         "enable_move_stable_row_ids": enable_move_stable_row_ids,
+        "auto_cleanup_options": auto_cleanup_options,
     }
 
     if commit_lock:

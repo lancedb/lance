@@ -160,8 +160,7 @@ impl<'a> CleanupTask<'a> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
             .commit_handler
-            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store.inner)
-            .await?
+            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                 self.process_manifest_file(location, &inspection, tagged_versions)
             })
@@ -263,7 +262,6 @@ impl<'a> CleanupTask<'a> {
             .dataset
             .object_store
             .read_dir_all(&self.dataset.base, Some(self.before))
-            .await?
             .try_filter_map(|obj_meta| {
                 // If a file is new-ish then it might be part of an ongoing operation and so we only
                 // delete it if we can verify it is part of an old version.
@@ -797,7 +795,7 @@ mod tests {
             let (os, path) =
                 ObjectStore::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
                     .await?;
-            let mut file_stream = os.read_dir_all(&path, None).await?;
+            let mut file_stream = os.read_dir_all(&path, None);
             let mut file_count = FileCounts {
                 num_data_files: 0,
                 num_delete_files: 0,

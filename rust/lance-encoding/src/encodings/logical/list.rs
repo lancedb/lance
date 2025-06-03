@@ -12,12 +12,12 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Fields};
 use futures::{future::BoxFuture, FutureExt};
+use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_arrow::list::ListArrayExt;
+use lance_core::{cache::FileMetadataCache, Error, Result};
 use log::trace;
 use snafu::location;
 use tokio::task::JoinHandle;
-
-use lance_core::{cache::FileMetadataCache, Error, Result};
 
 use crate::{
     buffer::LanceBuffer,
@@ -1268,12 +1268,16 @@ impl FieldEncoder for ListFieldEncoder {
 /// The values will have any garbage values removed and will be trimmed
 /// to only include the values that are actually used.
 pub struct ListStructuralEncoder {
+    keep_original_array: bool,
     child: Box<dyn FieldEncoder>,
 }
 
 impl ListStructuralEncoder {
-    pub fn new(child: Box<dyn FieldEncoder>) -> Self {
-        Self { child }
+    pub fn new(keep_original_array: bool, child: Box<dyn FieldEncoder>) -> Self {
+        Self {
+            keep_original_array,
+            child,
+        }
     }
 }
 
@@ -1287,16 +1291,23 @@ impl FieldEncoder for ListStructuralEncoder {
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let values = if let Some(list_arr) = array.as_list_opt::<i32>() {
-            let has_garbage_values =
-                repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned());
+            let has_garbage_values = if self.keep_original_array {
+                repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned())
+            } else {
+                // there is no need to deep copy offsets, because offset buffers will be cast to a common type (i64).
+                repdef.add_offsets(list_arr.offsets().clone(), deep_copy_nulls(array.nulls()))
+            };
             if has_garbage_values {
                 list_arr.filter_garbage_nulls().trimmed_values()
             } else {
                 list_arr.trimmed_values()
             }
         } else if let Some(list_arr) = array.as_list_opt::<i64>() {
-            let has_garbage_values =
-                repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned());
+            let has_garbage_values = if self.keep_original_array {
+                repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned())
+            } else {
+                repdef.add_offsets(list_arr.offsets().clone(), deep_copy_nulls(array.nulls()))
+            };
             if has_garbage_values {
                 list_arr.filter_garbage_nulls().trimmed_values()
             } else {

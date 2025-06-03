@@ -1076,17 +1076,17 @@ impl FilteredReadExec {
 
 impl DisplayAs for FilteredReadExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let columns = self
+            .options
+            .projection
+            .to_schema()
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let columns = self
-                    .options
-                    .projection
-                    .to_schema()
-                    .fields
-                    .iter()
-                    .map(|f| f.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 write!(
                     f,
                     "LanceRead: uri={}, projection=[{}], num_fragments={}, range_before={:?}, range_after={:?}, row_id={}, row_addr={}, indexed_filter={}, refine_filter={}",
@@ -1100,6 +1100,19 @@ impl DisplayAs for FilteredReadExec {
                     self.options.filter_plan.index_query.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
                     self.options.filter_plan.refine_expr.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
                 )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "LanceRead\nuri={}\nprojection=[{}]\nnum_fragments={}\nrange_before={:?}\nrange_after={:?}\nrow_id={}\nrow_addr={}\nindexed_filter={}\nrefine_filter={}",
+                self.dataset.data_dir(),
+                columns,
+                self.options.fragments.as_ref().map(|f| f.len()).unwrap_or(self.dataset.fragments().len()),
+                self.options.scan_range_before_filter,
+                self.options.scan_range_after_filter,
+                self.options.projection.with_row_id,
+                self.options.projection.with_row_addr,
+                self.options.filter_plan.index_query.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
+                self.options.filter_plan.refine_expr.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
+            )
             }
         }
     }

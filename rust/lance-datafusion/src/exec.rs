@@ -105,18 +105,26 @@ impl DisplayAs for OneShotExec {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         let stream = self.stream.lock().unwrap();
+        let exhausted = if stream.is_some() { "" } else { "EXHAUSTED" };
+        let columns = self
+            .schema
+            .field_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let exhausted = if stream.is_some() { "" } else { "EXHAUSTED" };
-                let columns = self
-                    .schema
-                    .field_names()
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>();
                 write!(
                     f,
                     "OneShotStream: {}columns=[{}]",
+                    exhausted,
+                    columns.join(",")
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "OneShotStream\nexhausted={}\ncolumns=[{}]",
                     exhausted,
                     columns.join(",")
                 )

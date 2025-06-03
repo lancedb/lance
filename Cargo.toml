@@ -21,7 +21,7 @@ exclude = ["python"]
 resolver = "2"
 
 [workspace.package]
-version = "0.28.1"
+version = "0.29.0"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -44,34 +44,34 @@ categories = [
 rust-version = "1.82.0"
 
 [workspace.dependencies]
-lance = { version = "=0.28.1", path = "./rust/lance" }
-lance-arrow = { version = "=0.28.1", path = "./rust/lance-arrow" }
-lance-core = { version = "=0.28.1", path = "./rust/lance-core" }
-lance-datafusion = { version = "=0.28.1", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=0.28.1", path = "./rust/lance-datagen" }
-lance-encoding = { version = "=0.28.1", path = "./rust/lance-encoding" }
-lance-encoding-datafusion = { version = "=0.28.1", path = "./rust/lance-encoding-datafusion" }
-lance-file = { version = "=0.28.1", path = "./rust/lance-file" }
-lance-index = { version = "=0.28.1", path = "./rust/lance-index" }
-lance-io = { version = "=0.28.1", path = "./rust/lance-io" }
-lance-jni = { version = "=0.28.1", path = "./java/core/lance-jni" }
-lance-linalg = { version = "=0.28.1", path = "./rust/lance-linalg" }
-lance-table = { version = "=0.28.1", path = "./rust/lance-table" }
-lance-test-macros = { version = "=0.28.1", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=0.28.1", path = "./rust/lance-testing" }
+lance = { version = "=0.29.0", path = "./rust/lance" }
+lance-arrow = { version = "=0.29.0", path = "./rust/lance-arrow" }
+lance-core = { version = "=0.29.0", path = "./rust/lance-core" }
+lance-datafusion = { version = "=0.29.0", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=0.29.0", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=0.29.0", path = "./rust/lance-encoding" }
+lance-encoding-datafusion = { version = "=0.29.0", path = "./rust/lance-encoding-datafusion" }
+lance-file = { version = "=0.29.0", path = "./rust/lance-file" }
+lance-index = { version = "=0.29.0", path = "./rust/lance-index" }
+lance-io = { version = "=0.29.0", path = "./rust/lance-io" }
+lance-jni = { version = "=0.29.0", path = "./java/core/lance-jni" }
+lance-linalg = { version = "=0.29.0", path = "./rust/lance-linalg" }
+lance-table = { version = "=0.29.0", path = "./rust/lance-table" }
+lance-test-macros = { version = "=0.29.0", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=0.29.0", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "54.1", optional = false, features = ["prettyprint"] }
-arrow-arith = "54.1"
-arrow-array = "54.1"
-arrow-buffer = "54.1"
-arrow-cast = "54.1"
-arrow-data = "54.1"
-arrow-ipc = { version = "54.1", features = ["zstd"] }
-arrow-ord = "54.1"
-arrow-row = "54.1"
-arrow-schema = "54.1"
-arrow-select = "54.1"
+arrow = { version = "55.1", optional = false, features = ["prettyprint"] }
+arrow-arith = "55.1"
+arrow-array = "55.1"
+arrow-buffer = "55.1"
+arrow-cast = "55.1"
+arrow-data = "55.1"
+arrow-ipc = { version = "55.1", features = ["zstd"] }
+arrow-ord = "55.1"
+arrow-row = "55.1"
+arrow-schema = "55.1"
+arrow-select = "55.1"
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "1.2.0"
@@ -86,9 +86,7 @@ bitvec = "1"
 bytes = "1.4"
 byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
-# Version temporarily pinned to work around unlabeled breaking change
-# https://github.com/apache/arrow-rs/commit/2fddf85afcd20110ce783ed5b4cdeb82293da30b
-chrono = { version = "=0.4.39", default-features = false, features = [
+chrono = { version = "0.4.41", default-features = false, features = [
     "std",
     "now",
 ] }
@@ -98,7 +96,7 @@ criterion = { version = "0.5", features = [
     "html_reports",
 ] }
 crossbeam-queue = "0.3"
-datafusion = { version = "46.0", default-features = false, features = [
+datafusion = { version = "47.0", default-features = false, features = [
     "nested_expressions",
     "regex_expressions",
     "unicode_expressions",
@@ -107,20 +105,21 @@ datafusion = { version = "46.0", default-features = false, features = [
     "datetime_expressions",
     "string_expressions",
 ] }
-datafusion-common = "46.0"
-datafusion-functions = { version = "46.0", features = ["regex_expressions"] }
-datafusion-sql = "46.0"
-datafusion-expr = "46.0"
-datafusion-ffi = "46.0"
-datafusion-execution = "46.0"
-datafusion-optimizer = "46.0"
-datafusion-physical-expr = { version = "46.0" }
-datafusion-physical-plan = { version = "46.0" }
+datafusion-common = "47.0"
+datafusion-functions = { version = "47.0", features = ["regex_expressions"] }
+datafusion-sql = "47.0"
+datafusion-expr = "47.0"
+datafusion-ffi = "47.0"
+datafusion-execution = "47.0"
+datafusion-optimizer = "47.0"
+datafusion-physical-expr = { version = "47.0" }
+datafusion-physical-plan = { version = "47.0" }
+datafusion-substrait = { version = "47.0" }
 deepsize = "0.2.0"
 dirs = "5.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=0.28.1", path = "./rust/lance-encoding/src/compression_algo/fsst" }
+fsst = { version = "=0.29.0", path = "./rust/lance-encoding/src/compression_algo/fsst" }
 futures = "0.3"
 http = "1.1.0"
 humantime = "2.2.0"
@@ -135,7 +134,6 @@ moka = { version = "0.12", features = ["future", "sync"] }
 num-traits = "0.2"
 # Set min to prevent use of versions with CVE-2024-41178
 object_store = { version = "0.11.0" }
-parquet = "54.1"
 pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.14.0", features = ["flamegraph", "criterion"] }

@@ -54,9 +54,7 @@ impl<T> ExpLinkedList<T> {
         match self.inner.back() {
             Some(last) => {
                 if last.len() == last.capacity() {
-                    let new_cap = if self.inner.len() == 1 {
-                        last.capacity()
-                    } else if self.limit > 0 && last.capacity() * 2 >= self.limit as usize {
+                    let new_cap = if self.limit > 0 && last.capacity() * 2 >= self.limit as usize {
                         self.limit as usize
                     } else {
                         last.capacity() * 2
@@ -65,7 +63,7 @@ impl<T> ExpLinkedList<T> {
                 }
             }
             None => {
-                self.inner.push_back(Vec::with_capacity(2));
+                self.inner.push_back(Vec::with_capacity(1));
             }
         }
         self.do_push(v);
@@ -156,6 +154,17 @@ impl<T> FromIterator<T> for ExpLinkedList<T> {
         list
     }
 }
+
+impl<T> PartialEq for ExpLinkedList<T>
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().zip(other.iter()).all(|(a, b)| a == b)
+    }
+}
+
+impl<T> Eq for ExpLinkedList<T> where T: Eq {}
 
 pub struct ExpLinkedListIter<'a, T> {
     inner: std::collections::linked_list::Iter<'a, Vec<T>>,

@@ -343,6 +343,8 @@ pub(crate) async fn optimize_vector_indices(
         });
     };
 
+    // never change the index version,
+    // because we won't update the legacy vector index format
     Ok((new_uuid, merged))
 }
 
@@ -2254,6 +2256,7 @@ mod tests {
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
             index_details: Some(vector_index_details()),
+            index_version: index.index_type().version(),
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));

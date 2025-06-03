@@ -118,6 +118,8 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let op = Operation::Rewrite {
                     groups,
                     rewritten_indices,
+                    // TODO: pass frag_reuse_index when available
+                    frag_reuse_index: None,
                 };
                 Ok(Self(op))
             }
@@ -126,7 +128,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let name = ob.getattr("name")?.extract()?;
                 let fields = ob.getattr("fields")?.extract()?;
                 let dataset_version = ob.getattr("dataset_version")?.extract()?;
-
+                let index_version = ob.getattr("index_version")?.extract()?;
                 let fragment_ids = ob.getattr("fragment_ids")?;
                 let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.downcast()?;
                 let fragment_ids = fragment_ids_ref
@@ -145,6 +147,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     // TODO: we should use lance::dataset::Dataset::commit_existing_index once
                     // we have a way to determine index details from an existing index.
                     index_details: None,
+                    index_version,
                 }];
 
                 let op = Operation::CreateIndex {

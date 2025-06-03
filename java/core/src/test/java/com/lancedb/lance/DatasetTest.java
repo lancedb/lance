@@ -195,25 +195,6 @@ public class DatasetTest {
   }
 
   @Test
-  void testCommitConflict() {
-    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
-    String datasetPath = tempDir.resolve(testMethodName).toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      try (Dataset dataset = testDataset.createEmptyDataset()) {
-        assertEquals(1, dataset.version());
-        assertEquals(1, dataset.latestVersion());
-        assertThrows(
-            IllegalArgumentException.class,
-            () -> {
-              testDataset.write(0, 5);
-            });
-      }
-    }
-  }
-
-  @Test
   void testGetSchemaWithClosedDataset() {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();

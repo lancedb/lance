@@ -14,10 +14,13 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::parse::str_is_truthy;
-use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS};
+use lance_core::utils::tracing::{
+    IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS,
+};
 use lance_file::reader::FileReader;
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
+use lance_index::frag_reuse::{FragReuseIndex, FRAG_REUSE_INDEX_NAME};
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
     FtsQueryParser, IndexInformationProvider, LabelListQueryParser, MultiQueryParser,
@@ -53,8 +56,8 @@ use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::{
-    build_inverted_index, detect_scalar_index_type, index_matches_criteria, inverted_index_details,
-    TrainingRequest,
+    build_inverted_index, detect_scalar_index_type, index_matches_criteria, infer_index_type,
+    inverted_index_details, TrainingRequest,
 };
 use serde_json::json;
 use snafu::location;
@@ -65,6 +68,7 @@ use vector::utils::get_vector_type;
 
 pub(crate) mod append;
 pub(crate) mod cache;
+pub mod frag_reuse;
 pub mod prefilter;
 pub mod scalar;
 pub mod vector;
@@ -277,7 +281,7 @@ impl DatasetIndexExt for Dataset {
         }
 
         let index_id = Uuid::new_v4();
-        let index_details: prost_types::Any = match (index_type, params.index_name()) {
+        let index_details = match (index_type, params.index_name()) {
             (
                 IndexType::Bitmap
                 | IndexType::BTree
@@ -360,6 +364,13 @@ impl DatasetIndexExt for Dataset {
                     .await?;
                 vector_index_details()
             }
+            (IndexType::FragmentReuse, _) => {
+                return Err(Error::Index {
+                    message: "Fragment reuse index can only be created through compaction"
+                        .to_string(),
+                    location: location!(),
+                })
+            }
             (index_type, index_name) => {
                 return Err(Error::Index {
                     message: format!(
@@ -377,6 +388,7 @@ impl DatasetIndexExt for Dataset {
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
             index_details: Some(index_details),
+            index_version: index_type.version(),
         };
         let transaction = Transaction::new(
             self.manifest.version,
@@ -445,10 +457,27 @@ impl DatasetIndexExt for Dataset {
             return Ok(indices);
         }
 
-        let loaded_indices: Arc<Vec<IndexMetadata>> =
+        let loaded_indices: Vec<IndexMetadata> =
             read_manifest_indexes(&self.object_store, &self.manifest_location, &self.manifest)
                 .await?
-                .into();
+                .into_iter()
+                .filter(|idx| {
+                    let max_valid_version = infer_index_type(idx)
+                        .map(|t| t.version())
+                        .unwrap_or_default();
+                    let is_valid = idx.index_version <= max_valid_version;
+                    if !is_valid {
+                        log::warn!(
+                            "Index {} has version {}, which is not supported (<={}), ignoring it",
+                            idx.name,
+                            idx.index_version,
+                            max_valid_version,
+                        );
+                    }
+                    is_valid
+                })
+                .collect();
+        let loaded_indices = Arc::new(loaded_indices);
 
         self.session.index_cache.insert_metadata(
             self.base.as_ref(),
@@ -481,6 +510,7 @@ impl DatasetIndexExt for Dataset {
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
             index_details: None,
+            index_version: 0,
         };
 
         let transaction = Transaction::new(
@@ -555,6 +585,7 @@ impl DatasetIndexExt for Dataset {
                 indices_to_optimize
                     .as_ref()
                     .is_none_or(|names| names.contains(&idx.name))
+                    && idx.name != FRAG_REUSE_INDEX_NAME
             })
             .map(|idx| (idx.name.clone(), idx))
             .into_group_map();
@@ -562,28 +593,25 @@ impl DatasetIndexExt for Dataset {
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
-            let Some((new_id, removed, mut new_frag_ids)) =
-                merge_indices(dataset.clone(), deltas.as_slice(), options).await?
+            let Some(res) = merge_indices(dataset.clone(), deltas.as_slice(), options).await?
             else {
                 continue;
             };
-            for removed_idx in removed.iter() {
-                new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
-            }
 
             let last_idx = deltas.last().expect("Delta indices should not be empty");
             let new_idx = IndexMetadata {
-                uuid: new_id,
+                uuid: res.new_uuid,
                 name: last_idx.name.clone(), // Keep the same name
                 fields: last_idx.fields.clone(),
                 dataset_version: self.manifest.version,
-                fragment_bitmap: Some(new_frag_ids),
+                fragment_bitmap: Some(res.new_fragment_bitmap),
                 index_details: last_idx.index_details.clone(),
+                index_version: res.new_index_version,
             };
-            removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
-            if deltas.len() > removed.len() {
+            removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
+            if deltas.len() > removed_indices.len() {
                 new_indices.extend(
-                    deltas[0..(deltas.len() - removed.len())]
+                    deltas[0..(deltas.len() - res.removed_indices.len())]
                         .iter()
                         .map(|&idx| idx.clone()),
                 );
@@ -803,6 +831,14 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>>;
+
+    /// Opens the fragment reuse index
+    async fn open_frag_reuse_index(
+        &self,
+        uuid: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<FragReuseIndex>>;
+
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
 
@@ -826,6 +862,9 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(index.as_index());
         }
         if let Some(index) = self.session.index_cache.get_vector(uuid) {
+            return Ok(index.as_index());
+        }
+        if let Some(index) = self.session.index_cache.get_frag_reuse(uuid) {
             return Ok(index.as_index());
         }
 
@@ -1043,6 +1082,34 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(index)
     }
 
+    async fn open_frag_reuse_index(
+        &self,
+        uuid: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<FragReuseIndex>> {
+        if let Some(index) = self.session.index_cache.get_frag_reuse(uuid) {
+            log::debug!("Found vector index in cache uuid: {}", uuid);
+            return Ok(index);
+        }
+
+        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
+        let index_details = frag_reuse::load_frag_reuse_index_details(self, &index_meta).await?;
+        let index =
+            frag_reuse::open_frag_reuse_index(index_details.as_ref(), self.fragments().as_slice())
+                .await?;
+
+        info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_FRAG_REUSE);
+        metrics.record_index_load();
+
+        self.session
+            .index_cache
+            .insert_frag_reuse(uuid, index.clone());
+        Ok(index)
+    }
+
     #[instrument(level = "trace", skip_all)]
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
         let indices = self.load_indices().await?;
@@ -1053,7 +1120,8 @@ impl DatasetIndexInternalExt for Dataset {
             let is_vector_index = idx_schema
                 .fields
                 .iter()
-                .any(|f| matches!(f.data_type(), DataType::FixedSizeList(_, _)));
+                .any(|f| is_vector_field(f.data_type()));
+
             idx.fields.len() == 1 && !is_vector_index
         }) {
             let field = index.fields[0];
@@ -1154,6 +1222,17 @@ impl DatasetIndexInternalExt for Dataset {
                 Ok(indexed_frags)
             })
             .collect()
+    }
+}
+
+fn is_vector_field(data_type: DataType) -> bool {
+    match data_type {
+        DataType::FixedSizeList(_, _) => true,
+        DataType::List(inner) => {
+            // If the inner type is a fixed size list, then it is a multivector field
+            matches!(inner.data_type(), DataType::FixedSizeList(_, _))
+        }
+        _ => false,
     }
 }
 

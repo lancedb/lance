@@ -67,6 +67,18 @@ impl TryFrom<IndexType> for ScalarIndexType {
     }
 }
 
+impl From<ScalarIndexType> for IndexType {
+    fn from(val: ScalarIndexType) -> Self {
+        match val {
+            ScalarIndexType::BTree => Self::BTree,
+            ScalarIndexType::Bitmap => Self::Bitmap,
+            ScalarIndexType::LabelList => Self::LabelList,
+            ScalarIndexType::NGram => Self::NGram,
+            ScalarIndexType::Inverted => Self::Inverted,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ScalarIndexParams {
     /// If set then always use the given index type and skip auto-detection

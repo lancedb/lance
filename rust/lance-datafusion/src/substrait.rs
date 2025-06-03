@@ -156,7 +156,10 @@ fn remove_type_extensions(
 fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Result<()> {
     match expr.rex_type.as_mut().unwrap() {
         // Simple, no field references possible
-        RexType::Literal(_) | RexType::Nested(_) | RexType::Enum(_) => Ok(()),
+        RexType::Literal(_)
+        | RexType::Nested(_)
+        | RexType::Enum(_)
+        | RexType::DynamicParameter(_) => Ok(()),
         // Complex operators not supported in filters
         RexType::WindowFunction(_) | RexType::Subquery(_) => Err(Error::invalid_input(
             "Window functions or subqueries not allowed in filter expression",
@@ -322,6 +325,7 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Res
         version: None,
         extensions: remove_type_extensions(&envelope.extensions),
         advanced_extensions: envelope.advanced_extensions.clone(),
+        parameter_bindings: vec![],
         expected_type_urls: vec![],
         extension_uris: vec![],
         relations: vec![PlanRel {

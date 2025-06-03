@@ -69,27 +69,28 @@ pub trait ObjectStoreExt {
     /// Read all files (start from base directory) recursively
     ///
     /// unmodified_since can be specified to only return files that have not been modified since the given time.
-    async fn read_dir_all<'a>(
+    fn read_dir_all<'a, 'b>(
         &'a self,
-        dir_path: impl Into<&Path> + Send,
+        dir_path: impl Into<&'b Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<'a, Result<ObjectMeta>>>;
+    ) -> BoxStream<'a, Result<ObjectMeta>>;
 }
 
 #[async_trait]
 impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
-    async fn read_dir_all<'a>(
+    fn read_dir_all<'a, 'b>(
         &'a self,
-        dir_path: impl Into<&Path> + Send,
+        dir_path: impl Into<&'b Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<'a, Result<ObjectMeta>>> {
-        let mut output = self.list(Some(dir_path.into()));
+    ) -> BoxStream<'a, Result<ObjectMeta>> {
+        let output = self.list(Some(dir_path.into())).map_err(|e| e.into());
         if let Some(unmodified_since_val) = unmodified_since {
-            output = output
+            output
                 .try_filter(move |file| future::ready(file.last_modified < unmodified_since_val))
-                .boxed();
+                .boxed()
+        } else {
+            output.boxed()
         }
-        Ok(output.map_err(|e| e.into()).boxed())
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {
@@ -138,6 +139,29 @@ impl std::fmt::Display for ObjectStore {
 
 pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ChainedWrappingObjectStore {
+    wrappers: Vec<Arc<dyn WrappingObjectStore>>,
+}
+
+impl ChainedWrappingObjectStore {
+    pub fn new(wrappers: Vec<Arc<dyn WrappingObjectStore>>) -> Self {
+        Self { wrappers }
+    }
+
+    pub fn add_wrapper(&mut self, wrapper: Arc<dyn WrappingObjectStore>) {
+        self.wrappers.push(wrapper);
+    }
+}
+
+impl WrappingObjectStore for ChainedWrappingObjectStore {
+    fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+        self.wrappers
+            .iter()
+            .fold(original, |acc, wrapper| wrapper.wrap(acc))
+    }
 }
 
 /// Parameters to create an [ObjectStore]
@@ -483,12 +507,12 @@ impl ObjectStore {
     /// Read all files (start from base directory) recursively
     ///
     /// unmodified_since can be specified to only return files that have not been modified since the given time.
-    pub async fn read_dir_all(
-        &self,
-        dir_path: impl Into<&Path> + Send,
+    pub fn read_dir_all<'a, 'b>(
+        &'a self,
+        dir_path: impl Into<&'b Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<Result<ObjectMeta>>> {
-        self.inner.read_dir_all(dir_path, unmodified_since).await
+    ) -> BoxStream<'a, Result<ObjectMeta>> {
+        self.inner.read_dir_all(dir_path, unmodified_since)
     }
 
     /// Remove a directory recursively.
@@ -690,7 +714,6 @@ fn infer_block_size(scheme: &str) -> usize {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
-    use parquet::data_type::AsBytes;
     use rstest::rstest;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
@@ -955,7 +978,7 @@ mod tests {
 
         let reader = ObjectStore::open_local(file_path.as_path()).await.unwrap();
         let buf = reader.get_range(0..5).await.unwrap();
-        assert_eq!(buf.as_bytes(), b"LOCAL");
+        assert_eq!(buf.as_ref(), b"LOCAL");
     }
 
     #[tokio::test]
@@ -972,10 +995,10 @@ mod tests {
         let file_path_os = object_store::path::Path::parse(file_path.to_str().unwrap()).unwrap();
         let obj_store = ObjectStore::local();
         let buf = obj_store.read_one_all(&file_path_os).await.unwrap();
-        assert_eq!(buf.as_bytes(), b"LOCAL");
+        assert_eq!(buf.as_ref(), b"LOCAL");
 
         let buf = obj_store.read_one_range(&file_path_os, 0..5).await.unwrap();
-        assert_eq!(buf.as_bytes(), b"LOCAL");
+        assert_eq!(buf.as_ref(), b"LOCAL");
     }
 
     #[tokio::test]

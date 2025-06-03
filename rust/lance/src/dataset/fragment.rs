@@ -70,7 +70,6 @@ pub struct FileFragment {
 const DEFAULT_BATCH_READ_SIZE: u32 = 1024;
 
 /// A trait for file readers to be implemented by both the v1 and v2 readers
-#[async_trait::async_trait]
 #[allow(clippy::len_without_is_empty)]
 pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     /// Reads the requested range of rows from the file, returning as a stream
@@ -176,7 +175,6 @@ impl V1Reader {
     }
 }
 
-#[async_trait::async_trait]
 impl GenericFileReader for V1Reader {
     /// Reads the requested range of rows from the file, returning as a stream
     fn read_range_tasks(
@@ -321,7 +319,6 @@ mod v2_adapter {
         }
     }
 
-    #[async_trait::async_trait]
     impl GenericFileReader for Reader {
         /// Reads the requested range of rows from the file, returning as a stream
         fn read_range_tasks(
@@ -513,7 +510,6 @@ impl NullReader {
     }
 }
 
-#[async_trait::async_trait]
 impl GenericFileReader for NullReader {
     fn read_range_tasks(
         &self,

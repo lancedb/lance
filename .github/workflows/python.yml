@@ -24,12 +24,15 @@ env:
   CARGO_TERM_COLOR: always
   # Disable full debug symbol generation to speed up CI build and keep memory down
   # "1" means line tables only, which is useful for panic tracebacks.
-  RUSTFLAGS: "-C debuginfo=1"
+  RUSTFLAGS: "-C debuginfo=line-tables-only"
   RUST_BACKTRACE: "1"
   CI: "true"
   # Color output for pytest is off by default.
   PYTEST_ADDOPTS: "--color=yes"
   FORCE_COLOR: "1"
+  # Change this to bust all caches (may be needed periodically if the caches accumulate
+  # a lot of cruft).
+  CACHE_PREFIX: "1"
 
 jobs:
   lint:
@@ -55,6 +58,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
       - name: Install linting tools
         run: |
           pip install ruff==0.11.2 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas]
@@ -111,7 +115,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
-          prefix-key: "manylinux2014" # use this to flush the cache
+          prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_linux_wheel
       - uses: ./.github/workflows/run_tests
       - name: Generate forward compatibility files
@@ -150,7 +154,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
-          prefix-key: "manylinux2014" # use this to flush the cache
+          prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_linux_wheel
         with:
           arm-build: "true"
@@ -183,6 +187,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_mac_wheel
       - uses: ./.github/workflows/run_tests
         with:
@@ -205,6 +210,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_windows_wheel
       - uses: ./.github/workflows/run_tests
   aws-integtest:
@@ -226,7 +232,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
-          prefix-key: "manylinux2014" # use this to flush the cache
+          prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_linux_wheel
       - name: Install dependencies
         run: |

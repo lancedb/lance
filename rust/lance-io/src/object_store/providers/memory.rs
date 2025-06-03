@@ -7,10 +7,10 @@ use object_store::{memory::InMemory, path::Path};
 use url::Url;
 
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE,
-    DEFAULT_MAX_IOP_SIZE,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_MAX_IOP_SIZE,
 };
-use lance_core::{error::Result, utils::tokio::get_num_compute_intensive_cpus};
+use lance_core::error::Result;
 
 /// Provides a fresh in-memory object store for each call to `new_store`.
 #[derive(Default, Debug)]
@@ -29,7 +29,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
-            io_parallelism: get_num_compute_intensive_cpus(),
+            io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
         })
     }

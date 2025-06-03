@@ -31,8 +31,8 @@ use tracing::instrument;
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
 pub fn compress_posting_list<'a>(
     length: usize,
-    doc_ids: impl Iterator<Item = &'a [u32]>,
-    frequencies: impl Iterator<Item = &'a [u32]>,
+    doc_ids: impl Iterator<Item = &'a u32>,
+    frequencies: impl Iterator<Item = &'a u32>,
     mut block_max_scores: impl Iterator<Item = f32>,
 ) -> Result<arrow::array::LargeBinaryArray> {
     if length < BLOCK_SIZE {
@@ -42,15 +42,11 @@ pub fn compress_posting_list<'a>(
         let max_score = block_max_scores.next().unwrap();
         let _ = builder.write(max_score.to_le_bytes().as_ref())?;
         compress_remainder(
-            doc_ids.flatten().copied().collect::<Vec<_>>().as_slice(),
+            doc_ids.copied().collect::<Vec<_>>().as_slice(),
             &mut builder,
         )?;
         compress_remainder(
-            frequencies
-                .flatten()
-                .copied()
-                .collect::<Vec<_>>()
-                .as_slice(),
+            frequencies.copied().collect::<Vec<_>>().as_slice(),
             &mut builder,
         )?;
         builder.append_value("");
@@ -61,30 +57,23 @@ pub fn compress_posting_list<'a>(
     let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
     let mut doc_id_buffer = Vec::with_capacity(BLOCK_SIZE);
     let mut freq_buffer = Vec::with_capacity(BLOCK_SIZE);
-    for (doc_id_chunk, freq_chunk) in std::iter::zip(doc_ids, frequencies) {
-        let (doc_id_chunk, freq_chunk) =
-            if doc_id_buffer.is_empty() && doc_id_chunk.len() == BLOCK_SIZE {
-                (doc_id_chunk, freq_chunk) // no need to copy
-            } else {
-                doc_id_buffer.extend_from_slice(doc_id_chunk);
-                freq_buffer.extend_from_slice(freq_chunk);
-                (doc_id_buffer.as_slice(), freq_buffer.as_slice())
-            };
+    for (doc_id, freq) in std::iter::zip(doc_ids, frequencies) {
+        doc_id_buffer.push(*doc_id);
+        freq_buffer.push(*freq);
 
-        // this is a hack, that the ExpLinkedList would always return a slice of BLOCK_SIZE
-        // after consuming the first blocks that cap is less than BLOCK_SIZE
-        if doc_id_chunk.len() < BLOCK_SIZE {
+        if doc_id_buffer.len() < BLOCK_SIZE {
             continue;
         }
-        assert_eq!(doc_id_chunk.len(), BLOCK_SIZE);
+
+        assert_eq!(doc_id_buffer.len(), BLOCK_SIZE);
 
         // write the max score of the block
         let max_score = block_max_scores.next().unwrap();
         let _ = builder.write(max_score.to_le_bytes().as_ref())?;
         // delta encoding + bitpacking for doc ids
-        compress_sorted_block(doc_id_chunk, &mut buffer, &mut builder)?;
+        compress_sorted_block(&doc_id_buffer, &mut buffer, &mut builder)?;
         // bitpacking for frequencies
-        compress_block(freq_chunk, &mut buffer, &mut builder)?;
+        compress_block(&freq_buffer, &mut buffer, &mut builder)?;
         builder.append_value("");
         doc_id_buffer.clear();
         freq_buffer.clear();
@@ -295,8 +284,8 @@ mod tests {
         let block_max_scores = (0..num_rows.div_ceil(BLOCK_SIZE)).map(|_| rng.gen_range(0.0..1.0));
         let posting_list = compress_posting_list(
             doc_ids.len(),
-            doc_ids.chunks(BLOCK_SIZE),
-            frequencies.chunks(BLOCK_SIZE),
+            doc_ids.iter(),
+            frequencies.iter(),
             block_max_scores,
         )?;
         assert_eq!(posting_list.len(), num_rows.div_ceil(BLOCK_SIZE));

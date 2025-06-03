@@ -15,7 +15,7 @@ use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use blob::LanceBlobFile;
-use chrono::Duration;
+use chrono::{Duration, TimeDelta};
 use futures::{StreamExt, TryFutureExt};
 use log::error;
 use object_store::path::Path;
@@ -37,6 +37,7 @@ use lance::dataset::scanner::{
     DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
+use lance::dataset::AutoCleanupParams;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
@@ -1864,6 +1865,27 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             get_dict_opt::<bool>(options, "enable_v2_manifest_paths")?
         {
             p.enable_v2_manifest_paths = enable_v2_manifest_paths;
+        }
+
+        if let Some(auto_cleanup) = get_dict_opt::<Bound<PyAny>>(options, "auto_cleanup_options")? {
+            let mut auto_cleanup_params = AutoCleanupParams::default();
+
+            auto_cleanup_params.interval = auto_cleanup
+                .get_item("interval")
+                .and_then(|i| i.extract::<usize>())
+                .ok()
+                .unwrap_or(auto_cleanup_params.interval);
+
+            auto_cleanup_params.older_than = auto_cleanup
+                .get_item("older_than_seconds")
+                .and_then(|i| i.extract::<i64>())
+                .ok()
+                .map(TimeDelta::seconds)
+                .unwrap_or(auto_cleanup_params.older_than);
+
+            p.auto_cleanup = Some(auto_cleanup_params);
+        } else {
+            p.auto_cleanup = None;
         }
 
         p.commit_handler = get_commit_handler(options)?;

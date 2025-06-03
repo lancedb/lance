@@ -304,23 +304,26 @@ impl DisplayAs for TakeExec {
             .iter()
             .map(|f| f.name.clone())
             .collect::<HashSet<_>>();
+        let columns = self
+            .output_schema
+            .fields
+            .iter()
+            .map(|f| {
+                let name = f.name();
+                if extra_fields.contains(name) {
+                    format!("({})", name)
+                } else {
+                    name.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let columns = self
-                    .output_schema
-                    .fields
-                    .iter()
-                    .map(|f| {
-                        let name = f.name();
-                        if extra_fields.contains(name) {
-                            format!("({})", name)
-                        } else {
-                            name.to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 write!(f, "Take: columns={:?}", columns)
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "Take\ncolumns={:?}", columns)
             }
         }
     }

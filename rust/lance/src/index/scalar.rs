@@ -14,20 +14,26 @@ use futures::TryStreamExt;
 use lance_core::datatypes::Field;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
-use lance_index::scalar::ngram::{train_ngram_index, NGramIndex};
-use lance_index::scalar::{
-    bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
-    btree::{train_btree_index, BTreeIndex, TrainingSource},
-    flat::FlatIndexMetadata,
-    inverted::{train_inverted_index, InvertedIndex, INVERT_LIST_FILE},
-    label_list::{train_label_list_index, LabelListIndex},
-    lance_format::LanceIndexStore,
-    ScalarIndex, ScalarIndexParams, ScalarIndexType,
-};
 use lance_index::scalar::{
     btree::DEFAULT_BTREE_BATCH_SIZE, inverted::tokenizer::InvertedIndexParams,
 };
+use lance_index::scalar::{
+    inverted::METADATA_FILE,
+    ngram::{train_ngram_index, NGramIndex},
+};
 use lance_index::ScalarIndexCriteria;
+use lance_index::{
+    scalar::{
+        bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
+        btree::{train_btree_index, BTreeIndex, TrainingSource},
+        flat::FlatIndexMetadata,
+        inverted::{train_inverted_index, InvertedIndex, INVERT_LIST_FILE},
+        label_list::{train_label_list_index, LabelListIndex},
+        lance_format::LanceIndexStore,
+        ScalarIndex, ScalarIndexParams, ScalarIndexType,
+    },
+    IndexType,
+};
 use lance_table::format::Index;
 use log::info;
 use snafu::location;
@@ -232,6 +238,18 @@ fn get_scalar_index_details(
     }
 }
 
+fn get_vector_index_details(
+    details: &prost_types::Any,
+) -> Result<Option<lance_table::format::pb::VectorIndexDetails>> {
+    if details.type_url.ends_with("VectorIndexDetails") {
+        Ok(Some(
+            details.to_msg::<lance_table::format::pb::VectorIndexDetails>()?,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Build a Scalar Index (returns details to store in the manifest)
 #[instrument(level = "debug", skip_all)]
 pub(super) async fn build_scalar_index(
@@ -383,12 +401,18 @@ async fn infer_scalar_index_type(
     })?;
 
     let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
-    let inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
+    let inverted_list_lookup = index_dir.child(METADATA_FILE);
+    let legacy_inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
     let index_type = if let DataType::List(_) = col.data_type() {
         ScalarIndexType::LabelList
     } else if dataset.object_store.exists(&bitmap_page_lookup).await? {
         ScalarIndexType::Bitmap
-    } else if dataset.object_store.exists(&inverted_list_lookup).await? {
+    } else if dataset.object_store.exists(&inverted_list_lookup).await?
+        || dataset
+            .object_store
+            .exists(&legacy_inverted_list_lookup)
+            .await?
+    {
         ScalarIndexType::Inverted
     } else {
         ScalarIndexType::BTree
@@ -444,6 +468,23 @@ fn best_effort_scalar_index_type(index: &Index) -> Result<Option<ScalarIndexType
         }
     }
     Ok(None)
+}
+
+/// Infers the index type from the index details, if available.
+/// Returns None if the index details are not present or the type cannot be determined.
+/// This returns IndexType::Vector for all vector index types.
+pub fn infer_index_type(index: &Index) -> Option<IndexType> {
+    if let Some(details) = &index.index_details {
+        if let Ok(Some(details)) = get_scalar_index_details(details) {
+            return Some(details.get_type().into());
+        } else if let Ok(Some(_)) = get_vector_index_details(details) {
+            return Some(IndexType::Vector);
+        } else {
+            // If the details are not recognized, we return None
+            return None;
+        }
+    }
+    None
 }
 
 pub fn index_matches_criteria(

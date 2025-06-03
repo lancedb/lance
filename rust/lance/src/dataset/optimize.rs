@@ -82,6 +82,7 @@
 //! they can be committed in any order.
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::ops::{AddAssign, Range};
 use std::sync::{Arc, RwLock};
 
@@ -105,8 +106,9 @@ use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
 use super::utils::make_rowid_capture_stream;
 use super::{write_fragments_internal, WriteMode, WriteParams};
 
-mod remapping;
+pub mod remapping;
 
+use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
@@ -147,6 +149,10 @@ pub struct CompactionOptions {
     /// specified then the default (see
     /// [`crate::dataset::Scanner::batch_size`]) will be used.
     pub batch_size: Option<usize>,
+    /// Whether to defer remapping indices during compaction. If true, indices will
+    /// not be remapped during this compaction operation. Instead, the fragment reuse index
+    /// is updated and will be used to perform remapping later.
+    pub defer_index_remap: bool,
 }
 
 impl Default for CompactionOptions {
@@ -160,6 +166,7 @@ impl Default for CompactionOptions {
             num_threads: None,
             max_bytes_per_file: None,
             batch_size: None,
+            defer_index_remap: false,
         }
     }
 }
@@ -232,7 +239,7 @@ pub async fn compact_files(
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
-    let metrics = commit_compaction(dataset, completed_tasks, remap_options).await?;
+    let metrics = commit_compaction(dataset, completed_tasks, remap_options, &options).await?;
 
     Ok(metrics)
 }
@@ -581,7 +588,13 @@ pub struct RewriteResult {
     pub read_version: u64,
     /// The original fragments being replaced
     pub original_fragments: Vec<Fragment>,
-    pub row_id_map: HashMap<u64, Option<u64>>,
+    /// A HashMap of original row IDs to new row IDs or None (deleted)
+    /// Only set when index remap is done as a part of the compaction
+    pub row_id_map: Option<HashMap<u64, Option<u64>>>,
+    /// the changed row addresses in the original fragment
+    /// in the form of serialized RoaringTreemap
+    /// Only set when index remap is deferred after compaction
+    pub changed_row_addrs: Option<Vec<u8>>,
 }
 
 async fn reserve_fragment_ids(
@@ -636,7 +649,8 @@ async fn rewrite_files(
             new_fragments: Vec::new(),
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
-            row_id_map: HashMap::new(),
+            row_id_map: None,
+            changed_row_addrs: None,
         });
     }
 
@@ -726,7 +740,7 @@ async fn rewrite_files(
 
     log::info!("Compaction task {}: file written", task_id);
 
-    let row_id_map = if let Some(row_ids) = row_ids {
+    let (row_id_map, changed_row_addrs) = if let Some(row_ids) = row_ids {
         let row_ids = Arc::try_unwrap(row_ids)
             .expect("Row ids lock still owned")
             .into_inner()
@@ -738,12 +752,26 @@ async fn rewrite_files(
         );
         reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
 
-        remapping::transpose_row_ids(row_ids, &fragments, &new_fragments)
+        if options.defer_index_remap {
+            let mut changed_row_addrs = Vec::with_capacity(row_ids.serialized_size());
+            row_ids.serialize_into(&mut changed_row_addrs)?;
+            (None, Some(changed_row_addrs))
+        } else {
+            let row_id_map = remapping::transpose_row_ids(row_ids, &fragments, &new_fragments);
+            (Some(row_id_map), None)
+        }
     } else {
         log::info!("Compaction task {}: rechunking stable row ids", task_id);
         rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
 
-        HashMap::new()
+        if options.defer_index_remap {
+            let no_addrs = RoaringTreemap::new();
+            let mut serialized_no_addrs = Vec::with_capacity(no_addrs.serialized_size());
+            no_addrs.serialize_into(&mut serialized_no_addrs)?;
+            (None, Some(serialized_no_addrs))
+        } else {
+            (Some(HashMap::new()), None)
+        }
     };
 
     metrics.files_removed = task
@@ -766,6 +794,7 @@ async fn rewrite_files(
         read_version: dataset.manifest.version,
         original_fragments: task.fragments,
         row_id_map,
+        changed_row_addrs,
     })
 }
 
@@ -839,34 +868,50 @@ async fn rechunk_stable_row_ids(
 pub async fn commit_compaction(
     dataset: &mut Dataset,
     completed_tasks: Vec<RewriteResult>,
-    options: Arc<dyn IndexRemapperOptions>,
+    remap_options: Arc<dyn IndexRemapperOptions>,
+    options: &CompactionOptions,
 ) -> Result<CompactionMetrics> {
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
     }
 
     // If we aren't using move-stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_move_stable_row_ids();
+    let needs_remapping =
+        !dataset.manifest.uses_move_stable_row_ids() && !options.defer_index_remap;
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
     let mut metrics = CompactionMetrics::default();
 
     let mut row_id_map: HashMap<u64, Option<u64>> = HashMap::default();
+    let mut changed_row_addrs: RoaringTreemap = RoaringTreemap::new();
+    let mut old_fragments: Vec<Fragment> = Vec::new();
+    let mut new_fragment_ids: Vec<u64> = Vec::new();
+    let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
 
     for task in completed_tasks {
         metrics += task.metrics;
         let rewrite_group = RewriteGroup {
-            old_fragments: task.original_fragments,
-            new_fragments: task.new_fragments,
+            old_fragments: task.original_fragments.clone(),
+            new_fragments: task.new_fragments.clone(),
         };
         if needs_remapping {
-            row_id_map.extend(task.row_id_map);
+            row_id_map.extend(task.row_id_map.unwrap());
+        } else if options.defer_index_remap {
+            let task_changed_row_addr_bytes = task.changed_row_addrs.unwrap();
+            let mut cursor = Cursor::new(&task_changed_row_addr_bytes);
+            let task_changed_row_addrs = RoaringTreemap::deserialize_from(&mut cursor)?;
+            changed_row_addrs |= task_changed_row_addrs;
+            old_fragments.extend(task.original_fragments.clone());
+            task.new_fragments.iter().for_each(|frag| {
+                new_fragment_ids.push(frag.id);
+                new_fragment_bitmap.insert(frag.id as u32);
+            });
         }
         rewrite_groups.push(rewrite_group);
     }
 
     let rewritten_indices = if needs_remapping {
-        let index_remapper = options.create_remapper(dataset)?;
+        let index_remapper = remap_options.create_remapper(dataset)?;
         let affected_ids = rewrite_groups
             .iter()
             .flat_map(|group| group.old_fragments.iter().map(|frag| frag.id))
@@ -882,7 +927,7 @@ pub async fn commit_compaction(
                 new_id: rewritten.new,
             })
             .collect()
-    } else {
+    } else if !options.defer_index_remap {
         // We need to reserve fragment ids here so that the fragment bitmap
         // can be updated for each index.
         let new_fragments = rewrite_groups
@@ -891,6 +936,23 @@ pub async fn commit_compaction(
             .collect::<Vec<_>>();
         reserve_fragment_ids(dataset, new_fragments.into_iter()).await?;
         Vec::new()
+    } else {
+        Vec::new()
+    };
+
+    let frag_reuse_index = if options.defer_index_remap {
+        Some(
+            build_new_frag_reuse_index(
+                dataset,
+                old_fragments,
+                new_fragment_ids,
+                new_fragment_bitmap,
+                changed_row_addrs,
+            )
+            .await?,
+        )
+    } else {
+        None
     };
 
     let transaction = Transaction::new(
@@ -898,6 +960,7 @@ pub async fn commit_compaction(
         Operation::Rewrite {
             groups: rewrite_groups,
             rewritten_indices,
+            frag_reuse_index,
         },
         // TODO: Add a blob compaction pass
         /*blob_op= */ None,
@@ -916,12 +979,18 @@ mod tests {
 
     use std::collections::HashSet;
 
+    use self::remapping::RemappedIndex;
+    use crate::dataset::optimize::remapping::transpose_row_ids;
+    use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+    use crate::index::vector::VectorIndexParams;
     use arrow_array::{Float32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
     use lance_core::utils::address::RowAddress;
+    use lance_core::Error;
     use lance_file::version::LanceFileVersion;
+    use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use lance_index::scalar::ScalarIndexParams;
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
@@ -929,10 +998,6 @@ mod tests {
     use rstest::rstest;
     use tempfile::tempdir;
     use uuid::Uuid;
-
-    use crate::index::vector::VectorIndexParams;
-
-    use self::remapping::RemappedIndex;
 
     use super::*;
 
@@ -1567,6 +1632,7 @@ mod tests {
             &mut dataset,
             vec![results.pop().unwrap()],
             Arc::new(IgnoreRemap::default()),
+            &options,
         )
         .await
         .unwrap();
@@ -1582,9 +1648,14 @@ mod tests {
         }
 
         // Can commit the remaining tasks
-        commit_compaction(&mut dataset, results, Arc::new(IgnoreRemap::default()))
-            .await
-            .unwrap();
+        commit_compaction(
+            &mut dataset,
+            results,
+            Arc::new(IgnoreRemap::default()),
+            &options,
+        )
+        .await
+        .unwrap();
         if use_stable_row_id {
             // 1 commit for reserve fragments and 1 for final commit, both
             // from the call to commit_compaction
@@ -1699,5 +1770,412 @@ mod tests {
 
         let after_scalar_result = scalar_query(&dataset).await;
         assert_eq!(before_scalar_result, after_scalar_result);
+    }
+
+    #[tokio::test]
+    async fn test_defer_index_remap() {
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(
+                RandomVector::new().vec_width(128).named("vec".to_owned()),
+            ))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let mut dataset = Dataset::write(
+            data_gen.batch(6_000),
+            "memory://test/table",
+            Some(WriteParams {
+                max_rows_per_file: 1_000, // 6 files
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Create another same dataset to mimic behavior without deferred index remap
+        let mut data_gen2 = BatchGenerator::new()
+            .col(Box::new(
+                RandomVector::new().vec_width(128).named("vec".to_owned()),
+            ))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let mut dataset2 = Dataset::write(
+            data_gen2.batch(6_000),
+            "memory://test/table",
+            Some(WriteParams {
+                max_rows_per_file: 1_000, // 6 files
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Delete some rows to create deletions
+        dataset.delete("i < 500").await.unwrap();
+        dataset2.delete("i < 500").await.unwrap();
+
+        // Create a scalar index to check this is not touched
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Verify the initial state - no fragment reuse index should exist
+        let initial_indices = dataset.load_indices().await.unwrap();
+        assert_eq!(initial_indices.len(), 1);
+        assert_eq!(initial_indices[0].name, "scalar");
+
+        // Store the original scalar index UUID for comparison
+        let original_scalar_uuid = initial_indices[0].uuid;
+
+        // Plan and execute compaction manually
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let options2 = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: false,
+            ..Default::default()
+        };
+
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let plan2 = plan_compaction(&dataset2, &options2).await.unwrap();
+
+        let mut expected_all_old_frag_ids = Vec::new();
+        let mut expected_all_new_frag_ids = Vec::new();
+        let mut expected_all_new_frag_bitmap = RoaringBitmap::new();
+        let mut expected_all_row_id_map = HashMap::new();
+        let mut deferred_results = Vec::new();
+
+        for (task, task2) in plan.tasks().iter().zip(plan2.tasks()) {
+            let deferred_result = rewrite_files(Cow::Borrowed(&dataset), task.clone(), &options)
+                .await
+                .unwrap();
+            let immediate_result =
+                rewrite_files(Cow::Borrowed(&dataset2), task2.clone(), &options2)
+                    .await
+                    .unwrap();
+
+            // Verify RewriteResult for deferred index remap
+            assert!(deferred_result.row_id_map.is_none());
+            assert!(deferred_result.changed_row_addrs.is_some());
+            assert!(!deferred_result
+                .changed_row_addrs
+                .as_ref()
+                .unwrap()
+                .is_empty());
+            assert!(!deferred_result.original_fragments.is_empty());
+            assert!(!deferred_result.new_fragments.is_empty());
+
+            // Verify RewriteResult for immediate index remap
+            assert!(immediate_result.changed_row_addrs.is_none());
+            assert!(!immediate_result.original_fragments.is_empty());
+            assert!(!immediate_result.new_fragments.is_empty());
+            assert!(immediate_result.row_id_map.is_some());
+
+            // Deserialize the changed_row_addrs from the deferred result
+            let changed_row_addrs_bytes = deferred_result.changed_row_addrs.as_ref().unwrap();
+            let mut cursor = Cursor::new(changed_row_addrs_bytes);
+            let changed_row_addrs = RoaringTreemap::deserialize_from(&mut cursor).unwrap();
+
+            // Use transpose_row_ids to convert changed_row_addrs to row_id_map
+            let transposed_map = transpose_row_ids(
+                changed_row_addrs,
+                &deferred_result.original_fragments,
+                &deferred_result.new_fragments,
+            );
+
+            // Compare with the immediate result's row_id_map
+            let immediate_map = immediate_result.row_id_map.as_ref().unwrap();
+            assert_eq!(transposed_map.len(), immediate_map.len());
+            for (old_row_id, new_row_id) in &transposed_map {
+                assert_eq!(
+                    immediate_map.get(old_row_id),
+                    Some(new_row_id),
+                    "Row ID mapping should be identical: {} -> {:?}",
+                    old_row_id,
+                    new_row_id
+                );
+            }
+
+            // Store result for further comparison against frag reuse index
+            deferred_results.push(deferred_result);
+            immediate_result.new_fragments.iter().for_each(|frag| {
+                expected_all_new_frag_bitmap.insert(frag.id as u32);
+            });
+            expected_all_new_frag_ids.extend(
+                immediate_result
+                    .new_fragments
+                    .iter()
+                    .map(|s| s.id)
+                    .collect::<Vec<_>>(),
+            );
+            expected_all_old_frag_ids.extend(
+                immediate_result
+                    .original_fragments
+                    .iter()
+                    .map(|s| s.id)
+                    .collect::<Vec<_>>(),
+            );
+            expected_all_row_id_map.extend(immediate_result.row_id_map.unwrap());
+        }
+
+        // Now commit the first compaction (using deferred results)
+        let first_metrics = commit_compaction(
+            &mut dataset,
+            deferred_results.clone(),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        // Verify compaction happened
+        assert!(first_metrics.fragments_removed > 0);
+        assert!(first_metrics.fragments_added > 0);
+
+        // Verify fragment reuse index was created
+        let indices_after_compact = dataset.load_indices().await.unwrap();
+        let frag_reuse_indices: Vec<_> = indices_after_compact
+            .iter()
+            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .collect();
+        assert_eq!(frag_reuse_indices.len(), 1);
+
+        // Load and verify the fragment reuse index content
+        let frag_reuse_index_meta = frag_reuse_indices[0];
+        assert_eq!(
+            frag_reuse_index_meta.fragment_bitmap.clone().unwrap(),
+            expected_all_new_frag_bitmap
+        );
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, frag_reuse_index_meta)
+            .await
+            .unwrap();
+        let frag_reuse_index =
+            open_frag_reuse_index(frag_reuse_details.as_ref(), dataset.fragments().as_slice())
+                .await
+                .unwrap();
+
+        // Verify the index has one version with the correct dataset version
+        let compaction_version = &frag_reuse_index.details.versions[0];
+        assert_eq!(frag_reuse_index.details.versions.len(), 1);
+        assert_eq!(
+            compaction_version.dataset_version,
+            frag_reuse_index_meta.dataset_version
+        );
+
+        // Verify the index compaction version information matches the RewriteResults
+        let changed_row_addr_bytes = &compaction_version.changed_row_addrs;
+        let mut cursor = Cursor::new(&changed_row_addr_bytes);
+        let changed_row_addrs = RoaringTreemap::deserialize_from(&mut cursor).unwrap();
+
+        assert_eq!(
+            compaction_version
+                .old_frags
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            expected_all_old_frag_ids
+        );
+        assert_eq!(compaction_version.new_frags, expected_all_new_frag_ids);
+
+        let new_fragments = deferred_results
+            .into_iter()
+            .flat_map(|r| r.new_fragments.into_iter())
+            .collect::<Vec<_>>();
+        let transposed_map = transpose_row_ids(
+            changed_row_addrs,
+            &compaction_version.old_frags,
+            new_fragments.as_slice(),
+        );
+        assert_eq!(transposed_map, expected_all_row_id_map);
+
+        // Verify the scalar index UUID is unchanged (it should not be remapped yet)
+        let current_scalar_index = indices_after_compact
+            .iter()
+            .find(|idx| idx.name == "scalar")
+            .unwrap();
+        assert_eq!(current_scalar_index.uuid, original_scalar_uuid);
+    }
+
+    #[tokio::test]
+    async fn test_defer_index_remap_multiple_compactions() {
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(
+                RandomVector::new().vec_width(128).named("vec".to_owned()),
+            ))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let mut dataset = Dataset::write(
+            data_gen.batch(6_000),
+            "memory://test/table",
+            Some(WriteParams {
+                max_rows_per_file: 1_000, // 6 files
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        let mut compact_read_versions = Vec::new();
+        for i in 0..10 {
+            dataset
+                .delete(&format!("i < {}", 500 * (i + 1)))
+                .await
+                .unwrap();
+            let read_version = dataset.manifest.version;
+            compact_files(&mut dataset, options.clone(), None)
+                .await
+                .unwrap();
+
+            // Record the read version for verification if compaction has happened
+            if dataset.manifest.version > read_version {
+                compact_read_versions.push(read_version);
+            }
+
+            let indices_after_compact = dataset.load_indices().await.unwrap();
+            let frag_reuse_indices: Vec<_> = indices_after_compact
+                .iter()
+                .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                .collect();
+            assert_eq!(frag_reuse_indices.len(), 1);
+
+            // Load and verify the fragment reuse index content
+            let frag_reuse_index_meta = frag_reuse_indices[0];
+            let frag_reuse_details = load_frag_reuse_index_details(&dataset, frag_reuse_index_meta)
+                .await
+                .unwrap();
+            let frag_reuse_index =
+                open_frag_reuse_index(frag_reuse_details.as_ref(), dataset.fragments().as_slice())
+                    .await
+                    .unwrap();
+
+            // Verify the index has one version with the correct dataset version
+            assert_eq!(
+                frag_reuse_index
+                    .details
+                    .versions
+                    .iter()
+                    .map(|v| v.dataset_version)
+                    .collect::<Vec<_>>(),
+                compact_read_versions
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remap_index_after_compaction() {
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(
+                RandomVector::new().vec_width(128).named("vec".to_owned()),
+            ))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let mut dataset = Dataset::write(
+            data_gen.batch(6_000),
+            "memory://test/table",
+            Some(WriteParams {
+                max_rows_per_file: 1_000, // 6 files
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Create a index to be remapped
+        let index_name = Some("scalar".into());
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                index_name.clone(),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        // Remap without a frag reuse index should yield unsupported
+        let indices = dataset.load_indices().await.unwrap();
+        let scalar_index = indices.iter().find(|idx| idx.name == "scalar").unwrap();
+
+        let result = remapping::remap_column_index(&mut dataset, &["i"], index_name.clone()).await;
+        assert!(matches!(result, Err(Error::NotSupported { .. })));
+
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+
+        // Commit each rewrite task separately to simulate 3 compaction runs
+        // being accumulated in the fragment reuse index
+        for task in plan.tasks().iter() {
+            let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), task.clone(), &options)
+                .await
+                .unwrap();
+
+            commit_compaction(
+                &mut dataset,
+                Vec::from([rewrite_result]),
+                Arc::new(DatasetIndexRemapperOptions::default()),
+                &options,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Verify the fragment reuse index content
+        let indices_after_compact = dataset.load_indices().await.unwrap();
+        let frag_reuse_indices: Vec<_> = indices_after_compact
+            .iter()
+            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .collect();
+        assert_eq!(frag_reuse_indices.len(), 1);
+
+        // Load and verify the fragment reuse index content
+        let frag_reuse_index_meta = frag_reuse_indices[0];
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, frag_reuse_index_meta)
+            .await
+            .unwrap();
+        let frag_reuse_index =
+            open_frag_reuse_index(frag_reuse_details.as_ref(), dataset.fragments().as_slice())
+                .await
+                .unwrap();
+
+        assert_eq!(frag_reuse_index.details.versions.len(), plan.tasks().len());
+
+        // Trigger index remap
+        remapping::remap_column_index(&mut dataset, &["i"], index_name.clone())
+            .await
+            .unwrap();
+
+        // Compare against original index
+        let indices = dataset.load_indices().await.unwrap();
+        let remapped_scalar_index = indices.iter().find(|idx| idx.name == "scalar").unwrap();
+        assert_ne!(remapped_scalar_index.uuid, scalar_index.uuid);
+        let mut all_fragment_bitmap = RoaringBitmap::new();
+        dataset.fragments().iter().for_each(|f| {
+            all_fragment_bitmap.insert(f.id as u32);
+        });
+        assert_eq!(
+            remapped_scalar_index.fragment_bitmap.clone().unwrap(),
+            all_fragment_bitmap
+        );
     }
 }

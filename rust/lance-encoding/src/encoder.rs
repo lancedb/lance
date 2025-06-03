@@ -1286,7 +1286,10 @@ impl StructuralEncodingStrategy {
                         options,
                         root_field_metadata,
                     )?;
-                    Ok(Box::new(ListStructuralEncoder::new(child_encoder)))
+                    Ok(Box::new(ListStructuralEncoder::new(
+                        options.keep_original_array,
+                        child_encoder,
+                    )))
                 }
                 DataType::Struct(_) => {
                     if field.is_packed_struct() {
@@ -1311,7 +1314,10 @@ impl StructuralEncodingStrategy {
                                 )
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        Ok(Box::new(StructStructuralEncoder::new(children_encoders)))
+                        Ok(Box::new(StructStructuralEncoder::new(
+                            options.keep_original_array,
+                            children_encoders,
+                        )))
                     }
                 }
                 DataType::Dictionary(_, value_type) => {
