@@ -1941,21 +1941,20 @@ mod tests {
         assert!(first_metrics.fragments_removed > 0);
         assert!(first_metrics.fragments_added > 0);
 
-        // Verify fragment reuse index was created
-        let indices_after_compact = dataset.load_indices().await.unwrap();
-        let frag_reuse_indices: Vec<_> = indices_after_compact
-            .iter()
-            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .collect();
-        assert_eq!(frag_reuse_indices.len(), 1);
-
         // Load and verify the fragment reuse index content
-        let frag_reuse_index_meta = frag_reuse_indices[0];
+        let Some(frag_reuse_index_meta) = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+        else {
+            panic!("Fragment reuse index must be available");
+        };
+
         assert_eq!(
             frag_reuse_index_meta.fragment_bitmap.clone().unwrap(),
             expected_all_new_frag_bitmap
         );
-        let frag_reuse_details = load_frag_reuse_index_details(&dataset, frag_reuse_index_meta)
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
         let frag_reuse_index =
@@ -1998,10 +1997,9 @@ mod tests {
         assert_eq!(transposed_map, expected_all_row_id_map);
 
         // Verify the scalar index UUID is unchanged (it should not be remapped yet)
-        let current_scalar_index = indices_after_compact
-            .iter()
-            .find(|idx| idx.name == "scalar")
-            .unwrap();
+        let Some(current_scalar_index) = dataset.load_index_by_name("scalar").await.unwrap() else {
+            panic!("scalar index must be available");
+        };
         assert_eq!(current_scalar_index.uuid, original_scalar_uuid);
     }
 
@@ -2046,18 +2044,18 @@ mod tests {
                 compact_read_versions.push(read_version);
             }
 
-            let indices_after_compact = dataset.load_indices().await.unwrap();
-            let frag_reuse_indices: Vec<_> = indices_after_compact
-                .iter()
-                .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-                .collect();
-            assert_eq!(frag_reuse_indices.len(), 1);
-
             // Load and verify the fragment reuse index content
-            let frag_reuse_index_meta = frag_reuse_indices[0];
-            let frag_reuse_details = load_frag_reuse_index_details(&dataset, frag_reuse_index_meta)
+            let Some(frag_reuse_index_meta) = dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
                 .await
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("Fragment reuse index must be available");
+            };
+            let frag_reuse_details =
+                load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+                    .await
+                    .unwrap();
             let frag_reuse_index =
                 open_frag_reuse_index(frag_reuse_details.as_ref(), dataset.fragments().as_slice())
                     .await
@@ -2115,8 +2113,9 @@ mod tests {
         };
 
         // Remap without a frag reuse index should yield unsupported
-        let indices = dataset.load_indices().await.unwrap();
-        let scalar_index = indices.iter().find(|idx| idx.name == "scalar").unwrap();
+        let Some(scalar_index) = dataset.load_index_by_name("scalar").await.unwrap() else {
+            panic!("scalar index must be available");
+        };
 
         let result = remapping::remap_column_index(&mut dataset, &["i"], index_name.clone()).await;
         assert!(matches!(result, Err(Error::NotSupported { .. })));
@@ -2140,17 +2139,15 @@ mod tests {
             .unwrap();
         }
 
-        // Verify the fragment reuse index content
-        let indices_after_compact = dataset.load_indices().await.unwrap();
-        let frag_reuse_indices: Vec<_> = indices_after_compact
-            .iter()
-            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .collect();
-        assert_eq!(frag_reuse_indices.len(), 1);
-
         // Load and verify the fragment reuse index content
-        let frag_reuse_index_meta = frag_reuse_indices[0];
-        let frag_reuse_details = load_frag_reuse_index_details(&dataset, frag_reuse_index_meta)
+        let Some(frag_reuse_index_meta) = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+        else {
+            panic!("Fragment reuse index must be available");
+        };
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
         let frag_reuse_index =
@@ -2166,15 +2163,17 @@ mod tests {
             .unwrap();
 
         // Compare against original index
-        let indices = dataset.load_indices().await.unwrap();
-        let remapped_scalar_index = indices.iter().find(|idx| idx.name == "scalar").unwrap();
+        let Some(remapped_scalar_index) = dataset.load_index_by_name("scalar").await.unwrap()
+        else {
+            panic!("scalar index must be available");
+        };
         assert_ne!(remapped_scalar_index.uuid, scalar_index.uuid);
         let mut all_fragment_bitmap = RoaringBitmap::new();
         dataset.fragments().iter().for_each(|f| {
             all_fragment_bitmap.insert(f.id as u32);
         });
         assert_eq!(
-            remapped_scalar_index.fragment_bitmap.clone().unwrap(),
+            remapped_scalar_index.fragment_bitmap.unwrap(),
             all_fragment_bitmap
         );
     }

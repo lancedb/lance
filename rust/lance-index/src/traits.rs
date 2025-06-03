@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use lance_core::Result;
+use lance_core::{Error, Result};
+use snafu::location;
 
 use crate::{optimize::OptimizeOptions, scalar::ScalarIndexType, IndexParams, IndexType};
 use lance_table::format::Index;
@@ -134,6 +135,31 @@ pub trait DatasetIndexExt {
                 .cloned()
                 .collect()
         })
+    }
+
+    /// Loads a specific index with the given index name.
+    /// This function only works for indices that are unique.
+    /// If there are multiple indices sharing the same name, please use [load_indices_by_name]
+    ///
+    /// Returns
+    /// -------
+    /// - `Ok(Some(index))`: if the index exists, returns the index.
+    /// - `Ok(None)`: if the index does not exist.
+    /// - `Err(e)`: Index error if there are multiple indexes sharing the same name.
+    ///
+    async fn load_index_by_name(&self, name: &str) -> Result<Option<Index>> {
+        let indices = self.load_indices_by_name(name).await?;
+        if indices.is_empty() {
+            Ok(None)
+        } else if indices.len() == 1 {
+            Ok(Some(indices[0].clone()))
+        } else {
+            Err(Error::Index {
+                message: format!("Found multiple indices of the same name: {:?}, please use load_indices_by_name", 
+                    indices.iter().map(|idx| &idx.name).collect::<Vec<_>>()),
+                location: location!(),
+            })
+        }
     }
 
     /// Loads a specific index with the given index name.
