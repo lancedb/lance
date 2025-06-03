@@ -135,11 +135,18 @@ pub async fn build_new_frag_reuse_index(
         }
     };
 
-    build_frag_reuse_index_metadata(dataset, new_index_details, new_fragment_bitmap).await
+    build_frag_reuse_index_metadata(
+        dataset,
+        index_meta.as_ref(),
+        new_index_details,
+        new_fragment_bitmap,
+    )
+    .await
 }
 
 pub(crate) async fn build_frag_reuse_index_metadata(
     dataset: &mut Dataset,
+    index_meta: Option<&Index>,
     new_index_details: FragReuseIndexDetails,
     new_fragment_bitmap: RoaringBitmap,
 ) -> lance_core::Result<Index> {
@@ -175,8 +182,6 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(new_fragment_bitmap),
         index_details: Some(prost_types::Any::from_msg(&proto)?),
-        index_version: index_meta
-            .as_ref()
-            .map_or(0, |index_meta| index_meta.index_version),
+        index_version: index_meta.map_or(0, |index_meta| index_meta.index_version),
     })
 }
