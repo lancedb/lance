@@ -240,12 +240,7 @@ async fn migrate_manifest(
 ) -> Result<()> {
     if !recompute_stats
         && manifest.fragments.iter().all(|f| {
-            f.physical_rows.is_some()
-                && (f
-                    .deletion_file
-                    .as_ref()
-                    .map(|d| d.num_deleted_rows.is_some())
-                    .unwrap_or(true))
+            f.num_rows().map(|n| n > 0).unwrap_or(false)
                 && f.files.iter().all(|f| f.file_size_bytes.get().is_some())
         })
     {
@@ -472,6 +467,8 @@ pub(crate) async fn migrate_fragments(
             })
         })
         .buffered(dataset.object_store.io_parallelism())
+        // Filter out empty fragments
+        .try_filter(|frag| futures::future::ready(frag.num_rows().map(|n| n > 0).unwrap_or(false)))
         .boxed();
 
     new_fragments.try_collect().await
