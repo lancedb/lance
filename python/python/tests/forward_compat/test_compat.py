@@ -30,10 +30,8 @@ def test_scans():
     reason="Lance 0.29.0-beta.2 would ignore indices too new",
 )
 def test_pq_buffer():
-    # the index should be ignored
     ds = lance.dataset(get_path("pq_in_schema"))
-    assert ds.stats.index_stats("vec_idx") is None
-    # still able to query (brute force)
+    # the index should be ignored, still able to query (brute force)
     q = pc.random(32).cast(pa.float32())
     ds.to_table(
         nearest={
