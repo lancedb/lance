@@ -21,8 +21,12 @@ mod test {
         };
     }
 
-    use std::sync::Arc;
-
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::{
+        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
+        Dataset,
+    };
+    use arrow_array::types::Int32Type;
     use aws_credential_types::Credentials;
     use aws_sdk_dynamodb::{
         config::Region,
@@ -33,19 +37,15 @@ mod test {
         Client,
     };
     use futures::future::join_all;
-    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-    use object_store::local::LocalFileSystem;
-    use object_store::path::Path;
-
-    use crate::{
-        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
-        Dataset,
-    };
+    use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_table::io::commit::{
         dynamodb::DynamoDBExternalManifestStore,
         external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
         CommitHandler, ManifestNamingScheme,
     };
+    use object_store::local::LocalFileSystem;
+    use object_store::path::Path;
+    use std::sync::Arc;
 
     fn read_params(handler: Arc<dyn CommitHandler>) -> ReadParams {
         ReadParams {
@@ -190,12 +190,18 @@ mod test {
     #[tokio::test]
     async fn test_dataset_can_onboard_external_store() {
         // First write a dataset WITHOUT external store
-        let mut data_gen =
-            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
-        let reader = data_gen.batch(100);
         let dir = tempfile::tempdir().unwrap();
         let ds_uri = dir.path().to_str().unwrap();
-        Dataset::write(reader, ds_uri, None).await.unwrap();
+        gen()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                ds_uri,
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+                None,
+            )
+            .await
+            .unwrap();
 
         // Then try to load the dataset with external store handler set
         let store = make_dynamodb_store().await;
@@ -215,13 +221,16 @@ mod test {
             external_manifest_store: store,
         };
         let handler = Arc::new(handler);
-
-        let mut data_gen =
-            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
-        let reader = data_gen.batch(100);
         let dir = tempfile::tempdir().unwrap();
         let ds_uri = dir.path().to_str().unwrap();
-        Dataset::write(reader, ds_uri, Some(write_params(handler.clone())))
+        gen()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                ds_uri,
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+                Some(write_params(handler.clone())),
+            )
             .await
             .unwrap();
 
@@ -237,18 +246,17 @@ mod test {
     #[tokio::test]
     async fn test_concurrent_commits_are_okay() {
         let store = make_dynamodb_store().await;
-        let handler = ExternalManifestCommitHandler {
+        let handler = Arc::new(ExternalManifestCommitHandler {
             external_manifest_store: store,
-        };
-        let handler = Arc::new(handler);
-
-        let mut data_gen =
-            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
+        });
+        let mut data_gen = gen()
+            .col("x", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(6));
         let dir = tempfile::tempdir().unwrap();
         let ds_uri = dir.path().to_str().unwrap();
 
         Dataset::write(
-            data_gen.batch(10),
+            data_gen.gen_next_reader(),
             ds_uri,
             Some(write_params(handler.clone())),
         )
@@ -257,7 +265,7 @@ mod test {
 
         // we have 5 retries by default, more than this will just fail
         let write_futs = (0..5)
-            .map(|_| data_gen.batch(10))
+            .map(|_| data_gen.gen_next_reader())
             .map(|data| {
                 let mut params = write_params(handler.clone());
                 params.mode = WriteMode::Append;
@@ -292,13 +300,14 @@ mod test {
         };
         let handler = Arc::new(handler);
 
-        let mut data_gen =
-            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
+        let mut data_gen = gen()
+            .col("x", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(6));
         let dir = tempfile::tempdir().unwrap();
         let ds_uri = dir.path().to_str().unwrap();
 
         let mut ds = Dataset::write(
-            data_gen.batch(10),
+            data_gen.gen_next_reader(),
             ds_uri,
             Some(write_params(handler.clone())),
         )
@@ -306,7 +315,7 @@ mod test {
         .unwrap();
 
         for _ in 0..5 {
-            let data = data_gen.batch(10);
+            let data = data_gen.gen_next_reader();
             let mut params = write_params(handler.clone());
             params.mode = WriteMode::Append;
             ds = Dataset::write(data, ds_uri, Some(params)).await.unwrap();

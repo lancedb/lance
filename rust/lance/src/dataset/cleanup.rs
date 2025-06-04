@@ -551,17 +551,18 @@ mod tests {
     };
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::RenameCommitHandler;
-    use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
+    use lance_testing::datagen::some_batch;
     use snafu::location;
 
+    use super::*;
     use crate::{
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
+    use arrow_array::types::Int32Type;
+    use lance_datagen::{BatchCount, RowCount};
     use tempfile::{tempdir, TempDir};
-
-    use super::*;
 
     #[derive(Debug)]
     struct MockObjectStore {
@@ -1214,19 +1215,28 @@ mod tests {
     #[tokio::test]
     async fn clean_old_delete_files() {
         let fixture = MockDatasetFixture::try_new().unwrap();
-        let mut data_gen = BatchGenerator::new().col(Box::new(
-            IncrementingInt32::new().named("filter_me".to_owned()),
-        ));
+        let mut data_gen = lance_datagen::gen()
+            .col("filter_me", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(16), BatchCount::from(3));
 
-        fixture.create_with_data(data_gen.batch(16)).await.unwrap();
-        fixture.append_data(data_gen.batch(16)).await.unwrap();
+        fixture
+            .create_with_data(data_gen.gen_next_reader())
+            .await
+            .unwrap();
+        fixture
+            .append_data(data_gen.gen_next_reader())
+            .await
+            .unwrap();
         // This will keep some data from the appended file and should
         // completely remove the first file
         fixture.delete_data("filter_me < 20").await.unwrap();
         fixture
             .clock
             .set_system_time(TimeDelta::try_days(10).unwrap());
-        fixture.overwrite_data(data_gen.batch(16)).await.unwrap();
+        fixture
+            .overwrite_data(data_gen.gen_next_reader())
+            .await
+            .unwrap();
         // This will delete half of the last fragment
         fixture.delete_data("filter_me >= 40").await.unwrap();
 

@@ -980,26 +980,27 @@ mod tests {
     use std::collections::HashSet;
 
     use self::remapping::RemappedIndex;
+    use super::*;
     use crate::dataset::optimize::remapping::transpose_row_ids;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::VectorIndexParams;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{Float32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
     use lance_core::utils::address::RowAddress;
     use lance_core::Error;
+    use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use lance_index::scalar::ScalarIndexParams;
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
-    use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
     use tempfile::tempdir;
     use uuid::Uuid;
-
-    use super::*;
 
     #[test]
     fn test_candidate_bin() {
@@ -1675,22 +1676,22 @@ mod tests {
     #[tokio::test]
     async fn test_stable_row_indices() {
         // Validate behavior of indices after compaction with move-stable row ids.
-        let mut data_gen = BatchGenerator::new()
-            .col(Box::new(
-                RandomVector::new().vec_width(128).named("vec".to_owned()),
-            ))
-            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
-        let mut dataset = Dataset::write(
-            data_gen.batch(5_000),
-            "memory://test/table",
-            Some(WriteParams {
-                enable_move_stable_row_ids: true,
-                max_rows_per_file: 1_000, // 5 files
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let mut dataset = lance_datagen::gen()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(
+                FragmentCount::from(5),
+                FragmentRowCount::from(1000),
+                Some(WriteParams {
+                    enable_move_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
 
         // Delete first 1,100 rows so rowids != final rowaddrs
         // First 1,000 rows deletes first file. Next 100 deletes part of second
@@ -1774,40 +1775,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_defer_index_remap() {
-        let mut data_gen = BatchGenerator::new()
-            .col(Box::new(
-                RandomVector::new().vec_width(128).named("vec".to_owned()),
-            ))
-            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
-
-        let mut dataset = Dataset::write(
-            data_gen.batch(6_000),
-            "memory://test/table",
-            Some(WriteParams {
-                max_rows_per_file: 1_000, // 6 files
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let mut dataset = lance_datagen::gen()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000), None)
+            .await
+            .unwrap();
 
         // Create another same dataset to mimic behavior without deferred index remap
-        let mut data_gen2 = BatchGenerator::new()
-            .col(Box::new(
-                RandomVector::new().vec_width(128).named("vec".to_owned()),
-            ))
-            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
-
-        let mut dataset2 = Dataset::write(
-            data_gen2.batch(6_000),
-            "memory://test/table",
-            Some(WriteParams {
-                max_rows_per_file: 1_000, // 6 files
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let mut dataset2 = lance_datagen::gen()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000), None)
+            .await
+            .unwrap();
 
         // Delete some rows to create deletions
         dataset.delete("i < 500").await.unwrap();
@@ -2005,22 +1992,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_defer_index_remap_multiple_compactions() {
-        let mut data_gen = BatchGenerator::new()
-            .col(Box::new(
-                RandomVector::new().vec_width(128).named("vec".to_owned()),
-            ))
-            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
-
-        let mut dataset = Dataset::write(
-            data_gen.batch(6_000),
-            "memory://test/table",
-            Some(WriteParams {
-                max_rows_per_file: 1_000, // 6 files
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let mut dataset = lance_datagen::gen()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000), None)
+            .await
+            .unwrap();
 
         let options = CompactionOptions {
             target_rows_per_fragment: 2_000,
@@ -2076,22 +2056,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_remap_index_after_compaction() {
-        let mut data_gen = BatchGenerator::new()
-            .col(Box::new(
-                RandomVector::new().vec_width(128).named("vec".to_owned()),
-            ))
-            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
-
-        let mut dataset = Dataset::write(
-            data_gen.batch(6_000),
-            "memory://test/table",
-            Some(WriteParams {
-                max_rows_per_file: 1_000, // 6 files
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let mut dataset = lance_datagen::gen()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000), None)
+            .await
+            .unwrap();
 
         // Create a index to be remapped
         let index_name = Some("scalar".into());

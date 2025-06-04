@@ -15,8 +15,8 @@ use arrow_array::{
     make_array,
     types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
     Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, LargeListArray,
-    ListArray, NullArray, PrimitiveArray, RecordBatch, RecordBatchOptions, RecordBatchReader,
-    StringArray, StructArray,
+    ListArray, NullArray, PrimitiveArray, RecordBatch, RecordBatchIterator, RecordBatchOptions,
+    RecordBatchReader, StringArray, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SchemaRef};
 use futures::{stream::BoxStream, StreamExt};
@@ -1491,6 +1491,22 @@ impl FixedSizeBatchGenerator {
         )
         .unwrap())
     }
+
+    /// generate the next record batch, and expose it as a RecordBatchReader
+    pub fn gen_next_reader(&mut self) -> impl RecordBatchReader {
+        let batch = self.gen_next().unwrap();
+        let schema = batch.schema();
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema)
+    }
+
+    /// generate the next num_batches of record batches, and expose it as a RecordBatchReader
+    pub fn gen_next_batch_reader(&mut self, num_batches: BatchCount) -> impl RecordBatchReader {
+        let batches = (0..num_batches.0)
+            .map(|_| self.gen_next().unwrap())
+            .collect::<Vec<_>>();
+        let schema = batches[0].schema();
+        RecordBatchIterator::new(batches.into_iter().map(Ok), schema)
+    }
 }
 
 impl Iterator for FixedSizeBatchGenerator {
@@ -1575,12 +1591,12 @@ impl BatchGeneratorBuilder {
             .expect("Asked for 1 batch but reader was empty")
     }
 
-    /// Create a RecordBatchReader that generates batches of the given size (in rows)
+    /// Create a FixedSizeBatchGenerator that generates batches of the given size (in rows)
     pub fn into_reader_rows(
         self,
         batch_size: RowCount,
         num_batches: BatchCount,
-    ) -> impl RecordBatchReader {
+    ) -> FixedSizeBatchGenerator {
         FixedSizeBatchGenerator::new(
             self.generators,
             batch_size,

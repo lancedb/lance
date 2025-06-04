@@ -569,17 +569,19 @@ pub trait DatagenExt {
         path: &str,
         frag_count: FragmentCount,
         rows_per_fragment: FragmentRowCount,
+        write_params: Option<WriteParams>,
     ) -> crate::Result<Dataset>;
 
     async fn into_ram_dataset(
         self,
         frag_count: FragmentCount,
         rows_per_fragment: FragmentRowCount,
+        write_params: Option<WriteParams>,
     ) -> crate::Result<Dataset>
     where
         Self: Sized,
     {
-        self.into_dataset("memory://", frag_count, rows_per_fragment)
+        self.into_dataset("memory://", frag_count, rows_per_fragment, write_params)
             .await
     }
 }
@@ -591,6 +593,7 @@ impl DatagenExt for BatchGeneratorBuilder {
         path: &str,
         frag_count: FragmentCount,
         rows_per_fragment: FragmentRowCount,
+        write_params: Option<WriteParams>,
     ) -> crate::Result<Dataset> {
         let reader = self.into_reader_rows(
             RowCount::from(rows_per_fragment.0 as u64),
@@ -601,7 +604,7 @@ impl DatagenExt for BatchGeneratorBuilder {
             path,
             Some(WriteParams {
                 max_rows_per_file: rows_per_fragment.0 as usize,
-                ..Default::default()
+                ..write_params.unwrap_or_default()
             }),
         )
         .await
@@ -627,7 +630,12 @@ impl NoContextTestFixture {
                     "text",
                     lance_datagen::array::rand_utf8(ByteCount::from(10), false),
                 )
-                .into_dataset(tmppath, FragmentCount::from(4), FragmentRowCount::from(100))
+                .into_dataset(
+                    tmppath,
+                    FragmentCount::from(4),
+                    FragmentRowCount::from(100),
+                    None,
+                )
                 .await
                 .unwrap();
             Self {

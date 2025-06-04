@@ -281,11 +281,12 @@ impl PreFilter for DatasetPreFilter {
 
 #[cfg(test)]
 mod test {
-    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-
-    use crate::dataset::WriteParams;
+    use arrow_array::types::Int32Type;
+    use lance_datagen::{array, gen};
 
     use super::*;
+    use crate::dataset::WriteParams;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     struct TestDatasets {
         no_deletions: Arc<Dataset>,
@@ -295,20 +296,19 @@ mod test {
     }
 
     async fn test_datasets(use_stable_row_id: bool) -> TestDatasets {
-        let test_data = BatchGenerator::new()
-            .col(Box::new(IncrementingInt32::new().named("x")))
-            .batch(9);
-        let mut dataset = Dataset::write(
-            test_data,
-            "memory://test",
-            Some(WriteParams {
-                max_rows_per_file: 3,
-                enable_move_stable_row_ids: use_stable_row_id,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let mut dataset = gen()
+            .col("x", array::step::<Int32Type>())
+            .into_ram_dataset(
+                FragmentCount::from(3),
+                FragmentRowCount::from(3),
+                Some(WriteParams {
+                    enable_move_stable_row_ids: use_stable_row_id,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
         let no_deletions = Arc::new(dataset.clone());
 
         // This will add a deletion file.
