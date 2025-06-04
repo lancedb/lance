@@ -473,6 +473,31 @@ public class Dataset implements Closeable {
   private native long nativeLatestVersion();
 
   /**
+   * Checks out a specific version of the dataset. If the version is already checked out, it returns
+   * the current instance.
+   *
+   * @param version the version to check out
+   * @return a new Dataset instance with the specified version checked out
+   */
+  public Dataset checkoutVersion(long version) {
+    if (version < 1) {
+      throw new IllegalArgumentException("Version must be greater than 0");
+    }
+
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+
+      if (this.version() == version) {
+        return this;
+      }
+
+      return nativeCheckoutVersion(version);
+    }
+  }
+
+  private native Dataset nativeCheckoutVersion(long version);
+
+  /**
    * Creates a new index on the dataset. Only vector indexes are supported.
    *
    * @param columns the columns to index from
