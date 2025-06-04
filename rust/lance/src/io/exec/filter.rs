@@ -35,7 +35,7 @@ impl LanceFilterExec {
     ) -> Result<Self> {
         let filter_exec = FilterExec::try_new(predicate.clone(), input)?;
         Ok(Self {
-            expr: expr,
+            expr,
             filter: Arc::new(filter_exec),
         })
     }

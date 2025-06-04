@@ -13,7 +13,6 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use datafusion::common::{DFSchema, SchemaExt};
-use datafusion::error::DataFusionError;
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{col, lit, Expr};
@@ -2194,7 +2193,7 @@ impl Scanner {
             };
             if let Some(refine_expr) = &filter_plan.refine_expr {
                 let planner = Planner::new(plan.schema());
-                let physical_refine_expr = planner.create_physical_expr(&refine_expr)?;
+                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
                 plan = Arc::new(LanceFilterExec::try_new(
                     refine_expr.clone(),
                     physical_refine_expr,
@@ -2626,8 +2625,7 @@ impl Scanner {
                 let logical = col(DIST_COL).gt_eq(lit(v));
                 let schema = flat_dist.schema();
                 let df_schema = DFSchema::try_from(schema)?;
-                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())
-                    .map_err(DataFusionError::from)?;
+                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
                 Ok::<(Expr, Arc<dyn PhysicalExpr>), _>((logical, physical))
             })
             .transpose()?;
@@ -2638,20 +2636,18 @@ impl Scanner {
                 let logical = col(DIST_COL).lt(lit(v));
                 let schema = flat_dist.schema();
                 let df_schema = DFSchema::try_from(schema)?;
-                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())
-                    .map_err(DataFusionError::from)?;
+                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
                 Ok::<(Expr, Arc<dyn PhysicalExpr>), _>((logical, physical))
             })
             .transpose()?;
 
         let filter_expr = match (lower, upper) {
             (Some((llog, _)), Some((ulog, _))) => {
-                let logical = llog.clone().and(ulog.clone());
+                let logical = llog.and(ulog);
                 let schema = flat_dist.schema();
                 let df_schema = DFSchema::try_from(schema)?;
-                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())
-                    .map_err(DataFusionError::from)?;
-                Some((logical, Arc::from(physical)))
+                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                Some((logical, physical))
             }
             (Some((llog, lphys)), None) => Some((llog, lphys)),
             (None, Some((ulog, uphys))) => Some((ulog, uphys)),
@@ -2684,8 +2680,7 @@ impl Scanner {
         let logical_not_null = col(DIST_COL).is_not_null();
         let physical_not_null = {
             let df_schema = DFSchema::try_from(sort.schema())?;
-            create_physical_expr(&logical_not_null, &df_schema, &ExecutionProps::new())
-                .map_err(DataFusionError::from)?
+            create_physical_expr(&logical_not_null, &df_schema, &ExecutionProps::new())?
         };
         let not_nulls = Arc::new(LanceFilterExec::try_new(
             logical_not_null,
