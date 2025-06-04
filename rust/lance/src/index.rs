@@ -124,6 +124,15 @@ pub(crate) async fn remap_index(
             location: location!(),
         });
     }
+
+    if row_id_map.is_empty() {
+        // If there are no rows to remap, we can just return the same index ID.
+        // This can happen if there is a bug where the index is covering empty
+        // fragment that haven't been cleaned up. They should be cleaned up
+        // outside of this function.
+        return Ok(*index_id);
+    }
+
     let field = matched
         .fields
         .first()
