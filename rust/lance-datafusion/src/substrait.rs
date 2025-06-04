@@ -36,7 +36,7 @@ pub fn encode_substrait(expr: Expr, schema: Arc<ArrowSchema>) -> Result<Vec<u8>>
 
     let ctx = SessionContext::new();
 
-    let df_schema = Arc::new(DFSchema::try_from(schema.clone())?);
+    let df_schema = Arc::new(DFSchema::try_from(schema)?);
     let output_type = expr.get_type(&df_schema)?;
     // Nullability doesn't matter
     let output_field = Field::new("output", output_type, /*nullable=*/ true);
