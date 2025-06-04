@@ -13,6 +13,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tracing::{
     IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS,
@@ -125,12 +126,20 @@ pub(crate) async fn remap_index(
         });
     }
 
-    if row_id_map.is_empty() {
-        // If there are no rows to remap, we can just return the same index ID.
-        // This can happen if there is a bug where the index is covering empty
-        // fragment that haven't been cleaned up. They should be cleaned up
-        // outside of this function.
-        return Ok(*index_id);
+    if row_id_map.values().all(|v| v.is_none()) {
+        let deleted_bitmap = RoaringBitmap::from_iter(
+            row_id_map
+                .iter()
+                .map(|(row_id, _)| RowAddress::new_from_u64(*row_id))
+                .map(|addr| addr.fragment_id()),
+        );
+        if Some(deleted_bitmap) == matched.fragment_bitmap {
+            // If remap deleted all rows, we can just return the same index ID.
+            // This can happen if there is a bug where the index is covering empty
+            // fragment that haven't been cleaned up. They should be cleaned up
+            // outside of this function.
+            return Ok(*index_id);
+        }
     }
 
     let field = matched
@@ -1256,9 +1265,12 @@ mod tests {
     use super::*;
 
     use arrow::array::AsArray;
+    use arrow::datatypes::{Float32Type, Int32Type};
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
+    use lance_datagen::r#gen;
+    use lance_datagen::{array, BatchCount, Dimension, RowCount};
     use lance_index::scalar::FullTextSearchQuery;
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
@@ -2071,5 +2083,32 @@ mod tests {
         assert_eq!(stats.read_iops, 0);
         assert_eq!(stats.read_bytes, 0);
         assert_eq!(indices2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_remap_empty() {
+        let data = gen()
+            .col("int", array::step::<Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(16)),
+            )
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 1, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+        let remap_to_empty = (0..dataset.count_all_rows().await.unwrap())
+            .map(|i| (i as u64, None))
+            .collect::<HashMap<_, _>>();
+        let new_uuid = remap_index(&dataset, &index_uuid, &remap_to_empty)
+            .await
+            .unwrap();
+        assert_eq!(new_uuid, index_uuid);
     }
 }
