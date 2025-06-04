@@ -29,6 +29,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Convert a DF Expr into a Substrait ExtendedExpressions message
+///
+/// The schema needs to contain all of the fields that are referenced in the expression.
+/// It is ok if the schema has more fields than are required.  However, we cannot currently
+/// convert all field types (e.g. extension types, FSL) and if these fields are present then
+/// the conversion will fail.
+///
+/// As a result, it may be a good idea for now to remove those types from the schema before
+/// calling this function.
 pub fn encode_substrait(expr: Expr, schema: Arc<ArrowSchema>) -> Result<Vec<u8>> {
     use arrow_schema::Field;
     use datafusion::logical_expr::ExprSchemable;
