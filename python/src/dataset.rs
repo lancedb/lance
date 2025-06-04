@@ -2249,7 +2249,7 @@ pub struct PyFullTextQuery {
 #[pymethods]
 impl PyFullTextQuery {
     #[staticmethod]
-    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR"))]
+    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR", prefix_length=0))]
     fn match_query(
         query: String,
         column: String,
@@ -2257,6 +2257,7 @@ impl PyFullTextQuery {
         fuzziness: Option<u32>,
         max_expansions: usize,
         operator: &str,
+        prefix_length: u32,
     ) -> PyResult<Self> {
         Ok(Self {
             inner: MatchQuery::new(query)
@@ -2268,6 +2269,7 @@ impl PyFullTextQuery {
                     Operator::try_from(operator)
                         .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?,
                 )
+                .with_prefix_length(prefix_length)
                 .into(),
         })
     }

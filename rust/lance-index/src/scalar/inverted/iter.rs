@@ -146,3 +146,17 @@ impl Iterator for CompressedPostingListIterator {
         self.next()
     }
 }
+
+pub fn take_fst_keys<'f, I, S>(s: I, dst: &mut Vec<String>, max_expansion: usize)
+where
+    I: for<'a> fst::IntoStreamer<'a, Into = S, Item = (&'a [u8], u64)>,
+    S: 'f + for<'a> fst::Streamer<'a, Item = (&'a [u8], u64)>,
+{
+    let mut stream = s.into_stream();
+    while let Some((token, _)) = stream.next() {
+        dst.push(String::from_utf8_lossy(token).into_owned());
+        if dst.len() >= max_expansion {
+            break;
+        }
+    }
+}
