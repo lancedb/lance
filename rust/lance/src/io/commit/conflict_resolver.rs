@@ -241,6 +241,7 @@ impl<'a> TransactionRebase<'a> {
 
                 let merged = existing_deletions.clone() | affected_rows.clone();
 
+                let mut new_deleted_frag_ids = Vec::new();
                 let mut new_deletion_files = HashMap::with_capacity(fragments_ids_to_rewrite.len());
                 for fragment_id in fragments_ids_to_rewrite.iter() {
                     let dv = DeletionVector::from(
@@ -249,6 +250,21 @@ impl<'a> TransactionRebase<'a> {
                             .unwrap()
                             .clone(),
                     );
+                    // If we've deleted all rows in the fragment, we can delete it.
+                    // It's acceptable if we don't handle it here, as the commit step
+                    // can handle it later. Though it should be rare that physical_rows
+                    // is missing.
+                    if let Some(physical_rows) = self
+                        .initial_fragments
+                        .get(fragment_id)
+                        .and_then(|(fragment, _)| fragment.physical_rows)
+                    {
+                        if dv.len() == physical_rows {
+                            new_deleted_frag_ids.push(*fragment_id);
+                            continue;
+                        }
+                    }
+
                     let new_deletion_file = write_deletion_file(
                         &dataset.base,
                         *fragment_id,
@@ -275,16 +291,21 @@ impl<'a> TransactionRebase<'a> {
 
                 match &mut self.transaction.operation {
                     Operation::Update {
-                        updated_fragments, ..
+                        updated_fragments,
+                        removed_fragment_ids,
+                        ..
                     }
                     | Operation::Delete {
-                        updated_fragments, ..
+                        updated_fragments,
+                        deleted_fragment_ids: removed_fragment_ids,
+                        ..
                     } => {
                         for updated in updated_fragments {
                             if let Some(new_deletion_file) = new_deletion_files.get(&updated.id) {
                                 updated.deletion_file = new_deletion_file.clone();
                             }
                         }
+                        removed_fragment_ids.extend(new_deleted_frag_ids);
                     }
                     _ => {}
                 }

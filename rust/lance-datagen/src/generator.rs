@@ -4,18 +4,19 @@
 use std::{collections::HashMap, iter, marker::PhantomData, sync::Arc};
 
 use arrow::{
-    array::{ArrayData, AsArray},
+    array::{ArrayData, AsArray, Float32Builder},
     buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer},
     datatypes::{
-        ArrowPrimitiveType, Int32Type, Int64Type, IntervalDayTime, IntervalMonthDayNano, UInt32Type,
+        ArrowPrimitiveType, Float32Type, Int32Type, Int64Type, IntervalDayTime,
+        IntervalMonthDayNano, UInt32Type,
     },
 };
 use arrow_array::{
     make_array,
     types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
-    Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, LargeListArray, ListArray,
-    NullArray, PrimitiveArray, RecordBatch, RecordBatchOptions, RecordBatchReader, StringArray,
-    StructArray,
+    Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, LargeListArray,
+    ListArray, NullArray, PrimitiveArray, RecordBatch, RecordBatchOptions, RecordBatchReader,
+    StringArray, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SchemaRef};
 use futures::{stream::BoxStream, StreamExt};
@@ -76,6 +77,23 @@ pub trait ArrayGenerator: Send + Sync + std::fmt::Debug {
         length: RowCount,
         rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
     ) -> Result<Arc<dyn arrow_array::Array>, ArrowError>;
+
+    /// Generate an array of the given length using a new RNG with the default seed
+    ///
+    /// # Arguments
+    ///
+    /// * `length` - The number of elements to generate
+    ///
+    /// # Returns
+    ///
+    /// An array of the given length
+    fn generate_default(
+        &mut self,
+        length: RowCount,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+        Self::generate(self, length, &mut rng)
+    }
     /// Get the data type of the array that this generator produces
     ///
     /// # Returns
@@ -1221,6 +1239,142 @@ impl ArrayGenerator for NullArrayGenerator {
     }
 }
 
+/// Generates 2 dimensional vectors along the unit circle, with a configurable number of steps per circle.
+#[derive(Debug)]
+struct RadialStepGenerator {
+    num_steps_per_circle: u32,
+    data_field: Arc<Field>,
+    data_type: DataType,
+    current_step: u32,
+}
+
+impl RadialStepGenerator {
+    fn new(num_steps_per_circle: u32) -> Self {
+        let data_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let data_type = DataType::FixedSizeList(data_field.clone(), 2);
+        Self {
+            num_steps_per_circle,
+            data_field,
+            data_type,
+            current_step: 0,
+        }
+    }
+}
+
+impl ArrayGenerator for RadialStepGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        _rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn Array>, ArrowError> {
+        let mut values_builder = Float32Builder::with_capacity(length.0 as usize * 2);
+        for _ in 0..length.0 {
+            let angle = (self.current_step as f32) / (self.num_steps_per_circle as f32)
+                * 2.0
+                * std::f32::consts::PI;
+            values_builder.append_value(angle.cos());
+            values_builder.append_value(angle.sin());
+            self.current_step = (self.current_step + 1) % self.num_steps_per_circle;
+        }
+        let values = values_builder.finish();
+        let vectors =
+            FixedSizeListArray::try_new(self.data_field.clone(), 2, Arc::new(values), None)?;
+        Ok(Arc::new(vectors))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        Some(ByteCount::from(8))
+    }
+}
+
+/// Cycles through a set of centroids, adding noise to each point
+#[derive(Debug)]
+struct JitterCentroidsGenerator {
+    centroids: Float32Array,
+    dimension: u32,
+    noise_level: f32,
+    data_type: DataType,
+    data_field: Arc<Field>,
+
+    offset: usize,
+}
+
+impl JitterCentroidsGenerator {
+    fn try_new(centroids: Arc<dyn Array>, noise_level: f32) -> Result<Self, ArrowError> {
+        let DataType::FixedSizeList(values_field, dimension) = centroids.data_type() else {
+            return Err(ArrowError::InvalidArgumentError(
+                "Centroids must be a FixedSizeList".to_string(),
+            ));
+        };
+        if values_field.data_type() != &DataType::Float32 {
+            return Err(ArrowError::InvalidArgumentError(
+                "Centroids values must be a Float32".to_string(),
+            ));
+        }
+        let data_type = DataType::FixedSizeList(values_field.clone(), *dimension);
+        Ok(Self {
+            centroids: centroids
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<Float32Type>()
+                .clone(),
+            dimension: *dimension as u32,
+            noise_level,
+            data_type,
+            data_field: values_field.clone(),
+            offset: 0,
+        })
+    }
+}
+
+impl ArrayGenerator for JitterCentroidsGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn Array>, ArrowError> {
+        let mut values_builder =
+            Float32Builder::with_capacity(length.0 as usize * self.dimension as usize);
+        for _ in 0..length.0 {
+            // Generate random N dimensional point
+            let mut noise = (0..self.dimension as usize)
+                .map(|_| rng.gen::<f32>())
+                .collect::<Vec<_>>();
+            // Scale point to noise_level length
+            let scale = self.noise_level / noise.iter().map(|v| v * v).sum::<f32>().sqrt();
+            noise.iter_mut().for_each(|v| *v *= scale);
+
+            // Add noise to centroid and store in values
+            for (i, noise) in noise.into_iter().enumerate() {
+                let centroid_val = self.centroids.value(self.offset + i);
+                let jittered_val = centroid_val + noise;
+                values_builder.append_value(jittered_val);
+            }
+            // Advance to next centroid
+            self.offset = (self.offset + self.dimension as usize) % self.centroids.len();
+        }
+        let values = values_builder.finish();
+        let vectors = FixedSizeListArray::try_new(
+            self.data_field.clone(),
+            self.dimension as i32,
+            Arc::new(values),
+            None,
+        )?;
+        Ok(Arc::new(vectors))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        Some(ByteCount::from(self.dimension as u64 * 4))
+    }
+}
 #[derive(Debug)]
 struct RandomStructGenerator {
     fields: Fields,
@@ -1573,6 +1727,21 @@ pub mod array {
             min_list_size,
             max_list_size,
         ))
+    }
+
+    /// Create a generator of vectors around unit circle
+    ///
+    /// Vectors will be equally spaced around the unit circle so that there are num_steps
+    /// vectors per circle.
+    pub fn cycle_unit_circle(num_steps: u32) -> Box<dyn ArrayGenerator> {
+        Box::new(RadialStepGenerator::new(num_steps))
+    }
+
+    /// Create a generator of vectors by cycling through a given set of vectors
+    ///
+    /// Each value will be spaced in slightly away from the previous value on a ball of radius jitter
+    pub fn jitter_centroids(centroids: Arc<dyn Array>, jitter: f32) -> Box<dyn ArrayGenerator> {
+        Box::new(JitterCentroidsGenerator::try_new(centroids, jitter).unwrap())
     }
 
     /// Create a generator from a vector of values
@@ -2357,6 +2526,61 @@ mod tests {
         assert!((3..5).all(|idx| arr.is_valid(idx)));
         assert!(arr.is_null(5));
         assert!(arr.is_valid(6));
+    }
+
+    #[test]
+    fn test_unit_circle() {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+        let mut gen = array::cycle_unit_circle(4);
+        let arr = gen.generate(RowCount::from(6), &mut rng).unwrap();
+
+        let arr_values = arr
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(arr_values.len(), 12);
+        let expected_values = [1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0, 1.0];
+        for (actual, expected) in arr_values.iter().zip(expected_values.iter()) {
+            assert!((actual - expected).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn test_jitter_centroids() {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+        let mut centroids_gen = array::cycle_unit_circle(4);
+        let centroids = centroids_gen.generate(RowCount::from(4), &mut rng).unwrap();
+
+        let centroid_values = centroids
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+
+        let mut jitter_jen = array::jitter_centroids(centroids, 0.001);
+        let jittered = jitter_jen.generate(RowCount::from(100), &mut rng).unwrap();
+
+        let values = jittered
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+
+        for i in 0..100 {
+            let centroid = i % 4;
+            let centroid_x = centroid_values[centroid * 2];
+            let centroid_y = centroid_values[centroid * 2 + 1];
+            let value_x = values[i * 2];
+            let value_y = values[i * 2 + 1];
+
+            let l2_dist = ((value_x - centroid_x).powi(2) + (value_y - centroid_y).powi(2)).sqrt();
+            assert!(l2_dist < 0.001001);
+            assert!(l2_dist > 0.000999);
+        }
     }
 
     #[test]

@@ -4214,6 +4214,7 @@ dependencies = [
  "protobuf-src",
  "rand 0.8.5",
  "roaring",
+ "rstest",
  "snafu",
  "tempfile",
  "test-log",

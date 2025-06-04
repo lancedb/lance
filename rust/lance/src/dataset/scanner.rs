@@ -805,7 +805,8 @@ impl Scanner {
             k,
             lower_bound: None,
             upper_bound: None,
-            nprobes: 1,
+            minimum_nprobes: 20,
+            maximum_nprobes: None,
             ef: None,
             refine_factor: None,
             metric_type: MetricType::L2,
@@ -827,9 +828,50 @@ impl Scanner {
         self
     }
 
+    /// Configures how many partititions will be searched in the vector index.
+    ///
+    /// This method is a convenience method that sets both [Self::minimum_nprobes] and
+    /// [Self::maximum_nprobes] to the same value.
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.nprobes = n;
+            q.minimum_nprobes = n;
+            q.maximum_nprobes = Some(n);
+        } else {
+            log::warn!("nprobes is not set because nearest has not been called yet");
+        }
+        self
+    }
+
+    /// Configures the minimum number of partitions to search in the vector index.
+    ///
+    /// If we have found k matching results after searching this many partitions then
+    /// the search will stop.  Increasing this number can increase recall but will increase
+    /// latency on all queries.
+    pub fn minimum_nprobes(&mut self, n: usize) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.minimum_nprobes = n;
+        } else {
+            log::warn!("minimum_nprobes is not set because nearest has not been called yet");
+        }
+        self
+    }
+
+    /// Configures the maximum number of partitions to search in the vector index.
+    ///
+    /// These partitions will only be searched if we have not found `k` results after
+    /// searching the minimum number of partitions.  Setting this to None (the default)
+    /// will search all partitions if needed.
+    ///
+    /// This setting only takes effect when a prefilter is in place.  In that case we
+    /// can spend more effort to try and find results when the filter is highly selective.
+    ///
+    /// If there is no prefilter, or the results are not highly selective, this value will
+    /// have no effect.
+    pub fn maximum_nprobes(&mut self, n: usize) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.maximum_nprobes = Some(n);
+        } else {
+            log::warn!("maximum_nprobes is not set because nearest has not been called yet");
         }
         self
     }
@@ -4015,7 +4057,7 @@ mod test {
         let mut scan = dataset.scan();
         scan.filter("filterable > 5").unwrap();
         scan.nearest("vector", query_key.as_ref(), 1).unwrap();
-        scan.nprobs(100);
+        scan.minimum_nprobes(100);
         scan.with_row_id();
 
         let batches = scan
@@ -4316,7 +4358,7 @@ mod test {
             let key: Float32Array = (0..32).map(|_v| 1.0_f32).collect();
             scan.nearest("vec", &key, 5).unwrap();
             scan.refine(100);
-            scan.nprobs(100);
+            scan.minimum_nprobes(100);
 
             assert_eq!(
                 dataset.index_cache_entry_count(),
@@ -4352,7 +4394,7 @@ mod test {
             let mut scan = dataset.scan();
             scan.nearest("vec", &key, 5).unwrap();
             scan.refine(100);
-            scan.nprobs(100);
+            scan.minimum_nprobes(100);
 
             let results = scan
                 .try_into_stream()
@@ -4414,7 +4456,7 @@ mod test {
             let mut scan = dataset.scan();
             scan.nearest("vec", &key, 5).unwrap();
             scan.refine(100);
-            scan.nprobs(100);
+            scan.minimum_nprobes(100);
 
             let results = scan
                 .try_into_stream()
@@ -5588,7 +5630,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=42), expr=...
         ANNSubIndex: name=..., k=42, deltas=1
-          ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5605,7 +5647,7 @@ mod test {
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=40), expr=...
                   ANNSubIndex: name=..., k=40, deltas=1
-                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+                    ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5641,7 +5683,7 @@ mod test {
           CoalesceBatchesExec: target_batch_size=8192
             SortExec: TopK(fetch=17), expr=...
               ANNSubIndex: name=..., k=17, deltas=1
-                ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+                ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5659,7 +5701,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=17), expr=...
         ANNSubIndex: name=..., k=17, deltas=1
-          ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
           FilterExec: i@0 > 10
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
@@ -5688,7 +5730,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=6), expr=...
                       ANNSubIndex: name=..., k=6, deltas=1
-                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5716,7 +5758,7 @@ mod test {
                         CoalesceBatchesExec: target_batch_size=8192
                           SortExec: TopK(fetch=15), expr=...
                             ANNSubIndex: name=..., k=15, deltas=1
-                              ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+                              ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5749,7 +5791,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
                       ANNSubIndex: name=..., k=5, deltas=1
-                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
                         FilterExec: i@0 > 10
                           LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
@@ -5774,7 +5816,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
-          ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
           ScalarIndexQuery: query=[i > 10]@i_idx",
         )
         .await?;
@@ -5793,7 +5835,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
-          ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
           FilterExec: i@0 > 10
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
@@ -5827,7 +5869,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=8), expr=...
                       ANNSubIndex: name=..., k=8, deltas=1
-                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
                         ScalarIndexQuery: query=[i > 10]@i_idx",
         )
         .await?;
@@ -5860,7 +5902,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=11), expr=...
                       ANNSubIndex: name=..., k=11, deltas=1
-                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
                         ScalarIndexQuery: query=[i > 10]@i_idx",
         )
         .await?;
@@ -6138,7 +6180,7 @@ mod test {
             "ProjectionExec: expr=[_rowid@1 as _rowid, _distance@0 as _distance]
   SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
-      ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+      ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await
         .unwrap();
@@ -6154,7 +6196,7 @@ mod test {
             "ProjectionExec: expr=[_rowid@1 as _rowid, _distance@0 as _distance]
   SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
-      ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+      ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await
         .unwrap();
@@ -6182,7 +6224,7 @@ mod test {
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]...
                   ANNSubIndex: name=idx, k=34, deltas=1
-                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+                    ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await
         .unwrap();

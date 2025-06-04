@@ -193,12 +193,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let indices_after_compact = dataset.load_indices().await.unwrap();
-        let frag_reuse_index_meta = indices_after_compact
-            .iter()
-            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .expect("Fragment reuse index must exist");
-        let frag_reuse_details = load_frag_reuse_index_details(&dataset, frag_reuse_index_meta)
+        let Some(frag_reuse_index_meta) = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+        else {
+            panic!("Fragment reuse index must be available");
+        };
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
         assert_eq!(frag_reuse_details.versions.len(), 1);
@@ -220,12 +222,14 @@ mod tests {
 
         // Cleanup frag reuse index and check there is no reuse version
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-        let indices_after_cleanup = dataset.load_indices().await.unwrap();
-        let frag_reuse_index_meta = indices_after_cleanup
-            .iter()
-            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .expect("Fragment reuse index must exist");
-        let frag_reuse_details = load_frag_reuse_index_details(&dataset, frag_reuse_index_meta)
+        let Some(frag_reuse_index_meta) = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+        else {
+            panic!("Fragment reuse index must be available");
+        };
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
         assert_eq!(frag_reuse_details.versions.len(), 0);

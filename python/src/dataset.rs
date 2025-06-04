@@ -92,7 +92,7 @@ pub mod commit;
 pub mod optimize;
 pub mod stats;
 
-const DEFAULT_NPROBS: usize = 1;
+const DEFAULT_NPROBS: usize = 20;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 
@@ -746,15 +746,41 @@ impl Dataset {
                 10
             };
 
-            let nprobes: usize = if let Some(nprobes) = nearest.get_item("nprobes")? {
-                if nprobes.is_none() {
-                    DEFAULT_NPROBS
-                } else {
-                    nprobes.extract()?
+            let mut minimum_nprobes = DEFAULT_NPROBS;
+            let mut maximum_nprobes = None;
+
+            if let Some(nprobes) = nearest.get_item("nprobes")? {
+                if !nprobes.is_none() {
+                    minimum_nprobes = nprobes.extract()?;
+                    maximum_nprobes = Some(minimum_nprobes);
                 }
-            } else {
-                DEFAULT_NPROBS
-            };
+            }
+
+            if let Some(min_nprobes) = nearest.get_item("minimum_nprobes")? {
+                if !min_nprobes.is_none() {
+                    minimum_nprobes = min_nprobes.extract()?;
+                }
+            }
+
+            if let Some(max_nprobes) = nearest.get_item("maximum_nprobes")? {
+                if !max_nprobes.is_none() {
+                    maximum_nprobes = Some(max_nprobes.extract()?);
+                }
+            }
+
+            if minimum_nprobes > maximum_nprobes.unwrap_or(usize::MAX) {
+                return Err(PyValueError::new_err(
+                    "minimum_nprobes must be <= maximum_nprobes",
+                ));
+            }
+
+            if minimum_nprobes < 1 {
+                return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
+            }
+
+            if maximum_nprobes.unwrap_or(usize::MAX) < 1 {
+                return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
+            }
 
             let metric_type: Option<MetricType> =
                 if let Some(metric) = nearest.get_item("metric")? {
@@ -813,7 +839,10 @@ impl Dataset {
             };
             scanner
                 .map(|s| {
-                    let mut s = s.nprobs(nprobes);
+                    let mut s = s.minimum_nprobes(minimum_nprobes);
+                    if let Some(maximum_nprobes) = maximum_nprobes {
+                        s = s.maximum_nprobes(maximum_nprobes);
+                    }
                     if let Some(factor) = refine_factor {
                         s = s.refine(factor);
                     }

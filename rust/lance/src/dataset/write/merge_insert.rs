@@ -2713,4 +2713,94 @@ mod tests {
 
         check_indices(&dataset, &[], &[]).await;
     }
+
+    #[tokio::test]
+    async fn test_upsert_concurrent_full_frag() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1])),
+                Arc::new(UInt32Array::from(vec![0, 0])),
+            ],
+        )
+        .unwrap();
+
+        // Increase likelihood of contention by throttling the store
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: Duration::from_millis(5),
+                wait_get_per_call: Duration::from_millis(5),
+                wait_put_per_call: Duration::from_millis(5),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+
+        // Each merge insert will update one row. Combined, they should delete
+        // all rows in the first fragment, and it should be dropped.
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for i in 0..2 {
+            let new_data = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![i])),
+                    Arc::new(UInt32Array::from(vec![1])),
+                ],
+            )
+            .unwrap();
+            let source = Box::new(RecordBatchIterator::new([Ok(new_data)], schema.clone()));
+
+            let dataset_ref = Arc::new(dataset.clone());
+            let barrier = barrier.clone();
+            let handle = tokio::spawn(async move {
+                barrier.wait().await;
+                MergeInsertBuilder::try_new(dataset_ref, vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap()
+                    .execute_reader(source)
+                    .await
+                    .unwrap();
+            });
+            handles.push(handle);
+        }
+        try_join_all(handles).await.unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+        assert!(
+            dataset
+                .get_fragments()
+                .iter()
+                .all(|f| f.metadata().num_rows().unwrap() > 0),
+            "No fragments should have zero rows after upsert"
+        );
+
+        let batches = dataset.scan().try_into_batch().await.unwrap();
+        let values = batches["value"].as_primitive::<UInt32Type>();
+        assert!(
+            values.values().iter().all(|&v| v == 1),
+            "All values should be 1 after merge insert. Got: {:?}",
+            values
+        );
+    }
 }

@@ -147,22 +147,22 @@ pub enum Operation {
         /// The fragment reuse index to be created or updated to
         frag_reuse_index: Option<Index>,
     },
-    /// Replace data in a column in the dataset with a new data. This is used for
+    /// Replace data in a column in the dataset with new data. This is used for
     /// null column population where we replace an entirely null column with a
     /// new column that has data.
     ///
     /// This operation will only allow replacing files that contain the same schema
-    /// e.g. if the original files contains column A, B, C and the new files contains
-    /// only column A, B then the operation is not allowed. As we would need to split
+    /// e.g. if the original files contain columns A, B, C and the new files contain
+    /// only columns A, B then the operation is not allowed. As we would need to split
     /// the original files into two files, one with column A, B and the other with column C.
     ///
     /// Corollary to the above: the operation will also not allow replacing files unless the
     /// affected columns all have the same datafile layout across the fragments being replaced.
     ///
-    /// e.g. if fragments being replaced contains files with different schema layouts on
+    /// e.g. if fragments being replaced contain files with different schema layouts on
     /// the column being replaced, the operation is not allowed.
     /// say frag_1: [A] [B, C] and frag_2: [A, B] [C] and we are trying to replace column A
-    /// with a new column A the operation is not allowed.
+    /// with a new column A, the operation is not allowed.
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
     },

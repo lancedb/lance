@@ -409,7 +409,6 @@ pub(crate) async fn remap_vector_index(
     let old_index = dataset
         .open_vector_index(column, &old_uuid.to_string(), &NoOpMetricsCollector)
         .await?;
-    old_index.check_can_remap()?;
 
     if let Some(ivf_index) = old_index.as_any().downcast_ref::<IVFIndex>() {
         remap_index_file(
