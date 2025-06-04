@@ -457,6 +457,7 @@ impl Quantization for ProductQuantizer {
             Some(args) => args.codebook_position,
             None => Some(0),
         };
+
         let codebook_position = codebook_position.expect("codebook position should be set");
         ProductQuantizationMetadata {
             codebook_position,

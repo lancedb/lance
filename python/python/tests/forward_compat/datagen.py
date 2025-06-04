@@ -96,9 +96,7 @@ def write_large():
 
 def write_dataset_pq_buffer():
     # In https://github.com/lancedb/lance/pull/3829, we started storing the PQ
-    # codebook in a global buffer instead of the schema metadata as JSON. However,
-    # for forward compatibility, we still write out the codebook in the
-    # metadata as JSON.
+    # codebook in a global buffer instead of the schema metadata as JSON.
 
     ndims = 32
     nvecs = 512

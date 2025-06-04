@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import lance
+import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from lance.file import LanceFileReader
@@ -25,12 +26,15 @@ def test_scans():
 
 @pytest.mark.forward
 @pytest.mark.skipif(
-    Version(lance.__version__).release < (0, 25, 0),  # at least 0.25.0
-    reason="Lance 0.25.0 can read v3 indices",
+    Version(lance.__version__) < Version("0.29.0.beta2"),  # at least 0.29.0-beta.2
+    reason="Lance 0.29.0-beta.2 would ignore indices too new",
 )
 def test_pq_buffer():
+    # the index should be ignored
     ds = lance.dataset(get_path("pq_in_schema"))
-    q = pc.random(32).cast("float32")
+    assert ds.stats.index_stats("vec_idx") is None
+    # still able to query (brute force)
+    q = pc.random(32).cast(pa.float32())
     ds.to_table(
         nearest={
             "q": q,
