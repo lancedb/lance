@@ -1590,13 +1590,7 @@ impl Scanner {
         if let Some(refine_expr) = filter_plan.refine_expr {
             // We create a new planner specific to the node's schema, since
             // physical expressions reference column by index rather than by name.
-            let planner = Planner::new(plan.schema());
-            let physical_refine_expr = planner.create_physical_expr(&refine_expr)?;
-            plan = Arc::new(LanceFilterExec::try_new(
-                refine_expr.clone(),
-                physical_refine_expr,
-                plan,
-            )?);
+            plan = Arc::new(LanceFilterExec::try_new(refine_expr, plan)?);
         }
 
         // Stage 3: sort
@@ -2068,13 +2062,7 @@ impl Scanner {
 
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 // If there is a prefilter we need to manually apply it to the new data
-                let planner = Planner::new(scan_node.schema());
-                let physical_refine_expr = planner.create_physical_expr(expr)?;
-                scan_node = Arc::new(LanceFilterExec::try_new(
-                    expr.clone(),
-                    physical_refine_expr,
-                    scan_node,
-                )?);
+                scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
             }
 
             let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
@@ -2192,13 +2180,7 @@ impl Scanner {
                 )
             };
             if let Some(refine_expr) = &filter_plan.refine_expr {
-                let planner = Planner::new(plan.schema());
-                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
-                plan = Arc::new(LanceFilterExec::try_new(
-                    refine_expr.clone(),
-                    physical_refine_expr,
-                    plan,
-                )?);
+                plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
             }
             Ok(self.flat_knn(plan, q)?)
         }
@@ -2263,13 +2245,7 @@ impl Scanner {
 
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 // If there is a prefilter we need to manually apply it to the new data
-                let planner = Planner::new(scan_node.schema());
-                let physical_refine_expr = planner.create_physical_expr(expr)?;
-                scan_node = Arc::new(LanceFilterExec::try_new(
-                    expr.clone(),
-                    physical_refine_expr,
-                    scan_node,
-                )?);
+                scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
             }
             // first we do flat search on just the new data
             let topk_appended = self.flat_knn(scan_node, &q)?;
@@ -2442,12 +2418,7 @@ impl Scanner {
         if let Some(post_take_filter) = post_take_filter {
             let planner = Planner::new(plan.schema());
             let optimized_filter = planner.optimize_expr(post_take_filter)?;
-            let physical_refine_expr = planner.create_physical_expr(&optimized_filter)?;
-            plan = Arc::new(LanceFilterExec::try_new(
-                optimized_filter.clone(),
-                physical_refine_expr,
-                plan,
-            )?);
+            plan = Arc::new(LanceFilterExec::try_new(optimized_filter, plan)?);
         }
 
         if self.with_row_address {
@@ -2475,7 +2446,6 @@ impl Scanner {
             let scan_arrow_schema = Arc::new(scan_schema.as_ref().into());
             let planner = Planner::new(scan_arrow_schema);
             let optimized_filter = planner.optimize_expr(filter.clone())?;
-            let physical_refine_expr = planner.create_physical_expr(&optimized_filter)?;
 
             let new_data_scan = self.scan_fragments(
                 true,
@@ -2487,11 +2457,7 @@ impl Scanner {
                 None,
                 false,
             );
-            let filtered = Arc::new(LanceFilterExec::try_new(
-                optimized_filter.clone(),
-                physical_refine_expr,
-                new_data_scan,
-            )?);
+            let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, new_data_scan)?);
             Some(Arc::new(project(filtered, plan.schema().as_ref())?))
         } else {
             None
@@ -2655,11 +2621,7 @@ impl Scanner {
         };
 
         let knn_plan: Arc<dyn ExecutionPlan> = if let Some(filter_expr) = filter_expr {
-            Arc::new(LanceFilterExec::try_new(
-                filter_expr.0,
-                filter_expr.1,
-                flat_dist,
-            )?)
+            Arc::new(LanceFilterExec::try_new(filter_expr.0, flat_dist)?)
         } else {
             flat_dist
         };
@@ -2678,15 +2640,7 @@ impl Scanner {
         .with_fetch(Some(q.k));
 
         let logical_not_null = col(DIST_COL).is_not_null();
-        let physical_not_null = {
-            let df_schema = DFSchema::try_from(sort.schema())?;
-            create_physical_expr(&logical_not_null, &df_schema, &ExecutionProps::new())?
-        };
-        let not_nulls = Arc::new(LanceFilterExec::try_new(
-            logical_not_null,
-            physical_not_null,
-            Arc::new(sort),
-        )?);
+        let not_nulls = Arc::new(LanceFilterExec::try_new(logical_not_null, Arc::new(sort))?);
 
         Ok(not_nulls)
     }
@@ -2854,13 +2808,8 @@ impl Scanner {
                 let columns_in_filter = Planner::column_names_in_expr(refine_expr);
                 let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
                 let filter_input = self.scan(true, false, true, None, filter_schema);
-                let planner = Planner::new(filter_input.schema());
-                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
-                let filtered_row_ids = Arc::new(LanceFilterExec::try_new(
-                    refine_expr.clone(),
-                    physical_refine_expr,
-                    filter_input,
-                )?);
+                let filtered_row_ids =
+                    Arc::new(LanceFilterExec::try_new(refine_expr.clone(), filter_input)?);
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             }
             // No prefilter

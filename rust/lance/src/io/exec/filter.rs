@@ -4,12 +4,12 @@
 use std::sync::Arc;
 
 use datafusion::{execution::TaskContext, logical_expr::Expr};
-use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::{
     filter::FilterExec, metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan,
     PlanProperties, SendableRecordBatchStream, Statistics,
 };
 use lance_core::{error::DataFusionResult, Result};
+use lance_datafusion::planner::Planner;
 
 #[derive(Debug)]
 pub struct LanceFilterExec {
@@ -28,11 +28,9 @@ impl DisplayAs for LanceFilterExec {
 // possible for an optimization rule to serialize the filter to substrait and
 // send it to a remote worker.
 impl LanceFilterExec {
-    pub fn try_new(
-        expr: Expr,
-        predicate: Arc<dyn PhysicalExpr>,
-        input: Arc<dyn ExecutionPlan>,
-    ) -> Result<Self> {
+    pub fn try_new(expr: Expr, input: Arc<dyn ExecutionPlan>) -> Result<Self> {
+        let planner = Planner::new(input.schema());
+        let predicate = planner.create_physical_expr(&expr)?;
         let filter_exec = FilterExec::try_new(predicate.clone(), input)?;
         Ok(Self {
             expr,
