@@ -38,13 +38,6 @@ use super::{pb, PQ_CODE_COLUMN};
 pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
 
-pub static WRITE_CODEBOOK_IN_METADATA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    std::env::var("LANCE_WRITE_CODEBOOK_IN_METADATA")
-        .ok()
-        .and_then(|s| s.parse::<bool>().ok())
-        .unwrap_or(true)
-});
-
 #[derive(Debug, Clone)]
 pub struct ProductQuantizer {
     pub num_sub_vectors: usize,
@@ -465,23 +458,13 @@ impl Quantization for ProductQuantizer {
             None => Some(0),
         };
         let codebook_position = codebook_position.expect("codebook position should be set");
-        let codebook_tensor = match *WRITE_CODEBOOK_IN_METADATA {
-            true => {
-                // Written for backward compatibility
-                // TODO: remove this in the future
-                pb::Tensor::try_from(&self.codebook)
-                    .map(|t| t.encode_to_vec())
-                    .unwrap_or_default()
-            }
-            false => Vec::new(),
-        };
         ProductQuantizationMetadata {
             codebook_position,
             nbits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
             codebook: Some(self.codebook.clone()),
-            codebook_tensor,
+            codebook_tensor: Vec::new(),
             transposed: args.map(|args| args.transposed).unwrap_or_default(),
         }
     }
