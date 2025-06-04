@@ -12,6 +12,10 @@ use lance_core::{error::DataFusionResult, Result};
 use lance_datafusion::planner::Planner;
 
 #[derive(Debug)]
+// LanceFilterExec is a wrapper around FilterExec that includes the original
+// expression for the filter node. In comparison to a FilterExec, this makes it
+// possible for an optimization rule to serialize the filter to substrait and
+// send it to a remote worker.
 pub struct LanceFilterExec {
     expr: Expr,
     pub filter: Arc<FilterExec>,
@@ -23,10 +27,6 @@ impl DisplayAs for LanceFilterExec {
     }
 }
 
-// LanceFilterExec is a wrapper around FilterExec that includes the original
-// expression for the filter node. In comparison to a FilterExec, this makes it
-// possible for an optimization rule to serialize the filter to substrait and
-// send it to a remote worker.
 impl LanceFilterExec {
     pub fn try_new(expr: Expr, input: Arc<dyn ExecutionPlan>) -> Result<Self> {
         let planner = Planner::new(input.schema());
