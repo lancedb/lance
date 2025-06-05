@@ -43,8 +43,8 @@
 //!
 //! # Definition Levels
 //!
-//! Definition levels are simpler.  We can think of them as zipping together various validity (from
-//! different levels of nesting) into a single buffer.  For example, we could zip the arrays
+//! Definition levels are simpler.  We can think of them as zipping together various validity bitmaps
+//! (from different levels of nesting) into a single buffer.  For example, we could zip the arrays
 //! [1, 1, 0, 0] and [1, 0, 1, 0] into [11, 10, 01, 00].  However, 00 and 01 are redundant.  If the
 //! outer level is null then the validity of the inner levels is irrelevant.  To save space we instead
 //! encode a "level" which is the "depth" of the null.  Let's look at a more complete example:
@@ -69,7 +69,8 @@
 //! # Compression
 //!
 //! Note that we only need 2 bits of definition levels to represent 3 levels of nesting.  Definition
-//! levels are always more compact than the input validity arrays.
+//! levels are always more compact than the input validity arrays.  However, compressed levels are not
+//! necessarily more compact than the compressed validity arrays.
 //!
 //! Repetition levels are more complex.  If there are very large lists then a sparse array of offsets
 //! (which has one element per list) might be more compact than a dense array of repetition levels
@@ -79,6 +80,31 @@
 //!
 //! However, in Lance we don't always take advantage of that compression because we want to be able
 //! to zip rep-def levels together with our values.  This gives us fewer IOPS when accessing row values.
+//!
+//! # Utilities in this Module
+//!
+//! - `RepDefBuilder` - Extracts validity and offset information from Arrow arrays.  We use this as we
+//!   shred the incoming data into primitive leaf arrays.  We don't immediately convert into rep-def because
+//!   we need to share and cheaply clone the builder when we have structs (each struct child shares some parent
+//!   validity / offset information)  The `serialize` method is called once all data has been received to create
+//!   the final rep-def levels.
+//!
+//! - `SerializerContext` - This is an internal utility that helps with serializing rep-def levels.
+//!
+//! - `CompositeRepDefUnraveler` - This structure is used to reverse the process.  It starts with a set of
+//!   rep-def levels and then uses the `unravel_validity` and `unravel_offsets` methods to produce validity
+//!   buffers and offset buffers.  It is "composite" because we may be combining sets of rep-def buffers from
+//!   multiple locations (e.g. multiple blocks in a mini-block encoded file).
+//!
+//! - `RepDefSlicer` - This is a utility that helps with slicing rep-def buffers.  These buffers are "kind of"
+//!   transparent (maps 1:1 with the values in the array) but not exactly because of the special (empty/null) lists.
+//!   The slicer helps with this issue and is used when slicing a rep-def buffer into mini-blocks.
+//!
+//! - `build_control_word_iterator` - This takes in rep-def levels and returns an iterator that returns byte-padded
+//!   "control words" which are used when creating full-zip encoded data.
+//!
+//! - `ControlWordParser` - This parser can parse the control words returned by `build_control_word_iterator` and is
+//!   used when decoding full-zip encoded data.
 
 use std::{
     iter::{Copied, Zip},
@@ -94,19 +120,28 @@ use snafu::location;
 
 use crate::buffer::LanceBuffer;
 
-// We assume 16 bits is good enough for rep-def levels.  This gives us
-// 65536 levels of struct nesting and list nesting.
+// We assume 16 bits is good enough for rep-def levels.  This _would_ give
+// us 65536 levels of struct nesting and list nesting.  However, we cut that
+// in half for SPECIAL_THRESHOLD because we use the top bit to indicate if an
+// item is a special value (null list / empty list) during construction.
 pub type LevelBuffer = Vec<u16>;
+
+// As we build def levels we add this to special values to indicate that they
+// are special so that we can skip over them when processing lower levels.
+//
+// We subtract this off at the end of construction to get the actual definition
+// levels.
+const SPECIAL_THRESHOLD: u16 = u16::MAX / 2;
 
 /// Represents information that we extract from a list array as we are
 /// encoding
 #[derive(Clone, Debug)]
 struct OffsetDesc {
     offsets: Arc<[i64]>,
-    specials: Arc<[SpecialOffset]>,
     validity: Option<BooleanBuffer>,
     has_empty_lists: bool,
     num_values: usize,
+    num_specials: usize,
 }
 
 /// Represents validity information that we extract from non-list arrays (that
@@ -155,6 +190,46 @@ impl RawRepDef {
             Self::Fsl(FslDesc { num_values, .. }) => *num_values,
         }
     }
+
+    /// How many empty/null lists are in this layer
+    fn num_specials(&self) -> usize {
+        match self {
+            Self::Offsets(OffsetDesc { num_specials, .. }) => *num_specials,
+            _ => 0,
+        }
+    }
+
+    /// How many definition levels do we need for this layer
+    fn max_def(&self) -> u16 {
+        match self {
+            Self::Offsets(OffsetDesc {
+                has_empty_lists,
+                validity,
+                ..
+            }) => {
+                let mut max_def = 0;
+                if *has_empty_lists {
+                    max_def += 1;
+                }
+                if validity.is_some() {
+                    max_def += 1;
+                }
+                max_def
+            }
+            Self::Validity(ValidityDesc { validity: None, .. }) => 0,
+            Self::Validity(ValidityDesc { .. }) => 1,
+            Self::Fsl(FslDesc { validity: None, .. }) => 0,
+            Self::Fsl(FslDesc { .. }) => 1,
+        }
+    }
+
+    /// How many repetition levels do we need for this layer
+    fn max_rep(&self) -> u16 {
+        match self {
+            Self::Offsets(_) => 1,
+            _ => 0,
+        }
+    }
 }
 
 /// Represents repetition and definition levels that have been
@@ -169,11 +244,6 @@ pub struct SerializedRepDefs {
     ///
     /// If None, there are no nulls
     pub definition_levels: Option<Arc<[u16]>>,
-    /// Special records indicate empty / null lists
-    ///
-    /// These do not have any mapping to items.  There may be empty or there may
-    /// be more special records than items or anywhere in between.
-    pub special_records: Vec<SpecialRecord>,
     /// The meaning of each definition level
     pub def_meaning: Vec<DefinitionInterpretation>,
     /// The maximum level that is "visible" from the lowest level
@@ -189,7 +259,6 @@ impl SerializedRepDefs {
     pub fn new(
         repetition_levels: Option<LevelBuffer>,
         definition_levels: Option<LevelBuffer>,
-        special_records: Vec<SpecialRecord>,
         def_meaning: Vec<DefinitionInterpretation>,
     ) -> Self {
         let first_list = def_meaning.iter().position(|level| level.is_list());
@@ -203,7 +272,6 @@ impl SerializedRepDefs {
         Self {
             repetition_levels: repetition_levels.map(Arc::from),
             definition_levels: definition_levels.map(Arc::from),
-            special_records,
             def_meaning,
             max_visible_level,
         }
@@ -214,7 +282,6 @@ impl SerializedRepDefs {
         Self {
             repetition_levels: None,
             definition_levels: None,
-            special_records: Vec::new(),
             def_meaning,
             max_visible_level: None,
         }
@@ -230,110 +297,6 @@ impl SerializedRepDefs {
         self.definition_levels
             .as_ref()
             .map(|def| RepDefSlicer::new(self, def.clone()))
-    }
-
-    /// Creates a version of the SerializedRepDefs with the specials collapsed into
-    /// the repetition and definition levels
-    pub fn collapse_specials(self) -> Self {
-        if self.special_records.is_empty() {
-            return self;
-        }
-
-        // If we have specials then we must have repetition
-        let rep = self.repetition_levels.unwrap();
-
-        let new_len = rep.len() + self.special_records.len();
-
-        let mut new_rep = Vec::with_capacity(new_len);
-        let mut new_def = Vec::with_capacity(new_len);
-
-        // Now we just merge the rep/def levels and the specials into one list.  There is just
-        // one tricky part.  If a non-special is added after a special item then it swaps its
-        // repetition level with the special item.
-        if let Some(def) = self.definition_levels {
-            let mut def_itr = def.iter();
-            let mut rep_itr = rep.iter();
-            let mut special_itr = self.special_records.into_iter().peekable();
-            let mut last_special = None;
-
-            for idx in 0..new_len {
-                if let Some(special) = special_itr.peek() {
-                    if special.pos == idx {
-                        new_rep.push(special.rep_level);
-                        new_def.push(special.def_level);
-                        special_itr.next();
-                        last_special = Some(new_rep.last_mut().unwrap());
-                    } else {
-                        let rep = if let Some(last_special) = last_special {
-                            let rep = *last_special;
-                            *last_special = *rep_itr.next().unwrap();
-                            rep
-                        } else {
-                            *rep_itr.next().unwrap()
-                        };
-                        new_rep.push(rep);
-                        new_def.push(*def_itr.next().unwrap());
-                        last_special = None;
-                    }
-                } else {
-                    let rep = if let Some(last_special) = last_special {
-                        let rep = *last_special;
-                        *last_special = *rep_itr.next().unwrap();
-                        rep
-                    } else {
-                        *rep_itr.next().unwrap()
-                    };
-                    new_rep.push(rep);
-                    new_def.push(*def_itr.next().unwrap());
-                    last_special = None;
-                }
-            }
-        } else {
-            let mut rep_itr = rep.iter();
-            let mut special_itr = self.special_records.into_iter().peekable();
-            let mut last_special = None;
-
-            for idx in 0..new_len {
-                if let Some(special) = special_itr.peek() {
-                    if special.pos == idx {
-                        new_rep.push(special.rep_level);
-                        new_def.push(special.def_level);
-                        special_itr.next();
-                        last_special = Some(new_rep.last_mut().unwrap());
-                    } else {
-                        let rep = if let Some(last_special) = last_special {
-                            let rep = *last_special;
-                            *last_special = *rep_itr.next().unwrap();
-                            rep
-                        } else {
-                            *rep_itr.next().unwrap()
-                        };
-                        new_rep.push(rep);
-                        new_def.push(0);
-                        last_special = None;
-                    }
-                } else {
-                    let rep = if let Some(last_special) = last_special {
-                        let rep = *last_special;
-                        *last_special = *rep_itr.next().unwrap();
-                        rep
-                    } else {
-                        *rep_itr.next().unwrap()
-                    };
-                    new_rep.push(rep);
-                    new_def.push(0);
-                    last_special = None;
-                }
-            }
-        }
-
-        Self {
-            repetition_levels: Some(new_rep.into()),
-            definition_levels: Some(new_def.into()),
-            special_records: Vec::new(),
-            def_meaning: self.def_meaning,
-            max_visible_level: self.max_visible_level,
-        }
     }
 }
 
@@ -420,31 +383,6 @@ impl<'a> RepDefSlicer<'a> {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct SpecialRecord {
-    /// The position of the special record in the items array
-    ///
-    /// Note that this is the position in the "expanded" items array (including the specials)
-    ///
-    /// For example, if we have five items [I0, I1, ..., I4] and two specials [S0(pos=3), S1(pos=6)] then
-    /// the combined array is [I0, I1, I2, S0, I3, I4, S1].
-    ///
-    /// Another tricky fact is that a special "swaps" the repetition level of the matching item when it is
-    /// being inserted into the combined list.  So, if items are [I0(rep=2), I1(rep=1), I2(rep=2), I3(rep=0)]
-    /// and a special is S0(pos=2, rep=1) then the combined list is
-    /// [I0(rep=2), I1(rep=1), S0(rep=2), I2(rep=1), I3(rep=0)].
-    ///
-    /// Or, to put it in practice we start with [[I0], [I1]], [[I2, I3]] and after inserting our special
-    /// we have [[I0], [I1]], [S0, [I2, I3]]
-    pos: usize,
-    /// The definition level of the special record.  This is never 0 and is used to distinguish between an
-    /// empty list and a null list.
-    def_level: u16,
-    /// The repetition level of the special record.  This is never 0 and is used to indicate which level of
-    /// nesting the special record is at.
-    rep_level: u16,
-}
-
 /// This tells us how an array handles definition.  Given a stack of
 /// these and a nested array and a set of definition levels we can calculate
 /// how we should interpret the definition levels.
@@ -502,96 +440,76 @@ impl DefinitionInterpretation {
 
 /// The RepDefBuilder is used to collect offsets & validity buffers
 /// from arrow structures.  Once we have those we use the SerializerContext
-/// to build the actual repetition and definition levels by walking through
-/// the arrow constructs in reverse order.
+/// to build the actual repetition and definition levels.
 ///
-/// The algorithm for definition levels is as follows:
+/// We know ahead of time how many rep/def levels we will need (number of items
+/// in inner-most array + the number of empty/null lists in any parent arrays).
 ///
-/// Given:
-///  - a validity buffer of [T, F, F, T, T]
-///  - a current def level of 5
-///  - a current definitions of [0, 1, 3, 3, 0]
-///
-/// We walk through the definitions and replace them with
-///   the current level whenever a value is invalid.  Thus
-///   our output is: [0, 5, 5, 3, 0]
-///
-/// The algorithm for repetition levels is more complex.
-///
-/// The first time we see an offsets buffer we initialize the
-/// rep levels to have a value of 1 whenever a list starts and 0
-/// otherwise.
-///
-/// So, given offsets of [0, 3, 5] and no repetition we create
-/// rep levels [1 0 0 1 0]
-///
-/// However, we also record the offsets into our current rep and
-/// def levels and all operations happen in context of those offsets.
-///
-/// For example, continuing the above scenario we might then see validity
-/// of [T, F].  This is strange since our validity bitmap has 2 items but
-/// we would have 5 definition levels.  We can use our current offsets
-/// ([0, 3, 5]) to expand [T, F] into [T, T, T, F, F].
+/// As a result we try and avoid any re-allocations by pre-allocating the buffers
+/// up front.  We allocate two copies of each buffer which allows us to avoid unsafe
+/// code caused by reading and writing to the same buffer (also, it's unavoidable
+/// because there are times we need to write 'faster' than we read)
+#[derive(Debug)]
 struct SerializerContext {
-    last_offsets: Option<Vec<usize>>,
-    last_offsets_full: Option<Vec<usize>>,
-    specials: Vec<SpecialRecord>,
+    // This is built from outer-to-inner and then reversed at the end
     def_meaning: Vec<DefinitionInterpretation>,
     rep_levels: LevelBuffer,
+    spare_rep: LevelBuffer,
     def_levels: LevelBuffer,
+    spare_def: LevelBuffer,
     current_rep: u16,
     current_def: u16,
-    // FSL layers multiply the preceding def / rep levels by the dimension
-    current_multiplier: usize,
-    has_nulls: bool,
+    current_len: usize,
+    current_num_specials: usize,
 }
 
 impl SerializerContext {
-    fn new(len: usize, has_nulls: bool, has_offsets: bool, num_layers: usize) -> Self {
+    fn new(len: usize, num_layers: usize, max_rep: u16, max_def: u16) -> Self {
         let def_meaning = Vec::with_capacity(num_layers);
         Self {
-            last_offsets: None,
-            last_offsets_full: None,
-            rep_levels: if has_offsets {
+            rep_levels: if max_rep > 0 {
                 vec![0; len]
             } else {
                 LevelBuffer::default()
             },
-            def_levels: if has_nulls {
+            spare_rep: if max_rep > 0 {
+                vec![0; len]
+            } else {
+                LevelBuffer::default()
+            },
+            def_levels: if max_def > 0 {
+                vec![0; len]
+            } else {
+                LevelBuffer::default()
+            },
+            spare_def: if max_def > 0 {
                 vec![0; len]
             } else {
                 LevelBuffer::default()
             },
             def_meaning,
-            current_rep: 1,
-            current_def: 1,
-            current_multiplier: 1,
-            has_nulls: false,
-            specials: Vec::default(),
+            current_rep: max_rep,
+            current_def: max_def,
+            current_len: 0,
+            current_num_specials: 0,
         }
     }
 
     fn checkout_def(&mut self, meaning: DefinitionInterpretation) -> u16 {
         let def = self.current_def;
-        self.current_def += meaning.num_def_levels();
+        self.current_def -= meaning.num_def_levels();
         self.def_meaning.push(meaning);
         def
     }
 
     fn record_offsets(&mut self, offset_desc: &OffsetDesc) {
-        if self.current_multiplier != 1 {
-            // If we need this it isn't too terrible.  We just need to multiply all of the offsets in offset_desc by
-            // the current multiplier before we do anything with them.  Not adding at the moment simply to avoid the
-            // burden of testing
-            todo!("List<...FSL<...>> not yet supported");
-        }
         let rep_level = self.current_rep;
         let (null_list_level, empty_list_level) =
             match (offset_desc.validity.is_some(), offset_desc.has_empty_lists) {
                 (true, true) => {
                     let level =
                         self.checkout_def(DefinitionInterpretation::NullableAndEmptyableList);
-                    (level, level + 1)
+                    (level - 1, level)
                 }
                 (true, false) => (self.checkout_def(DefinitionInterpretation::NullableList), 0),
                 (false, true) => (
@@ -603,146 +521,198 @@ impl SerializerContext {
                     (0, 0)
                 }
             };
-        self.current_rep += 1;
-        if let Some(last_offsets) = &self.last_offsets {
-            let last_offsets_full = self.last_offsets_full.as_ref().unwrap();
-            let mut new_last_off = Vec::with_capacity(offset_desc.offsets.len());
-            let mut new_last_off_full = Vec::with_capacity(offset_desc.offsets.len());
-            let mut empties_seen = 0;
-            for off in offset_desc.offsets.windows(2) {
-                let offset_ctx = last_offsets[off[0] as usize];
-                let offset_ctx_end = last_offsets[off[1] as usize];
-                new_last_off.push(offset_ctx);
-                new_last_off_full.push(last_offsets_full[off[0] as usize] + empties_seen);
-                if off[0] == off[1] {
-                    // This list has an empty/null
-                    empties_seen += 1;
-                } else if offset_ctx == offset_ctx_end {
-                    // Inner list is empty/null
-                    // We previously added a special record but now we need to upgrade its repetition
-                    // level to the current level
-                    let matching_special_idx = self
-                        .specials
-                        .binary_search_by_key(&offset_ctx, |spec| spec.pos)
-                        .unwrap();
-                    self.specials[matching_special_idx].rep_level = rep_level;
-                } else {
-                    self.rep_levels[offset_ctx] = rep_level;
-                }
-            }
-            new_last_off.push(last_offsets[*offset_desc.offsets.last().unwrap() as usize]);
-            new_last_off_full.push(
-                last_offsets_full[*offset_desc.offsets.last().unwrap() as usize] + empties_seen,
-            );
-            self.last_offsets = Some(new_last_off);
-            self.last_offsets_full = Some(new_last_off_full);
-        } else {
-            let mut new_last_off = Vec::with_capacity(offset_desc.offsets.len());
-            let mut new_last_off_full = Vec::with_capacity(offset_desc.offsets.len());
-            let mut empties_seen = 0;
-            for off in offset_desc.offsets.windows(2) {
-                new_last_off.push(off[0] as usize);
-                new_last_off_full.push(off[0] as usize + empties_seen);
-                if off[0] == off[1] {
-                    empties_seen += 1;
-                } else {
-                    self.rep_levels[off[0] as usize] = rep_level;
-                }
-            }
-            new_last_off.push(*offset_desc.offsets.last().unwrap() as usize);
-            new_last_off_full.push(*offset_desc.offsets.last().unwrap() as usize + empties_seen);
-            self.last_offsets = Some(new_last_off);
-            self.last_offsets_full = Some(new_last_off_full);
+        self.current_rep -= 1;
+
+        if let Some(validity) = &offset_desc.validity {
+            self.do_record_validity(validity, null_list_level);
         }
 
-        // Must update specials _after_ setting last_offsets_full
-        let last_offsets_full = self.last_offsets_full.as_ref().unwrap();
-        let num_combined_specials = self.specials.len() + offset_desc.specials.len();
-        let mut new_specials = Vec::with_capacity(num_combined_specials);
-        let mut new_inserted = 0;
-        let mut old_specials_itr = self.specials.iter().peekable();
-        let mut specials_itr = offset_desc.specials.iter().peekable();
-        for _ in 0..num_combined_specials {
-            if let Some(old_special) = old_specials_itr.peek() {
-                let old_special_pos = old_special.pos + new_inserted;
-                if let Some(new_special) = specials_itr.peek() {
-                    let new_special_pos = last_offsets_full[new_special.pos()];
-                    if old_special_pos < new_special_pos {
-                        let mut old_special = *old_specials_itr.next().unwrap();
-                        old_special.pos = old_special_pos;
-                        new_specials.push(old_special);
-                    } else {
-                        let new_special = specials_itr.next().unwrap();
-                        new_specials.push(SpecialRecord {
-                            pos: new_special_pos,
-                            def_level: if matches!(new_special, SpecialOffset::EmptyList(_)) {
-                                empty_list_level
-                            } else {
-                                null_list_level
-                            },
-                            rep_level,
-                        });
-                        new_inserted += 1;
-                    }
-                } else {
-                    let mut old_special = *old_specials_itr.next().unwrap();
-                    old_special.pos = old_special_pos;
-                    new_specials.push(old_special);
+        // We write into the spare buffers and read from the active buffers
+        // and then swap at the end.  This way we don't write over what we
+        // are reading.
+
+        let mut new_len = 0;
+        assert!(self.rep_levels.len() >= offset_desc.num_values - 1 + self.current_num_specials);
+        if self.def_levels.is_empty() {
+            let mut write_itr = self.spare_rep.iter_mut();
+            let mut read_iter = self.rep_levels.iter().copied();
+            for w in offset_desc.offsets.windows(2) {
+                let len = w[1] - w[0];
+                // len can't be 0 because then we'd have def levels
+                assert!(len > 0);
+                let rep = read_iter.next().unwrap();
+                let list_level = if rep == 0 { rep_level } else { rep };
+                *write_itr.next().unwrap() = list_level;
+
+                for _ in 1..len {
+                    *write_itr.next().unwrap() = 0;
                 }
-            } else {
-                let new_special = specials_itr.next().unwrap();
-                new_specials.push(SpecialRecord {
-                    pos: last_offsets_full[new_special.pos()],
-                    def_level: if matches!(new_special, SpecialOffset::EmptyList(_)) {
-                        empty_list_level
-                    } else {
-                        null_list_level
-                    },
-                    rep_level,
-                });
-                new_inserted += 1;
+                new_len += len as usize;
             }
+            std::mem::swap(&mut self.rep_levels, &mut self.spare_rep);
+        } else {
+            assert!(
+                self.def_levels.len() >= offset_desc.num_values - 1 + self.current_num_specials
+            );
+            let mut def_write_itr = self.spare_def.iter_mut();
+            let mut rep_write_itr = self.spare_rep.iter_mut();
+            let mut rep_read_itr = self.rep_levels.iter().copied();
+            let mut def_read_itr = self.def_levels.iter().copied();
+            let specials_to_pass = self.current_num_specials;
+            let mut specials_passed = 0;
+
+            for w in offset_desc.offsets.windows(2) {
+                let mut def = def_read_itr.next().unwrap();
+                // Copy over any higher-level special values in place
+                while def > SPECIAL_THRESHOLD {
+                    *def_write_itr.next().unwrap() = def;
+                    *rep_write_itr.next().unwrap() = rep_read_itr.next().unwrap();
+                    def = def_read_itr.next().unwrap();
+                    new_len += 1;
+                    specials_passed += 1;
+                }
+
+                let len = w[1] - w[0];
+                let rep = rep_read_itr.next().unwrap();
+
+                // If the rep_level is 0 then we are the first list level
+                // otherwise we are starting a higher level list so keep
+                // existing rep level
+                let list_level = if rep == 0 { rep_level } else { rep };
+
+                if def == 0 && len > 0 {
+                    // New valid list, write a rep level and then add new 0/0 items
+                    *def_write_itr.next().unwrap() = 0;
+                    *rep_write_itr.next().unwrap() = list_level;
+
+                    for _ in 1..len {
+                        *def_write_itr.next().unwrap() = 0;
+                        *rep_write_itr.next().unwrap() = 0;
+                    }
+
+                    new_len += len as usize;
+                } else if def == 0 {
+                    // Empty list, insert new special
+                    *def_write_itr.next().unwrap() = empty_list_level + SPECIAL_THRESHOLD;
+                    *rep_write_itr.next().unwrap() = list_level;
+                    new_len += 1;
+                } else {
+                    // Either the list is null or one of its struct parents
+                    // is null.  Promote it to a special value.
+                    *def_write_itr.next().unwrap() = def + SPECIAL_THRESHOLD;
+                    *rep_write_itr.next().unwrap() = list_level;
+                    new_len += 1;
+                }
+            }
+
+            // If we have any special values at the end, we need to copy them over
+            while specials_passed < specials_to_pass {
+                *def_write_itr.next().unwrap() = def_read_itr.next().unwrap();
+                *rep_write_itr.next().unwrap() = rep_read_itr.next().unwrap();
+                new_len += 1;
+                specials_passed += 1;
+            }
+            std::mem::swap(&mut self.def_levels, &mut self.spare_def);
+            std::mem::swap(&mut self.rep_levels, &mut self.spare_rep);
         }
-        self.specials = new_specials;
+
+        self.current_len = new_len;
+        self.current_num_specials += offset_desc.num_specials;
     }
 
     fn do_record_validity(&mut self, validity: &BooleanBuffer, null_level: u16) {
-        self.has_nulls = true;
-        assert!(!self.def_levels.is_empty());
-        if let Some(last_offsets) = &self.last_offsets {
-            last_offsets
-                .windows(2)
-                .zip(validity.iter())
-                .for_each(|(w, valid)| {
-                    let start = w[0] * self.current_multiplier;
-                    let end = w[1] * self.current_multiplier;
-                    if !valid {
-                        self.def_levels[start..end].fill(null_level);
-                    }
-                });
-        } else if self.current_multiplier == 1 {
-            self.def_levels
-                .iter_mut()
-                .zip(validity.iter())
-                .for_each(|(def, valid)| {
-                    if !valid {
-                        *def = null_level;
-                    }
-                });
-        } else {
-            self.def_levels
-                .iter_mut()
-                .zip(
-                    validity
-                        .iter()
-                        .flat_map(|v| std::iter::repeat_n(v, self.current_multiplier)),
-                )
-                .for_each(|(def, valid)| {
-                    if !valid {
-                        *def = null_level;
-                    }
-                });
+        assert!(self.def_levels.len() >= validity.len() + self.current_num_specials);
+        debug_assert!(
+            self.current_len == 0 || self.current_len == validity.len() + self.current_num_specials
+        );
+        self.current_len = validity.len();
+
+        let mut def_read_itr = self.def_levels.iter().copied();
+        let mut def_write_itr = self.spare_def.iter_mut();
+
+        let specials_to_pass = self.current_num_specials;
+        let mut specials_passed = 0;
+
+        for incoming_validity in validity.iter() {
+            let mut def = def_read_itr.next().unwrap();
+            while def > SPECIAL_THRESHOLD {
+                *def_write_itr.next().unwrap() = def;
+                def = def_read_itr.next().unwrap();
+                specials_passed += 1;
+            }
+            if def == 0 && !incoming_validity {
+                *def_write_itr.next().unwrap() = null_level;
+            } else {
+                *def_write_itr.next().unwrap() = def;
+            }
         }
+
+        while specials_passed < specials_to_pass {
+            *def_write_itr.next().unwrap() = def_read_itr.next().unwrap();
+            specials_passed += 1;
+        }
+
+        std::mem::swap(&mut self.def_levels, &mut self.spare_def);
+    }
+
+    fn multiply_levels(&mut self, multiplier: usize) {
+        let old_len = self.current_len;
+        // All non-special values will be broadcasted by the multiplier.  Special values are copied as-is.
+        self.current_len =
+            (self.current_len - self.current_num_specials) * multiplier + self.current_num_specials;
+
+        if self.rep_levels.is_empty() && self.def_levels.is_empty() {
+            // All valid with no rep/def levels, nothing to do
+            return;
+        } else if self.rep_levels.is_empty() {
+            assert!(self.def_levels.len() >= self.current_len);
+            // No rep levels, just multiply the def levels
+            let mut def_read_itr = self.def_levels.iter().copied();
+            let mut def_write_itr = self.spare_def.iter_mut();
+            for _ in 0..old_len {
+                let mut def = def_read_itr.next().unwrap();
+                while def > SPECIAL_THRESHOLD {
+                    *def_write_itr.next().unwrap() = def;
+                    def = def_read_itr.next().unwrap();
+                }
+                for _ in 0..multiplier {
+                    *def_write_itr.next().unwrap() = def;
+                }
+            }
+        } else if self.def_levels.is_empty() {
+            assert!(self.rep_levels.len() >= self.current_len);
+            // No def levels, just multiply the rep levels
+            let mut rep_read_itr = self.rep_levels.iter().copied();
+            let mut rep_write_itr = self.spare_rep.iter_mut();
+            for _ in 0..old_len {
+                let rep = rep_read_itr.next().unwrap();
+                for _ in 0..multiplier {
+                    *rep_write_itr.next().unwrap() = rep;
+                }
+            }
+        } else {
+            assert!(self.rep_levels.len() >= self.current_len);
+            assert!(self.def_levels.len() >= self.current_len);
+            let mut rep_read_itr = self.rep_levels.iter().copied();
+            let mut def_read_itr = self.def_levels.iter().copied();
+            let mut rep_write_itr = self.spare_rep.iter_mut();
+            let mut def_write_itr = self.spare_def.iter_mut();
+            for _ in 0..old_len {
+                let mut def = def_read_itr.next().unwrap();
+                while def > SPECIAL_THRESHOLD {
+                    *def_write_itr.next().unwrap() = def;
+                    *rep_write_itr.next().unwrap() = rep_read_itr.next().unwrap();
+                    def = def_read_itr.next().unwrap();
+                }
+                let rep = rep_read_itr.next().unwrap();
+                for _ in 0..multiplier {
+                    *def_write_itr.next().unwrap() = def;
+                    *rep_write_itr.next().unwrap() = rep;
+                }
+            }
+        }
+        std::mem::swap(&mut self.def_levels, &mut self.spare_def);
+        std::mem::swap(&mut self.rep_levels, &mut self.spare_rep);
     }
 
     fn record_validity_buf(&mut self, validity: &Option<BooleanBuffer>) {
@@ -759,44 +729,40 @@ impl SerializerContext {
     }
 
     fn record_fsl(&mut self, fsl_desc: &FslDesc) {
-        self.current_multiplier *= fsl_desc.dimension;
         self.record_validity_buf(&fsl_desc.validity);
+        self.multiply_levels(fsl_desc.dimension);
     }
 
-    fn build(self) -> SerializedRepDefs {
-        let definition_levels = if self.has_nulls {
-            Some(self.def_levels)
-        } else {
-            None
-        };
-        let repetition_levels = if self.current_rep > 1 {
-            Some(self.rep_levels)
-        } else {
-            None
-        };
-        SerializedRepDefs::new(
-            repetition_levels,
-            definition_levels,
-            self.specials,
-            self.def_meaning,
-        )
-    }
-}
-
-/// As we are encoding we record information about "specials" which are
-/// empty lists or null lists.
-#[derive(Debug, Copy, Clone)]
-enum SpecialOffset {
-    NullList(usize),
-    EmptyList(usize),
-}
-
-impl SpecialOffset {
-    fn pos(&self) -> usize {
-        match self {
-            Self::NullList(pos) => *pos,
-            Self::EmptyList(pos) => *pos,
+    fn normalize_specials(&mut self) {
+        for def in self.def_levels.iter_mut() {
+            if *def > SPECIAL_THRESHOLD {
+                *def -= SPECIAL_THRESHOLD;
+            }
         }
+    }
+
+    fn build(mut self) -> SerializedRepDefs {
+        if self.current_len == 0 {
+            return SerializedRepDefs::new(None, None, self.def_meaning);
+        }
+
+        self.normalize_specials();
+
+        let definition_levels = if self.def_levels.is_empty() {
+            None
+        } else {
+            Some(self.def_levels)
+        };
+        let repetition_levels = if self.rep_levels.is_empty() {
+            None
+        } else {
+            Some(self.rep_levels)
+        };
+
+        // Need to reverse the def meaning since we build rep / def levels in reverse
+        let def_meaning = self.def_meaning.into_iter().rev().collect::<Vec<_>>();
+
+        SerializedRepDefs::new(repetition_levels, definition_levels, def_meaning)
     }
 }
 
@@ -821,8 +787,10 @@ impl RepDefBuilder {
     fn check_validity_len(&mut self, incoming_len: usize) {
         if let Some(len) = self.len {
             assert_eq!(incoming_len, len);
+        } else {
+            // First validity buffer we've seen
+            self.len = Some(incoming_len);
         }
-        self.len = Some(incoming_len);
     }
 
     fn num_layers(&self) -> usize {
@@ -917,26 +885,26 @@ impl RepDefBuilder {
         validity: Option<NullBuffer>,
     ) -> bool {
         let mut has_garbage_values = false;
+        let mut num_specials = 0;
         if O::IS_LARGE {
             let inner = offsets.into_inner();
             let len = inner.len();
             let i64_buff = ScalarBuffer::<i64>::new(inner.into_inner(), 0, len);
             let mut normalized = Vec::with_capacity(len);
             normalized.push(0_i64);
-            let mut specials = Vec::new();
             let mut has_empty_lists = false;
             let mut last_off = 0;
             if let Some(validity) = validity.as_ref() {
-                for (idx, (off, valid)) in i64_buff.windows(2).zip(validity.iter()).enumerate() {
+                for (off, valid) in i64_buff.windows(2).zip(validity.iter()) {
                     let len: i64 = off[1] - off[0];
                     match (valid, len == 0) {
                         (false, is_empty) => {
-                            specials.push(SpecialOffset::NullList(idx));
+                            num_specials += 1;
                             has_garbage_values |= !is_empty;
                         }
                         (true, true) => {
+                            num_specials += 1;
                             has_empty_lists = true;
-                            specials.push(SpecialOffset::EmptyList(idx));
                         }
                         _ => {
                             last_off += len;
@@ -945,11 +913,11 @@ impl RepDefBuilder {
                     normalized.push(last_off);
                 }
             } else {
-                for (idx, off) in i64_buff.windows(2).enumerate() {
+                for off in i64_buff.windows(2) {
                     let len: i64 = off[1] - off[0];
                     if len == 0 {
+                        num_specials += 1;
                         has_empty_lists = true;
-                        specials.push(SpecialOffset::EmptyList(idx));
                     }
                     last_off += len;
                     normalized.push(last_off);
@@ -961,7 +929,7 @@ impl RepDefBuilder {
                 offsets: normalized.into(),
                 validity: validity.map(|v| v.into_inner()),
                 has_empty_lists,
-                specials: specials.into(),
+                num_specials,
             }));
             has_garbage_values
         } else {
@@ -971,19 +939,19 @@ impl RepDefBuilder {
             let mut casted = Vec::with_capacity(len);
             casted.push(0);
             let mut has_empty_lists = false;
-            let mut specials = Vec::new();
+            let mut num_specials = 0;
             let mut last_off: i64 = 0;
             if let Some(validity) = validity.as_ref() {
-                for (idx, (off, valid)) in scalar_off.windows(2).zip(validity.iter()).enumerate() {
+                for (off, valid) in scalar_off.windows(2).zip(validity.iter()) {
                     let len = (off[1] - off[0]) as i64;
                     match (valid, len == 0) {
                         (false, is_empty) => {
-                            specials.push(SpecialOffset::NullList(idx));
+                            num_specials += 1;
                             has_garbage_values |= !is_empty;
                         }
                         (true, true) => {
+                            num_specials += 1;
                             has_empty_lists = true;
-                            specials.push(SpecialOffset::EmptyList(idx));
                         }
                         _ => {
                             last_off += len;
@@ -992,11 +960,11 @@ impl RepDefBuilder {
                     casted.push(last_off);
                 }
             } else {
-                for (idx, off) in scalar_off.windows(2).enumerate() {
+                for off in scalar_off.windows(2) {
                     let len = (off[1] - off[0]) as i64;
                     if len == 0 {
+                        num_specials += 1;
                         has_empty_lists = true;
-                        specials.push(SpecialOffset::EmptyList(idx));
                     }
                     last_off += len;
                     casted.push(last_off);
@@ -1008,7 +976,7 @@ impl RepDefBuilder {
                 offsets: casted.into(),
                 validity: validity.map(|v| v.into_inner()),
                 has_empty_lists,
-                specials: specials.into(),
+                num_specials,
             }));
             has_garbage_values
         }
@@ -1040,7 +1008,7 @@ impl RepDefBuilder {
         let mut collected = Vec::with_capacity(num_layers);
         let mut has_nulls = false;
         let mut layer_kind = LayerKind::Validity;
-        let mut num_specials = 0;
+        let mut total_num_specials = 0;
         let mut all_dimension = 0;
         let mut all_has_empty_lists = false;
         let mut all_num_values = 0;
@@ -1051,13 +1019,13 @@ impl RepDefBuilder {
                     layer_kind = LayerKind::Validity;
                 }
                 RawRepDef::Offsets(OffsetDesc {
-                    specials,
+                    num_specials,
                     has_empty_lists,
                     ..
                 }) => {
                     all_has_empty_lists |= *has_empty_lists;
                     layer_kind = LayerKind::Offsets;
-                    num_specials += specials.len();
+                    total_num_specials += num_specials;
                 }
                 RawRepDef::Fsl(FslDesc { dimension, .. }) => {
                     layer_kind = LayerKind::Fsl;
@@ -1101,7 +1069,6 @@ impl RepDefBuilder {
         } else {
             Vec::new()
         };
-        let mut all_specials = Vec::with_capacity(num_specials);
 
         for layer in collected {
             match layer {
@@ -1132,45 +1099,26 @@ impl RepDefBuilder {
                     offsets,
                     validity: Some(validity),
                     has_empty_lists,
-                    specials,
                     ..
                 }) => {
                     all_has_empty_lists |= has_empty_lists;
                     validity_builder.append_buffer(validity);
-                    let existing_lists = all_offsets.len() - 1;
                     let last = *all_offsets.last().unwrap();
                     all_offsets.extend(offsets.iter().skip(1).map(|off| *off + last));
-                    all_specials.extend(specials.iter().map(|s| match s {
-                        SpecialOffset::NullList(pos) => {
-                            SpecialOffset::NullList(*pos + existing_lists)
-                        }
-                        SpecialOffset::EmptyList(pos) => {
-                            SpecialOffset::EmptyList(*pos + existing_lists)
-                        }
-                    }));
                 }
                 RawRepDef::Offsets(OffsetDesc {
                     offsets,
                     validity: None,
                     has_empty_lists,
                     num_values,
-                    specials,
+                    ..
                 }) => {
                     all_has_empty_lists |= has_empty_lists;
                     if has_nulls {
                         validity_builder.append_n(*num_values, true);
                     }
                     let last = *all_offsets.last().unwrap();
-                    let existing_lists = all_offsets.len() - 1;
                     all_offsets.extend(offsets.iter().skip(1).map(|off| *off + last));
-                    all_specials.extend(specials.iter().map(|s| match s {
-                        SpecialOffset::NullList(pos) => {
-                            SpecialOffset::NullList(*pos + existing_lists)
-                        }
-                        SpecialOffset::EmptyList(pos) => {
-                            SpecialOffset::EmptyList(*pos + existing_lists)
-                        }
-                    }));
                 }
             }
         }
@@ -1194,7 +1142,7 @@ impl RepDefBuilder {
                 validity,
                 has_empty_lists: all_has_empty_lists,
                 num_values: all_num_values,
-                specials: all_specials.into(),
+                num_specials: total_num_specials,
             }),
         }
     }
@@ -1215,11 +1163,8 @@ impl RepDefBuilder {
                     .collect::<Vec<_>>(),
             );
         }
-        let has_nulls = builders.iter().any(|b| b.has_nulls());
-        let has_offsets = builders.iter().any(|b| b.has_offsets());
-        let total_len = builders.iter().map(|b| b.len.unwrap()).sum();
+
         let num_layers = builders[0].num_layers();
-        let mut context = SerializerContext::new(total_len, has_nulls, has_offsets, num_layers);
         let combined_layers = (0..num_layers)
             .map(|layer_index| {
                 Self::concat_layers(
@@ -1231,7 +1176,17 @@ impl RepDefBuilder {
         debug_assert!(builders
             .iter()
             .all(|b| b.num_layers() == builders[0].num_layers()));
-        for layer in combined_layers.into_iter().rev() {
+
+        let total_len = combined_layers.last().unwrap().num_values()
+            + combined_layers
+                .iter()
+                .map(|l| l.num_specials())
+                .sum::<usize>();
+        let max_rep = combined_layers.iter().map(|l| l.max_rep()).sum::<u16>();
+        let max_def = combined_layers.iter().map(|l| l.max_def()).sum::<u16>();
+
+        let mut context = SerializerContext::new(total_len, num_layers, max_rep, max_def);
+        for layer in combined_layers.into_iter() {
             match layer {
                 RawRepDef::Validity(def) => {
                     context.record_validity(&def);
@@ -1244,7 +1199,7 @@ impl RepDefBuilder {
                 }
             }
         }
-        context.build().collapse_specials()
+        context.build()
     }
 }
 
@@ -1364,8 +1319,26 @@ impl RepDefUnraveler {
             DefinitionInterpretation::AllValidList => (0, 0),
             _ => unreachable!(),
         };
-        let max_level = null_level.max(empty_level);
         self.current_layer += 1;
+
+        // This is the highest def level that is still visible.  Once we hit a list then
+        // we stop looking because any null / empty list (or list masked by a higher level
+        // null) will not be visible
+        let mut max_level = null_level.max(empty_level);
+        // Anything higher than this (but less than max_level) is a null struct masking our
+        // list.  We will materialize this is a null list.
+        let upper_null = max_level;
+        for level in self.def_meaning[self.current_layer..].iter() {
+            match level {
+                DefinitionInterpretation::NullableItem => {
+                    max_level += 1;
+                }
+                DefinitionInterpretation::AllValidItem => {}
+                _ => {
+                    break;
+                }
+            }
+        }
 
         let mut curlen: usize = offsets.last().map(|o| o.as_usize()).unwrap_or(0);
 
@@ -1416,8 +1389,8 @@ impl RepDefUnraveler {
                             push_validity(true);
                         } else if def_val > max_level {
                             // This is not visible at this rep level, do not add to offsets, but keep in repdef
-                        } else if def_val == null_level {
-                            // This is a null list
+                        } else if def_val == null_level || def_val > upper_null {
+                            // This is a null list (or a list masked by a null struct)
                             offsets.push(to_offset(curlen)?);
                             push_validity(false);
                         } else if def_val == empty_level {
@@ -2357,6 +2330,8 @@ mod tests {
         assert_eq!(vec![0, 0, 0, 3, 1, 1, 2, 1, 0, 0, 1], *def);
         assert_eq!(vec![2, 1, 0, 2, 2, 0, 1, 1, 0, 0, 0], *rep);
 
+        // [[I], [I, I]], NULL, [[NULL, NULL], NULL, [NULL, I, I, NULL]]
+
         let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
             Some(rep.as_ref().to_vec()),
             Some(def.as_ref().to_vec()),
@@ -2387,7 +2362,6 @@ mod tests {
 
             assert_eq!([1, 0, 1, 1, 0, 0], *rep);
             assert_eq!([0, 0, 2, 0, 1, 0], *def);
-            assert!(repdefs.special_records.is_empty());
             assert_eq!(
                 vec![DefinitionInterpretation::NullableItem, last_def,],
                 repdefs.def_meaning
@@ -2432,7 +2406,6 @@ mod tests {
 
         assert_eq!([1, 0, 1, 0, 0, 1], *rep);
         assert_eq!([0, 0, 0, 1, 0, 2], *def);
-        assert!(repdefs.special_records.is_empty());
         assert_eq!(
             vec![
                 DefinitionInterpretation::NullableItem,
@@ -2662,6 +2635,90 @@ mod tests {
     }
 
     #[test]
+    fn test_only_empty_lists() {
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(offsets_32(&[0, 4, 4, 4, 6]), None);
+        builder.add_no_null(6);
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
+
+        assert_eq!([1, 0, 0, 0, 1, 1, 1, 0], *rep);
+        assert_eq!([0, 0, 0, 0, 1, 1, 0, 0], *def);
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(rep.as_ref().to_vec()),
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+        )]);
+
+        assert_eq!(unraveler.unravel_validity(6), None);
+        let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
+        assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
+        assert_eq!(val, None);
+    }
+
+    #[test]
+    fn test_only_null_lists() {
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(
+            offsets_32(&[0, 4, 4, 4, 6]),
+            Some(validity(&[true, false, false, true])),
+        );
+        builder.add_no_null(6);
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
+
+        assert_eq!([1, 0, 0, 0, 1, 1, 1, 0], *rep);
+        assert_eq!([0, 0, 0, 0, 1, 1, 0, 0], *def);
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(rep.as_ref().to_vec()),
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+        )]);
+
+        assert_eq!(unraveler.unravel_validity(6), None);
+        let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
+        assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
+        assert_eq!(val, Some(validity(&[true, false, false, true])));
+    }
+
+    #[test]
+    fn test_null_and_empty_lists() {
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(
+            offsets_32(&[0, 4, 4, 4, 6]),
+            Some(validity(&[true, false, true, true])),
+        );
+        builder.add_no_null(6);
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
+
+        assert_eq!([1, 0, 0, 0, 1, 1, 1, 0], *rep);
+        assert_eq!([0, 0, 0, 0, 1, 2, 0, 0], *def);
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(rep.as_ref().to_vec()),
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+        )]);
+
+        assert_eq!(unraveler.unravel_validity(6), None);
+        let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
+        assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
+        assert_eq!(val, Some(validity(&[true, false, true, true])));
+    }
+
+    #[test]
     fn test_repdef_no_rep() {
         let mut builder = RepDefBuilder::default();
         builder.add_no_null(5);
@@ -2698,11 +2755,22 @@ mod tests {
             offsets_64(&[0, 2, 2, 5]),
             Some(validity(&[true, false, true])),
         );
+        builder.add_no_null(5);
         let repdef1 = RepDefBuilder::serialize(vec![builder]);
 
         let mut builder = RepDefBuilder::default();
         builder.add_offsets(offsets_64(&[0, 1, 3, 5, 7, 9]), None);
+        builder.add_no_null(9);
         let repdef2 = RepDefBuilder::serialize(vec![builder]);
+
+        let rep1 = repdef1.repetition_levels.clone().unwrap();
+        let def1 = repdef1.definition_levels.clone().unwrap();
+        let rep2 = repdef2.repetition_levels.clone().unwrap();
+        assert!(repdef2.definition_levels.is_none());
+
+        assert_eq!([1, 0, 1, 1, 0, 0], *rep1);
+        assert_eq!([0, 0, 1, 0, 0, 0], *def1);
+        assert_eq!([1, 1, 0, 1, 0, 1, 0, 1, 0], *rep2);
 
         let unravel1 = RepDefUnraveler::new(
             repdef1.repetition_levels.map(|l| l.to_vec()),
@@ -2717,6 +2785,7 @@ mod tests {
 
         let mut unraveler = CompositeRepDefUnraveler::new(vec![unravel1, unravel2]);
 
+        assert!(unraveler.unravel_validity(9).is_none());
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(
             off.inner(),
@@ -2966,4 +3035,72 @@ mod tests {
             vec![true; 11],
         );
     }
+
+    #[test]
+    fn regress_empty_list_case() {
+        // This regresses a case where we had 3 null lists inside a struct
+        let mut builder = RepDefBuilder::default();
+        builder.add_validity_bitmap(validity(&[true, false, true]));
+        builder.add_offsets(
+            offsets_32(&[0, 0, 0, 0]),
+            Some(validity(&[false, false, false])),
+        );
+        builder.add_no_null(0);
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
+
+        assert_eq!([1, 1, 1], *rep);
+        assert_eq!([1, 2, 1], *def);
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(rep.as_ref().to_vec()),
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+        )]);
+
+        assert_eq!(unraveler.unravel_validity(0), None);
+        let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
+        assert_eq!(off.inner(), offsets_32(&[0, 0, 0, 0]).inner());
+        assert_eq!(val, Some(validity(&[false, false, false])));
+        let val = unraveler.unravel_validity(3).unwrap();
+        assert_eq!(val.inner(), validity(&[true, false, true]).inner());
+    }
+
+    #[test]
+    fn regress_list_ends_null_case() {
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(
+            offsets_64(&[0, 1, 2, 2]),
+            Some(validity(&[true, true, false])),
+        );
+        builder.add_offsets(offsets_64(&[0, 1, 1]), Some(validity(&[true, false])));
+        builder.add_no_null(1);
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
+
+        assert_eq!([2, 2, 2], *rep);
+        assert_eq!([0, 1, 2], *def);
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(rep.as_ref().to_vec()),
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+        )]);
+
+        assert_eq!(unraveler.unravel_validity(1), None);
+        let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
+        assert_eq!(off.inner(), offsets_32(&[0, 1, 1]).inner());
+        assert_eq!(val, Some(validity(&[true, false])));
+        let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
+        assert_eq!(off.inner(), offsets_32(&[0, 1, 2, 2]).inner());
+        assert_eq!(val, Some(validity(&[true, true, false])));
+    }
 }
+
+// TO TEST:
+
+// - List array where the offsets don't start at 0
