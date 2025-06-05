@@ -93,8 +93,6 @@ pub mod optimize;
 pub mod stats;
 
 const DEFAULT_NPROBS: usize = 20;
-const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
-const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
@@ -316,7 +314,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None))]
     fn new(
         py: Python,
         uri: String,
@@ -327,17 +325,24 @@ impl Dataset {
         commit_handler: Option<PyObject>,
         storage_options: Option<HashMap<String, String>>,
         manifest: Option<&[u8]>,
+        metadata_cache_size_bytes: Option<usize>,
     ) -> PyResult<Self> {
-        let mut params = ReadParams {
-            index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
-            metadata_cache_size: metadata_cache_size.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
-            store_options: Some(ObjectStoreParams {
-                block_size,
+        let mut params = ReadParams::default();
+        if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
+            params.metadata_cache_size_bytes(metadata_cache_size_bytes);
+        } else if let Some(metadata_cache_size) = metadata_cache_size {
+            #[allow(deprecated)]
+            params.metadata_cache_size(metadata_cache_size);
+        }
+        if let Some(index_cache_size) = index_cache_size {
+            params.index_cache_size(index_cache_size);
+        }
+        if let Some(block_size) = block_size {
+            params.store_options = Some(ObjectStoreParams {
+                block_size: Some(block_size),
                 ..Default::default()
-            }),
-            ..Default::default()
+            });
         };
-
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);
             params.set_commit_lock(Arc::new(py_commit_lock));

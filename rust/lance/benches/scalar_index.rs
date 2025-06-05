@@ -12,7 +12,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
 use lance::{io::ObjectStore, Dataset};
-use lance_core::{cache::FileMetadataCache, Result};
+use lance_core::{cache::LanceCache, Result};
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{array, gen, BatchCount, RowCount};
 use lance_index::metrics::NoOpMetricsCollector;
@@ -71,7 +71,7 @@ impl BenchmarkFixture {
         Arc::new(LanceIndexStore::new(
             object_store,
             test_path,
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ))
     }
 
