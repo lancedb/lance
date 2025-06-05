@@ -82,7 +82,7 @@ impl LanceIndexStoreExt for LanceIndexStore {
         Self::new(
             dataset.object_store.clone(),
             index_dir,
-            dataset.session.file_metadata_cache.clone(),
+            dataset.metadata_cache.clone(),
         )
     }
 }
