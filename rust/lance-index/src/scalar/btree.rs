@@ -1383,7 +1383,7 @@ mod tests {
     use datafusion_physical_expr::{expressions::col, LexOrdering, PhysicalSortExpr};
     use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
-    use lance_core::{cache::FileMetadataCache, utils::mask::RowIdTreeMap};
+    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
@@ -1424,7 +1424,7 @@ mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
 
         // Generate 50,000 rows of random data with 80% nulls
@@ -1455,7 +1455,7 @@ mod tests {
         let remap_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(remap_dir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
 
         // Remap with a no-op mapping.  The remapped index should be identical to the original
@@ -1491,7 +1491,7 @@ mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
 
         let values = vec![
