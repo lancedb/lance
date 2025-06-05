@@ -126,11 +126,12 @@ pub async fn read_manifest_indexes(
         };
         let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
 
-        Ok(section
+        let indices = section
             .indices
             .into_iter()
             .map(Index::try_from)
-            .collect::<Result<Vec<_>>>()?)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(indices)
     } else {
         Ok(vec![])
     }

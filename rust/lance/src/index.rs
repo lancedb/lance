@@ -467,42 +467,49 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        if let Some(indices) = self
+        let indices = match self
             .session
             .index_cache
             .get_metadata(self.base.as_ref(), self.version().version)
         {
-            return Ok(indices);
-        }
+            Some(indices) => indices,
+            None => {
+                let loaded_indices = read_manifest_indexes(
+                    &self.object_store,
+                    &self.manifest_location,
+                    &self.manifest,
+                )
+                .await?;
+                let loaded_indices = Arc::new(loaded_indices);
+                self.session.index_cache.insert_metadata(
+                    self.base.as_ref(),
+                    self.version().version,
+                    loaded_indices.clone(),
+                );
+                loaded_indices
+            }
+        };
 
-        let loaded_indices: Vec<IndexMetadata> =
-            read_manifest_indexes(&self.object_store, &self.manifest_location, &self.manifest)
-                .await?
-                .into_iter()
-                .filter(|idx| {
-                    let max_valid_version = infer_index_type(idx)
-                        .map(|t| t.version())
-                        .unwrap_or_default();
-                    let is_valid = idx.index_version <= max_valid_version;
-                    if !is_valid {
-                        log::warn!(
-                            "Index {} has version {}, which is not supported (<={}), ignoring it",
-                            idx.name,
-                            idx.index_version,
-                            max_valid_version,
-                        );
-                    }
-                    is_valid
-                })
-                .collect();
-        let loaded_indices = Arc::new(loaded_indices);
-
-        self.session.index_cache.insert_metadata(
-            self.base.as_ref(),
-            self.version().version,
-            loaded_indices.clone(),
-        );
-        Ok(loaded_indices)
+        let indices = indices
+            .iter()
+            .filter(|idx| {
+                let max_valid_version = infer_index_type(idx)
+                    .map(|t| t.version())
+                    .unwrap_or_default();
+                let is_valid = idx.index_version <= max_valid_version;
+                if !is_valid {
+                    log::warn!(
+                        "Index {} has version {}, which is not supported (<={}), ignoring it",
+                        idx.name,
+                        idx.index_version,
+                        max_valid_version,
+                    );
+                }
+                is_valid
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(Arc::new(indices))
     }
 
     async fn commit_existing_index(
