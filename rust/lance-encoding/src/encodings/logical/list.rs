@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Fields};
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_arrow::list::ListArrayExt;
-use lance_core::{cache::FileMetadataCache, Error, Result};
+use lance_core::{cache::LanceCache, Error, Result};
 use log::trace;
 use snafu::location;
 use tokio::task::JoinHandle;
@@ -329,7 +329,7 @@ async fn indirect_schedule_task(
     items_scheduler: Arc<dyn FieldScheduler>,
     items_type: DataType,
     io: Arc<dyn EncodingsIo>,
-    cache: Arc<FileMetadataCache>,
+    cache: Arc<LanceCache>,
     priority: Box<dyn PriorityRange>,
 ) -> Result<IndirectlyLoaded> {
     let num_offsets = offsets_decoder.num_rows();

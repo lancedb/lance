@@ -18,7 +18,7 @@ use deepsize::DeepSizeOf;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::iter_str_array;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{cache::FileMetadataCache, utils::tokio::spawn_cpu};
+use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use lazy_static::lazy_static;
@@ -93,7 +93,7 @@ impl InvertedIndexBuilder {
         let local_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
         let src_store = store.unwrap_or_else(|| local_store.clone());
         Self {

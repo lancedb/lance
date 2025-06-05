@@ -724,7 +724,7 @@ impl FileFragment {
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),
-                &dataset.session.file_metadata_cache,
+                &dataset.metadata_cache,
                 FileReaderOptions::default(),
             )
             .await?;
@@ -904,7 +904,7 @@ impl FileFragment {
                     self.id() as u32,
                     field_id_offset as i32,
                     *max_field_id,
-                    Some(&self.dataset.session.file_metadata_cache),
+                    Some(&self.dataset.metadata_cache),
                 )
                 .await?;
                 let initialized_schema = reader.schema().project_by_schema(
@@ -948,7 +948,7 @@ impl FileFragment {
                     None,
                     Arc::<DecoderPlugins>::default(),
                     file_metadata,
-                    &self.dataset.session.file_metadata_cache,
+                    &self.dataset.metadata_cache,
                     FileReaderOptions::default(),
                 )
                 .await?,
@@ -1322,11 +1322,11 @@ impl FileFragment {
         &self,
         file_scheduler: &FileScheduler,
     ) -> Result<Arc<CachedFileMetadata>> {
-        let cache = &self.dataset.session.file_metadata_cache;
+        let cache = &self.dataset.metadata_cache;
         let path = file_scheduler.reader().path();
 
         let file_metadata = cache
-            .get_or_insert(path, |_path| async {
+            .get_or_insert(path.to_string(), |_path| async {
                 let file_metadata: CachedFileMetadata =
                     v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
                 Ok(file_metadata)

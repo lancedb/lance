@@ -26,16 +26,14 @@ pub async fn load_row_id_sequence(
         }),
         Some(RowIdMeta::Inline(data)) => {
             dataset
-                .session
-                .file_metadata_cache
-                .get_or_insert(&path, |_path| async { read_row_ids(data) })
+                .metadata_cache
+                .get_or_insert(path.to_string(), |_path| async { read_row_ids(data) })
                 .await
         }
         Some(RowIdMeta::External(file_slice)) => {
             dataset
-                .session
-                .file_metadata_cache
-                .get_or_insert(&path, |_path| async {
+                .metadata_cache
+                .get_or_insert(path.to_string(), |_path| async {
                     let path = dataset.base.child(file_slice.path.as_str());
                     let range = file_slice.offset as usize
                         ..(file_slice.offset as usize + file_slice.size as usize);
@@ -71,15 +69,12 @@ pub async fn get_row_id_index(
     dataset: &Dataset,
 ) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
     if dataset.manifest.uses_move_stable_row_ids() {
-        // The path here isn't real, it's just used to prevent collisions in the cache.
-        let path = dataset
-            .base
-            .child("row_ids")
-            .child(dataset.manifest.version.to_string());
+        let cache_key = format!("row_id_index/{}", dataset.manifest.version);
         let index = dataset
-            .session
-            .file_metadata_cache
-            .get_or_insert(&path, |_path| async { load_row_id_index(dataset).await })
+            .metadata_cache
+            .get_or_insert(cache_key, |_path| async {
+                load_row_id_index(dataset).await
+            })
             .await?;
         Ok(Some(index))
     } else {

@@ -12,6 +12,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 use itertools::Itertools;
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
@@ -77,8 +78,8 @@ use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments, manifest_cache_path, read_transaction_file,
-    transaction_file_cache_path,
+    detect_overlapping_fragments, manifest_cache_key, read_transaction_file,
+    transaction_file_cache_key,
 };
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
@@ -107,7 +108,10 @@ const INDICES_DIR: &str = "_indices";
 pub const DATA_DIR: &str = "data";
 pub const BLOB_DIR: &str = "_blobs";
 pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
-pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
+// Default to 1 GiB for the metadata cache. Column metadata can be like 40MB,
+// so this should be enough for a few hundred columns. Other metadata is much
+// smaller.
+pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Lance Dataset
 #[derive(Clone)]
@@ -126,6 +130,9 @@ pub struct Dataset {
     pub(crate) manifest_location: ManifestLocation,
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
+
+    // These are references to session caches, but with the dataset URI as a prefix.
+    pub(crate) metadata_cache: Arc<LanceCache>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -170,9 +177,9 @@ pub struct ReadParams {
     ///
     pub index_cache_size: usize,
 
-    /// Metadata cache size for the fragment metadata. If it is zero, metadata
-    /// cache is disabled.
-    pub metadata_cache_size: usize,
+    /// Size of the metadata cache in bytes. This cache stores metadata in memory
+    /// for faster open table and scans. The default is 1 GiB.
+    pub metadata_cache_size_bytes: usize,
 
     /// If present, dataset will use this shared [`Session`] instead creating a new one.
     ///
@@ -208,8 +215,19 @@ impl ReadParams {
     }
 
     /// Set the cache size for the file metadata. Set to zero to disable this cache.
+    #[deprecated(
+        since = "0.30.0",
+        note = "Use `metadata_cache_size_bytes` instead, which accepts a size in bytes."
+    )]
     pub fn metadata_cache_size(&mut self, cache_size: usize) -> &mut Self {
-        self.metadata_cache_size = cache_size;
+        let assumed_entry_size = 10 * 1024 * 1024; // 10 MiB per entry
+        self.metadata_cache_size_bytes = cache_size * assumed_entry_size;
+        self
+    }
+
+    /// Set the cache size for the file metadata in bytes.
+    pub fn metadata_cache_size_bytes(&mut self, cache_size: usize) -> &mut Self {
+        self.metadata_cache_size_bytes = cache_size;
         self
     }
 
@@ -229,7 +247,7 @@ impl Default for ReadParams {
     fn default() -> Self {
         Self {
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
-            metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
+            metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             session: None,
             store_options: None,
             commit_handler: None,
@@ -485,6 +503,7 @@ impl Dataset {
             commit_handler.clone(),
             base_path.clone(),
         );
+        let metadata_cache = Arc::new(session.file_metadata_cache.with_key_prefix(&uri));
         Ok(Self {
             object_store,
             base: base_path,
@@ -494,6 +513,7 @@ impl Dataset {
             commit_handler,
             session,
             tags,
+            metadata_cache,
         })
     }
 
@@ -599,8 +619,8 @@ impl Dataset {
             .await?;
 
         // Check if manifest is in cache before reading from storage
-        let cache_path = manifest_cache_path(&location);
-        let cached_manifest = self.session.file_metadata_cache.get(&cache_path);
+        let cache_key = manifest_cache_key(&location);
+        let cached_manifest = self.metadata_cache.get(&cache_key);
         if let Some(cached_manifest) = cached_manifest {
             return Ok((cached_manifest, location));
         }
@@ -1485,11 +1505,10 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .map_ok(move |location| {
             let latest_tx = latest_tx.take();
             async move {
-                let cache_path = manifest_cache_path(&location);
+                let cache_key = manifest_cache_key(&location);
                 let manifest = dataset
-                    .session
-                    .file_metadata_cache
-                    .get_or_insert(&cache_path, |_| {
+                    .metadata_cache
+                    .get_or_insert(cache_key, |_| {
                         Dataset::load_manifest(
                             dataset.object_store(),
                             &location,
@@ -1510,12 +1529,11 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .try_buffer_unordered(io_parallelism / 2);
     let transactions = manifests
         .map_ok(move |(manifest, location)| async move {
-            let cache_path = transaction_file_cache_path(&dataset.base, manifest.version);
+            let cache_key = transaction_file_cache_key(manifest.version);
             let manifest_copy = manifest.clone();
             let transaction = dataset
-                .session
-                .file_metadata_cache
-                .get_or_insert(&cache_path, |_| async move {
+                .metadata_cache
+                .get_or_insert(cache_key, |_| async move {
                     let dataset_version = Dataset::checkout_manifest(
                         dataset.object_store.clone(),
                         dataset.base.clone(),

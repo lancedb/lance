@@ -25,6 +25,19 @@ use std::{
     sync::Arc,
 };
 
+use futures::{StreamExt, TryStreamExt};
+use lance_core::{
+    utils::{deletion::DeletionVector, mask::RowIdTreeMap},
+    Result,
+};
+use lance_table::{format::Fragment, io::deletion::write_deletion_file};
+
+use crate::io::{commit::deletion_file_cache_key, deletion::read_dataset_deletion_file};
+use crate::{
+    dataset::transaction::{ConflictResult, Operation, Transaction},
+    Dataset,
+};
+
 #[derive(Debug)]
 pub struct TransactionRebase<'a> {
     transaction: Transaction,
@@ -970,15 +983,9 @@ impl<'a> TransactionRebase<'a> {
                     .await?;
 
                     // Make sure this is available in the cache for future conflict resolution.
-                    let path = deletion_file_path(
-                        &dataset.base,
-                        *fragment_id,
-                        new_deletion_file.as_ref().unwrap(),
-                    );
-                    dataset
-                        .session
-                        .file_metadata_cache
-                        .insert(path, Arc::new(dv));
+                    let key =
+                        deletion_file_cache_key(*fragment_id, new_deletion_file.as_ref().unwrap());
+                    dataset.metadata_cache.insert(&key, Arc::new(dv));
 
                     // TODO: also cleanup the old deletion file.
                     new_deletion_files.insert(*fragment_id, new_deletion_file);
@@ -1349,15 +1356,11 @@ mod tests {
         .await
         .unwrap();
 
-        let path = deletion_file_path(
-            &dataset.base,
-            fragment.id,
-            fragment.deletion_file.as_ref().unwrap(),
-        );
+        let cache_key =
+            deletion_file_cache_key(fragment.id, fragment.deletion_file.as_ref().unwrap());
         dataset
-            .session
-            .file_metadata_cache
-            .insert(path, Arc::new(current_deletions));
+            .metadata_cache
+            .insert(&cache_key, Arc::new(current_deletions));
 
         fragment.clone()
     }

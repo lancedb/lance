@@ -164,7 +164,7 @@ impl DatasetBuilder {
     pub fn with_read_params(mut self, read_params: ReadParams) -> Self {
         self = self
             .with_index_cache_size(read_params.index_cache_size)
-            .with_metadata_cache_size(read_params.metadata_cache_size);
+            .with_metadata_cache_size(read_params.metadata_cache_size_bytes);
 
         if let Some(options) = read_params.store_options {
             self.options = options;

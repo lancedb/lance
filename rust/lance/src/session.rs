@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
@@ -24,8 +24,12 @@ pub struct Session {
     /// Cache for opened indices.
     pub(crate) index_cache: IndexCache,
 
-    /// Cache for file metadata
-    pub(crate) file_metadata_cache: FileMetadataCache,
+    /// Global cache for file metadata.
+    ///
+    /// Sub-caches are created from this cache for each dataset by adding the
+    /// URI as a key prefix. See the [`LanceDataset::metadata_cache`] field.
+    /// This prevents collisions between different datasets.
+    pub(crate) file_metadata_cache: LanceCache,
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
@@ -54,7 +58,7 @@ impl std::fmt::Debug for Session {
             .field(
                 "file_metadata_cache",
                 &format!(
-                    "FileMetadataCache(items={})",
+                    "LanceCache(items={})",
                     self.file_metadata_cache.approx_size(),
                 ),
             )
@@ -83,7 +87,7 @@ impl Session {
     ) -> Self {
         Self {
             index_cache: IndexCache::new(index_cache_size),
-            file_metadata_cache: FileMetadataCache::new(metadata_cache_size),
+            file_metadata_cache: LanceCache::with_capacity(metadata_cache_size),
             index_extensions: HashMap::new(),
             store_registry,
         }
@@ -161,7 +165,7 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             index_cache: IndexCache::new(DEFAULT_INDEX_CACHE_SIZE),
-            file_metadata_cache: FileMetadataCache::new(DEFAULT_METADATA_CACHE_SIZE),
+            file_metadata_cache: LanceCache::with_capacity(DEFAULT_METADATA_CACHE_SIZE),
             index_extensions: HashMap::new(),
             store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
