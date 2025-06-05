@@ -34,7 +34,8 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::Operation;
 use lance::dataset::{
-    ColumnAlteration, Dataset, NewColumnTransform, ProjectionRequest, ReadParams, WriteParams,
+    ColumnAlteration, Dataset, NewColumnTransform, ProjectionRequest, ReadParams, Version,
+    WriteParams,
 };
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
@@ -150,6 +151,25 @@ impl BlockingDataset {
     pub fn latest_version(&self) -> Result<u64> {
         let version = RT.block_on(self.inner.latest_version_id())?;
         Ok(version)
+    }
+
+    pub fn list_versions(&self) -> Result<Vec<Version>> {
+        let versions = RT.block_on(self.inner.versions())?;
+        Ok(versions)
+    }
+
+    pub fn version(&self) -> Result<Version> {
+        Ok(self.inner.version())
+    }
+
+    pub fn checkout_version(&mut self, version: u64) -> Result<Self> {
+        let inner = RT.block_on(self.inner.checkout_version(version))?;
+        Ok(Self { inner })
+    }
+
+    pub fn checkout_latest(&mut self) -> Result<()> {
+        RT.block_on(self.inner.checkout_latest())?;
+        Ok(())
     }
 
     pub fn count_rows(&self, filter: Option<String>) -> Result<usize> {
@@ -323,6 +343,41 @@ fn create_dataset<'local>(
 impl IntoJava for BlockingDataset {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         attach_native_dataset(env, self)
+    }
+}
+
+impl IntoJava for Version {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let timestamp_str = self.timestamp.to_rfc3339();
+        let jtimestamp = env.new_string(timestamp_str)?;
+        let zdt = env
+            .call_static_method(
+                "java/time/ZonedDateTime",
+                "parse",
+                "(Ljava/lang/CharSequence;)Ljava/time/ZonedDateTime;",
+                &[JValue::Object(&jtimestamp)],
+            )?
+            .l()?;
+
+        let jmap = env.new_object("java/util/TreeMap", "()V", &[])?;
+        let map = JMap::from_env(env, &jmap)?;
+
+        for (k, v) in self.metadata {
+            let jkey = env.new_string(k)?;
+            let jval = env.new_string(v)?;
+            map.put(env, &jkey, &jval).expect("ERROR: calling jmap.put");
+        }
+
+        let java_version = env.new_object(
+            "com/lancedb/lance/Version",
+            "(JLjava/time/ZonedDateTime;Ljava/util/TreeMap;)V",
+            &[
+                JValue::Long(self.version as i64),
+                JValue::Object(&zdt),
+                JValue::Object(&jmap),
+            ],
+        )?;
+        Ok(java_version)
     }
 }
 
@@ -658,31 +713,87 @@ fn inner_uri<'local>(env: &mut JNIEnv<'local>, java_dataset: JObject) -> Result<
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeVersion(
-    mut env: JNIEnv,
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeListVersions<'local>(
+    mut env: JNIEnv<'local>,
     java_dataset: JObject,
-) -> jlong {
-    ok_or_throw_with_return!(env, inner_version(&mut env, java_dataset), -1) as jlong
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_list_versions(&mut env, java_dataset))
 }
 
-fn inner_version(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> {
-    let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    Ok(dataset_guard.inner.version().version)
+fn inner_list_versions<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let versions = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.list_versions()?
+    };
+    let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+
+    versions
+        .into_iter()
+        .map(|inner_ver| inner_ver.into_java(env))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .try_for_each(|java_ver| -> Result<()> {
+            env.call_method(
+                &array_list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&java_ver)],
+            )?;
+            Ok(())
+        })?;
+    Ok(array_list)
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeLatestVersion(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetVersion<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_version(&mut env, java_dataset))
+}
+
+fn inner_get_version<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let version = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.version()?
+    };
+    Ok(version.into_java(env)?)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetLatestVersionId(
     mut env: JNIEnv,
     java_dataset: JObject,
 ) -> jlong {
-    ok_or_throw_with_return!(env, inner_latest_version(&mut env, java_dataset), -1) as jlong
+    ok_or_throw_with_return!(env, inner_latest_version_id(&mut env, java_dataset), -1) as jlong
 }
 
-fn inner_latest_version(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> {
+fn inner_latest_version_id(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> {
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     dataset_guard.latest_version()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCheckoutLatest(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) {
+    ok_or_throw_without_return!(env, inner_checkout_latest(&mut env, java_dataset));
+}
+
+fn inner_checkout_latest(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.checkout_latest()
 }
 
 #[no_mangle]
@@ -700,15 +811,12 @@ fn inner_checkout_version<'local>(
     version: jlong,
 ) -> Result<JObject<'local>> {
     let new_dataset = {
-        let dataset_guard =
+        let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-
-        let version_u64 = version as u64;
-        RT.block_on(dataset_guard.inner.checkout_version(version_u64))?
+        dataset_guard.checkout_version(version as u64)?
     };
 
-    let blocking_dataset = BlockingDataset { inner: new_dataset };
-    blocking_dataset.into_java(env)
+    new_dataset.into_java(env)
 }
 
 #[no_mangle]

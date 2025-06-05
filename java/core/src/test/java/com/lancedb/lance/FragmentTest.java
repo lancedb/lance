@@ -57,8 +57,8 @@ public class FragmentTest {
       // Commit fragment
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
-        assertEquals(2, dataset.version());
-        assertEquals(2, dataset.latestVersion());
+        assertEquals(2, dataset.getVersion().getId());
+        assertEquals(2, dataset.getLatestVersionId());
         assertEquals(rowCount, dataset.countRows());
         Fragment fragment = dataset.getFragments().get(0);
 
@@ -117,8 +117,8 @@ public class FragmentTest {
           new FragmentOperation.Overwrite(
               Collections.singletonList(fragmentMeta), testDataset.getSchema());
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, overwrite, Optional.of(1L))) {
-        assertEquals(2, dataset.version());
-        assertEquals(2, dataset.latestVersion());
+        assertEquals(2, dataset.getVersion().getId());
+        assertEquals(2, dataset.getLatestVersionId());
         assertEquals(rowCount, dataset.countRows());
         Fragment fragment = dataset.getFragments().get(0);
 
@@ -135,8 +135,8 @@ public class FragmentTest {
           new FragmentOperation.Overwrite(
               Collections.singletonList(fragmentMeta), testDataset.getSchema());
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, overwrite, Optional.of(2L))) {
-        assertEquals(3, dataset.version());
-        assertEquals(3, dataset.latestVersion());
+        assertEquals(3, dataset.getVersion().getId());
+        assertEquals(3, dataset.getLatestVersionId());
         assertEquals(rowCount, dataset.countRows());
         Fragment fragment = dataset.getFragments().get(0);
 
