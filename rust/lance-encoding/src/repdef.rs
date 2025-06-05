@@ -3100,7 +3100,3 @@ mod tests {
         assert_eq!(val, Some(validity(&[true, true, false])));
     }
 }
-
-// TO TEST:
-
-// - List array where the offsets don't start at 0
