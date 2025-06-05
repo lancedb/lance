@@ -738,7 +738,8 @@ mod tests {
             "boost": 2.0,
             "fuzziness": 1,
             "max_expansions": 10,
-            "operator": "And"
+            "operator": "And",
+            "prefix_length": 0,
         });
         assert_eq!(serialized, expected);
 
@@ -754,6 +755,7 @@ mod tests {
         assert_eq!(query.fuzziness, Some(0));
         assert_eq!(query.max_expansions, 50);
         assert_eq!(query.operator, Operator::Or);
+        assert_eq!(query.prefix_length, 0);
     }
 
     #[test]

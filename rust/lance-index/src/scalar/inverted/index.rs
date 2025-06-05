@@ -453,11 +453,7 @@ impl InvertedPartition {
         self.tokens.get(token)
     }
 
-    pub fn expand_fuzzy<'a>(
-        &self,
-        tokens: &[String],
-        params: &FtsSearchParams,
-    ) -> Result<Vec<String>> {
+    pub fn expand_fuzzy(&self, tokens: &[String], params: &FtsSearchParams) -> Result<Vec<String>> {
         let mut new_tokens = Vec::with_capacity(min(tokens.len(), params.max_expansions));
         for token in tokens {
             let fuzziness = match params.fuzziness {
