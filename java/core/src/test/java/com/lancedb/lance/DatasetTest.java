@@ -115,63 +115,57 @@ public class DatasetTest {
       ZonedDateTime before = ZonedDateTime.now();
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         ZonedDateTime time1 = dataset.getVersion().getDataTime();
-        assertEquals(1, dataset.getVersion().getId());
+        assertEquals(1, dataset.version());
         assertTrue(time1.isEqual(before) || time1.isAfter(before));
         assertTrue(time1.isEqual(ZonedDateTime.now()) || time1.isBefore(ZonedDateTime.now()));
         assertEquals(time1.getZone(), Clock.systemUTC().getZone());
-        assertEquals(1, dataset.getLatestVersionId());
+        assertEquals(1, dataset.latestVersion());
 
         // Write first batch of data
         try (Dataset dataset2 = testDataset.write(1, 5)) {
           ZonedDateTime time2 = dataset2.getVersion().getDataTime();
-          assertEquals(1, dataset.getVersion().getId());
-          assertEquals(2, dataset.getLatestVersionId());
-          assertEquals(2, dataset2.getVersion().getId());
-          assertEquals(2, dataset2.getLatestVersionId());
+          assertEquals(1, dataset.version());
+          assertEquals(2, dataset.latestVersion());
+          assertEquals(2, dataset2.version());
+          assertEquals(2, dataset2.latestVersion());
           assertTrue(time2.isEqual(before) || time2.isAfter(before));
-          assertTrue(
-              time2.isEqual(ZonedDateTime.now(Clock.systemUTC()))
-                  || time2.isBefore(ZonedDateTime.now(Clock.systemUTC())));
           assertTrue(time2.isEqual(time1) || time2.isAfter(time1));
           assertTrue(time1.isEqual(dataset.getVersion().getDataTime()));
 
           // Open dataset with version 1
           ReadOptions options1 = new ReadOptions.Builder().setVersion(1).build();
           try (Dataset datasetV1 = Dataset.open(allocator, datasetPath, options1)) {
-            assertEquals(1, datasetV1.getVersion().getId());
+            assertEquals(1, datasetV1.version());
             assertTrue(time1.isEqual(dataset.getVersion().getDataTime()));
-            assertEquals(2, datasetV1.getLatestVersionId());
+            assertEquals(2, datasetV1.latestVersion());
           }
 
           // Write second batch of data
           try (Dataset dataset3 = testDataset.write(2, 3)) {
             ZonedDateTime time3 = dataset3.getVersion().getDataTime();
-            assertEquals(1, dataset.getVersion().getId());
+            assertEquals(1, dataset.version());
             assertTrue(time1.isEqual(dataset.getVersion().getDataTime()));
-            assertEquals(3, dataset.getLatestVersionId());
-            assertEquals(2, dataset2.getVersion().getId());
+            assertEquals(3, dataset.latestVersion());
+            assertEquals(2, dataset2.version());
             assertTrue(time2.isEqual(dataset2.getVersion().getDataTime()));
-            assertEquals(3, dataset2.getLatestVersionId());
+            assertEquals(3, dataset2.latestVersion());
             assertTrue(time3.isEqual(before) || time3.isAfter(before));
-            assertTrue(
-                time3.isEqual(ZonedDateTime.now(Clock.systemUTC()))
-                    || time3.isBefore(ZonedDateTime.now(Clock.systemUTC())));
-            assertEquals(3, dataset3.getVersion().getId());
-            assertEquals(3, dataset3.getLatestVersionId());
+            assertEquals(3, dataset3.version());
+            assertEquals(3, dataset3.latestVersion());
 
             // Open dataset with version 2
             ReadOptions options2 = new ReadOptions.Builder().setVersion(2).build();
             try (Dataset datasetV2 = Dataset.open(allocator, datasetPath, options2)) {
-              assertEquals(2, datasetV2.getVersion().getId());
+              assertEquals(2, datasetV2.version());
               assertTrue(time2.isEqual(datasetV2.getVersion().getDataTime()));
-              assertEquals(3, datasetV2.getLatestVersionId());
+              assertEquals(3, datasetV2.latestVersion());
             }
 
             // Open dataset with latest version (3)
             try (Dataset datasetLatest = Dataset.open(datasetPath, allocator)) {
-              assertEquals(3, datasetLatest.getVersion().getId());
+              assertEquals(3, datasetLatest.version());
               assertTrue(time3.isEqual(datasetLatest.getVersion().getDataTime()));
-              assertEquals(3, datasetLatest.getLatestVersionId());
+              assertEquals(3, datasetLatest.latestVersion());
             }
 
             List<Version> versions = dataset.listVersions();
@@ -185,9 +179,9 @@ public class DatasetTest {
             assertArrayEquals(versions.toArray(), dataset2.listVersions().toArray());
             assertArrayEquals(versions.toArray(), dataset3.listVersions().toArray());
             dataset.checkoutLatest();
-            assertEquals(3, dataset.getVersion().getId());
+            assertEquals(3, dataset.version());
             assertTrue(time3.isEqual(dataset.getVersion().getDataTime()));
-            assertEquals(3, dataset.getLatestVersionId());
+            assertEquals(3, dataset.latestVersion());
           }
         }
       }
@@ -203,21 +197,21 @@ public class DatasetTest {
 
       // version 1, empty dataset
       try (Dataset dataset = testDataset.createEmptyDataset()) {
-        assertEquals(1, dataset.getVersion().getId());
-        assertEquals(1, dataset.getLatestVersionId());
+        assertEquals(1, dataset.version());
+        assertEquals(1, dataset.latestVersion());
         assertEquals(0, dataset.countRows());
       }
 
       // write first batch of data, version 2
       try (Dataset dataset2 = testDataset.write(1, 5)) {
-        assertEquals(2, dataset2.getVersion().getId());
-        assertEquals(2, dataset2.getLatestVersionId());
+        assertEquals(2, dataset2.version());
+        assertEquals(2, dataset2.latestVersion());
         assertEquals(5, dataset2.countRows());
 
         // checkout the dataset at version 1
         try (Dataset checkoutV1 = dataset2.checkout(1)) {
-          assertEquals(1, checkoutV1.getVersion().getId());
-          assertEquals(2, checkoutV1.getLatestVersionId());
+          assertEquals(1, checkoutV1.version());
+          assertEquals(2, checkoutV1.latestVersion());
           assertEquals(0, checkoutV1.countRows());
         }
       }

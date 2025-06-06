@@ -449,6 +449,15 @@ public class Dataset implements Closeable {
   private native String nativeUri();
 
   /**
+   * Get the currently checked out version id of the dataset
+   *
+   * @return the version id of the dataset
+   */
+  public long version() {
+    return getVersion().getId();
+  }
+
+  /**
    * Gets the currently checked out version of the dataset.
    *
    * @return the version of the dataset
@@ -477,7 +486,7 @@ public class Dataset implements Closeable {
   private native List<Version> nativeListVersions();
 
   /** @return the latest version of the dataset. */
-  public long getLatestVersionId() {
+  public long latestVersion() {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       return nativeGetLatestVersionId();

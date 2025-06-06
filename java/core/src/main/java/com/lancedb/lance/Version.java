@@ -14,12 +14,14 @@
 package com.lancedb.lance;
 
 import java.time.ZonedDateTime;
+import java.util.Objects;
+import java.util.SortedMap;
 import java.util.TreeMap;
 
 public class Version {
   private final long id;
   private final ZonedDateTime dataTime;
-  private final TreeMap<String, String> metadata;
+  private final SortedMap<String, String> metadata;
 
   public Version(long id, ZonedDateTime dataTime, TreeMap<String, String> metadata) {
     this.id = id;
@@ -31,7 +33,7 @@ public class Version {
     return dataTime;
   }
 
-  public TreeMap<String, String> getMetadata() {
+  public SortedMap<String, String> getMetadata() {
     return metadata;
   }
 
@@ -43,6 +45,7 @@ public class Version {
     return "Version: " + id + ", dataTime: " + dataTime + ", metadata: " + metadata;
   }
 
+  @Override
   public boolean equals(Object o) {
     if (this == o) {
       return true;
@@ -52,11 +55,12 @@ public class Version {
     }
     Version version = (Version) o;
     return id == version.id
-        && dataTime.isEqual(version.dataTime)
-        && metadata.equals(version.metadata);
+        && Objects.equals(dataTime, version.dataTime)
+        && Objects.equals(metadata, version.metadata);
   }
 
+  @Override
   public int hashCode() {
-    return (int) (id ^ dataTime.hashCode());
+    return Objects.hash(id, dataTime, metadata);
   }
 }

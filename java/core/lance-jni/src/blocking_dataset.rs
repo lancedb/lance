@@ -765,7 +765,7 @@ fn inner_get_version<'local>(
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
         dataset_guard.version()?
     };
-    Ok(version.into_java(env)?)
+    version.into_java(env)
 }
 
 #[no_mangle]
