@@ -983,6 +983,7 @@ mod tests {
     use super::*;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::transpose_row_ids;
+    use crate::dataset::WriteDestination;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -2179,6 +2180,204 @@ mod tests {
             remapped_scalar_index.fragment_bitmap.unwrap(),
             all_fragment_bitmap
         );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_compaction_reindex_compaction_commit_first() {
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(
+                RandomVector::new().vec_width(128).named("vec".to_owned()),
+            ))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let mut dataset = Dataset::write(
+            data_gen.batch(6_000),
+            "memory://test/table",
+            Some(WriteParams {
+                max_rows_per_file: 1_000, // 6 files
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Create an index
+        let index_name = Some("scalar".into());
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                index_name.clone(),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Write some more data for reindexing
+        Dataset::write(
+            data_gen.batch(6_000),
+            WriteDestination::Dataset(Arc::new(dataset.clone())),
+            Some(WriteParams {
+                max_rows_per_file: 1_000, // 6 files
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+        let mut dataset_clone = dataset.clone();
+        let frags_before_compact = dataset_clone
+            .fragments()
+            .iter()
+            .map(|f| f.id as u32)
+            .collect::<HashSet<_>>();
+
+        // First commit a compaction with deferred remap
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Concurrent reindex should succeed
+        dataset_clone
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                index_name.clone(),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Check new index does not cover the compacted files
+        dataset.checkout_latest().await.unwrap();
+        let Some(scalar_index) = dataset.load_index_by_name("scalar").await.unwrap() else {
+            panic!("scalar index must be available");
+        };
+        let index_frags = scalar_index
+            .fragment_bitmap
+            .unwrap()
+            .iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(index_frags, frags_before_compact);
+        assert_ne!(
+            index_frags,
+            dataset
+                .fragments()
+                .iter()
+                .map(|f| f.id as u32)
+                .collect::<HashSet<_>>()
+        )
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_compaction_reindex_reindex_commit_first() {
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(
+                RandomVector::new().vec_width(128).named("vec".to_owned()),
+            ))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let mut dataset = Dataset::write(
+            data_gen.batch(6_000),
+            "memory://test/table",
+            Some(WriteParams {
+                max_rows_per_file: 1_000, // 6 files
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Create an index
+        let index_name = Some("scalar".into());
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                index_name.clone(),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Write some more data for reindexing
+        Dataset::write(
+            data_gen.batch(6_000),
+            WriteDestination::Dataset(Arc::new(dataset.clone())),
+            Some(WriteParams {
+                max_rows_per_file: 1_000, // 6 files
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+        let mut dataset_clone = dataset.clone();
+        let frags_before_compact = dataset_clone
+            .fragments()
+            .iter()
+            .map(|f| f.id as u32)
+            .collect::<HashSet<_>>();
+
+        // Concurrent reindex should succeed
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                index_name.clone(),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // First commit a compaction with deferred remap
+        compact_files(
+            &mut dataset_clone,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Check new index does not cover the compacted files
+        dataset.checkout_latest().await.unwrap();
+        let Some(scalar_index) = dataset.load_index_by_name("scalar").await.unwrap() else {
+            panic!("scalar index must be available");
+        };
+        let index_frags = scalar_index
+            .fragment_bitmap
+            .unwrap()
+            .iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(index_frags, frags_before_compact);
+        assert_ne!(
+            index_frags,
+            dataset
+                .fragments()
+                .iter()
+                .map(|f| f.id as u32)
+                .collect::<HashSet<_>>()
+        )
     }
 
     #[tokio::test]

@@ -512,53 +512,59 @@ impl<'a> TransactionRebase<'a> {
                     removed_indices,
                     ..
                 } => {
-                    // if the rewrite produces a FRI, but FRI was cleaned up
-                    // in the other transaction, the FRI produced by the rewrite should
-                    // be cleaned up in the same way as a part of the rebase.
-                    if let (Some(committed_fri), Some(_)) = (
+                    match (
                         new_indices
                             .iter()
                             .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
                         &frag_reuse_index,
                     ) {
-                        // this should not happen today since we don't support committing
-                        // a mixture of FRI and other indices.
-                        if new_indices.len() != 1 || removed_indices.len() != 1 {
-                            return Err(self.incompatible_conflict_err(
-                                other_transaction,
-                                other_version,
-                                location!(),
-                            ));
-                        }
-
-                        self.conflicting_frag_reuse_indices
-                            .push(committed_fri.clone());
-                        Ok(())
-                    } else {
-                        let mut affected_ids = HashSet::new();
-                        for index in new_indices {
-                            if let Some(frag_bitmap) = &index.fragment_bitmap {
-                                affected_ids.extend(frag_bitmap.iter());
-                            } else {
-                                return Err(self.retryable_conflict_err(
+                        // If the rewrite produces a FRI, but FRI was cleaned up
+                        // in the other transaction, the FRI produced by the rewrite should
+                        // be cleaned up in the same way as a part of the rebase.
+                        (Some(committed_fri), Some(_)) => {
+                            // this should not happen today since we don't support committing
+                            // a mixture of FRI and other indices.
+                            if new_indices.len() != 1 || removed_indices.len() != 1 {
+                                return Err(self.incompatible_conflict_err(
                                     other_transaction,
                                     other_version,
                                     location!(),
                                 ));
                             }
-                        }
-                        if groups
-                            .iter()
-                            .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
-                            .any(|id| affected_ids.contains(&(id as u32)))
-                        {
-                            Err(self.retryable_conflict_err(
-                                other_transaction,
-                                other_version,
-                                location!(),
-                            ))
-                        } else {
+
+                            self.conflicting_frag_reuse_indices
+                                .push(committed_fri.clone());
                             Ok(())
+                        }
+                        // If rewrite defers index remap then it does not conflict with index creation
+                        (None, Some(_)) => Ok(()),
+                        // If rewrite performs index remap, fail if there are overlapping fragments
+                        (_, None) => {
+                            let mut affected_ids = HashSet::new();
+                            for index in new_indices {
+                                if let Some(frag_bitmap) = &index.fragment_bitmap {
+                                    affected_ids.extend(frag_bitmap.iter());
+                                } else {
+                                    return Err(self.retryable_conflict_err(
+                                        other_transaction,
+                                        other_version,
+                                        location!(),
+                                    ));
+                                }
+                            }
+                            if groups
+                                .iter()
+                                .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
+                                .any(|id| affected_ids.contains(&(id as u32)))
+                            {
+                                Err(self.retryable_conflict_err(
+                                    other_transaction,
+                                    other_version,
+                                    location!(),
+                                ))
+                            } else {
+                                Ok(())
+                            }
                         }
                     }
                 }
