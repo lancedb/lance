@@ -7,7 +7,7 @@ The example uses only one record batch, however it should work for larger datase
 Writing the raw dataset
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-.. literalinclude:: ../../rust/lance/examples/write_read_ds.rs
+.. literalinclude:: ../../../rust/examples/src/write_read_ds.rs
    :language: rust
    :linenos:
    :start-at: // Writes sample dataset to the given path
@@ -19,7 +19,7 @@ Reading a Lance dataset
 ~~~~~~~~~~~~~~~~~~~~~~~
 Now that we have written the dataset to a new directory, we can read it back and print out some basic properties.
 
-.. literalinclude:: ../../rust/lance/examples/write_read_ds.rs
+.. literalinclude:: ../../../rust/examples/src/write_read_ds.rs
    :language: rust
    :linenos:
    :start-at: // Reads dataset from the given path
