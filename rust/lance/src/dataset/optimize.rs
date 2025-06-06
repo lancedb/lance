@@ -980,15 +980,20 @@ mod tests {
     use std::collections::HashSet;
 
     use self::remapping::RemappedIndex;
+    use super::*;
+    use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::transpose_row_ids;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::VectorIndexParams;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{Float32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
     use lance_core::utils::address::RowAddress;
     use lance_core::Error;
+    use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use lance_index::scalar::ScalarIndexParams;
@@ -998,8 +1003,6 @@ mod tests {
     use rstest::rstest;
     use tempfile::tempdir;
     use uuid::Uuid;
-
-    use super::*;
 
     #[test]
     fn test_candidate_bin() {
@@ -2176,5 +2179,288 @@ mod tests {
             remapped_scalar_index.fragment_bitmap.unwrap(),
             all_fragment_bitmap
         );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_cleanup_and_compaction_rebase_cleanup() {
+        let mut dataset = lance_datagen::gen()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let tasks = plan.tasks();
+
+        // Only compact the first task, record the state of the dataset
+        let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), tasks[0].clone(), &options)
+            .await
+            .unwrap();
+
+        commit_compaction(
+            &mut dataset,
+            Vec::from([rewrite_result]),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        let mut dataset_clone = dataset.clone();
+
+        // Load and verify the fragment reuse index content
+        let Some(frag_reuse_index_meta) = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+        else {
+            panic!("Fragment reuse index must be available");
+        };
+
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .await
+            .unwrap();
+        assert_eq!(frag_reuse_details.versions.len(), 1);
+
+        // First commit the remaining 2 compaction tasks.
+        let rewrite_result2 = rewrite_files(Cow::Borrowed(&dataset), tasks[1].clone(), &options)
+            .await
+            .unwrap();
+        let rewritten_frags2 = rewrite_result2.original_fragments.clone();
+        let new_frags2 = rewrite_result2
+            .new_fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<u64>>();
+        commit_compaction(
+            &mut dataset,
+            Vec::from([rewrite_result2]),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        let rewrite_result3 = rewrite_files(Cow::Borrowed(&dataset), tasks[2].clone(), &options)
+            .await
+            .unwrap();
+        let rewritten_frags3 = rewrite_result3.original_fragments.clone();
+        let new_frags3 = rewrite_result3
+            .new_fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<u64>>();
+        commit_compaction(
+            &mut dataset,
+            Vec::from([rewrite_result3]),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        // Concurrently commit a FRI cleanup operation.
+        // Because there is no index, it should remove the first version.
+        // but after rebase it should contain the new compaction versions.
+        cleanup_frag_reuse_index(&mut dataset_clone).await.unwrap();
+
+        // Load and verify the fragment reuse index content
+        dataset.checkout_latest().await.unwrap();
+        let Some(frag_reuse_index_meta) = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+        else {
+            panic!("Fragment reuse index must be available");
+        };
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .await
+            .unwrap();
+        assert_eq!(frag_reuse_details.versions.len(), 2);
+        assert_eq!(frag_reuse_details.versions[0].old_frags, rewritten_frags2);
+        assert_eq!(frag_reuse_details.versions[0].new_frags, new_frags2);
+        assert_eq!(frag_reuse_details.versions[1].old_frags, rewritten_frags3);
+        assert_eq!(frag_reuse_details.versions[1].new_frags, new_frags3);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_cleanup_and_compaction_rebase_compaction() {
+        let mut dataset = lance_datagen::gen()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let tasks = plan.tasks();
+
+        // Only compact the first task, record the state of the dataset
+        let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), tasks[0].clone(), &options)
+            .await
+            .unwrap();
+
+        commit_compaction(
+            &mut dataset,
+            Vec::from([rewrite_result]),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        let mut dataset_clone = dataset.clone();
+
+        // Load and verify the fragment reuse index content
+        let Some(frag_reuse_index_meta) = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+        else {
+            panic!("Fragment reuse index must be available");
+        };
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .await
+            .unwrap();
+        assert_eq!(frag_reuse_details.versions.len(), 1);
+
+        // First commit the FRI cleanup
+        // Because there is no index, it should remove the first version.
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+
+        // Load and verify the fragment reuse index content
+        dataset.checkout_latest().await.unwrap();
+        let Some(frag_reuse_index_meta) = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+        else {
+            panic!("Fragment reuse index must be available");
+        };
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .await
+            .unwrap();
+        assert_eq!(frag_reuse_details.versions.len(), 0);
+
+        // Concurrently commit a rewrite
+        // After rebase it should only contain the latest reuse version
+        let rewrite_result2 =
+            rewrite_files(Cow::Borrowed(&dataset_clone), tasks[1].clone(), &options)
+                .await
+                .unwrap();
+        let rewritten_frags2 = rewrite_result2.original_fragments.clone();
+        let new_frags2 = rewrite_result2
+            .new_fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<u64>>();
+        commit_compaction(
+            &mut dataset_clone,
+            Vec::from([rewrite_result2]),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        // Load and verify the fragment reuse index content
+        dataset.checkout_latest().await.unwrap();
+        let Some(frag_reuse_index_meta) = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+        else {
+            panic!("Fragment reuse index must be available");
+        };
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .await
+            .unwrap();
+        assert_eq!(frag_reuse_details.versions.len(), 1);
+        assert_eq!(frag_reuse_details.versions[0].old_frags, rewritten_frags2);
+        assert_eq!(frag_reuse_details.versions[0].new_frags, new_frags2);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_compactions_with_defer_index_remap() {
+        let mut dataset = lance_datagen::gen()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let tasks = plan.tasks();
+
+        let mut dataset_clone = dataset.clone();
+
+        // Only compact the first task, record the state of the dataset
+        let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), tasks[0].clone(), &options)
+            .await
+            .unwrap();
+
+        commit_compaction(
+            &mut dataset,
+            Vec::from([rewrite_result]),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        // Load and verify the fragment reuse index content
+        let Some(frag_reuse_index_meta) = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+        else {
+            panic!("Fragment reuse index must be available");
+        };
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .await
+            .unwrap();
+        assert_eq!(frag_reuse_details.versions.len(), 1);
+
+        // Concurrently commit a rewrite should fail
+        let rewrite_result2 =
+            rewrite_files(Cow::Borrowed(&dataset_clone), tasks[1].clone(), &options)
+                .await
+                .unwrap();
+        let result = commit_compaction(
+            &mut dataset_clone,
+            Vec::from([rewrite_result2]),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await;
+        assert!(matches!(result, Err(Error::RetryableCommitConflict { .. })));
     }
 }

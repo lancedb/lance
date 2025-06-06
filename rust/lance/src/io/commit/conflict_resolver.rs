@@ -326,6 +326,7 @@ impl<'a> TransactionRebase<'a> {
             match &other_transaction.operation {
                 Operation::Append { .. } => Ok(()),
                 // Indices are identified by UUIDs, so they shouldn't conflict.
+                // unless it is the same frag reuse index
                 Operation::CreateIndex {
                     new_indices: created_indices,
                     ..
@@ -337,7 +338,7 @@ impl<'a> TransactionRebase<'a> {
                             .iter()
                             .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
                     {
-                        Err(self.incompatible_conflict_err(
+                        Err(self.retryable_conflict_err(
                             other_transaction,
                             other_version,
                             location!(),
@@ -361,7 +362,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_index,
                     ..
                 } => {
-                    // if FRI is some, index remapping is deferred and
+                    // if FRI is available, index remapping is deferred and
                     // there is no conflict with concurrent CreateIndex of column indices.
                     // The only case that needs rebasing is when the FRI cleanup
                     // triggers a CreateIndex, and it needs to add the new reuse
@@ -473,12 +474,26 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::Rewrite { groups, .. } => {
+                Operation::Rewrite {
+                    groups,
+                    frag_reuse_index: committed_fri,
+                    ..
+                } => {
                     if groups
                         .iter()
                         .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
+                        Err(self.retryable_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ))
+                    } else if committed_fri.is_some() && frag_reuse_index.is_some() {
+                        // Do not commit concurrent rewrites that could produce conflicting FRIs.
+                        // The other rewrite must retry.
+                        // TODO: could potentially rebase to combine both FRIs,
+                        //   but today it is already rare to run concurrent rewrites.
                         Err(self.retryable_conflict_err(
                             other_transaction,
                             other_version,
@@ -497,8 +512,9 @@ impl<'a> TransactionRebase<'a> {
                     removed_indices,
                     ..
                 } => {
-                    // if FRI was cleaned up,
-                    // the FRI produced by the rewrite should clean up the same versions.
+                    // if the rewrite produces a FRI, but FRI was cleaned up
+                    // in the other transaction, the FRI produced by the rewrite should
+                    // be cleaned up in the same way as a part of the rebase.
                     if let (Some(committed_fri), Some(_)) = (
                         new_indices
                             .iter()
@@ -1081,9 +1097,27 @@ impl<'a> TransactionRebase<'a> {
                         .iter()
                         .map(|v| v.dataset_version)
                         .min();
-                    if let Some(committed_min_dataset_version) = committed_min_dataset_version {
-                        if committed_min_dataset_version > min_dataset_version {
-                            min_dataset_version = committed_min_dataset_version;
+
+                    // For example, if we have new_fri has reuse versions [1, 2, 3]
+                    // If committed_fri has versions [2], that means 1 is cleaned up,
+                    // then [2, 3] should be retained in the new_fri.
+                    // If comitted_fri is empty, that means everything is cleaned up.
+                    // then only the last item in committed_fri should be retained, which is [3].
+                    // Note that this is under the assumption that the sequence of
+                    // conflicting_frag_reuse_indices all come from FRI cleanup rebase.
+                    match committed_min_dataset_version {
+                        Some(committed_min_dataset_version) => {
+                            if committed_min_dataset_version > min_dataset_version {
+                                min_dataset_version = committed_min_dataset_version;
+                            }
+                        }
+                        None => {
+                            min_dataset_version = new_fri_details
+                                .versions
+                                .iter()
+                                .map(|v| v.dataset_version)
+                                .max()
+                                .unwrap();
                         }
                     }
                 }
