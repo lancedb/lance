@@ -356,6 +356,10 @@ class ShardedFragmentSampler(FragmentSampler):
         self._world_size = world_size
         self._randomize = randomize
         self._seed = seed
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self._epoch = epoch
 
     @staticmethod
     def from_torch(randomize: bool = False, seed: int = 0) -> ShardedFragmentSampler:
@@ -399,15 +403,89 @@ class ShardedBatchSampler(Sampler):
     not assigned to it.  The resulting stream is then randomized via a reservoir
     sampler.  This does not perfectly randomize the stream but it should generate
     a stream that is random enough for many use cases.
+
+    Operates in two modes:
+      Mode Selection:
+    - Index Mode: Provide `total_num_rows` and `batch_size`
+    - Data Stream Mode: Omit both (call with `batch_size` in __call__)
+
+        1. Index Mode (__iter__): For PyTorch DataLoader integration
+           - Requires total_num_rows and batch_size
+           - Yields consecutive index blocks for current rank
+           Example: (world_size=4, batch_size=250)
+             Rank 0: indices [0-249], [1000-1249]...
+             Rank 1: indices [250-499], [1250-1499]...
+
+        2. Data Stream Mode (__call__): Direct data pipeline integration
+           - Dynamically loads data from LanceDataset
+           - Two processing strategies:
+             a. Unfiltered: Direct range scan (memory efficient)
+             b. Filtered: Full scan + reservoir sampling (randomized)
+
+        Parameters:
+        rank (int): Process ID in distributed cluster
+        world_size (int): Total processes in cluster
+        total_num_rows (int): [Index Mode] Total dataset rows
+        batch_size (int): [Index Mode] Rows per batch
+        randomize (bool): Enable batch order randomization
+        seed (int): Random seed for reproducibility
     """
 
     def __init__(
-        self, rank: int, world_size: int, randomize: bool = False, seed: int = 0
+        self,
+        rank: int,
+        world_size: int,
+        total_num_rows: int = 0,
+        batch_size: int = 0,
+        randomize: bool = False,
+        seed: int = 0,
     ):
         self._rank = rank
         self._world_size = world_size
         self._randomize = randomize
         self._seed = seed
+        self._batch_size = batch_size
+        self._total_num_rows = total_num_rows
+
+        if total_num_rows > 0:
+            self._len = self._compute_length()
+        self._epoch = 0
+
+    # can't have filter
+    def _compute_length(self):
+        if self._batch_size == 0 and self._total_num_rows == 0:
+            return 0
+        per_rank = math.ceil(self._total_num_rows / self._world_size)
+        return math.ceil(per_rank / self._batch_size)
+
+    def __len__(self):
+        return self._len
+
+    def set_epoch(self, epoch: int):
+        self._epoch = epoch
+
+    def __iter__(self) -> Generator[List[int], None, None]:
+        """Yields consecutive index blocks for current rank.
+
+        Example (total_num_rows=1000, world_size=4, batch_size=250):
+        - Rank 0: [0-249], [1000-1249]...
+        - Rank 1: [250-499], [1250-1499]...
+        """
+        # Calculate block boundaries
+        block_size = self._batch_size * self._world_size
+        start_idx = self._rank * self._batch_size
+
+        blocks = []
+        for block_start in range(start_idx, self._total_num_rows, block_size):
+            block_end = min(block_start + self._batch_size, self._total_num_rows)
+            blocks.append(list(range(block_start, block_end)))
+
+        # Handle randomization with epoch-aware seeding
+        if self._randomize:
+            random.seed(self._seed + self._epoch)
+            random.shuffle(blocks)
+
+        yield from blocks
 
     @staticmethod
     def from_torch(randomize: bool = False, seed: int = 0) -> ShardedBatchSampler:
@@ -488,7 +566,7 @@ class ShardedBatchSampler(Sampler):
         if not self._randomize:
             yield from shard_scan
 
-        random.seed(self._seed)
+        random.seed(self._seed + self._epoch)
         heap = []
         # We want to randomize the incoming sequence.  The normal approach
         # is to pull the whole thing in memory and run fisher-yates.  We
