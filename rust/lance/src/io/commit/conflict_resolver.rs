@@ -1101,7 +1101,7 @@ impl<'a> TransactionRebase<'a> {
                     // For example, if we have new_fri has reuse versions [1, 2, 3]
                     // If committed_fri has versions [2], that means 1 is cleaned up,
                     // then [2, 3] should be retained in the new_fri.
-                    // If comitted_fri is empty, that means everything is cleaned up.
+                    // If committed_fri is empty, that means everything is cleaned up.
                     // then only the last item in committed_fri should be retained, which is [3].
                     // Note that this is under the assumption that the sequence of
                     // conflicting_frag_reuse_indices all come from FRI cleanup rebase.
