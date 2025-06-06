@@ -512,7 +512,7 @@ public class Dataset implements Closeable {
    * @param version the version to check out
    * @return a new Dataset instance with the specified version checked out
    */
-  public Dataset checkout(long version) {
+  public Dataset checkoutVersion(long version) {
     Preconditions.checkArgument(version > 0, "version number must be greater than 0");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");

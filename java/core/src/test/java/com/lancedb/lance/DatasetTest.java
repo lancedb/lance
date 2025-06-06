@@ -209,7 +209,7 @@ public class DatasetTest {
         assertEquals(5, dataset2.countRows());
 
         // checkout the dataset at version 1
-        try (Dataset checkoutV1 = dataset2.checkout(1)) {
+        try (Dataset checkoutV1 = dataset2.checkoutVersion(1)) {
           assertEquals(1, checkoutV1.version());
           assertEquals(2, checkoutV1.latestVersion());
           assertEquals(0, checkoutV1.countRows());
