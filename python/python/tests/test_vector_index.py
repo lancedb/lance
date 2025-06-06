@@ -892,6 +892,16 @@ def test_knn_with_deletions(tmp_path):
     assert expected == [r.as_py() for r in results]
 
 
+def test_metadata_cache_size(tmp_path):
+    lance.write_dataset(create_table(), tmp_path / "test")
+
+    ds = lance.dataset(tmp_path / "test")
+    assert ds.session().size_bytes() > 0
+    
+    ds = lance.dataset(tmp_path / "test", metadata_cache_size_bytes=0)
+    assert ds.session().size_bytes() == 0
+
+
 def test_index_cache_size(tmp_path):
     rng = np.random.default_rng(seed=42)
 

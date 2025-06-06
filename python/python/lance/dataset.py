@@ -220,6 +220,7 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]] = None,
         serialized_manifest: Optional[bytes] = None,
         default_scan_options: Optional[Dict[str, Any]] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -233,6 +234,7 @@ class LanceDataset(pa.dataset.Dataset):
             commit_lock,
             storage_options,
             serialized_manifest,
+            metadata_cache_size_bytes=metadata_cache_size_bytes,
         )
         self._default_scan_options = default_scan_options
 
