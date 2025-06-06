@@ -34,6 +34,8 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -215,6 +217,27 @@ public class FileReaderWriterTest {
       fail("Expected IllegalArgumentException to be thrown");
     } catch (IllegalArgumentException e) {
       assertTrue(e.getMessage().contains("no data provided"));
+    }
+  }
+
+  @Test
+  void testWriteWithStorage() {
+    String filePath = "az://fail_bucket" + tempDir.resolve("test_write_with_storage");
+    BufferAllocator allocator = new RootAllocator();
+    Map<String, String> storageOptions = new HashMap<>();
+    try {
+      LanceFileWriter.open(filePath, allocator, null, storageOptions);
+    } catch (IOException e) {
+      assertTrue(e.getMessage().contains("Account must be specified"));
+    }
+
+    storageOptions.put("account_name", "some_account");
+    storageOptions.put("account_key", "some_key");
+    try {
+      // Verify the config in storage options is worked. The message will change.
+      LanceFileWriter.open(filePath, allocator, null, storageOptions);
+    } catch (IOException e) {
+      assertTrue(e.getMessage().contains("Invalid Access Key"));
     }
   }
 
