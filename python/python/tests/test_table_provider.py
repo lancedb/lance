@@ -6,7 +6,7 @@ import shutil
 import lance
 import numpy as np
 import pandas as pd
-from datafusion import SessionContext
+from datafusion import SessionContext, col
 from lance import FFILanceTableProvider, LanceDataset
 
 
@@ -17,6 +17,7 @@ def test_table_loading():
     shutil.rmtree(lancedb_temp_path, ignore_errors=True)
     df = pd.DataFrame({"col1": [4, 2], "col2": ["a", "b"], "col3": [4.2, 2.4]})
     dataset: LanceDataset = lance.write_dataset(df, lancedb_temp_path)
+    dataset.create_scalar_index("col1", "BTREE")
 
     ffi_lance_table = FFILanceTableProvider(
         dataset, with_row_id=True, with_row_addr=True
@@ -38,3 +39,14 @@ def test_table_loading():
     )
 
     pd.testing.assert_frame_equal(result[0].to_pandas(), expected)
+
+    result = ctx.table("ffi_lance_table").filter(col("col1") == 4).collect()
+    assert len(result) == 1
+
+    result = ctx.table("ffi_lance_table").limit(1).collect()
+    assert len(result) == 1
+    assert result[0]["col1"][0].as_py() == 4
+
+    result = ctx.table("ffi_lance_table").limit(1, offset=1).collect()
+    assert len(result) == 1
+    assert result[0]["col1"][0].as_py() == 2
