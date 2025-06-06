@@ -449,28 +449,61 @@ public class Dataset implements Closeable {
   private native String nativeUri();
 
   /**
+   * Get the currently checked out version id of the dataset
+   *
+   * @return the version id of the dataset
+   */
+  public long version() {
+    return getVersion().getId();
+  }
+
+  /**
    * Gets the currently checked out version of the dataset.
    *
    * @return the version of the dataset
    */
-  public long version() {
+  public Version getVersion() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeVersion();
+      return nativeGetVersion();
     }
   }
 
-  private native long nativeVersion();
+  private native Version nativeGetVersion();
+
+  /**
+   * Get the version history of the dataset.
+   *
+   * @return the version history of the dataset
+   */
+  public List<Version> listVersions() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeListVersions();
+    }
+  }
+
+  private native List<Version> nativeListVersions();
 
   /** @return the latest version of the dataset. */
   public long latestVersion() {
-    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeLatestVersion();
+      return nativeGetLatestVersionId();
     }
   }
 
-  private native long nativeLatestVersion();
+  private native long nativeGetLatestVersionId();
+
+  /** Checkout the dataset to the latest version. */
+  public void checkoutLatest() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeCheckoutLatest();
+    }
+  }
+
+  private native void nativeCheckoutLatest();
 
   /**
    * Checks out a specific version of the dataset. If the version is already checked out, it returns
@@ -480,17 +513,9 @@ public class Dataset implements Closeable {
    * @return a new Dataset instance with the specified version checked out
    */
   public Dataset checkoutVersion(long version) {
-    if (version < 1) {
-      throw new IllegalArgumentException("Version must be greater than 0");
-    }
-
+    Preconditions.checkArgument(version > 0, "version number must be greater than 0");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-
-      if (this.version() == version) {
-        return this;
-      }
-
       return nativeCheckoutVersion(version);
     }
   }
