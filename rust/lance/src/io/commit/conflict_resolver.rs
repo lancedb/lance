@@ -536,9 +536,25 @@ impl<'a> TransactionRebase<'a> {
                                 .push(committed_fri.clone());
                             Ok(())
                         }
-                        // If rewrite defers index remap then it does not conflict with index creation
+                        // If rewrite defers index remap,
+                        // then it does not conflict with index creation
                         (None, Some(_)) => Ok(()),
-                        // If rewrite performs index remap, fail if there are overlapping fragments
+                        // Rewrite with remapping and FRI creation can commit without conflict
+                        (Some(_), None) => {
+                            // this should not happen today since we don't support committing
+                            // a mixture of FRI and other indices.
+                            if new_indices.len() != 1 || removed_indices.len() != 1 {
+                                Err(self.incompatible_conflict_err(
+                                    other_transaction,
+                                    other_version,
+                                    location!(),
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        // Rewrite with remapping will conflict with
+                        // index creation that touches overlapping fragments.
                         (_, None) => {
                             let mut affected_ids = HashSet::new();
                             for index in new_indices {
