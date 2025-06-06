@@ -810,31 +810,6 @@ impl RepDefBuilder {
         self.repdefs.len() == 1 && matches!(self.repdefs[0], RawRepDef::Validity(_))
     }
 
-    /// Return True if any layer has a validity bitmap
-    ///
-    /// Return False if all layers are non-null (the def levels can
-    /// be skipped in this case)
-    pub fn has_nulls(&self) -> bool {
-        self.repdefs.iter().any(|rd| {
-            matches!(
-                rd,
-                RawRepDef::Validity(ValidityDesc {
-                    validity: Some(_),
-                    ..
-                }) | RawRepDef::Fsl(FslDesc {
-                    validity: Some(_),
-                    ..
-                })
-            )
-        })
-    }
-
-    pub fn has_offsets(&self) -> bool {
-        self.repdefs
-            .iter()
-            .any(|rd| matches!(rd, RawRepDef::Offsets(OffsetDesc { .. })))
-    }
-
     /// Registers a nullable validity bitmap
     pub fn add_validity_bitmap(&mut self, validity: NullBuffer) {
         self.check_validity_len(validity.len());
