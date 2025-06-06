@@ -32,7 +32,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
-use fst::{IntoStreamer, Streamer};
+use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
@@ -67,11 +67,11 @@ use super::{
     iter::{PostingListIterator, TokenIterator, TokenSource},
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
-use crate::prefilter::PreFilter;
 use crate::scalar::{
     AnyQuery, IndexReader, IndexStore, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
 };
 use crate::Index;
+use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
@@ -453,15 +453,10 @@ impl InvertedPartition {
         self.tokens.get(token)
     }
 
-    pub fn expand_fuzzy(
-        &self,
-        tokens: &[String],
-        fuzziness: Option<u32>,
-        max_expansions: usize,
-    ) -> Result<Vec<String>> {
-        let mut new_tokens = Vec::with_capacity(min(tokens.len(), max_expansions));
+    pub fn expand_fuzzy(&self, tokens: &[String], params: &FtsSearchParams) -> Result<Vec<String>> {
+        let mut new_tokens = Vec::with_capacity(min(tokens.len(), params.max_expansions));
         for token in tokens {
-            let fuzziness = match fuzziness {
+            let fuzziness = match params.fuzziness {
                 Some(fuzziness) => fuzziness,
                 None => MatchQuery::auto_fuzziness(token),
             };
@@ -470,12 +465,18 @@ impl InvertedPartition {
                     message: format!("failed to construct the fuzzy query: {}", e),
                     location: location!(),
                 })?;
+
             if let TokenMap::Fst(ref map) = self.tokens.tokens {
-                let mut stream = map.search(lev).into_stream();
-                while let Some((token, _)) = stream.next() {
-                    new_tokens.push(String::from_utf8_lossy(token).into_owned());
-                    if new_tokens.len() >= max_expansions {
-                        break;
+                match params.prefix_length {
+                    0 => take_fst_keys(map.search(lev), &mut new_tokens, params.max_expansions),
+                    prefix_length => {
+                        let prefix = &token[..min(prefix_length as usize, token.len())];
+                        let prefix = fst::automaton::Str::new(prefix).starts_with();
+                        take_fst_keys(
+                            map.search(lev.intersection(prefix)),
+                            &mut new_tokens,
+                            params.max_expansions,
+                        )
                     }
                 }
             } else {
@@ -503,7 +504,7 @@ impl InvertedPartition {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let is_phrase_query = params.phrase_slop.is_some();
         let tokens = match is_fuzzy {
-            true => self.expand_fuzzy(tokens, params.fuzziness, params.max_expansions)?,
+            true => self.expand_fuzzy(tokens, params)?,
             false => tokens.to_vec(),
         };
         let mut token_ids = Vec::with_capacity(tokens.len());

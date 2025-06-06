@@ -17,6 +17,8 @@ pub struct FtsSearchParams {
     // None means not a phrase query
     // Some(n) means a phrase query with slop n
     pub phrase_slop: Option<u32>,
+    /// The number of beginning characters being unchanged for fuzzy matching.
+    pub prefix_length: u32,
 }
 
 impl FtsSearchParams {
@@ -27,6 +29,7 @@ impl FtsSearchParams {
             fuzziness: Some(0),
             max_expansions: 50,
             phrase_slop: None,
+            prefix_length: 0,
         }
     }
 
@@ -52,6 +55,11 @@ impl FtsSearchParams {
 
     pub fn with_phrase_slop(mut self, phrase_slop: Option<u32>) -> Self {
         self.phrase_slop = phrase_slop;
+        self
+    }
+
+    pub fn with_prefix_length(mut self, prefix_length: u32) -> Self {
+        self.prefix_length = prefix_length;
         self
     }
 }
@@ -285,6 +293,11 @@ pub struct MatchQuery {
     /// - `Or`: At least one term must match.
     #[serde(default)]
     pub operator: Operator,
+
+    /// The number of beginning characters being unchanged for fuzzy matching.
+    /// Default to 0.
+    #[serde(default)]
+    pub prefix_length: u32,
 }
 
 impl MatchQuery {
@@ -296,6 +309,7 @@ impl MatchQuery {
             fuzziness: Some(0),
             max_expansions: 50,
             operator: Operator::Or,
+            prefix_length: 0,
         }
     }
 
@@ -329,6 +343,11 @@ impl MatchQuery {
 
     pub fn with_operator(mut self, operator: Operator) -> Self {
         self.operator = operator;
+        self
+    }
+
+    pub fn with_prefix_length(mut self, prefix_length: u32) -> Self {
+        self.prefix_length = prefix_length;
         self
     }
 
@@ -719,7 +738,8 @@ mod tests {
             "boost": 2.0,
             "fuzziness": 1,
             "max_expansions": 10,
-            "operator": "And"
+            "operator": "And",
+            "prefix_length": 0,
         });
         assert_eq!(serialized, expected);
 
@@ -735,6 +755,7 @@ mod tests {
         assert_eq!(query.fuzziness, Some(0));
         assert_eq!(query.max_expansions, 50);
         assert_eq!(query.operator, Operator::Or);
+        assert_eq!(query.prefix_length, 0);
     }
 
     #[test]
@@ -745,11 +766,7 @@ mod tests {
         let query = json!({
             "terms": "hello world",
         });
-        let expected = PhraseQuery {
-            column: None,
-            terms: "hello world".to_string(),
-            slop: 0,
-        };
+        let expected = PhraseQuery::new("hello world".to_string());
         let query: PhraseQuery = serde_json::from_value(query).unwrap();
         assert_eq!(query, expected);
 
@@ -758,11 +775,9 @@ mod tests {
             "column": "text",
             "slop": 2,
         });
-        let expected = PhraseQuery {
-            column: Some("text".to_string()),
-            terms: "hello world".to_string(),
-            slop: 2,
-        };
+        let expected = PhraseQuery::new("hello world".to_string())
+            .with_column(Some("text".to_string()))
+            .with_slop(2);
         let query: PhraseQuery = serde_json::from_value(query).unwrap();
         assert_eq!(query, expected);
     }

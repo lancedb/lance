@@ -660,6 +660,16 @@ def test_fts_fuzzy_query(tmp_path):
     )
     assert results.num_rows == 3
 
+    # prefix matching
+    results = ds.to_table(
+        full_text_query=MatchQuery("foo", "text", fuzziness=1, prefix_length=3)
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "foo",
+        "food",
+    }
+
 
 def test_fts_phrase_query(tmp_path):
     data = pa.table(

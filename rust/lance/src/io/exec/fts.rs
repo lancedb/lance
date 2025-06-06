@@ -217,7 +217,8 @@ impl ExecutionPlan for MatchQueryExec {
             let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
             let params = params
                 .with_fuzziness(query.fuzziness)
-                .with_max_expansions(query.max_expansions);
+                .with_max_expansions(query.max_expansions)
+                .with_prefix_length(query.prefix_length);
             let mut tokenizer = match is_fuzzy {
                 false => inverted_idx.tokenizer(),
                 true => tantivy::tokenizer::TextAnalyzer::from(

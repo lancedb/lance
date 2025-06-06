@@ -96,6 +96,7 @@ class MatchQuery(FullTextQuery):
         fuzziness: int = 0,
         max_expansions: int = 50,
         operator: FullTextOperator = FullTextOperator.OR,
+        prefix_length: int = 0,
     ):
         """
         Match query for full-text search.
@@ -119,6 +120,14 @@ class MatchQuery(FullTextQuery):
         max_expansions : int, optional
             The maximum number of terms to consider for fuzzy matching.
             Defaults to 50.
+        operator : FullTextOperator, default OR
+            The operator to use for combining the query results.
+            Can be either `AND` or `OR`.
+            If `AND`, all terms in the query must match.
+            If `OR`, at least one term in the query must match.
+        prefix_length : int, default 0
+            The number of beginning characters being unchanged for fuzzy matching.
+            This is useful to achieve prefix matching.
         """
         self._inner = PyFullTextQuery.match_query(
             query,
@@ -127,6 +136,7 @@ class MatchQuery(FullTextQuery):
             fuzziness=fuzziness,
             max_expansions=max_expansions,
             operator=operator.value,
+            prefix_length=prefix_length,
         )
 
     def query_type(self) -> FullTextQueryType:
