@@ -7,7 +7,7 @@ use crate::{
     dataset::transaction::{Operation, Transaction},
     Dataset,
 };
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use lance_core::{
     utils::{deletion::DeletionVector, mask::RowIdTreeMap},
     Error, Result,
@@ -367,9 +367,9 @@ impl<'a> TransactionRebase<'a> {
                     // triggers a CreateIndex, and it needs to add the new reuse
                     // version created by the rewrite
                     if let Some(committed_fri) = frag_reuse_index {
-                        if let Some(_) = new_indices
+                        if new_indices
                             .iter()
-                            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                            .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
                         {
                             // this should not happen today since we don't support committing
                             // a mixture of fri and other indices.
@@ -988,10 +988,9 @@ impl<'a> TransactionRebase<'a> {
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
         if let Operation::CreateIndex { new_indices, .. } = &mut self.transaction.operation {
-            if new_indices
+            if !new_indices
                 .iter()
-                .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-                .is_none()
+                .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
             {
                 return Ok(self.transaction);
             }
@@ -1001,23 +1000,22 @@ impl<'a> TransactionRebase<'a> {
             }
 
             // had at least 1 previous rewrite conflict
-            let max_versions = stream::iter(&self.conflicting_frag_reuse_indices)
-                .map(|committed_fri| async move {
-                    let committed_fri_details = Arc::try_unwrap(
-                        load_frag_reuse_index_details(dataset, committed_fri)
-                            .await
-                            .unwrap(),
-                    )
+            // get the max reuse version from each run to be added to the cleaned up index
+            let mut max_versions = Vec::with_capacity(self.conflicting_frag_reuse_indices.len());
+            for committed_fri in &self.conflicting_frag_reuse_indices {
+                let committed_fri_details = Arc::try_unwrap(
+                    load_frag_reuse_index_details(dataset, committed_fri)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                let max_version = committed_fri_details
+                    .versions
+                    .into_iter()
+                    .max_by_key(|v| v.dataset_version)
                     .unwrap();
-                    committed_fri_details
-                        .versions
-                        .into_iter()
-                        .max_by_key(|v| v.dataset_version)
-                        .unwrap()
-                })
-                .buffer_unordered(dataset.object_store.io_parallelism())
-                .collect::<Vec<_>>()
-                .await;
+                max_versions.push(max_version);
+            }
 
             // there should be only 1 FRI in new indices
             let new_fri = &new_indices[0];
@@ -1037,7 +1035,7 @@ impl<'a> TransactionRebase<'a> {
 
             let new_fri_meta = build_frag_reuse_index_metadata(
                 dataset,
-                Some(&new_fri),
+                Some(new_fri),
                 new_fri_details,
                 new_frag_bitmap,
             )
@@ -1101,7 +1099,7 @@ impl<'a> TransactionRebase<'a> {
 
                 let new_fri_meta = build_frag_reuse_index_metadata(
                     dataset,
-                    Some(&new_fri),
+                    Some(new_fri),
                     new_fri_details,
                     new_frag_bitmap,
                 )
