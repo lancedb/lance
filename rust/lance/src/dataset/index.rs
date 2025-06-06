@@ -6,15 +6,15 @@ pub mod frag_reuse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::index::remap_index;
+use crate::Dataset;
 use async_trait::async_trait;
 use lance_core::Result;
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::DatasetIndexExt;
 use lance_table::format::Index;
 use serde::{Deserialize, Serialize};
-
-use crate::index::remap_index;
-use crate::Dataset;
 
 use super::optimize::{IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
@@ -58,12 +58,13 @@ impl IndexRemapper for DatasetIndexRemapper {
         let indices = self.dataset.load_indices().await?;
         let mut remapped = Vec::with_capacity(indices.len());
         for index in indices.iter() {
-            let needs_remapped = match &index.fragment_bitmap {
-                None => true,
-                Some(fragment_bitmap) => fragment_bitmap
-                    .iter()
-                    .any(|frag_idx| affected_frag_ids.contains(&(frag_idx as u64))),
-            };
+            let needs_remapped = index.name != FRAG_REUSE_INDEX_NAME
+                && match &index.fragment_bitmap {
+                    None => true,
+                    Some(fragment_bitmap) => fragment_bitmap
+                        .iter()
+                        .any(|frag_idx| affected_frag_ids.contains(&(frag_idx as u64))),
+                };
             if needs_remapped {
                 remapped.push(self.remap_index(index, &mapping).await?);
             }

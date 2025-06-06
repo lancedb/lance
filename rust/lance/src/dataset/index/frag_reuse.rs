@@ -221,6 +221,7 @@ mod tests {
         );
 
         // Cleanup frag reuse index and check there is no reuse version
+        let mut dataset_clone = dataset.clone();
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
         let Some(frag_reuse_index_meta) = dataset
             .load_index_by_name(FRAG_REUSE_INDEX_NAME)
@@ -233,5 +234,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(frag_reuse_details.versions.len(), 0);
+
+        // Try doing a concurrent cleanup should fail with conflict
+        assert!(matches!(
+            cleanup_frag_reuse_index(&mut dataset_clone).await,
+            Err(Error::RetryableCommitConflict { .. })
+        ));
     }
 }
