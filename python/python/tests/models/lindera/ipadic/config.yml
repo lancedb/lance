@@ -1,0 +1,4 @@
+segmenter:
+  mode: "normal"
+  dictionary:
+    kind: "ipadic"
