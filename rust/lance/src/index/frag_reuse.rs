@@ -145,7 +145,7 @@ pub async fn build_new_frag_reuse_index(
 }
 
 pub(crate) async fn build_frag_reuse_index_metadata(
-    dataset: &mut Dataset,
+    dataset: &Dataset,
     index_meta: Option<&Index>,
     new_index_details: FragReuseIndexDetails,
     new_fragment_bitmap: RoaringBitmap,
