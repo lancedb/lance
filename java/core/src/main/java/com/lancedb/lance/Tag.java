@@ -15,40 +15,37 @@ package com.lancedb.lance;
 
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
-import java.time.ZonedDateTime;
 import java.util.Objects;
-import java.util.SortedMap;
-import java.util.TreeMap;
 
-public class Version {
-  private final long id;
-  private final ZonedDateTime dataTime;
-  private final SortedMap<String, String> metadata;
+public class Tag {
+  private final String name;
+  private final long version;
+  private final int manifestSize;
 
-  public Version(long id, ZonedDateTime dataTime, TreeMap<String, String> metadata) {
-    this.id = id;
-    this.dataTime = dataTime;
-    this.metadata = metadata;
+  public Tag(String name, long version, int manifestSize) {
+    this.name = name;
+    this.version = version;
+    this.manifestSize = manifestSize;
   }
 
-  public ZonedDateTime getDataTime() {
-    return dataTime;
+  public String getName() {
+    return name;
   }
 
-  public SortedMap<String, String> getMetadata() {
-    return metadata;
+  public long getVersion() {
+    return version;
   }
 
-  public long getId() {
-    return id;
+  public int getManifestSize() {
+    return manifestSize;
   }
 
   @Override
   public String toString() {
     return new ToStringBuilder(this)
-        .append("id", id)
-        .append("dataTime", dataTime)
-        .append("metadata", metadata)
+        .append("name", name)
+        .append("version", version)
+        .append("manifestSize", manifestSize)
         .toString();
   }
 
@@ -60,14 +57,14 @@ public class Version {
     if (o == null || getClass() != o.getClass()) {
       return false;
     }
-    Version version = (Version) o;
-    return id == version.id
-        && Objects.equals(dataTime, version.dataTime)
-        && Objects.equals(metadata, version.metadata);
+    Tag tag = (Tag) o;
+    return version == tag.version
+        && manifestSize == tag.manifestSize
+        && Objects.equals(name, tag.name);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(id, dataTime, metadata);
+    return Objects.hash(name, version, manifestSize);
   }
 }

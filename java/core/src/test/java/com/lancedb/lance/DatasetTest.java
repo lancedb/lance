@@ -219,6 +219,57 @@ public class DatasetTest {
   }
 
   @Test
+  void testDatasetTags() {
+    String datasetPath = tempDir.resolve("dataset_tags").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      // version 1, empty dataset
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(1, dataset.version());
+        dataset.tags().create("tag1", 1);
+        assertEquals(1, dataset.tags().list().size());
+        assertEquals(1, dataset.tags().list().get(0).getVersion());
+        assertEquals(1, dataset.tags().getVersion("tag1"));
+      }
+
+      // write first batch of data, version 2
+      try (Dataset dataset2 = testDataset.write(1, 5)) {
+        assertEquals(2, dataset2.version());
+        assertEquals(1, dataset2.tags().list().size());
+        assertEquals(1, dataset2.tags().list().get(0).getVersion());
+        assertEquals(1, dataset2.tags().getVersion("tag1"));
+        dataset2.tags().create("tag2", 2);
+        assertEquals(2, dataset2.tags().list().size());
+        assertEquals(1, dataset2.tags().getVersion("tag1"));
+        assertEquals(2, dataset2.tags().getVersion("tag2"));
+        dataset2.tags().update("tag2", 1);
+        assertEquals(2, dataset2.tags().list().size());
+        assertEquals(1, dataset2.tags().list().get(0).getVersion());
+        assertEquals(1, dataset2.tags().list().get(1).getVersion());
+        assertEquals(1, dataset2.tags().getVersion("tag1"));
+        assertEquals(1, dataset2.tags().getVersion("tag2"));
+        dataset2.tags().delete("tag2");
+        assertEquals(1, dataset2.tags().list().size());
+        assertEquals(1, dataset2.tags().list().get(0).getVersion());
+        assertEquals(1, dataset2.tags().getVersion("tag1"));
+        assertThrows(RuntimeException.class, () -> dataset2.tags().getVersion("tag2"));
+
+        // checkout the dataset at version 1
+        try (Dataset checkoutV1 = dataset2.checkoutTag("tag1")) {
+          assertEquals(1, checkoutV1.version());
+          assertEquals(2, checkoutV1.latestVersion());
+          assertEquals(0, checkoutV1.countRows());
+          assertEquals(1, checkoutV1.tags().list().size());
+          assertEquals(1, checkoutV1.tags().list().get(0).getVersion());
+          assertEquals(1, checkoutV1.tags().getVersion("tag1"));
+        }
+      }
+    }
+  }
+
+  @Test
   void testDatasetUri() {
     String datasetPath = tempDir.resolve("dataset_uri").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
