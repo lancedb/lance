@@ -1426,8 +1426,8 @@ fn inner_update_tag(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetVersionByTag<'local>(
-    mut env: JNIEnv<'local>,
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetVersionByTag(
+    mut env: JNIEnv,
     java_dataset: JObject,
     jtag_name: JString,
 ) -> jlong {
