@@ -286,7 +286,7 @@ impl ScalarIndex for BitmapIndex {
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        let state = self
+        let mut state = self
             .index_map
             .iter()
             .map(|(key, bitmap)| {
@@ -301,6 +301,17 @@ impl ScalarIndex for BitmapIndex {
                 (key.0.clone(), bitmap)
             })
             .collect::<HashMap<_, _>>();
+
+        let null_map =
+            RowIdTreeMap::from_iter(self.null_map.row_ids().unwrap().filter_map(|addr| {
+                let addr_as_u64 = u64::from(addr);
+                mapping
+                    .get(&addr_as_u64)
+                    .copied()
+                    .unwrap_or(Some(addr_as_u64))
+            }));
+        state.insert(ScalarValue::try_from(&self.value_type)?, null_map);
+
         write_bitmap_index(state, dest_store, &self.value_type).await
     }
 
@@ -444,6 +455,21 @@ pub async fn train_bitmap_index(
 
 #[cfg(test)]
 pub mod tests {
+    use crate::scalar::bitmap::BitmapIndex;
+    use crate::scalar::btree::OrderableScalarValue;
+    use crate::scalar::lance_format::LanceIndexStore;
+    use crate::scalar::ScalarIndex;
+    use arrow_schema::DataType;
+    use datafusion_common::ScalarValue;
+    use lance_core::cache::FileMetadataCache;
+    use lance_core::utils::address::RowAddress;
+    use lance_core::utils::mask::RowIdTreeMap;
+    use lance_io::object_store::ObjectStore;
+    use object_store::path::Path;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
     #[tokio::test]
     #[ignore]
     async fn test_big_bitmap_index() {
@@ -583,5 +609,113 @@ pub mod tests {
         }
 
         tracing::info!("Test successful! Index properly contains {} keys", m);
+    }
+
+    #[tokio::test]
+    async fn test_remap_bitmap_with_null() {
+        // Create a temporary store.
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            FileMetadataCache::no_cache(),
+        ));
+
+        // Simulate a bitmap where:
+        // frag 1 - { 0: null, 1: null, 2: 1 }
+        // frag 2 - { 0: 1, 1: 2, 2: 2 }
+        let mut null_map = RowIdTreeMap::new();
+        null_map.insert(RowAddress::new_from_parts(1, 0).into());
+        null_map.insert(RowAddress::new_from_parts(1, 1).into());
+
+        let mut scalar_value1 = RowIdTreeMap::new();
+        scalar_value1.insert(RowAddress::new_from_parts(1, 2).into());
+        scalar_value1.insert(RowAddress::new_from_parts(2, 0).into());
+
+        let mut scalar_value2 = RowIdTreeMap::new();
+        scalar_value2.insert(RowAddress::new_from_parts(2, 1).into());
+        scalar_value2.insert(RowAddress::new_from_parts(2, 2).into());
+
+        let mut index_map = BTreeMap::new();
+        index_map.insert(
+            OrderableScalarValue(ScalarValue::UInt32(Some(1))),
+            scalar_value1,
+        );
+        index_map.insert(
+            OrderableScalarValue(ScalarValue::UInt32(Some(2))),
+            scalar_value2,
+        );
+
+        // Create a bitmap index
+        let bitmap_index = BitmapIndex::new(
+            index_map,
+            null_map,
+            DataType::UInt32,
+            0, // not used
+            test_store.clone(),
+        );
+
+        // Simulating a compaction that compacts all frags to frag 3
+        let mut row_addr_map = HashMap::<u64, Option<u64>>::new();
+        row_addr_map.insert(
+            RowAddress::new_from_parts(1, 0).into(),
+            Some(RowAddress::new_from_parts(3, 0).into()),
+        );
+        row_addr_map.insert(
+            RowAddress::new_from_parts(1, 1).into(),
+            Some(RowAddress::new_from_parts(3, 1).into()),
+        );
+        row_addr_map.insert(
+            RowAddress::new_from_parts(1, 2).into(),
+            Some(RowAddress::new_from_parts(3, 2).into()),
+        );
+        row_addr_map.insert(
+            RowAddress::new_from_parts(2, 0).into(),
+            Some(RowAddress::new_from_parts(3, 3).into()),
+        );
+        row_addr_map.insert(
+            RowAddress::new_from_parts(2, 1).into(),
+            Some(RowAddress::new_from_parts(3, 4).into()),
+        );
+        row_addr_map.insert(
+            RowAddress::new_from_parts(2, 2).into(),
+            Some(RowAddress::new_from_parts(3, 5).into()),
+        );
+
+        // Perform remap
+        bitmap_index
+            .remap(&row_addr_map, test_store.as_ref())
+            .await
+            .unwrap();
+
+        // Reload and check
+        let reloaded_idx = BitmapIndex::load(test_store)
+            .await
+            .expect("Failed to load bitmap index");
+
+        let mut expected_null_map = RowIdTreeMap::new();
+        expected_null_map.insert(RowAddress::new_from_parts(3, 0).into());
+        expected_null_map.insert(RowAddress::new_from_parts(3, 1).into());
+        assert_eq!(reloaded_idx.null_map, expected_null_map);
+
+        let mut expected_scalar_value1 = RowIdTreeMap::new();
+        expected_scalar_value1.insert(RowAddress::new_from_parts(3, 2).into());
+        expected_scalar_value1.insert(RowAddress::new_from_parts(3, 3).into());
+
+        let mut expected_scalar_value2 = RowIdTreeMap::new();
+        expected_scalar_value2.insert(RowAddress::new_from_parts(3, 4).into());
+        expected_scalar_value2.insert(RowAddress::new_from_parts(3, 5).into());
+
+        let mut expected_index_map = BTreeMap::new();
+        expected_index_map.insert(
+            OrderableScalarValue(ScalarValue::UInt32(Some(1))),
+            expected_scalar_value1,
+        );
+        expected_index_map.insert(
+            OrderableScalarValue(ScalarValue::UInt32(Some(2))),
+            expected_scalar_value2,
+        );
+
+        assert_eq!(reloaded_idx.index_map, expected_index_map);
     }
 }
