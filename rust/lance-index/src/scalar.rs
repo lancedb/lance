@@ -36,6 +36,7 @@ pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
 
+use crate::frag_reuse::FragReuseIndex;
 pub use inverted::tokenizer::InvertedIndexParams;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
@@ -598,7 +599,10 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     fn can_answer_exact(&self, query: &dyn AnyQuery) -> bool;
 
     /// Load the scalar index from storage
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<Self>>
     where
         Self: Sized;
 

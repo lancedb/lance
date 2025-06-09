@@ -15,9 +15,11 @@ pub mod utils;
 #[cfg(test)]
 mod fixture_test;
 
+use self::{ivf::*, pq::PQIndex};
 use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
+use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
@@ -44,8 +46,6 @@ use tempfile::tempdir;
 use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
-
-use self::{ivf::*, pq::PQIndex};
 
 use super::{pb, DatasetIndexInternalExt, IndexParams};
 use crate::{dataset::Dataset, index::pb::vector_index_stage::Stage, Error, Result};
@@ -448,6 +448,7 @@ pub(crate) async fn open_vector_index(
     uuid: &str,
     vec_idx: &lance_index::pb::VectorIndex,
     reader: Arc<dyn Reader>,
+    fri: Option<Arc<FragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();
 
@@ -489,7 +490,7 @@ pub(crate) async fn open_vector_index(
                     });
                 };
                 let pq = ProductQuantizer::from_proto(pq_proto, metric_type)?;
-                last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
+                last_stage = Some(Arc::new(PQIndex::new(pq, metric_type, fri.clone())));
             }
             Some(Stage::Diskann(_)) => {
                 return Err(Error::Index {
@@ -517,6 +518,7 @@ pub(crate) async fn open_vector_index_v2(
     column: &str,
     uuid: &str,
     reader: FileReader,
+    fri: Option<Arc<FragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let index_metadata = reader
         .schema()

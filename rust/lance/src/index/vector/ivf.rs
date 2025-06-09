@@ -9,6 +9,18 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
+use super::{
+    pq::{build_pq_model, PQIndex},
+    utils::maybe_sample_training_data,
+};
+use crate::dataset::builder::DatasetBuilder;
+use crate::index::vector::utils::{get_vector_dim, get_vector_type};
+use crate::{
+    dataset::Dataset,
+    index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
+    session::Session,
+};
 use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
 use arrow_array::{
@@ -77,19 +89,6 @@ use serde_json::json;
 use snafu::location;
 use tracing::instrument;
 use uuid::Uuid;
-
-use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
-use super::{
-    pq::{build_pq_model, PQIndex},
-    utils::maybe_sample_training_data,
-};
-use crate::dataset::builder::DatasetBuilder;
-use crate::index::vector::utils::{get_vector_dim, get_vector_type};
-use crate::{
-    dataset::Dataset,
-    index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
-    session::Session,
-};
 
 pub mod builder;
 pub mod io;

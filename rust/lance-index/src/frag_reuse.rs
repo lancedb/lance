@@ -2,13 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::{Index, IndexType};
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
+use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt64Array};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
 use lance_table::format::{pb, ExternalFile, Fragment};
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::{any::Any, collections::HashMap, sync::Arc};
@@ -113,6 +117,132 @@ impl FragReuseIndex {
             row_id_maps,
             details,
         }
+    }
+
+    pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
+        let mut mapped_value = Some(row_id);
+        for row_id_map in self.row_id_maps.iter() {
+            if mapped_value.is_some() {
+                mapped_value = row_id_map
+                    .get(&mapped_value.unwrap())
+                    .copied()
+                    .unwrap_or(mapped_value);
+            }
+        }
+
+        mapped_value
+    }
+
+    pub fn remap_row_ids_tree_map(&self, row_ids: &RowIdTreeMap) -> RowIdTreeMap {
+        RowIdTreeMap::from_iter(row_ids.row_ids().unwrap().filter_map(|addr| {
+            let addr_as_u64 = u64::from(addr);
+
+            let mut mapped_value = Some(addr_as_u64);
+            for row_id_map in self.row_id_maps.iter() {
+                if mapped_value.is_some() {
+                    mapped_value = row_id_map
+                        .get(&mapped_value.unwrap())
+                        .copied()
+                        .unwrap_or(mapped_value);
+                }
+            }
+
+            mapped_value
+        }))
+    }
+
+    pub fn remap_row_ids_roaring_tree_map(&self, row_ids: &RoaringTreemap) -> RoaringTreemap {
+        RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| {
+            let mut mapped_value = Some(addr);
+            for row_id_map in self.row_id_maps.iter() {
+                if mapped_value.is_some() {
+                    mapped_value = row_id_map
+                        .get(&mapped_value.unwrap())
+                        .copied()
+                        .unwrap_or(mapped_value);
+                }
+            }
+
+            mapped_value
+        }))
+    }
+
+    pub fn remap_row_ids_record_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        let row_ids = batch.column(1).as_primitive::<UInt64Type>();
+        let val_idx_and_new_id = row_ids
+            .values()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, old_id)| {
+                let mut new_id = Some(*old_id);
+                for row_id_map in self.row_id_maps.iter() {
+                    if new_id.is_some() {
+                        new_id = row_id_map.get(&new_id.unwrap()).copied().unwrap_or(new_id);
+                    }
+                }
+                new_id.map(|new_id| (idx, new_id))
+            })
+            .collect::<Vec<_>>();
+        let new_ids = Arc::new(UInt64Array::from_iter_values(
+            val_idx_and_new_id.iter().copied().map(|(_, new_id)| new_id),
+        ));
+        let new_val_indices = UInt64Array::from_iter_values(
+            val_idx_and_new_id
+                .into_iter()
+                .map(|(val_idx, _)| val_idx as u64),
+        );
+        let new_vals = arrow_select::take::take(batch.column(0), &new_val_indices, None)?;
+        Ok(RecordBatch::try_new(
+            batch.schema(),
+            vec![new_vals, new_ids],
+        )?)
+    }
+
+    pub fn remap_row_ids_array(&self, array: ArrayRef) -> PrimitiveArray<UInt64Type> {
+        let primitive_array = array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<UInt64Type>>()
+            .expect("expected row IDs to be uint64 array");
+        (0..primitive_array.len())
+            .map(|i| {
+                if primitive_array.is_null(i) {
+                    None
+                } else {
+                    self.remap_row_id(primitive_array.value(i))
+                }
+            })
+            .collect()
+    }
+
+    pub fn remap_fragment_bitmap(&self, fragment_bitmap: &mut RoaringBitmap) -> Result<()> {
+        for version in self.details.versions.iter() {
+            if fragment_bitmap.contains(version.old_frags[0].id as u32) {
+                let mut removed = 0;
+                for old_frag in version.old_frags.iter() {
+                    if fragment_bitmap.remove(old_frag.id as u32) {
+                        removed += 1;
+                    }
+                }
+
+                if removed > 0 {
+                    if removed != version.old_frags.len() {
+                        // This should never happen because we always commit a full rewrite group
+                        // and we always reindex either the entire group or nothing.
+                        // We use invalid input to be consistent with
+                        // dataset::transaction::recalculate_fragment_bitmap
+                        return Err(Error::invalid_input(
+                            format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
+                                    version.old_frags.iter().map(|frag| frag.id).collect::<Vec<_>>()),
+                            location!()));
+                    }
+
+                    for new_frag in version.new_frags.iter() {
+                        fragment_bitmap.insert(*new_frag as u32);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
