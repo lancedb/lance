@@ -270,6 +270,47 @@ public class DatasetTest {
   }
 
   @Test
+  void testDatasetRestore() {
+    String datasetPath = tempDir.resolve("dataset_restore").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      // version 1, empty dataset
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(1, dataset.version());
+        assertEquals(1, dataset.latestVersion());
+        assertEquals(0, dataset.countRows());
+      }
+      // write first batch of data, version 2
+      try (Dataset dataset2 = testDataset.write(1, 5)) {
+        assertEquals(2, dataset2.version());
+        assertEquals(2, dataset2.latestVersion());
+        assertEquals(5, dataset2.countRows());
+        dataset2.tags().create("tag1", 2);
+        try (Dataset dataset3 = dataset2.checkoutVersion(1)) {
+          assertEquals(1, dataset3.version());
+          assertEquals(2, dataset3.latestVersion());
+          assertEquals(0, dataset3.countRows());
+          dataset3.restore();
+          assertEquals(3, dataset3.version());
+          assertEquals(3, dataset3.latestVersion());
+          assertEquals(0, dataset3.countRows());
+
+          try (Dataset dataset4 = dataset3.checkoutTag("tag1")) {
+            assertEquals(2, dataset4.version());
+            assertEquals(3, dataset4.latestVersion());
+            assertEquals(5, dataset4.countRows());
+            dataset4.restore();
+            assertEquals(4, dataset4.version());
+            assertEquals(4, dataset4.latestVersion());
+            assertEquals(5, dataset4.countRows());
+          }
+        }
+      }
+    }
+  }
+
+  @Test
   void testDatasetUri() {
     String datasetPath = tempDir.resolve("dataset_uri").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {

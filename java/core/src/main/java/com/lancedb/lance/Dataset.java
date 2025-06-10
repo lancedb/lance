@@ -540,6 +540,19 @@ public class Dataset implements Closeable {
   private native Dataset nativeCheckoutTag(String tag);
 
   /**
+   * Restore the currently checked out version of the dataset as the latest version. This operation
+   * produces a new version and doesn't influence any old versions and tags.
+   */
+  public void restore() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeRestore();
+    }
+  }
+
+  private native void nativeRestore();
+
+  /**
    * Creates a new index on the dataset. Only vector indexes are supported.
    *
    * @param columns the columns to index from
