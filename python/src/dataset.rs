@@ -1714,6 +1714,20 @@ impl Dataset {
         )));
         Ok(PyArrowType(reader))
     }
+
+    #[pyo3(signature = (upsert_values))]
+    fn update_config(&mut self, upsert_values: &Bound<'_, PyDict>) -> PyResult<()> {
+        let upsert: HashMap<String, String> = upsert_values
+            .iter()
+            .map(|(k, v)| Ok((k.extract::<String>()?, v.extract::<String>()?)))
+            .collect::<PyResult<_>>()?;
+
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.update_config(upsert))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
 }
 
 #[derive(FromPyObject)]
