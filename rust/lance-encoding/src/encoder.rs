@@ -851,8 +851,22 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                     } else {
                         Ok(Box::new(BinaryMiniBlockEncoder::default()))
                     }
+                } else if variable_width_data.bits_per_offset == 64 {
+                    // Same logic as 32-bit offsets but for 64-bit LargeBinary/LargeUtf8 types
+                    let data_size =
+                        variable_width_data.expect_single_stat::<UInt64Type>(Stat::DataSize);
+                    let max_len =
+                        variable_width_data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
+
+                    if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
+                        && data_size >= FSST_LEAST_INPUT_SIZE as u64
+                    {
+                        Ok(Box::new(FsstMiniBlockEncoder::default()))
+                    } else {
+                        Ok(Box::new(BinaryMiniBlockEncoder::default()))
+                    }
                 } else {
-                    todo!("Implement MiniBlockCompression for VariableWidth DataBlock with 64 bits offsets.")
+                    todo!("Implement MiniBlockCompression for VariableWidth DataBlock with {} bits offsets.", variable_width_data.bits_per_offset)
                 }
             }
             DataBlock::Struct(struct_data_block) => {
