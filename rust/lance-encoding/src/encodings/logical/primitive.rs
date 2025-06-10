@@ -3919,11 +3919,6 @@ impl PrimitiveStructuralEncoder {
             todo!()
         }
 
-        // The top-level validity is encoded in repdef so we can remove it.  There may be inner
-        // validities if we have FSL fields but those are not included in the repdef and need to
-        // be encoded.
-        let data = data.remove_outer_validity();
-
         let num_items = data.num_values();
 
         let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
@@ -4236,9 +4231,6 @@ impl PrimitiveStructuralEncoder {
             .as_ref()
             .map_or(0, |d| d.iter().max().copied().unwrap_or(0));
 
-        // The top-level validity is encoded in repdef so we can remove it
-        let data = data.remove_outer_validity();
-
         // To handle FSL we just flatten
         // let data = data.flatten();
 
@@ -4466,6 +4458,9 @@ impl PrimitiveStructuralEncoder {
                         panic!("packed struct encoding currently only supports fixed-width fields.")
                     }
                 }
+
+                // The top-level validity is encoded in repdef so we can remove it.
+                let data_block = data_block.remove_outer_validity();
 
                 let dictionary_encoding_threshold: u64 = 100.max(data_block.num_values() / 4);
                 let cardinality =
