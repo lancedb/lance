@@ -1227,7 +1227,7 @@ impl FsstDecoder {
 
 /// This is the public API for the FSST compression, when the in_buf is less than FSST_LEAST_INPUT_SIZE, we put the FSST_MAGIC header and then copy the input to the output
 /// we check to make sure the out_buf's size is at least the same as the in_buf's size, otherwise Err is returned, this is actually
-/// risky as in some ramdomly generated data, the output size can be larger than the input size.
+/// risky as in some randomly generated data, the output size can be larger than the input size.
 /// the out_offsets_buf should be at least the same size as the in_offsets_buf, otherwise Err is returned
 /// the symbol_table is used to store the symbol table created by `compression`, it's size should be FSST_SYMBOL_TABLE_SIZE
 /// after compression, the first 64 bits of the output buffer is the fsst header:
