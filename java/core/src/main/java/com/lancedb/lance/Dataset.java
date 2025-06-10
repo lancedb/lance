@@ -507,7 +507,7 @@ public class Dataset implements Closeable {
 
   /**
    * Checks out a specific version of the dataset. If the version is already checked out, it returns
-   * the current instance.
+   * a new Java Dataset object pointing to the same underlying Rust Dataset object
    *
    * @param version the version to check out
    * @return a new Dataset instance with the specified version checked out
@@ -521,6 +521,23 @@ public class Dataset implements Closeable {
   }
 
   private native Dataset nativeCheckoutVersion(long version);
+
+  /**
+   * Checks out a specific tag of the dataset. If the underlying version is already checked out, it
+   * returns a new Java Dataset object pointing to the same underlying Rust Dataset object
+   *
+   * @param tag
+   * @return
+   */
+  public Dataset checkoutTag(String tag) {
+    Preconditions.checkArgument(tag != null, "Tag can not be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCheckoutTag(tag);
+    }
+  }
+
+  private native Dataset nativeCheckoutTag(String tag);
 
   /**
    * Creates a new index on the dataset. Only vector indexes are supported.
@@ -686,4 +703,91 @@ public class Dataset implements Closeable {
   }
 
   private native FragmentMetadata getFragmentNative(int fragmentId);
+
+  /**
+   * Returns a {@link Tags} instance for performing tag-related operations on the dataset.
+   *
+   * @return new {@code Tags} instance for dataset tag operations
+   * @see Tags
+   */
+  public Tags tags() {
+    return new Tags();
+  }
+
+  /** Tag operations of the dataset. */
+  public class Tags {
+
+    /**
+     * Create a new tag for this dataset.
+     *
+     * @param tag the tag name
+     * @param version the version to tag
+     */
+    public void create(String tag, long version) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeCreateTag(tag, version);
+      }
+    }
+
+    /**
+     * Delete a tag from this dataset.
+     *
+     * @param tag the tag name
+     */
+    public void delete(String tag) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeDeleteTag(tag);
+      }
+    }
+
+    /**
+     * Update a tag to a new version for the dataset.
+     *
+     * @param tag the tag name
+     * @param version the version to tag
+     */
+    public void update(String tag, long version) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeUpdateTag(tag, version);
+      }
+    }
+
+    /**
+     * List all tags of the dataset.
+     *
+     * @return a list of tags
+     */
+    public List<Tag> list() {
+      try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        return nativeListTags();
+      }
+    }
+
+    /**
+     * Get the version of a tag in the dataset.
+     *
+     * @param tag the tag name
+     * @return the version of the tag
+     */
+    public long getVersion(String tag) {
+      try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        return nativeGetVersionByTag(tag);
+      }
+    }
+  }
+
+  private native void nativeCreateTag(String tag, long version);
+
+  private native void nativeDeleteTag(String tag);
+
+  private native void nativeUpdateTag(String tag, long version);
+
+  private native List<Tag> nativeListTags();
+
+  private native long nativeGetVersionByTag(String tag);
 }
