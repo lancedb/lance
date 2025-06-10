@@ -178,6 +178,11 @@ impl BlockingDataset {
         Ok(())
     }
 
+    pub fn restore(&mut self) -> Result<()> {
+        RT.block_on(self.inner.restore())?;
+        Ok(())
+    }
+
     pub fn list_tags(&self) -> Result<HashMap<String, TagContents>> {
         let tags = RT.block_on(self.inner.tags.list())?;
         Ok(tags)
@@ -872,6 +877,20 @@ fn inner_checkout_tag<'local>(
     };
 
     new_dataset.into_java(env)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeRestore(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) {
+    ok_or_throw_without_return!(env, inner_restore(&mut env, java_dataset))
+}
+
+fn inner_restore(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.restore()
 }
 
 #[no_mangle]
