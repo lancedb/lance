@@ -829,6 +829,15 @@ impl CoreFieldDecoderStrategy {
                 column_infos.next_top_level();
                 Ok(scheduler)
             }
+            DataType::LargeBinary | DataType::LargeUtf8 => {
+                let column_info = column_infos.expect_next()?;
+                let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
+                    column_info.as_ref(),
+                    self.decompressor_strategy.as_ref(),
+                )?);
+                column_infos.next_top_level();
+                Ok(scheduler)
+            }
             DataType::List(_) | DataType::LargeList(_) => {
                 let child = field
                     .children
