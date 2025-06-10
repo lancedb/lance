@@ -13,7 +13,7 @@ use lance::session::Session as LanceSession;
 #[pyclass(name = "_Session", module = "_lib")]
 #[derive(Clone)]
 pub struct Session {
-    inner: Arc<LanceSession>,
+    pub inner: Arc<LanceSession>,
 }
 
 impl Session {
@@ -27,5 +27,10 @@ impl Session {
     /// Return the current size of the session in bytes
     pub fn size_bytes(&self) -> u64 {
         self.inner.size_bytes()
+    }
+
+    /// Return whether the other session is the same as this one.
+    pub fn is_same_as(&self, other: &Session) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
