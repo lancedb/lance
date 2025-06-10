@@ -395,7 +395,7 @@ impl DecodeMiniBlockTask {
     ///
     /// So the start (1) maps to the second 1 (idx=3) and the end (2) maps to the third 1 (idx=5)
     ///
-    /// If there are invisible items then we don't count them when calcuating the range of items we
+    /// If there are invisible items then we don't count them when calculating the range of items we
     /// are interested in but we do count them when calculating the range of levels we are interested
     /// in.  As a result we have to return both the item range (first return value) and the level range
     /// (second return value).
