@@ -168,7 +168,6 @@ jobs:
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
       - uses: rui314/setup-mold@v1
-      - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: |
           sudo apt update
