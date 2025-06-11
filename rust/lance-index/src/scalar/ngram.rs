@@ -1270,7 +1270,9 @@ mod tests {
             .unwrap();
 
         (
-            NGramIndex::from_store(Arc::new(test_store), None).await.unwrap(),
+            NGramIndex::from_store(Arc::new(test_store), None)
+                .await
+                .unwrap(),
             tmpdir,
         )
     }
