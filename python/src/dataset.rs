@@ -22,7 +22,7 @@ use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
 use pyo3::{
-    exceptions::{PyIOError, PyKeyError, PyValueError},
+    exceptions::{PyFileNotFoundError, PyIOError, PyKeyError, PyValueError},
     pybacked::PyBackedStr,
     pyclass,
     types::{IntoPyDict, PyDict},
@@ -72,19 +72,6 @@ use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
-use log::error;
-use object_store::path::Path;
-use pyo3::exceptions::{PyStopIteration, PyTypeError};
-use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
-use pyo3::{
-    exceptions::{PyFileNotFoundError, PyIOError, PyKeyError, PyValueError},
-    pybacked::PyBackedStr,
-    pyclass,
-    types::{IntoPyDict, PyDict},
-    PyObject, PyResult,
-};
-use pyo3::{prelude::*, IntoPyObjectExt};
-use snafu::location;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
