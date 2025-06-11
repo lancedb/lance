@@ -1088,7 +1088,7 @@ def test_auto_cleanup(tmp_path):
     assert len(dataset.versions()) == 2
 
 
-def test_update_config(tmp_path):
+def test_config_update_auto_cleanup(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
     ds = lance.write_dataset(table, base_dir, mode="create")
