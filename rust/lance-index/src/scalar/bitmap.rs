@@ -548,7 +548,7 @@ pub mod tests {
 
         // Load the index using BitmapIndex::load
         tracing::info!("Loading index from disk...");
-        let loaded_index = BitmapIndex::load(Arc::new(test_store))
+        let loaded_index = BitmapIndex::load(Arc::new(test_store), None)
             .await
             .expect("Failed to load bitmap index");
 
@@ -696,7 +696,7 @@ pub mod tests {
             .unwrap();
 
         // Reload and check
-        let reloaded_idx = BitmapIndex::load(test_store)
+        let reloaded_idx = BitmapIndex::load(test_store, None)
             .await
             .expect("Failed to load bitmap index");
 
