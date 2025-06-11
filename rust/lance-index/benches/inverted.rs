@@ -82,7 +82,7 @@ fn bench_inverted(c: &mut Criterion) {
             });
         })
     });
-    let invert_index = rt.block_on(InvertedIndex::load(store)).unwrap();
+    let invert_index = rt.block_on(InvertedIndex::load(store, None)).unwrap();
 
     let params = FtsSearchParams::new().with_limit(Some(10));
     let no_filter = Arc::new(NoFilter);

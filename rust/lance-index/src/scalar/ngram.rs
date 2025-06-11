@@ -1270,7 +1270,7 @@ mod tests {
             .unwrap();
 
         (
-            NGramIndex::from_store(Arc::new(test_store)).await.unwrap(),
+            NGramIndex::from_store(Arc::new(test_store), None).await.unwrap(),
             tmpdir,
         )
     }
@@ -1470,7 +1470,7 @@ mod tests {
 
         index.update(data, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let index = NGramIndex::from_store(test_store, None).await.unwrap();
         assert_eq!(index.tokens.len(), 3);
     }
 
@@ -1506,7 +1506,7 @@ mod tests {
         let remapping = HashMap::from([(2, Some(100)), (3, None), (4, Some(101))]);
         index.remap(&remapping, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let index = NGramIndex::from_store(test_store, None).await.unwrap();
         let row_ids = row_ids_in_index(&index).await;
         assert_eq!(row_ids, vec![0, 1, 100, 101]);
 
@@ -1545,7 +1545,7 @@ mod tests {
 
         index.update(data, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let index = NGramIndex::from_store(test_store, None).await.unwrap();
         let row_ids = row_ids_in_index(&index).await;
         assert_eq!(row_ids, vec![0, 1, 2, 3, 4, 100, 101, 102]);
 
