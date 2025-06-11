@@ -66,7 +66,7 @@ impl ScalarIndexLoader for Dataset {
                 message: format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column),
                 location: location!()
             })?;
-        self.open_scalar_index(index_name, &idx.uuid.to_string(), metrics)
+        self.open_scalar_index(column, &idx.uuid.to_string(), metrics)
             .await
     }
 }
