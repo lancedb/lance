@@ -117,7 +117,7 @@ datafusion-physical-expr = { version = "47.0" }
 datafusion-physical-plan = { version = "47.0" }
 datafusion-substrait = { version = "47.0" }
 deepsize = "0.2.0"
-dirs = "5.0.0"
+dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
 fsst = { version = "=0.29.1", path = "./rust/lance-encoding/src/compression_algo/fsst" }
