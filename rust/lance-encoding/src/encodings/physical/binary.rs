@@ -1112,16 +1112,17 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_binary_dictionary_encoding(
         #[values(true, false)] with_nulls: bool,
-        #[values(100, 100000, 100000000)] dict_size: u32,
+        #[values(100, 500, 35000)] dict_size: u32,
     ) {
         let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
         let strings = (0..dict_size)
             .map(|i| i.to_string())
             .collect::<Vec<String>>();
+
         let repeated_strings: Vec<_> = strings
             .iter()
             .cycle()
-            .take(strings.len() * 10000)
+            .take(70000)
             .enumerate()
             .map(|(i, s)| {
                 if with_nulls && i % 7 == 0 {

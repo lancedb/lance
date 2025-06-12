@@ -4,6 +4,7 @@
 use std::{
     any::Any,
     collections::{HashMap, VecDeque},
+    env,
     fmt::Debug,
     iter,
     ops::Range,
@@ -4298,7 +4299,12 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
-    fn dictionary_encode(mut data_block: DataBlock, cardinality: u64) -> (DataBlock, DataBlock) {
+    fn dictionary_encode(mut data_block: DataBlock) -> (DataBlock, DataBlock) {
+        let cardinality = data_block
+            .get_stat(Stat::Cardinality)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .value(0);
         match data_block {
             DataBlock::FixedWidth(ref mut fixed_width_data_block) => {
                 // Currently FixedWidth DataBlock with only bits_per_value 128 has cardinality
@@ -4406,6 +4412,41 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
+    fn should_dictionary_encode(data_block: &DataBlock) -> bool {
+        // Don't dictionary encode tiny arrays
+        let too_small = env::var("LANCE_ENCODING_DICT_TOO_SMALL")
+            .ok()
+            .and_then(|val| val.parse().ok())
+            .unwrap_or(100);
+        if data_block.num_values() < too_small {
+            return false;
+        }
+
+        // Somewhat arbitrary threshold rule.  Apply dictionary encoding if the number of unique
+        // values is less than 1/2 the total number of values.
+        let divisor = env::var("LANCE_ENCODING_DICT_DIVISOR")
+            .ok()
+            .and_then(|val| val.parse().ok())
+            .unwrap_or(2);
+
+        // Cap on cardinality.  This should be pushed into the cardinality estimation to avoid
+        // spending too much time estimating cardinality.
+        let max_cardinality = env::var("LANCE_ENCODING_DICT_MAX_CARDINALITY")
+            .ok()
+            .and_then(|val| val.parse().ok())
+            .unwrap_or(100000);
+
+        let threshold = (data_block.num_values() / divisor).min(max_cardinality);
+
+        let cardinality = if let Some(cardinality_array) = data_block.get_stat(Stat::Cardinality) {
+            cardinality_array.as_primitive::<UInt64Type>().value(0)
+        } else {
+            u64::MAX
+        };
+
+        cardinality < threshold
+    }
+
     // Creates an encode task, consuming all buffered data
     fn do_flush(
         &mut self,
@@ -4420,6 +4461,7 @@ impl PrimitiveStructuralEncoder {
         let encoding_metadata = self.encoding_metadata.clone();
         let task = spawn_cpu(move || {
             let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+
             if num_values == 0 {
                 // We should not encode empty arrays.  So if we get here that should mean that we
                 // either have all empty lists or all null lists (or a mix).  We still need to encode
@@ -4432,7 +4474,7 @@ impl PrimitiveStructuralEncoder {
                 .sum::<u64>();
 
             if num_values == num_nulls {
-                if repdefs.iter().all(|rd| rd.is_simple_validity()) {
+                return if repdefs.iter().all(|rd| rd.is_simple_validity()) {
                     log::debug!(
                         "Encoding column {} with {} items using simple-null layout",
                         column_idx,
@@ -4441,85 +4483,79 @@ impl PrimitiveStructuralEncoder {
                     // Simple case, no rep/def and all nulls, we don't need to encode any data
                     Self::encode_simple_all_null(column_idx, num_values, row_number)
                 } else {
-                    // If we get here then we have definition levels (presumably due to FSL) and
-                    // we need to store those
+                    // If we get here then we have definition levels and we need to store those
                     Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows)
-                }
-            } else {
-                let data_block = DataBlock::from_arrays(&arrays, num_values);
+                };
+            }
 
-                // if the `data_block` is a `StructDataBlock`, then this is a struct with packed struct encoding.
-                if let DataBlock::Struct(ref struct_data_block) = data_block {
-                    if struct_data_block
-                        .children
-                        .iter()
-                        .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
-                    {
-                        panic!("packed struct encoding currently only supports fixed-width fields.")
-                    }
-                }
+            let data_block = DataBlock::from_arrays(&arrays, num_values);
 
-                // The top-level validity is encoded in repdef so we can remove it.
-                let data_block = data_block.remove_outer_validity();
-
-                let dictionary_encoding_threshold: u64 = 100.max(data_block.num_values() / 4);
-                let cardinality =
-                    if let Some(cardinality_array) = data_block.get_stat(Stat::Cardinality) {
-                        cardinality_array.as_primitive::<UInt64Type>().value(0)
-                    } else {
-                        u64::MAX
-                    };
-
-                // The triggering threshold for dictionary encoding can be further tuned.
-                if cardinality <= dictionary_encoding_threshold
-                    && data_block.num_values() >= 10 * cardinality
+            // if the `data_block` is a `StructDataBlock`, then this is a struct with packed struct encoding.
+            if let DataBlock::Struct(ref struct_data_block) = data_block {
+                if struct_data_block
+                    .children
+                    .iter()
+                    .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
                 {
-                    let (indices_data_block, dictionary_data_block) =
-                        Self::dictionary_encode(data_block, cardinality);
-                    Self::encode_miniblock(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        indices_data_block,
-                        repdefs,
-                        row_number,
-                        Some(dictionary_data_block),
-                        num_rows,
-                    )
-                } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
-                    log::debug!(
-                        "Encoding column {} with {} items using mini-block layout",
-                        column_idx,
-                        num_values
-                    );
-                    Self::encode_miniblock(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        data_block,
-                        repdefs,
-                        row_number,
-                        None,
-                        num_rows,
-                    )
-                } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
-                    log::debug!(
-                        "Encoding column {} with {} items using full-zip layout",
-                        column_idx,
-                        num_values
-                    );
-                    Self::encode_full_zip(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        data_block,
-                        repdefs,
-                        row_number,
-                        num_rows,
-                    )
-                } else {
-                    Err(Error::InvalidInput { source: format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into(), location: location!() })
+                    panic!("packed struct encoding currently only supports fixed-width fields.")
                 }
+            }
+
+            // The top-level validity is encoded in repdef so we can remove it.
+            let data_block = data_block.remove_outer_validity();
+
+
+            if Self::should_dictionary_encode(&data_block) {
+                log::debug!(
+                    "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
+                    column_idx,
+                    num_values
+                );
+                let (indices_data_block, dictionary_data_block) =
+                    Self::dictionary_encode(data_block);
+                Self::encode_miniblock(
+                    column_idx,
+                    &field,
+                    compression_strategy.as_ref(),
+                    indices_data_block,
+                    repdefs,
+                    row_number,
+                    Some(dictionary_data_block),
+                    num_rows,
+                )
+            } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
+                log::debug!(
+                    "Encoding column {} with {} items using mini-block layout",
+                    column_idx,
+                    num_values
+                );
+                Self::encode_miniblock(
+                    column_idx,
+                    &field,
+                    compression_strategy.as_ref(),
+                    data_block,
+                    repdefs,
+                    row_number,
+                    None,
+                    num_rows,
+                )
+            } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
+                log::debug!(
+                    "Encoding column {} with {} items using full-zip layout",
+                    column_idx,
+                    num_values
+                );
+                Self::encode_full_zip(
+                    column_idx,
+                    &field,
+                    compression_strategy.as_ref(),
+                    data_block,
+                    repdefs,
+                    row_number,
+                    num_rows,
+                )
+            } else {
+                Err(Error::InvalidInput { source: format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into(), location: location!() })
             }
         })
         .boxed();
