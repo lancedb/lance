@@ -749,9 +749,9 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 / dictionary.num_values();
             let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
-            // if dictionary encoding is applied, indices are of type `UInt8`
+            // if dictionary encoding is applied, indices are of type `Int32`
             if let DataBlock::FixedWidth(mut fixed_width_data_block) = data {
-                let indices = fixed_width_data_block.data.borrow_to_typed_slice::<u8>();
+                let indices = fixed_width_data_block.data.borrow_to_typed_slice::<i32>();
                 let indices = indices.as_ref();
 
                 indices.iter().for_each(|&idx| {
@@ -4309,7 +4309,7 @@ impl PrimitiveStructuralEncoder {
                 let mut dictionary_buffer = Vec::with_capacity(cardinality as usize);
                 let mut indices_buffer =
                     Vec::with_capacity(fixed_width_data_block.num_values as usize);
-                let mut curr_idx: u8 = 0;
+                let mut curr_idx: i32 = 0;
                 u128_slice.iter().for_each(|&value| {
                     let idx = *map.entry(value).or_insert_with(|| {
                         dictionary_buffer.push(value);
@@ -4326,7 +4326,7 @@ impl PrimitiveStructuralEncoder {
                 });
                 let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
                     data: LanceBuffer::reinterpret_vec(indices_buffer),
-                    bits_per_value: 8,
+                    bits_per_value: 32,
                     num_values: fixed_width_data_block.num_values,
                     block_info: BlockInfo::default(),
                 });
@@ -4339,7 +4339,7 @@ impl PrimitiveStructuralEncoder {
             DataBlock::VariableWidth(ref mut variable_width_data_block) => {
                 match variable_width_data_block.bits_per_offset {
                     32 => {
-                        let mut map: HashMap<U8SliceKey, u8> = HashMap::new();
+                        let mut map = HashMap::new();
                         let offsets = variable_width_data_block
                             .offsets
                             .borrow_to_typed_slice::<u32>();
@@ -4363,7 +4363,7 @@ impl PrimitiveStructuralEncoder {
                             .for_each(|(&start, &end)| {
                                 let key =
                                     &variable_width_data_block.data[start as usize..end as usize];
-                                let idx = *map.entry(U8SliceKey(key)).or_insert_with(|| {
+                                let idx: i32 = *map.entry(U8SliceKey(key)).or_insert_with(|| {
                                     dictionary_buffer.extend_from_slice(key);
                                     dictionary_offsets_buffer.push(dictionary_buffer.len() as u32);
                                     curr_idx += 1;
@@ -4381,8 +4381,8 @@ impl PrimitiveStructuralEncoder {
                         });
 
                         let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                            data: LanceBuffer::Owned(indices_buffer),
-                            bits_per_value: 8,
+                            data: LanceBuffer::reinterpret_vec(indices_buffer),
+                            bits_per_value: 32,
                             num_values: variable_width_data_block.num_values,
                             block_info: BlockInfo::default(),
                         });

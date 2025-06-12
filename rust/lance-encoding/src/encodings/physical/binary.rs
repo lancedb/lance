@@ -1110,16 +1110,14 @@ pub mod tests {
 
     #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_binary_dictionary_encoding(#[values(true, false)] with_nulls: bool) {
+    async fn test_binary_dictionary_encoding(
+        #[values(true, false)] with_nulls: bool,
+        #[values(100, 100000, 100000000)] dict_size: u32,
+    ) {
         let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
-        let strings = [
-            "Hal Abelson",
-            "Charles Babbage",
-            "Vint Cerf",
-            "Jim Gray",
-            "Alonzo Church",
-            "Edgar F. Codd",
-        ];
+        let strings = (0..dict_size)
+            .map(|i| i.to_string())
+            .collect::<Vec<String>>();
         let repeated_strings: Vec<_> = strings
             .iter()
             .cycle()
