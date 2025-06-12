@@ -4,7 +4,7 @@
 use crate::{Index, IndexType};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt64Array};
+use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
@@ -136,35 +136,12 @@ impl FragReuseIndex {
     pub fn remap_row_ids_tree_map(&self, row_ids: &RowIdTreeMap) -> RowIdTreeMap {
         RowIdTreeMap::from_iter(row_ids.row_ids().unwrap().filter_map(|addr| {
             let addr_as_u64 = u64::from(addr);
-
-            let mut mapped_value = Some(addr_as_u64);
-            for row_id_map in self.row_id_maps.iter() {
-                if mapped_value.is_some() {
-                    mapped_value = row_id_map
-                        .get(&mapped_value.unwrap())
-                        .copied()
-                        .unwrap_or(mapped_value);
-                }
-            }
-
-            mapped_value
+            self.remap_row_id(addr_as_u64)
         }))
     }
 
     pub fn remap_row_ids_roaring_tree_map(&self, row_ids: &RoaringTreemap) -> RoaringTreemap {
-        RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| {
-            let mut mapped_value = Some(addr);
-            for row_id_map in self.row_id_maps.iter() {
-                if mapped_value.is_some() {
-                    mapped_value = row_id_map
-                        .get(&mapped_value.unwrap())
-                        .copied()
-                        .unwrap_or(mapped_value);
-                }
-            }
-
-            mapped_value
-        }))
+        RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| self.remap_row_id(addr)))
     }
 
     pub fn remap_row_ids_record_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
@@ -173,15 +150,7 @@ impl FragReuseIndex {
             .values()
             .iter()
             .enumerate()
-            .filter_map(|(idx, old_id)| {
-                let mut new_id = Some(*old_id);
-                for row_id_map in self.row_id_maps.iter() {
-                    if new_id.is_some() {
-                        new_id = row_id_map.get(&new_id.unwrap()).copied().unwrap_or(new_id);
-                    }
-                }
-                new_id.map(|new_id| (idx, new_id))
-            })
+            .filter_map(|(idx, old_id)| self.remap_row_id(*old_id).map(|new_id| (idx, new_id)))
             .collect::<Vec<_>>();
         let new_ids = Arc::new(UInt64Array::from_iter_values(
             val_idx_and_new_id.iter().copied().map(|(_, new_id)| new_id),
@@ -212,6 +181,30 @@ impl FragReuseIndex {
                 }
             })
             .collect()
+    }
+
+    /// Remap a record batch which has schema (row_id, vector)
+    /// The vector column can be of any type
+    pub fn remap_row_ids_vector_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        let mut indices = Vec::with_capacity(batch.num_rows());
+        let mut new_row_ids = Vec::with_capacity(batch.num_rows());
+
+        let row_ids = batch.column(0).as_primitive::<UInt64Type>().values();
+        for (i, row_id) in row_ids.iter().enumerate() {
+            if let Some(mapped_value) = self.remap_row_id(*row_id) {
+                indices.push(i as u32);
+                new_row_ids.push(mapped_value);
+            }
+        }
+
+        let indices = UInt32Array::from(indices);
+        let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
+        let new_vectors = arrow::compute::take(batch.column(1), &indices, None)?;
+
+        Ok(RecordBatch::try_new(
+            batch.schema(),
+            vec![new_row_ids, new_vectors],
+        )?)
     }
 
     pub fn remap_fragment_bitmap(&self, fragment_bitmap: &mut RoaringBitmap) -> Result<()> {

@@ -16,6 +16,7 @@ use super::{
 };
 use crate::dataset::builder::DatasetBuilder;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
+use crate::index::DatasetIndexInternalExt;
 use crate::{
     dataset::Dataset,
     index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
@@ -366,6 +367,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     let distance_type = existing_indices[0].metric_type();
     let num_partitions = ivf_model.num_partitions();
     let index_type = existing_indices[0].sub_index_type();
+    let fri = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
     let num_indices_to_merge = if options.retrain {
         existing_indices.len()
@@ -395,6 +397,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                     distance_type,
                     shuffler,
                     (),
+                    fri,
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
@@ -412,6 +415,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                     distance_type,
                     shuffler,
                     (),
+                    fri,
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
@@ -432,6 +436,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 distance_type,
                 shuffler,
                 (),
+                fri,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
@@ -454,6 +459,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 None,
                 // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
+                fri,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
@@ -476,6 +482,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 None,
                 // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
+                fri,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)

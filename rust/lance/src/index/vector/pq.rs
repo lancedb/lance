@@ -613,6 +613,8 @@ pub(crate) fn build_pq_storage(
         pq.dimension,
         distance_type,
         false,
+        // TODO: support auto-remap with FRI for HNSW
+        None,
     )?;
 
     Ok(pq_store)
