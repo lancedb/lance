@@ -10,6 +10,14 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use crate::index::vector::builder::{index_type_string, IvfIndexBuilder};
+use crate::{
+    index::{
+        vector::{utils::PartitionLoadLock, VectorIndex},
+        PreFilter,
+    },
+    session::Session,
+};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
 use arrow_array::{RecordBatch, UInt32Array};
@@ -25,6 +33,7 @@ use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::{FileReader, FileReaderOptions};
+use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
@@ -56,15 +65,6 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{info, instrument};
-
-use crate::index::vector::builder::{index_type_string, IvfIndexBuilder};
-use crate::{
-    index::{
-        vector::{utils::PartitionLoadLock, VectorIndex},
-        PreFilter,
-    },
-    session::Session,
-};
 
 use super::{centroids_to_vectors, IvfIndexPartitionStatistics, IvfIndexStatistics};
 
@@ -121,6 +121,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         index_dir: Path,
         uuid: String,
         session: Weak<Session>,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
@@ -194,7 +195,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             FileReaderOptions::default(),
         )
         .await?;
-        let storage = IvfQuantizationStorage::try_new(storage_reader).await?;
+        let storage = IvfQuantizationStorage::try_new(storage_reader, fri.clone()).await?;
 
         let num_partitions = ivf.num_partitions();
         Ok(Self {

@@ -234,6 +234,7 @@ pub(crate) async fn build_vector_index(
     name: &str,
     uuid: &str,
     params: &VectorIndexParams,
+    fri: Option<Arc<FragReuseIndex>>,
 ) -> Result<()> {
     let stages = &params.stages;
 
@@ -277,6 +278,7 @@ pub(crate) async fn build_vector_index(
                     Some(ivf_params.clone()),
                     Some(()),
                     (),
+                    fri,
                 )?
                 .build()
                 .await?;
@@ -291,6 +293,7 @@ pub(crate) async fn build_vector_index(
                     Some(ivf_params.clone()),
                     Some(()),
                     (),
+                    fri,
                 )?
                 .build()
                 .await?;
@@ -334,6 +337,7 @@ pub(crate) async fn build_vector_index(
                     Some(ivf_params.clone()),
                     Some(pq_params.clone()),
                     (),
+                    fri,
                 )?
                 .build()
                 .await?;
@@ -361,6 +365,7 @@ pub(crate) async fn build_vector_index(
                         Some(ivf_params.clone()),
                         Some(pq_params.clone()),
                         hnsw_params.clone(),
+                        fri,
                     )?
                     .build()
                     .await?;
@@ -375,6 +380,7 @@ pub(crate) async fn build_vector_index(
                         Some(ivf_params.clone()),
                         Some(sq_params.clone()),
                         hnsw_params.clone(),
+                        fri,
                     )?
                     .build()
                     .await?;

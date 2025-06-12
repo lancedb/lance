@@ -276,6 +276,7 @@ impl DatasetIndexExt for Dataset {
 
         // Load indices from the disk.
         let indices = self.load_indices().await?;
+        let fri = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
         let index_name = name.unwrap_or(format!("{column}_idx"));
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
             if idx.fields == [field.id] && !replace {
@@ -352,6 +353,7 @@ impl DatasetIndexExt for Dataset {
                     &index_name,
                     &index_id.to_string(),
                     vec_params,
+                    fri,
                 ))
                 .await?;
                 vector_index_details()
@@ -1051,6 +1053,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.indices_dir(),
                                 uuid.to_owned(),
                                 Arc::downgrade(&self.session),
+                                fri,
                             )
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1061,6 +1064,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.indices_dir(),
                                 uuid.to_owned(),
                                 Arc::downgrade(&self.session),
+                                fri,
                             )
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1080,6 +1084,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.indices_dir(),
                             uuid.to_owned(),
                             Arc::downgrade(&self.session),
+                            fri,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1091,6 +1096,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.indices_dir(),
                             uuid.to_owned(),
                             Arc::downgrade(&self.session),
+                            fri,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1102,6 +1108,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.indices_dir(),
                             uuid.to_owned(),
                             Arc::downgrade(&self.session),
+                            fri,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
