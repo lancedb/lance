@@ -457,47 +457,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(())
     }
 
-    // async fn load_precomputed_shuffle_buffers(
-    //     dir: &Path,
-    //     buffers: &[String],
-    // ) -> Result<Box<dyn RecordBatchStream + Unpin + 'static>> {
-    //     let store = Arc::new(ObjectStore::local());
-    //     let paths = buffers
-    //         .iter()
-    //         .map(|buffer| dir.child(buffer.as_str()))
-    //         .collect::<Vec<_>>();
-
-    //     let reader =
-    //         lance_file::reader::FileReader::try_new_self_described(&store, &paths[0], None).await?;
-    //     let schema: arrow_schema::Schema = reader.schema().into();
-
-    //     let stream = stream::iter(paths)
-    //         .map(|path| {
-    //             let store = store.clone();
-    //             async move {
-    //                 let reader =
-    //                     lance_file::reader::FileReader::try_new_self_described(&store, &path, None)
-    //                         .await?;
-    //                 Result::Ok(reader)
-    //             }
-    //         })
-    //         .buffered(store.io_parallelism())
-    //         .map(|reader| {
-    //             let reader = reader?;
-    //             let results = stream::iter(0..reader.num_batches())
-    //                 .map(|i| {
-    //                     reader.read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema())
-    //                 })
-    //                 .buffered(store.io_parallelism());
-    //             Result::Ok(results)
-    //         })
-    //         .try_flatten();
-    //     Ok(Box::new(RecordBatchStreamAdapter::new(
-    //         Arc::new(schema),
-    //         Box::pin(stream),
-    //     )))
-    // }
-
     // shuffle the unindexed data and existing indices
     // data must be with schema | ROW_ID | vector_column |
     // the shuffled data will be with schema | ROW_ID | PART_ID | code_column |
