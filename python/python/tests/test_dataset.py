@@ -1088,6 +1088,25 @@ def test_auto_cleanup(tmp_path):
     assert len(dataset.versions()) == 2
 
 
+def test_config_update_auto_cleanup(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir, mode="create")
+    ds.update_config(
+        {"lance.auto_cleanup.interval": "1", "lance.auto_cleanup.older_than": "1ms"}
+    )
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+
+    time.sleep(5)
+
+    # trigger cleanup
+    lance.write_dataset(table, base_dir, mode="append")
+    dataset = lance.dataset(base_dir)
+    assert len(dataset.versions()) == 2
+
+
 def test_auto_cleanup_invalid(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

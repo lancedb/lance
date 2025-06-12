@@ -2681,6 +2681,20 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.migrate_manifest_paths_v2()
 
+    def update_config(self, upsert_values: Dict[str, str]) -> None:
+        """
+        Update the dataset configuration.
+
+        This method inserts or updates configuration key-value pairs for the dataset.
+
+        Parameters
+        ----------
+        upsert_values : dict of str to str
+            The configuration items to insert or update.
+            Both keys and values should be strings.
+        """
+        self._ds.update_config(upsert_values)
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
