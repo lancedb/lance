@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::{collections::HashMap, pin::Pin};
 
 use arrow::datatypes;
 use arrow::{array::AsArray, datatypes::UInt64Type};
 use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
-use futures::prelude::stream::{StreamExt, TryStreamExt};
-use futures::{stream, FutureExt};
-use itertools::Itertools;
+use futures::stream;
+use futures::{
+    prelude::stream::{StreamExt, TryStreamExt},
+    Stream,
+};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{cache::FileMetadataCache, ROW_ID};
+use lance_core::ROW_ID;
 use lance_core::{Error, Result, ROW_ID_FIELD};
-use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2::reader::FileReaderOptions;
-use lance_file::v2::{reader::FileReader, writer::FileWriter};
+use lance_file::v2::writer::FileWriter;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -44,13 +44,9 @@ use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
 use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+use lance_io::local::to_local_path;
 use lance_io::stream::RecordBatchStream;
-use lance_io::utils::CachedFileSize;
-use lance_io::{local::to_local_path, scheduler::SchedulerConfig};
-use lance_io::{
-    object_store::ObjectStore, scheduler::ScanScheduler, stream::RecordBatchStreamAdapter,
-    ReadBatchParams,
-};
+use lance_io::{object_store::ObjectStore, stream::RecordBatchStreamAdapter};
 use lance_linalg::distance::DistanceType;
 use log::info;
 use object_store::path::Path;
@@ -94,11 +90,13 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     ivf: Option<IvfModel>,
     quantizer: Option<Q>,
     shuffle_reader: Option<Arc<dyn ShuffleReader>>,
-    partition_sizes: Vec<(usize, usize)>,
 
     // fields for merging indices / remapping
     existing_indices: Vec<Arc<dyn VectorIndex>>,
 }
+
+type BuildStream<S, Q> =
+    Pin<Box<dyn Stream<Item = Result<Option<(<Q as Quantization>::Storage, S, f64)>>> + Send>>;
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
     #[allow(clippy::too_many_arguments)]
@@ -131,7 +129,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ivf: None,
             quantizer: None,
             shuffle_reader: None,
-            partition_sizes: Vec::new(),
             existing_indices: Vec::new(),
         })
     }
@@ -189,7 +186,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ivf: Some(ivf_index.ivf_model().clone()),
             quantizer: Some(ivf_index.quantizer().try_into()?),
             shuffle_reader: None,
-            partition_sizes: Vec::new(),
             existing_indices: vec![index],
         })
     }
@@ -212,73 +208,54 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         }
 
         // step 3. build partitions
-        self.build_partitions().await?;
+        let build_idx_stream = self.build_partitions().await?;
 
         // step 4. merge all partitions
-        self.merge_partitions().await?;
+        self.merge_partitions(build_idx_stream).await?;
 
         Ok(())
     }
 
     pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         debug_assert_eq!(self.existing_indices.len(), 1);
-        let ivf_index = self.existing_indices[0]
-            .as_any()
-            .downcast_ref::<IVFIndex<S, Q>>()
-            .ok_or(Error::invalid_input(
-                "existing index is not IVF index",
-                location!(),
-            ))?;
-
-        let model = ivf_index.ivf_model();
-        let mapped = stream::iter(0..model.num_partitions())
-            .map(|part_id| async move {
-                let part = ivf_index
-                    .load_partition(part_id, false, &NoOpMetricsCollector)
-                    .await?;
-                let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
-                    Error::Internal {
-                        message: "failed to downcast partition entry".to_string(),
-                        location: location!(),
-                    },
-                )?;
-                Result::Ok((part.storage.remap(mapping)?, part.index.remap(mapping)?))
+        let ivf_model = self.ivf.as_ref().ok_or(Error::invalid_input(
+            "IVF model not set before remapping",
+            location!(),
+        ))?;
+        let existing_index = self.existing_indices[0].clone();
+        let mapping = Arc::new(mapping.clone());
+        let mapped_stream = stream::iter(0..ivf_model.num_partitions())
+            .map(move |part_id| {
+                let existing_index = existing_index.clone();
+                let mapping = mapping.clone();
+                async move {
+                    let ivf_index = existing_index
+                        .as_any()
+                        .downcast_ref::<IVFIndex<S, Q>>()
+                        .ok_or(Error::invalid_input(
+                            "existing index is not IVF index",
+                            location!(),
+                        ))?;
+                    let part = ivf_index
+                        .load_partition(part_id, false, &NoOpMetricsCollector)
+                        .await?;
+                    let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
+                        Error::Internal {
+                            message: "failed to downcast partition entry".to_string(),
+                            location: location!(),
+                        },
+                    )?;
+                    Result::Ok(Some((
+                        part.storage.remap(&mapping)?,
+                        part.index.remap(&mapping)?,
+                        0.0,
+                    )))
+                }
             })
             .buffered(get_num_compute_intensive_cpus())
-            .try_collect::<Vec<_>>()
-            .await?;
+            .boxed();
 
-        self.partition_sizes = vec![(0, 0); model.num_partitions()];
-        let local_store = ObjectStore::local();
-        for (part_id, (store, index)) in mapped.into_iter().enumerate() {
-            let path = self.temp_dir.child(format!("storage_part{}", part_id));
-            let batches = store.to_batches()?;
-            let schema = store.schema().as_ref().try_into()?;
-            let store_len = FileWriter::create_file_with_batches(
-                &local_store,
-                &path,
-                schema,
-                batches,
-                Default::default(),
-            )
-            .await?;
-
-            let path = self.temp_dir.child(format!("index_part{}", part_id));
-            let batch = index.to_batch()?;
-            let schema = batch.schema().as_ref().try_into()?;
-            let index_len = FileWriter::create_file_with_batches(
-                &local_store,
-                &path,
-                schema,
-                std::iter::once(batch),
-                Default::default(),
-            )
-            .await?;
-
-            self.partition_sizes[part_id] = (store_len, index_len);
-        }
-
-        self.merge_partitions().await?;
+        self.merge_partitions(mapped_stream).await?;
         Ok(())
     }
 
@@ -573,7 +550,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     #[instrument(name = "build_partitions", level = "debug", skip_all)]
-    async fn build_partitions(&mut self) -> Result<&mut Self> {
+    async fn build_partitions(&mut self) -> Result<BuildStream<S, Q>> {
         let ivf = self.ivf.as_mut().ok_or(Error::invalid_input(
             "IVF not set before building partitions",
             location!(),
@@ -591,27 +568,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             location!(),
         ))?;
 
-        let partition_build_order = (0..ivf.num_partitions())
-            .map(|partition_id| reader.partition_size(partition_id))
-            .collect::<Result<Vec<_>>>()?
-            // sort by partition size in descending order
-            .into_iter()
-            .enumerate()
-            .sorted_unstable_by(|(_, a), (_, b)| b.cmp(a))
-            .map(|(idx, _)| idx)
-            .collect::<Vec<_>>();
-
         let reader = reader.clone();
         let existing_indices = Arc::new(self.existing_indices.clone());
         let distance_type = self.distance_type;
-        let mut partition_sizes = vec![(0, 0); ivf.num_partitions()];
-        let build_iter = partition_build_order.iter().map(|&partition| {
+        let column = self.column.clone();
+        let build_iter = (0..ivf.num_partitions()).map(move |partition| {
             let reader = reader.clone();
             let existing_indices = existing_indices.clone();
-            let temp_dir = self.temp_dir.clone();
+            let distance_type = distance_type.clone();
             let quantizer = quantizer.clone();
             let sub_index_params = sub_index_params.clone();
-            let column = self.column.clone();
+            let column = column.clone();
             async move {
                 let (batches, loss) = Self::take_partition_batches(
                     partition,
@@ -622,81 +589,32 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
                 let num_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
                 if num_rows == 0 {
-                    return Ok(((0, 0), 0.0));
+                    return Ok(None);
                 }
 
-                Self::build_partition(
-                    &temp_dir,
-                    distance_type,
-                    quantizer,
-                    sub_index_params,
-                    batches,
-                    partition,
-                    column,
-                )
-                .await
-                .map(|res| (res, loss))
+                let (storage, sub_index) =
+                    Self::build_index(distance_type, quantizer, sub_index_params, batches, column)?;
+                Ok(Some((storage, sub_index, loss)))
             }
         });
-        let results = stream::iter(build_iter)
+        Ok(stream::iter(build_iter)
             .buffered(get_num_compute_intensive_cpus())
-            .try_collect::<Vec<_>>()
-            .boxed()
-            .await?;
-
-        let mut total_loss = 0.0;
-        for (i, (res, loss)) in results.into_iter().enumerate() {
-            total_loss += loss;
-            partition_sizes[partition_build_order[i]] = res;
-        }
-        if let Some(loss) = reader.total_loss() {
-            total_loss += loss;
-        }
-        ivf.loss = Some(total_loss);
-
-        self.partition_sizes = partition_sizes;
-        Ok(self)
+            .boxed())
     }
 
-    #[instrument(name = "build_partition", level = "debug", skip_all)]
+    #[instrument(name = "build_index", level = "debug", skip_all)]
     #[allow(clippy::too_many_arguments)]
-    async fn build_partition(
-        temp_dir: &Path,
+    fn build_index(
         distance_type: DistanceType,
         quantizer: Q,
         sub_index_params: S::BuildParams,
         batches: Vec<RecordBatch>,
-        part_id: usize,
         column: String,
-    ) -> Result<(usize, usize)> {
-        let local_store = ObjectStore::local();
-        // build quantized vector storage
+    ) -> Result<(Q::Storage, S)> {
         let storage = StorageBuilder::new(column, distance_type, quantizer)?.build(batches)?;
-
-        let path = temp_dir.child(format!("storage_part{}", part_id));
-        let batches = storage.to_batches()?;
-        let write_storage_fut = FileWriter::create_file_with_batches(
-            &local_store,
-            &path,
-            storage.schema().as_ref().try_into()?,
-            batches,
-            Default::default(),
-        );
-
-        // build the sub index, with in-memory storage
         let sub_index = S::index_vectors(&storage, sub_index_params)?;
-        let path = temp_dir.child(format!("index_part{}", part_id));
-        let index_batch = sub_index.to_batch()?;
-        let schema = index_batch.schema().as_ref().try_into()?;
-        let write_index_fut = FileWriter::create_file_with_batches(
-            &local_store,
-            &path,
-            schema,
-            std::iter::once(index_batch),
-            Default::default(),
-        );
 
-        futures::try_join!(write_storage_fut, write_index_fut)
+        Ok((storage, sub_index))
     }
 
     #[instrument(name = "take_partition_batches", level = "debug", skip_all)]
@@ -759,7 +677,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     #[instrument(name = "merge_partitions", level = "debug", skip_all)]
-    async fn merge_partitions(&mut self) -> Result<()> {
+    async fn merge_partitions(&mut self, mut build_stream: BuildStream<S, Q>) -> Result<()> {
         let ivf = self.ivf.as_ref().ok_or(Error::invalid_input(
             "IVF not set before merge partitions",
             location!(),
@@ -768,10 +686,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             "quantizer not set before merge partitions",
             location!(),
         ))?;
-        let partition_sizes = std::mem::take(&mut self.partition_sizes);
-        if partition_sizes.is_empty() {
-            return Err(Error::invalid_input("no partition to merge", location!()));
-        }
 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
@@ -786,35 +700,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // maintain the IVF partitions
         let mut storage_ivf = IvfModel::empty();
         let mut index_ivf = IvfModel::new(ivf.centroids.clone().unwrap(), ivf.loss);
-        let mut partition_index_metadata = Vec::with_capacity(partition_sizes.len());
-        let obj_store = Arc::new(ObjectStore::local());
-        let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
-        let scheduler = ScanScheduler::new(obj_store, scheduler_config);
-        for (part_id, (storage_size, index_size)) in partition_sizes.into_iter().enumerate() {
-            log::info!("merging partition {}/{}", part_id + 1, ivf.num_partitions());
-            if storage_size == 0 {
+        let mut partition_index_metadata = Vec::with_capacity(ivf.num_partitions());
+
+        let mut part_id = 0;
+        let mut total_loss = 0.0;
+        while let Some(part) = build_stream.try_next().await? {
+            part_id += 1;
+            log::info!("merging partition {}/{}", part_id, ivf.num_partitions());
+
+            let Some((storage, index, loss)) = part else {
+                log::warn!("partition {} is empty, skipping", part_id);
+                continue;
+            };
+            total_loss += loss;
+
+            if storage.len() == 0 {
                 storage_ivf.add_partition(0);
             } else {
-                let storage_part_path = self.temp_dir.child(format!("storage_part{}", part_id));
-                let reader = FileReader::try_open(
-                    scheduler
-                        .open_file(&storage_part_path, &CachedFileSize::unknown())
-                        .await?,
-                    None,
-                    Arc::<DecoderPlugins>::default(),
-                    &FileMetadataCache::no_cache(),
-                    FileReaderOptions::default(),
-                )
-                .await?;
-                let batches = reader
-                    .read_stream(
-                        ReadBatchParams::RangeFull,
-                        u32::MAX,
-                        1,
-                        FilterExpression::no_filter(),
-                    )?
-                    .try_collect::<Vec<_>>()
-                    .await?;
+                let batches = storage.to_batches()?.collect::<Vec<_>>();
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
                 if storage_writer.is_none() {
                     storage_writer = Some(FileWriter::try_new(
@@ -827,41 +730,34 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 storage_ivf.add_partition(batch.num_rows() as u32);
             }
 
-            if index_size == 0 {
+            let index_batch = index.to_batch()?;
+            if index_batch.num_rows() == 0 {
                 index_ivf.add_partition(0);
                 partition_index_metadata.push(String::new());
             } else {
-                let index_part_path = self.temp_dir.child(format!("index_part{}", part_id));
-                let reader = FileReader::try_open(
-                    scheduler
-                        .open_file(&index_part_path, &CachedFileSize::unknown())
-                        .await?,
-                    None,
-                    Arc::<DecoderPlugins>::default(),
-                    &FileMetadataCache::no_cache(),
-                    FileReaderOptions::default(),
-                )
-                .await?;
-                let batches = reader
-                    .read_stream(
-                        ReadBatchParams::RangeFull,
-                        u32::MAX,
-                        1,
-                        FilterExpression::no_filter(),
-                    )?
-                    .try_collect::<Vec<_>>()
-                    .await?;
-                let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
-                index_writer.write_batch(&batch).await?;
-                index_ivf.add_partition(batch.num_rows() as u32);
+                index_writer.write_batch(&index_batch).await?;
+                index_ivf.add_partition(index_batch.num_rows() as u32);
                 partition_index_metadata.push(
-                    reader
+                    index_batch
                         .schema()
                         .metadata
                         .get(S::metadata_key())
                         .cloned()
                         .unwrap_or_default(),
                 );
+            }
+        }
+
+        match self.shuffle_reader.as_ref() {
+            Some(reader) => {
+                // it's building index, the loss is already calculated in the shuffle reader
+                if let Some(loss) = reader.total_loss() {
+                    total_loss += loss;
+                }
+                index_ivf.loss = Some(total_loss);
+            }
+            None => {
+                // it's remapping, we don't need to change the loss
             }
         }
 
