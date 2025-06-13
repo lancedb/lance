@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn test_cache_bytes() {
         let item = Arc::new(vec![1, 2, 3]);
-        let item_size = (*item).deep_size_of();
+        let item_size = item.deep_size_of(); // Size of Arc<Vec<i32>>
         let capacity = 10 * item_size;
 
         let cache = LanceCache::with_capacity(capacity);
