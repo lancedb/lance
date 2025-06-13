@@ -1844,8 +1844,19 @@ mod tests {
             .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_empty_lists() {
+    async fn test_empty_lists(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
         // Scenario 1: Some lists are empty
 
         let values = [vec![Some(1), Some(2), Some(3)], vec![], vec![None]];
@@ -1861,15 +1872,21 @@ mod tests {
                 .with_indices(vec![1])
                 .with_indices(vec![0])
                 .with_indices(vec![2])
-                .with_indices(vec![0, 1]);
+                .with_indices(vec![0, 1])
+                .with_file_version(version);
             check_round_trip_encoding_of_data(
                 vec![list_array.clone()],
                 &test_cases,
-                HashMap::new(),
+                field_metadata.clone(),
             )
             .await;
             let test_cases = test_cases.with_batch_size(1);
-            check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+            check_round_trip_encoding_of_data(
+                vec![list_array],
+                &test_cases,
+                field_metadata.clone(),
+            )
+            .await;
         }
 
         // Scenario 2: All lists are empty
@@ -1883,13 +1900,21 @@ mod tests {
         list_builder.append(true);
         let list_array = Arc::new(list_builder.finish());
 
-        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
-        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases, HashMap::new())
-            .await;
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_indices(vec![1])
+            .with_file_version(version);
+        check_round_trip_encoding_of_data(
+            vec![list_array.clone()],
+            &test_cases,
+            field_metadata.clone(),
+        )
+        .await;
         let test_cases = test_cases.with_batch_size(1);
-        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata.clone())
+            .await;
 
-        // Scenario 2: All lists are empty (but now with strings)
+        // Scenario 2B: All lists are empty (but now with strings)
 
         // When encoding a list of empty lists there are no items to encode
         // which is strange and we want to ensure we handle it
@@ -1900,11 +1925,80 @@ mod tests {
         list_builder.append(true);
         let list_array = Arc::new(list_builder.finish());
 
-        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
-        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases, HashMap::new())
-            .await;
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_indices(vec![1])
+            .with_file_version(version);
+        check_round_trip_encoding_of_data(
+            vec![list_array.clone()],
+            &test_cases,
+            field_metadata.clone(),
+        )
+        .await;
         let test_cases = test_cases.with_batch_size(1);
-        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata.clone())
+            .await;
+
+        // Scenario 3: All lists are null
+
+        let items_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append_null();
+        list_builder.append_null();
+        list_builder.append_null();
+        let list_array = Arc::new(list_builder.finish());
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_indices(vec![1])
+            .with_file_version(version);
+        check_round_trip_encoding_of_data(
+            vec![list_array.clone()],
+            &test_cases,
+            field_metadata.clone(),
+        )
+        .await;
+        let test_cases = test_cases.with_batch_size(1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata.clone())
+            .await;
+
+        if version < LanceFileVersion::V2_1 {
+            return;
+        }
+
+        // Scenario 4: All lists are null and inside a struct (only valid for 2.1 since 2.0 doesn't
+        // support null structs)
+        let items_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append_null();
+        list_builder.append_null();
+        list_builder.append_null();
+        let list_array = Arc::new(list_builder.finish());
+
+        let struct_validity = NullBuffer::new(BooleanBuffer::from(vec![true, false, true]));
+        let struct_array = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new(
+                "lists",
+                list_array.data_type().clone(),
+                true,
+            )]),
+            vec![list_array],
+            Some(struct_validity),
+        ));
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_indices(vec![1])
+            .with_file_version(version);
+        check_round_trip_encoding_of_data(
+            vec![struct_array.clone()],
+            &test_cases,
+            field_metadata.clone(),
+        )
+        .await;
+        let test_cases = test_cases.with_batch_size(1);
+        check_round_trip_encoding_of_data(vec![struct_array], &test_cases, field_metadata.clone())
+            .await;
     }
 
     #[test_log::test(tokio::test)]
