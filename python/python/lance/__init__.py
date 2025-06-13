@@ -155,6 +155,7 @@ def dataset(
                 block_size,
                 commit_lock=commit_lock,
                 index_cache_size=index_cache_size,
+                metadata_cache_size_bytes=metadata_cache_size_bytes,
             )
     else:
         return ds
