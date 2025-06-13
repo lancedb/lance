@@ -31,6 +31,19 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Global counter of how many bytes were read by the scheduler
 static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
+// By default, we limit the number of IOPS across the entire process to 128
+//
+// In theory this is enough for ~10GBps on S3 following the guidelines to issue
+// 1 IOP per 80MBps.  In practice, I have noticed slightly better performance going
+// up to 256.
+//
+// However, non-S3 stores (e.g. GCS, Azure) can suffer significantly from too many
+// concurrent IOPS.  For safety, we set the default to 128 and let the user override
+// this if needed.
+//
+// Note: this only limits things that run through the scheduler.  It does not limit
+// IOPS from other sources like writing or commits.
+static DEFAULT_PROCESS_IOPS_LIMIT: i32 = 128;
 
 pub fn iops_counter() -> u64 {
     IOPS_COUNTER.load(Ordering::Acquire)
@@ -89,24 +102,20 @@ impl IopsReservation<'_> {
 }
 
 impl IopsQuota {
-    // By default, there is no process-wide limit on IOPS
+    // By default, we throttle the number of scan IOPS across the entire process
     //
-    // However, the user can request one by setting the environment variable
-    // LANCE_PROCESS_IO_THREADS_LIMIT to a positive integer.
+    // However, the user can disable this by setting the environment variable
+    // LANCE_PROCESS_IO_THREADS_LIMIT to zero (or a negative integer).
     fn new() -> Self {
         let initial_capacity = std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT")
             .map(|s| {
-                let limit = s
-                    .parse::<i32>()
-                    .expect("LANCE_PROCESS_IO_THREADS_LIMIT must be a positive integer");
-                if limit <= 0 {
-                    panic!("LANCE_PROCESS_IO_THREADS_LIMIT must be a positive integer.  To disable the limit, unset the environment variable");
-                }
-                limit
+                s.parse::<i32>().unwrap_or_else(|_| {
+                    log::warn!("Ignoring invalid LANCE_PROCESS_IO_THREADS_LIMIT: {}", s);
+                    DEFAULT_PROCESS_IOPS_LIMIT
+                })
             })
-            // The default (-1) does not apply any limit
-            .unwrap_or(-1);
-        let iops_avail = if initial_capacity < 0 {
+            .unwrap_or(DEFAULT_PROCESS_IOPS_LIMIT);
+        let iops_avail = if initial_capacity <= 0 {
             None
         } else {
             Some(Semaphore::new(initial_capacity as usize))
