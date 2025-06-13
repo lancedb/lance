@@ -4,6 +4,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::dataset::ProjectionRequest;
+use crate::index::vector::ivf::v2::PartitionEntry;
+use crate::Dataset;
 use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{FixedSizeListArray, RecordBatch, UInt64Array};
@@ -17,6 +20,7 @@ use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::FileReaderOptions;
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
+use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::transpose;
@@ -59,10 +63,6 @@ use snafu::location;
 use tempfile::{tempdir, TempDir};
 use tracing::{instrument, span, Level};
 
-use crate::dataset::ProjectionRequest;
-use crate::index::vector::ivf::v2::PartitionEntry;
-use crate::Dataset;
-
 use super::utils::{self, get_vector_type};
 use super::v2::IVFIndex;
 
@@ -95,6 +95,8 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
 
     // fields for merging indices / remapping
     existing_indices: Vec<Arc<dyn VectorIndex>>,
+
+    fri: Option<Arc<FragReuseIndex>>,
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
@@ -108,6 +110,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         ivf_params: Option<IvfBuildParams>,
         quantizer_params: Option<Q::BuildParams>,
         sub_index_params: S::BuildParams,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let temp_dir = tempdir()?;
         let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
@@ -130,6 +133,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             partition_sizes: Vec::new(),
             existing_indices: Vec::new(),
+            fri,
         })
     }
 
@@ -140,6 +144,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         distance_type: DistanceType,
         shuffler: Box<dyn Shuffler>,
         sub_index_params: S::BuildParams,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         Self::new(
             dataset,
@@ -150,6 +155,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             None,
             None,
             sub_index_params,
+            fri,
         )
     }
 
@@ -188,6 +194,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             partition_sizes: Vec::new(),
             existing_indices: vec![index],
+            fri: None,
         })
     }
 
@@ -548,6 +555,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let quantizer = quantizer.clone();
             let sub_index_params = sub_index_params.clone();
             let column = self.column.clone();
+            let fri = self.fri.clone();
             async move {
                 let (batches, loss) = Self::take_partition_batches(
                     partition,
@@ -569,6 +577,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     batches,
                     partition,
                     column,
+                    fri,
                 )
                 .await
                 .map(|res| (res, loss))
@@ -604,10 +613,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         batches: Vec<RecordBatch>,
         part_id: usize,
         column: String,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<(usize, usize)> {
         let local_store = ObjectStore::local();
         // build quantized vector storage
-        let storage = StorageBuilder::new(column, distance_type, quantizer)?.build(batches)?;
+        let storage = StorageBuilder::new(column, distance_type, quantizer, fri)?.build(batches)?;
 
         let path = temp_dir.child(format!("storage_part{}", part_id));
         let batches = storage.to_batches()?;
