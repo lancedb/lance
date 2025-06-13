@@ -23,7 +23,6 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
-use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::{
     hnsw::{
         builder::HnswBuildParams,
@@ -38,9 +37,7 @@ use lance_index::{IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KE
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
-use object_store::path::Path;
 use snafu::location;
-use tempfile::tempdir;
 use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
@@ -262,9 +259,6 @@ pub(crate) async fn build_vector_index(
         }
     }
 
-    let temp_dir = tempdir()?;
-    let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
-    let shuffler = IvfShuffler::new(temp_dir_path, ivf_params.num_partitions);
     if is_ivf_flat(stages) {
         match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
@@ -273,7 +267,6 @@ pub(crate) async fn build_vector_index(
                     column.to_owned(),
                     dataset.indices_dir().child(uuid),
                     params.metric_type,
-                    Box::new(shuffler),
                     Some(ivf_params.clone()),
                     Some(()),
                     (),
@@ -287,7 +280,6 @@ pub(crate) async fn build_vector_index(
                     column.to_owned(),
                     dataset.indices_dir().child(uuid),
                     params.metric_type,
-                    Box::new(shuffler),
                     Some(ivf_params.clone()),
                     Some(()),
                     (),
@@ -330,7 +322,6 @@ pub(crate) async fn build_vector_index(
                     column.to_owned(),
                     dataset.indices_dir().child(uuid),
                     params.metric_type,
-                    Box::new(shuffler),
                     Some(ivf_params.clone()),
                     Some(pq_params.clone()),
                     (),
@@ -357,7 +348,6 @@ pub(crate) async fn build_vector_index(
                         column.to_owned(),
                         dataset.indices_dir().child(uuid),
                         params.metric_type,
-                        Box::new(shuffler),
                         Some(ivf_params.clone()),
                         Some(pq_params.clone()),
                         hnsw_params.clone(),
@@ -371,7 +361,6 @@ pub(crate) async fn build_vector_index(
                         column.to_owned(),
                         dataset.indices_dir().child(uuid),
                         params.metric_type,
-                        Box::new(shuffler),
                         Some(ivf_params.clone()),
                         Some(sq_params.clone()),
                         hnsw_params.clone(),
