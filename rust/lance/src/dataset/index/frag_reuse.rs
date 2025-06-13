@@ -55,9 +55,9 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         if !check_results.into_iter().all(|r| r.unwrap()) {
             fragment_bitmaps.extend(
                 version
-                    .new_frags
+                    .groups
                     .iter()
-                    .map(|id| *id as u32)
+                    .flat_map(|g| g.new_frags.iter().map(move |i| *i as u32))
                     .collect::<Vec<_>>(),
             );
             retained_versions.push(version.clone());
@@ -112,28 +112,29 @@ fn is_index_remap_caught_up(
 
     match index_meta.fragment_bitmap.clone() {
         Some(index_frag_bitmap) => {
-            let mut old_frag_in_index = 0;
-            for old_frag in frag_reuse_version.old_frags.iter() {
-                if index_frag_bitmap.contains(old_frag.id as u32) {
-                    old_frag_in_index += 1;
+            for group in frag_reuse_version.groups.iter() {
+                let mut old_frag_in_index = 0;
+                for old_frag in group.old_frags.iter() {
+                    if index_frag_bitmap.contains(*old_frag as u32) {
+                        old_frag_in_index += 1;
+                    }
                 }
-            }
 
-            if old_frag_in_index == 0 {
-                Ok(true)
-            } else {
-                if old_frag_in_index != frag_reuse_version.old_frags.len() {
-                    // This should never happen because we always commit a full rewrite group
-                    // and we always reindex either the entire group or nothing.
-                    // We use invalid input to be consistent with
-                    // dataset::transaction::recalculate_fragment_bitmap
-                    return Err(Error::invalid_input(
-                        format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                                frag_reuse_version.old_frags.iter().map(|frag| frag.id).collect::<Vec<_>>()),
-                        location!()));
+                if old_frag_in_index > 0 {
+                    if old_frag_in_index != group.old_frags.len() {
+                        // This should never happen because we always commit a full rewrite group
+                        // and we always reindex either the entire group or nothing.
+                        // We use invalid input to be consistent with
+                        // dataset::transaction::recalculate_fragment_bitmap
+                        return Err(Error::invalid_input(
+                            format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
+                                    group.old_frags),
+                            location!()));
+                    }
+                    return Ok(false);
                 }
-                Ok(false)
             }
+            Ok(true)
         }
         None => {
             warn!(
