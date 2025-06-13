@@ -18,6 +18,10 @@ use snafu::location;
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
 use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 
+pub const LANCE_SCHEMA_PRIMARY_KEY: &str = "primary_key";
+
+pub const LANCE_SCHEMA_PRIMARY_KEY_DELIMITER: &str = "primary_key_delim";
+
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
 pub struct Schema {
@@ -60,6 +64,22 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
+    /// The primary key of the schema is set in the schema metadata
+    /// using key [`LANCE_SCHEMA_PRIMARY_KEY`] and specify the column name in value.
+    /// If this is a composite primary key, use `,` to delimit the column name.
+    /// If you need to override the delimiter, use key [`LANCE_SCHEMA_PRIMARY_KEY_DELIMITER`]
+    pub fn primary_key(&self) -> Option<Vec<String>> {
+        let delimiter: &str = self
+            .metadata
+            .get(LANCE_SCHEMA_PRIMARY_KEY_DELIMITER)
+            .map(String::as_str)
+            .unwrap_or(",");
+
+        self.metadata
+            .get(LANCE_SCHEMA_PRIMARY_KEY)
+            .map(|pk_str| pk_str.split(delimiter).map(|s| s.to_string()).collect())
+    }
+
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
         compare_fields(&self.fields, &expected.fields, options)
             && (!options.compare_metadata || self.metadata == expected.metadata)
@@ -597,6 +617,35 @@ impl TryFrom<&ArrowSchema> for Schema {
             metadata: schema.metadata.clone(),
         };
         schema.set_field_id(None);
+
+        if let Some(pk) = schema.primary_key() {
+            let mut seen = HashSet::new();
+            for pk_col in pk {
+                if seen.contains(&pk_col) {
+                    return Err(Error::Schema {
+                        message: format!(
+                            "Primary key cannot contain multiple copies of the same column: {}",
+                            pk_col
+                        ),
+                        location: location!(),
+                    });
+                }
+                if let Some(field) = schema.field(&pk_col) {
+                    if field.nullable {
+                        return Err(Error::Schema {
+                            message: format!("Primary key column must not be nullable: {}", pk_col),
+                            location: location!(),
+                        });
+                    }
+                    seen.insert(pk_col);
+                } else {
+                    return Err(Error::Schema {
+                        message: format!("Primary key column does not exist: {}", pk_col),
+                        location: location!(),
+                    });
+                }
+            }
+        }
 
         Ok(schema)
     }
@@ -1737,6 +1786,84 @@ mod tests {
                 metadata: Default::default(),
             };
             assert_eq!(schema.all_fields_nullable(), expected);
+        }
+    }
+
+    #[test]
+    fn test_schema_primary_key() {
+        let cases = vec![
+            vec![].into_iter().collect::<HashMap<String, String>>(),
+            vec![(LANCE_SCHEMA_PRIMARY_KEY.into(), "a".into())]
+                .into_iter()
+                .collect::<HashMap<String, String>>(),
+            vec![(LANCE_SCHEMA_PRIMARY_KEY.into(), "a,b.f1".into())]
+                .into_iter()
+                .collect::<HashMap<String, String>>(),
+            vec![
+                (LANCE_SCHEMA_PRIMARY_KEY.into(), "a:b.f,3".into()),
+                (LANCE_SCHEMA_PRIMARY_KEY_DELIMITER.into(), ":".into()),
+            ]
+            .into_iter()
+            .collect::<HashMap<String, String>>(),
+        ];
+        let fields = vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, false),
+                    ArrowField::new("f2", DataType::Boolean, true),
+                    ArrowField::new("f,3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ];
+        let expected = vec![
+            None,
+            Some(vec!["a".to_owned()]),
+            Some(vec!["a".to_owned(), "b.f1".to_owned()]),
+            Some(vec!["a".to_owned(), "b.f,3".to_owned()]),
+        ];
+
+        for (idx, case) in cases.into_iter().enumerate() {
+            let arrow_schema = ArrowSchema::new_with_metadata(fields.clone(), case);
+            let schema = Schema::try_from(&arrow_schema).unwrap();
+            assert_eq!(schema.primary_key(), expected[idx]);
+        }
+    }
+
+    #[test]
+    fn test_schema_primary_key_failures() {
+        let cases = vec![
+            vec![(LANCE_SCHEMA_PRIMARY_KEY.into(), "b.f2".into())]
+                .into_iter()
+                .collect::<HashMap<String, String>>(),
+            vec![(LANCE_SCHEMA_PRIMARY_KEY.into(), "a,a".into())]
+                .into_iter()
+                .collect::<HashMap<String, String>>(),
+            vec![(LANCE_SCHEMA_PRIMARY_KEY.into(), "d".into())]
+                .into_iter()
+                .collect::<HashMap<String, String>>(),
+        ];
+        let fields = vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, false),
+                    ArrowField::new("f2", DataType::Boolean, true),
+                    ArrowField::new("f,3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ];
+
+        for case in cases.into_iter() {
+            let arrow_schema = ArrowSchema::new_with_metadata(fields.clone(), case);
+            let result = Schema::try_from(&arrow_schema);
+            assert!(result.is_err());
         }
     }
 }
