@@ -1819,7 +1819,7 @@ mod tests {
             ),
             ArrowField::new("c", DataType::Float64, false),
         ];
-        let expected = vec![
+        let expected = [
             None,
             Some(vec!["a".to_owned()]),
             Some(vec!["a".to_owned(), "b.f1".to_owned()]),
