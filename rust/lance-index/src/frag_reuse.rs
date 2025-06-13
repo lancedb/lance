@@ -11,7 +11,7 @@ use itertools::Itertools;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
-use lance_table::format::{pb, ExternalFile, Fragment};
+use lance_table::format::{pb, ExternalFile};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -21,11 +21,36 @@ pub const FRAG_REUSE_INDEX_NAME: &str = "__lance_frag_reuse";
 pub const FRAG_REUSE_DETAILS_FILE_NAME: &str = "details.binpb";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+pub struct FragReuseGroup {
+    pub old_frags: Vec<u64>,
+    pub new_frags: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct FragReuseVersion {
     pub dataset_version: u64,
     pub changed_row_addrs: Vec<u8>,
-    pub old_frags: Vec<Fragment>,
-    pub new_frags: Vec<u64>,
+    pub groups: Vec<FragReuseGroup>,
+}
+
+impl From<&FragReuseGroup> for pb::fragment_reuse_index_details::Group {
+    fn from(group: &FragReuseGroup) -> Self {
+        Self {
+            old_fragments: group.old_frags.clone(),
+            new_fragments: group.new_frags.clone(),
+        }
+    }
+}
+
+impl TryFrom<pb::fragment_reuse_index_details::Group> for FragReuseGroup {
+    type Error = Error;
+
+    fn try_from(group: pb::fragment_reuse_index_details::Group) -> Result<Self> {
+        Ok(Self {
+            old_frags: group.old_fragments,
+            new_frags: group.new_fragments,
+        })
+    }
 }
 
 impl From<&FragReuseVersion> for pb::fragment_reuse_index_details::Version {
@@ -33,12 +58,9 @@ impl From<&FragReuseVersion> for pb::fragment_reuse_index_details::Version {
         Self {
             dataset_version: version.dataset_version,
             changed_row_addrs: version.changed_row_addrs.clone(),
-            old_fragments: version
-                .old_frags
-                .iter()
-                .map(pb::DataFragment::from)
-                .collect::<Vec<_>>(),
-            new_fragments: version.new_frags.clone(),
+            groups: version.groups.iter()
+                .map(|m| m.into())
+                .collect(),
         }
     }
 }
@@ -50,12 +72,11 @@ impl TryFrom<pb::fragment_reuse_index_details::Version> for FragReuseVersion {
         Ok(Self {
             dataset_version: version.dataset_version,
             changed_row_addrs: version.changed_row_addrs,
-            old_frags: version
-                .old_fragments
+            groups: version
+                .groups
                 .into_iter()
-                .map(Fragment::try_from)
+                .map(FragReuseGroup::try_from)
                 .collect::<Result<_>>()?,
-            new_frags: version.new_fragments,
         })
     }
 }
@@ -210,27 +231,27 @@ impl FragReuseIndex {
     pub fn remap_fragment_bitmap(&self, fragment_bitmap: &mut RoaringBitmap) -> Result<()> {
         println!("fragment bitmap to remap: {:?}", fragment_bitmap);
         for version in self.details.versions.iter() {
-            if fragment_bitmap.contains(version.old_frags[0].id as u32) {
+            for group in version.groups.iter() {
                 let mut removed = 0;
-                for old_frag in version.old_frags.iter() {
-                    if fragment_bitmap.remove(old_frag.id as u32) {
+                for old_frag in group.old_frags.iter() {
+                    if fragment_bitmap.remove(*old_frag as u32) {
                         removed += 1;
                     }
                 }
 
                 if removed > 0 {
-                    if removed != version.old_frags.len() {
+                    if removed != group.old_frags.len() {
                         // This should never happen because we always commit a full rewrite group
                         // and we always reindex either the entire group or nothing.
                         // We use invalid input to be consistent with
                         // dataset::transaction::recalculate_fragment_bitmap
                         return Err(Error::invalid_input(
                             format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                                    version.old_frags.iter().map(|frag| frag.id).collect::<Vec<_>>()),
+                                    group.old_frags),
                             location!()));
                     }
 
-                    for new_frag in version.new_frags.iter() {
+                    for new_frag in group.new_frags.iter() {
                         fragment_bitmap.insert(*new_frag as u32);
                     }
                 }
@@ -296,27 +317,19 @@ pub mod tests {
         let version1 = FragReuseVersion {
             dataset_version: 2,
             changed_row_addrs: vec![1, 2, 3],
-            old_frags: vec![Fragment {
-                id: 1,
-                files: vec![],
-                deletion_file: None,
-                row_id_meta: None,
-                physical_rows: None,
+            groups: vec![FragReuseGroup {
+                old_frags: vec![1],
+                new_frags: vec![2, 3],
             }],
-            new_frags: vec![2, 3],
         };
 
         let version2 = FragReuseVersion {
             dataset_version: 1,
             changed_row_addrs: vec![4, 5, 6],
-            old_frags: vec![Fragment {
-                id: 2,
-                files: vec![],
-                deletion_file: None,
-                row_id_meta: None,
-                physical_rows: None,
+            groups: vec![FragReuseGroup {
+                old_frags: vec![2],
+                new_frags: vec![4, 5],
             }],
-            new_frags: vec![4, 5],
         };
 
         // Create FragReuseIndexDetails with versions in reverse order
@@ -339,13 +352,15 @@ pub mod tests {
             roundtrip_details.versions[0].changed_row_addrs,
             vec![4, 5, 6]
         );
-        assert_eq!(roundtrip_details.versions[0].new_frags, vec![4, 5]);
+        assert_eq!(roundtrip_details.versions[0].groups[0].new_frags, vec![4, 5]);
+        assert_eq!(roundtrip_details.versions[0].groups[0].old_frags, vec![2]);
 
         assert_eq!(roundtrip_details.versions[1].dataset_version, 2);
         assert_eq!(
             roundtrip_details.versions[1].changed_row_addrs,
             vec![1, 2, 3]
         );
-        assert_eq!(roundtrip_details.versions[1].new_frags, vec![2, 3]);
+        assert_eq!(roundtrip_details.versions[1].groups[0].new_frags, vec![2, 3]);
+        assert_eq!(roundtrip_details.versions[1].groups[0].old_frags, vec![1]);
     }
 }

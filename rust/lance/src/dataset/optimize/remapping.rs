@@ -218,29 +218,31 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         let maybe_index_bitmap = curr_index_meta.fragment_bitmap.clone();
         let (should_remap, bitmap_after_remap) = match maybe_index_bitmap {
             Some(mut index_frag_bitmap) => {
-                let mut old_frag_in_index = 0;
-                for old_frag in version.old_frags.iter() {
-                    if index_frag_bitmap.remove(old_frag.id as u32) {
-                        old_frag_in_index += 1;
+                let mut should_remap = false;
+                for group in version.groups.iter() {
+                    let mut old_frag_in_index = 0;
+                    for old_frag in group.old_frags.iter() {
+                        if index_frag_bitmap.remove(*old_frag as u32) {
+                            old_frag_in_index += 1;
+                        }
                     }
-                }
 
-                if old_frag_in_index == 0 {
-                    (false, Some(index_frag_bitmap))
-                } else {
-                    if old_frag_in_index != version.old_frags.len() {
-                        // this should never happen because we always commit a full rewrite group
-                        // and we always reindex either the entire group or nothing.
-                        // We use invalid input to be consistent with
-                        // dataset::transaction::recalculate_fragment_bitmap
-                        return Err(Error::invalid_input(
-                            "The compaction plan included a rewrite group that was a split of indexed and non-indexed data",
-                            location!()));
+                    if old_frag_in_index > 0 {
+                        if old_frag_in_index != group.old_frags.len() {
+                            // this should never happen because we always commit a full rewrite group
+                            // and we always reindex either the entire group or nothing.
+                            // We use invalid input to be consistent with
+                            // dataset::transaction::recalculate_fragment_bitmap
+                            return Err(Error::invalid_input(
+                                format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}", group.old_frags),
+                                location!()));
+                        }
+                        index_frag_bitmap
+                            .extend(group.new_frags.clone().into_iter().map(|f| f as u32));
+                        should_remap = true;
                     }
-                    index_frag_bitmap
-                        .extend(version.new_frags.clone().into_iter().map(|f| f as u32));
-                    (true, Some(index_frag_bitmap))
                 }
+                (should_remap, Some(index_frag_bitmap))
             }
             // if there is no fragment bitmap for the index,
             // we attempt remapping but will not update the fragment bitmap.

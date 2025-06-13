@@ -386,6 +386,12 @@ message FragmentReuseIndexDetails {
     repeated Version versions = 1;
   }
 
+  // A summarized version of the RewriteGroup information in a Rewrite transaction
+  message Group {
+    repeated uint64 old_fragments = 1;
+    repeated uint64 new_fragments = 2;
+  }
+
   message Version {
     // The dataset_version at the time the index adds this version entry
     uint64 dataset_version = 1;
@@ -396,11 +402,6 @@ message FragmentReuseIndexDetails {
     // this mapping can then be used to remap indexes or satisfy index queries for the new unindexed fragments.
     bytes changed_row_addrs = 2;
 
-    // Store the full content of old fragments to be used for indexed queries
-    // This should be exactly in the order that a rewrite_files takes in the old fragments
-    repeated DataFragment old_fragments = 3;
-
-    // This must be exactly in the order that a rewrite_files produces the new fragments
-    repeated uint64 new_fragments = 4;
+    repeated Group groups = 3;
   }
 }
