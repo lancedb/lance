@@ -3,7 +3,6 @@
 
 use std::ops::Range;
 
-use futures::future;
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
@@ -13,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::{Error, Result};
-use std::collections::HashMap;
+use std::cmp::Ordering;
 
 /// Lance Ref
 #[derive(Debug, Clone)]
@@ -55,9 +54,10 @@ impl Tags {
     }
 
     /// Get all tags.
-    pub async fn list(&self) -> Result<HashMap<String, TagContents>> {
-        let mut tags = HashMap::<String, TagContents>::new();
-
+    pub async fn list(
+        &self,
+        order: Option<std::cmp::Ordering>,
+    ) -> Result<Vec<(String, TagContents)>> {
         let tag_files = self
             .object_store()
             .read_dir(base_tags_path(&self.base))
@@ -69,21 +69,34 @@ impl Tags {
             .map(|name| name.to_string())
             .collect_vec();
 
-        futures::stream::iter(tag_names)
+        let mut tags: Vec<(String, TagContents)> = futures::stream::iter(tag_names)
             .map(|tag_name| {
                 let tag_file = tag_path(&self.base, &tag_name);
                 async move {
-                    let contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-                    Ok((tag_name, contents))
+                    match TagContents::from_path(&tag_file, self.object_store()).await {
+                        Ok(contents) => Ok((tag_name, contents)),
+                        Err(e) => Err(lance_core::Error::RefNotFound {
+                            message: format!("Tag {} not found: {}", tag_name, e),
+                        }),
+                    }
                 }
             })
             .buffer_unordered(10)
-            .try_for_each(|result| {
-                let (tag_name, contents) = result;
-                tags.insert(tag_name, contents);
-                future::ready(Ok::<(), Error>(()))
-            })
+            .try_collect()
             .await?;
+
+        tags.sort_by(|a, b| {
+            // If no order is specified, default to descending order, latest version first.
+            // if version is equal, sort by tag name, default to ascending order,
+            let desired_ordering = order.unwrap_or(Ordering::Greater);
+
+            let version_ordering = a.1.version.cmp(&b.1.version);
+            let version_result = match desired_ordering {
+                Ordering::Less => version_ordering,
+                _ => version_ordering.reverse(),
+            };
+            version_result.then_with(|| a.0.cmp(&b.0))
+        });
 
         Ok(tags)
     }

@@ -486,6 +486,24 @@ def test_tag(tmp_path: Path):
     assert ds.version == 1
 
 
+def test_tag_order(tmp_path: Path):
+    table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
+    base_dir = tmp_path / "test"
+
+    for i in range(3):
+        mode = "append" if i > 0 else "create"
+        ds = lance.write_dataset(table, base_dir, mode=mode)
+
+    expected_tags = {"tag3": 3, "tag2": 2, "tag1": 1}
+    for name, version in expected_tags.items():
+        ds.tags.create(name, version)
+
+    tags = ds.tags.list()
+    assert len(tags) == 3
+    tag_names = [t[0] for t in tags]
+    assert tag_names == list(expected_tags.keys()), f"Unexpected tag order: {tag_names}"
+
+
 def test_sample(tmp_path: Path):
     table1 = pa.Table.from_pydict({"x": [0, 10, 20, 30, 40, 50], "y": range(6)})
     base_dir = tmp_path / "test"

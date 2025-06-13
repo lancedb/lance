@@ -3843,7 +3843,7 @@ class Tags:
     def __init__(self, dataset: _Dataset):
         self._ds = dataset
 
-    def list(self) -> dict[str, Tag]:
+    def list(self) -> list[str, Tag]:
         """
         List all dataset tags.
 
