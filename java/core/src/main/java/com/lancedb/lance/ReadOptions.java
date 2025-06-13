@@ -25,14 +25,14 @@ public class ReadOptions {
   private final Optional<Integer> version;
   private final Optional<Integer> blockSize;
   private final int indexCacheSize;
-  private final int metadataCacheSize;
+  private final int metadataCacheSizeBytes;
   private final Map<String, String> storageOptions;
 
   private ReadOptions(Builder builder) {
     this.version = builder.version;
     this.blockSize = builder.blockSize;
     this.indexCacheSize = builder.indexCacheSize;
-    this.metadataCacheSize = builder.metadataCacheSize;
+    this.metadataCacheSizeBytes = builder.metadataCacheSizeBytes;
     this.storageOptions = builder.storageOptions;
   }
 
@@ -48,8 +48,21 @@ public class ReadOptions {
     return indexCacheSize;
   }
 
+  public int getMetadataCacheSizeBytes() {
+    return metadataCacheSizeBytes;
+  }
+
+  /**
+   * Get metadata cache size. This method is deprecated. Use {@link #getMetadataCacheSizeBytes()}
+   * instead.
+   *
+   * @return the metadata cache size in entry count (estimated)
+   * @deprecated Use {@link #getMetadataCacheSizeBytes()} instead
+   */
+  @Deprecated
   public int getMetadataCacheSize() {
-    return metadataCacheSize;
+    int assumedEntrySize = 10 * 1024 * 1024; // 10MB per entry
+    return metadataCacheSizeBytes / assumedEntrySize;
   }
 
   public Map<String, String> getStorageOptions() {
@@ -62,7 +75,7 @@ public class ReadOptions {
         .append("version", version.orElse(null))
         .append("blockSize", blockSize.orElse(null))
         .append("indexCacheSize", indexCacheSize)
-        .append("metadataCacheSize", metadataCacheSize)
+        .append("metadataCacheSizeBytes", metadataCacheSizeBytes)
         .append("storageOptions", storageOptions)
         .toString();
   }
@@ -72,7 +85,7 @@ public class ReadOptions {
     private Optional<Integer> version = Optional.empty();
     private Optional<Integer> blockSize = Optional.empty();
     private int indexCacheSize = 256;
-    private int metadataCacheSize = 256;
+    private int metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rust
     private Map<String, String> storageOptions = new HashMap<>();
 
     /**
@@ -115,14 +128,29 @@ public class ReadOptions {
     }
 
     /**
-     * Metadata cache size for the fragment metadata. If it is zero, metadata cache is disabled.
-     * Default is 256.
+     * Size of the metadata cache in bytes. This cache stores metadata in memory for faster open
+     * table and scans. If it is zero, metadata cache is disabled. Default is 1 GiB.
      *
-     * @param metadataCacheSize the metadata cache size
+     * @param metadataCacheSizeBytes the metadata cache size in bytes
      * @return this builder
      */
+    public Builder setMetadataCacheSizeBytes(int metadataCacheSizeBytes) {
+      this.metadataCacheSizeBytes = metadataCacheSizeBytes;
+      return this;
+    }
+
+    /**
+     * Metadata cache size for the fragment metadata. If it is zero, metadata cache is disabled.
+     * This method is deprecated. Use {@link #setMetadataCacheSizeBytes(int)} instead.
+     *
+     * @param metadataCacheSize the metadata cache size (entry count)
+     * @return this builder
+     * @deprecated Use {@link #setMetadataCacheSizeBytes(int)} instead
+     */
+    @Deprecated
     public Builder setMetadataCacheSize(int metadataCacheSize) {
-      this.metadataCacheSize = metadataCacheSize;
+      int assumedEntrySize = 10 * 1024 * 1024; // 10MB per entry
+      this.metadataCacheSizeBytes = metadataCacheSize * assumedEntrySize;
       return this;
     }
 
