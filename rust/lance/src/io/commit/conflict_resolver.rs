@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
-use crate::io::deletion::read_dataset_deletion_file;
+use crate::io::{commit::deletion_file_cache_key, deletion::read_dataset_deletion_file};
 use crate::{
     dataset::transaction::{Operation, Transaction},
     Dataset,
@@ -14,28 +14,12 @@ use lance_core::{
 };
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_table::format::Index;
-use lance_table::{
-    format::Fragment,
-    io::deletion::{deletion_file_path, write_deletion_file},
-};
+use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use snafu::{location, Location};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
-};
-
-use futures::{StreamExt, TryStreamExt};
-use lance_core::{
-    utils::{deletion::DeletionVector, mask::RowIdTreeMap},
-    Result,
-};
-use lance_table::{format::Fragment, io::deletion::write_deletion_file};
-
-use crate::io::{commit::deletion_file_cache_key, deletion::read_dataset_deletion_file};
-use crate::{
-    dataset::transaction::{ConflictResult, Operation, Transaction},
-    Dataset,
 };
 
 #[derive(Debug)]

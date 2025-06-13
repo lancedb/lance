@@ -13,7 +13,7 @@ use itertools::Itertools;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{cache::FileMetadataCache, ROW_ID};
+use lance_core::ROW_ID;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::FileReaderOptions;
