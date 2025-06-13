@@ -385,6 +385,8 @@ impl FFILanceTableProvider {
         let py = dataset.py();
         let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
         let dataset_ref = &dataset.bind(py).borrow().ds;
+        // TODO: https://github.com/lancedb/lance/issues/3966 remove this workaround
+        let _ = RT.block_on(Some(py), dataset_ref.load_indices())?;
         Ok(Self {
             dataset: dataset_ref.clone(),
             with_row_id,
