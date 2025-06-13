@@ -229,6 +229,7 @@ pub async fn compact_files(
 
     let dataset_ref = &dataset.clone();
 
+    println!("compaction tasks: {:?}", compaction_plan.tasks);
     let result_stream = futures::stream::iter(compaction_plan.tasks.into_iter())
         .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &options))
         .buffer_unordered(
@@ -2079,7 +2080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remap_index_after_compaction() {
+    async fn test_auto_remap_index_after_compaction() {
         let mut data_gen = BatchGenerator::new()
             .col(Box::new(
                 RandomVector::new().vec_width(128).named("vec".to_owned()),
@@ -2161,7 +2162,7 @@ mod tests {
 
         assert_eq!(frag_reuse_index.details.versions.len(), plan.tasks().len());
 
-        // Trigger index remap
+        // Trigger index remap should have no change because index is auto-remapped
         remapping::remap_column_index(&mut dataset, &["i"], index_name.clone())
             .await
             .unwrap();
@@ -2171,7 +2172,7 @@ mod tests {
         else {
             panic!("scalar index must be available");
         };
-        assert_ne!(remapped_scalar_index.uuid, scalar_index.uuid);
+        assert_eq!(remapped_scalar_index.uuid, scalar_index.uuid);
         let mut all_fragment_bitmap = RoaringBitmap::new();
         dataset.fragments().iter().for_each(|f| {
             all_fragment_bitmap.insert(f.id as u32);
@@ -2248,6 +2249,8 @@ mod tests {
         .await
         .unwrap();
 
+        println!("finished compaction");
+
         // Concurrent reindex should succeed
         dataset_clone
             .create_index(
@@ -2262,6 +2265,8 @@ mod tests {
 
         // Check new index does not cover the compacted files
         dataset.checkout_latest().await.unwrap();
+
+        println!("try to load new scalar index");
         let Some(scalar_index) = dataset.load_index_by_name("scalar").await.unwrap() else {
             panic!("scalar index must be available");
         };
@@ -2328,11 +2333,6 @@ mod tests {
 
         dataset.checkout_latest().await.unwrap();
         let mut dataset_clone = dataset.clone();
-        let frags_before_compact = dataset_clone
-            .fragments()
-            .iter()
-            .map(|f| f.id as u32)
-            .collect::<HashSet<_>>();
 
         // Concurrent reindex should succeed
         dataset
@@ -2359,7 +2359,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Check new index does not cover the compacted files
+        // Check new index is auto-remapped
         dataset.checkout_latest().await.unwrap();
         let Some(scalar_index) = dataset.load_index_by_name("scalar").await.unwrap() else {
             panic!("scalar index must be available");
@@ -2369,8 +2369,7 @@ mod tests {
             .unwrap()
             .iter()
             .collect::<HashSet<_>>();
-        assert_eq!(index_frags, frags_before_compact);
-        assert_ne!(
+        assert_eq!(
             index_frags,
             dataset
                 .fragments()

@@ -208,6 +208,7 @@ impl FragReuseIndex {
     }
 
     pub fn remap_fragment_bitmap(&self, fragment_bitmap: &mut RoaringBitmap) -> Result<()> {
+        println!("fragment bitmap to remap: {:?}", fragment_bitmap);
         for version in self.details.versions.iter() {
             if fragment_bitmap.contains(version.old_frags[0].id as u32) {
                 let mut removed = 0;
