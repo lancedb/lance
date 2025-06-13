@@ -47,6 +47,9 @@ impl Debug for PQTransformer {
 impl Transformer for PQTransformer {
     #[instrument(name = "PQTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        if batch.column_by_name(&self.output_column).is_some() {
+            return Ok(batch.clone());
+        }
         let input_arr = batch
             .column_by_name(&self.input_column)
             .ok_or(Error::Index {
