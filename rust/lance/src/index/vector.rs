@@ -145,6 +145,19 @@ impl VectorIndexParams {
         }
     }
 
+    pub fn ivf_hnsw(
+        distance_type: DistanceType,
+        ivf: IvfBuildParams,
+        hnsw: HnswBuildParams,
+    ) -> Self {
+        let stages = vec![StageParams::Ivf(ivf), StageParams::Hnsw(hnsw)];
+        Self {
+            stages,
+            metric_type: distance_type,
+            version: IndexFileVersion::V3,
+        }
+    }
+
     /// Create index parameters with `IVF`, `PQ` and `HNSW` parameters, respectively.
     /// This is used for `IVF_HNSW_PQ` index.
     pub fn with_ivf_hnsw_pq_params(
@@ -386,6 +399,20 @@ pub(crate) async fn build_vector_index(
                     });
                 }
             }
+        } else {
+            // without quantization
+            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                dataset.clone(),
+                column.to_owned(),
+                dataset.indices_dir().child(uuid),
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params.clone()),
+                Some(()),
+                hnsw_params.clone(),
+            )?
+            .build()
+            .await?;
         }
     } else {
         return Err(Error::Index {
