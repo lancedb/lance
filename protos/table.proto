@@ -386,10 +386,16 @@ message FragmentReuseIndexDetails {
     repeated Version versions = 1;
   }
 
+  message FragmentDigest {
+    uint64 id = 1;
+    uint64 physical_rows = 2;
+    uint64 num_deleted_rows = 3;
+  }
+
   // A summarized version of the RewriteGroup information in a Rewrite transaction
   message Group {
-    repeated uint64 old_fragments = 1;
-    repeated uint64 new_fragments = 2;
+    repeated FragmentDigest old_fragments = 1;
+    repeated FragmentDigest new_fragments = 2;
   }
 
   message Version {

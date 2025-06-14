@@ -519,9 +519,7 @@ impl DatasetIndexExt for Dataset {
                 index
             } else {
                 let index_details = load_frag_reuse_index_details(self, fri_meta).await?;
-                let index =
-                    open_frag_reuse_index(index_details.as_ref(), self.fragments().as_slice())
-                        .await?;
+                let index = open_frag_reuse_index(index_details.as_ref()).await?;
                 self.session
                     .index_cache
                     .insert_frag_reuse(&uuid, index.clone());
@@ -1149,8 +1147,7 @@ impl DatasetIndexInternalExt for Dataset {
                 location: location!(),
             })?;
             let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
-            let index =
-                open_frag_reuse_index(index_details.as_ref(), self.fragments().as_slice()).await?;
+            let index = open_frag_reuse_index(index_details.as_ref()).await?;
 
             info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_FRAG_REUSE);
             metrics.record_index_load();
