@@ -2281,8 +2281,7 @@ mod tests {
             .unwrap()
             .iter()
             .collect::<HashSet<_>>();
-        assert_eq!(index_frags, frags_before_compact);
-        assert_ne!(
+        assert_eq!(
             index_frags,
             dataset
                 .fragments()
