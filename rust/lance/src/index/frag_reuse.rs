@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::dataset::optimize::remapping::transpose_row_ids;
+use crate::dataset::optimize::remapping::transpose_row_ids_from_digest;
 use crate::Dataset;
 use lance_core::Error;
 use lance_index::frag_reuse::{
-    FragReuseIndex, FragReuseIndexDetails, FragReuseVersion, FRAG_REUSE_DETAILS_FILE_NAME,
-    FRAG_REUSE_INDEX_NAME,
+    FragReuseGroup, FragReuseIndex, FragReuseIndexDetails, FragReuseVersion,
+    FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME,
 };
 use lance_index::DatasetIndexExt;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
-use lance_table::format::{Fragment, Index};
+use lance_table::format::Index;
 use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use snafu::location;
@@ -72,26 +72,29 @@ pub async fn load_frag_reuse_index_details(
 }
 
 /// open fragment reuse index based on its metadata details
-pub async fn open_frag_reuse_index(
+pub(crate) async fn open_frag_reuse_index(
     details: &FragReuseIndexDetails,
-    dataset_fragments: &[Fragment],
 ) -> lance_core::Result<Arc<FragReuseIndex>> {
     let mut row_id_maps: Vec<HashMap<u64, Option<u64>>> =
         Vec::with_capacity(details.versions.len());
     for version in &details.versions {
-        let mut new_fragments_in_version = Vec::with_capacity(version.new_frags.len());
-        dataset_fragments
-            .iter()
-            .filter(|f| version.new_frags.contains(&f.id))
-            .for_each(|f| new_fragments_in_version.push(f.clone()));
-
         let cursor = Cursor::new(&version.changed_row_addrs);
         let changed_row_addrs = RoaringTreemap::deserialize_from(cursor).unwrap();
 
-        let row_id_map = transpose_row_ids(
+        let all_old_frag_digests = version
+            .groups
+            .iter()
+            .flat_map(|g| g.old_frags.clone().into_iter())
+            .collect::<Vec<_>>();
+        let all_new_frag_digests = version
+            .groups
+            .iter()
+            .flat_map(|g| g.new_frags.clone().into_iter())
+            .collect::<Vec<_>>();
+        let row_id_map = transpose_row_ids_from_digest(
             changed_row_addrs,
-            &version.old_frags,
-            new_fragments_in_version.as_slice(),
+            &all_old_frag_digests,
+            &all_new_frag_digests,
         );
         row_id_maps.push(row_id_map);
     }
@@ -99,10 +102,9 @@ pub async fn open_frag_reuse_index(
     Ok(Arc::new(FragReuseIndex::new(row_id_maps, details.clone())))
 }
 
-pub async fn build_new_frag_reuse_index(
+pub(crate) async fn build_new_frag_reuse_index(
     dataset: &mut Dataset,
-    old_fragments: Vec<Fragment>,
-    new_fragment_ids: Vec<u64>,
+    frag_reuse_groups: Vec<FragReuseGroup>,
     new_fragment_bitmap: RoaringBitmap,
     changed_row_addrs: RoaringTreemap,
 ) -> lance_core::Result<Index> {
@@ -111,9 +113,8 @@ pub async fn build_new_frag_reuse_index(
 
     let new_version = FragReuseVersion {
         dataset_version: dataset.manifest.version,
-        old_frags: old_fragments.clone(),
-        new_frags: new_fragment_ids,
         changed_row_addrs: serialized,
+        groups: frag_reuse_groups,
     };
 
     let index_meta = dataset.load_indices().await.map(|indices| {

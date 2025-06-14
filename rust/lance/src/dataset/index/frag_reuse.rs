@@ -53,13 +53,7 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         }
 
         if !check_results.into_iter().all(|r| r.unwrap()) {
-            fragment_bitmaps.extend(
-                version
-                    .groups
-                    .iter()
-                    .flat_map(|g| g.new_frags.iter().map(move |i| *i as u32))
-                    .collect::<Vec<_>>(),
-            );
+            fragment_bitmaps.extend(version.new_frag_bitmap());
             retained_versions.push(version.clone());
         }
     }
@@ -115,7 +109,7 @@ fn is_index_remap_caught_up(
             for group in frag_reuse_version.groups.iter() {
                 let mut old_frag_in_index = 0;
                 for old_frag in group.old_frags.iter() {
-                    if index_frag_bitmap.contains(*old_frag as u32) {
+                    if index_frag_bitmap.contains(old_frag.id as u32) {
                         old_frag_in_index += 1;
                     }
                 }

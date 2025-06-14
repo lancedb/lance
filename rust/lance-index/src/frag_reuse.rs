@@ -11,7 +11,7 @@ use itertools::Itertools;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
-use lance_table::format::{pb, ExternalFile};
+use lance_table::format::{pb, ExternalFile, Fragment};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -21,23 +21,61 @@ pub const FRAG_REUSE_INDEX_NAME: &str = "__lance_frag_reuse";
 pub const FRAG_REUSE_DETAILS_FILE_NAME: &str = "details.binpb";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub struct FragReuseGroup {
-    pub old_frags: Vec<u64>,
-    pub new_frags: Vec<u64>,
+pub struct FragDigest {
+    pub id: u64,
+    pub physical_rows: usize,
+    pub num_deleted_rows: usize,
+}
+
+impl From<&FragDigest> for pb::fragment_reuse_index_details::FragmentDigest {
+    fn from(digest: &FragDigest) -> Self {
+        Self {
+            id: digest.id,
+            physical_rows: digest.physical_rows as u64,
+            num_deleted_rows: digest.num_deleted_rows as u64,
+        }
+    }
+}
+
+impl From<&Fragment> for FragDigest {
+    fn from(fragment: &Fragment) -> Self {
+        Self {
+            id: fragment.id,
+            physical_rows: fragment
+                .physical_rows
+                .expect("Fragment doesn't have physical rows recorded"),
+            num_deleted_rows: fragment
+                .deletion_file
+                .as_ref()
+                .and_then(|d| d.num_deleted_rows)
+                .unwrap_or(0),
+        }
+    }
+}
+
+impl TryFrom<pb::fragment_reuse_index_details::FragmentDigest> for FragDigest {
+    type Error = Error;
+
+    fn try_from(digest: pb::fragment_reuse_index_details::FragmentDigest) -> Result<Self> {
+        Ok(Self {
+            id: digest.id,
+            physical_rows: digest.physical_rows as usize,
+            num_deleted_rows: digest.num_deleted_rows as usize,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub struct FragReuseVersion {
-    pub dataset_version: u64,
-    pub changed_row_addrs: Vec<u8>,
-    pub groups: Vec<FragReuseGroup>,
+pub struct FragReuseGroup {
+    pub old_frags: Vec<FragDigest>,
+    pub new_frags: Vec<FragDigest>,
 }
 
 impl From<&FragReuseGroup> for pb::fragment_reuse_index_details::Group {
     fn from(group: &FragReuseGroup) -> Self {
         Self {
-            old_fragments: group.old_frags.clone(),
-            new_fragments: group.new_frags.clone(),
+            old_fragments: group.old_frags.iter().map(|f| f.into()).collect(),
+            new_fragments: group.new_frags.iter().map(|f| f.into()).collect(),
         }
     }
 }
@@ -47,10 +85,25 @@ impl TryFrom<pb::fragment_reuse_index_details::Group> for FragReuseGroup {
 
     fn try_from(group: pb::fragment_reuse_index_details::Group) -> Result<Self> {
         Ok(Self {
-            old_frags: group.old_fragments,
-            new_frags: group.new_fragments,
+            old_frags: group
+                .old_fragments
+                .into_iter()
+                .map(FragDigest::try_from)
+                .collect::<Result<_>>()?,
+            new_frags: group
+                .new_fragments
+                .into_iter()
+                .map(FragDigest::try_from)
+                .collect::<Result<_>>()?,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+pub struct FragReuseVersion {
+    pub dataset_version: u64,
+    pub changed_row_addrs: Vec<u8>,
+    pub groups: Vec<FragReuseGroup>,
 }
 
 impl From<&FragReuseVersion> for pb::fragment_reuse_index_details::Version {
@@ -58,9 +111,7 @@ impl From<&FragReuseVersion> for pb::fragment_reuse_index_details::Version {
         Self {
             dataset_version: version.dataset_version,
             changed_row_addrs: version.changed_row_addrs.clone(),
-            groups: version.groups.iter()
-                .map(|m| m.into())
-                .collect(),
+            groups: version.groups.iter().map(|g| g.into()).collect(),
         }
     }
 }
@@ -78,6 +129,26 @@ impl TryFrom<pb::fragment_reuse_index_details::Version> for FragReuseVersion {
                 .map(FragReuseGroup::try_from)
                 .collect::<Result<_>>()?,
         })
+    }
+}
+
+impl FragReuseVersion {
+    pub fn old_frag_ids(&self) -> Vec<u64> {
+        self.groups
+            .iter()
+            .flat_map(|g| g.old_frags.iter().map(|f| f.id))
+            .collect::<Vec<_>>()
+    }
+
+    pub fn new_frag_ids(&self) -> Vec<u64> {
+        self.groups
+            .iter()
+            .flat_map(|g| g.new_frags.iter().map(|f| f.id))
+            .collect::<Vec<_>>()
+    }
+
+    pub fn new_frag_bitmap(&self) -> RoaringBitmap {
+        RoaringBitmap::from_iter(self.new_frag_ids().iter().map(|&id| id as u32))
     }
 }
 
@@ -117,6 +188,16 @@ impl TryFrom<InlineContent> for FragReuseIndexDetails {
                 .map(|m| m.try_into())
                 .collect::<Result<Vec<_>>>()?,
         })
+    }
+}
+
+impl FragReuseIndexDetails {
+    pub fn new_frag_bitmap(&self) -> RoaringBitmap {
+        RoaringBitmap::from_iter(
+            self.versions
+                .iter()
+                .flat_map(|v| v.new_frag_ids().into_iter().map(|id| id as u32)),
+        )
     }
 }
 
@@ -229,12 +310,11 @@ impl FragReuseIndex {
     }
 
     pub fn remap_fragment_bitmap(&self, fragment_bitmap: &mut RoaringBitmap) -> Result<()> {
-        println!("fragment bitmap to remap: {:?}", fragment_bitmap);
         for version in self.details.versions.iter() {
             for group in version.groups.iter() {
                 let mut removed = 0;
                 for old_frag in group.old_frags.iter() {
-                    if fragment_bitmap.remove(*old_frag as u32) {
+                    if fragment_bitmap.remove(old_frag.id as u32) {
                         removed += 1;
                     }
                 }
@@ -252,7 +332,7 @@ impl FragReuseIndex {
                     }
 
                     for new_frag in group.new_frags.iter() {
-                        fragment_bitmap.insert(*new_frag as u32);
+                        fragment_bitmap.insert(new_frag.id as u32);
                     }
                 }
             }
@@ -318,8 +398,23 @@ pub mod tests {
             dataset_version: 2,
             changed_row_addrs: vec![1, 2, 3],
             groups: vec![FragReuseGroup {
-                old_frags: vec![1],
-                new_frags: vec![2, 3],
+                old_frags: vec![FragDigest {
+                    id: 1,
+                    physical_rows: 1,
+                    num_deleted_rows: 0,
+                }],
+                new_frags: vec![
+                    FragDigest {
+                        id: 2,
+                        physical_rows: 1,
+                        num_deleted_rows: 0,
+                    },
+                    FragDigest {
+                        id: 3,
+                        physical_rows: 1,
+                        num_deleted_rows: 0,
+                    },
+                ],
             }],
         };
 
@@ -327,8 +422,23 @@ pub mod tests {
             dataset_version: 1,
             changed_row_addrs: vec![4, 5, 6],
             groups: vec![FragReuseGroup {
-                old_frags: vec![2],
-                new_frags: vec![4, 5],
+                old_frags: vec![FragDigest {
+                    id: 2,
+                    physical_rows: 1,
+                    num_deleted_rows: 0,
+                }],
+                new_frags: vec![
+                    FragDigest {
+                        id: 4,
+                        physical_rows: 1,
+                        num_deleted_rows: 0,
+                    },
+                    FragDigest {
+                        id: 5,
+                        physical_rows: 1,
+                        num_deleted_rows: 0,
+                    },
+                ],
             }],
         };
 
@@ -352,15 +462,57 @@ pub mod tests {
             roundtrip_details.versions[0].changed_row_addrs,
             vec![4, 5, 6]
         );
-        assert_eq!(roundtrip_details.versions[0].groups[0].new_frags, vec![4, 5]);
-        assert_eq!(roundtrip_details.versions[0].groups[0].old_frags, vec![2]);
+        assert_eq!(
+            roundtrip_details.versions[0].groups[0].new_frags,
+            vec![
+                FragDigest {
+                    id: 4,
+                    physical_rows: 1,
+                    num_deleted_rows: 0,
+                },
+                FragDigest {
+                    id: 5,
+                    physical_rows: 1,
+                    num_deleted_rows: 0,
+                }
+            ]
+        );
+        assert_eq!(
+            roundtrip_details.versions[0].groups[0].old_frags,
+            vec![FragDigest {
+                id: 2,
+                physical_rows: 1,
+                num_deleted_rows: 0,
+            }]
+        );
 
         assert_eq!(roundtrip_details.versions[1].dataset_version, 2);
         assert_eq!(
             roundtrip_details.versions[1].changed_row_addrs,
             vec![1, 2, 3]
         );
-        assert_eq!(roundtrip_details.versions[1].groups[0].new_frags, vec![2, 3]);
-        assert_eq!(roundtrip_details.versions[1].groups[0].old_frags, vec![1]);
+        assert_eq!(
+            roundtrip_details.versions[1].groups[0].new_frags,
+            vec![
+                FragDigest {
+                    id: 2,
+                    physical_rows: 1,
+                    num_deleted_rows: 0,
+                },
+                FragDigest {
+                    id: 3,
+                    physical_rows: 1,
+                    num_deleted_rows: 0,
+                }
+            ]
+        );
+        assert_eq!(
+            roundtrip_details.versions[1].groups[0].old_frags,
+            vec![FragDigest {
+                id: 1,
+                physical_rows: 1,
+                num_deleted_rows: 0,
+            }]
+        );
     }
 }

@@ -11,7 +11,7 @@ use crate::{index, Dataset};
 use async_trait::async_trait;
 use lance_core::utils::address::RowAddress;
 use lance_core::Error;
-use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_index::frag_reuse::{FragDigest, FRAG_REUSE_INDEX_NAME};
 use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, Index};
 use roaring::RoaringTreemap;
@@ -80,14 +80,14 @@ struct MissingIds<'a, I: Iterator<Item = u64>> {
     expected_row_id: u64,
     current_fragment_idx: usize,
     last: Option<u64>,
-    fragments: &'a Vec<Fragment>,
+    fragments: &'a Vec<FragDigest>,
 }
 
 impl<'a, I: Iterator<Item = u64>> MissingIds<'a, I> {
     /// row_ids must be sorted in the same order in which the rows would be
     /// found by scanning fragments in the order they are presented in.
     /// fragments is not guaranteed to be sorted by id.
-    fn new(row_ids: I, fragments: &'a Vec<Fragment>) -> Self {
+    fn new(row_ids: I, fragments: &'a Vec<FragDigest>) -> Self {
         assert!(!fragments.is_empty());
         let first_frag = &fragments[0];
         Self {
@@ -123,9 +123,7 @@ impl<I: Iterator<Item = u64>> Iterator for MissingIds<'_, I> {
             let expected_row_id = self.expected_row_id;
             self.expected_row_id += 1;
             // We validate before this we should have physical rows recorded
-            let current_physical_rows = current_fragment
-                .physical_rows
-                .expect("Fragment doesn't have physical rows recorded");
+            let current_physical_rows = current_fragment.physical_rows;
             if (self.expected_row_id % RowAddress::FRAGMENT_SIZE) == current_physical_rows as u64 {
                 self.current_fragment_idx += 1;
                 if self.current_fragment_idx < self.fragments.len() {
@@ -147,11 +145,21 @@ impl<I: Iterator<Item = u64>> Iterator for MissingIds<'_, I> {
 
 pub fn transpose_row_ids(
     row_ids: RoaringTreemap,
-    old_fragments: &Vec<Fragment>,
+    old_fragments: &[Fragment],
     new_fragments: &[Fragment],
 ) -> HashMap<u64, Option<u64>> {
+    let old_frag_digests: Vec<FragDigest> = old_fragments.iter().map(|frag| frag.into()).collect();
+    let new_frag_digests: Vec<FragDigest> = new_fragments.iter().map(|frag| frag.into()).collect();
+    transpose_row_ids_from_digest(row_ids, &old_frag_digests, &new_frag_digests)
+}
+
+pub fn transpose_row_ids_from_digest(
+    row_ids: RoaringTreemap,
+    old_fragments: &Vec<FragDigest>,
+    new_fragments: &[FragDigest],
+) -> HashMap<u64, Option<u64>> {
     let new_ids = new_fragments.iter().flat_map(|frag| {
-        (0..frag.physical_rows.unwrap() as u32).map(|offset| {
+        (0..frag.physical_rows as u32).map(|offset| {
             Some(u64::from(RowAddress::new_from_parts(
                 frag.id as u32,
                 offset,
@@ -163,12 +171,7 @@ pub fn transpose_row_ids(
     let expected_size = row_ids.len() as usize
         + old_fragments
             .iter()
-            .map(|frag| {
-                frag.deletion_file
-                    .as_ref()
-                    .and_then(|d| d.num_deleted_rows)
-                    .unwrap_or(0)
-            })
+            .map(|frag| frag.num_deleted_rows)
             .sum::<usize>();
     // We expect row ids to be unique, so we should already not get many collisions.
     // The default hasher is designed to be resistance to DoS attacks, which is
@@ -197,10 +200,9 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta)
         .await
         .unwrap();
-    let frag_reuse_index =
-        open_frag_reuse_index(frag_reuse_details.as_ref(), dataset.fragments().as_slice())
-            .await
-            .unwrap();
+    let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
+        .await
+        .unwrap();
 
     if frag_reuse_index.row_id_maps.is_empty() {
         return Ok(());
@@ -222,7 +224,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                 for group in version.groups.iter() {
                     let mut old_frag_in_index = 0;
                     for old_frag in group.old_frags.iter() {
-                        if index_frag_bitmap.remove(*old_frag as u32) {
+                        if index_frag_bitmap.remove(old_frag.id as u32) {
                             old_frag_in_index += 1;
                         }
                     }
@@ -238,7 +240,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                                 location!()));
                         }
                         index_frag_bitmap
-                            .extend(group.new_frags.clone().into_iter().map(|f| f as u32));
+                            .extend(group.new_frags.clone().into_iter().map(|f| f.id as u32));
                         should_remap = true;
                     }
                 }
@@ -339,19 +341,15 @@ mod tests {
         // Sanity test to make sure MissingIds works.  Does not test actual functionality so
         // feel free to remove if it becomes inconvenient
         let frags = vec![
-            Fragment {
+            FragDigest {
                 id: 0,
-                files: Vec::new(),
-                deletion_file: None,
-                row_id_meta: None,
-                physical_rows: Some(5),
+                physical_rows: 5,
+                num_deleted_rows: 0,
             },
-            Fragment {
+            FragDigest {
                 id: 3,
-                files: Vec::new(),
-                deletion_file: None,
-                row_id_meta: None,
-                physical_rows: Some(3),
+                physical_rows: 3,
+                num_deleted_rows: 0,
             },
         ];
         let rows = [(0, 1), (0, 3), (0, 4), (3, 0), (3, 2)]
@@ -373,26 +371,20 @@ mod tests {
         // test fragment ids out of order
 
         let fragments = vec![
-            Fragment {
+            FragDigest {
                 id: 0,
-                files: Vec::new(),
-                deletion_file: None,
-                row_id_meta: None,
-                physical_rows: Some(5),
+                physical_rows: 5,
+                num_deleted_rows: 0,
             },
-            Fragment {
+            FragDigest {
                 id: 3,
-                files: Vec::new(),
-                deletion_file: None,
-                row_id_meta: None,
-                physical_rows: Some(3),
+                physical_rows: 3,
+                num_deleted_rows: 0,
             },
-            Fragment {
+            FragDigest {
                 id: 1,
-                files: Vec::new(),
-                deletion_file: None,
-                row_id_meta: None,
-                physical_rows: Some(3),
+                physical_rows: 3,
+                num_deleted_rows: 0,
             },
         ];
 
