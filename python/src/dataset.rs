@@ -1211,15 +1211,19 @@ impl Dataset {
         let tags = self_
             .list_tags()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
         Python::with_gil(|py| {
-            let pytags = PyDict::new(py);
-            for (k, v) in tags.iter() {
+            let pylist = PyList::empty(py);
+
+            for (tag_name, tag_content) in tags {
                 let dict = PyDict::new(py);
-                dict.set_item("version", v.version).unwrap();
-                dict.set_item("manifest_size", v.manifest_size).unwrap();
-                pytags.set_item(k, dict.into_py_any(py)?).unwrap();
+                dict.set_item("version", tag_content.version)?;
+                dict.set_item("manifest_size", tag_content.manifest_size)?;
+
+                pylist.append((tag_name.as_str(), dict))?;
             }
-            pytags.into_py_any(py)
+
+            Ok(PyObject::from(pylist))
         })
     }
 
@@ -1764,8 +1768,8 @@ impl Dataset {
         RT.runtime.block_on(self.ds.versions())
     }
 
-    fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
-        RT.runtime.block_on(self.ds.tags.list())
+    fn list_tags(&self) -> ::lance::error::Result<Vec<(String, TagContents)>> {
+        RT.runtime.block_on(self.ds.tags.list(None))
     }
 
     fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {
