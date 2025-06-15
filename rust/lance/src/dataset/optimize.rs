@@ -86,18 +86,18 @@ use std::io::Cursor;
 use std::ops::{AddAssign, Range};
 use std::sync::{Arc, RwLock};
 
+use crate::io::commit::{commit_transaction, migrate_fragments};
+use crate::Dataset;
+use crate::Result;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::DatasetIndexExt;
+use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
-
-use crate::io::commit::{commit_transaction, migrate_fragments};
-use crate::Dataset;
-use crate::Result;
-use lance_table::format::{Fragment, RowIdMeta};
 
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
@@ -884,8 +884,7 @@ pub async fn commit_compaction(
 
     let mut row_id_map: HashMap<u64, Option<u64>> = HashMap::default();
     let mut changed_row_addrs: RoaringTreemap = RoaringTreemap::new();
-    let mut old_fragments: Vec<Fragment> = Vec::new();
-    let mut new_fragment_ids: Vec<u64> = Vec::new();
+    let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
 
     for task in completed_tasks {
@@ -901,9 +900,13 @@ pub async fn commit_compaction(
             let mut cursor = Cursor::new(&task_changed_row_addr_bytes);
             let task_changed_row_addrs = RoaringTreemap::deserialize_from(&mut cursor)?;
             changed_row_addrs |= task_changed_row_addrs;
-            old_fragments.extend(task.original_fragments.clone());
+
+            frag_reuse_groups.push(FragReuseGroup {
+                old_frags: task.original_fragments.iter().map(|f| f.into()).collect(),
+                new_frags: task.new_fragments.iter().map(|f| f.into()).collect(),
+            });
+
             task.new_fragments.iter().for_each(|frag| {
-                new_fragment_ids.push(frag.id);
                 new_fragment_bitmap.insert(frag.id as u32);
             });
         }
@@ -944,8 +947,7 @@ pub async fn commit_compaction(
         Some(
             build_new_frag_reuse_index(
                 dataset,
-                old_fragments,
-                new_fragment_ids,
+                frag_reuse_groups,
                 new_fragment_bitmap,
                 changed_row_addrs,
             )
@@ -982,7 +984,7 @@ mod tests {
     use self::remapping::RemappedIndex;
     use super::*;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
-    use crate::dataset::optimize::remapping::transpose_row_ids;
+    use crate::dataset::optimize::remapping::{transpose_row_ids, transpose_row_ids_from_digest};
     use crate::dataset::WriteDestination;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::VectorIndexParams;
@@ -1000,6 +1002,7 @@ mod tests {
     use lance_index::scalar::ScalarIndexParams;
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
+    use lance_table::io::manifest::read_manifest_indexes;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
     use tempfile::tempdir;
@@ -1961,10 +1964,9 @@ mod tests {
         let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
-        let frag_reuse_index =
-            open_frag_reuse_index(frag_reuse_details.as_ref(), dataset.fragments().as_slice())
-                .await
-                .unwrap();
+        let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
+            .await
+            .unwrap();
 
         // Verify the index has one version with the correct dataset version
         let compaction_version = &frag_reuse_index.details.versions[0];
@@ -1978,25 +1980,36 @@ mod tests {
         let changed_row_addr_bytes = &compaction_version.changed_row_addrs;
         let mut cursor = Cursor::new(&changed_row_addr_bytes);
         let changed_row_addrs = RoaringTreemap::deserialize_from(&mut cursor).unwrap();
+        let compacted_all_old_frag_digests = compaction_version
+            .groups
+            .iter()
+            .flat_map(|g| g.old_frags.clone().into_iter())
+            .collect::<Vec<_>>();
+        let compacted_all_new_frag_digests = compaction_version
+            .groups
+            .iter()
+            .flat_map(|g| g.new_frags.clone().into_iter())
+            .collect::<Vec<_>>();
 
         assert_eq!(
-            compaction_version
-                .old_frags
+            compacted_all_old_frag_digests
                 .iter()
-                .map(|s| s.id)
+                .map(|f| f.id)
                 .collect::<Vec<_>>(),
             expected_all_old_frag_ids
         );
-        assert_eq!(compaction_version.new_frags, expected_all_new_frag_ids);
+        assert_eq!(
+            compacted_all_new_frag_digests
+                .iter()
+                .map(|f| f.id)
+                .collect::<Vec<_>>(),
+            expected_all_new_frag_ids
+        );
 
-        let new_fragments = deferred_results
-            .into_iter()
-            .flat_map(|r| r.new_fragments.into_iter())
-            .collect::<Vec<_>>();
-        let transposed_map = transpose_row_ids(
+        let transposed_map = transpose_row_ids_from_digest(
             changed_row_addrs,
-            &compaction_version.old_frags,
-            new_fragments.as_slice(),
+            &compacted_all_old_frag_digests,
+            &compacted_all_new_frag_digests,
         );
         assert_eq!(transposed_map, expected_all_row_id_map);
 
@@ -2060,10 +2073,9 @@ mod tests {
                 load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
                     .await
                     .unwrap();
-            let frag_reuse_index =
-                open_frag_reuse_index(frag_reuse_details.as_ref(), dataset.fragments().as_slice())
-                    .await
-                    .unwrap();
+            let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
+                .await
+                .unwrap();
 
             // Verify the index has one version with the correct dataset version
             assert_eq!(
@@ -2154,12 +2166,25 @@ mod tests {
         let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
-        let frag_reuse_index =
-            open_frag_reuse_index(frag_reuse_details.as_ref(), dataset.fragments().as_slice())
-                .await
-                .unwrap();
+        let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
+            .await
+            .unwrap();
 
         assert_eq!(frag_reuse_index.details.versions.len(), plan.tasks().len());
+
+        // Check auto-remap
+        let mut all_fragment_bitmap = RoaringBitmap::new();
+        dataset.fragments().iter().for_each(|f| {
+            all_fragment_bitmap.insert(f.id as u32);
+        });
+        let Some(scalar_index_before_remap) = dataset.load_index_by_name("scalar").await.unwrap()
+        else {
+            panic!("scalar index must be available");
+        };
+        assert_eq!(
+            scalar_index_before_remap.fragment_bitmap.unwrap(),
+            all_fragment_bitmap
+        );
 
         // Trigger index remap
         remapping::remap_column_index(&mut dataset, &["i"], index_name.clone())
@@ -2167,15 +2192,18 @@ mod tests {
             .unwrap();
 
         // Compare against original index
-        let Some(remapped_scalar_index) = dataset.load_index_by_name("scalar").await.unwrap()
+        let indices = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let Some(remapped_scalar_index) = indices.into_iter().find(|idx| idx.name == "scalar")
         else {
             panic!("scalar index must be available");
         };
         assert_ne!(remapped_scalar_index.uuid, scalar_index.uuid);
-        let mut all_fragment_bitmap = RoaringBitmap::new();
-        dataset.fragments().iter().for_each(|f| {
-            all_fragment_bitmap.insert(f.id as u32);
-        });
         assert_eq!(
             remapped_scalar_index.fragment_bitmap.unwrap(),
             all_fragment_bitmap
@@ -2229,11 +2257,6 @@ mod tests {
 
         dataset.checkout_latest().await.unwrap();
         let mut dataset_clone = dataset.clone();
-        let frags_before_compact = dataset_clone
-            .fragments()
-            .iter()
-            .map(|f| f.id as u32)
-            .collect::<HashSet<_>>();
 
         // First commit a compaction with deferred remap
         compact_files(
@@ -2262,6 +2285,7 @@ mod tests {
 
         // Check new index does not cover the compacted files
         dataset.checkout_latest().await.unwrap();
+
         let Some(scalar_index) = dataset.load_index_by_name("scalar").await.unwrap() else {
             panic!("scalar index must be available");
         };
@@ -2270,8 +2294,7 @@ mod tests {
             .unwrap()
             .iter()
             .collect::<HashSet<_>>();
-        assert_eq!(index_frags, frags_before_compact);
-        assert_ne!(
+        assert_eq!(
             index_frags,
             dataset
                 .fragments()
@@ -2328,11 +2351,6 @@ mod tests {
 
         dataset.checkout_latest().await.unwrap();
         let mut dataset_clone = dataset.clone();
-        let frags_before_compact = dataset_clone
-            .fragments()
-            .iter()
-            .map(|f| f.id as u32)
-            .collect::<HashSet<_>>();
 
         // Concurrent reindex should succeed
         dataset
@@ -2359,7 +2377,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Check new index does not cover the compacted files
+        // Check new index is auto-remapped
         dataset.checkout_latest().await.unwrap();
         let Some(scalar_index) = dataset.load_index_by_name("scalar").await.unwrap() else {
             panic!("scalar index must be available");
@@ -2369,8 +2387,7 @@ mod tests {
             .unwrap()
             .iter()
             .collect::<HashSet<_>>();
-        assert_eq!(index_frags, frags_before_compact);
-        assert_ne!(
+        assert_eq!(
             index_frags,
             dataset
                 .fragments()
@@ -2435,7 +2452,11 @@ mod tests {
         let rewrite_result2 = rewrite_files(Cow::Borrowed(&dataset), tasks[1].clone(), &options)
             .await
             .unwrap();
-        let rewritten_frags2 = rewrite_result2.original_fragments.clone();
+        let rewritten_frags2 = rewrite_result2
+            .original_fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>();
         let new_frags2 = rewrite_result2
             .new_fragments
             .iter()
@@ -2453,7 +2474,11 @@ mod tests {
         let rewrite_result3 = rewrite_files(Cow::Borrowed(&dataset), tasks[2].clone(), &options)
             .await
             .unwrap();
-        let rewritten_frags3 = rewrite_result3.original_fragments.clone();
+        let rewritten_frags3 = rewrite_result3
+            .original_fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>();
         let new_frags3 = rewrite_result3
             .new_fragments
             .iter()
@@ -2486,10 +2511,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(frag_reuse_details.versions.len(), 2);
-        assert_eq!(frag_reuse_details.versions[0].old_frags, rewritten_frags2);
-        assert_eq!(frag_reuse_details.versions[0].new_frags, new_frags2);
-        assert_eq!(frag_reuse_details.versions[1].old_frags, rewritten_frags3);
-        assert_eq!(frag_reuse_details.versions[1].new_frags, new_frags3);
+        assert_eq!(
+            frag_reuse_details.versions[0].old_frag_ids(),
+            rewritten_frags2
+        );
+        assert_eq!(frag_reuse_details.versions[0].new_frag_ids(), new_frags2);
+        assert_eq!(
+            frag_reuse_details.versions[1].old_frag_ids(),
+            rewritten_frags3
+        );
+        assert_eq!(frag_reuse_details.versions[1].new_frag_ids(), new_frags3);
     }
 
     #[tokio::test]
@@ -2566,7 +2597,11 @@ mod tests {
             rewrite_files(Cow::Borrowed(&dataset_clone), tasks[1].clone(), &options)
                 .await
                 .unwrap();
-        let rewritten_frags2 = rewrite_result2.original_fragments.clone();
+        let rewritten_frags2 = rewrite_result2
+            .original_fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>();
         let new_frags2 = rewrite_result2
             .new_fragments
             .iter()
@@ -2594,8 +2629,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(frag_reuse_details.versions.len(), 1);
-        assert_eq!(frag_reuse_details.versions[0].old_frags, rewritten_frags2);
-        assert_eq!(frag_reuse_details.versions[0].new_frags, new_frags2);
+        assert_eq!(
+            frag_reuse_details.versions[0].old_frag_ids(),
+            rewritten_frags2
+        );
+        assert_eq!(frag_reuse_details.versions[0].new_frag_ids(), new_frags2);
     }
 
     #[tokio::test]

@@ -23,10 +23,10 @@ use serde::Serialize;
 use snafu::location;
 use tracing::instrument;
 
-use crate::{metrics::MetricsCollector, Index, IndexType};
-
 use super::{btree::OrderableScalarValue, SargableQuery, SearchResult};
 use super::{btree::TrainingSource, AnyQuery, IndexStore, ScalarIndex};
+use crate::frag_reuse::FragReuseIndex;
+use crate::{metrics::MetricsCollector, Index, IndexType};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
@@ -208,7 +208,10 @@ impl ScalarIndex for BitmapIndex {
         true
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         let total_rows = page_lookup_file.num_rows();
 
@@ -257,7 +260,11 @@ impl ScalarIndex for BitmapIndex {
             for idx in 0..chunk.num_rows() {
                 let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
                 let bitmap_bytes = bitmap_binary_array.value(idx);
-                let bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
+                let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
+
+                if let Some(fri_ref) = fri.as_ref() {
+                    bitmap = fri_ref.remap_row_ids_tree_map(&bitmap);
+                }
 
                 index_map_size_bytes += key.deep_size_of();
                 index_map_size_bytes += bitmap_bytes.len();
@@ -541,7 +548,7 @@ pub mod tests {
 
         // Load the index using BitmapIndex::load
         tracing::info!("Loading index from disk...");
-        let loaded_index = BitmapIndex::load(Arc::new(test_store))
+        let loaded_index = BitmapIndex::load(Arc::new(test_store), None)
             .await
             .expect("Failed to load bitmap index");
 
@@ -689,7 +696,7 @@ pub mod tests {
             .unwrap();
 
         // Reload and check
-        let reloaded_idx = BitmapIndex::load(test_store)
+        let reloaded_idx = BitmapIndex::load(test_store, None)
             .await
             .expect("Failed to load bitmap index");
 
