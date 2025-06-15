@@ -1002,6 +1002,7 @@ mod tests {
     use lance_index::scalar::ScalarIndexParams;
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
+    use lance_table::io::manifest::read_manifest_indexes;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
     use tempfile::tempdir;
@@ -2090,7 +2091,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_auto_remap_index_after_compaction() {
+    async fn test_remap_index_after_compaction() {
         let mut data_gen = BatchGenerator::new()
             .col(Box::new(
                 RandomVector::new().vec_width(128).named("vec".to_owned()),
@@ -2171,21 +2172,38 @@ mod tests {
 
         assert_eq!(frag_reuse_index.details.versions.len(), plan.tasks().len());
 
-        // Trigger index remap should have no change because index is auto-remapped
+        // Check auto-remap
+        let mut all_fragment_bitmap = RoaringBitmap::new();
+        dataset.fragments().iter().for_each(|f| {
+            all_fragment_bitmap.insert(f.id as u32);
+        });
+        let Some(scalar_index_before_remap) = dataset.load_index_by_name("scalar").await.unwrap()
+        else {
+            panic!("scalar index must be available");
+        };
+        assert_eq!(
+            scalar_index_before_remap.fragment_bitmap.unwrap(),
+            all_fragment_bitmap
+        );
+
+        // Trigger index remap
         remapping::remap_column_index(&mut dataset, &["i"], index_name.clone())
             .await
             .unwrap();
 
         // Compare against original index
-        let Some(remapped_scalar_index) = dataset.load_index_by_name("scalar").await.unwrap()
+        let indices = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let Some(remapped_scalar_index) = indices.into_iter().find(|idx| idx.name == "scalar")
         else {
             panic!("scalar index must be available");
         };
-        assert_eq!(remapped_scalar_index.uuid, scalar_index.uuid);
-        let mut all_fragment_bitmap = RoaringBitmap::new();
-        dataset.fragments().iter().for_each(|f| {
-            all_fragment_bitmap.insert(f.id as u32);
-        });
+        assert_ne!(remapped_scalar_index.uuid, scalar_index.uuid);
         assert_eq!(
             remapped_scalar_index.fragment_bitmap.unwrap(),
             all_fragment_bitmap
