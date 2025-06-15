@@ -2239,11 +2239,6 @@ mod tests {
 
         dataset.checkout_latest().await.unwrap();
         let mut dataset_clone = dataset.clone();
-        let frags_before_compact = dataset_clone
-            .fragments()
-            .iter()
-            .map(|f| f.id as u32)
-            .collect::<HashSet<_>>();
 
         // First commit a compaction with deferred remap
         compact_files(

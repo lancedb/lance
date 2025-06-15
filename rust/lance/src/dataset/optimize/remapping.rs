@@ -14,6 +14,7 @@ use lance_core::Error;
 use lance_index::frag_reuse::{FragDigest, FRAG_REUSE_INDEX_NAME};
 use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, Index};
+use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -212,10 +213,16 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     let mut curr_index_id = *index_id;
     for (i, row_id_map) in frag_reuse_index.row_id_maps.iter().enumerate() {
         let version = &frag_reuse_index.details.versions[i];
-        let curr_index_meta = dataset
-            .load_index(&curr_index_id.to_string())
-            .await?
-            .unwrap();
+        // load on-disk index metadata before auto-remap
+        let curr_index_meta = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await?
+        .into_iter()
+        .find(|idx| idx.uuid == curr_index_id)
+        .unwrap();
 
         let maybe_index_bitmap = curr_index_meta.fragment_bitmap.clone();
         let (should_remap, bitmap_after_remap) = match maybe_index_bitmap {

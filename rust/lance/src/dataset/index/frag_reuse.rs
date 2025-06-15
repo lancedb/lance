@@ -6,8 +6,8 @@ use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_
 use crate::Dataset;
 use lance_core::Error;
 use lance_index::frag_reuse::{FragReuseIndexDetails, FragReuseVersion, FRAG_REUSE_INDEX_NAME};
-use lance_index::DatasetIndexExt;
 use lance_table::format::Index;
+use lance_table::io::manifest::read_manifest_indexes;
 use log::warn;
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -26,7 +26,13 @@ use snafu::location;
 /// This will make that specific index not efficient until the next reindex,
 /// but it will not cause any correctness problem.
 pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Result<()> {
-    let indices = dataset.load_indices().await?;
+    // check against index metadata before auto-remap
+    let indices = read_manifest_indexes(
+        &dataset.object_store,
+        &dataset.manifest_location,
+        &dataset.manifest,
+    )
+    .await?;
     let frag_reuse_index_meta = match indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
         None => return Ok(()),
         Some(idx) => idx,
@@ -149,7 +155,7 @@ mod tests {
     use arrow_array::types::{Float32Type, Int32Type};
     use lance_datagen::Dimension;
     use lance_index::scalar::ScalarIndexParams;
-    use lance_index::IndexType;
+    use lance_index::{DatasetIndexExt, IndexType};
 
     #[tokio::test]
     async fn test_cleanup_frag_reuse_index() {
@@ -201,6 +207,7 @@ mod tests {
         assert_eq!(frag_reuse_details.versions.len(), 1);
         let indices = dataset.load_indices().await.unwrap();
         let scalar_index = indices.iter().find(|idx| idx.name == "scalar").unwrap();
+        // Should not be considered caught up because index was created at an old dataset version
         assert_false!(
             is_index_remap_caught_up(&frag_reuse_details.versions[0], scalar_index).unwrap()
         );
