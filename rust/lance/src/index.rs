@@ -1324,6 +1324,7 @@ mod tests {
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
+    use std::collections::HashSet;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -1469,7 +1470,6 @@ mod tests {
 
         let reader =
             RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
-
         let test_uri = test_dir.path().to_str().unwrap();
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
         dataset.validate().await.unwrap();
@@ -2156,5 +2156,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_uuid, index_uuid);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_ivf_pq_up_to_date() {
+        // https://github.com/lancedb/lance/issues/4016
+        let nrows = 256;
+        let dimensions = 16;
+        let column_name = "vector";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                column_name,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimensions,
+                ),
+                false,
+            ),
+        ]));
+
+        let float_arr = generate_random_array(nrows * dimensions as usize);
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+        let record_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int32Array::from_iter_values(0..nrows as i32)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(
+            vec![record_batch.clone()].into_iter().map(Ok),
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 2, MetricType::L2, 2);
+        dataset
+            .create_index(&[column_name], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let query_vector = generate_random_array(dimensions as usize);
+
+        let nearest = dataset
+            .scan()
+            .nearest(column_name, &query_vector, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let ids = nearest["id"].as_primitive::<Int32Type>();
+        let mut seen = HashSet::new();
+        for id in ids.values() {
+            assert!(seen.insert(*id), "Duplicate id found: {}", id);
+        }
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let nearest_after = dataset
+            .scan()
+            .nearest(column_name, &query_vector, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let ids = nearest_after["id"].as_primitive::<Int32Type>();
+        let mut seen = HashSet::new();
+        for id in ids.values() {
+            assert!(seen.insert(*id), "Duplicate id found: {}", id);
+        }
     }
 }
