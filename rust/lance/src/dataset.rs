@@ -15,6 +15,7 @@ use itertools::Itertools;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
 use lance_core::ROW_ADDR;
@@ -36,6 +37,7 @@ use lance_table::io::commit::{
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use object_store::path::Path;
 use prost::Message;
+use roaring::RoaringTreemap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -43,7 +45,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use take::row_indices_to_row_addresses;
 use tracing::{info, instrument};
 
@@ -72,6 +74,7 @@ use self::fragment::FileFragment;
 use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
+use self::utils::make_rowid_capture_stream;
 use self::write::write_fragments_internal;
 use crate::datatypes::Schema;
 use crate::error::box_error;
@@ -988,8 +991,56 @@ impl Dataset {
 
     /// Delete rows based on a predicate.
     pub async fn delete(&mut self, predicate: &str) -> Result<()> {
+        // Optimize for simple "true" predicate - delete everything
+        let predicate_lower = predicate.trim().to_lowercase();
+        if predicate_lower == "true" {
+            return self.delete_all().await;
+        } else if predicate_lower == "false" {
+            return Ok(()); // No-op
+        }
+
+        // Step 1: Create a scanner to collect all row IDs that match the delete predicate
+        let removed_row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
+
+        let mut scanner = self.scan();
+        scanner
+            .with_row_id()
+            .filter(predicate)?
+            .project::<&str>(&[])?; // We only need row IDs, no actual columns
+
+        // Collect all matching row IDs using the row ID capture stream
+        let stream = scanner.try_into_stream().await?;
+        let stream = make_rowid_capture_stream(removed_row_ids.clone(), stream.into())?;
+
+        // Consume the stream to collect all row IDs to be deleted
+        stream
+            .try_for_each(|_batch| {
+                // We're just consuming batches to collect row IDs
+                futures::future::ready(Ok(()))
+            })
+            .await?;
+
+        // Extract the accumulated row IDs
+        let removed_row_ids = Arc::try_unwrap(removed_row_ids)
+            .map_err(|_| Error::Internal {
+                message: "Failed to extract removed_row_ids from Arc".into(),
+                location: location!(),
+            })?
+            .into_inner()
+            .map_err(|_| Error::Internal {
+                message: "Failed to extract removed_row_ids from RwLock".into(),
+                location: location!(),
+            })?;
+
+        // If no rows matched, nothing to delete
+        if removed_row_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Step 2: Apply deletions to fragments (similar to current implementation)
         let mut updated_fragments: Vec<Fragment> = Vec::new();
         let mut deleted_fragment_ids: Vec<u64> = Vec::new();
+
         stream::iter(self.get_fragments())
             .map(|f| async move {
                 let old_fragment = f.metadata.clone();
@@ -997,7 +1048,6 @@ impl Dataset {
                 Ok((old_fragment, new_fragment))
             })
             .buffer_unordered(get_num_compute_intensive_cpus())
-            // Drop the fragments that were deleted.
             .try_for_each(|(old_fragment, new_fragment)| {
                 if let Some(new_fragment) = new_fragment {
                     if new_fragment != old_fragment {
@@ -1010,6 +1060,9 @@ impl Dataset {
             })
             .await?;
 
+        // Step 3: Create transaction and commit with affected_rows
+        let affected_rows = RowIdTreeMap::from(removed_row_ids);
+
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::Delete {
@@ -1020,6 +1073,39 @@ impl Dataset {
             // No change is needed to the blobs dataset.  The blobs are implicitly deleted since the
             // rows that reference them are deleted.
             /*blobs_op=*/
+            None,
+            None,
+        );
+
+        // Use CommitBuilder with affected_rows for row-level conflict resolution
+        let new_dataset = CommitBuilder::new(Arc::new(self.clone()))
+            .with_affected_rows(affected_rows)
+            .execute(transaction)
+            .await?;
+
+        // Update self to the new dataset
+        self.manifest = new_dataset.manifest;
+        self.manifest_location = new_dataset.manifest_location;
+
+        Ok(())
+    }
+
+    async fn delete_all(&mut self) -> Result<()> {
+        // For "delete everything", use the current simple approach since it's more efficient
+        let updated_fragments: Vec<Fragment> = Vec::new();
+        let mut deleted_fragment_ids: Vec<u64> = Vec::new();
+
+        for fragment in self.get_fragments() {
+            deleted_fragment_ids.push(fragment.metadata.id);
+        }
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                predicate: "true".to_string(),
+            },
             None,
             None,
         );
@@ -1932,6 +2018,13 @@ mod tests {
     use rand::seq::SliceRandom;
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
+
+    // Imports for concurrent delete test
+    use futures::future::try_join_all;
+    use lance_io::object_store::ObjectStoreParams;
+    use object_store::throttle::ThrottleConfig;
+    use std::time::Duration;
+    use tokio::sync::Barrier;
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -3833,6 +3926,89 @@ mod tests {
         assert_eq!(fragments[0].id(), 0);
         assert_eq!(fragments[1].id(), 2);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_delete_concurrent_row_level_conflict_resolution() {
+        use crate::utils::test::ThrottledStoreWrapper;
+        use crate::dataset::ReadParams;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::UInt32, false),
+            ArrowField::new("value", DataType::UInt32, false),
+        ]));
+        let concurrency = 3;
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..concurrency)),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(
+                    0,
+                    concurrency as usize,
+                ))),
+            ],
+        )
+        .unwrap();
+
+        // Increase likelihood of contention by throttling the store
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: Duration::from_millis(1),
+                wait_get_per_call: Duration::from_millis(1),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(concurrency as usize));
+        let mut handles = Vec::new();
+        for i in 0..concurrency {
+            let session_ref = session.clone();
+            let barrier_ref = barrier.clone();
+            let throttled_ref = throttled.clone();
+            let handle = tokio::task::spawn(async move {
+                let dataset = DatasetBuilder::from_uri("memory://")
+                    .with_read_params(ReadParams {
+                        store_options: Some(ObjectStoreParams {
+                            object_store_wrapper: Some(throttled_ref.clone()),
+                            ..Default::default()
+                        }),
+                        session: Some(session_ref.clone()),
+                        ..Default::default()
+                    })
+                    .load()
+                    .await
+                    .unwrap();
+
+                barrier_ref.wait().await;
+                
+                // Each task deletes a different row in the same fragment
+                let mut dataset = dataset;
+                dataset.delete(&format!("id = {}", i)).await.unwrap();
+            });
+            handles.push(handle);
+        }
+
+        try_join_all(handles).await.unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+
+        // Verify all rows were deleted
+        let final_count = dataset.count_rows(None).await.unwrap();
+        assert_eq!(final_count, 0);
     }
 
     #[rstest]
