@@ -13,11 +13,11 @@ use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNod
 use std::{cmp::Ordering, sync::Arc};
 
 use crate::{
-    dataset::write::merge_insert::exec::{FullSchemaMergeInsertExec, PartialUpdateMergeInsertExec},
+    dataset::write::merge_insert::exec::{FullSchemaMergeInsertExec},
     Dataset,
 };
 
-use super::{exec::MERGE_STATS_SCHEMA, MergeInsertParams};
+use super::MergeInsertParams;
 
 /// Logical plan node for merge insert write.
 ///
@@ -71,15 +71,14 @@ impl MergeInsertWriteNode {
         input: LogicalPlan,
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
-        write_style: MergeInsertWriteStyle,
     ) -> Self {
-        let schema = Arc::new(DFSchema::try_from((*MERGE_STATS_SCHEMA).clone()).unwrap());
+        let empty_schema = Arc::new(arrow_schema::Schema::empty());
+        let schema = Arc::new(DFSchema::try_from(empty_schema).unwrap());
         Self {
             input,
             dataset,
             params,
             schema,
-            write_style,
         }
     }
 }
@@ -123,7 +122,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
         Ok(Self::new(
             inputs[0].clone(),
             self.dataset.clone(),
-            self.params.clone,
+            self.params.clone(),
         ))
     }
 

@@ -100,6 +100,7 @@ use super::{write_fragments_internal, CommitBuilder, WriteParams};
 
 mod assign_action;
 mod exec;
+mod logical_plan;
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -139,7 +140,7 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
 /// Describes how rows should be handled when there is no matching row in the source table
 ///
 /// These are old rows which do not match any new data
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhenNotMatchedBySource {
     /// Do not delete rows from the target table
     ///
@@ -177,8 +178,56 @@ impl WhenNotMatchedBySource {
     }
 }
 
+impl std::hash::Hash for WhenNotMatchedBySource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            WhenNotMatchedBySource::Keep | WhenNotMatchedBySource::Delete => {},
+            WhenNotMatchedBySource::DeleteIf(_) => {
+                format!("{:?}", self).hash(state);
+            }
+        }
+    }
+}
+
+impl PartialOrd for WhenNotMatchedBySource {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WhenNotMatchedBySource {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let self_disc = std::mem::discriminant(self);
+        let other_disc = std::mem::discriminant(other);
+        
+        // Compare discriminants first
+        if self_disc != other_disc {
+            // Use a simple ordering based on variant pattern
+            let self_order = match self {
+                WhenNotMatchedBySource::Keep => 0u8,
+                WhenNotMatchedBySource::Delete => 1u8,
+                WhenNotMatchedBySource::DeleteIf(_) => 2u8,
+            };
+            let other_order = match other {
+                WhenNotMatchedBySource::Keep => 0u8,
+                WhenNotMatchedBySource::Delete => 1u8,
+                WhenNotMatchedBySource::DeleteIf(_) => 2u8,
+            };
+            return self_order.cmp(&other_order);
+        }
+        
+        // If same variant, compare contents for complex variants
+        if let (WhenNotMatchedBySource::DeleteIf(_), WhenNotMatchedBySource::DeleteIf(_)) = (self, other) {
+            format!("{:?}", self).cmp(&format!("{:?}", other))
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }
+}
+
 /// Describes how rows should be handled when there is a match between the target table and source table
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhenMatched {
     /// The row is deleted from the target table and a new row is inserted based on the source table
     ///
@@ -214,9 +263,58 @@ impl WhenMatched {
     }
 }
 
+impl std::hash::Hash for WhenMatched {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            WhenMatched::UpdateAll | WhenMatched::DoNothing => {},
+            WhenMatched::UpdateIf(_) => {
+                format!("{:?}", self).hash(state);
+            }
+        }
+    }
+}
+
+impl PartialOrd for WhenMatched {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WhenMatched {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let self_disc = std::mem::discriminant(self);
+        let other_disc = std::mem::discriminant(other);
+        
+        // Compare discriminants first
+        if self_disc != other_disc {
+            // Use a simple ordering based on variant pattern
+            let self_order = match self {
+                WhenMatched::UpdateAll => 0u8,
+                WhenMatched::DoNothing => 1u8,
+                WhenMatched::UpdateIf(_) => 2u8,
+            };
+            let other_order = match other {
+                WhenMatched::UpdateAll => 0u8,
+                WhenMatched::DoNothing => 1u8,
+                WhenMatched::UpdateIf(_) => 2u8,
+            };
+            return self_order.cmp(&other_order);
+        }
+        
+        // If same variant, compare contents for complex variants
+        if let (WhenMatched::UpdateIf(_), WhenMatched::UpdateIf(_)) = (self, other) {
+            format!("{:?}", self).cmp(&format!("{:?}", other))
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }
+}
+
 /// Describes how rows should be handled when there is no matching row in the target table
 ///
 /// These are new rows which do not match any old data
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WhenNotMatched {
     /// The new row is inserted into the target table
     ///
@@ -226,7 +324,7 @@ pub enum WhenNotMatched {
     DoNothing,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MergeInsertParams {
     // The column(s) to join on
     on: Vec<String>,
@@ -238,6 +336,34 @@ struct MergeInsertParams {
     delete_not_matched_by_source: WhenNotMatchedBySource,
     conflict_retries: u32,
     retry_timeout: Duration,
+}
+
+impl std::hash::Hash for MergeInsertParams {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.on.hash(state);
+        self.when_matched.hash(state);
+        self.insert_not_matched.hash(state);
+        self.delete_not_matched_by_source.hash(state);
+        self.conflict_retries.hash(state);
+        self.retry_timeout.hash(state);
+    }
+}
+
+impl PartialOrd for MergeInsertParams {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeInsertParams {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.on.cmp(&other.on)
+            .then_with(|| self.when_matched.cmp(&other.when_matched))
+            .then_with(|| self.insert_not_matched.cmp(&other.insert_not_matched))
+            .then_with(|| self.delete_not_matched_by_source.cmp(&other.delete_not_matched_by_source))
+            .then_with(|| self.conflict_retries.cmp(&other.conflict_retries))
+            .then_with(|| self.retry_timeout.cmp(&other.retry_timeout))
+    }
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as

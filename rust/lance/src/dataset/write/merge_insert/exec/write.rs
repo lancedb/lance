@@ -46,8 +46,9 @@ impl FullSchemaMergeInsertExec {
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
     ) -> DFResult<Self> {
+        let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(input.schema()),
+            EquivalenceProperties::new(empty_schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
@@ -97,7 +98,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        self.input.schema()
+        Arc::new(arrow_schema::Schema::empty())
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
