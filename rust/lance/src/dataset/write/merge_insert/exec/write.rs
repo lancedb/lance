@@ -15,7 +15,10 @@ use datafusion::{
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
 use crate::{
-    dataset::write::merge_insert::{exec::MergeInsertMetrics, MergeInsertParams, MergeStats},
+    dataset::{
+        transaction::Transaction,
+        write::merge_insert::{exec::MergeInsertMetrics, MergeInsertParams, MergeStats},
+    },
     Dataset,
 };
 
@@ -34,6 +37,7 @@ pub struct FullSchemaMergeInsertExec {
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
+    transaction: Arc<Mutex<Option<Transaction>>>,
 }
 
 impl FullSchemaMergeInsertExec {
@@ -56,6 +60,7 @@ impl FullSchemaMergeInsertExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             merge_stats: Arc::new(Mutex::new(None)),
+            transaction: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -63,6 +68,12 @@ impl FullSchemaMergeInsertExec {
     /// Returns `None` if the execution is still in progress or hasn't started.
     pub fn merge_stats(&self) -> Option<MergeStats> {
         self.merge_stats.lock().unwrap().clone()
+    }
+
+    /// Returns the transaction if the execution has completed.
+    /// Returns `None` if the execution is still in progress or hasn't started.
+    pub fn transaction(&self) -> Option<Transaction> {
+        self.transaction.lock().unwrap().clone()
     }
 }
 
@@ -109,6 +120,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             properties: self.properties.clone(),
             metrics: self.metrics.clone(),
             merge_stats: self.merge_stats.clone(),
+            transaction: self.transaction.clone(),
         }))
     }
 

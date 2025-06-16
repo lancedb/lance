@@ -1229,7 +1229,34 @@ impl MergeInsertJob {
         let plan = self.create_plan(source).await?;
 
         // Execute the plan
-        todo!("execute_plan");
+        // Assert that we have exactly one partition since we're designed for single-partition execution
+        let partition_count = match plan.properties().output_partitioning() {
+            datafusion_physical_expr::Partitioning::RoundRobinBatch(n) => *n,
+            datafusion_physical_expr::Partitioning::Hash(_, n) => *n,
+            datafusion_physical_expr::Partitioning::UnknownPartitioning(n) => *n,
+        };
+        
+        if partition_count != 1 {
+            return Err(Error::invalid_input(
+                format!("Expected exactly 1 partition, got {}", partition_count),
+                location!(),
+            ));
+        }
+
+        // Execute partition 0 (the only partition)
+        let task_context = Arc::new(datafusion::execution::TaskContext::default());
+        let mut stream = plan.execute(0, task_context)?;
+        
+        // Assert that the execution produces no output (this is a write operation)
+        if let Some(batch) = stream.next().await {
+            let batch = batch?;
+            if batch.num_rows() > 0 {
+                return Err(Error::invalid_input(
+                    format!("Expected no output from write operation, got {} rows", batch.num_rows()),
+                    location!(),
+                ));
+            }
+        }
 
         // Extract merge stats from the execution plan
         let merge_insert_exec = plan
@@ -1241,7 +1268,9 @@ impl MergeInsertJob {
             .merge_stats()
             .ok_or_else(|| Error::invalid_input("Merge stats not available - execution may not have completed", location!()))?;
 
-        let transaction = todo!("get transaction out of plan");
+        let transaction = merge_insert_exec
+            .transaction()
+            .ok_or_else(|| Error::invalid_input("Transaction not available - execution may not have completed", location!()))?;
 
         Ok((transaction, stats))
     }
