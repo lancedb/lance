@@ -38,39 +38,39 @@ impl Action {
 /// Transforms merge insert parameters into a logical expression. The output
 /// is a single "action" column, that describes what to do with each row.
 pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
-    let source_has_key: Expr = todo!("Make sure at least one key column is non-null");
+    let source_has_key: Expr = datafusion_expr::lit(true); // TODO: Make sure at least one key column is non-null
 
-    let row_id_is_not_null = col(ROWID).is_not_null();
-    let matched = source_has_key.and(row_id_is_not_null);
+    let row_id_is_not_null = col("target._rowid").is_not_null();
+    let matched = source_has_key.clone().and(row_id_is_not_null);
 
-    let row_id_is_null = col(ROWID).is_null();
+    let row_id_is_null = col("target._rowid").is_null();
     let not_matched_in_target = source_has_key.and(row_id_is_null);
 
-    let not_matched_in_source = col(ROWID).is_null().is_not_true();
+    let not_matched_in_source = col("target._rowid").is_null().is_not_true();
 
-    let cases = vec![];
+    let mut cases = vec![];
 
     if params.insert_not_matched {
         cases.push((not_matched_in_target, Action::Insert.as_literal_expr()));
     }
 
-    match params.when_matched {
+    match &params.when_matched {
         WhenMatched::UpdateAll => {
             cases.push((matched, Action::UpdateAll.as_literal_expr()));
         }
         WhenMatched::UpdateIf(condition) => {
-            cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
+            cases.push((matched.and(condition.clone()), Action::UpdateAll.as_literal_expr()));
         }
         WhenMatched::DoNothing => {}
     }
 
-    match params.delete_not_matched_by_source {
+    match &params.delete_not_matched_by_source {
         WhenNotMatchedBySource::Delete => {
             cases.push((not_matched_in_source, Action::Delete.as_literal_expr()));
         }
         WhenNotMatchedBySource::DeleteIf(condition) => {
             cases.push((
-                not_matched_in_source.and(condition),
+                not_matched_in_source.and(condition.clone()),
                 Action::Delete.as_literal_expr(),
             ));
         }

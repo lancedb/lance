@@ -36,7 +36,7 @@ use datafusion::{
         context::{SessionConfig, SessionContext},
         memory_pool::MemoryConsumer,
     },
-    logical_expr::{self, Expr, JoinType},
+    logical_expr::{self, Expr, JoinConstraint, JoinType},
     physical_plan::{
         joins::{HashJoinExec, PartitionMode},
         projection::ProjectionExec,
@@ -1315,20 +1315,24 @@ impl MergeInsertJob {
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
         let session_config = SessionConfig::default();
         let session_ctx = SessionContext::new_with_config(session_config);
-        todo!("register planning rules to session ctx");
+        // todo!("register planning rules to session ctx");
         let scan = session_ctx.read_lance(self.dataset.clone(), true, true)?;
-        let on = self
+        let on_cols = self
             .params
             .on
             .iter()
-            .map(|name| col(name))
+            .map(|name| name.as_str())
             .collect::<Vec<_>>();
-        let df = session_ctx
-            .read_one_shot(source)?
-            .join_on(scan, JoinType::Left, on)?
-            .select(vec![merge_insert_action(&self.params)?.alias("action")])?;
-        let df: DataFrame = todo!("apply the write node at the end");
-
+        let source_df = session_ctx.read_one_shot(source)?;
+        // For now, let's create a simple join and handle duplicates
+        let source_df_aliased = source_df.alias("source")?;
+        let scan_aliased = scan.alias("target")?;
+        let df = source_df_aliased
+            .join(scan_aliased, JoinType::Left, &on_cols, &on_cols, None)?
+            .with_column("action", merge_insert_action(&self.params)?)?;
+        dbg!(df.schema());
+        // TODO: apply the write node at the end
+        
         let (session_state, logical_plan) = df.into_parts();
 
         let logical_plan = session_state.optimize(&logical_plan)?;
@@ -3051,5 +3055,49 @@ mod tests {
             "All values should be 1 after merge insert. Got: {:?}",
             values
         );
+    }
+
+    #[tokio::test]
+    async fn test_plan_upsert() {
+        let data = lance_datagen::gen()
+            .with_seed(Seed::from(1))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(32));
+        let _schema = data.schema();
+
+        // Create dataset with initial data
+        let ds = Dataset::write(data, "memory://", None).await.unwrap();
+
+        // Create upsert job
+        let merge_insert_job = crate::dataset::MergeInsertBuilder::try_new(
+            Arc::new(ds),
+            vec!["key".to_string()],
+        )
+        .unwrap()
+        .when_matched(crate::dataset::WhenMatched::UpdateAll)
+        .try_build()
+        .unwrap();
+
+        // Create new data for upsert
+        let new_data = lance_datagen::gen()
+            .with_seed(Seed::from(2))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let new_data = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
+        let new_data_stream = reader_to_stream(Box::new(new_data));
+
+        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+
+        // Print the plan using DisplayableExecutionPlan
+        use datafusion::physical_plan::displayable;
+        let display = displayable(plan.as_ref());
+        let plan_str = format!("{}", display.indent(false));
+
+        // Assert the plan structure - should contain HashJoin, Projection, and MergeInsertWrite
+        assert!(plan_str.contains("HashJoinExec"));
+        assert!(plan_str.contains("ProjectionExec"));
+        // The exact plan string can vary, so we check for key components
+        println!("Plan:\n{}", plan_str);
     }
 }
