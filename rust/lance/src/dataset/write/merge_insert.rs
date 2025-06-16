@@ -18,7 +18,6 @@
 
 use assign_action::merge_insert_action;
 use datafusion_expr::col;
-use exec::MergeInsertMetrics;
 use futures::FutureExt;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -1229,14 +1228,18 @@ impl MergeInsertJob {
     ) -> Result<(Transaction, MergeStats)> {
         let plan = self.create_plan(source).await?;
 
-        // We have to get the data off of the execution plan.
-        // Option 1: serialize the output to the recordbatch, then deserialize after
-        // Option 2: add methods on the write execution plan. Then after we run it,
-        //           downcast it and call the methods to get the data.
-        let output: RecordBatch = todo!("execute_plan");
+        // Execute the plan
+        todo!("execute_plan");
 
-        let stats = MergeInsertMetrics::from(&output);
-        let stats = MergeStats::from(&stats);
+        // Extract merge stats from the execution plan
+        let merge_insert_exec = plan
+            .as_any()
+            .downcast_ref::<exec::FullSchemaMergeInsertExec>()
+            .ok_or_else(|| Error::invalid_input("Expected FullSchemaMergeInsertExec", location!()))?;
+        
+        let stats = merge_insert_exec
+            .merge_stats()
+            .ok_or_else(|| Error::invalid_input("Merge stats not available - execution may not have completed", location!()))?;
 
         let transaction = todo!("get transaction out of plan");
 

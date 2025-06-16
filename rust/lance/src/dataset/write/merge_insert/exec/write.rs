@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use datafusion::common::Result as DFResult;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
@@ -15,11 +15,9 @@ use datafusion::{
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
 use crate::{
-    dataset::write::merge_insert::{exec::MergeInsertMetrics, MergeInsertParams},
+    dataset::write::merge_insert::{exec::MergeInsertMetrics, MergeInsertParams, MergeStats},
     Dataset,
 };
-
-use super::MERGE_STATS_SCHEMA;
 
 /// Inserts new rows and updates existing rows in the target table.
 ///
@@ -28,7 +26,6 @@ use super::MERGE_STATS_SCHEMA;
 /// This is implemented by moving updated rows to new fragments. This mode
 /// is most optimal when updating the full schema.
 ///
-/// It returns a single batch, containing the statistics.
 #[derive(Debug)]
 pub struct FullSchemaMergeInsertExec {
     input: Arc<dyn ExecutionPlan>,
@@ -36,6 +33,7 @@ pub struct FullSchemaMergeInsertExec {
     params: MergeInsertParams,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
+    merge_stats: Arc<Mutex<Option<MergeStats>>>,
 }
 
 impl FullSchemaMergeInsertExec {
@@ -45,7 +43,7 @@ impl FullSchemaMergeInsertExec {
         params: MergeInsertParams,
     ) -> DFResult<Self> {
         let properties = PlanProperties::new(
-            EquivalenceProperties::new((*MERGE_STATS_SCHEMA).clone()),
+            EquivalenceProperties::new(input.schema()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
@@ -57,7 +55,14 @@ impl FullSchemaMergeInsertExec {
             params,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            merge_stats: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Returns the merge statistics if the execution has completed.
+    /// Returns `None` if the execution is still in progress or hasn't started.
+    pub fn merge_stats(&self) -> Option<MergeStats> {
+        self.merge_stats.lock().unwrap().clone()
     }
 }
 
@@ -81,7 +86,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        (*MERGE_STATS_SCHEMA).clone()
+        self.input.schema()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -103,6 +108,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             params: self.params.clone(),
             properties: self.properties.clone(),
             metrics: self.metrics.clone(),
+            merge_stats: self.merge_stats.clone(),
         }))
     }
 
