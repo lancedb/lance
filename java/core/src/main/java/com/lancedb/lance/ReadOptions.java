@@ -52,19 +52,6 @@ public class ReadOptions {
     return metadataCacheSizeBytes;
   }
 
-  /**
-   * Get metadata cache size. This method is deprecated. Use {@link #getMetadataCacheSizeBytes()}
-   * instead.
-   *
-   * @return the metadata cache size in entry count (estimated)
-   * @deprecated Use {@link #getMetadataCacheSizeBytes()} instead
-   */
-  @Deprecated
-  public int getMetadataCacheSize() {
-    int assumedEntrySize = 10 * 1024 * 1024; // 10MB per entry
-    return metadataCacheSizeBytes / assumedEntrySize;
-  }
-
   public Map<String, String> getStorageOptions() {
     return storageOptions;
   }
