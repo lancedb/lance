@@ -16,7 +16,6 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowIdTreeMap;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
@@ -1000,17 +999,14 @@ impl Dataset {
         }
 
         // Step 1: Create a scanner to collect all row IDs that match the delete predicate
-        let removed_row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
-
         let mut scanner = self.scan();
-        scanner
-            .with_row_id()
-            .filter(predicate)?
-            .project::<&str>(&[])?; // We only need row IDs, no actual columns
+        scanner.with_row_id().filter(predicate)?.project::<&str>(&[])?; // We only need row IDs, no actual columns
 
-        // Collect all matching row IDs using the row ID capture stream
-        let stream = scanner.try_into_stream().await?;
-        let stream = make_rowid_capture_stream(removed_row_ids.clone(), stream.into())?;
+        let stream = scanner.try_into_stream().await?.into();
+
+        // We keep track of seen row ids so we can delete them from the existing fragments.
+        let removed_row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
+        let stream = make_rowid_capture_stream(removed_row_ids.clone(), stream)?;
 
         // Consume the stream to collect all row IDs to be deleted
         stream
@@ -1021,44 +1017,18 @@ impl Dataset {
             .await?;
 
         // Extract the accumulated row IDs
-        let removed_row_ids = Arc::try_unwrap(removed_row_ids)
-            .map_err(|_| Error::Internal {
-                message: "Failed to extract removed_row_ids from Arc".into(),
-                location: location!(),
-            })?
+        let removed_row_ids = Arc::into_inner(removed_row_ids)
+            .unwrap()
             .into_inner()
-            .map_err(|_| Error::Internal {
-                message: "Failed to extract removed_row_ids from RwLock".into(),
-                location: location!(),
-            })?;
+            .unwrap();
 
         // If no rows matched, nothing to delete
         if removed_row_ids.is_empty() {
             return Ok(());
         }
 
-        // Step 2: Apply deletions to fragments (similar to current implementation)
-        let mut updated_fragments: Vec<Fragment> = Vec::new();
-        let mut deleted_fragment_ids: Vec<u64> = Vec::new();
-
-        stream::iter(self.get_fragments())
-            .map(|f| async move {
-                let old_fragment = f.metadata.clone();
-                let new_fragment = f.delete(predicate).await?.map(|f| f.metadata);
-                Ok((old_fragment, new_fragment))
-            })
-            .buffer_unordered(get_num_compute_intensive_cpus())
-            .try_for_each(|(old_fragment, new_fragment)| {
-                if let Some(new_fragment) = new_fragment {
-                    if new_fragment != old_fragment {
-                        updated_fragments.push(new_fragment);
-                    }
-                } else {
-                    deleted_fragment_ids.push(old_fragment.id);
-                }
-                futures::future::ready(Ok::<_, crate::Error>(()))
-            })
-            .await?;
+        // Step 2: Apply deletions using the same approach as UpdateJob
+        let (updated_fragments, deleted_fragment_ids) = self.apply_deletions(&removed_row_ids).await?;
 
         // Step 3: Create transaction and commit with affected_rows
         let affected_rows = RowIdTreeMap::from(removed_row_ids);
@@ -1088,6 +1058,55 @@ impl Dataset {
         self.manifest_location = new_dataset.manifest_location;
 
         Ok(())
+    }
+
+    /// Apply deletions using previously found row IDs to delete rows from existing fragments.
+    ///
+    /// Returns the set of modified fragments and removed fragments, if any.
+    async fn apply_deletions(
+        &self,
+        removed_row_ids: &RoaringTreemap,
+    ) -> Result<(Vec<Fragment>, Vec<u64>)> {
+        let bitmaps = Arc::new(removed_row_ids.bitmaps().collect::<BTreeMap<_, _>>());
+
+        enum FragmentChange {
+            Unchanged,
+            Modified(Fragment),
+            Removed(u64),
+        }
+
+        let mut updated_fragments = Vec::new();
+        let mut removed_fragments = Vec::new();
+
+        let mut stream = futures::stream::iter(self.get_fragments())
+            .map(move |fragment| {
+                let bitmaps_ref = bitmaps.clone();
+                async move {
+                    let fragment_id = fragment.id();
+                    if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
+                        match fragment.extend_deletions(*bitmap).await {
+                            Ok(Some(new_fragment)) => {
+                                Ok(FragmentChange::Modified(new_fragment.metadata))
+                            }
+                            Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        Ok(FragmentChange::Unchanged)
+                    }
+                }
+            })
+            .buffer_unordered(self.object_store.io_parallelism());
+
+        while let Some(res) = stream.next().await.transpose()? {
+            match res {
+                FragmentChange::Unchanged => {}
+                FragmentChange::Modified(fragment) => updated_fragments.push(fragment),
+                FragmentChange::Removed(fragment_id) => removed_fragments.push(fragment_id),
+            }
+        }
+
+        Ok((updated_fragments, removed_fragments))
     }
 
     async fn delete_all(&mut self) -> Result<()> {
