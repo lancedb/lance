@@ -2221,6 +2221,8 @@ mod tests {
             .await
             .unwrap();
 
+        dataset.validate().await.unwrap();
+
         let nearest_after = dataset
             .scan()
             .nearest(column_name, &query_vector, 5)
