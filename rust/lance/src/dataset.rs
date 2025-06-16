@@ -4034,7 +4034,7 @@ mod tests {
         dataset.delete("i > 50").await.unwrap();
         assert_eq!(dataset.manifest.version, 2);
 
-        assert_eq!(dataset.tags.list(None).await.unwrap().len(), 0);
+        assert_eq!(dataset.tags.list().await.unwrap().len(), 0);
 
         let bad_tag_creation = dataset.tags.create("tag1", 3).await;
         assert_eq!(
@@ -4050,7 +4050,7 @@ mod tests {
 
         dataset.tags.create("tag1", 1).await.unwrap();
 
-        assert_eq!(dataset.tags.list(None).await.unwrap().len(), 1);
+        assert_eq!(dataset.tags.list().await.unwrap().len(), 1);
 
         let another_bad_tag_creation = dataset.tags.create("tag1", 1).await;
         assert_eq!(
@@ -4060,13 +4060,13 @@ mod tests {
 
         dataset.tags.delete("tag1").await.unwrap();
 
-        assert_eq!(dataset.tags.list(None).await.unwrap().len(), 0);
+        assert_eq!(dataset.tags.list().await.unwrap().len(), 0);
 
         dataset.tags.create("tag1", 1).await.unwrap();
         dataset.tags.create("tag2", 1).await.unwrap();
         dataset.tags.create("v1.0.0-rc1", 2).await.unwrap();
 
-        let default_order = dataset.tags.list(None).await.unwrap();
+        let default_order = dataset.tags.list_tags_ordered(None).await.unwrap();
         let default_names: Vec<_> = default_order.iter().map(|t| &t.0).collect();
         assert_eq!(
             default_names,
@@ -4074,7 +4074,11 @@ mod tests {
             "Default ordering mismatch"
         );
 
-        let asc_order = dataset.tags.list(Some(Ordering::Less)).await.unwrap();
+        let asc_order = dataset
+            .tags
+            .list_tags_ordered(Some(Ordering::Less))
+            .await
+            .unwrap();
         let asc_names: Vec<_> = asc_order.iter().map(|t| &t.0).collect();
         assert_eq!(
             asc_names,
@@ -4082,7 +4086,11 @@ mod tests {
             "Ascending ordering mismatch"
         );
 
-        let desc_order = dataset.tags.list(Some(Ordering::Greater)).await.unwrap();
+        let desc_order = dataset
+            .tags
+            .list_tags_ordered(Some(Ordering::Greater))
+            .await
+            .unwrap();
         let desc_names: Vec<_> = desc_order.iter().map(|t| &t.0).collect();
         assert_eq!(
             desc_names,
@@ -4090,7 +4098,7 @@ mod tests {
             "Descending ordering mismatch"
         );
 
-        assert_eq!(dataset.tags.list(None).await.unwrap().len(), 3);
+        assert_eq!(dataset.tags.list().await.unwrap().len(), 3);
 
         let bad_checkout = dataset.checkout_version("tag3").await;
         assert_eq!(

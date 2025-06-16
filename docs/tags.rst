@@ -29,17 +29,27 @@ and :meth:`delete <lance.dataset.Tags.delete>` or :py:meth:`list <lance.dataset.
     >>> len(ds.versions())
     2
     >>> ds.tags.list()
-    []
+    {}
     >>> ds.tags.create("v1-prod", 1)
     >>> ds.tags.list()
-    [('v1-prod', {'version': 1, 'manifest_size': ...})]
+    {'v1-prod': {'version': 1, 'manifest_size': ...}}
     >>> ds.tags.update("v1-prod", 2)
     >>> ds.tags.list()
-    [('v1-prod', {'version': 2, 'manifest_size': ...})]
+    {'v1-prod': {'version': 2, 'manifest_size': ...}}
     >>> ds.tags.delete("v1-prod")
     >>> ds.tags.list()
+    {}
+    >>> ds.tags.list_ordered()
     []
-
+    >>> ds.tags.create("v1-prod", 1)
+    >>> ds.tags.list_ordered()
+    [('v1-prod', {'version': 1, 'manifest_size': ...})]
+    >>> ds.tags.update("v1-prod", 2)
+    >>> ds.tags.list_ordered()
+    [('v1-prod', {'version': 2, 'manifest_size': ...})]
+    >>> ds.tags.delete("v1-prod")
+    >>> ds.tags.list_ordered()
+    []
 
 
 .. note::

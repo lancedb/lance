@@ -137,10 +137,10 @@ impl<'a> CleanupTask<'a> {
         // pass on option to process manifests around whether to return error
         // or clean around the manifest
 
-        let tags = self.dataset.tags.list(None).await?;
+        let tags = self.dataset.tags.list().await?;
         let tagged_versions: HashSet<u64> = tags
-            .iter()
-            .map(|(_, tag_content)| tag_content.version) // 使用结构化的元组解构
+            .values()
+            .map(|tag_content| tag_content.version)
             .collect();
 
         let inspection = self.process_manifests(&tagged_versions).await?;
@@ -518,12 +518,12 @@ pub async fn auto_cleanup_hook(
 }
 
 fn tagged_old_versions_cleanup_error(
-    tags: &[(String, TagContents)],
+    tags: &HashMap<String, TagContents>,
     tagged_old_versions: &HashSet<u64>,
 ) -> Error {
     let unreferenced_tags: HashMap<String, u64> = tags
         .iter()
-        .filter_map(|(k, v)| {
+        .filter_map(|(k, &v)| {
             if tagged_old_versions.contains(&v.version) {
                 Some((k.clone(), v.version))
             } else {

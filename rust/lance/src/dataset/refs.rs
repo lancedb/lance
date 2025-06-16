@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crate::{Error, Result};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 /// Lance Ref
 #[derive(Debug, Clone)]
@@ -53,15 +54,9 @@ impl Tags {
         }
     }
 
-    /// Get all tags.
-    pub async fn list(
-        &self,
-        order: Option<std::cmp::Ordering>,
-    ) -> Result<Vec<(String, TagContents)>> {
-        let tag_files = self
-            .object_store()
-            .read_dir(base_tags_path(&self.base))
-            .await?;
+    async fn fetch_tags(&self) -> Result<Vec<(String, TagContents)>> {
+        let base_path = base_tags_path(&self.base);
+        let tag_files = self.object_store().read_dir(base_path).await?;
 
         let tag_names: Vec<String> = tag_files
             .iter()
@@ -69,27 +64,21 @@ impl Tags {
             .map(|name| name.to_string())
             .collect_vec();
 
-        let mut tags: Vec<(String, TagContents)> = futures::stream::iter(tag_names)
-            .map(|tag_name| {
-                let tag_file = tag_path(&self.base, &tag_name);
-                async move {
-                    match TagContents::from_path(&tag_file, self.object_store()).await {
-                        Ok(contents) => Ok((tag_name, contents)),
-                        Err(e) => Err(lance_core::Error::RefNotFound {
-                            message: format!("Tag {} not found: {}", tag_name, e),
-                        }),
-                    }
-                }
+        futures::stream::iter(tag_names)
+            .map(|tag_name| async move {
+                let contents =
+                    TagContents::from_path(&tag_path(&self.base, &tag_name), self.object_store())
+                        .await?;
+                Ok((tag_name, contents))
             })
             .buffer_unordered(10)
             .try_collect()
-            .await?;
+            .await
+    }
 
+    pub(crate) fn sort_tags(tags: &mut [(String, TagContents)], order: Option<std::cmp::Ordering>) {
         tags.sort_by(|a, b| {
-            // If no order is specified, default to descending order, latest version first.
-            // if version is equal, sort by tag name, default to ascending order,
             let desired_ordering = order.unwrap_or(Ordering::Greater);
-
             let version_ordering = a.1.version.cmp(&b.1.version);
             let version_result = match desired_ordering {
                 Ordering::Less => version_ordering,
@@ -97,7 +86,20 @@ impl Tags {
             };
             version_result.then_with(|| a.0.cmp(&b.0))
         });
+    }
 
+    pub async fn list(&self) -> Result<HashMap<String, TagContents>> {
+        self.fetch_tags()
+            .await
+            .map(|tags| tags.into_iter().collect())
+    }
+
+    pub async fn list_tags_ordered(
+        &self,
+        order: Option<std::cmp::Ordering>,
+    ) -> Result<Vec<(String, TagContents)>> {
+        let mut tags = self.fetch_tags().await?;
+        Self::sort_tags(&mut tags, order);
         Ok(tags)
     }
 

@@ -183,11 +183,8 @@ impl BlockingDataset {
         Ok(())
     }
 
-    pub fn list_tags(
-        &self,
-        order: Option<std::cmp::Ordering>,
-    ) -> Result<Vec<(String, TagContents)>> {
-        let tags = RT.block_on(self.inner.tags.list(order))?;
+    pub fn list_tags(&self) -> Result<HashMap<String, TagContents>> {
+        let tags = RT.block_on(self.inner.tags.list())?;
         Ok(tags)
     }
 
@@ -1357,7 +1354,7 @@ fn inner_list_tags<'local>(
     let tag_map = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.list_tags(None)?
+        dataset_guard.list_tags()?
     };
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
 
