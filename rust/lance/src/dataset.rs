@@ -5264,7 +5264,14 @@ mod tests {
             list_col.values().append_value("mots");
             list_col.values().append_value("accentués");
             list_col.append(true);
+            list_col
+                .values()
+                .append_value("lance database full text search");
+            list_col.append(true);
+
+            // for testing null
             list_col.append(false);
+
             Arc::new(list_col.finish())
         } else {
             Arc::new(GenericStringArray::<Offset>::from(vec![
@@ -5275,6 +5282,7 @@ mod tests {
                 "unrelated doc",
                 "unrelated",
                 "mots accentués",
+                "lance database full text search",
             ]))
         };
         let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
@@ -5351,16 +5359,17 @@ mod tests {
                         .with_operator(Operator::And)
                         .into(),
                 )
-                .limit(Some(3)),
+                .limit(Some(5)),
             )
             .unwrap()
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 2, "{:?}", result);
+        assert_eq!(result.num_rows(), 3, "{:?}", result);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
         assert!(ids.contains(&0), "{:?}", result);
         assert!(ids.contains(&1), "{:?}", result);
+        assert!(ids.contains(&7), "{:?}", result);
 
         let result = ds
             .scan()
@@ -5407,12 +5416,13 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 4);
+        assert_eq!(result.num_rows(), 5);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(ids.contains(&2));
         assert!(ids.contains(&3));
+        assert!(ids.contains(&7));
 
         let result = ds
             .scan()
@@ -5429,9 +5439,10 @@ mod tests {
             .await
             .unwrap();
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert_eq!(result.num_rows(), 2, "{:?}", ids);
+        assert_eq!(result.num_rows(), 3, "{:?}", ids);
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
+        assert!(ids.contains(&7));
 
         let result = ds
             .scan()
@@ -5546,6 +5557,45 @@ mod tests {
                             MatchQuery::new("lance database".to_owned())
                                 .with_operator(Operator::And)
                                 .into(),
+                        ),
+                    ])
+                    .into(),
+                )
+                .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 3, "{:?}", result);
+        let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert!(ids.contains(&0), "{:?}", result);
+        assert!(ids.contains(&1), "{:?}", result);
+        assert!(ids.contains(&7), "{:?}", result);
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                // must contain "lance" and "database", and may contain "search"
+                FullTextSearchQuery::new_query(
+                    BooleanQuery::new([
+                        (
+                            Occur::Should,
+                            MatchQuery::new("search".to_owned())
+                                .with_operator(Operator::And)
+                                .into(),
+                        ),
+                        (
+                            Occur::Must,
+                            MatchQuery::new("lance database".to_owned())
+                                .with_operator(Operator::And)
+                                .into(),
+                        ),
+                        (
+                            Occur::MustNot,
+                            MatchQuery::new("full text".to_owned()).into(),
                         ),
                     ])
                     .into(),

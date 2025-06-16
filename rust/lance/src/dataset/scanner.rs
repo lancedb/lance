@@ -1992,11 +1992,44 @@ impl Scanner {
                         must = Some(plan);
                     }
                 }
+
+                // For must_not queries, union the results of each subquery
+                let mut must_not = Vec::with_capacity(query.must_not.len());
+                for query in &query.must_not {
+                    let plan = Box::pin(self.plan_fts(
+                        query,
+                        &unlimited_params,
+                        filter_plan,
+                        prefilter_source,
+                    ))
+                    .await?;
+                    must_not.push(plan);
+                }
+                let must_not = if must_not.is_empty() {
+                    Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
+                } else if must_not.len() == 1 {
+                    must_not.pop().unwrap()
+                } else {
+                    let unioned = Arc::new(UnionExec::new(must_not));
+                    Arc::new(RepartitionExec::try_new(
+                        unioned,
+                        Partitioning::RoundRobinBatch(1),
+                    )?)
+                };
+
+                if query.should.is_empty() && must.is_none() {
+                    return Err(Error::invalid_input(
+                        "boolean query must have at least one should/must query".to_string(),
+                        location!(),
+                    ));
+                }
+
                 Arc::new(BooleanQueryExec::new(
                     query.clone(),
                     params.clone(),
                     should,
                     must,
+                    must_not,
                 ))
             }
         };
