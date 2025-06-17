@@ -213,6 +213,7 @@ impl InvertedIndex {
     }
 
     async fn load_legacy_index(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
+        log::warn!("loading legacy FTS index");
         let tokens_fut = tokio::spawn({
             let store = store.clone();
             async move {
@@ -1292,6 +1293,20 @@ impl DeepSizeOf for CompressedPostingList {
 }
 
 impl CompressedPostingList {
+    pub fn new(
+        blocks: LargeBinaryArray,
+        max_score: f32,
+        length: u32,
+        positions: Option<ListArray>,
+    ) -> Self {
+        Self {
+            max_score,
+            length,
+            blocks,
+            positions,
+        }
+    }
+
     pub fn from_batch(batch: &RecordBatch, max_score: f32, length: u32) -> Self {
         debug_assert_eq!(batch.num_rows(), 1);
         let blocks = batch[POSTING_COL]
