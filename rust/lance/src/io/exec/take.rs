@@ -166,7 +166,12 @@ impl TakeStream {
         let row_addrs = row_addrs_arr.as_primitive::<UInt64Type>();
 
         // Check if the row addresses are already sorted to avoid unnecessary reorders
-        let is_sorted = row_addrs.values().windows(2).all(|w| w[0] <= w[1]);
+        debug_assert!(
+            row_addrs.null_count() == 0,
+            "{} nulls in row addresses",
+            row_addrs.null_count()
+        );
+        let is_sorted = row_addrs.values().is_sorted();
 
         let sorted_addrs: Arc<dyn Array>;
         let (sorted_addrs, permutation) = if is_sorted {
