@@ -4,7 +4,7 @@
 use crate::{Index, IndexType};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt64Array};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
@@ -246,26 +246,43 @@ impl FragReuseIndex {
         RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| self.remap_row_id(addr)))
     }
 
-    pub fn remap_row_ids_record_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        let row_ids = batch.column(1).as_primitive::<UInt64Type>();
-        let val_idx_and_new_id = row_ids
+    /// Remap a record batch that contains a row_id column at index [`row_id_idx`]
+    /// Currently this assumes there are only 2 columns in the schema,
+    /// which is the case for all indexes.
+    /// For example, for btree, the schema is (value, row_id).
+    /// For vector index storage, the schema is (row_id, vector).
+    pub fn remap_row_ids_record_batch(
+        &self,
+        batch: RecordBatch,
+        row_id_idx: usize,
+    ) -> Result<RecordBatch> {
+        assert_eq!(batch.schema().fields().len(), 2);
+        let other_column_idx = 1 - row_id_idx;
+        let row_ids = batch.column(row_id_idx).as_primitive::<UInt64Type>();
+        let (val_indices, new_row_ids): (Vec<u64>, Vec<u64>) = row_ids
             .values()
             .iter()
             .enumerate()
-            .filter_map(|(idx, old_id)| self.remap_row_id(*old_id).map(|new_id| (idx, new_id)))
-            .collect::<Vec<_>>();
-        let new_ids = Arc::new(UInt64Array::from_iter_values(
-            val_idx_and_new_id.iter().copied().map(|(_, new_id)| new_id),
-        ));
-        let new_val_indices = UInt64Array::from_iter_values(
-            val_idx_and_new_id
-                .into_iter()
-                .map(|(val_idx, _)| val_idx as u64),
-        );
-        let new_vals = arrow_select::take::take(batch.column(0), &new_val_indices, None)?;
+            .filter_map(|(idx, old_id)| {
+                self.remap_row_id(*old_id)
+                    .map(|new_id| (idx as u64, new_id))
+            })
+            .unzip();
+        let new_val_indices = UInt64Array::from_iter_values(val_indices);
+        let new_vals =
+            arrow_select::take::take(batch.column(other_column_idx), &new_val_indices, None)?;
+        
+        let mut batch_data: Vec<(usize, ArrayRef)> = vec![
+            (
+                row_id_idx,
+                Arc::new(UInt64Array::from_iter_values(new_row_ids)) as ArrayRef,
+            ),
+            (other_column_idx, Arc::new(new_vals))
+        ];
+        batch_data.sort_by_key(|(i, _)| *i);
         Ok(RecordBatch::try_new(
             batch.schema(),
-            vec![new_vals, new_ids],
+            batch_data.into_iter().map(|(_, item)| item).collect(),
         )?)
     }
 
@@ -283,30 +300,6 @@ impl FragReuseIndex {
                 }
             })
             .collect()
-    }
-
-    /// Remap a record batch which has schema (row_id, vector)
-    /// The vector column can be of any type
-    pub fn remap_row_ids_vector_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        let mut indices = Vec::with_capacity(batch.num_rows());
-        let mut new_row_ids = Vec::with_capacity(batch.num_rows());
-
-        let row_ids = batch.column(0).as_primitive::<UInt64Type>().values();
-        for (i, row_id) in row_ids.iter().enumerate() {
-            if let Some(mapped_value) = self.remap_row_id(*row_id) {
-                indices.push(i as u32);
-                new_row_ids.push(mapped_value);
-            }
-        }
-
-        let indices = UInt32Array::from(indices);
-        let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
-        let new_vectors = arrow::compute::take(batch.column(1), &indices, None)?;
-
-        Ok(RecordBatch::try_new(
-            batch.schema(),
-            vec![new_row_ids, new_vectors],
-        )?)
     }
 
     pub fn remap_fragment_bitmap(&self, fragment_bitmap: &mut RoaringBitmap) -> Result<()> {

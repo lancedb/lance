@@ -91,7 +91,7 @@ impl VectorStore for FlatFloatStorage {
         fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let batch = if let Some(fri_ref) = fri.as_ref() {
-            fri_ref.remap_row_ids_vector_batch(batch)?
+            fri_ref.remap_row_ids_record_batch(batch, 0)?
         } else {
             batch
         };
@@ -219,7 +219,7 @@ impl VectorStore for FlatBinStorage {
         fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let batch = if let Some(fri_ref) = fri.as_ref() {
-            fri_ref.remap_row_ids_vector_batch(batch)?
+            fri_ref.remap_row_ids_record_batch(batch, 0)?
         } else {
             batch
         };

@@ -2706,18 +2706,18 @@ mod tests {
             .unwrap();
 
         // Get initial counts for each category
-        let mut scanner = dataset.scan();
-        scanner.filter("category = 1").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        let count1 = scanner.count_rows().await.unwrap();
-        scanner = dataset.scan();
-        scanner.filter("category = 2").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        let count2 = scanner.count_rows().await.unwrap();
-        scanner = dataset.scan();
-        scanner.filter("category = 3").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        let count3 = scanner.count_rows().await.unwrap();
+        let count1 = dataset
+            .count_rows(Some("category = 1".to_owned()))
+            .await
+            .unwrap();
+        let count2 = dataset
+            .count_rows(Some("category = 2".to_owned()))
+            .await
+            .unwrap();
+        let count3 = dataset
+            .count_rows(Some("category = 3".to_owned()))
+            .await
+            .unwrap();
 
         // Create a bitmap index on the category column
         let index_name = Some("category_idx".into());
@@ -2755,18 +2755,27 @@ mod tests {
         assert_eq!(current_index.uuid, original_index.uuid);
 
         // Verify that scans still work correctly and return the same counts
-        let mut scanner = dataset.scan();
-        scanner.filter("category = 1").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        assert_eq!(scanner.count_rows().await.unwrap(), count1);
-        scanner = dataset.scan();
-        scanner.filter("category = 2").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        assert_eq!(scanner.count_rows().await.unwrap(), count2);
-        scanner = dataset.scan();
-        scanner.filter("category = 3").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        assert_eq!(scanner.count_rows().await.unwrap(), count3);
+        assert_eq!(
+            dataset
+                .count_rows(Some("category = 1".to_owned()))
+                .await
+                .unwrap(),
+            count1
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("category = 2".to_owned()))
+                .await
+                .unwrap(),
+            count2
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("category = 3".to_owned()))
+                .await
+                .unwrap(),
+            count3
+        );
 
         // Verify that after index creation and compaction, scan uses bitmap index scan
         let mut scanner = dataset.scan();
@@ -2799,18 +2808,18 @@ mod tests {
             .unwrap();
 
         // Get initial counts for some ID ranges
-        let mut scanner = dataset.scan();
-        scanner.filter("id < 1000").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        let count_low = scanner.count_rows().await.unwrap();
-        scanner = dataset.scan();
-        scanner.filter("id >= 2000 and id < 3000").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        let count_mid = scanner.count_rows().await.unwrap();
-        scanner = dataset.scan();
-        scanner.filter("id >= 5000").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        let count_high = scanner.count_rows().await.unwrap();
+        let count_low = dataset
+            .count_rows(Some("id < 1000".to_owned()))
+            .await
+            .unwrap();
+        let count_mid = dataset
+            .count_rows(Some("id >= 2000 and id < 3000".to_owned()))
+            .await
+            .unwrap();
+        let count_high = dataset
+            .count_rows(Some("id >= 5000".to_owned()))
+            .await
+            .unwrap();
 
         // Create a btree index on the id column
         let index_name = Some("id_idx".into());
@@ -2845,18 +2854,27 @@ mod tests {
         assert_eq!(current_index.uuid, original_index.uuid);
 
         // Verify that scans still work correctly and return the same counts
-        let mut scanner = dataset.scan();
-        scanner.filter("id < 1000").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        assert_eq!(scanner.count_rows().await.unwrap(), count_low);
-        scanner = dataset.scan();
-        scanner.filter("id >= 2000 and id < 3000").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        assert_eq!(scanner.count_rows().await.unwrap(), count_mid);
-        scanner = dataset.scan();
-        scanner.filter("id >= 5000").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        assert_eq!(scanner.count_rows().await.unwrap(), count_high);
+        assert_eq!(
+            dataset
+                .count_rows(Some("id < 1000".to_owned()))
+                .await
+                .unwrap(),
+            count_low
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("id >= 2000 and id < 3000".to_owned()))
+                .await
+                .unwrap(),
+            count_mid
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("id >= 5000".to_owned()))
+                .await
+                .unwrap(),
+            count_high
+        );
 
         // Verify that after index creation and compaction, scan uses btree index scan
         let mut scanner = dataset.scan();
@@ -3068,24 +3086,18 @@ mod tests {
         let original_index = indices.iter().find(|idx| idx.name == "doc_idx").unwrap();
 
         // Initial scan
-        let mut scanner = dataset.scan();
-        scanner
-            .filter(&format!("contains(doc, '{}')", test_word1))
+        let count1 = dataset
+            .count_rows(Some(format!("contains(doc, '{}')", test_word1)))
+            .await
             .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        let count1 = scanner.count_rows().await.unwrap();
-        scanner = dataset.scan();
-        scanner
-            .filter(&format!("contains(doc, '{}')", test_word2))
+        let count2 = dataset
+            .count_rows(Some(format!("contains(doc, '{}')", test_word2)))
+            .await
             .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        let count2 = scanner.count_rows().await.unwrap();
-        scanner = dataset.scan();
-        scanner
-            .filter(&format!("contains(doc, '{}')", test_word3))
+        let count3 = dataset
+            .count_rows(Some(format!("contains(doc, '{}')", test_word3)))
+            .await
             .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        let count3 = scanner.count_rows().await.unwrap();
 
         // Run compaction with deferred index remapping
         let options = CompactionOptions {
@@ -3105,24 +3117,27 @@ mod tests {
         assert_eq!(current_index.uuid, original_index.uuid);
 
         // Verify that scans still work correctly and return the same counts
-        let mut scanner = dataset.scan();
-        scanner
-            .filter(&format!("contains(doc, '{}')", test_word1))
-            .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        assert_eq!(scanner.count_rows().await.unwrap(), count1);
-        scanner = dataset.scan();
-        scanner
-            .filter(&format!("contains(doc, '{}')", test_word2))
-            .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        assert_eq!(scanner.count_rows().await.unwrap(), count2);
-        scanner = dataset.scan();
-        scanner
-            .filter(&format!("contains(doc, '{}')", test_word3))
-            .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        assert_eq!(scanner.count_rows().await.unwrap(), count3);
+        assert_eq!(
+            dataset
+                .count_rows(Some(format!("contains(doc, '{}')", test_word1)))
+                .await
+                .unwrap(),
+            count1
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some(format!("contains(doc, '{}')", test_word2)))
+                .await
+                .unwrap(),
+            count2
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some(format!("contains(doc, '{}')", test_word3)))
+                .await
+                .unwrap(),
+            count3
+        );
 
         // Verify that after index creation and compaction, scan uses inverted index scan
         let mut scanner = dataset.scan();
@@ -3163,18 +3178,18 @@ mod tests {
             .unwrap();
 
         // Get initial counts for different label values
-        let mut scanner = dataset.scan();
-        scanner.filter("array_has_any(labels, [1])").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        let count1 = scanner.count_rows().await.unwrap();
-        scanner = dataset.scan();
-        scanner.filter("array_has_any(labels, [5])").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        let count2 = scanner.count_rows().await.unwrap();
-        scanner = dataset.scan();
-        scanner.filter("array_has_any(labels, [10])").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        let count3 = scanner.count_rows().await.unwrap();
+        let count1 = dataset
+            .count_rows(Some("array_has_any(labels, [1])".to_owned()))
+            .await
+            .unwrap();
+        let count2 = dataset
+            .count_rows(Some("array_has_any(labels, [5])".to_owned()))
+            .await
+            .unwrap();
+        let count3 = dataset
+            .count_rows(Some("array_has_any(labels, [10])".to_owned()))
+            .await
+            .unwrap();
 
         // Create a label list index on the labels column
         let index_name = Some("labels_idx".into());
@@ -3207,18 +3222,27 @@ mod tests {
         assert_eq!(current_index.uuid, original_index.uuid);
 
         // Verify that scans still work correctly and return the same counts
-        let mut scanner = dataset.scan();
-        scanner.filter("array_has_any(labels, [1])").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        assert_eq!(scanner.count_rows().await.unwrap(), count1);
-        scanner = dataset.scan();
-        scanner.filter("array_has_any(labels, [5])").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        assert_eq!(scanner.count_rows().await.unwrap(), count2);
-        scanner = dataset.scan();
-        scanner.filter("array_has_any(labels, [10])").unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
-        assert_eq!(scanner.count_rows().await.unwrap(), count3);
+        assert_eq!(
+            dataset
+                .count_rows(Some("array_has_any(labels, [1])".to_owned()))
+                .await
+                .unwrap(),
+            count1
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("array_has_any(labels, [5])".to_owned()))
+                .await
+                .unwrap(),
+            count2
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("array_has_any(labels, [10])".to_owned()))
+                .await
+                .unwrap(),
+            count3
+        );
 
         // Verify that after index creation and compaction, scan uses label list index scan
         let mut scanner = dataset.scan();

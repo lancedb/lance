@@ -318,7 +318,7 @@ impl ScalarIndex for FlatIndex {
         let num_rows = batches.num_rows();
         let mut batch = batches.read_range(0..num_rows, None).await?;
         if let Some(fri_ref) = fri.as_ref() {
-            batch = fri_ref.remap_row_ids_record_batch(batch)?;
+            batch = fri_ref.remap_row_ids_record_batch(batch, 1)?;
         }
         let has_nulls = batch.column(0).null_count() > 0;
         Ok(Arc::new(Self {

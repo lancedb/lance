@@ -779,7 +779,7 @@ impl BTreeIndex {
             .read_record_batch(page_number as u64, self.batch_size)
             .await?;
         if let Some(fri_ref) = self.fri.as_ref() {
-            serialized_page = fri_ref.remap_row_ids_record_batch(serialized_page)?;
+            serialized_page = fri_ref.remap_row_ids_record_batch(serialized_page, 1)?;
         }
         let subindex = self.sub_index.load_subindex(serialized_page).await?;
         self.page_cache.0.insert(page_number, subindex.clone());
