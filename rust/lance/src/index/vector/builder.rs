@@ -25,7 +25,7 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::utils::is_finite;
-use lance_index::vector::v3::shuffler::IvfShufflerReader;
+use lance_index::vector::v3::shuffler::{EmptyReader, IvfShufflerReader};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{ivf::storage::IvfModel, PART_ID_FIELD};
 use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN};
@@ -473,6 +473,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         data: Option<impl RecordBatchStream + Unpin + 'static>,
     ) -> Result<&mut Self> {
         if data.is_none() {
+            // If we don't specify the shuffle reader, it's going to re-read the
+            // dataset and duplicate the data.
+            self.shuffle_reader = Some(Arc::new(EmptyReader));
+
             return Ok(self);
         }
         let data = data.unwrap();
