@@ -346,3 +346,23 @@ impl ShuffleReader for SinglePartitionReader {
         None
     }
 }
+
+pub struct EmptyReader;
+
+#[async_trait::async_trait]
+impl ShuffleReader for EmptyReader {
+    async fn read_partition(
+        &self,
+        _partition_id: usize,
+    ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
+        Ok(None)
+    }
+
+    fn partition_size(&self, _partition_id: usize) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn total_loss(&self) -> Option<f64> {
+        None
+    }
+}
