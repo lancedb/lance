@@ -194,7 +194,7 @@ mod tests {
                 .unwrap(),
             DistanceType::L2,
         );
-        let idx = Arc::new(PQIndex::new(pq, DistanceType::L2));
+        let idx = Arc::new(PQIndex::new(pq, DistanceType::L2, None));
         no_cache.index_cache.insert_vector("abc", idx);
 
         assert!(no_cache.index_cache.get_vector("abc").is_none());
@@ -214,7 +214,7 @@ mod tests {
                 .unwrap(),
             DistanceType::L2,
         );
-        let idx = Arc::new(PQIndex::new(pq, DistanceType::L2));
+        let idx = Arc::new(PQIndex::new(pq, DistanceType::L2, None));
         assert_eq!(session.index_cache.get_size(), 0);
 
         assert_eq!(session.index_cache.hit_rate(), 1.0);
@@ -239,7 +239,7 @@ mod tests {
                     .unwrap(),
                 DistanceType::L2,
             );
-            let idx_other = Arc::new(PQIndex::new(pq_other, DistanceType::L2));
+            let idx_other = Arc::new(PQIndex::new(pq_other, DistanceType::L2, None));
             session
                 .index_cache
                 .insert_vector(format!("{iter_idx}").as_str(), idx_other.clone());
