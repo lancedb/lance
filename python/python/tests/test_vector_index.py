@@ -1335,10 +1335,8 @@ def test_knn_deleted_rows(tmp_path):
 
     ds.delete("id = 0")
     assert ds.count_rows() == data.num_rows * 2 - 2
-    results = ds.scanner(
+    results = ds.to_table(
         nearest={"column": "vector", "q": data["vector"][0], "k": ds.count_rows()}
     )
-    print(results.explain_plan(True))
-    results = results.to_table()
     assert 0 not in results["id"]
     assert results.num_rows == ds.count_rows()
