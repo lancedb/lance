@@ -4,7 +4,10 @@
 //! Cache implementation
 
 use std::any::{Any, TypeId};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use futures::Future;
 use moka::sync::Cache;
@@ -45,6 +48,8 @@ impl SizedRecord {
 pub struct LanceCache {
     cache: Arc<Cache<(String, TypeId), SizedRecord>>,
     prefix: String,
+    hits: Arc<AtomicU64>,
+    misses: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for LanceCache {
@@ -76,6 +81,8 @@ impl LanceCache {
         Self {
             cache: Arc::new(cache),
             prefix: String::new(),
+            hits: Arc::new(AtomicU64::new(0)),
+            misses: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -83,6 +90,8 @@ impl LanceCache {
         Self {
             cache: Arc::new(Cache::new(0)),
             prefix: String::new(),
+            hits: Arc::new(AtomicU64::new(0)),
+            misses: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -97,6 +106,8 @@ impl LanceCache {
         Self {
             cache: self.cache.clone(),
             prefix: format!("{}{}/", self.prefix, prefix),
+            hits: self.hits.clone(),
+            misses: self.misses.clone(),
         }
     }
 
@@ -154,9 +165,13 @@ impl LanceCache {
 
     pub fn get<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
         let key = self.get_key(key);
-        self.cache
-            .get(&(key, TypeId::of::<T>()))
-            .map(|metadata| metadata.record.clone().downcast::<T>().unwrap())
+        if let Some(metadata) = self.cache.get(&(key, TypeId::of::<T>())) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            Some(metadata.record.clone().downcast::<T>().unwrap())
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
     }
 
     pub fn get_unsized<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
@@ -181,14 +196,30 @@ impl LanceCache {
         F: FnOnce(&str) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        if let Some(metadata) = self.get::<T>(&key) {
-            return Ok(metadata);
+        let full_key = self.get_key(&key);
+        if let Some(metadata) = self.cache.get(&(full_key, TypeId::of::<T>())) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(metadata.record.clone().downcast::<T>().unwrap());
         }
 
+        self.misses.fetch_add(1, Ordering::Relaxed);
         let metadata = Arc::new(loader(&key).await?);
         self.insert(&key, metadata.clone());
         Ok(metadata)
     }
+
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
 }
 
 #[cfg(test)]
@@ -246,5 +277,162 @@ mod tests {
         let retrieved = cache.get_unsized::<dyn MyTrait>("test").unwrap();
         let retrieved = retrieved.as_any().downcast_ref::<MyType>().unwrap();
         assert_eq!(retrieved.0, 42);
+    }
+
+    #[test]
+    fn test_cache_stats_basic() {
+        let cache = LanceCache::with_capacity(1000);
+
+        // Initially no hits or misses
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+
+        // Miss on first get
+        let result = cache.get::<Vec<i32>>("nonexistent");
+        assert!(result.is_none());
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 1);
+
+        // Insert and then hit
+        cache.insert("key1", Arc::new(vec![1, 2, 3]));
+        let result = cache.get::<Vec<i32>>("key1");
+        assert!(result.is_some());
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+
+        // Another hit
+        let result = cache.get::<Vec<i32>>("key1");
+        assert!(result.is_some());
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 1);
+
+        // Another miss
+        let result = cache.get::<Vec<i32>>("nonexistent2");
+        assert!(result.is_none());
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 2);
+    }
+
+    #[test]
+    fn test_cache_stats_with_prefixes() {
+        let base_cache = LanceCache::with_capacity(1000);
+        let prefixed_cache = base_cache.with_key_prefix("test");
+
+        // Stats should be shared between base and prefixed cache
+        let stats = base_cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+
+        let stats = prefixed_cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+
+        // Miss on prefixed cache
+        let result = prefixed_cache.get::<Vec<i32>>("key1");
+        assert!(result.is_none());
+
+        // Both should show the miss
+        let stats = base_cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 1);
+
+        let stats = prefixed_cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 1);
+
+        // Insert through prefixed cache and hit
+        prefixed_cache.insert("key1", Arc::new(vec![1, 2, 3]));
+        let result = prefixed_cache.get::<Vec<i32>>("key1");
+        assert!(result.is_some());
+
+        // Both should show the hit
+        let stats = base_cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+
+        let stats = prefixed_cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+    }
+
+    #[test]
+    fn test_cache_stats_unsized() {
+        #[derive(Debug, DeepSizeOf)]
+        struct MyType(i32);
+
+        trait MyTrait: DeepSizeOf + Send + Sync + Any {
+            fn as_any(&self) -> &dyn Any;
+        }
+
+        impl MyTrait for MyType {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let cache = LanceCache::with_capacity(1000);
+
+        // Miss on unsized get
+        let result = cache.get_unsized::<dyn MyTrait>("test");
+        assert!(result.is_none());
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 1);
+
+        // Insert and hit on unsized
+        let item = Arc::new(MyType(42));
+        let item_dyn: Arc<dyn MyTrait> = item;
+        cache.insert_unsized("test", item_dyn);
+
+        let result = cache.get_unsized::<dyn MyTrait>("test");
+        assert!(result.is_some());
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_stats_get_or_insert() {
+        let cache = LanceCache::with_capacity(1000);
+
+        // First call should be a miss and load the value
+        let result: Arc<Vec<i32>> = cache
+            .get_or_insert("key1".to_string(), |_key| async { Ok(vec![1, 2, 3]) })
+            .await
+            .unwrap();
+        assert_eq!(*result, vec![1, 2, 3]);
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 1);
+
+        // Second call should be a hit
+        let result: Arc<Vec<i32>> = cache
+            .get_or_insert("key1".to_string(), |_key| async {
+                panic!("Should not be called")
+            })
+            .await
+            .unwrap();
+        assert_eq!(*result, vec![1, 2, 3]);
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+
+        // Different key should be another miss
+        let result: Arc<Vec<i32>> = cache
+            .get_or_insert("key2".to_string(), |_key| async { Ok(vec![4, 5, 6]) })
+            .await
+            .unwrap();
+        assert_eq!(*result, vec![4, 5, 6]);
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 2);
     }
 }
