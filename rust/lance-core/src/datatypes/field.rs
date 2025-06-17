@@ -31,11 +31,12 @@ use crate::{Error, Result};
 
 pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
 
-/// Use this config key in Arrow schema metadata to indicate a column is a part of the primary key.
-/// If this is a composite primary key, use `,` to delimit the column name.
+/// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
+/// The value can be any true values like `true`, `1`, `yes` (case-insensitive).
 /// A primary key column must satisfy:
-/// (1) The column, and all its parents must not be nullable.
-/// (2) The column must be of a leaf column without child columns.
+/// (1) The field, and all its ancestors must not be nullable.
+/// (2) The field must be a leaf without child (i.e. it is a primitive data type).
+/// (3) The field must not be within a list type.
 pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-key";
 
 #[derive(Debug, Default)]

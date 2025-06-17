@@ -625,6 +625,16 @@ impl TryFrom<&ArrowSchema> for Schema {
                             location: location!(),
                         });
                     }
+
+                    if ancestor.logical_type.is_list() || ancestor.logical_type.is_large_list() {
+                        return Err(Error::Schema {
+                            message: format!(
+                                "Primary key column must not be in a list type: {}",
+                                ancestor
+                            ),
+                            location: location!(),
+                        });
+                    }
                 }
             }
         }
@@ -1877,11 +1887,29 @@ mod tests {
                 )])),
                 true,
             )]),
+            ArrowSchema::new(vec![ArrowField::new(
+                "b",
+                DataType::List(Arc::new(ArrowField::new(
+                    "f1",
+                    DataType::Utf8,
+                    false,
+                )
+                    .with_metadata(
+                        vec![(
+                            "lance-schema:unenforced-primary-key".to_owned(),
+                            "true".to_owned(),
+                        )]
+                            .into_iter()
+                            .collect::<HashMap<_, _>>(),
+                    ))),
+                false,
+            )]),
         ];
         let error_message_contains = [
             "Primary key column and all its ancestors must not be nullable",
             "Primary key column must be a leaf",
             "Primary key column and all its ancestors must not be nullable",
+            "Primary key column must not be in a list type"
         ];
 
         for (idx, case) in cases.into_iter().enumerate() {
