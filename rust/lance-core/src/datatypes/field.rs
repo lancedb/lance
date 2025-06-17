@@ -31,6 +31,13 @@ use crate::{Error, Result};
 
 pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
 
+/// Use this config key in Arrow schema metadata to indicate a column is a part of the primary key.
+/// If this is a composite primary key, use `,` to delimit the column name.
+/// A primary key column must satisfy:
+/// (1) The column, and all its parents must not be nullable.
+/// (2) The column must be of a leaf column without child columns.
+pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-key";
+
 #[derive(Debug, Default)]
 pub enum NullabilityComparison {
     // If the nullabilities don't match then the fields don't match
@@ -133,6 +140,7 @@ pub struct Field {
     /// Dictionary value array if this field is dictionary.
     pub dictionary: Option<Dictionary>,
     pub storage_class: StorageClass,
+    pub unenforced_primary_key: bool,
 }
 
 impl Field {
@@ -473,6 +481,18 @@ impl Field {
         }
     }
 
+    pub fn sub_field_mut(&mut self, path_components: &[&str]) -> Option<&mut Self> {
+        if path_components.is_empty() {
+            Some(self)
+        } else {
+            let first = path_components[0];
+            self.children
+                .iter_mut()
+                .find(|c| c.name == first)
+                .and_then(|c| c.sub_field_mut(&path_components[1..]))
+        }
+    }
+
     pub fn project(&self, path_components: &[&str]) -> Result<Self> {
         let mut f = Self {
             name: self.name.clone(),
@@ -485,6 +505,7 @@ impl Field {
             children: vec![],
             dictionary: self.dictionary.clone(),
             storage_class: self.storage_class,
+            unenforced_primary_key: self.unenforced_primary_key,
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
@@ -702,6 +723,7 @@ impl Field {
                 children,
                 dictionary: self.dictionary.clone(),
                 storage_class: self.storage_class,
+                unenforced_primary_key: self.unenforced_primary_key,
             };
             return Ok(f);
         }
@@ -765,6 +787,7 @@ impl Field {
                 children,
                 dictionary: self.dictionary.clone(),
                 storage_class: self.storage_class,
+                unenforced_primary_key: self.unenforced_primary_key,
             })
         }
     }
@@ -937,6 +960,16 @@ impl TryFrom<&ArrowField> for Field {
             .map(|s| StorageClass::from_str(s))
             .unwrap_or(Ok(StorageClass::Default))?;
 
+        let unenforced_primary_key = field
+            .metadata()
+            .get(LANCE_UNENFORCED_PRIMARY_KEY)
+            .map(|s| match s.to_lowercase().as_str() {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                _ => false,
+            })
+            .unwrap_or(false);
+
         Ok(Self {
             id: -1,
             parent_id: -1,
@@ -955,6 +988,7 @@ impl TryFrom<&ArrowField> for Field {
             children,
             dictionary: None,
             storage_class,
+            unenforced_primary_key,
         })
     }
 }
