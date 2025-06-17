@@ -3854,6 +3854,40 @@ class Tags:
         """
         return self._ds.tags()
 
+    def get_version(self, tag: str) -> Optional[int]:
+        """
+        Get the version of a specific tag by name.
+
+        Parameters
+        ----------
+        tag: str
+            The name of the tag to retrieve.
+
+        Returns
+        -------
+        int or None
+            The version number of the tag if it exists, otherwise None.
+        """
+        return self._ds.get_version(tag)
+
+    def list_ordered(self, order: Optional[str] = None) -> list[str, Tag]:
+        """
+        List all dataset tags.
+
+        Parameters
+        ----------
+        order: str, optional
+            The order in which to return the tags.
+            "asc" or "desc" can be used to specify the order explicitly.
+            default 'desc'.
+
+        Returns
+        -------
+        list[str, Tag]
+            An ordered list of tuples mapping tag names to its `Tag` metadata.
+        """
+        return self._ds.tags_ordered(order)
+
     def create(self, tag: str, version: int) -> None:
         """
         Create a tag for a given dataset version.

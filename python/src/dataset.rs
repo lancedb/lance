@@ -1207,10 +1207,31 @@ impl Dataset {
         })
     }
 
+    fn tags_ordered(self_: PyRef<'_, Self>, order: Option<String>) -> PyResult<PyObject> {
+        let tags = self_
+            .list_tags_ordered(order.as_deref())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Python::with_gil(|py| {
+            let pylist = PyList::empty(py);
+
+            for (tag_name, tag_content) in tags {
+                let dict = PyDict::new(py);
+                dict.set_item("version", tag_content.version)?;
+                dict.set_item("manifest_size", tag_content.manifest_size)?;
+
+                pylist.append((tag_name.as_str(), dict))?;
+            }
+
+            Ok(PyObject::from(pylist))
+        })
+    }
+
     fn tags(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let tags = self_
             .list_tags()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
         Python::with_gil(|py| {
             let pytags = PyDict::new(py);
             for (k, v) in tags.iter() {
@@ -1220,6 +1241,20 @@ impl Dataset {
                 pytags.set_item(k, dict.into_py_any(py)?).unwrap();
             }
             pytags.into_py_any(py)
+        })
+    }
+
+    fn get_version(self_: PyRef<'_, Self>, tag: String) -> PyResult<u64> {
+        let inner_result = RT.block_on(None, self_.ds.tags.get_version(&tag))?;
+
+        inner_result.map_err(|err: lance::Error| match err {
+            lance::Error::NotFound { .. } => {
+                PyValueError::new_err(format!("Tag not found: {}", err))
+            }
+            lance::Error::RefNotFound { .. } => {
+                PyValueError::new_err(format!("Ref not found: {}", err))
+            }
+            _ => PyIOError::new_err(format!("Storage error: {}", err)),
         })
     }
 
@@ -1766,6 +1801,32 @@ impl Dataset {
 
     fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
         RT.runtime.block_on(self.ds.tags.list())
+    }
+
+    fn list_tags_ordered(
+        &self,
+        order: Option<&str>,
+    ) -> ::lance::error::Result<Vec<(String, TagContents)>> {
+        let ordering = match order {
+            Some("asc") => Some(std::cmp::Ordering::Less),
+            Some("desc") => Some(std::cmp::Ordering::Greater),
+            Some(invalid_order) => {
+                let error_msg = format!(
+                    "Invalid sort order '{}'. Valid values are: asc, desc",
+                    invalid_order
+                );
+                return Err(::lance::error::Error::InvalidInput {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        error_msg,
+                    )),
+                    location: location!(),
+                });
+            }
+            None => None,
+        };
+        RT.runtime
+            .block_on(async { self.ds.tags.list_tags_ordered(ordering).await })
     }
 
     fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {

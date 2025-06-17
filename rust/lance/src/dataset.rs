@@ -1931,6 +1931,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
     use rstest::rstest;
+    use std::cmp::Ordering;
     use tempfile::{tempdir, TempDir};
 
     // Used to validate that futures returned are Send.
@@ -4063,7 +4064,39 @@ mod tests {
 
         dataset.tags.create("tag1", 1).await.unwrap();
         dataset.tags.create("tag2", 1).await.unwrap();
-        dataset.tags.create("v1.0.0-rc1", 1).await.unwrap();
+        dataset.tags.create("v1.0.0-rc1", 2).await.unwrap();
+
+        let default_order = dataset.tags.list_tags_ordered(None).await.unwrap();
+        let default_names: Vec<_> = default_order.iter().map(|t| &t.0).collect();
+        assert_eq!(
+            default_names,
+            ["v1.0.0-rc1", "tag1", "tag2"],
+            "Default ordering mismatch"
+        );
+
+        let asc_order = dataset
+            .tags
+            .list_tags_ordered(Some(Ordering::Less))
+            .await
+            .unwrap();
+        let asc_names: Vec<_> = asc_order.iter().map(|t| &t.0).collect();
+        assert_eq!(
+            asc_names,
+            ["tag1", "tag2", "v1.0.0-rc1"],
+            "Ascending ordering mismatch"
+        );
+
+        let desc_order = dataset
+            .tags
+            .list_tags_ordered(Some(Ordering::Greater))
+            .await
+            .unwrap();
+        let desc_names: Vec<_> = desc_order.iter().map(|t| &t.0).collect();
+        assert_eq!(
+            desc_names,
+            ["v1.0.0-rc1", "tag1", "tag2"],
+            "Descending ordering mismatch"
+        );
 
         assert_eq!(dataset.tags.list().await.unwrap().len(), 3);
 
