@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use super::index::FlatMetadata;
+use crate::frag_reuse::FragReuseIndex;
 use crate::vector::quantizer::QuantizerStorage;
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::utils::do_prefetch;
@@ -21,8 +23,6 @@ use lance_file::reader::FileReader;
 use lance_linalg::distance::hamming::hamming;
 use lance_linalg::distance::DistanceType;
 use snafu::location;
-
-use super::index::FlatMetadata;
 
 pub const FLAT_COLUMN: &str = "flat";
 
@@ -51,6 +51,7 @@ impl QuantizerStorage for FlatFloatStorage {
         _: std::ops::Range<usize>,
         _: DistanceType,
         _: &Self::Metadata,
+        _: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }
@@ -84,7 +85,17 @@ impl FlatFloatStorage {
 impl VectorStore for FlatFloatStorage {
     type DistanceCalculator<'a> = FlatDistanceCal<'a, Float32Type>;
 
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self> {
+    fn try_from_batch(
+        batch: RecordBatch,
+        distance_type: DistanceType,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let batch = if let Some(fri_ref) = fri.as_ref() {
+            fri_ref.remap_row_ids_record_batch(batch, 0)?
+        } else {
+            batch
+        };
+
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)
@@ -187,6 +198,7 @@ impl QuantizerStorage for FlatBinStorage {
         _: std::ops::Range<usize>,
         _: DistanceType,
         _: &Self::Metadata,
+        _: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }
@@ -201,7 +213,17 @@ impl FlatBinStorage {
 impl VectorStore for FlatBinStorage {
     type DistanceCalculator<'a> = FlatDistanceCal<'a, UInt8Type>;
 
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self> {
+    fn try_from_batch(
+        batch: RecordBatch,
+        distance_type: DistanceType,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let batch = if let Some(fri_ref) = fri.as_ref() {
+            fri_ref.remap_row_ids_record_batch(batch, 0)?
+        } else {
+            batch
+        };
+
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)

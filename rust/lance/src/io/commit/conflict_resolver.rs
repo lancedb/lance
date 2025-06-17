@@ -1065,11 +1065,7 @@ impl<'a> TransactionRebase<'a> {
             .unwrap();
             new_fri_details.versions.extend(max_versions);
 
-            let new_frag_bitmap = new_fri_details
-                .versions
-                .iter()
-                .flat_map(|v| v.new_frags.iter().map(|&x| x as u32))
-                .collect();
+            let new_frag_bitmap = new_fri_details.new_frag_bitmap();
 
             let new_fri_meta = build_frag_reuse_index_metadata(
                 dataset,
@@ -1147,11 +1143,7 @@ impl<'a> TransactionRebase<'a> {
                 new_fri_details
                     .versions
                     .retain(|v| v.dataset_version >= min_dataset_version);
-                let new_frag_bitmap = new_fri_details
-                    .versions
-                    .iter()
-                    .flat_map(|v| v.new_frags.iter().map(|&x| x as u32))
-                    .collect();
+                let new_frag_bitmap = new_fri_details.new_frag_bitmap();
 
                 let new_fri_meta = build_frag_reuse_index_metadata(
                     dataset,
