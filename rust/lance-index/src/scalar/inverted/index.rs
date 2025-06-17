@@ -1853,20 +1853,13 @@ pub fn flat_bm25_search(
     avgdl: f32,
     num_docs: usize,
 ) -> std::result::Result<RecordBatch, DataFusionError> {
-    let row_id_nulls = batch[ROW_ID].nulls();
     let doc_iter = iter_str_array(&batch[doc_col]);
     let mut scores = Vec::with_capacity(batch.num_rows());
-    for (i, doc) in doc_iter.enumerate() {
+    for doc in doc_iter {
         let Some(doc) = doc else {
             scores.push(0.0);
             continue;
         };
-        if let Some(nulls) = row_id_nulls {
-            if !nulls.is_valid(i) {
-                scores.push(0.0);
-                continue;
-            }
-        }
 
         let doc_tokens = collect_tokens(doc, tokenizer, Some(query_tokens));
         let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / avgdl);
