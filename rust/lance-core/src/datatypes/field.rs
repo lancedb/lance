@@ -964,10 +964,7 @@ impl TryFrom<&ArrowField> for Field {
         let unenforced_primary_key = field
             .metadata()
             .get(LANCE_UNENFORCED_PRIMARY_KEY)
-            .map(|s| match s.to_lowercase().as_str() {
-                "true" | "1" | "yes" => true,
-                _ => false,
-            })
+            .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
 
         Ok(Self {
