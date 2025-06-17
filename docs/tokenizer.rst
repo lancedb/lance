@@ -70,11 +70,9 @@ Using the Model
 User Dictionaries
 ~~~~~~~~~~~~~~~~~
 
-Create a file named config.yml in the root directory of your model.
+Create a file named config.yml in the root directory of your model, or specify a custom YAML file using the `LINDERA_CONFIG_PATH` environment variable.
+If both are provided, the config.yml in the root directory will be used.
 For more detailed configuration methods, see the lindera documentation at https://github.com/lindera/lindera/.
-
-NOTE: if `LINDERA_CONFIG_PATH` is set in lance, an exception will be raised.
-This is to prevent loading a single configuration file, since lance allows multiple tokenizers to be specified.
 
 .. code-block:: yaml
 

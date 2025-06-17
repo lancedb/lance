@@ -32,14 +32,6 @@ pub struct LinderaBuilder {
 
 impl LinderaTokenizerBuilder for LinderaBuilder {
     fn new(config_path: &Path) -> Result<Self> {
-        if std::env::var("LINDERA_CONFIG_PATH").is_ok() {
-            return Err(Error::io(
-                "The environment variable `LINDERA_CONFIG_PATH` is set, which is not allowed. \
-                Please create the configuration file at: \
-                `${LANCE_LANGUAGE_MODEL_HOME}/$(base_tokenizer)/config.yml` instead.",
-                location!(),
-            ));
-        }
         Ok(Self {
             config_path: config_path.to_path_buf(),
         })
@@ -61,6 +53,10 @@ impl LinderaTokenizerBuilder for LinderaBuilder {
                 }
             }
         } else {
+            log::info!(
+                "Config file not found at '{}'. Falling back to `LINDERA_CONFIG_PATH`.",
+                self.config_path.display(),
+            );
             LinderaTokenizer::new().map_err(|e| {
                 Error::io(
                     format!("Failed to initialize default tokenizer: {}", e),

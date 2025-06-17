@@ -879,11 +879,7 @@ def test_index_after_merge_insert(tmp_path):
     assert dataset.to_table(filter="payload >= 30").num_rows == 20
 
 
-def test_lindera_load_config_from_envpath(tmp_path, lindera_ipadic, monkeypatch):
-    # Note: In lindera, the config file is loaded via the LINDERA_CONFIG_PATH.
-    # However, in lance, the tokenizer is determined dynamically, so it's
-    # undesirable to load a single config file specified by LINDERA_CONFIG_PATH.
-    # Therefore, it is designed to raise an exception if LINDERA_CONFIG_PATH is set.
+def test_lindera_load_config_fallback(tmp_path, lindera_ipadic, monkeypatch):
     data = pa.table(
         {
             "text": [
@@ -894,8 +890,27 @@ def test_lindera_load_config_from_envpath(tmp_path, lindera_ipadic, monkeypatch)
         }
     )
     ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    with pytest.raises(OSError):
+        ds.create_scalar_index(
+            "text", "INVERTED", base_tokenizer="lindera/load_config_fallback"
+        )
+
+    config_path = os.path.join(
+        os.path.dirname(__file__),
+        "models/lindera/load_config_fallback/config_not_exists.yml",
+    )
+    monkeypatch.setenv("LINDERA_CONFIG_PATH", config_path)
+    with pytest.raises(OSError):
+        ds.create_scalar_index(
+            "text", "INVERTED", base_tokenizer="lindera/load_config_fallback"
+        )
+
+    config_path = os.path.join(
+        os.path.dirname(__file__), "models/lindera/load_config_fallback/config_env.yml"
+    )
+    monkeypatch.setenv("LINDERA_CONFIG_PATH", config_path)
     ds.create_scalar_index(
-        "text", "INVERTED", base_tokenizer="lindera/invalid_env_path"
+        "text", "INVERTED", base_tokenizer="lindera/load_config_fallback"
     )
     results = ds.to_table(
         full_text_query="成田",
@@ -904,14 +919,38 @@ def test_lindera_load_config_from_envpath(tmp_path, lindera_ipadic, monkeypatch)
     )
     assert results["_rowid"].to_pylist() == [0]
 
+
+def test_lindera_load_config_priority(tmp_path, lindera_ipadic, monkeypatch):
+    data = pa.table(
+        {
+            "text": [
+                "成田国際空港",
+                "東京国際空港",
+                "羽田空港",
+            ],
+        }
+    )
     config_path = os.path.join(
-        os.path.dirname(__file__), "models/lindera/invalid_env_path/config.yml"
+        os.path.dirname(__file__), "models/lindera/load_config_priority/config_env.yml"
     )
     monkeypatch.setenv("LINDERA_CONFIG_PATH", config_path)
-    with pytest.raises(OSError):
-        ds.create_scalar_index(
-            "text", "INVERTED", base_tokenizer="lindera/invalid_env_path"
-        )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text", "INVERTED", base_tokenizer="lindera/load_config_priority"
+    )
+    results = ds.to_table(
+        full_text_query="成田",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [0]
+
+    results = ds.to_table(
+        full_text_query="ほげほげ",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [0]
 
 
 def test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer(
