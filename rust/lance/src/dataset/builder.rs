@@ -308,7 +308,7 @@ impl DatasetBuilder {
             let location = commit_handler
                 .resolve_version_location(&base_path, manifest.version, &object_store.inner)
                 .await?;
-            if manifest.schema.has_dictionary_types() {
+            if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
                 let reader = object_store.open(&location.path).await?;
                 populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
             }

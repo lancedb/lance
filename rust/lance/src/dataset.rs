@@ -483,7 +483,9 @@ impl Dataset {
             }
         }
 
-        populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
+        if manifest.should_use_legacy_format() {
+            populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
+        }
 
         Ok(manifest)
     }
@@ -629,7 +631,7 @@ impl Dataset {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
-        if manifest.schema.has_dictionary_types() {
+        if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
             let reader = if let Some(size) = location.size {
                 self.object_store
                     .open_with_size(&location.path, size as usize)
