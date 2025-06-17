@@ -503,7 +503,7 @@ impl Dataset {
             commit_handler.clone(),
             base_path.clone(),
         );
-        let metadata_cache = Arc::new(session.file_metadata_cache.with_key_prefix(&uri));
+        let metadata_cache = Arc::new(session.metadata_cache.with_key_prefix(&uri));
         Ok(Self {
             object_store,
             base: base_path,

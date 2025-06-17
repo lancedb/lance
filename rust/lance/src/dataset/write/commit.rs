@@ -232,9 +232,7 @@ impl<'a> CommitBuilder<'a> {
 
         let metadata_cache = match &dest {
             WriteDestination::Dataset(ds) => ds.metadata_cache.clone(),
-            WriteDestination::Uri(uri) => {
-                Arc::new(session.file_metadata_cache.with_key_prefix(uri))
-            }
+            WriteDestination::Uri(uri) => Arc::new(session.metadata_cache.with_key_prefix(uri)),
         };
 
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {

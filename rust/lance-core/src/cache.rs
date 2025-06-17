@@ -31,8 +31,9 @@ impl std::fmt::Debug for SizedRecord {
 
 impl SizedRecord {
     fn new<T: DeepSizeOf + Send + Sync + 'static>(record: Arc<T>) -> Self {
+        // +8 for the size of the Arc pointer itself
         let size_accessor =
-            |record: &ArcAny| -> usize { record.clone().downcast::<T>().unwrap().deep_size_of() };
+            |record: &ArcAny| -> usize { record.downcast_ref::<T>().unwrap().deep_size_of() + 8 };
         Self {
             record,
             size_accessor: Arc::new(size_accessor),
