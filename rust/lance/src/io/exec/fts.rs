@@ -809,6 +809,7 @@ pub struct BooleanQueryExec {
     params: FtsSearchParams,
     should: Arc<dyn ExecutionPlan>,
     must: Option<Arc<dyn ExecutionPlan>>,
+    must_not: Arc<dyn ExecutionPlan>,
 
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -820,18 +821,22 @@ impl DisplayAs for BooleanQueryExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "BooleanQuery: must={}, should={}",
-                    self.query.must.len(),
-                    self.query.should.len()
+                    "BooleanQuery: should={:?}, must={:?}, must_not={:?}",
+                    self.query.should, self.query.must, self.query.must_not,
                 )
             }
             DisplayFormatType::TreeRender => {
-                write!(
-                    f,
-                    "BooleanQuery\nmust={}\nshould={}",
-                    self.query.must.len(),
-                    self.query.should.len()
-                )
+                write!(f, "BooleanQuery")?;
+                if !self.query.should.is_empty() {
+                    write!(f, "\nshould={:?}", self.query.should)?;
+                }
+                if !self.query.must.is_empty() {
+                    write!(f, "\nmust={:?}", self.query.must)?;
+                }
+                if !self.query.must_not.is_empty() {
+                    write!(f, "\nmust_not={:?}", self.query.must_not)?;
+                }
+                std::fmt::Result::Ok(())
             }
         }
     }
@@ -843,6 +848,7 @@ impl BooleanQueryExec {
         params: FtsSearchParams,
         should: Arc<dyn ExecutionPlan>,
         must: Option<Arc<dyn ExecutionPlan>>,
+        must_not: Arc<dyn ExecutionPlan>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(FTS_SCHEMA.clone()),
@@ -855,6 +861,7 @@ impl BooleanQueryExec {
             params,
             must,
             should,
+            must_not,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -872,8 +879,8 @@ impl ExecutionPlan for BooleanQueryExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.must {
-            Some(must) => vec![&self.should, must],
-            None => vec![&self.should],
+            Some(must) => vec![&self.should, &self.must_not, must],
+            None => vec![&self.should, &self.must_not],
         }
     }
 
@@ -898,18 +905,34 @@ impl ExecutionPlan for BooleanQueryExec {
                     params: self.params.clone(),
                     should,
                     must: None,
+                    must_not: self.must_not.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }))
             }
             2 => {
+                let must_not = children.pop().unwrap();
                 let should = children.pop().unwrap();
+                Ok(Arc::new(Self {
+                    query: self.query.clone(),
+                    params: self.params.clone(),
+                    should,
+                    must: None,
+                    must_not,
+                    properties: self.properties.clone(),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                }))
+            }
+            3 => {
                 let must = children.pop().unwrap();
+                let must_not = children.pop().unwrap();
+                let should = children.pop().unwrap();
                 Ok(Arc::new(Self {
                     query: self.query.clone(),
                     params: self.params.clone(),
                     should,
                     must: Some(must),
+                    must_not,
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }))
@@ -932,34 +955,45 @@ impl ExecutionPlan for BooleanQueryExec {
             .as_ref()
             .map(|m| m.execute(partition, context.clone()))
             .transpose()?;
-        let mut should = self.should.execute(partition, context)?;
-
-        let Some(mut must) = must else {
-            // If there is no must clause, we can just return the should clause
-            return Ok(should);
-        };
+        let mut should = self.should.execute(partition, context.clone())?;
+        let mut must_not = self.must_not.execute(partition, context)?;
 
         let stream = stream::once(async move {
             let mut res = HashMap::new();
-            while let Some(batch) = must.try_next().await? {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
-                let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
-                res.extend(std::iter::zip(
-                    row_ids.iter().copied(),
-                    scores.iter().copied(),
-                ));
+            let has_must = must.is_some();
+            if let Some(mut must) = must {
+                while let Some(batch) = must.try_next().await? {
+                    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+                    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+                    res.extend(std::iter::zip(
+                        row_ids.iter().copied(),
+                        scores.iter().copied(),
+                    ));
+                }
             }
 
+            // add the scores from the should clause
             while let Some(batch) = should.try_next().await? {
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
                 let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+
                 for (row_id, score) in std::iter::zip(row_ids, scores) {
-                    if let Some(existing_score) = res.get_mut(row_id) {
-                        *existing_score += score;
+                    let entry = res.entry(*row_id).and_modify(|e| *e += score);
+                    if !has_must {
+                        entry.or_insert(*score);
                     }
                 }
             }
 
+            // remove the results from the must_not clause
+            while let Some(batch) = must_not.try_next().await? {
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+                for row_id in row_ids {
+                    res.remove(row_id);
+                }
+            }
+
+            // sort the results and take the top k
             let (row_ids, scores): (Vec<_>, Vec<_>) = res
                 .into_iter()
                 .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
