@@ -11,7 +11,7 @@ use arrow_buffer::{bit_util, BooleanBuffer, BooleanBufferBuilder, NullBuffer, Sc
 use bytemuck::{cast_slice, try_cast_slice};
 use byteorder::{ByteOrder, LittleEndian};
 use futures::TryFutureExt;
-use lance_core::utils::bit::{pad_bytes, pad_bytes_to};
+use lance_core::utils::bit::pad_bytes_to;
 use snafu::location;
 
 use futures::{future::BoxFuture, FutureExt};
@@ -532,7 +532,6 @@ impl ArrayEncoder for BinaryEncoder {
 pub struct BinaryMiniBlockEncoder {}
 
 const AIM_MINICHUNK_SIZE: u64 = 4 * 1024;
-const BINARY_MINIBLOCK_CHUNK_ALIGNMENT: usize = 4;
 
 // Make it to support both u32 and u64
 fn chunk_offsets<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
@@ -559,7 +558,6 @@ fn chunk_offsets<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
     let mut chunks_info = vec![];
     let mut chunks = vec![];
     let mut last_offset_in_orig_idx = 0;
-    const PAD_BYTE: u8 = 72;
     loop {
         let this_last_offset_in_orig_idx =
             search_next_offset_idx(offsets, offset_size, last_offset_in_orig_idx);
@@ -627,7 +625,7 @@ fn chunk_offsets<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
 
         // Compare with usize literal to avoid type mismatch with N
         if pad_len > 0_usize {
-            output.extend(std::iter::repeat(PAD_BYTE).take(pad_len));
+            output.extend(std::iter::repeat_n(PAD_BYTE, pad_len));
         }
     }
     (vec![LanceBuffer::reinterpret_vec(output)], chunks)
@@ -681,12 +679,10 @@ impl BinaryMiniBlockEncoder {
     ) -> (MiniBlockCompressed, crate::format::pb::ArrayEncoding) {
         // TODO: extend me to support 64 bits
         //assert!(data.bits_per_offset == 32);
-        println!("Entering chunk_data");
         match data.bits_per_offset {
             32 => {
                 let offsets = data.offsets.borrow_to_typed_slice::<u32>();
                 let (buffers, chunks) = chunk_offsets(offsets.as_ref(), 4, &data.data, 4);
-                println!("HAHAHA! Testing 32 bits");
                 (
                     MiniBlockCompressed {
                         data: buffers,
@@ -739,24 +735,52 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
         let data = data.into_iter().next().unwrap();
-        assert!(data.len() >= 8);
-        let offsets: &[u32] = try_cast_slice(&data)
-            .expect("casting buffer failed during BinaryMiniBlock decompression");
+        // Use the starting offset and num_values to detect 32 or 64 bits
+        let is_64bit = data.len() >= (num_values + 1) as usize * 8;
+        // DELETE ME
+        //println!("is_64bit? {}", is_64bit);
+        if is_64bit {
+            // offset and at least one value
+            assert!(data.len() >= 16);
 
-        let result_offsets = offsets[0..(num_values + 1) as usize]
-            .iter()
-            .map(|offset| offset - offsets[0])
-            .collect::<Vec<u32>>();
+            let offsets: &[u64] = try_cast_slice(&data)
+                .expect("casting buffer failed during BinaryMiniBlock decompression");
 
-        Ok(DataBlock::VariableWidth(VariableWidthBlock {
-            data: LanceBuffer::Owned(
-                data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
-            ),
-            offsets: LanceBuffer::reinterpret_vec(result_offsets),
-            bits_per_offset: 32,
-            num_values,
-            block_info: BlockInfo::new(),
-        }))
+            let result_offsets = offsets[0..(num_values + 1) as usize]
+                .iter()
+                .map(|offset| offset - offsets[0])
+                .collect::<Vec<u64>>();
+            Ok(DataBlock::VariableWidth(VariableWidthBlock {
+                data: LanceBuffer::Owned(
+                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
+                ),
+                offsets: LanceBuffer::reinterpret_vec(result_offsets),
+                bits_per_offset: 64,
+                num_values,
+                block_info: BlockInfo::new(),
+            }))
+        } else {
+            // offset and at least one value
+            assert!(data.len() >= 8);
+
+            let offsets: &[u32] = try_cast_slice(&data)
+                .expect("casting buffer failed during BinaryMiniBlock decompression");
+
+            let result_offsets = offsets[0..(num_values + 1) as usize]
+                .iter()
+                .map(|offset| offset - offsets[0])
+                .collect::<Vec<u32>>();
+
+            Ok(DataBlock::VariableWidth(VariableWidthBlock {
+                data: LanceBuffer::Owned(
+                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
+                ),
+                offsets: LanceBuffer::reinterpret_vec(result_offsets),
+                bits_per_offset: 32,
+                num_values,
+                block_info: BlockInfo::new(),
+            }))
+        }
     }
 }
 
@@ -978,8 +1002,8 @@ pub mod tests {
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_large_binary(
-        //#[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-        #[values(LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        //#[values(LanceFileVersion::V2_1)] version: LanceFileVersion,
     ) {
         let field = Field::new("", DataType::LargeBinary, true);
         check_round_trip_encoding_random(field, version).await;

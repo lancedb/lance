@@ -306,6 +306,58 @@ impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
 }
 
 #[derive(Debug)]
+pub struct LargeVariableWidthDataBlockBuilder {
+    offsets: Vec<u64>,
+    bytes: Vec<u8>,
+}
+
+impl LargeVariableWidthDataBlockBuilder {
+    fn new(estimated_size_bytes: u64) -> Self {
+        Self {
+            offsets: vec![0u64],
+            bytes: Vec::with_capacity(estimated_size_bytes as usize),
+        }
+    }
+}
+
+impl DataBlockBuilderImpl for LargeVariableWidthDataBlockBuilder {
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+        let block = data_block.as_variable_width_ref().unwrap();
+        assert!(block.bits_per_offset == 64);
+        let offsets: &[u64] = try_cast_slice(&block.offsets)
+            .expect("cast from a bits_per_offset=64 `VariableWidthDataBlock's offsets field field to &[64] should be fine.");
+
+        let start_offset = offsets[selection.start as usize];
+        let end_offset = offsets[selection.end as usize];
+        let mut previous_len = self.bytes.len();
+
+        self.bytes
+            .extend_from_slice(&block.data[start_offset as usize..end_offset as usize]);
+
+        self.offsets.extend(
+            offsets[selection.start as usize..selection.end as usize]
+                .iter()
+                .zip(&offsets[selection.start as usize + 1..=selection.end as usize])
+                .map(|(&current, &next)| {
+                    let this_value_len = next - current;
+                    previous_len += this_value_len as usize;
+                    previous_len as u64
+                }),
+        );
+    }
+    fn finish(self: Box<Self>) -> DataBlock {
+        let num_values = (self.offsets.len() - 1) as u64;
+        DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::Owned(self.bytes),
+            offsets: LanceBuffer::reinterpret_vec(self.offsets),
+            bits_per_offset: 64,
+            num_values,
+            block_info: BlockInfo::new(),
+        })
+    }
+}
+
+#[derive(Debug)]
 struct BitmapDataBlockBuilder {
     values: BooleanBufferBuilder,
 }
@@ -1086,6 +1138,10 @@ impl DataBlock {
             Self::VariableWidth(inner) => {
                 if inner.bits_per_offset == 32 {
                     Box::new(VariableWidthDataBlockBuilder::new(estimated_size_bytes))
+                } else if inner.bits_per_offset == 64 {
+                    Box::new(LargeVariableWidthDataBlockBuilder::new(
+                        estimated_size_bytes,
+                    ))
                 } else {
                     todo!()
                 }
