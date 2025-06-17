@@ -352,7 +352,7 @@ impl VectorIndex for PQIndex {
         let (primitive_row_ids, transposed_pq_codes) = if let Some(fri_ref) = self.fri.as_ref() {
             let num_vectors = row_ids.len();
             let row_ids = row_ids.as_primitive::<UInt64Type>().values().iter();
-            let remapped = row_ids
+            let (remapped_row_ids, remapped_pq_codes): (Vec<u64>, Vec<Vec<u8>>) = row_ids
                 .enumerate()
                 .filter_map(|(vec_idx, old_row_id)| {
                     let new_row_id = fri_ref.remap_row_id(*old_row_id);
@@ -363,19 +363,16 @@ impl VectorIndex for PQIndex {
                         )
                     })
                 })
-                .collect::<Vec<_>>();
-
-            let primitive_row_ids =
-                UInt64Array::from_iter_values(remapped.iter().map(|(row_id, _)| *row_id));
-
-            let transposed_pq_codes =
-                UInt8Array::from_iter_values(remapped.into_iter().flat_map(|(_, code)| code));
+                .unzip();
             let transposed_codes = transpose(
-                &transposed_pq_codes,
-                primitive_row_ids.len(),
+                &UInt8Array::from_iter_values(remapped_pq_codes.into_iter().flatten()),
+                remapped_row_ids.len(),
                 self.pq.num_sub_vectors,
             );
-            (Arc::new(primitive_row_ids), Arc::new(transposed_codes))
+            (
+                Arc::new(UInt64Array::from_iter_values(remapped_row_ids)),
+                Arc::new(transposed_codes),
+            )
         } else {
             (Arc::new(row_ids.as_primitive().clone()), Arc::new(pq_codes))
         };

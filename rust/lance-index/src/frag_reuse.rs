@@ -271,13 +271,13 @@ impl FragReuseIndex {
         let new_val_indices = UInt64Array::from_iter_values(val_indices);
         let new_vals =
             arrow_select::take::take(batch.column(other_column_idx), &new_val_indices, None)?;
-        
+
         let mut batch_data: Vec<(usize, ArrayRef)> = vec![
             (
                 row_id_idx,
                 Arc::new(UInt64Array::from_iter_values(new_row_ids)) as ArrayRef,
             ),
-            (other_column_idx, Arc::new(new_vals))
+            (other_column_idx, Arc::new(new_vals)),
         ];
         batch_data.sort_by_key(|(i, _)| *i);
         Ok(RecordBatch::try_new(
