@@ -213,6 +213,7 @@ impl InvertedIndex {
     }
 
     async fn load_legacy_index(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
+        log::warn!("loading legacy FTS index");
         let tokens_fut = tokio::spawn({
             let store = store.clone();
             async move {
@@ -1292,6 +1293,20 @@ impl DeepSizeOf for CompressedPostingList {
 }
 
 impl CompressedPostingList {
+    pub fn new(
+        blocks: LargeBinaryArray,
+        max_score: f32,
+        length: u32,
+        positions: Option<ListArray>,
+    ) -> Self {
+        Self {
+            max_score,
+            length,
+            blocks,
+            positions,
+        }
+    }
+
     pub fn from_batch(batch: &RecordBatch, max_score: f32, length: u32) -> Self {
         debug_assert_eq!(batch.num_rows(), 1);
         let blocks = batch[POSTING_COL]
@@ -1893,6 +1908,7 @@ pub fn flat_bm25_search_stream(
     query: String,
     index: &InvertedIndex,
 ) -> SendableRecordBatchStream {
+    log::debug!("doing flat bm25 search stream");
     let mut tokenizer = index.tokenizer.clone();
     let tokens = collect_tokens(&query, &mut tokenizer, None)
         .into_iter()
@@ -1908,6 +1924,7 @@ pub fn flat_bm25_search_stream(
         nq.insert(token.clone(), token_nq);
     }
     let stream = input.map(move |batch| {
+        log::debug!("doing flat bm25 search batch");
         let batch = batch?;
         let batch = flat_bm25_search(
             batch,
@@ -1930,7 +1947,12 @@ pub fn flat_bm25_search_stream(
         Ok(batch)
     });
 
-    Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
+    Box::pin(RecordBatchStreamAdapter::new(
+        FTS_SCHEMA.clone(),
+        stream.inspect(|_| {
+            log::debug!("done flat bm25 search batch");
+        }),
+    )) as SendableRecordBatchStream
 }
 
 pub fn is_phrase_query(query: &str) -> bool {

@@ -227,6 +227,7 @@ impl ExecutionPlan for MatchQueryExec {
             };
             let tokens = collect_tokens(&query.terms, &mut tokenizer, None);
 
+            log::debug!("doing bm25 search");
             pre_filter.wait_for_ready().await?;
             let (doc_ids, mut scores) = inverted_idx
                 .bm25_search(
@@ -238,6 +239,7 @@ impl ExecutionPlan for MatchQueryExec {
                 )
                 .boxed()
                 .await?;
+            log::debug!("done bm25 search");
             scores.iter_mut().for_each(|s| {
                 *s *= query.boost;
             });
