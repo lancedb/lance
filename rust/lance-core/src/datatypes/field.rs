@@ -966,7 +966,6 @@ impl TryFrom<&ArrowField> for Field {
             .get(LANCE_UNENFORCED_PRIMARY_KEY)
             .map(|s| match s.to_lowercase().as_str() {
                 "true" | "1" | "yes" => true,
-                "false" | "0" | "no" => false,
                 _ => false,
             })
             .unwrap_or(false);
