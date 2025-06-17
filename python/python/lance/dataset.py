@@ -3836,6 +3836,34 @@ class DatasetOptimizer:
         """
         self._dataset._ds.optimize_indices(**kwargs)
 
+    def enable_autocleanup(self, auto_cleanup_config: AutoCleanupConfig, **kwargs):
+        """Enable autocleaning for an exists dataset.
+
+        Parameters
+        ----------
+        auto_cleanup_config: AutoCleanupConfig
+            Config options for automatic cleanup of the dataset.
+            If set, dataset's old versions will be automatically
+            cleaned up according to this parameter.
+        """
+        self._dataset._ds.update_config(
+            upsert_values= {
+                "lance.auto_cleanup.interval": auto_cleanup_config.interval,
+                "lance.auto_cleanup.older_than": auto_cleanup_config.older_than_seconds,
+            }
+        )
+
+    def disable_autocleanup(self, **kwargs):
+        """
+
+        :param kwargs:
+        :return:
+        """
+        self._dataset._ds.delete_config_keys([
+            "lance.auto_cleanup.interval",
+            "lance.auto_cleanup.older_than"
+        ])
+
 
 class Tags:
     """
