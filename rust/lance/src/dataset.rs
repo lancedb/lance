@@ -850,6 +850,11 @@ impl Dataset {
         Ok(())
     }
 
+    /// Get the table config from manifest
+    pub fn config(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.manifest.config.iter()
+    }
+
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(Arc::new(self.clone()))
