@@ -365,15 +365,9 @@ mod tests {
         #[derive(Debug, DeepSizeOf)]
         struct MyType(i32);
 
-        trait MyTrait: DeepSizeOf + Send + Sync + Any {
-            fn as_any(&self) -> &dyn Any;
-        }
+        trait MyTrait: DeepSizeOf + Send + Sync + Any {}
 
-        impl MyTrait for MyType {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
+        impl MyTrait for MyType {}
 
         let cache = LanceCache::with_capacity(1000);
 
