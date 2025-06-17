@@ -40,13 +40,13 @@ impl Action {
 pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
     let source_has_key: Expr = datafusion_expr::lit(true); // TODO: Make sure at least one key column is non-null
 
-    let row_id_is_not_null = col("target._rowid").is_not_null();
-    let matched = source_has_key.clone().and(row_id_is_not_null);
+    let row_addr_is_not_null = col("target._rowaddr").is_not_null();
+    let matched = source_has_key.clone().and(row_addr_is_not_null);
 
-    let row_id_is_null = col("target._rowid").is_null();
-    let not_matched_in_target = source_has_key.and(row_id_is_null);
+    let row_addr_is_null = col("target._rowaddr").is_null();
+    let not_matched_in_target = source_has_key.and(row_addr_is_null);
 
-    let not_matched_in_source = col("target._rowid").is_null().is_not_true();
+    let not_matched_in_source = col("target._rowaddr").is_null().is_not_true();
 
     let mut cases = vec![];
 

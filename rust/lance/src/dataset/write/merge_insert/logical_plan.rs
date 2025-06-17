@@ -33,7 +33,7 @@ use super::MergeInsertParams;
 ///
 /// The output of this node is a single row containing statistics about the operation.
 #[derive(Debug)]
-struct MergeInsertWriteNode {
+pub struct MergeInsertWriteNode {
     input: LogicalPlan,
     pub(crate) dataset: Arc<Dataset>,
     pub(crate) params: MergeInsertParams,
@@ -68,7 +68,7 @@ impl PartialOrd for MergeInsertWriteNode {
 }
 
 impl MergeInsertWriteNode {
-    fn new(
+    pub fn new(
         input: LogicalPlan,
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
@@ -161,7 +161,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
 }
 
 /// Physical planner for MergeInsertWriteNode.
-struct MergeInsertPlanner {}
+pub struct MergeInsertPlanner {}
 
 #[async_trait]
 impl ExtensionPlanner for MergeInsertPlanner {

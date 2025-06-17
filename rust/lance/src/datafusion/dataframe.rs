@@ -28,10 +28,15 @@ pub struct LanceTableProvider {
     full_schema: Arc<Schema>,
     row_id_idx: Option<usize>,
     row_addr_idx: Option<usize>,
+    ordered: bool,
 }
 
 impl LanceTableProvider {
     pub fn new(dataset: Arc<Dataset>, with_row_id: bool, with_row_addr: bool) -> Self {
+        Self::new_with_ordering(dataset, with_row_id, with_row_addr, true)
+    }
+
+    pub fn new_with_ordering(dataset: Arc<Dataset>, with_row_id: bool, with_row_addr: bool, ordered: bool) -> Self {
         let mut full_schema = Schema::from(dataset.schema());
         let mut row_id_idx = None;
         let mut row_addr_idx = None;
@@ -48,6 +53,7 @@ impl LanceTableProvider {
             full_schema: Arc::new(full_schema),
             row_id_idx,
             row_addr_idx,
+            ordered,
         }
     }
 }
@@ -104,6 +110,7 @@ impl TableProvider for LanceTableProvider {
             scan.filter_expr(combined_filter);
         }
         scan.limit(limit.map(|l| l as i64), None)?;
+        scan.scan_in_order(self.ordered);
 
         scan.create_plan().await.map_err(DataFusionError::from)
     }
@@ -125,6 +132,13 @@ impl TableProvider for LanceTableProvider {
 pub trait SessionContextExt {
     /// Creates a DataFrame for reading a Lance dataset
     fn read_lance(
+        &self,
+        dataset: Arc<Dataset>,
+        with_row_id: bool,
+        with_row_addr: bool,
+    ) -> datafusion::common::Result<DataFrame>;
+    /// Creates a DataFrame for reading a Lance dataset without ordering
+    fn read_lance_unordered(
         &self,
         dataset: Arc<Dataset>,
         with_row_id: bool,
@@ -186,6 +200,20 @@ impl SessionContextExt for SessionContext {
             dataset,
             with_row_id,
             with_row_addr,
+        )))
+    }
+
+    fn read_lance_unordered(
+        &self,
+        dataset: Arc<Dataset>,
+        with_row_id: bool,
+        with_row_addr: bool,
+    ) -> datafusion::common::Result<DataFrame> {
+        self.read_table(Arc::new(LanceTableProvider::new_with_ordering(
+            dataset,
+            with_row_id,
+            with_row_addr,
+            false,
         )))
     }
 

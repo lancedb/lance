@@ -84,7 +84,35 @@ impl DisplayAs for FullSchemaMergeInsertExec {
         t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "FullSchemaMergeInsertExec")
+        match t {
+            datafusion::physical_plan::DisplayFormatType::Default | datafusion::physical_plan::DisplayFormatType::Verbose => {
+                let on_keys = self.params.on.join(", ");
+                let when_matched = match &self.params.when_matched {
+                    crate::dataset::WhenMatched::DoNothing => "DoNothing",
+                    crate::dataset::WhenMatched::UpdateAll => "UpdateAll", 
+                    crate::dataset::WhenMatched::UpdateIf(_) => "UpdateIf",
+                };
+                let when_not_matched = if self.params.insert_not_matched {
+                    "InsertAll"
+                } else {
+                    "DoNothing"
+                };
+                let when_not_matched_by_source = match &self.params.delete_not_matched_by_source {
+                    crate::dataset::WhenNotMatchedBySource::Keep => "Keep",
+                    crate::dataset::WhenNotMatchedBySource::Delete => "Delete",
+                    crate::dataset::WhenNotMatchedBySource::DeleteIf(_) => "DeleteIf",
+                };
+                
+                write!(
+                    f,
+                    "MergeInsert: on=[{}], when_matched={}, when_not_matched={}, when_not_matched_by_source={}",
+                    on_keys,
+                    when_matched,
+                    when_not_matched,
+                    when_not_matched_by_source
+                )
+            }
+        }
     }
 }
 

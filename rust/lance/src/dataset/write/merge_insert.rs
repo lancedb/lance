@@ -35,18 +35,14 @@ use datafusion::{
     execution::{
         context::{SessionConfig, SessionContext},
         memory_pool::MemoryConsumer,
-    },
-    logical_expr::{self, Expr, JoinConstraint, JoinType},
-    physical_plan::{
+    }, logical_expr::{self, Expr, Extension, JoinType, LogicalPlan}, physical_plan::{
         joins::{HashJoinExec, PartitionMode},
         projection::ProjectionExec,
         repartition::RepartitionExec,
         stream::RecordBatchStreamAdapter,
         union::UnionExec,
         ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
-    },
-    prelude::DataFrame,
-    scalar::ScalarValue,
+    }, physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner}, prelude::DataFrame, scalar::ScalarValue
 };
 
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
@@ -83,17 +79,13 @@ use snafu::{location, ResultExt};
 use tokio::task::JoinSet;
 
 use crate::{
-    datafusion::dataframe::SessionContextExt,
-    dataset::{
+    datafusion::dataframe::SessionContextExt, dataset::{
         fragment::{FileFragment, FragReadConfig},
         transaction::{Operation, Transaction},
-        write::open_writer,
-    },
-    index::DatasetIndexInternalExt,
-    io::exec::{
+        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
+    }, index::DatasetIndexInternalExt, io::exec::{
         project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner, TakeExec,
-    },
-    Dataset,
+    }, session, Dataset
 };
 
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
@@ -1316,7 +1308,7 @@ impl MergeInsertJob {
         let session_config = SessionConfig::default();
         let session_ctx = SessionContext::new_with_config(session_config);
         // todo!("register planning rules to session ctx");
-        let scan = session_ctx.read_lance(self.dataset.clone(), true, true)?;
+        let scan = session_ctx.read_lance_unordered(self.dataset.clone(), false, true)?;
         let on_cols = self
             .params
             .on
@@ -1327,27 +1319,31 @@ impl MergeInsertJob {
         // For now, let's create a simple join and handle duplicates
         let source_df_aliased = source_df.alias("source")?;
         let scan_aliased = scan.alias("target")?;
-        let df = source_df_aliased
-            .join(scan_aliased, JoinType::Left, &on_cols, &on_cols, None)?
+        let df = scan_aliased
+            .join(source_df_aliased, JoinType::Right, &on_cols, &on_cols, None)?
             .with_column("action", merge_insert_action(&self.params)?)?;
         dbg!(df.schema());
-        // TODO: apply the write node at the end
         
         let (session_state, logical_plan) = df.into_parts();
 
+        let write_node = logical_plan::MergeInsertWriteNode::new(
+            logical_plan,
+            self.dataset.clone(),
+            self.params.clone(),
+        );
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(write_node),
+        });
+
         let logical_plan = session_state.optimize(&logical_plan)?;
 
-        // TODO: we need to register a planner that can take a logical write and make it a FullSchemaMergeInsertExec
-        let mut physical_plan = session_state.create_physical_plan(&logical_plan).await?;
-
-        // Do multiple passes (Maybe datafusion has a method for this, not sure?)
-        let optimizers = session_state.physical_optimizers();
-        for _ in 0..3 {
-            for optimizer in optimizers {
-                physical_plan =
-                    optimizer.optimize(physical_plan, session_state.config_options())?;
-            }
-        }
+        let planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
+            MergeInsertPlanner {},
+        )]);
+        // This method already does the optimization for us.
+        let physical_plan = planner
+            .create_physical_plan(&logical_plan, &session_state)
+            .await?;
 
         Ok(physical_plan)
     }
@@ -1887,6 +1883,8 @@ mod tests {
         session::Session,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper},
     };
+    
+    use crate::dataset::scanner::tests::assert_plan_node_equals;
 
     use super::*;
 
@@ -3089,15 +3087,26 @@ mod tests {
 
         let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
 
-        // Print the plan using DisplayableExecutionPlan
-        use datafusion::physical_plan::displayable;
-        let display = displayable(plan.as_ref());
-        let plan_str = format!("{}", display.indent(false));
-
-        // Assert the plan structure - should contain HashJoin, Projection, and MergeInsertWrite
-        assert!(plan_str.contains("HashJoinExec"));
-        assert!(plan_str.contains("ProjectionExec"));
-        // The exact plan string can vary, so we check for key components
-        println!("Plan:\n{}", plan_str);
+        // Assert the plan structure using portable plan matching
+        // The optimized plan should have:
+        // 1. FullSchemaMergeInsertExec at the top
+        // 2. ProjectionExec that only selects necessary columns (source.value, source.key, target._rowaddr, action)
+        // 3. HashJoin with projection optimization
+        // 4. LanceScan that only reads the key column (projection pushdown working!)
+        assert_plan_node_equals(
+            plan,
+            "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
+  ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN _rowaddr@0 IS NULL THEN 2 WHEN _rowaddr@0 IS NOT NULL THEN 1 ELSE 0 END as action]
+    CoalesceBatchesExec...
+      HashJoinExec: mode=Partitioned, join_type=Right, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
+        CoalesceBatchesExec...
+          RepartitionExec...
+            RepartitionExec...
+              LanceScan: uri=data, projection=[key], row_id=false, row_addr=true, ordered=false
+        CoalesceBatchesExec...
+          RepartitionExec...
+            RepartitionExec...
+              StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        ).await.unwrap();
     }
 }

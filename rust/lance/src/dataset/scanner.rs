@@ -3126,7 +3126,7 @@ pub mod test_dataset {
 }
 
 #[cfg(test)]
-mod test {
+pub mod tests {
 
     use std::collections::BTreeSet;
     use std::sync::Mutex;
@@ -5137,7 +5137,7 @@ mod test {
         assert_eq!(batches.len(), 1000_usize.div_ceil(16));
     }
 
-    async fn assert_plan_node_equals(
+    pub(crate) async fn assert_plan_node_equals(
         plan_node: Arc<dyn ExecutionPlan>,
         expected: &str,
     ) -> Result<()> {
