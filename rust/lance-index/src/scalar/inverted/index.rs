@@ -1908,7 +1908,6 @@ pub fn flat_bm25_search_stream(
     query: String,
     index: &InvertedIndex,
 ) -> SendableRecordBatchStream {
-    log::debug!("doing flat bm25 search stream");
     let mut tokenizer = index.tokenizer.clone();
     let tokens = collect_tokens(&query, &mut tokenizer, None)
         .into_iter()
@@ -1924,7 +1923,6 @@ pub fn flat_bm25_search_stream(
         nq.insert(token.clone(), token_nq);
     }
     let stream = input.map(move |batch| {
-        log::debug!("doing flat bm25 search batch");
         let batch = batch?;
         let batch = flat_bm25_search(
             batch,
@@ -1947,12 +1945,7 @@ pub fn flat_bm25_search_stream(
         Ok(batch)
     });
 
-    Box::pin(RecordBatchStreamAdapter::new(
-        FTS_SCHEMA.clone(),
-        stream.inspect(|_| {
-            log::debug!("done flat bm25 search batch");
-        }),
-    )) as SendableRecordBatchStream
+    Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
 }
 
 pub fn is_phrase_query(query: &str) -> bool {
