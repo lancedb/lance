@@ -60,7 +60,7 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
-    /// The primary key fields in the schema
+    /// The unenforced primary key fields in the schema
     pub fn unenforced_primary_key(&self) -> Vec<&Field> {
         self.fields_pre_order()
             .filter(|f| f.unenforced_primary_key)
@@ -1889,19 +1889,16 @@ mod tests {
             )]),
             ArrowSchema::new(vec![ArrowField::new(
                 "b",
-                DataType::List(Arc::new(ArrowField::new(
-                    "f1",
-                    DataType::Utf8,
-                    false,
-                )
-                    .with_metadata(
+                DataType::List(Arc::new(
+                    ArrowField::new("f1", DataType::Utf8, false).with_metadata(
                         vec![(
                             "lance-schema:unenforced-primary-key".to_owned(),
                             "true".to_owned(),
                         )]
-                            .into_iter()
-                            .collect::<HashMap<_, _>>(),
-                    ))),
+                        .into_iter()
+                        .collect::<HashMap<_, _>>(),
+                    ),
+                )),
                 false,
             )]),
         ];
@@ -1909,7 +1906,7 @@ mod tests {
             "Primary key column and all its ancestors must not be nullable",
             "Primary key column must be a leaf",
             "Primary key column and all its ancestors must not be nullable",
-            "Primary key column must not be in a list type"
+            "Primary key column must not be in a list type",
         ];
 
         for (idx, case) in cases.into_iter().enumerate() {
