@@ -973,7 +973,7 @@ mod tests {
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
-    use arrow_array::types::{Float32Type, Int32Type};
+    use arrow_array::types::{Float32Type, Int32Type, Int64Type};
     use arrow_array::{
         Float32Array, Int64Array, LargeStringArray, PrimitiveArray, RecordBatch,
         RecordBatchIterator,
@@ -2731,6 +2731,11 @@ mod tests {
             )
             .await
             .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let original_index = indices
+            .iter()
+            .find(|idx| idx.name == "category_idx")
+            .unwrap();
 
         // Run compaction with deferred index remapping
         let options = CompactionOptions {
@@ -2747,11 +2752,6 @@ mod tests {
         let Some(current_index) = dataset.load_index_by_name("category_idx").await.unwrap() else {
             panic!("category index must be available");
         };
-        let indices = dataset.load_indices().await.unwrap();
-        let original_index = indices
-            .iter()
-            .find(|idx| idx.name == "category_idx")
-            .unwrap();
         assert_eq!(current_index.uuid, original_index.uuid);
 
         // Verify that scans still work correctly and return the same counts
@@ -2824,6 +2824,8 @@ mod tests {
             )
             .await
             .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let original_index = indices.iter().find(|idx| idx.name == "id_idx").unwrap();
 
         // Run compaction with deferred index remapping
         let options = CompactionOptions {
@@ -2840,8 +2842,6 @@ mod tests {
         let Some(current_index) = dataset.load_index_by_name("id_idx").await.unwrap() else {
             panic!("id index must be available");
         };
-        let indices = dataset.load_indices().await.unwrap();
-        let original_index = indices.iter().find(|idx| idx.name == "id_idx").unwrap();
         assert_eq!(current_index.uuid, original_index.uuid);
 
         // Verify that scans still work correctly and return the same counts
@@ -2924,6 +2924,8 @@ mod tests {
             )
             .await
             .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let original_index = indices.iter().find(|idx| idx.name == "doc_idx").unwrap();
 
         // Run compaction with deferred index remapping
         let options = CompactionOptions {
@@ -2940,8 +2942,6 @@ mod tests {
         let Some(current_index) = dataset.load_index_by_name("doc_idx").await.unwrap() else {
             panic!("doc index must be available");
         };
-        let indices = dataset.load_indices().await.unwrap();
-        let original_index = indices.iter().find(|idx| idx.name == "doc_idx").unwrap();
         assert_eq!(current_index.uuid, original_index.uuid);
 
         // Initial scan
@@ -3064,6 +3064,8 @@ mod tests {
             )
             .await
             .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let original_index = indices.iter().find(|idx| idx.name == "doc_idx").unwrap();
 
         // Initial scan
         let mut scanner = dataset.scan();
@@ -3100,8 +3102,6 @@ mod tests {
         let Some(current_index) = dataset.load_index_by_name("doc_idx").await.unwrap() else {
             panic!("doc index must be available");
         };
-        let indices = dataset.load_indices().await.unwrap();
-        let original_index = indices.iter().find(|idx| idx.name == "doc_idx").unwrap();
         assert_eq!(current_index.uuid, original_index.uuid);
 
         // Verify that scans still work correctly and return the same counts
@@ -3134,6 +3134,100 @@ mod tests {
         assert!(
             plan.contains("MaterializeIndex"),
             "Expected inverted index scan in plan: {}",
+            plan
+        );
+        assert!(
+            !plan.contains("LanceScan"),
+            "Expected no fragment scan in plan: {}",
+            plan
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_label_list_index_with_defer_index_remap() {
+        // Create a dataset with list data for labels
+        let mut dataset = lance_datagen::gen()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col(
+                "labels",
+                lance_datagen::array::rand_list_any(
+                    lance_datagen::array::cycle::<Int64Type>(vec![1, 2, 3, 4, 5]),
+                    false,
+                ),
+            )
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        // Get initial counts for different label values
+        let mut scanner = dataset.scan();
+        scanner.filter("array_has_any(labels, [1])").unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        let count1 = scanner.count_rows().await.unwrap();
+        scanner = dataset.scan();
+        scanner.filter("array_has_any(labels, [5])").unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        let count2 = scanner.count_rows().await.unwrap();
+        scanner = dataset.scan();
+        scanner.filter("array_has_any(labels, [10])").unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        let count3 = scanner.count_rows().await.unwrap();
+
+        // Create a label list index on the labels column
+        let index_name = Some("labels_idx".into());
+        dataset
+            .create_index(
+                &["labels"],
+                IndexType::LabelList,
+                index_name.clone(),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let original_index = indices.iter().find(|idx| idx.name == "labels_idx").unwrap();
+
+        // Run compaction with deferred index remapping
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert!(metrics.fragments_added > 0);
+
+        // Verify that the index UUID remains unchanged
+        let indices = dataset.load_indices().await.unwrap();
+        let current_index = indices.iter().find(|idx| idx.name == "labels_idx").unwrap();
+        assert_eq!(current_index.uuid, original_index.uuid);
+
+        // Verify that scans still work correctly and return the same counts
+        let mut scanner = dataset.scan();
+        scanner.filter("array_has_any(labels, [1])").unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        assert_eq!(scanner.count_rows().await.unwrap(), count1);
+        scanner = dataset.scan();
+        scanner.filter("array_has_any(labels, [5])").unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        assert_eq!(scanner.count_rows().await.unwrap(), count2);
+        scanner = dataset.scan();
+        scanner.filter("array_has_any(labels, [10])").unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        assert_eq!(scanner.count_rows().await.unwrap(), count3);
+
+        // Verify that after index creation and compaction, scan uses label list index scan
+        let mut scanner = dataset.scan();
+        scanner.filter("array_has_any(labels, [1])").unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("MaterializeIndex"),
+            "Expected label list index scan in plan: {}",
             plan
         );
         assert!(
@@ -3228,6 +3322,8 @@ mod tests {
             )
             .await
             .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let original_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
 
         // Run compaction with deferred index remapping
         let options = CompactionOptions {
@@ -3244,8 +3340,6 @@ mod tests {
         let Some(current_index) = dataset.load_index_by_name("vec_idx").await.unwrap() else {
             panic!("vec index must be available");
         };
-        let indices = dataset.load_indices().await.unwrap();
-        let original_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
         assert_eq!(current_index.uuid, original_index.uuid);
 
         // Verify that KNN searches still work correctly and return the same counts
