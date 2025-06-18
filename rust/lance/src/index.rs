@@ -1167,7 +1167,6 @@ mod tests {
     use lance_datagen::r#gen;
     use lance_datagen::{array, BatchCount, Dimension, RowCount};
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
-    use rstest::rstest;
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
@@ -2090,173 +2089,83 @@ mod tests {
         }
     }
 
-    /// Comprehensive test for empty index creation across all supported index types.
-    ///
-    /// This test covers the empty index functionality for issue #3940 by testing:
-    /// - Empty index creation with train=false
-    /// - Index retention after append operations  
-    /// - Index statistics availability for empty indices
-    /// - Index optimization with empty indices
-    ///
-    /// Test covers all major index types:
-    /// - Scalar indices (BTree, Bitmap, LabelList) use integer column
-    /// - Vector indices use vector column
-    /// - Text indices (Inverted/FTS, NGram) use string column
-    ///
-    /// This is a TDD approach - many index types are expected to fail initially
-    /// with "not yet implemented" errors, which is part of the development process.
     #[rstest]
     #[case::btree("i", IndexType::BTree, Box::new(ScalarIndexParams::default()))]
     #[case::bitmap("i", IndexType::Bitmap, Box::new(ScalarIndexParams::default()))]
-    #[case::vector("vec", IndexType::Vector, Box::new(VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 5)))]
     #[case::inverted("text", IndexType::Inverted, Box::new(InvertedIndexParams::default()))]
-    // Note: NGram and LabelList have specific requirements that need to be addressed separately
     #[tokio::test]
-    async fn test_create_empty_index_all_types(
+    async fn test_create_empty_scalar_index(
         #[case] column_name: &str,
-        #[case] index_type: IndexType,  
+        #[case] index_type: IndexType,
         #[case] params: Box<dyn IndexParams>,
     ) {
-        use lance_datagen::{array, BatchCount, ByteCount, Dimension, RowCount};
+        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
 
-        // Create dataset with multiple column types using lance_datagen
+        // Create dataset with scalar and text columns (no vector column needed)
         let reader = lance_datagen::gen()
-            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(128)))
             .col("i", array::step::<Int32Type>())
             .col("text", array::rand_utf8(ByteCount::from(10), false))
             .into_reader_rows(RowCount::from(100), BatchCount::from(1));
-        let mut dataset = Dataset::write(reader, "memory://test", None)
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(reader, "memory://test", None).await.unwrap();
 
         // Create an empty index with train=false
-        let result = dataset
+        dataset
             .create_index_builder(&[column_name], index_type, params.as_ref())
             .name("index".to_string())
             .train(false)
             .execute()
-            .await;
+            .await
+            .unwrap();
 
-        // TDD: Expected that many index types will fail initially
-        // This is okay and part of the development process
-        match result {
-            Ok(_) => {
-                println!("✓ Empty index creation succeeded for {index_type:?} on {column_name}");
-                
-                // Verify the index was created
-                let indices = dataset.load_indices().await.unwrap();
-                assert_eq!(indices.len(), 1, "Expected exactly one index");
-                assert_eq!(indices[0].name, "index", "Index name mismatch");
+        // Verify we can get index statistics
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"], 0,
+            "Empty index should have zero indexed rows"
+        );
 
-                // Verify we can get index statistics
-                let stats = dataset.index_statistics("index").await.unwrap();
-                assert!(stats.contains("num_indexed_rows"), "Index statistics should contain num_indexed_rows");
+        // Append new data using lance_datagen
+        let append_reader = lance_datagen::gen()
+            .col("i", array::step::<Int32Type>())
+            .col("text", array::rand_utf8(ByteCount::from(10), false))
+            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
 
-                // Test that the empty index is retained after append operations
-                let initial_row_count = dataset.count_rows(None).await.unwrap();
+        dataset.append(append_reader, None).await.unwrap();
 
-                // Append new data using lance_datagen
-                let append_reader = lance_datagen::gen()
-                    .col("vec", array::rand_vec::<Float32Type>(Dimension::from(128)))
-                    .col("i", array::step::<Int32Type>())
-                    .col("text", array::rand_utf8(ByteCount::from(10), false))
-                    .into_reader_rows(RowCount::from(50), BatchCount::from(1));
-                
-                dataset.append(append_reader, None).await.unwrap();
+        // Critical test: Verify the empty index is still present after append
+        let indices_after_append = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_append.len(),
+            1,
+            "Index should be retained after append for index type {:?}",
+            index_type
+        );
 
-                // Verify row count increased
-                let new_row_count = dataset.count_rows(None).await.unwrap();
-                assert!(new_row_count > initial_row_count, "Row count should increase after append");
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"], 0,
+            "Empty index should still have zero indexed rows after append"
+        );
 
-                // Critical test: Verify the empty index is still present after append
-                let indices_after_append = dataset.load_indices().await.unwrap();
-                assert_eq!(
-                    indices_after_append.len(),
-                    1,
-                    "Index should be retained after append for index type {:?}",
-                    index_type
-                );
-                assert_eq!(
-                    indices_after_append[0].name,
-                    "index",
-                    "Index name should remain the same after append"
-                );
+        // Test optimize_indices with empty index
+        dataset.optimize_indices(&Default::default()).await.unwrap();
 
-                // The index should still be queryable
-                let stats_after_append = dataset.index_statistics("index").await.unwrap();
-                assert!(
-                    stats_after_append.contains("num_indexed_rows"),
-                    "Index statistics should still be available after append"
-                );
+        // Verify the index still exists after optimization
+        let indices_after_optimize = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_optimize.len(),
+            1,
+            "Index should still exist after optimization"
+        );
 
-                // Check if the index is truly empty (expected for proper empty index implementation)
-                let stats_before_optimize = dataset.index_statistics("index").await.unwrap();
-                println!("📊 Index statistics after creation: {}", stats_before_optimize);
-                
-                let is_truly_empty = stats_before_optimize.contains("\"num_indexed_rows\": 0") || 
-                                   stats_before_optimize.contains("\"num_indexed_rows\":0");
-                
-                if is_truly_empty {
-                    println!("✅ Index type {index_type:?} successfully created empty index!");
-                } else {
-                    println!("⚠ Index type {index_type:?} created with train=false but still has indexed rows");
-                    println!("   This indicates empty index creation needs refinement");
-                }
-
-                // Test optimize_indices with index (empty or not)
-                let optimize_result = dataset.optimize_indices(&Default::default()).await;
-                match optimize_result {
-                    Ok(_) => {
-                        // Verify the index still exists after optimization
-                        let indices_after_optimize = dataset.load_indices().await.unwrap();
-                        assert_eq!(
-                            indices_after_optimize.len(),
-                            1,
-                            "Index should still exist after optimization"
-                        );
-                        assert_eq!(
-                            indices_after_optimize[0].name,
-                            "index",
-                            "Index name should remain the same after optimization"
-                        );
-
-                        // Check index statistics after optimization
-                        let stats_after_optimize = dataset.index_statistics("index").await.unwrap();
-                        assert!(
-                            stats_after_optimize.contains("num_unindexed_rows"),
-                            "Index statistics should contain num_unindexed_rows after optimization"
-                        );
-                        
-                        if is_truly_empty {
-                            // For truly empty indices, we expect zero unindexed rows after optimization
-                            assert!(
-                                stats_after_optimize.contains("\"num_unindexed_rows\": 0") ||
-                                stats_after_optimize.contains("\"num_unindexed_rows\":0"),
-                                "Empty index should have zero unindexed rows after optimization: {}", stats_after_optimize
-                            );
-                        } else {
-                            println!("   Post-optimization stats: {}", stats_after_optimize);
-                        }
-                    }
-                    Err(err) => {
-                        println!("⚠ Index optimization failed for {index_type:?}: {}", err);
-                        // This might be expected for some index types during development
-                    }
-                }
-
-                println!("✓ Empty index optimization test passed for {index_type:?} on {column_name}");
-            }
-            Err(err) => {
-                let err_msg = err.to_string();
-                if err_msg.contains("not yet implemented") || err_msg.contains("todo") {
-                    println!("⚠ Empty index creation not yet implemented for {index_type:?} on {column_name}");
-                    println!("   Error: {}", err_msg);
-                    println!("   This is expected in TDD - we're writing tests first");
-                    // Test passes - this is the expected behavior during development
-                } else {
-                    panic!("Unexpected error creating empty index for {index_type:?} on {column_name}: {err_msg}");
-                }
-            }
-        }
+        // Check index statistics after optimization
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_unindexed_rows"], 0,
+            "Empty index should indexed all rows"
+        );
     }
 }

@@ -80,28 +80,35 @@ impl TrainingSource for TrainingRequest {
 
 impl TrainingRequest {
     pub fn new(dataset: Arc<Dataset>, column: String, train: bool) -> Self {
-        Self { dataset, column, train }
+        Self {
+            dataset,
+            column,
+            train,
+        }
     }
 
     async fn create_empty_stream(&self) -> Result<SendableRecordBatchStream> {
-        let column_field = self
-            .dataset
-            .schema()
-            .field(&self.column)
-            .ok_or(Error::InvalidInput {
-                source: format!("No column with name {}", self.column).into(),
-                location: location!(),
-            })?;
+        let column_field =
+            self.dataset
+                .schema()
+                .field(&self.column)
+                .ok_or(Error::InvalidInput {
+                    source: format!("No column with name {}", self.column).into(),
+                    location: location!(),
+                })?;
 
         // Create schema with the column and row_id field (matching scan_chunks behavior)
         let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new(&self.column, column_field.data_type().clone(), true),
+            arrow_schema::Field::new(&self.column, column_field.data_type(), true),
             arrow_schema::Field::new("_rowid", arrow_schema::DataType::UInt64, false),
         ]));
 
         // Create empty stream
         let empty_stream = futures::stream::empty();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, empty_stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            empty_stream,
+        )))
     }
 
     async fn scan_chunks(
