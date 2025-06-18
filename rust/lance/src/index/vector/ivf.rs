@@ -9,6 +9,19 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
+use super::{
+    pq::{build_pq_model, PQIndex},
+    utils::maybe_sample_training_data,
+};
+use crate::dataset::builder::DatasetBuilder;
+use crate::index::vector::utils::{get_vector_dim, get_vector_type};
+use crate::index::DatasetIndexInternalExt;
+use crate::{
+    dataset::Dataset,
+    index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
+    session::Session,
+};
 use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
 use arrow_array::{
@@ -77,19 +90,6 @@ use serde_json::json;
 use snafu::location;
 use tracing::instrument;
 use uuid::Uuid;
-
-use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
-use super::{
-    pq::{build_pq_model, PQIndex},
-    utils::maybe_sample_training_data,
-};
-use crate::dataset::builder::DatasetBuilder;
-use crate::index::vector::utils::{get_vector_dim, get_vector_type};
-use crate::{
-    dataset::Dataset,
-    index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
-    session::Session,
-};
 
 pub mod builder;
 pub mod io;
@@ -367,6 +367,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     let distance_type = existing_indices[0].metric_type();
     let num_partitions = ivf_model.num_partitions();
     let index_type = existing_indices[0].sub_index_type();
+    let fri = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
     let num_indices_to_merge = if options.retrain {
         existing_indices.len()
@@ -396,6 +397,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                     distance_type,
                     shuffler,
                     (),
+                    fri,
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
@@ -413,6 +415,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                     distance_type,
                     shuffler,
                     (),
+                    fri,
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
@@ -433,6 +436,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 distance_type,
                 shuffler,
                 (),
+                fri,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
@@ -455,6 +459,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 None,
                 // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
+                fri,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
@@ -477,6 +482,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 None,
                 // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
+                fri,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
@@ -1245,7 +1251,7 @@ async fn scan_index_field_stream(
     scanner.try_into_stream().await
 }
 
-async fn load_precomputed_partitions_if_available(
+pub async fn load_precomputed_partitions_if_available(
     ivf_params: &IvfBuildParams,
 ) -> Result<Option<HashMap<u64, u32>>> {
     match &ivf_params.precomputed_partitions_file {

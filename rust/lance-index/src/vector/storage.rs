@@ -19,6 +19,9 @@ use prost::Message;
 use snafu::location;
 use std::{any::Any, sync::Arc};
 
+use super::quantizer::Quantizer;
+use super::DISTANCE_TYPE_KEY;
+use crate::frag_reuse::FragReuseIndex;
 use crate::{
     pb,
     vector::{
@@ -111,15 +114,22 @@ pub struct StorageBuilder<Q: Quantization> {
 
     // this is for testing purpose
     assert_num_columns: bool,
+    fri: Option<Arc<FragReuseIndex>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
-    pub fn new(vector_column: String, distance_type: DistanceType, quantizer: Q) -> Result<Self> {
+    pub fn new(
+        vector_column: String,
+        distance_type: DistanceType,
+        quantizer: Q,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         Ok(Self {
             vector_column,
             distance_type,
             quantizer,
             assert_num_columns: true,
+            fri,
         })
     }
 
@@ -165,6 +175,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     metadata: Q::Metadata,
 
     ivf: IvfModel,
+    fri: Option<Arc<FragReuseIndex>>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -177,7 +188,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Open a Loader.
     ///
     ///
-    pub async fn try_new(reader: FileReader) -> Result<Self> {
+    pub async fn try_new(reader: FileReader, fri: Option<Arc<FragReuseIndex>>) -> Result<Self> {
         let schema = reader.schema();
 
         let distance_type = DistanceType::try_from(
@@ -235,6 +246,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             distance_type,
             metadata,
             ivf,
+            fri,
         })
     }
 

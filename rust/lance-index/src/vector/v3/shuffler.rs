@@ -74,6 +74,7 @@ pub struct IvfShuffler {
 
     // options
     buffer_size: usize,
+    precomputed_shuffle_buffers: Option<Vec<String>>,
 }
 
 impl IvfShuffler {
@@ -83,11 +84,20 @@ impl IvfShuffler {
             output_dir,
             num_partitions,
             buffer_size: 4096,
+            precomputed_shuffle_buffers: None,
         }
     }
 
     pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
         self.buffer_size = buffer_size;
+        self
+    }
+
+    pub fn with_precomputed_shuffle_buffers(
+        mut self,
+        precomputed_shuffle_buffers: Option<Vec<String>>,
+    ) -> Self {
+        self.precomputed_shuffle_buffers = precomputed_shuffle_buffers;
         self
     }
 }
@@ -118,18 +128,12 @@ impl Shuffler for IvfShuffler {
                         .map(|s| s.parse::<f64>().unwrap_or_default())
                         .unwrap_or_default();
 
-                    let part_ids: &UInt32Array = batch
-                        .column_by_name(PART_ID_COLUMN)
-                        .expect("Partition ID column not found")
-                        .as_primitive();
+                    let part_ids: &UInt32Array = batch[PART_ID_COLUMN].as_primitive();
 
                     let indices = sort_to_indices(&part_ids, None, None)?;
                     let batch = batch.take(&indices)?;
 
-                    let part_ids: &UInt32Array = batch
-                        .column_by_name(PART_ID_COLUMN)
-                        .expect("Partition ID column not found")
-                        .as_primitive();
+                    let part_ids: &UInt32Array = batch[PART_ID_COLUMN].as_primitive();
                     let batch = batch.drop_column(PART_ID_COLUMN)?;
 
                     let mut partition_buffers =
@@ -336,6 +340,26 @@ impl ShuffleReader for SinglePartitionReader {
         // it's used for determining the order of building the index and skipping empty partitions
         // so we just return 1 here
         Ok(1)
+    }
+
+    fn total_loss(&self) -> Option<f64> {
+        None
+    }
+}
+
+pub struct EmptyReader;
+
+#[async_trait::async_trait]
+impl ShuffleReader for EmptyReader {
+    async fn read_partition(
+        &self,
+        _partition_id: usize,
+    ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
+        Ok(None)
+    }
+
+    fn partition_size(&self, _partition_id: usize) -> Result<usize> {
+        Ok(0)
     }
 
     fn total_loss(&self) -> Option<f64> {

@@ -1319,3 +1319,24 @@ def test_vector_index_with_nprobes(indexed_dataset):
     ).analyze_plan()
 
     print(res)
+
+
+def test_knn_deleted_rows(tmp_path):
+    data = create_table()
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="cosine",
+        num_partitions=4,
+        num_sub_vectors=4,
+    )
+    ds.insert(create_table())
+
+    ds.delete("id = 0")
+    assert ds.count_rows() == data.num_rows * 2 - 2
+    results = ds.to_table(
+        nearest={"column": "vector", "q": data["vector"][0], "k": ds.count_rows()}
+    )
+    assert 0 not in results["id"]
+    assert results.num_rows == ds.count_rows()

@@ -111,8 +111,8 @@ pub struct KNNVectorDistanceExec {
 
     /// The vector query to execute.
     pub query: ArrayRef,
-    column: String,
-    distance_type: DistanceType,
+    pub column: String,
+    pub distance_type: DistanceType,
 
     output_schema: SchemaRef,
     properties: PlanProperties,

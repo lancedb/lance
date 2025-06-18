@@ -32,6 +32,8 @@ use snafu::location;
 
 use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use super::ProductQuantizer;
+use crate::frag_reuse::FragReuseIndex;
+use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     pb,
     vector::{
@@ -176,6 +178,7 @@ impl PartialEq for ProductQuantizationStorage {
 }
 
 impl ProductQuantizationStorage {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         codebook: FixedSizeListArray,
         mut batch: RecordBatch,
@@ -184,6 +187,7 @@ impl ProductQuantizationStorage {
         dimension: usize,
         distance_type: DistanceType,
         transposed: bool,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         if batch.num_columns() != 2 {
             log::warn!(
@@ -231,12 +235,52 @@ impl ProductQuantizationStorage {
             batch = batch.replace_column_by_name(PQ_CODE_COLUMN, pq_code_fsl)?;
         }
 
-        let pq_code = batch[PQ_CODE_COLUMN]
+        let mut pq_code: Arc<UInt8Array> = batch[PQ_CODE_COLUMN]
             .as_fixed_size_list()
             .values()
             .as_primitive()
             .clone()
             .into();
+
+        if let Some(fri_ref) = fri.as_ref() {
+            let transposed_codes = pq_code.values();
+            let mut new_row_ids = Vec::with_capacity(row_ids.len());
+            let mut new_codes = Vec::with_capacity(row_ids.len() * num_sub_vectors);
+
+            let row_ids_values = row_ids.values();
+            for (i, row_id) in row_ids_values.iter().enumerate() {
+                if let Some(mapped_value) = fri_ref.remap_row_id(*row_id) {
+                    new_row_ids.push(mapped_value);
+                    new_codes.extend(get_pq_code(
+                        transposed_codes,
+                        num_bits,
+                        num_sub_vectors,
+                        i as u32,
+                    ));
+                }
+            }
+
+            let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
+            let new_codes = UInt8Array::from(new_codes);
+            batch = if new_row_ids.is_empty() {
+                RecordBatch::new_empty(batch.schema())
+            } else {
+                let num_bytes_in_code = new_codes.len() / new_row_ids.len();
+                let new_transposed_codes =
+                    transpose(&new_codes, new_row_ids.len(), num_bytes_in_code);
+                let codes_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
+                    new_transposed_codes,
+                    num_bytes_in_code as i32,
+                )?);
+                RecordBatch::try_new(batch.schema(), vec![new_row_ids, codes_fsl])?
+            };
+            pq_code = batch[PQ_CODE_COLUMN]
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<UInt8Type>()
+                .clone()
+                .into();
+        }
 
         let distance_type = match distance_type {
             DistanceType::Cosine => DistanceType::L2,
@@ -278,6 +322,7 @@ impl ProductQuantizationStorage {
         quantizer: ProductQuantizer,
         batch: &RecordBatch,
         vector_col: &str,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let codebook = quantizer.codebook.clone();
         let num_bits = quantizer.num_bits;
@@ -294,6 +339,7 @@ impl ProductQuantizationStorage {
             dimension,
             metric_type,
             false,
+            fri,
         )
     }
 
@@ -316,7 +362,11 @@ impl ProductQuantizationStorage {
     ///
     /// Currently it loads everything in memory.
     /// TODO: support lazy loading later.
-    pub async fn load(object_store: &ObjectStore, path: &Path) -> Result<Self> {
+    pub async fn load(
+        object_store: &ObjectStore,
+        path: &Path,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         let reader = FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
 
@@ -339,7 +389,7 @@ impl ProductQuantizationStorage {
             DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
         let metadata = ProductQuantizationMetadata::load(&reader).await?;
-        Self::load_partition(&reader, 0..reader.len(), distance_type, &metadata).await
+        Self::load_partition(&reader, 0..reader.len(), distance_type, &metadata, fri).await
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -504,6 +554,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         // Hard coded to float32 for now
         let codebook = metadata
@@ -531,6 +582,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             metadata.dimension,
             distance_type,
             metadata.transposed,
+            fri,
         )
     }
 }
@@ -1012,7 +1064,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
 
-        StorageBuilder::new("vec".to_owned(), pq.distance_type, pq)
+        StorageBuilder::new("vec".to_owned(), pq.distance_type, pq, None)
             .unwrap()
             .build(vec![batch])
             .unwrap()
@@ -1045,7 +1097,7 @@ mod tests {
         )
         .unwrap();
 
-        StorageBuilder::new("vec".to_owned(), pq.distance_type, pq)
+        StorageBuilder::new("vec".to_owned(), pq.distance_type, pq, None)
             .unwrap()
             .assert_num_columns(false)
             .build(vec![batch])

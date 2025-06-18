@@ -6,8 +6,8 @@ use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_
 use crate::Dataset;
 use lance_core::Error;
 use lance_index::frag_reuse::{FragReuseIndexDetails, FragReuseVersion, FRAG_REUSE_INDEX_NAME};
-use lance_index::DatasetIndexExt;
 use lance_table::format::Index;
+use lance_table::io::manifest::read_manifest_indexes;
 use log::warn;
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -26,7 +26,13 @@ use snafu::location;
 /// This will make that specific index not efficient until the next reindex,
 /// but it will not cause any correctness problem.
 pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Result<()> {
-    let indices = dataset.load_indices().await?;
+    // check against index metadata before auto-remap
+    let indices = read_manifest_indexes(
+        &dataset.object_store,
+        &dataset.manifest_location,
+        &dataset.manifest,
+    )
+    .await?;
     let frag_reuse_index_meta = match indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
         None => return Ok(()),
         Some(idx) => idx,
@@ -53,13 +59,7 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         }
 
         if !check_results.into_iter().all(|r| r.unwrap()) {
-            fragment_bitmaps.extend(
-                version
-                    .new_frags
-                    .iter()
-                    .map(|id| *id as u32)
-                    .collect::<Vec<_>>(),
-            );
+            fragment_bitmaps.extend(version.new_frag_bitmap());
             retained_versions.push(version.clone());
         }
     }
@@ -112,28 +112,29 @@ fn is_index_remap_caught_up(
 
     match index_meta.fragment_bitmap.clone() {
         Some(index_frag_bitmap) => {
-            let mut old_frag_in_index = 0;
-            for old_frag in frag_reuse_version.old_frags.iter() {
-                if index_frag_bitmap.contains(old_frag.id as u32) {
-                    old_frag_in_index += 1;
+            for group in frag_reuse_version.groups.iter() {
+                let mut old_frag_in_index = 0;
+                for old_frag in group.old_frags.iter() {
+                    if index_frag_bitmap.contains(old_frag.id as u32) {
+                        old_frag_in_index += 1;
+                    }
                 }
-            }
 
-            if old_frag_in_index == 0 {
-                Ok(true)
-            } else {
-                if old_frag_in_index != frag_reuse_version.old_frags.len() {
-                    // This should never happen because we always commit a full rewrite group
-                    // and we always reindex either the entire group or nothing.
-                    // We use invalid input to be consistent with
-                    // dataset::transaction::recalculate_fragment_bitmap
-                    return Err(Error::invalid_input(
-                        format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                                frag_reuse_version.old_frags.iter().map(|frag| frag.id).collect::<Vec<_>>()),
-                        location!()));
+                if old_frag_in_index > 0 {
+                    if old_frag_in_index != group.old_frags.len() {
+                        // This should never happen because we always commit a full rewrite group
+                        // and we always reindex either the entire group or nothing.
+                        // We use invalid input to be consistent with
+                        // dataset::transaction::recalculate_fragment_bitmap
+                        return Err(Error::invalid_input(
+                            format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
+                                    group.old_frags),
+                            location!()));
+                    }
+                    return Ok(false);
                 }
-                Ok(false)
             }
+            Ok(true)
         }
         None => {
             warn!(
@@ -154,7 +155,7 @@ mod tests {
     use arrow_array::types::{Float32Type, Int32Type};
     use lance_datagen::Dimension;
     use lance_index::scalar::ScalarIndexParams;
-    use lance_index::IndexType;
+    use lance_index::{DatasetIndexExt, IndexType};
 
     #[tokio::test]
     async fn test_cleanup_frag_reuse_index() {
@@ -206,6 +207,7 @@ mod tests {
         assert_eq!(frag_reuse_details.versions.len(), 1);
         let indices = dataset.load_indices().await.unwrap();
         let scalar_index = indices.iter().find(|idx| idx.name == "scalar").unwrap();
+        // Should not be considered caught up because index was created at an old dataset version
         assert_false!(
             is_index_remap_caught_up(&frag_reuse_details.versions[0], scalar_index).unwrap()
         );
@@ -221,6 +223,7 @@ mod tests {
         );
 
         // Cleanup frag reuse index and check there is no reuse version
+        let mut dataset_clone = dataset.clone();
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
         let Some(frag_reuse_index_meta) = dataset
             .load_index_by_name(FRAG_REUSE_INDEX_NAME)
@@ -233,5 +236,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(frag_reuse_details.versions.len(), 0);
+
+        // Try doing a concurrent cleanup should fail with conflict
+        assert!(matches!(
+            cleanup_frag_reuse_index(&mut dataset_clone).await,
+            Err(Error::RetryableCommitConflict { .. })
+        ));
     }
 }

@@ -522,7 +522,7 @@ dependencies = [
  "futures-lite",
  "parking",
  "polling",
- "rustix",
+ "rustix 0.38.44",
  "slab",
  "tracing",
  "windows-sys 0.59.0",
@@ -2273,7 +2273,16 @@ version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
 dependencies = [
- "dirs-sys",
+ "dirs-sys 0.4.1",
+]
+
+[[package]]
+name = "dirs"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys 0.5.0",
 ]
 
 [[package]]
@@ -2284,8 +2293,20 @@ checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users",
+ "redox_users 0.4.6",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "dirs-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
+dependencies = [
+ "libc",
+ "option-ext",
+ "redox_users 0.5.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2560,13 +2581,13 @@ version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7e180ac76c23b45e767bd7ae9579bc0bb458618c4bc71835926e098e61d15f8"
 dependencies = [
- "rustix",
+ "rustix 0.38.44",
  "windows-sys 0.52.0",
 ]
 
 [[package]]
 name = "fsst"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "rand",
 ]
@@ -3474,7 +3495,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3539,7 +3560,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3556,7 +3577,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3592,7 +3613,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3622,7 +3643,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3637,7 +3658,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arrayref",
  "arrow",
@@ -3676,7 +3697,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3710,7 +3731,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3730,7 +3751,7 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-sql",
  "deepsize",
- "dirs",
+ "dirs 6.0.0",
  "fst",
  "futures",
  "half",
@@ -3768,7 +3789,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3807,7 +3828,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arrow-array",
  "arrow-ord",
@@ -3830,7 +3851,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4074,6 +4095,12 @@ name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd945864f07fe9f5371a27ad7b52a172b4b499999f1d97574c9fa68373937e12"
 
 [[package]]
 name = "litemap"
@@ -4791,7 +4818,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi 0.4.0",
  "pin-project-lite",
- "rustix",
+ "rustix 0.38.44",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -5025,7 +5052,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5327,6 +5354,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_users"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd6f9d3d47bdd2ad6945c5015a226ec6155d0bcdfd8f7cd29f86b71f8de99d2b"
+dependencies = [
+ "getrandom 0.2.15",
+ "libredox",
+ "thiserror 2.0.12",
+]
+
+[[package]]
 name = "regex"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5517,7 +5555,20 @@ dependencies = [
  "bitflags 2.9.0",
  "errno",
  "libc",
- "linux-raw-sys",
+ "linux-raw-sys 0.4.15",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rustix"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c71e83d6afe7ff64890ec6b71d6a69bb8a610ab78ce364b3352876bb4c801266"
+dependencies = [
+ "bitflags 2.9.0",
+ "errno",
+ "libc",
+ "linux-raw-sys 0.9.4",
  "windows-sys 0.59.0",
 ]
 
@@ -5853,7 +5904,7 @@ version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da03fa3b94cc19e3ebfc88c4229c49d8f08cdbd1228870a45f0ffdf84988e14b"
 dependencies = [
- "dirs",
+ "dirs 5.0.1",
 ]
 
 [[package]]
@@ -6276,15 +6327,14 @@ checksum = "e502f78cdbb8ba4718f566c418c52bc729126ffd16baee5baa718cf25dd5a69a"
 
 [[package]]
 name = "tempfile"
-version = "3.17.1"
+version = "3.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22e5a0acb1f3f55f65cc4a866c361b2fb2a0ff6366785ae6fbb5f85df07ba230"
+checksum = "e8a64e3985349f2441a1a9ef0b853f869006c3855f2cda6862a94d26ebb9d6a1"
 dependencies = [
- "cfg-if",
  "fastrand",
  "getrandom 0.3.1",
  "once_cell",
- "rustix",
+ "rustix 1.0.7",
  "windows-sys 0.59.0",
 ]
 
@@ -7010,7 +7060,7 @@ dependencies = [
  "either",
  "home",
  "once_cell",
- "rustix",
+ "rustix 0.38.44",
 ]
 
 [[package]]
@@ -7319,8 +7369,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e105d177a3871454f754b33bb0ee637ecaaac997446375fd3e5d43a2ed00c909"
 dependencies = [
  "libc",
- "linux-raw-sys",
- "rustix",
+ "linux-raw-sys 0.4.15",
+ "rustix 0.38.44",
 ]
 
 [[package]]

@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use all_asserts::assert_gt;
 use arrow::array::AsArray;
+use arrow::array::{LargeStringArray, RecordBatch, RecordBatchIterator, UInt64Array};
 use arrow::datatypes::UInt64Type;
-use arrow_array::{LargeStringArray, RecordBatch, RecordBatchIterator, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 use itertools::Itertools;
 use lance::Dataset;
 use lance_core::ROW_ID;
@@ -45,11 +46,10 @@ async fn main() {
             .collect_vec();
         let doc_col = Arc::new(LargeStringArray::from(docs));
         let batch = RecordBatch::try_new(
-            arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new("doc", arrow_schema::DataType::LargeUtf8, false),
-                arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
-            ])
-            .into(),
+            Arc::new(Schema::new(vec![
+                Field::new("doc", DataType::LargeUtf8, false),
+                Field::new(ROW_ID, DataType::UInt64, false),
+            ])),
             vec![doc_col.clone(), row_id_col.clone()],
         )
         .unwrap();

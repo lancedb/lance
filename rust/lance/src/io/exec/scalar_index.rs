@@ -3,6 +3,12 @@
 
 use std::sync::Arc;
 
+use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
+use crate::{
+    dataset::rowids::load_row_id_sequences,
+    index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
+    Dataset,
+};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -39,14 +45,6 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{debug_span, instrument};
 
-use crate::{
-    dataset::rowids::load_row_id_sequences,
-    index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
-    Dataset,
-};
-
-use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
-
 lazy_static::lazy_static! {
     pub static ref SCALAR_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![Field::new("result".to_string(), DataType::Binary, true)]));
 }
@@ -66,7 +64,7 @@ impl ScalarIndexLoader for Dataset {
                 message: format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column),
                 location: location!()
             })?;
-        self.open_scalar_index(index_name, &idx.uuid.to_string(), metrics)
+        self.open_scalar_index(column, &idx.uuid.to_string(), metrics)
             .await
     }
 }

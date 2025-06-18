@@ -1,8 +1,8 @@
 Training LLMs using a Lance text dataset
 -----------------------------------------
 
-Using a Lance text dataset for pre-training / fine-tuning a Large Language model is straightforward and memory-efficient. 
-This example follows up on the  `Creating text dataset for LLM training using Lance <https://lancedb.github.io/lance/examples/llm_dataset_creation.html>`_ example. 
+Using a Lance text dataset for pre-training / fine-tuning a Large Language model is straightforward and memory-efficient.
+This example follows up on the  `Creating text dataset for LLM training using Lance <https://lancedb.github.io/lance/examples/Python/llm_dataset_creation.html>`_ example.
 Check it out if you haven't already.
 
 In this example, we will be training an LLM using 🤗 transformers on the tokenized "wikitext_500K" lance dataset we created in the aforementioned example.
@@ -20,6 +20,7 @@ Let's setup our environment by doing all the necessary imports and defining a fe
     from torch.utils.data import Dataset, DataLoader, Sampler
 
     from transformers import AutoTokenizer, AutoModelForCausalLM
+    from tqdm.auto import tqdm
 
     # We'll be training the pre-trained GPT2 model in this example
     model_name = 'gpt2'
@@ -116,7 +117,7 @@ To solve this problem, we define a custom Sampler that only returns the indices 
         def __len__(self) -> int:
             return len(self.available_indices)
 
-Now when we fetch the tokens from our dataset with sampler being the :meth:`LanceSampler`, all samples in all 
+Now when we fetch the tokens from our dataset with sampler being the :meth:`LanceSampler`, all samples in all
 the batches that our model sees during the training are guaranteed to be non-overlapping.
 
 This is done by generating a list of indices starting from 0 to the end of the dataset (which if you remember is lance dataset length - block size) with each index 'block_size' apart from the other.
@@ -180,6 +181,6 @@ Now you train the model just like you would with any other dataset!
 
 One tip: If your lance dataset is huge (like the wikitext_500K is), and you want to debug the model to look out for errors, you may want to wrap the dataloader in an :meth:`iter()` function and only run it for a couple batches.
 
-And that's basically it! 
+And that's basically it!
 
-The best part about using Lance, the custom Dataset and Sampler is that you get a whooping **95%** average GPU utilisation and minimal CPU overhead thanks to the lightning fast random access that Lance provides 🚀
+The best part about using Lance, the custom Dataset and Sampler is that you get a whopping **95%** average GPU utilisation and minimal CPU overhead thanks to the lightning fast random access that Lance provides 🚀

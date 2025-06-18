@@ -26,7 +26,9 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 public class LanceFileReader implements AutoCloseable {
 
@@ -39,7 +41,8 @@ public class LanceFileReader implements AutoCloseable {
   private BufferAllocator allocator;
   private Schema schema;
 
-  private static native LanceFileReader openNative(String fileUri) throws IOException;
+  private static native LanceFileReader openNative(
+      String fileUri, Map<String, String> storageOptions) throws IOException;
 
   private native void closeNative(long nativeLanceFileReaderHandle) throws IOException;
 
@@ -64,7 +67,21 @@ public class LanceFileReader implements AutoCloseable {
    * @return a new LanceFileReader
    */
   public static LanceFileReader open(String path, BufferAllocator allocator) throws IOException {
-    LanceFileReader reader = openNative(path);
+    return open(path, Collections.emptyMap(), allocator);
+  }
+
+  /**
+   * Open a LanceFileReader from a file URI
+   *
+   * @param path the URI to the Lance file
+   * @param storageOptions optional storage options for the Lance file
+   * @param allocator the Arrow BufferAllocator to use for the reader
+   * @return a new LanceFileReader
+   */
+  public static LanceFileReader open(
+      String path, Map<String, String> storageOptions, BufferAllocator allocator)
+      throws IOException {
+    LanceFileReader reader = openNative(path, storageOptions);
     reader.allocator = allocator;
     reader.schema = reader.load_schema();
     return reader;

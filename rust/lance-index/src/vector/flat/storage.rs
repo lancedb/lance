@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use super::index::FlatMetadata;
+use crate::frag_reuse::FragReuseIndex;
 use crate::vector::quantizer::QuantizerStorage;
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::utils::do_prefetch;
@@ -21,8 +23,6 @@ use lance_file::reader::FileReader;
 use lance_linalg::distance::hamming::hamming;
 use lance_linalg::distance::DistanceType;
 use snafu::location;
-
-use super::index::FlatMetadata;
 
 pub const FLAT_COLUMN: &str = "flat";
 
@@ -91,6 +91,7 @@ impl QuantizerStorage for FlatFloatStorage {
         _: std::ops::Range<usize>,
         _: DistanceType,
         _: &Self::Metadata,
+        _: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }

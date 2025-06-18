@@ -61,7 +61,7 @@ let's define the main function that takes in the dataset, number of samples and 
                 continue
             # Tokenize the current sample
             tokenized_sample = tokenize(sample, field)
-            # Increement the counter
+            # Increment the counter
             current_sample += 1
             # Yield a PyArrow RecordBatch
             yield pa.RecordBatch.from_arrays(

@@ -485,6 +485,41 @@ def test_tag(tmp_path: Path):
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 1
 
+    version = ds.tags.get_version("tag1")
+    assert version == 1
+
+
+def test_tag_order(tmp_path: Path):
+    table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
+    base_dir = tmp_path / "test"
+
+    for i in range(3):
+        mode = "append" if i > 0 else "create"
+        ds = lance.write_dataset(table, base_dir, mode=mode)
+
+    expected_tags = {"tag3": 3, "tag2": 2, "tag1": 1}
+    for name, version in expected_tags.items():
+        ds.tags.create(name, version)
+
+    tags_asc = ds.tags.list_ordered(order="asc")
+    assert len(tags_asc) == 3
+    tag_names_asc = [t[0] for t in tags_asc]
+    assert tag_names_asc == sorted(expected_tags.keys()), (
+        f"Unexpected ascending order: {tag_names_asc}"
+    )
+
+    # Test descending order (default)
+    tags_desc = ds.tags.list_ordered(order="desc")
+    assert len(tags_desc) == 3
+    tag_names_desc = [t[0] for t in tags_desc]
+    assert tag_names_desc == list(expected_tags.keys()), (
+        f"Unexpected descending order: {tag_names_desc}"
+    )
+
+    # Test without parameter (should default to descending)
+    tags_default = ds.tags.list_ordered()
+    assert tags_default == tags_desc, "Default order should match descending order"
+
 
 def test_sample(tmp_path: Path):
     table1 = pa.Table.from_pydict({"x": [0, 10, 20, 30, 40, 50], "y": range(6)})
@@ -1075,6 +1110,25 @@ def test_auto_cleanup(tmp_path):
     )
     lance.write_dataset(
         table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="create"
+    )
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+
+    time.sleep(5)
+
+    # trigger cleanup
+    lance.write_dataset(table, base_dir, mode="append")
+    dataset = lance.dataset(base_dir)
+    assert len(dataset.versions()) == 2
+
+
+def test_config_update_auto_cleanup(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir, mode="create")
+    ds.update_config(
+        {"lance.auto_cleanup.interval": "1", "lance.auto_cleanup.older_than": "1ms"}
     )
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")

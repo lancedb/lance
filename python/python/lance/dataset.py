@@ -2681,6 +2681,20 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.migrate_manifest_paths_v2()
 
+    def update_config(self, upsert_values: Dict[str, str]) -> None:
+        """
+        Update the dataset configuration.
+
+        This method inserts or updates configuration key-value pairs for the dataset.
+
+        Parameters
+        ----------
+        upsert_values : dict of str to str
+            The configuration items to insert or update.
+            Both keys and values should be strings.
+        """
+        self._ds.update_config(upsert_values)
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -3839,6 +3853,40 @@ class Tags:
             A dictionary mapping tag names to version numbers.
         """
         return self._ds.tags()
+
+    def get_version(self, tag: str) -> Optional[int]:
+        """
+        Get the version of a specific tag by name.
+
+        Parameters
+        ----------
+        tag: str
+            The name of the tag to retrieve.
+
+        Returns
+        -------
+        int or None
+            The version number of the tag if it exists, otherwise None.
+        """
+        return self._ds.get_version(tag)
+
+    def list_ordered(self, order: Optional[str] = None) -> list[str, Tag]:
+        """
+        List all dataset tags.
+
+        Parameters
+        ----------
+        order: str, optional
+            The order in which to return the tags.
+            "asc" or "desc" can be used to specify the order explicitly.
+            default 'desc'.
+
+        Returns
+        -------
+        list[str, Tag]
+            An ordered list of tuples mapping tag names to its `Tag` metadata.
+        """
+        return self._ds.tags_ordered(order)
 
     def create(self, tag: str, version: int) -> None:
         """

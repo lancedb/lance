@@ -12,10 +12,10 @@ use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
-use datafusion::common::SchemaExt;
+use datafusion::common::{DFSchema, SchemaExt};
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{col, lit, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::expressions;
@@ -25,16 +25,15 @@ use datafusion::physical_plan::{
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
     expressions::Literal,
-    filter::FilterExec,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
     union::UnionExec,
     ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
-use datafusion_expr::Operator;
+use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{aggregate::AggregateExprBuilder, expressions::Column};
-use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
@@ -69,7 +68,7 @@ use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-use crate::io::exec::{get_physical_optimizer, LanceScanConfig};
+use crate::io::exec::{get_physical_optimizer, LanceFilterExec, LanceScanConfig};
 use crate::io::exec::{
     knn::new_knn_exec, project, AddRowAddrExec, FilterPlan, KNNVectorDistanceExec,
     LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
@@ -1591,10 +1590,7 @@ impl Scanner {
         if let Some(refine_expr) = filter_plan.refine_expr {
             // We create a new planner specific to the node's schema, since
             // physical expressions reference column by index rather than by name.
-            let planner = Planner::new(plan.schema());
-            let physical_refine_expr = planner.create_physical_expr(&refine_expr)?;
-
-            plan = Arc::new(FilterExec::try_new(physical_refine_expr, plan)?);
+            plan = Arc::new(LanceFilterExec::try_new(refine_expr, plan)?);
         }
 
         // Stage 3: sort
@@ -1996,11 +1992,44 @@ impl Scanner {
                         must = Some(plan);
                     }
                 }
+
+                // For must_not queries, union the results of each subquery
+                let mut must_not = Vec::with_capacity(query.must_not.len());
+                for query in &query.must_not {
+                    let plan = Box::pin(self.plan_fts(
+                        query,
+                        &unlimited_params,
+                        filter_plan,
+                        prefilter_source,
+                    ))
+                    .await?;
+                    must_not.push(plan);
+                }
+                let must_not = if must_not.is_empty() {
+                    Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
+                } else if must_not.len() == 1 {
+                    must_not.pop().unwrap()
+                } else {
+                    let unioned = Arc::new(UnionExec::new(must_not));
+                    Arc::new(RepartitionExec::try_new(
+                        unioned,
+                        Partitioning::RoundRobinBatch(1),
+                    )?)
+                };
+
+                if query.should.is_empty() && must.is_none() {
+                    return Err(Error::invalid_input(
+                        "boolean query must have at least one should/must query".to_string(),
+                        location!(),
+                    ));
+                }
+
                 Arc::new(BooleanQueryExec::new(
                     query.clone(),
                     params.clone(),
                     should,
                     must,
+                    must_not,
                 ))
             }
         };
@@ -2057,7 +2086,7 @@ impl Scanner {
             let mut scan_node = self.scan_fragments(
                 true,
                 false,
-                true,
+                false,
                 flat_fts_scan_schema,
                 Arc::new(unindexed_fragments),
                 None,
@@ -2066,9 +2095,7 @@ impl Scanner {
 
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 // If there is a prefilter we need to manually apply it to the new data
-                let planner = Planner::new(scan_node.schema());
-                let physical_refine_expr = planner.create_physical_expr(expr)?;
-                scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
+                scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
             }
 
             let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
@@ -2186,10 +2213,7 @@ impl Scanner {
                 )
             };
             if let Some(refine_expr) = &filter_plan.refine_expr {
-                let planner = Planner::new(plan.schema());
-                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
-
-                plan = Arc::new(FilterExec::try_new(physical_refine_expr, plan)?);
+                plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
             }
             Ok(self.flat_knn(plan, q)?)
         }
@@ -2242,7 +2266,7 @@ impl Scanner {
             let mut scan_node = self.scan_fragments(
                 true,
                 false,
-                true,
+                false,
                 vector_scan_projection,
                 Arc::new(unindexed_fragments),
                 // Can't pushdown limit/offset in an ANN search
@@ -2254,9 +2278,7 @@ impl Scanner {
 
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 // If there is a prefilter we need to manually apply it to the new data
-                let planner = Planner::new(scan_node.schema());
-                let physical_refine_expr = planner.create_physical_expr(expr)?;
-                scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
+                scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
             }
             // first we do flat search on just the new data
             let topk_appended = self.flat_knn(scan_node, &q)?;
@@ -2429,9 +2451,7 @@ impl Scanner {
         if let Some(post_take_filter) = post_take_filter {
             let planner = Planner::new(plan.schema());
             let optimized_filter = planner.optimize_expr(post_take_filter)?;
-            let physical_refine_expr = planner.create_physical_expr(&optimized_filter)?;
-
-            plan = Arc::new(FilterExec::try_new(physical_refine_expr, plan)?);
+            plan = Arc::new(LanceFilterExec::try_new(optimized_filter, plan)?);
         }
 
         if self.with_row_address {
@@ -2459,7 +2479,6 @@ impl Scanner {
             let scan_arrow_schema = Arc::new(scan_schema.as_ref().into());
             let planner = Planner::new(scan_arrow_schema);
             let optimized_filter = planner.optimize_expr(filter.clone())?;
-            let physical_refine_expr = planner.create_physical_expr(&optimized_filter)?;
 
             let new_data_scan = self.scan_fragments(
                 true,
@@ -2471,7 +2490,7 @@ impl Scanner {
                 None,
                 false,
             );
-            let filtered = Arc::new(FilterExec::try_new(physical_refine_expr, new_data_scan)?);
+            let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, new_data_scan)?);
             Some(Arc::new(project(filtered, plan.schema().as_ref())?))
         } else {
             None
@@ -2599,45 +2618,43 @@ impl Scanner {
             q.metric_type,
         )?);
 
-        // filter out elements out of distance range
-        let lower_bound_expr = q
+        let lower: Option<(Expr, Arc<dyn PhysicalExpr>)> = q
             .lower_bound
-            .map(|v| {
-                let lower_bound = expressions::lit(v);
-                expressions::binary(
-                    expressions::col(DIST_COL, flat_dist.schema().as_ref())?,
-                    Operator::GtEq,
-                    lower_bound,
-                    flat_dist.schema().as_ref(),
-                )
+            .map(|v| -> Result<(Expr, Arc<dyn PhysicalExpr>)> {
+                let logical = col(DIST_COL).gt_eq(lit(v));
+                let schema = flat_dist.schema();
+                let df_schema = DFSchema::try_from(schema)?;
+                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                Ok::<(Expr, Arc<dyn PhysicalExpr>), _>((logical, physical))
             })
             .transpose()?;
-        let upper_bound_expr = q
+
+        let upper = q
             .upper_bound
-            .map(|v| {
-                let upper_bound = expressions::lit(v);
-                expressions::binary(
-                    expressions::col(DIST_COL, flat_dist.schema().as_ref())?,
-                    Operator::Lt,
-                    upper_bound,
-                    flat_dist.schema().as_ref(),
-                )
+            .map(|v| -> Result<(Expr, Arc<dyn PhysicalExpr>)> {
+                let logical = col(DIST_COL).lt(lit(v));
+                let schema = flat_dist.schema();
+                let df_schema = DFSchema::try_from(schema)?;
+                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                Ok::<(Expr, Arc<dyn PhysicalExpr>), _>((logical, physical))
             })
             .transpose()?;
-        let filter_expr = match (lower_bound_expr, upper_bound_expr) {
-            (Some(lower), Some(upper)) => Some(expressions::binary(
-                lower,
-                Operator::And,
-                upper,
-                flat_dist.schema().as_ref(),
-            )?),
-            (Some(lower), None) => Some(lower),
-            (None, Some(upper)) => Some(upper),
+
+        let filter_expr = match (lower, upper) {
+            (Some((llog, _)), Some((ulog, _))) => {
+                let logical = llog.and(ulog);
+                let schema = flat_dist.schema();
+                let df_schema = DFSchema::try_from(schema)?;
+                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                Some((logical, physical))
+            }
+            (Some((llog, lphys)), None) => Some((llog, lphys)),
+            (None, Some((ulog, uphys))) => Some((ulog, uphys)),
             (None, None) => None,
         };
 
         let knn_plan: Arc<dyn ExecutionPlan> = if let Some(filter_expr) = filter_expr {
-            Arc::new(FilterExec::try_new(filter_expr, flat_dist)?)
+            Arc::new(LanceFilterExec::try_new(filter_expr.0, flat_dist)?)
         } else {
             flat_dist
         };
@@ -2655,12 +2672,10 @@ impl Scanner {
         )
         .with_fetch(Some(q.k));
 
-        let not_nulls = FilterExec::try_new(
-            expressions::is_not_null(expressions::col(DIST_COL, sort.schema().as_ref())?)?,
-            Arc::new(sort),
-        )?;
+        let logical_not_null = col(DIST_COL).is_not_null();
+        let not_nulls = Arc::new(LanceFilterExec::try_new(logical_not_null, Arc::new(sort))?);
 
-        Ok(Arc::new(not_nulls))
+        Ok(not_nulls)
     }
 
     fn get_fragments_as_bitmap(&self) -> RoaringBitmap {
@@ -2826,10 +2841,8 @@ impl Scanner {
                 let columns_in_filter = Planner::column_names_in_expr(refine_expr);
                 let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
                 let filter_input = self.scan(true, false, true, None, filter_schema);
-                let planner = Planner::new(filter_input.schema());
-                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
                 let filtered_row_ids =
-                    Arc::new(FilterExec::try_new(physical_refine_expr, filter_input)?);
+                    Arc::new(LanceFilterExec::try_new(refine_expr.clone(), filter_input)?);
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             }
             // No prefilter

@@ -17,6 +17,8 @@ pub struct FtsSearchParams {
     // None means not a phrase query
     // Some(n) means a phrase query with slop n
     pub phrase_slop: Option<u32>,
+    /// The number of beginning characters being unchanged for fuzzy matching.
+    pub prefix_length: u32,
 }
 
 impl FtsSearchParams {
@@ -27,6 +29,7 @@ impl FtsSearchParams {
             fuzziness: Some(0),
             max_expansions: 50,
             phrase_slop: None,
+            prefix_length: 0,
         }
     }
 
@@ -52,6 +55,11 @@ impl FtsSearchParams {
 
     pub fn with_phrase_slop(mut self, phrase_slop: Option<u32>) -> Self {
         self.phrase_slop = phrase_slop;
+        self
+    }
+
+    pub fn with_prefix_length(mut self, prefix_length: u32) -> Self {
+        self.prefix_length = prefix_length;
         self
     }
 }
@@ -84,6 +92,15 @@ impl TryFrom<&str> for Operator {
                 format!("Invalid operator: {}", value),
                 location!(),
             )),
+        }
+    }
+}
+
+impl From<Operator> for &'static str {
+    fn from(operator: Operator) -> Self {
+        match operator {
+            Operator::And => "AND",
+            Operator::Or => "OR",
         }
     }
 }
@@ -219,7 +236,16 @@ impl FtsQuery {
                     .into_iter()
                     .map(|q| q.with_column(column.clone()))
                     .collect();
-                Self::Boolean(BooleanQuery { must, should })
+                let must_not = query
+                    .must_not
+                    .into_iter()
+                    .map(|q| q.with_column(column.clone()))
+                    .collect();
+                Self::Boolean(BooleanQuery {
+                    must,
+                    should,
+                    must_not,
+                })
             }
         }
     }
@@ -285,6 +311,11 @@ pub struct MatchQuery {
     /// - `Or`: At least one term must match.
     #[serde(default)]
     pub operator: Operator,
+
+    /// The number of beginning characters being unchanged for fuzzy matching.
+    /// Default to 0.
+    #[serde(default)]
+    pub prefix_length: u32,
 }
 
 impl MatchQuery {
@@ -296,6 +327,7 @@ impl MatchQuery {
             fuzziness: Some(0),
             max_expansions: 50,
             operator: Operator::Or,
+            prefix_length: 0,
         }
     }
 
@@ -329,6 +361,11 @@ impl MatchQuery {
 
     pub fn with_operator(mut self, operator: Operator) -> Self {
         self.operator = operator;
+        self
+    }
+
+    pub fn with_prefix_length(mut self, prefix_length: u32) -> Self {
+        self.prefix_length = prefix_length;
         self
     }
 
@@ -527,6 +564,7 @@ impl FtsQueryNode for MultiMatchQuery {
 pub enum Occur {
     Should,
     Must,
+    MustNot,
 }
 
 impl TryFrom<&str> for Occur {
@@ -535,6 +573,7 @@ impl TryFrom<&str> for Occur {
         match value.to_ascii_uppercase().as_str() {
             "SHOULD" => Ok(Self::Should),
             "MUST" => Ok(Self::Must),
+            "MUST_NOT" => Ok(Self::MustNot),
             _ => Err(Error::invalid_input(
                 format!("Invalid occur value: {}", value),
                 location!(),
@@ -543,24 +582,40 @@ impl TryFrom<&str> for Occur {
     }
 }
 
+impl From<Occur> for &'static str {
+    fn from(occur: Occur) -> Self {
+        match occur {
+            Occur::Should => "SHOULD",
+            Occur::Must => "MUST",
+            Occur::MustNot => "MUST_NOT",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BooleanQuery {
     pub should: Vec<FtsQuery>,
     pub must: Vec<FtsQuery>,
-    // TODO: support must_not
+    pub must_not: Vec<FtsQuery>,
 }
 
 impl BooleanQuery {
     pub fn new(iter: impl IntoIterator<Item = (Occur, FtsQuery)>) -> Self {
         let mut should = Vec::new();
         let mut must = Vec::new();
+        let mut must_not = Vec::new();
         for (occur, query) in iter {
             match occur {
                 Occur::Should => should.push(query),
                 Occur::Must => must.push(query),
+                Occur::MustNot => must_not.push(query),
             }
         }
-        Self { should, must }
+        Self {
+            should,
+            must,
+            must_not,
+        }
     }
 
     pub fn with_should(mut self, query: FtsQuery) -> Self {
@@ -572,6 +627,11 @@ impl BooleanQuery {
         self.must.push(query);
         self
     }
+
+    pub fn with_must_not(mut self, query: FtsQuery) -> Self {
+        self.must_not.push(query);
+        self
+    }
 }
 
 impl FtsQueryNode for BooleanQuery {
@@ -581,6 +641,9 @@ impl FtsQueryNode for BooleanQuery {
             columns.extend(query.columns());
         }
         for query in &self.must {
+            columns.extend(query.columns());
+        }
+        for query in &self.must_not {
             columns.extend(query.columns());
         }
         columns
@@ -693,7 +756,12 @@ pub fn fill_fts_query_column(
                 .iter()
                 .map(|query| fill_fts_query_column(query, columns, replace))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(FtsQuery::Boolean(BooleanQuery { must, should }))
+            let must_not = bool_query
+                .must_not
+                .iter()
+                .map(|query| fill_fts_query_column(query, columns, replace))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(FtsQuery::Boolean(BooleanQuery { must, should, must_not }))
         }
     }
 }
@@ -719,7 +787,8 @@ mod tests {
             "boost": 2.0,
             "fuzziness": 1,
             "max_expansions": 10,
-            "operator": "And"
+            "operator": "And",
+            "prefix_length": 0,
         });
         assert_eq!(serialized, expected);
 
@@ -735,6 +804,7 @@ mod tests {
         assert_eq!(query.fuzziness, Some(0));
         assert_eq!(query.max_expansions, 50);
         assert_eq!(query.operator, Operator::Or);
+        assert_eq!(query.prefix_length, 0);
     }
 
     #[test]
@@ -745,11 +815,7 @@ mod tests {
         let query = json!({
             "terms": "hello world",
         });
-        let expected = PhraseQuery {
-            column: None,
-            terms: "hello world".to_string(),
-            slop: 0,
-        };
+        let expected = PhraseQuery::new("hello world".to_string());
         let query: PhraseQuery = serde_json::from_value(query).unwrap();
         assert_eq!(query, expected);
 
@@ -758,11 +824,9 @@ mod tests {
             "column": "text",
             "slop": 2,
         });
-        let expected = PhraseQuery {
-            column: Some("text".to_string()),
-            terms: "hello world".to_string(),
-            slop: 2,
-        };
+        let expected = PhraseQuery::new("hello world".to_string())
+            .with_column(Some("text".to_string()))
+            .with_slop(2);
         let query: PhraseQuery = serde_json::from_value(query).unwrap();
         assert_eq!(query, expected);
     }
