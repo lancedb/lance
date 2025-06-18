@@ -58,6 +58,7 @@ impl PartitionTransformer {
     /// Compute the partition for each row in the input Matrix.
     ///
     #[instrument(level = "debug", skip_all)]
+    #[allow(dead_code)]
     pub(super) fn compute_partitions(&self, data: &FixedSizeListArray) -> UInt32Array {
         compute_partitions_arrow_array(&self.centroids, data, self.distance_type)
             .expect("failed to compute partitions")
