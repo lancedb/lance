@@ -136,7 +136,7 @@ public class ReadOptions {
      */
     @Deprecated
     public Builder setMetadataCacheSize(int metadataCacheSize) {
-      int assumedEntrySize = 10 * 1024 * 1024; // 10MB per entry
+      int assumedEntrySize = 4 * 1024 * 1024; // 4MB per entry
       this.metadataCacheSizeBytes = metadataCacheSize * assumedEntrySize;
       return this;
     }

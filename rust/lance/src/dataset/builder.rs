@@ -77,7 +77,7 @@ impl DatasetBuilder {
         note = "Use `with_metadata_cache_size_bytes` instead"
     )]
     pub fn with_metadata_cache_size(mut self, cache_size: usize) -> Self {
-        let assumed_entry_size = 10 * 1024 * 1024; // 10MB per entry
+        let assumed_entry_size = 4 * 1024 * 1024; // 4MB per entry
         self.metadata_cache_size_bytes = cache_size * assumed_entry_size;
         self
     }
