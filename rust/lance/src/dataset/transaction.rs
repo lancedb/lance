@@ -1109,6 +1109,7 @@ impl Transaction {
                         }
                     }
                 });
+                Self::prune_deleted_fragments_from_indices(&mut final_indices, deleted_fragment_ids);
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Update {
@@ -1469,11 +1470,27 @@ impl Transaction {
         }
     }
 
+    /// Remove deleted fragments from index bitmaps
+    fn prune_deleted_fragments_from_indices(
+        indices: &mut [Index],
+        deleted_fragment_ids: &[u64],
+    ) {
+        for index in indices.iter_mut() {
+            if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
+                for fragment_id in deleted_fragment_ids.iter().map(|&id| id as u32) {
+                    fragment_bitmap.remove(fragment_id);
+                }
+            }
+        }
+    }
+
     fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, fragments: &[Fragment]) {
         let field_ids = schema
             .fields_pre_order()
             .map(|f| f.id)
             .collect::<HashSet<_>>();
+        
+        // Remove indices for fields no longer in schema
         indices.retain(|existing_index| {
             existing_index
                 .fields
@@ -1484,15 +1501,70 @@ impl Transaction {
 
         let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
 
-        // We might have also removed all fragments that an index was covering, so
-        // we should remove those indices as well.
-        indices.retain(|existing_index| {
-            existing_index
-                .fragment_bitmap
-                .as_ref()
-                .map(|bitmap| bitmap.iter().any(|id| fragment_ids.contains(&(id as u64))))
-                .unwrap_or(true)
-                || existing_index.name == FRAG_REUSE_INDEX_NAME
+        // Update fragment bitmaps to remove non-existent fragments
+        for existing_index in indices.iter_mut() {
+            if let Some(fragment_bitmap) = &mut existing_index.fragment_bitmap {
+                // Remove fragments that no longer exist
+                let mut ids_to_remove = Vec::new();
+                for id in fragment_bitmap.iter() {
+                    if !fragment_ids.contains(&(id as u64)) {
+                        ids_to_remove.push(id);
+                    }
+                }
+                for id in ids_to_remove {
+                    fragment_bitmap.remove(id);
+                }
+            }
+        }
+
+        // Apply retention logic for indices with empty bitmaps per index name
+        // (except for fragment reuse indices which are always kept)
+        let mut indices_by_name: std::collections::HashMap<String, Vec<&Index>> = std::collections::HashMap::new();
+        
+        // Group indices by name
+        for index in indices.iter() {
+            if index.name != FRAG_REUSE_INDEX_NAME {
+                indices_by_name.entry(index.name.clone()).or_default().push(index);
+            }
+        }
+
+        // Build a set of UUIDs to keep based on retention rules
+        let mut uuids_to_keep = std::collections::HashSet::new();
+        
+        // For each group of indices with the same name
+        for (_, same_name_indices) in indices_by_name {
+            if same_name_indices.len() > 1 {
+                // Separate empty and non-empty indices
+                let (empty_indices, non_empty_indices): (Vec<_>, Vec<_>) = same_name_indices.iter().partition(|index| {
+                    index.fragment_bitmap.as_ref().map_or(true, |bitmap| bitmap.is_empty())
+                });
+                
+                if non_empty_indices.is_empty() {
+                    // All indices are empty - keep only the first (oldest) one
+                    let mut sorted_indices = empty_indices;
+                    sorted_indices.sort_by_key(|index: &&Index| index.dataset_version); // Sort by ascending dataset_version
+                    
+                    // Keep only the first (oldest)
+                    if let Some(oldest) = sorted_indices.first() {
+                        uuids_to_keep.insert(oldest.uuid);
+                    }
+                } else {
+                    // At least one index has non-empty bitmap - keep all non-empty indices
+                    for index in non_empty_indices {
+                        uuids_to_keep.insert(index.uuid);
+                    }
+                }
+            } else {
+                // Single index - always keep it
+                if let Some(index) = same_name_indices.first() {
+                    uuids_to_keep.insert(index.uuid);
+                }
+            }
+        }
+
+        // Use Vec::retain to safely remove indices
+        indices.retain(|index| {
+            index.name == FRAG_REUSE_INDEX_NAME || uuids_to_keep.contains(&index.uuid)
         });
     }
 
