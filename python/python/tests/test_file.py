@@ -9,6 +9,15 @@ import pyarrow.parquet as pq
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
+def test_file_read_projection(tmp_path):
+    table = pa.table({"a": [1, 2, 3], "b": [4, 5, 6]})
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(table)
+
+    reader = LanceFileReader(str(path), columns=["a"])
+    assert reader.read_all().to_table() == table.select('a')
+
 
 def test_file_writer(tmp_path):
     path = tmp_path / "foo.lance"
