@@ -2169,6 +2169,31 @@ mod tests {
         );
     }
 
+    /// Helper function to check if an index is being used in a query plan
+    fn assert_index_usage(plan: &str, column_name: &str, should_use_index: bool, context: &str) {
+        let index_used = if column_name == "text" {
+            // For inverted index, look for MatchQuery which indicates FTS index usage
+            plan.contains("MatchQuery")
+        } else {
+            // For btree/bitmap, look for MaterializeIndex which indicates scalar index usage
+            plan.contains("MaterializeIndex")
+        };
+
+        if should_use_index {
+            assert!(
+                index_used,
+                "Query plan should use index {}: {}",
+                context, plan
+            );
+        } else {
+            assert!(
+                !index_used,
+                "Query plan should NOT use index {}: {}",
+                context, plan
+            );
+        }
+    }
+
     /// Test that scalar indices are retained after deleting all data from a table.
     ///
     /// This test verifies that when we:
@@ -2212,6 +2237,29 @@ mod tests {
             "Index should have indexed all 100 rows"
         );
 
+        // Verify index is being used in queries before delete
+        let plan = if column_name == "text" {
+            // Use full-text search for inverted index
+            dataset
+                .scan()
+                .full_text_search(FullTextSearchQuery::new("test".to_string()))
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap()
+        } else {
+            // Use equality filter for btree/bitmap indices
+            dataset
+                .scan()
+                .filter(format!("{} = 50", column_name).as_str())
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap()
+        };
+        // Verify index is being used before delete
+        assert_index_usage(&plan, column_name, true, "before delete");
+
         // Delete all rows from the table
         dataset.delete("true").await.unwrap();
 
@@ -2231,12 +2279,53 @@ mod tests {
             "Index name should remain the same after delete"
         );
 
+        // Critical test: Verify the fragment bitmap is empty after delete
+        let indices = dataset.load_indices().await.unwrap();
+        let index = &indices[0];
+        assert!(
+            index
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|bitmap| bitmap.is_empty()),
+            "Fragment bitmap should be empty after deleting all data"
+        );
+
         // Verify we can still get index statistics
         let stats = dataset.index_statistics("index").await.unwrap();
         let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
         assert_eq!(
             stats["num_indexed_rows"], 0,
             "Index should now report zero indexed rows after delete all"
+        );
+
+        // Verify index is NOT being used in queries after delete (empty bitmap)
+        let plan_after_delete = if column_name == "text" {
+            // Use full-text search for inverted index
+            dataset
+                .scan()
+                .project(&[column_name])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new("test".to_string()))
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap()
+        } else {
+            // Use equality filter for btree/bitmap indices
+            dataset
+                .scan()
+                .filter(format!("{} = 50", column_name).as_str())
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap()
+        };
+        // Verify index is NOT being used after delete (empty bitmap)
+        assert_index_usage(
+            &plan_after_delete,
+            column_name,
+            false,
+            "after delete (empty bitmap)",
         );
 
         // Test that we can append new data and the index is still there
@@ -2326,6 +2415,31 @@ mod tests {
             "Index should have indexed all 100 rows"
         );
 
+        // Verify index is being used in queries before update
+        let plan = if column_name == "text" {
+            // Use full-text search for inverted index
+            dataset
+                .scan()
+                .project(&[column_name])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new("test".to_string()))
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap()
+        } else {
+            // Use equality filter for btree/bitmap indices
+            dataset
+                .scan()
+                .filter(format!("{} = 50", column_name).as_str())
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap()
+        };
+        // Verify index is being used before update
+        assert_index_usage(&plan, column_name, true, "before update");
+
         // Update some rows - update first 50 rows
         let update_result = UpdateBuilder::new(Arc::new(dataset))
             .set("i", "i + 1000")
@@ -2352,6 +2466,17 @@ mod tests {
             "Index should be retained after updating rows"
         );
 
+        // Critical test: Verify the fragment bitmap is empty after update
+        let indices = dataset.load_indices().await.unwrap();
+        let index = &indices[0];
+        assert!(
+            index
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|bitmap| bitmap.is_empty()),
+            "Fragment bitmap should be empty after updating all data"
+        );
+
         // Verify we can still get index statistics
         let stats_after_update = dataset.index_statistics("index").await.unwrap();
         let stats_after_update: serde_json::Value =
@@ -2361,6 +2486,36 @@ mod tests {
         assert_eq!(
             stats_after_update["num_indexed_rows"], 0,
             "Index statistics should be zero after update, as it is not re-trained"
+        );
+
+        // Verify index is NOT being used in queries after update (empty bitmap)
+        let plan_after_update = if column_name == "text" {
+            // Use full-text search for inverted index
+            dataset
+                .scan()
+                .project(&[column_name])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new("test".to_string()))
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap()
+        } else {
+            // Use equality filter for btree/bitmap indices
+            dataset
+                .scan()
+                .filter(format!("{} = 50", column_name).as_str())
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap()
+        };
+        // Verify index is NOT being used after update (empty bitmap)
+        assert_index_usage(
+            &plan_after_update,
+            column_name,
+            false,
+            "after update (empty bitmap)",
         );
 
         // Test that we can optimize indices after update
