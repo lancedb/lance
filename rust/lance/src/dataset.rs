@@ -1944,7 +1944,7 @@ mod tests {
         tokenizer::InvertedIndexParams,
     };
     use lance_index::scalar::FullTextSearchQuery;
-    use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
+    use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, IndexType};
     use lance_io::utils::CachedFileSize;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;

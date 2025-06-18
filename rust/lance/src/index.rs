@@ -37,16 +37,11 @@ use lance_index::vector::sq::ScalarQuantizer;
 pub use lance_index::IndexParams;
 use lance_index::{
     metrics::{MetricsCollector, NoOpMetricsCollector},
-    scalar::inverted::tokenizer::InvertedIndexParams,
+    ScalarIndexCriteria,
 };
 use lance_index::{optimize::OptimizeOptions, scalar::inverted::train_inverted_index};
-use lance_index::{
-    pb,
-    scalar::{ScalarIndexParams, LANCE_SCALAR_INDEX},
-    vector::VectorIndex,
-    DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME,
-};
-use lance_index::{ScalarIndexCriteria, INDEX_METADATA_SCHEMA_KEY};
+use lance_index::{pb, vector::VectorIndex, Index, IndexType, INDEX_FILE_NAME};
+use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{
@@ -57,10 +52,7 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
-use scalar::{
-    build_inverted_index, detect_scalar_index_type, index_matches_criteria, infer_index_type,
-    inverted_index_details, TrainingRequest,
-};
+use scalar::{detect_scalar_index_type, index_matches_criteria, infer_index_type, TrainingRequest};
 use serde_json::json;
 use snafu::location;
 use tracing::{info, instrument};
@@ -70,6 +62,7 @@ use vector::utils::get_vector_type;
 
 pub(crate) mod append;
 pub(crate) mod cache;
+mod create;
 pub mod frag_reuse;
 pub mod prefilter;
 pub mod scalar;
@@ -77,13 +70,12 @@ pub mod vector;
 
 use crate::dataset::index::LanceIndexStoreExt;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
+pub use create::CreateIndexBuilder;
 
 use self::append::merge_indices;
-use self::scalar::build_scalar_index;
-use self::vector::{build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX};
+use self::vector::remap_vector_index;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
-use crate::index::vector::remap_vector_index;
 use crate::{dataset::Dataset, Error, Result};
 
 // Whether to auto-migrate a dataset when we encounter corruption.
@@ -252,6 +244,17 @@ fn vector_index_details() -> prost_types::Any {
 
 #[async_trait]
 impl DatasetIndexExt for Dataset {
+    type IndexBuilder<'a> = CreateIndexBuilder<'a>;
+
+    fn create_index_builder<'a>(
+        &'a mut self,
+        columns: &[&str],
+        index_type: IndexType,
+        params: &'a dyn IndexParams,
+    ) -> CreateIndexBuilder<'a> {
+        CreateIndexBuilder::new(self, columns, index_type, params)
+    }
+
     #[instrument(skip_all)]
     async fn create_index(
         &mut self,
@@ -261,170 +264,14 @@ impl DatasetIndexExt for Dataset {
         params: &dyn IndexParams,
         replace: bool,
     ) -> Result<()> {
-        if columns.len() != 1 {
-            return Err(Error::Index {
-                message: "Only support building index on 1 column at the moment".to_string(),
-                location: location!(),
-            });
-        }
-        let column = columns[0];
-        let Some(field) = self.schema().field(column) else {
-            return Err(Error::Index {
-                message: format!("CreateIndex: column '{column}' does not exist"),
-                location: location!(),
-            });
-        };
+        // Use the builder pattern with default train=true for backward compatibility
+        let mut builder = self.create_index_builder(columns, index_type, params);
 
-        // Load indices from the disk.
-        let indices = self.load_indices().await?;
-        let fri = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-        let index_name = name.unwrap_or(format!("{column}_idx"));
-        if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
-            if idx.fields == [field.id] && !replace {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index name '{index_name} already exists, \
-                        please specify a different name or use replace=True"
-                    ),
-                    location: location!(),
-                });
-            };
-            if idx.fields != [field.id] {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index name '{index_name} already exists with different fields, \
-                        please specify a different name"
-                    ),
-                    location: location!(),
-                });
-            }
+        if let Some(name) = name {
+            builder = builder.name(name);
         }
 
-        let index_id = Uuid::new_v4();
-        let index_details = match (index_type, params.index_name()) {
-            (
-                IndexType::Bitmap
-                | IndexType::BTree
-                | IndexType::Inverted
-                | IndexType::NGram
-                | IndexType::LabelList,
-                LANCE_SCALAR_INDEX,
-            ) => {
-                let params = ScalarIndexParams::new(index_type.try_into()?);
-                build_scalar_index(self, column, &index_id.to_string(), &params).await?
-            }
-            (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
-                // Guess the index type
-                let params = params
-                    .as_any()
-                    .downcast_ref::<ScalarIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Scalar index type must take a ScalarIndexParams".to_string(),
-                        location: location!(),
-                    })?;
-                build_scalar_index(self, column, &index_id.to_string(), params).await?
-            }
-            (IndexType::Inverted, _) => {
-                // Inverted index params.
-                let inverted_params = params
-                    .as_any()
-                    .downcast_ref::<InvertedIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Inverted index type must take a InvertedIndexParams".to_string(),
-                        location: location!(),
-                    })?;
-
-                build_inverted_index(self, column, &index_id.to_string(), inverted_params).await?;
-                inverted_index_details()
-            }
-            (IndexType::Vector, LANCE_VECTOR_INDEX) => {
-                // Vector index params.
-                let vec_params = params
-                    .as_any()
-                    .downcast_ref::<VectorIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Vector index type must take a VectorIndexParams".to_string(),
-                        location: location!(),
-                    })?;
-
-                // this is a large future so move it to heap
-                Box::pin(build_vector_index(
-                    self,
-                    column,
-                    &index_name,
-                    &index_id.to_string(),
-                    vec_params,
-                    fri,
-                ))
-                .await?;
-                vector_index_details()
-            }
-            // Can't use if let Some(...) here because it's not stable yet.
-            // TODO: fix after https://github.com/rust-lang/rust/issues/51114
-            (IndexType::Vector, name)
-                if self
-                    .session
-                    .index_extensions
-                    .contains_key(&(IndexType::Vector, name.to_string())) =>
-            {
-                let ext = self
-                    .session
-                    .index_extensions
-                    .get(&(IndexType::Vector, name.to_string()))
-                    .expect("already checked")
-                    .clone()
-                    .to_vector()
-                    // this should never happen because we control the registration
-                    // if this fails, the registration logic has a bug
-                    .ok_or(Error::Internal {
-                        message: "unable to cast index extension to vector".to_string(),
-                        location: location!(),
-                    })?;
-
-                ext.create_index(self, column, &index_id.to_string(), params)
-                    .await?;
-                vector_index_details()
-            }
-            (IndexType::FragmentReuse, _) => {
-                return Err(Error::Index {
-                    message: "Fragment reuse index can only be created through compaction"
-                        .to_string(),
-                    location: location!(),
-                })
-            }
-            (index_type, index_name) => {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index type {index_type} with name {index_name} is not supported"
-                    ),
-                    location: location!(),
-                });
-            }
-        };
-
-        let new_idx = IndexMetadata {
-            uuid: index_id,
-            name: index_name,
-            fields: vec![field.id],
-            dataset_version: self.manifest.version,
-            fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
-            index_details: Some(index_details),
-            index_version: index_type.version(),
-        };
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::CreateIndex {
-                new_indices: vec![new_idx],
-                removed_indices: vec![],
-            },
-            /*blobs_op= */ None,
-            None,
-        );
-
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-
-        Ok(())
+        builder.replace(replace).execute().await
     }
 
     async fn drop_index(&mut self, name: &str) -> Result<()> {
@@ -1305,6 +1152,7 @@ mod tests {
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::{ReadParams, WriteParams};
+    use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, StatsHolder};
 
@@ -1317,7 +1165,7 @@ mod tests {
     use lance_arrow::*;
     use lance_datagen::r#gen;
     use lance_datagen::{array, BatchCount, Dimension, RowCount};
-    use lance_index::scalar::FullTextSearchQuery;
+    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
@@ -2238,5 +2086,100 @@ mod tests {
         for id in ids.values() {
             assert!(seen.insert(*id), "Duplicate id found: {}", id);
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_empty_vector_index() {
+        use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Create a simple dataset with vector data
+        let dimension = 16;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                dimension,
+            ),
+            false,
+        )]));
+
+        let values = Float32Array::from(vec![0.0; dimension as usize]);
+        let vector_array = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vector_array)]).unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Create an empty index with train=false
+        let params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 5);
+        dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .train(false)
+            .execute()
+            .await
+            .unwrap();
+
+        // Verify the index was created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "vector_idx");
+
+        // Verify we can get index statistics (should have zero rows initially)
+        let stats = dataset.index_statistics("vector_idx").await.unwrap();
+        assert!(stats.contains("num_indexed_rows"));
+
+        // The index should exist in the loaded indices
+        let indices = dataset.load_indices().await.unwrap();
+        let index_names: Vec<String> = indices.iter().map(|i| i.name.clone()).collect();
+        assert!(index_names.contains(&"vector_idx".to_string()));
+
+        // Now test that the empty index is retained after append operations
+        let initial_row_count = dataset.count_rows(None).await.unwrap();
+        println!("Initial row count: {}", initial_row_count);
+
+        // Create new data to append
+        let new_values = Float32Array::from(vec![1.0; dimension as usize]);
+        let new_vector_array =
+            FixedSizeListArray::try_new_from_values(new_values, dimension).unwrap();
+        let new_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(new_vector_array)]).unwrap();
+
+        // Append the new data
+        let new_reader =
+            RecordBatchIterator::new(vec![new_batch].into_iter().map(Ok), schema.clone());
+        dataset.append(new_reader, None).await.unwrap();
+
+        // Verify row count increased
+        let new_row_count = dataset.count_rows(None).await.unwrap();
+        assert_eq!(new_row_count, initial_row_count + 1);
+        println!("Row count after append: {}", new_row_count);
+
+        // Critical test: Verify the empty index is still present after append
+        let indices_after_append = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_append.len(),
+            1,
+            "Index should be retained after append"
+        );
+        assert_eq!(indices_after_append[0].name, "vector_idx");
+
+        // The index should still be queryable
+        let stats_after_append = dataset.index_statistics("vector_idx").await.unwrap();
+        assert!(stats_after_append.contains("num_indexed_rows"));
+        println!("Index statistics after append: {}", stats_after_append);
+
+        // Verify index names are still available
+        let index_names_after: Vec<String> = indices_after_append
+            .iter()
+            .map(|i| i.name.clone())
+            .collect();
+        assert!(
+            index_names_after.contains(&"vector_idx".to_string()),
+            "Index name should still be available after append operation"
+        );
     }
 }
