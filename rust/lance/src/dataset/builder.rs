@@ -30,7 +30,7 @@ pub struct DatasetBuilder {
     index_cache_size: usize,
     /// Metadata cache size for the fragment metadata. If it is zero, metadata
     /// cache is disabled.
-    metadata_cache_size: usize,
+    metadata_cache_size_bytes: usize,
     /// Optional pre-loaded manifest to avoid loading it again.
     manifest: Option<Manifest>,
     session: Option<Arc<Session>>,
@@ -44,7 +44,7 @@ impl DatasetBuilder {
     pub fn from_uri<T: AsRef<str>>(table_uri: T) -> Self {
         Self {
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
-            metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
+            metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             table_uri: table_uri.as_ref().to_string(),
             options: ObjectStoreParams::default(),
             commit_handler: None,
@@ -64,9 +64,21 @@ impl DatasetBuilder {
         self
     }
 
+    /// Size of the metadata cache in bytes. This cache stores metadata in memory
+    /// for faster open table and scans. The default is 1 GiB.
+    pub fn with_metadata_cache_size_bytes(mut self, cache_size: usize) -> Self {
+        self.metadata_cache_size_bytes = cache_size;
+        self
+    }
+
     /// Set the cache size for the file metadata. Set to zero to disable this cache.
+    #[deprecated(
+        since = "0.30.0",
+        note = "Use `with_metadata_cache_size_bytes` instead"
+    )]
     pub fn with_metadata_cache_size(mut self, cache_size: usize) -> Self {
-        self.metadata_cache_size = cache_size;
+        let assumed_entry_size = 4 * 1024 * 1024; // 4MB per entry
+        self.metadata_cache_size_bytes = cache_size * assumed_entry_size;
         self
     }
 
@@ -164,7 +176,7 @@ impl DatasetBuilder {
     pub fn with_read_params(mut self, read_params: ReadParams) -> Self {
         self = self
             .with_index_cache_size(read_params.index_cache_size)
-            .with_metadata_cache_size(read_params.metadata_cache_size);
+            .with_metadata_cache_size_bytes(read_params.metadata_cache_size_bytes);
 
         if let Some(options) = read_params.store_options {
             self.options = options;
@@ -263,7 +275,7 @@ impl DatasetBuilder {
             Some(session) => session.clone(),
             None => Arc::new(Session::new(
                 self.index_cache_size,
-                self.metadata_cache_size,
+                self.metadata_cache_size_bytes,
                 Default::default(),
             )),
         };

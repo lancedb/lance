@@ -89,12 +89,12 @@ impl BlockingDataset {
         version: Option<i32>,
         block_size: Option<i32>,
         index_cache_size: i32,
-        metadata_cache_size: i32,
+        metadata_cache_size_bytes: i32,
         storage_options: HashMap<String, String>,
     ) -> Result<Self> {
         let params = ReadParams {
             index_cache_size: index_cache_size as usize,
-            metadata_cache_size: metadata_cache_size as usize,
+            metadata_cache_size_bytes: metadata_cache_size_bytes as usize,
             store_options: Some(ObjectStoreParams {
                 block_size: block_size.map(|size| size as usize),
                 ..Default::default()
@@ -605,7 +605,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     version_obj: JObject,    // Optional<Integer>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size: jint,
-    metadata_cache_size: jint,
+    metadata_cache_size_bytes: jint,
     storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -616,7 +616,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
             version_obj,
             block_size_obj,
             index_cache_size,
-            metadata_cache_size,
+            metadata_cache_size_bytes,
             storage_options_obj
         )
     )
@@ -628,7 +628,7 @@ fn inner_open_native<'local>(
     version_obj: JObject,    // Optional<Integer>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size: jint,
-    metadata_cache_size: jint,
+    metadata_cache_size_bytes: jint,
     storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
@@ -641,7 +641,7 @@ fn inner_open_native<'local>(
         version,
         block_size,
         index_cache_size,
-        metadata_cache_size,
+        metadata_cache_size_bytes,
         storage_options,
     )?;
     dataset.into_java(env)

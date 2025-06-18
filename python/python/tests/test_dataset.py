@@ -3439,3 +3439,20 @@ def test_create_table_from_pydict(tmp_path):
     }
     ds = lance.write_dataset(dat, tmp_path)
     assert ds.to_table() == pa.Table.from_pydict(dat)
+
+
+def test_metadata_cache_size(tmp_path):
+    lance.write_dataset(pa.table({"id": [1, 2, 3]}), tmp_path / "test")
+
+    ds = lance.dataset(tmp_path / "test")
+    ds.to_table()  # Populate cache
+    default_size = ds.session().size_bytes()
+    assert default_size > 0
+
+    ds = lance.dataset(tmp_path / "test", metadata_cache_size_bytes=0)
+    ds.to_table()  # Attempt to populate cache (should be limited by 0 size)
+    zero_cache_size = ds.session().size_bytes()
+
+    # With zero cache size, session should be smaller than default
+    # (it won't be exactly 0 due to struct overhead)
+    assert zero_cache_size < default_size

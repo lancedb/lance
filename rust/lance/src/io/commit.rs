@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
+use lance_core::cache::LanceCache;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_file::version::LanceFileVersion;
@@ -57,7 +58,6 @@ use crate::dataset::{
 };
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
-use crate::session::Session;
 use crate::Dataset;
 
 mod conflict_resolver;
@@ -81,18 +81,26 @@ pub(crate) async fn read_transaction_file(
     transaction.try_into()
 }
 
-pub(crate) fn transaction_file_cache_path(base_path: &Path, version: u64) -> Path {
-    base_path
-        .child("_transactions")
-        .child(format!("{}.txn", version))
+pub(crate) fn transaction_file_cache_key(version: u64) -> String {
+    format!("txn/{version}")
 }
 
-pub(crate) fn manifest_cache_path(location: &ManifestLocation) -> Path {
-    let mut buf = location.path.clone();
+pub(crate) fn manifest_cache_key(location: &ManifestLocation) -> String {
     if let Some(e_tag) = &location.e_tag {
-        buf = buf.child(e_tag.as_str());
+        format!("manifest/{}/{}", location.version, e_tag)
+    } else {
+        format!("manifest/{}", location.version)
     }
-    buf
+}
+
+pub(crate) fn deletion_file_cache_key(fragment_id: u64, deletion_file: &DeletionFile) -> String {
+    format!(
+        "deletion/{}/{}/{}/{}",
+        fragment_id,
+        deletion_file.read_version,
+        deletion_file.id,
+        deletion_file.file_type.suffix()
+    )
 }
 
 /// Write a transaction to a file and return the relative path.
@@ -120,7 +128,7 @@ async fn do_commit_new_dataset(
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     blob_version: Option<u64>,
-    session: &Session,
+    metadata_cache: &LanceCache,
 ) -> Result<(Manifest, ManifestLocation)> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
@@ -148,12 +156,12 @@ async fn do_commit_new_dataset(
     // if there is a conflict.
     match result {
         Ok(manifest_location) => {
-            session.file_metadata_cache.insert(
-                transaction_file_cache_path(base_path, manifest.version),
+            metadata_cache.insert(
+                &transaction_file_cache_key(manifest.version),
                 Arc::new(transaction.clone()),
             );
-            session.file_metadata_cache.insert(
-                manifest_cache_path(&manifest_location),
+            metadata_cache.insert(
+                &manifest_cache_key(&manifest_location),
                 Arc::new(manifest.clone()),
             );
             Ok((manifest, manifest_location))
@@ -173,7 +181,7 @@ pub(crate) async fn commit_new_dataset(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-    session: &Session,
+    metadata_cache: &LanceCache,
 ) -> Result<(Manifest, ManifestLocation)> {
     let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blob_path = base_path.child(BLOB_DIR);
@@ -186,7 +194,7 @@ pub(crate) async fn commit_new_dataset(
             write_config,
             manifest_naming_scheme,
             None,
-            session,
+            metadata_cache,
         )
         .await?;
         Some(blob_manifest.version)
@@ -202,7 +210,7 @@ pub(crate) async fn commit_new_dataset(
         write_config,
         manifest_naming_scheme,
         blob_version,
-        session,
+        metadata_cache,
     )
     .await
 }
@@ -842,13 +850,12 @@ pub(crate) async fn commit_transaction(
         match result {
             Ok(manifest_location) => {
                 // Cache both the transaction file and manifest
-                let cache_path = transaction_file_cache_path(&dataset.base, target_version);
+                let cache_key = transaction_file_cache_key(target_version);
                 dataset
-                    .session()
-                    .file_metadata_cache
-                    .insert(cache_path, Arc::new(transaction.clone()));
-                dataset.session().file_metadata_cache.insert(
-                    manifest_cache_path(&manifest_location),
+                    .metadata_cache
+                    .insert(&cache_key, Arc::new(transaction.clone()));
+                dataset.metadata_cache.insert(
+                    &manifest_cache_key(&manifest_location),
                     Arc::new(manifest.clone()),
                 );
                 if !indices.is_empty() {
@@ -923,6 +930,7 @@ mod tests {
 
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
+    use crate::Dataset;
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler

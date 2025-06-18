@@ -468,7 +468,7 @@ pub mod tests {
     use crate::scalar::ScalarIndex;
     use arrow_schema::DataType;
     use datafusion_common::ScalarValue;
-    use lance_core::cache::FileMetadataCache;
+    use lance_core::cache::LanceCache;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::mask::RowIdTreeMap;
     use lance_io::object_store::ObjectStore;
@@ -487,7 +487,7 @@ pub mod tests {
         use crate::scalar::IndexStore;
         use arrow_schema::DataType;
         use datafusion_common::ScalarValue;
-        use lance_core::cache::FileMetadataCache;
+        use lance_core::cache::LanceCache;
         use lance_core::utils::mask::RowIdTreeMap;
         use lance_io::object_store::ObjectStore;
         use object_store::path::Path;
@@ -517,7 +517,7 @@ pub mod tests {
         let test_store = LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         );
 
         // This call should never trigger a "byte array offset overflow" error since now the code supports
@@ -625,7 +625,7 @@ pub mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
 
         // Simulate a bitmap where:

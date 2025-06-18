@@ -12,7 +12,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
-use lance_core::{cache::FileMetadataCache, Error, Result};
+use lance_core::{cache::LanceCache, Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
@@ -37,7 +37,7 @@ use super::{IndexReader, IndexStore, IndexWriter};
 pub struct LanceIndexStore {
     object_store: Arc<ObjectStore>,
     index_dir: Path,
-    metadata_cache: FileMetadataCache,
+    metadata_cache: Arc<LanceCache>,
     scheduler: Arc<ScanScheduler>,
 }
 
@@ -54,7 +54,7 @@ impl LanceIndexStore {
     pub fn new(
         object_store: Arc<ObjectStore>,
         index_dir: Path,
-        metadata_cache: FileMetadataCache,
+        metadata_cache: Arc<LanceCache>,
     ) -> Self {
         let scheduler = ScanScheduler::new(
             object_store.clone(),
@@ -330,7 +330,7 @@ pub mod tests {
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
-    use lance_core::{cache::CapacityMode, utils::mask::RowIdTreeMap};
+    use lance_core::utils::mask::RowIdTreeMap;
     use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
@@ -341,7 +341,7 @@ pub mod tests {
                 .now_or_never()
                 .unwrap()
                 .unwrap();
-        let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
+        let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 

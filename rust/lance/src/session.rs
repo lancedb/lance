@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
@@ -24,8 +24,12 @@ pub struct Session {
     /// Cache for opened indices.
     pub(crate) index_cache: IndexCache,
 
-    /// Cache for file metadata
-    pub(crate) file_metadata_cache: FileMetadataCache,
+    /// Global cache for file metadata.
+    ///
+    /// Sub-caches are created from this cache for each dataset by adding the
+    /// URI as a key prefix. See the [`LanceDataset::metadata_cache`] field.
+    /// This prevents collisions between different datasets.
+    pub(crate) metadata_cache: LanceCache,
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
@@ -36,7 +40,7 @@ impl DeepSizeOf for Session {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         let mut size = 0;
         size += self.index_cache.deep_size_of_children(context);
-        size += self.file_metadata_cache.deep_size_of_children(context);
+        size += self.metadata_cache.deep_size_of_children(context);
         for ext in self.index_extensions.values() {
             size += ext.deep_size_of_children(context);
         }
@@ -54,8 +58,9 @@ impl std::fmt::Debug for Session {
             .field(
                 "file_metadata_cache",
                 &format!(
-                    "FileMetadataCache(items={})",
-                    self.file_metadata_cache.approx_size(),
+                    "LanceCache(items={}, size_bytes={})",
+                    self.metadata_cache.approx_size(),
+                    self.metadata_cache.size_bytes(),
                 ),
             )
             .field(
@@ -83,7 +88,7 @@ impl Session {
     ) -> Self {
         Self {
             index_cache: IndexCache::new(index_cache_size),
-            file_metadata_cache: FileMetadataCache::new(metadata_cache_size),
+            metadata_cache: LanceCache::with_capacity(metadata_cache_size),
             index_extensions: HashMap::new(),
             store_registry,
         }
@@ -147,7 +152,7 @@ impl Session {
 
     pub fn approx_num_items(&self) -> usize {
         self.index_cache.approx_size()
-            + self.file_metadata_cache.approx_size()
+            + self.metadata_cache.approx_size()
             + self.index_extensions.len()
     }
 
@@ -161,7 +166,7 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             index_cache: IndexCache::new(DEFAULT_INDEX_CACHE_SIZE),
-            file_metadata_cache: FileMetadataCache::new(DEFAULT_METADATA_CACHE_SIZE),
+            metadata_cache: LanceCache::with_capacity(DEFAULT_METADATA_CACHE_SIZE),
             index_extensions: HashMap::new(),
             store_registry: Arc::new(ObjectStoreRegistry::default()),
         }

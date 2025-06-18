@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
-use crate::io::deletion::read_dataset_deletion_file;
+use crate::io::{commit::deletion_file_cache_key, deletion::read_dataset_deletion_file};
 use crate::{
     dataset::transaction::{Operation, Transaction},
     Dataset,
@@ -14,10 +14,7 @@ use lance_core::{
 };
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_table::format::Index;
-use lance_table::{
-    format::Fragment,
-    io::deletion::{deletion_file_path, write_deletion_file},
-};
+use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use snafu::{location, Location};
 use std::{
     borrow::Cow,
@@ -970,15 +967,9 @@ impl<'a> TransactionRebase<'a> {
                     .await?;
 
                     // Make sure this is available in the cache for future conflict resolution.
-                    let path = deletion_file_path(
-                        &dataset.base,
-                        *fragment_id,
-                        new_deletion_file.as_ref().unwrap(),
-                    );
-                    dataset
-                        .session
-                        .file_metadata_cache
-                        .insert(path, Arc::new(dv));
+                    let key =
+                        deletion_file_cache_key(*fragment_id, new_deletion_file.as_ref().unwrap());
+                    dataset.metadata_cache.insert(&key, Arc::new(dv));
 
                     // TODO: also cleanup the old deletion file.
                     new_deletion_files.insert(*fragment_id, new_deletion_file);
@@ -1341,15 +1332,11 @@ mod tests {
         .await
         .unwrap();
 
-        let path = deletion_file_path(
-            &dataset.base,
-            fragment.id,
-            fragment.deletion_file.as_ref().unwrap(),
-        );
+        let cache_key =
+            deletion_file_cache_key(fragment.id, fragment.deletion_file.as_ref().unwrap());
         dataset
-            .session
-            .file_metadata_cache
-            .insert(path, Arc::new(current_deletions));
+            .metadata_cache
+            .insert(&cache_key, Arc::new(current_deletions));
 
         fragment.clone()
     }

@@ -27,7 +27,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, TryStreamExt};
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID};
@@ -128,8 +128,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
         let file_metadata_cache = session
             .upgrade()
-            .map(|sess| sess.file_metadata_cache.clone())
-            .unwrap_or_else(FileMetadataCache::no_cache);
+            .map(|sess| sess.metadata_cache.clone())
+            .unwrap_or_else(LanceCache::no_cache);
         let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
         let index_reader = FileReader::try_open(
             scheduler

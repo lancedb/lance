@@ -761,7 +761,7 @@ mod tests {
     use arrow_array::{types::Float64Type, RecordBatchReader};
     use arrow_array::{RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use lance_core::cache::FileMetadataCache;
+    use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_encoding::decoder::DecoderPlugins;
@@ -871,7 +871,7 @@ mod tests {
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
-            &FileMetadataCache::no_cache(),
+            &LanceCache::no_cache(),
             FileReaderOptions::default(),
         )
         .await
@@ -951,7 +951,7 @@ mod tests {
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
-            &FileMetadataCache::no_cache(),
+            &LanceCache::no_cache(),
             FileReaderOptions::default(),
         )
         .await
