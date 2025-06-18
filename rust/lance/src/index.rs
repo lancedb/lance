@@ -174,6 +174,7 @@ pub(crate) async fn remap_index(
                         let training_request = Box::new(TrainingRequest::new(
                             Arc::new(dataset.clone()),
                             field.name.clone(),
+                            true, // Legacy reindexing should always train
                         ));
                         train_inverted_index(
                             training_request,
@@ -2190,14 +2191,16 @@ mod tests {
 
                 // Check if the index is truly empty (expected for proper empty index implementation)
                 let stats_before_optimize = dataset.index_statistics("index").await.unwrap();
+                println!("📊 Index statistics after creation: {}", stats_before_optimize);
+                
                 let is_truly_empty = stats_before_optimize.contains("\"num_indexed_rows\": 0") || 
                                    stats_before_optimize.contains("\"num_indexed_rows\":0");
                 
-                if !is_truly_empty {
+                if is_truly_empty {
+                    println!("✅ Index type {index_type:?} successfully created empty index!");
+                } else {
                     println!("⚠ Index type {index_type:?} created with train=false but still has indexed rows");
-                    println!("   This indicates empty index creation is not fully implemented yet");
-                    println!("   Stats: {}", stats_before_optimize);
-                    // For TDD, we'll continue the test to verify other behaviors
+                    println!("   This indicates empty index creation needs refinement");
                 }
 
                 // Test optimize_indices with index (empty or not)

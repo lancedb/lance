@@ -122,7 +122,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 LANCE_SCALAR_INDEX,
             ) => {
                 let params = ScalarIndexParams::new(self.index_type.try_into()?);
-                build_scalar_index(self.dataset, column, &index_id.to_string(), &params).await?
+                build_scalar_index(self.dataset, column, &index_id.to_string(), &params, self.train).await?
             }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 // Guess the index type
@@ -134,7 +134,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         message: "Scalar index type must take a ScalarIndexParams".to_string(),
                         location: location!(),
                     })?;
-                build_scalar_index(self.dataset, column, &index_id.to_string(), params).await?
+                build_scalar_index(self.dataset, column, &index_id.to_string(), params, self.train).await?
             }
             (IndexType::Inverted, _) => {
                 // Inverted index params.
@@ -147,7 +147,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         location: location!(),
                     })?;
 
-                build_inverted_index(self.dataset, column, &index_id.to_string(), inverted_params)
+                build_inverted_index(self.dataset, column, &index_id.to_string(), inverted_params, self.train)
                     .await?;
                 inverted_index_details()
             }
@@ -232,13 +232,19 @@ impl<'a> CreateIndexBuilder<'a> {
             name: index_name,
             fields: vec![field.id],
             dataset_version: self.dataset.manifest.version,
-            fragment_bitmap: Some(
-                self.dataset
-                    .get_fragments()
-                    .iter()
-                    .map(|f| f.id() as u32)
-                    .collect(),
-            ),
+            fragment_bitmap: if self.train {
+                // Include all fragments if training occurred
+                Some(
+                    self.dataset
+                        .get_fragments()
+                        .iter()
+                        .map(|f| f.id() as u32)
+                        .collect(),
+                )
+            } else {
+                // Empty bitmap for untrained indices
+                Some(roaring::RoaringBitmap::new())
+            },
             index_details: Some(index_details),
             index_version: self.index_type.version(),
         };
