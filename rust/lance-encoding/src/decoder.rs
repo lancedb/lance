@@ -517,9 +517,9 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
             pb::array_encoding::ArrayEncoding::InlineBitpacking(description) => {
                 Ok(Box::new(InlineBitpacking::from_description(description)))
             }
-            pb::array_encoding::ArrayEncoding::Variable(_) => {
-                Ok(Box::new(BinaryMiniBlockDecompressor::default()))
-            }
+            pb::array_encoding::ArrayEncoding::Variable(description) => Ok(Box::new(
+                BinaryMiniBlockDecompressor::from_variable(description),
+            )),
             pb::array_encoding::ArrayEncoding::Fsst(description) => {
                 Ok(Box::new(FsstMiniBlockDecompressor::new(description)))
             }
@@ -786,6 +786,7 @@ impl CoreFieldDecoderStrategy {
             let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                 column_info.as_ref(),
                 self.decompressor_strategy.as_ref(),
+                32, // Use 32-bit offsets for standard primitive fields
             )?);
 
             // advance to the next top level column
@@ -800,6 +801,7 @@ impl CoreFieldDecoderStrategy {
                     let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                         column_info.as_ref(),
                         self.decompressor_strategy.as_ref(),
+                        32, // Use 32-bit offsets for packed struct fields
                     )?);
 
                     // advance to the next top level column
@@ -825,6 +827,7 @@ impl CoreFieldDecoderStrategy {
                 let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                     column_info.as_ref(),
                     self.decompressor_strategy.as_ref(),
+                    32, // Use 32-bit offsets for Binary/Utf8
                 )?);
                 column_infos.next_top_level();
                 Ok(scheduler)
@@ -834,6 +837,7 @@ impl CoreFieldDecoderStrategy {
                 let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                     column_info.as_ref(),
                     self.decompressor_strategy.as_ref(),
+                    64, // Use 64-bit offsets for LargeBinary/LargeUtf8
                 )?);
                 column_infos.next_top_level();
                 Ok(scheduler)

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, OffsetSizeTrait};
 use arrow_buffer::{bit_util, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use bytemuck::{cast_slice, try_cast_slice};
 use byteorder::{ByteOrder, LittleEndian};
@@ -531,17 +531,14 @@ impl ArrayEncoder for BinaryEncoder {
 #[derive(Debug, Default)]
 pub struct BinaryMiniBlockEncoder {}
 
-const AIM_MINICHUNK_SIZE: u64 = 4 * 1024;
+const AIM_MINICHUNK_SIZE: i64 = 4 * 1024;
 
 // Make it to support both u32 and u64
-fn chunk_offsets<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
+fn chunk_offsets<N: OffsetSizeTrait>(
     offsets: &[N],
-    // auto deduce from offsets?
-    offset_size /*the number of bytes in the type from offsets */: usize,
     data: &[u8],
     alignment: usize,
 ) -> (Vec<LanceBuffer>, Vec<MiniBlockChunk>) {
-    //assert!(data.bits_per_offset == 32 || data.bit_per_offset == 64);
     #[derive(Debug)]
     struct ChunkInfo {
         chunk_start_offset_in_orig_idx: usize,
@@ -555,21 +552,21 @@ fn chunk_offsets<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
         padded_chunk_size: usize,
     }
 
+    let byte_width: usize = N::get_byte_width();
     let mut chunks_info = vec![];
     let mut chunks = vec![];
     let mut last_offset_in_orig_idx = 0;
     loop {
-        let this_last_offset_in_orig_idx =
-            search_next_offset_idx(offsets, offset_size, last_offset_in_orig_idx);
+        let this_last_offset_in_orig_idx = search_next_offset_idx(offsets, last_offset_in_orig_idx);
 
         let num_values_in_this_chunk = this_last_offset_in_orig_idx - last_offset_in_orig_idx;
         let chunk_bytes = offsets[this_last_offset_in_orig_idx] - offsets[last_offset_in_orig_idx];
         let this_chunk_size =
-            (num_values_in_this_chunk + 1) * offset_size + chunk_bytes.to_usize().unwrap();
+            (num_values_in_this_chunk + 1) * byte_width + chunk_bytes.to_usize().unwrap();
 
         let padded_chunk_size = this_chunk_size.next_multiple_of(alignment);
 
-        let this_chunk_bytes_start_offset = (num_values_in_this_chunk + 1) * offset_size;
+        let this_chunk_bytes_start_offset = (num_values_in_this_chunk + 1) * byte_width;
         chunks_info.push(ChunkInfo {
             chunk_start_offset_in_orig_idx: last_offset_in_orig_idx,
             chunk_last_offset_in_orig_idx: this_last_offset_in_orig_idx,
@@ -603,11 +600,12 @@ fn chunk_offsets<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
             .iter()
             .map(|offset| {
                 *offset - offsets[chunk.chunk_start_offset_in_orig_idx]
-                    + N::from(chunk.bytes_start_offset).unwrap()
+                    + N::from_usize(chunk.bytes_start_offset).unwrap()
             })
             .collect();
 
-        output.extend_from_slice(bytemuck::cast_slice(&this_chunk_offsets));
+        let this_chunk_offsets = LanceBuffer::reinterpret_vec(this_chunk_offsets);
+        output.extend_from_slice(&this_chunk_offsets);
 
         let start_in_orig = offsets[chunk.chunk_start_offset_in_orig_idx]
             .to_usize()
@@ -618,8 +616,6 @@ fn chunk_offsets<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
         output.extend_from_slice(&data[start_in_orig..end_in_orig]);
 
         // pad this chunk to make it align to desired bytes.
-        // Use the runtime alignment parameter instead of the compile-time constant
-        // QUESTION: WHY 72????????
         const PAD_BYTE: u8 = 72;
         let pad_len = pad_bytes_to(output.len(), alignment);
 
@@ -635,21 +631,16 @@ fn chunk_offsets<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
 // this function incrementally peek the number of values in a chunk,
 // each time multiplies the number of values by 2.
 // It returns the offset_idx in `offsets` that belongs to this chunk.
-
-fn search_next_offset_idx<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
-    offsets: &[N],
-    offset_size: usize,
-    last_offset_idx: usize,
-) -> usize {
+fn search_next_offset_idx<N: OffsetSizeTrait>(offsets: &[N], last_offset_idx: usize) -> usize {
     let mut num_values = 1;
     let mut new_num_values = num_values * 2;
     loop {
         if last_offset_idx + new_num_values >= offsets.len() {
             let existing_bytes = offsets[offsets.len() - 1] - offsets[last_offset_idx];
             // existing bytes plus the new offset size
-            let new_size =
-                existing_bytes + N::from((offsets.len() - last_offset_idx) * offset_size).unwrap();
-            if new_size.to_u64().unwrap() <= AIM_MINICHUNK_SIZE {
+            let new_size = existing_bytes
+                + N::from_usize((offsets.len() - last_offset_idx) * N::get_byte_width()).unwrap();
+            if new_size.to_i64().unwrap() <= AIM_MINICHUNK_SIZE {
                 // case 1: can fit the rest of all data into a miniblock
                 return offsets.len() - 1;
             } else {
@@ -658,8 +649,9 @@ fn search_next_offset_idx<N: num_traits::PrimInt + num_traits::Unsigned + bytemu
             }
         }
         let existing_bytes = offsets[last_offset_idx + new_num_values] - offsets[last_offset_idx];
-        let new_size = existing_bytes + N::from((new_num_values + 1) * offset_size).unwrap();
-        if new_size.to_u64().unwrap() <= AIM_MINICHUNK_SIZE {
+        let new_size =
+            existing_bytes + N::from_usize((new_num_values + 1) * N::get_byte_width()).unwrap();
+        if new_size.to_i64().unwrap() <= AIM_MINICHUNK_SIZE {
             num_values = new_num_values;
             new_num_values *= 2;
         } else {
@@ -677,12 +669,10 @@ impl BinaryMiniBlockEncoder {
         &self,
         mut data: VariableWidthBlock,
     ) -> (MiniBlockCompressed, crate::format::pb::ArrayEncoding) {
-        // TODO: extend me to support 64 bits
-        //assert!(data.bits_per_offset == 32);
         match data.bits_per_offset {
             32 => {
-                let offsets = data.offsets.borrow_to_typed_slice::<u32>();
-                let (buffers, chunks) = chunk_offsets(offsets.as_ref(), 4, &data.data, 4);
+                let offsets = data.offsets.borrow_to_typed_slice::<i32>();
+                let (buffers, chunks) = chunk_offsets(offsets.as_ref(), &data.data, 4);
                 (
                     MiniBlockCompressed {
                         data: buffers,
@@ -693,8 +683,8 @@ impl BinaryMiniBlockEncoder {
                 )
             }
             64 => {
-                let offsets = data.offsets.borrow_to_typed_slice::<u64>();
-                let (buffers, chunks) = chunk_offsets(offsets.as_ref(), 8, &data.data, 8);
+                let offsets = data.offsets.borrow_to_typed_slice::<i64>();
+                let (buffers, chunks) = chunk_offsets(offsets.as_ref(), &data.data, 8);
                 (
                     MiniBlockCompressed {
                         data: buffers,
@@ -725,8 +715,23 @@ impl MiniBlockCompressor for BinaryMiniBlockEncoder {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct BinaryMiniBlockDecompressor {}
+#[derive(Debug)]
+pub struct BinaryMiniBlockDecompressor {
+    bits_per_offset: u8,
+}
+
+impl BinaryMiniBlockDecompressor {
+    pub fn new(bits_per_offset: u8) -> Self {
+        assert!(bits_per_offset == 32 || bits_per_offset == 64);
+        Self { bits_per_offset }
+    }
+
+    pub fn from_variable(variable: &pb::Variable) -> Self {
+        Self {
+            bits_per_offset: variable.bits_per_offset as u8,
+        }
+    }
+}
 
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // decompress a MiniBlock of binary data, the num_values must be less than or equal
@@ -735,11 +740,8 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
         let data = data.into_iter().next().unwrap();
-        // Use the starting offset and num_values to detect 32 or 64 bits
-        let is_64bit = data.len() >= (num_values + 1) as usize * 8;
-        // DELETE ME
-        //println!("is_64bit? {}", is_64bit);
-        if is_64bit {
+
+        if self.bits_per_offset == 64 {
             // offset and at least one value
             assert!(data.len() >= 16);
 
@@ -981,29 +983,10 @@ pub mod tests {
         check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
     }
 
-    /*
-    #[rstest]
-    #[test_log::test(tokio::test)]
-    async fn test_large_binary_fsst(
-        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
-        structural_encoding: &str,
-    ) {
-        let mut field_metadata = HashMap::new();
-        field_metadata.insert(
-            STRUCTURAL_ENCODING_META_KEY.to_string(),
-            structural_encoding.into(),
-        );
-        field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
-
-        let field = Field::new("", DataType::LargeBinary, true).with_metadata(field_metadata);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
-    }
-         */
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_large_binary(
         #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-        //#[values(LanceFileVersion::V2_1)] version: LanceFileVersion,
     ) {
         let field = Field::new("", DataType::LargeBinary, true);
         check_round_trip_encoding_random(field, version).await;

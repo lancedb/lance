@@ -387,8 +387,9 @@ impl FsstMiniBlockDecompressor {
 impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         // Step 1. decompress data use `BinaryMiniBlockDecompressor`
+        // TODO: Support 64 bits for FSST compressor
         let binary_decompressor =
-            Box::new(BinaryMiniBlockDecompressor::default()) as Box<dyn MiniBlockDecompressor>;
+            Box::new(BinaryMiniBlockDecompressor::new(32)) as Box<dyn MiniBlockDecompressor>;
         let compressed_data_block = binary_decompressor.decompress(data, num_values)?;
         let DataBlock::VariableWidth(mut compressed_data_block) = compressed_data_block else {
             panic!("BinaryMiniBlockDecompressor should output VariableWidth DataBlock")
