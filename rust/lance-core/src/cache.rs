@@ -224,6 +224,24 @@ pub struct CacheStats {
     pub misses: u64,
 }
 
+impl CacheStats {
+    pub fn hit_ratio(&self) -> f32 {
+        if self.hits + self.misses == 0 {
+            0.0
+        } else {
+            self.hits as f32 / (self.hits + self.misses) as f32
+        }
+    }
+
+    pub fn miss_ratio(&self) -> f32 {
+        if self.hits + self.misses == 0 {
+            0.0
+        } else {
+            self.misses as f32 / (self.hits + self.misses) as f32
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

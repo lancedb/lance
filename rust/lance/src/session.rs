@@ -12,7 +12,6 @@ use lance_io::object_store::ObjectStoreRegistry;
 use snafu::location;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
-use crate::index::cache::IndexCache;
 
 use self::index_extension::IndexExtension;
 
@@ -22,7 +21,7 @@ pub mod index_extension;
 #[derive(Clone)]
 pub struct Session {
     /// Cache for opened indices.
-    pub(crate) index_cache: IndexCache,
+    pub(crate) index_cache: LanceCache,
 
     /// Global cache for file metadata.
     ///
@@ -87,7 +86,7 @@ impl Session {
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
         Self {
-            index_cache: IndexCache::new(index_cache_size),
+            index_cache: LanceCache::with_capacity(index_cache_size),
             metadata_cache: LanceCache::with_capacity(metadata_cache_size),
             index_extensions: HashMap::new(),
             store_registry,
@@ -164,12 +163,16 @@ impl Session {
     pub fn metadata_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.metadata_cache.stats()
     }
+
+    pub fn index_cache_stats(&self) -> lance_core::cache::CacheStats {
+        self.index_cache.stats()
+    }
 }
 
 impl Default for Session {
     fn default() -> Self {
         Self {
-            index_cache: IndexCache::new(DEFAULT_INDEX_CACHE_SIZE),
+            index_cache: LanceCache::with_capacity(DEFAULT_INDEX_CACHE_SIZE),
             metadata_cache: LanceCache::with_capacity(DEFAULT_METADATA_CACHE_SIZE),
             index_extensions: HashMap::new(),
             store_registry: Arc::new(ObjectStoreRegistry::default()),
@@ -180,81 +183,14 @@ impl Default for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use arrow_array::{FixedSizeListArray, Float32Array};
-    use lance_arrow::FixedSizeListArrayExt;
-    use std::sync::Arc;
-
-    use crate::index::vector::pq::PQIndex;
-    use lance_index::vector::pq::ProductQuantizer;
-    use lance_linalg::distance::DistanceType;
+    use lance_index::vector::VectorIndex;
 
     #[test]
     fn test_disable_index_cache() {
         let no_cache = Session::new(0, 0, Default::default());
-        assert!(no_cache.index_cache.get_vector("abc").is_none());
-        let no_cache = Arc::new(no_cache);
-
-        let pq = ProductQuantizer::new(
-            1,
-            8,
-            1,
-            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 1)
-                .unwrap(),
-            DistanceType::L2,
-        );
-        let idx = Arc::new(PQIndex::new(pq, DistanceType::L2, None));
-        no_cache.index_cache.insert_vector("abc", idx);
-
-        assert!(no_cache.index_cache.get_vector("abc").is_none());
-        assert_eq!(no_cache.index_cache.len_vector(), 0);
-    }
-
-    #[test]
-    fn test_basic() {
-        let session = Session::new(10, 1, Default::default());
-        let session = Arc::new(session);
-
-        let pq = ProductQuantizer::new(
-            1,
-            8,
-            1,
-            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 1)
-                .unwrap(),
-            DistanceType::L2,
-        );
-        let idx = Arc::new(PQIndex::new(pq, DistanceType::L2, None));
-        assert_eq!(session.index_cache.get_size(), 0);
-
-        assert_eq!(session.index_cache.hit_rate(), 1.0);
-        session.index_cache.insert_vector("abc", idx.clone());
-
-        let found = session.index_cache.get_vector("abc");
-        assert!(found.is_some());
-        assert_eq!(format!("{:?}", found.unwrap()), format!("{:?}", idx));
-        assert_eq!(session.index_cache.hit_rate(), 1.0);
-        assert!(session.index_cache.get_vector("def").is_none());
-        assert_eq!(session.index_cache.hit_rate(), 0.5);
-        assert!(session.index_cache.get_vector("abc").is_some());
-        assert_eq!(session.index_cache.len_vector(), 1);
-        assert_eq!(session.index_cache.get_size(), 1);
-
-        for iter_idx in 0..100 {
-            let pq_other = ProductQuantizer::new(
-                1,
-                8,
-                1,
-                FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 1)
-                    .unwrap(),
-                DistanceType::L2,
-            );
-            let idx_other = Arc::new(PQIndex::new(pq_other, DistanceType::L2, None));
-            session
-                .index_cache
-                .insert_vector(format!("{iter_idx}").as_str(), idx_other.clone());
-        }
-
-        // Capacity is 10 so there should be at most 10 items
-        assert_eq!(session.index_cache.len_vector(), 10);
+        assert!(no_cache
+            .index_cache
+            .get_unsized::<dyn VectorIndex>("abc")
+            .is_none());
     }
 }

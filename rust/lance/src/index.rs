@@ -69,7 +69,6 @@ use vector::ivf::v2::IVFIndex;
 use vector::utils::get_vector_type;
 
 pub(crate) mod append;
-pub(crate) mod cache;
 pub mod frag_reuse;
 pub mod prefilter;
 pub mod scalar;
@@ -470,19 +469,17 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        let indices = match self
-            .session
-            .index_cache
-            .get_metadata(self.base.as_ref(), self.version().version)
-        {
+        let metadata_key = self.version().version.to_string();
+        let indices = match self.index_cache.get::<Vec<IndexMetadata>>(&metadata_key) {
             Some(indices) => indices,
             None => {
-                let loaded_indices = read_manifest_indexes(
+                let mut loaded_indices = read_manifest_indexes(
                     &self.object_store,
                     &self.manifest_location,
                     &self.manifest,
                 )
                 .await?;
+                retain_supported_indices(&mut loaded_indices);
                 let loaded_indices = Arc::new(loaded_indices);
                 self.session.index_cache.insert_metadata(
                     self.base.as_ref(),
@@ -515,17 +512,23 @@ impl DatasetIndexExt for Dataset {
 
         if let Some(fri_meta) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
             let uuid = fri_meta.uuid.to_string();
-            let fri = if let Some(index) = self.session.index_cache.get_frag_reuse(&uuid) {
-                log::debug!("Found fragment reuse index in cache uuid: {}", uuid);
-                index
-            } else {
-                let index_details = load_frag_reuse_index_details(self, fri_meta).await?;
-                let index = open_frag_reuse_index(index_details.as_ref()).await?;
-                self.session
-                    .index_cache
-                    .insert_frag_reuse(&uuid, index.clone());
-                index
-            };
+            let fri = self
+                .index_cache
+                .get_or_insert(format!("fri-{}", uuid), || async move {
+                    let index_details = load_frag_reuse_index_details(self, fri_meta).await?;
+                    open_frag_reuse_index(index_details.as_ref()).await
+                })
+                .await?;
+            // let fri = if let Some(index) = self.index_cache.get_frag_reuse(&uuid) {
+            //     log::debug!("Found fragment reuse index in cache uuid: {}", uuid);
+            //     index
+            // } else {
+            //     let index_details = load_frag_reuse_index_details(self, fri_meta).await?;
+            //     let index = open_frag_reuse_index(index_details.as_ref()).await?;
+            //     self.index_cache
+            //         .insert_frag_reuse(&uuid, index.clone());
+            //     index
+            // };
             indices.iter_mut().for_each(|idx| {
                 if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
                     fri.remap_fragment_bitmap(bitmap).unwrap();
@@ -854,6 +857,24 @@ impl DatasetIndexExt for Dataset {
             ))),
         }
     }
+}
+
+fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
+    indices.retain(|idx| {
+        let max_valid_version = infer_index_type(idx)
+            .map(|t| t.version())
+            .unwrap_or_default();
+        let is_valid = idx.index_version <= max_valid_version;
+        if !is_valid {
+            log::warn!(
+                "Index {} has version {}, which is not supported (<={}), ignoring it",
+                idx.name,
+                idx.index_version,
+                max_valid_version,
+            );
+        }
+        is_valid
+    })
 }
 
 /// A trait for internal dataset utilities
