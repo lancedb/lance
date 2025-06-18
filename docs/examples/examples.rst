@@ -13,7 +13,6 @@ Python Examples
    Python/flickr8k_dataset_creation
    Python/clip_training
    Python/artefact_management
-   Python/spark_datasource_example
 
 Rust Examples
 -------------
