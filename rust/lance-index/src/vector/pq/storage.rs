@@ -477,6 +477,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             metadata.dimension,
             distance_type,
             metadata.transposed,
+            None,
         )
     }
 

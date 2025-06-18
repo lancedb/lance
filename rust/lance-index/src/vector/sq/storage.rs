@@ -278,6 +278,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
             distance_type,
             metadata.bounds.clone(),
             [batch],
+            None,
         )
     }
 
