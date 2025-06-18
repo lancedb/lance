@@ -26,8 +26,8 @@ def test_scans():
 
 @pytest.mark.forward
 @pytest.mark.skipif(
-    Version(lance.__version__) < Version("0.29.0.beta2"),  # at least 0.29.0-beta.2
-    reason="Lance 0.29.0-beta.2 would ignore indices too new",
+    Version(lance.__version__) < Version("0.29.1.beta2"),  # at least 0.29.1-beta.2
+    reason="Lance 0.29.1-beta.2 would ignore indices too new",
 )
 def test_pq_buffer():
     ds = lance.dataset(get_path("pq_in_schema"))

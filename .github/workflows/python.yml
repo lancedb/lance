@@ -126,10 +126,10 @@ jobs:
           source venv/bin/activate
           pip install pytest pylance==0.16.0
           pytest python/tests/forward_compat --run-forward
-      - name: Run forward compatibility tests (pylance 0.29.0.beta2)
+      - name: Run forward compatibility tests (pylance 0.29.1.beta2)
         run: |
           source venv/bin/activate
-          pip install pytest --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==0.29.0.beta2
+          pip install pytest --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==0.29.1.beta2
           pytest python/tests/forward_compat --run-forward
       # Make sure wheels are not included in the Rust cache
       - name: Delete wheels
