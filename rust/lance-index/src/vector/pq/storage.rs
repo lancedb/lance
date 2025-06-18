@@ -33,7 +33,6 @@ use snafu::location;
 use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use super::ProductQuantizer;
 use crate::frag_reuse::FragReuseIndex;
-use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     pb,
     vector::{

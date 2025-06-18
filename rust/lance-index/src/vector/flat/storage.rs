@@ -242,6 +242,7 @@ impl QuantizerStorage for FlatBinStorage {
         _: std::ops::Range<usize>,
         _: DistanceType,
         _: &Self::Metadata,
+        _: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }

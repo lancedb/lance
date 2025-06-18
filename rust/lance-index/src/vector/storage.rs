@@ -19,8 +19,6 @@ use prost::Message;
 use snafu::location;
 use std::{any::Any, sync::Arc};
 
-use super::quantizer::Quantizer;
-use super::DISTANCE_TYPE_KEY;
 use crate::frag_reuse::FragReuseIndex;
 use crate::{
     pb,

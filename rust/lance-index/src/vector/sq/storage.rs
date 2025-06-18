@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use super::{inverse_scalar_dist, scale_to_u8, ScalarQuantizer};
 use crate::frag_reuse::FragReuseIndex;
-use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     vector::{
         quantizer::{QuantizerMetadata, QuantizerStorage},
