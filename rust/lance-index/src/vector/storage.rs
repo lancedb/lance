@@ -22,6 +22,9 @@ use lance_linalg::distance::DistanceType;
 use prost::Message;
 use snafu::location;
 
+use super::quantizer::Quantizer;
+use super::DISTANCE_TYPE_KEY;
+use crate::frag_reuse::FragReuseIndex;
 use crate::{
     pb,
     vector::{
@@ -29,9 +32,6 @@ use crate::{
         quantizer::Quantization,
     },
 };
-
-use super::quantizer::Quantizer;
-use super::DISTANCE_TYPE_KEY;
 
 /// <section class="warning">
 ///  Internal API
@@ -70,7 +70,11 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
     /// Create a [VectorStore] from a [RecordBatch].
     /// The batch should consist of row IDs and quantized vector.
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>;
+    fn try_from_batch(
+        batch: RecordBatch,
+        distance_type: DistanceType,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self>;
 
     fn as_any(&self) -> &dyn Any;
 
@@ -112,7 +116,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
             .collect::<Result<Vec<_>>>()?;
 
         let batch = concat_batches(self.schema(), batches.iter())?;
-        Self::try_from_batch(batch, self.distance_type())
+        Self::try_from_batch(batch, self.distance_type(), None)
     }
 
     fn len(&self) -> usize;
@@ -155,15 +159,22 @@ pub struct StorageBuilder<Q: Quantization> {
 
     // this is for testing purpose
     assert_num_columns: bool,
+    fri: Option<Arc<FragReuseIndex>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
-    pub fn new(vector_column: String, distance_type: DistanceType, quantizer: Q) -> Result<Self> {
+    pub fn new(
+        vector_column: String,
+        distance_type: DistanceType,
+        quantizer: Q,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         Ok(Self {
             vector_column,
             distance_type,
             quantizer,
             assert_num_columns: true,
+            fri,
         })
     }
 
@@ -200,7 +211,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
             STORAGE_METADATA_KEY.to_owned(),
             self.quantizer.metadata(None)?.to_string(),
         )?;
-        Q::Storage::try_from_batch(batch, self.distance_type)
+        Q::Storage::try_from_batch(batch, self.distance_type, self.fri.clone())
     }
 }
 
@@ -213,6 +224,7 @@ pub struct IvfQuantizationStorage {
     metadata: Vec<String>,
 
     ivf: IvfModel,
+    fri: Option<Arc<FragReuseIndex>>,
 }
 
 impl DeepSizeOf for IvfQuantizationStorage {
@@ -226,7 +238,7 @@ impl IvfQuantizationStorage {
     /// Open a Loader.
     ///
     ///
-    pub async fn try_new(reader: FileReader) -> Result<Self> {
+    pub async fn try_new(reader: FileReader, fri: Option<Arc<FragReuseIndex>>) -> Result<Self> {
         let schema = reader.schema();
 
         let distance_type = DistanceType::try_from(
@@ -270,6 +282,7 @@ impl IvfQuantizationStorage {
             distance_type,
             metadata,
             ivf,
+            fri,
         })
     }
 
@@ -325,6 +338,6 @@ impl IvfQuantizationStorage {
             // it's all the same for all partitions, so now we store only one copy of it
             self.metadata[0].clone(),
         )?;
-        Q::Storage::try_from_batch(batch, self.distance_type)
+        Q::Storage::try_from_batch(batch, self.distance_type, self.fri.clone())
     }
 }

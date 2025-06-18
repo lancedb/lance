@@ -13,7 +13,14 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.query import BoostQuery, MatchQuery, MultiMatchQuery, PhraseQuery
+from lance.query import (
+    BooleanQuery,
+    BoostQuery,
+    MatchQuery,
+    MultiMatchQuery,
+    Occur,
+    PhraseQuery,
+)
 from lance.vector import vec_to_table
 
 
@@ -798,6 +805,20 @@ def test_fts_boolean_query(tmp_path):
         "frodo was a puppy with a tail",
     }
 
+    results = ds.to_table(
+        full_text_query=BooleanQuery(
+            [
+                (Occur.MUST, MatchQuery("puppy", "text")),
+                (Occur.MUST_NOT, MatchQuery("happy", "text")),
+            ]
+        ),
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+    }
+
 
 def test_fts_with_postfilter(tmp_path):
     tab = pa.table({"text": ["Frodo the puppy"] * 100, "id": range(100)})
@@ -834,6 +855,19 @@ def test_fts_all_deleted(dataset):
     first_row_doc = dataset.take(indices=[0], columns=["doc"]).column(0)[0].as_py()
     dataset.delete(f"doc = '{first_row_doc}'")
     dataset.to_table(full_text_query=first_row_doc)
+
+
+def test_fts_deleted_rows(tmp_path):
+    data = pa.table({"text": ["lance is cool", "databases are cool", "search is neat"]})
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+    ds.insert(
+        pa.table({"text": ["lance is cool", "databases are cool", "search is neat"]})
+    )
+
+    ds.delete("text = 'lance is cool'")
+    results = ds.to_table(full_text_query="cool")
+    assert results.num_rows == 2
 
 
 def test_index_after_merge_insert(tmp_path):

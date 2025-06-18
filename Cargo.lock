@@ -4452,6 +4452,7 @@ dependencies = [
  "random_word",
  "rayon",
  "roaring",
+ "rstest",
  "serde",
  "serde_json",
  "snafu",

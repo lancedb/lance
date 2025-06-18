@@ -17,11 +17,11 @@ use lance_table::format::SelfDescribingFileReader;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 
-use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
-
 use super::flat::index::{FlatBinQuantizer, FlatQuantizer};
 use super::pq::ProductQuantizer;
 use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
+use crate::frag_reuse::FragReuseIndex;
+use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
 pub trait Quantization:
     Send
@@ -195,6 +195,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>;
 }
 
@@ -294,6 +295,13 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     ///
     pub async fn load_partition(&self, part_id: usize) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
-        Q::Storage::load_partition(&self.reader, range, self.distance_type, &self.metadata).await
+        Q::Storage::load_partition(
+            &self.reader,
+            range,
+            self.distance_type,
+            &self.metadata,
+            None,
+        )
+        .await
     }
 }

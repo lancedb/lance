@@ -23,8 +23,9 @@ class FullTextOperator(Enum):
 
 
 class Occur(Enum):
-    MUST = "MUST"
     SHOULD = "SHOULD"
+    MUST = "MUST"
+    MUST_NOT = "MUST_NOT"
 
 
 class FullTextQuery(abc.ABC):

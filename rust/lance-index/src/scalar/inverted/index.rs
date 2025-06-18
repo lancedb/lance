@@ -67,6 +67,7 @@ use super::{
     iter::{PostingListIterator, TokenIterator, TokenSource},
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
+use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::{
     AnyQuery, IndexReader, IndexStore, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
 };
@@ -212,7 +213,11 @@ impl InvertedIndex {
             .unzip())
     }
 
-    async fn load_legacy_index(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
+    async fn load_legacy_index(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<Self>> {
+        log::warn!("loading legacy FTS index");
         let tokens_fut = tokio::spawn({
             let store = store.clone();
             async move {
@@ -240,7 +245,7 @@ impl InvertedIndex {
             let store = store.clone();
             async move {
                 let docs_reader = store.open_index_file(DOCS_FILE).await?;
-                let docs = DocSet::load(docs_reader, true).await?;
+                let docs = DocSet::load(docs_reader, true, fri).await?;
                 Result::Ok(docs)
             }
         });
@@ -341,7 +346,7 @@ impl ScalarIndex for InvertedIndex {
         true
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
+    async fn load(store: Arc<dyn IndexStore>, fri: Option<Arc<FragReuseIndex>>) -> Result<Arc<Self>>
     where
         Self: Sized,
     {
@@ -369,7 +374,12 @@ impl ScalarIndex for InvertedIndex {
 
                 let partitions = partitions.into_iter().map(|id| {
                     let store = store.clone();
-                    async move { Result::Ok(Arc::new(InvertedPartition::load(store, id).await?)) }
+                    let fri_clone = fri.clone();
+                    async move {
+                        Result::Ok(Arc::new(
+                            InvertedPartition::load(store, id, fri_clone).await?,
+                        ))
+                    }
                 });
                 let partitions = stream::iter(partitions)
                     .buffer_unordered(store.io_parallelism())
@@ -385,7 +395,7 @@ impl ScalarIndex for InvertedIndex {
             }
             Err(_) => {
                 // old index format
-                Self::load_legacy_index(store).await
+                Self::load_legacy_index(store, fri).await
             }
         }
     }
@@ -432,13 +442,17 @@ impl InvertedPartition {
         self.inverted_list.lengths.is_none()
     }
 
-    pub async fn load(store: Arc<dyn IndexStore>, id: u64) -> Result<Self> {
+    pub async fn load(
+        store: Arc<dyn IndexStore>,
+        id: u64,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
         let inverted_list = PostingListReader::try_new(invert_list_file).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
-        let docs = DocSet::load(docs_file, false).await?;
+        let docs = DocSet::load(docs_file, false, fri).await?;
 
         Ok(Self {
             id,
@@ -1292,6 +1306,20 @@ impl DeepSizeOf for CompressedPostingList {
 }
 
 impl CompressedPostingList {
+    pub fn new(
+        blocks: LargeBinaryArray,
+        max_score: f32,
+        length: u32,
+        positions: Option<ListArray>,
+    ) -> Self {
+        Self {
+            max_score,
+            length,
+            blocks,
+            positions,
+        }
+    }
+
     pub fn from_batch(batch: &RecordBatch, max_score: f32, length: u32) -> Self {
         debug_assert_eq!(batch.num_rows(), 1);
         let blocks = batch[POSTING_COL]
@@ -1709,7 +1737,11 @@ impl DocSet {
         Ok(batch)
     }
 
-    pub async fn load(reader: Arc<dyn IndexReader>, is_legacy: bool) -> Result<Self> {
+    pub async fn load(
+        reader: Arc<dyn IndexReader>,
+        is_legacy: bool,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
@@ -1721,11 +1753,28 @@ impl DocSet {
             true => row_id_col
                 .values()
                 .iter()
+                .filter_map(|id| {
+                    if let Some(fri_ref) = fri.as_ref() {
+                        fri_ref.remap_row_id(*id)
+                    } else {
+                        Some(*id)
+                    }
+                })
                 .zip(num_tokens_col.values().iter())
                 .sorted_unstable_by_key(|x| x.0)
                 .unzip(),
             false => {
-                let row_ids = row_id_col.values().to_vec();
+                let row_ids = row_id_col
+                    .values()
+                    .iter()
+                    .filter_map(|id| {
+                        if let Some(fri_ref) = fri.as_ref() {
+                            fri_ref.remap_row_id(*id)
+                        } else {
+                            Some(*id)
+                        }
+                    })
+                    .collect();
                 let num_tokens = num_tokens_col.values().to_vec();
                 (row_ids, num_tokens)
             }
@@ -1927,6 +1976,7 @@ pub fn flat_bm25_search_stream(
             .collect::<Vec<_>>();
         let mask = BooleanArray::from(mask);
         let batch = arrow::compute::filter_record_batch(&batch, &mask)?;
+        debug_assert!(batch[ROW_ID].null_count() == 0, "flat FTS produces nulls");
         Ok(batch)
     });
 
