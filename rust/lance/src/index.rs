@@ -2168,4 +2168,220 @@ mod tests {
             "Empty index should indexed all rows"
         );
     }
+
+    /// Test that scalar indices are retained after deleting all data from a table.
+    ///
+    /// This test verifies that when we:
+    /// 1. Create a table with data
+    /// 2. Add a scalar index with train=true
+    /// 3. Delete all data in the table
+    /// The index remains available on the table.
+    #[rstest]
+    #[case::btree("i", IndexType::BTree, Box::new(ScalarIndexParams::default()))]
+    #[case::bitmap("i", IndexType::Bitmap, Box::new(ScalarIndexParams::default()))]
+    #[case::inverted("text", IndexType::Inverted, Box::new(InvertedIndexParams::default()))]
+    #[tokio::test]
+    async fn test_scalar_index_retained_after_delete_all(
+        #[case] column_name: &str,
+        #[case] index_type: IndexType,
+        #[case] params: Box<dyn IndexParams>,
+    ) {
+        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+
+        // Create dataset with initial data
+        let reader = lance_datagen::gen()
+            .col("i", array::step::<Int32Type>())
+            .col("text", array::rand_utf8(ByteCount::from(10), false))
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://test", None).await.unwrap();
+
+        // Create index with train=true (normal index with data)
+        dataset
+            .create_index_builder(&[column_name], index_type, params.as_ref())
+            .name("index".to_string())
+            .train(true)
+            .execute()
+            .await
+            .unwrap();
+
+        // Verify index was created and has indexed rows
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"], 100,
+            "Index should have indexed all 100 rows"
+        );
+
+        // Delete all rows from the table
+        dataset.delete("true").await.unwrap();
+
+        // Verify table is empty
+        let row_count = dataset.count_rows(None).await.unwrap();
+        assert_eq!(row_count, 0, "Table should be empty after delete all");
+
+        // Critical test: Verify the index still exists after deleting all data
+        let indices_after_delete = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_delete.len(),
+            1,
+            "Index should be retained after deleting all data"
+        );
+        assert_eq!(
+            indices_after_delete[0].name, "index",
+            "Index name should remain the same after delete"
+        );
+
+        // Verify we can still get index statistics
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"], 0,
+            "Index should now report zero indexed rows after delete all"
+        );
+
+        // Test that we can append new data and the index is still there
+        let append_reader = lance_datagen::gen()
+            .col("i", array::step::<Int32Type>())
+            .col("text", array::rand_utf8(ByteCount::from(10), false))
+            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+
+        dataset.append(append_reader, None).await.unwrap();
+
+        // Verify index still exists after append
+        let indices_after_append = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_append.len(),
+            1,
+            "Index should still exist after appending to empty table"
+        );
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"], 0,
+            "Index should now report zero indexed rows after data is added"
+        );
+
+        // Test optimize_indices after delete all
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+
+        // Verify index still exists after optimization
+        let indices_after_optimize = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_optimize.len(),
+            1,
+            "Index should still exist after optimization following delete all"
+        );
+
+        // Verify we can still get index statistics after optimization
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"],
+            dataset.count_rows(None).await.unwrap(),
+            "Index should now cover all newly added rows after optimization"
+        );
+    }
+
+    /// Test that scalar indices are retained after updating rows in a table.
+    ///
+    /// This test verifies that when we:
+    /// 1. Create a table with data
+    /// 2. Add a scalar index with train=true  
+    /// 3. Update rows in the table
+    /// The index remains available on the table.
+    #[rstest]
+    #[case::btree("i", IndexType::BTree, Box::new(ScalarIndexParams::default()))]
+    #[case::bitmap("i", IndexType::Bitmap, Box::new(ScalarIndexParams::default()))]
+    #[case::inverted("text", IndexType::Inverted, Box::new(InvertedIndexParams::default()))]
+    #[tokio::test]
+    async fn test_scalar_index_retained_after_update(
+        #[case] column_name: &str,
+        #[case] index_type: IndexType,
+        #[case] params: Box<dyn IndexParams>,
+    ) {
+        use crate::dataset::UpdateBuilder;
+        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+
+        // Create dataset with initial data
+        let reader = lance_datagen::gen()
+            .col("i", array::step::<Int32Type>())
+            .col("text", array::rand_utf8(ByteCount::from(10), false))
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://test", None).await.unwrap();
+
+        // Create index with train=true (normal index with data)
+        dataset
+            .create_index_builder(&[column_name], index_type, params.as_ref())
+            .name("index".to_string())
+            .train(true)
+            .execute()
+            .await
+            .unwrap();
+
+        // Verify index was created and has indexed rows
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"], 100,
+            "Index should have indexed all 100 rows"
+        );
+
+        // Update some rows - update first 50 rows
+        let update_result = UpdateBuilder::new(Arc::new(dataset))
+            .set("i", "i + 1000")
+            .unwrap()
+            .set("text", "'updated_' || text")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        let mut dataset = update_result.new_dataset.as_ref().clone();
+
+        // Verify row count remains the same
+        let row_count = dataset.count_rows(None).await.unwrap();
+        assert_eq!(row_count, 100, "Row count should remain 100 after update");
+
+        // Critical test: Verify the index still exists after updating data
+        let indices_after_update = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_update.len(),
+            1,
+            "Index should be retained after updating rows"
+        );
+
+        // Verify we can still get index statistics
+        let stats_after_update = dataset.index_statistics("index").await.unwrap();
+        let stats_after_update: serde_json::Value =
+            serde_json::from_str(&stats_after_update).unwrap();
+
+        // The index should still be available
+        assert_eq!(
+            stats_after_update["num_indexed_rows"], 0,
+            "Index statistics should be zero after update, as it is not re-trained"
+        );
+
+        // Test that we can optimize indices after update
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+
+        // Verify index still exists after optimization
+        let indices_after_optimize = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_optimize.len(),
+            1,
+            "Index should still exist after optimization following update"
+        );
+
+        let stats_after_optimization = dataset.index_statistics("index").await.unwrap();
+        let stats_after_optimization: serde_json::Value =
+            serde_json::from_str(&stats_after_optimization).unwrap();
+
+        // The index should still be available
+        assert_eq!(
+            stats_after_optimization["num_unindexed_rows"], 0,
+            "Index should have zero unindexed rows after optimization"
+        );
+    }
 }
