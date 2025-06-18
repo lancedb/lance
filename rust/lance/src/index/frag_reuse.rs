@@ -50,7 +50,7 @@ pub async fn load_frag_reuse_index_details(
         }
         Some(Content::External(external_file)) => {
             let file_path = dataset
-                .base
+                .indices_dir()
                 .child(index.uuid.to_string())
                 .child(external_file.path.clone());
 
@@ -150,8 +150,9 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         writer
             .write_all(new_index_details_proto.encode_to_vec().as_slice())
             .await?;
+        writer.shutdown().await?;
         let external_file = ExternalFile {
-            path: file_path.to_string(),
+            path: FRAG_REUSE_DETAILS_FILE_NAME.to_owned(),
             offset: 0,
             size: new_index_details_proto.encoded_len() as u64,
         };
