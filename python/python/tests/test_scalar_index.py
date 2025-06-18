@@ -857,6 +857,19 @@ def test_fts_all_deleted(dataset):
     dataset.to_table(full_text_query=first_row_doc)
 
 
+def test_fts_deleted_rows(tmp_path):
+    data = pa.table({"text": ["lance is cool", "databases are cool", "search is neat"]})
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+    ds.insert(
+        pa.table({"text": ["lance is cool", "databases are cool", "search is neat"]})
+    )
+
+    ds.delete("text = 'lance is cool'")
+    results = ds.to_table(full_text_query="cool")
+    assert results.num_rows == 2
+
+
 def test_index_after_merge_insert(tmp_path):
     # This regresses a defect where a horizontal merge insert was not taking modified
     # fragments out of the index if the column is modified.

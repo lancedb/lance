@@ -2086,7 +2086,7 @@ impl Scanner {
             let mut scan_node = self.scan_fragments(
                 true,
                 false,
-                true,
+                false,
                 flat_fts_scan_schema,
                 Arc::new(unindexed_fragments),
                 None,
@@ -2266,7 +2266,7 @@ impl Scanner {
             let mut scan_node = self.scan_fragments(
                 true,
                 false,
-                true,
+                false,
                 vector_scan_projection,
                 Arc::new(unindexed_fragments),
                 // Can't pushdown limit/offset in an ANN search

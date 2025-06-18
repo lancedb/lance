@@ -1976,6 +1976,7 @@ pub fn flat_bm25_search_stream(
             .collect::<Vec<_>>();
         let mask = BooleanArray::from(mask);
         let batch = arrow::compute::filter_record_batch(&batch, &mask)?;
+        debug_assert!(batch[ROW_ID].null_count() == 0, "flat FTS produces nulls");
         Ok(batch)
     });
 
