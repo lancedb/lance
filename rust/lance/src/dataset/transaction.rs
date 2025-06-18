@@ -1109,7 +1109,10 @@ impl Transaction {
                         }
                     }
                 });
-                Self::prune_deleted_fragments_from_indices(&mut final_indices, deleted_fragment_ids);
+                Self::prune_deleted_fragments_from_indices(
+                    &mut final_indices,
+                    deleted_fragment_ids,
+                );
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Update {
@@ -1471,10 +1474,7 @@ impl Transaction {
     }
 
     /// Remove deleted fragments from index bitmaps
-    fn prune_deleted_fragments_from_indices(
-        indices: &mut [Index],
-        deleted_fragment_ids: &[u64],
-    ) {
+    fn prune_deleted_fragments_from_indices(indices: &mut [Index], deleted_fragment_ids: &[u64]) {
         for index in indices.iter_mut() {
             if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                 for fragment_id in deleted_fragment_ids.iter().map(|&id| id as u32) {
@@ -1489,7 +1489,7 @@ impl Transaction {
             .fields_pre_order()
             .map(|f| f.id)
             .collect::<HashSet<_>>();
-        
+
         // Remove indices for fields no longer in schema
         indices.retain(|existing_index| {
             existing_index
@@ -1519,31 +1519,39 @@ impl Transaction {
 
         // Apply retention logic for indices with empty bitmaps per index name
         // (except for fragment reuse indices which are always kept)
-        let mut indices_by_name: std::collections::HashMap<String, Vec<&Index>> = std::collections::HashMap::new();
-        
+        let mut indices_by_name: std::collections::HashMap<String, Vec<&Index>> =
+            std::collections::HashMap::new();
+
         // Group indices by name
         for index in indices.iter() {
             if index.name != FRAG_REUSE_INDEX_NAME {
-                indices_by_name.entry(index.name.clone()).or_default().push(index);
+                indices_by_name
+                    .entry(index.name.clone())
+                    .or_default()
+                    .push(index);
             }
         }
 
         // Build a set of UUIDs to keep based on retention rules
         let mut uuids_to_keep = std::collections::HashSet::new();
-        
+
         // For each group of indices with the same name
         for (_, same_name_indices) in indices_by_name {
             if same_name_indices.len() > 1 {
                 // Separate empty and non-empty indices
-                let (empty_indices, non_empty_indices): (Vec<_>, Vec<_>) = same_name_indices.iter().partition(|index| {
-                    index.fragment_bitmap.as_ref().map_or(true, |bitmap| bitmap.is_empty())
-                });
-                
+                let (empty_indices, non_empty_indices): (Vec<_>, Vec<_>) =
+                    same_name_indices.iter().partition(|index| {
+                        index
+                            .fragment_bitmap
+                            .as_ref()
+                            .is_none_or(|bitmap| bitmap.is_empty())
+                    });
+
                 if non_empty_indices.is_empty() {
                     // All indices are empty - keep only the first (oldest) one
                     let mut sorted_indices = empty_indices;
                     sorted_indices.sort_by_key(|index: &&Index| index.dataset_version); // Sort by ascending dataset_version
-                    
+
                     // Keep only the first (oldest)
                     if let Some(oldest) = sorted_indices.first() {
                         uuids_to_keep.insert(oldest.uuid);

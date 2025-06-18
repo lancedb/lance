@@ -1024,7 +1024,13 @@ impl DatasetIndexInternalExt for Dataset {
                 .iter()
                 .any(|f| is_vector_field(f.data_type()));
 
-            idx.fields.len() == 1 && !is_vector_index
+            // Only include indices with non-empty fragment bitmaps
+            let has_non_empty_bitmap = idx
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| !bitmap.is_empty());
+
+            idx.fields.len() == 1 && !is_vector_index && has_non_empty_bitmap
         }) {
             let field = index.fields[0];
             let field = schema.field_by_id(field).ok_or_else(|| Error::Internal {
@@ -2299,35 +2305,38 @@ mod tests {
         );
 
         // Verify index is NOT being used in queries after delete (empty bitmap)
-        let _plan_after_delete = if column_name == "text" {
-            // Use full-text search for inverted index
-            dataset
+        if column_name == "text" {
+            // For inverted index with empty bitmap, full-text search construction succeeds
+            // but execution should fail because no inverted index is available
+            let plan_result = dataset
                 .scan()
                 .project(&[column_name])
                 .unwrap()
                 .full_text_search(FullTextSearchQuery::new("test".to_string()))
                 .unwrap()
                 .explain_plan(false)
-                .await
-                .unwrap()
+                .await;
+            assert!(
+                plan_result.is_err(),
+                "Full text search execution should fail when inverted index has empty bitmap"
+            );
         } else {
             // Use equality filter for btree/bitmap indices
-            dataset
+            let _plan_after_delete = dataset
                 .scan()
                 .filter(format!("{} = 50", column_name).as_str())
                 .unwrap()
                 .explain_plan(false)
                 .await
-                .unwrap()
-        };
-        // TODO: Verify index is NOT being used after delete (empty bitmap)
-        // This will be implemented when we add query-side logic
-        // assert_index_usage(
-        //     &_plan_after_delete,
-        //     column_name,
-        //     false,
-        //     "after delete (empty bitmap)",
-        // );
+                .unwrap();
+            // Verify index is NOT being used after delete (empty bitmap)
+            assert_index_usage(
+                &_plan_after_delete,
+                column_name,
+                false,
+                "after delete (empty bitmap)",
+            );
+        }
 
         // Test that we can append new data and the index is still there
         let append_reader = lance_datagen::gen()
@@ -2490,35 +2499,38 @@ mod tests {
         );
 
         // Verify index is NOT being used in queries after update (empty bitmap)
-        let _plan_after_update = if column_name == "text" {
-            // Use full-text search for inverted index
-            dataset
+        if column_name == "text" {
+            // For inverted index with empty bitmap, full-text search construction succeeds
+            // but execution should fail because no inverted index is available
+            let plan_result = dataset
                 .scan()
                 .project(&[column_name])
                 .unwrap()
                 .full_text_search(FullTextSearchQuery::new("test".to_string()))
                 .unwrap()
                 .explain_plan(false)
-                .await
-                .unwrap()
+                .await;
+            assert!(
+                plan_result.is_err(),
+                "Full text search execution should fail when inverted index has empty bitmap"
+            );
         } else {
             // Use equality filter for btree/bitmap indices
-            dataset
+            let _plan_after_update = dataset
                 .scan()
                 .filter(format!("{} = 50", column_name).as_str())
                 .unwrap()
                 .explain_plan(false)
                 .await
-                .unwrap()
-        };
-        // TODO: Verify index is NOT being used after update (empty bitmap)
-        // This will be implemented when we add query-side logic
-        // assert_index_usage(
-        //     &_plan_after_update,
-        //     column_name,
-        //     false,
-        //     "after update (empty bitmap)",
-        // );
+                .unwrap();
+            // Verify index is NOT being used after update (empty bitmap)
+            assert_index_usage(
+                &_plan_after_update,
+                column_name,
+                false,
+                "after update (empty bitmap)",
+            );
+        }
 
         // Test that we can optimize indices after update
         dataset.optimize_indices(&Default::default()).await.unwrap();

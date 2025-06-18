@@ -578,5 +578,13 @@ pub fn index_matches_criteria(
             return Ok(false);
         }
     }
+
+    // Do not use indices with empty fragment bitmaps
+    if let Some(fragment_bitmap) = &index.fragment_bitmap {
+        if fragment_bitmap.is_empty() {
+            return Ok(false);
+        }
+    }
+
     Ok(true)
 }
