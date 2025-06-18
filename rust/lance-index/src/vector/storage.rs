@@ -160,7 +160,12 @@ impl<Q: Quantization> StorageBuilder<Q> {
         debug_assert!(batch.column_by_name(ROW_ID).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
-        Q::Storage::try_from_batch(batch, &self.quantizer.metadata(None), self.distance_type)
+        Q::Storage::try_from_batch(
+            batch,
+            &self.quantizer.metadata(None),
+            self.distance_type,
+            self.fri.clone(),
+        )
     }
 }
 
@@ -294,6 +299,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let schema = Arc::new(self.reader.schema().as_ref().into());
             concat_batches(&schema, batches.iter())?
         };
-        Q::Storage::try_from_batch(batch, self.metadata(), self.distance_type)
+        Q::Storage::try_from_batch(batch, self.metadata(), self.distance_type, self.fri.clone())
     }
 }

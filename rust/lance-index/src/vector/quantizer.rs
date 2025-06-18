@@ -219,6 +219,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>;
 
     fn metadata(&self) -> &Self::Metadata;
@@ -257,7 +258,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
             .collect::<Result<Vec<_>>>()?;
 
         let batch = concat_batches(self.schema(), batches.iter())?;
-        Self::try_from_batch(batch, self.metadata(), self.distance_type())
+        Self::try_from_batch(batch, self.metadata(), self.distance_type(), None)
     }
 
     async fn load_partition(
