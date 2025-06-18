@@ -386,21 +386,31 @@ message FragmentReuseIndexDetails {
     repeated Version versions = 1;
   }
 
-  message Version {
-    // The dataset_version at the time the index adds this version entry
-    uint64 dataset_version = 1;
+  message FragmentDigest {
+    uint64 id = 1;
 
+    uint64 physical_rows = 2;
+
+    uint64 num_deleted_rows = 3;
+  }
+
+  // A summarized version of the RewriteGroup information in a Rewrite transaction
+  message Group {
     // A roaring treemap of the changed row addresses.
     // When combined with the old fragment IDs and new fragment IDs,
     // it can recover the full mapping of old row addresses to either new row addresses or deleted.
     // this mapping can then be used to remap indexes or satisfy index queries for the new unindexed fragments.
-    bytes changed_row_addrs = 2;
+    bytes changed_row_addrs = 1;
 
-    // Store the full content of old fragments to be used for indexed queries
-    // This should be exactly in the order that a rewrite_files takes in the old fragments
-    repeated DataFragment old_fragments = 3;
+    repeated FragmentDigest old_fragments = 2;
 
-    // This must be exactly in the order that a rewrite_files produces the new fragments
-    repeated uint64 new_fragments = 4;
+    repeated FragmentDigest new_fragments = 3;
+  }
+
+  message Version {
+    // The dataset_version at the time the index adds this version entry
+    uint64 dataset_version = 1;
+
+    repeated Group groups = 3;
   }
 }

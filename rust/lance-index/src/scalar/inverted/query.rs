@@ -96,6 +96,15 @@ impl TryFrom<&str> for Operator {
     }
 }
 
+impl From<Operator> for &'static str {
+    fn from(operator: Operator) -> Self {
+        match operator {
+            Operator::And => "AND",
+            Operator::Or => "OR",
+        }
+    }
+}
+
 pub trait FtsQueryNode {
     fn columns(&self) -> HashSet<String>;
 }
@@ -227,7 +236,16 @@ impl FtsQuery {
                     .into_iter()
                     .map(|q| q.with_column(column.clone()))
                     .collect();
-                Self::Boolean(BooleanQuery { must, should })
+                let must_not = query
+                    .must_not
+                    .into_iter()
+                    .map(|q| q.with_column(column.clone()))
+                    .collect();
+                Self::Boolean(BooleanQuery {
+                    must,
+                    should,
+                    must_not,
+                })
             }
         }
     }
@@ -546,6 +564,7 @@ impl FtsQueryNode for MultiMatchQuery {
 pub enum Occur {
     Should,
     Must,
+    MustNot,
 }
 
 impl TryFrom<&str> for Occur {
@@ -554,6 +573,7 @@ impl TryFrom<&str> for Occur {
         match value.to_ascii_uppercase().as_str() {
             "SHOULD" => Ok(Self::Should),
             "MUST" => Ok(Self::Must),
+            "MUST_NOT" => Ok(Self::MustNot),
             _ => Err(Error::invalid_input(
                 format!("Invalid occur value: {}", value),
                 location!(),
@@ -562,24 +582,40 @@ impl TryFrom<&str> for Occur {
     }
 }
 
+impl From<Occur> for &'static str {
+    fn from(occur: Occur) -> Self {
+        match occur {
+            Occur::Should => "SHOULD",
+            Occur::Must => "MUST",
+            Occur::MustNot => "MUST_NOT",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BooleanQuery {
     pub should: Vec<FtsQuery>,
     pub must: Vec<FtsQuery>,
-    // TODO: support must_not
+    pub must_not: Vec<FtsQuery>,
 }
 
 impl BooleanQuery {
     pub fn new(iter: impl IntoIterator<Item = (Occur, FtsQuery)>) -> Self {
         let mut should = Vec::new();
         let mut must = Vec::new();
+        let mut must_not = Vec::new();
         for (occur, query) in iter {
             match occur {
                 Occur::Should => should.push(query),
                 Occur::Must => must.push(query),
+                Occur::MustNot => must_not.push(query),
             }
         }
-        Self { should, must }
+        Self {
+            should,
+            must,
+            must_not,
+        }
     }
 
     pub fn with_should(mut self, query: FtsQuery) -> Self {
@@ -591,6 +627,11 @@ impl BooleanQuery {
         self.must.push(query);
         self
     }
+
+    pub fn with_must_not(mut self, query: FtsQuery) -> Self {
+        self.must_not.push(query);
+        self
+    }
 }
 
 impl FtsQueryNode for BooleanQuery {
@@ -600,6 +641,9 @@ impl FtsQueryNode for BooleanQuery {
             columns.extend(query.columns());
         }
         for query in &self.must {
+            columns.extend(query.columns());
+        }
+        for query in &self.must_not {
             columns.extend(query.columns());
         }
         columns
@@ -712,7 +756,12 @@ pub fn fill_fts_query_column(
                 .iter()
                 .map(|query| fill_fts_query_column(query, columns, replace))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(FtsQuery::Boolean(BooleanQuery { must, should }))
+            let must_not = bool_query
+                .must_not
+                .iter()
+                .map(|query| fill_fts_query_column(query, columns, replace))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(FtsQuery::Boolean(BooleanQuery { must, should, must_not }))
         }
     }
 }

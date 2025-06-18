@@ -6,6 +6,12 @@
 
 use std::sync::Arc;
 
+use crate::index::DatasetIndexInternalExt;
+use crate::session::Session;
+use crate::{
+    dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
+    Dataset,
+};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -14,6 +20,7 @@ use futures::TryStreamExt;
 use lance_core::datatypes::Field;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
+use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::{
     btree::DEFAULT_BTREE_BATCH_SIZE, inverted::tokenizer::InvertedIndexParams,
 };
@@ -38,12 +45,6 @@ use lance_table::format::Index;
 use log::info;
 use snafu::location;
 use tracing::instrument;
-
-use crate::session::Session;
-use crate::{
-    dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
-    Dataset,
-};
 
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
 const TRAINING_UPDATE_FREQ: usize = 1000000;
@@ -358,29 +359,31 @@ pub async fn open_scalar_index(
     dataset: &Dataset,
     column: &str,
     index: &Index,
+    metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let uuid_str = index.uuid.to_string();
     let index_store = Arc::new(LanceIndexStore::from_dataset(dataset, &uuid_str));
     let index_type = detect_scalar_index_type(dataset, index, column, &dataset.session).await?;
+    let fri = dataset.open_frag_reuse_index(metrics).await?;
     match index_type {
         ScalarIndexType::Bitmap => {
-            let bitmap_index = BitmapIndex::load(index_store).await?;
+            let bitmap_index = BitmapIndex::load(index_store, fri).await?;
             Ok(bitmap_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::LabelList => {
-            let tag_index = LabelListIndex::load(index_store).await?;
+            let tag_index = LabelListIndex::load(index_store, fri).await?;
             Ok(tag_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::Inverted => {
-            let inverted_index = InvertedIndex::load(index_store).await?;
+            let inverted_index = InvertedIndex::load(index_store, fri).await?;
             Ok(inverted_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::NGram => {
-            let ngram_index = NGramIndex::load(index_store).await?;
+            let ngram_index = NGramIndex::load(index_store, fri).await?;
             Ok(ngram_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::BTree => {
-            let btree_index = BTreeIndex::load(index_store).await?;
+            let btree_index = BTreeIndex::load(index_store, fri).await?;
             Ok(btree_index as Arc<dyn ScalarIndex>)
         }
     }

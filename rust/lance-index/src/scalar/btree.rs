@@ -10,6 +10,12 @@ use std::{
     sync::Arc,
 };
 
+use super::{
+    flat::FlatIndexMetadata, AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector,
+    SargableQuery, ScalarIndex, SearchResult,
+};
+use crate::frag_reuse::FragReuseIndex;
+use crate::{Index, IndexType};
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
@@ -43,13 +49,6 @@ use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
 use snafu::location;
 use tracing::info;
-
-use crate::{Index, IndexType};
-
-use super::{
-    flat::FlatIndexMetadata, AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector,
-    SargableQuery, ScalarIndex, SearchResult,
-};
 
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
@@ -735,6 +734,7 @@ pub struct BTreeIndex {
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
     batch_size: u64,
+    fri: Option<Arc<FragReuseIndex>>,
 }
 
 impl BTreeIndex {
@@ -744,6 +744,7 @@ impl BTreeIndex {
         store: Arc<dyn IndexStore>,
         sub_index: Arc<dyn BTreeSubIndex>,
         batch_size: u64,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Self {
         let page_lookup = Arc::new(BTreeLookup::new(tree, null_pages));
         let page_cache = Arc::new(BTreeCache(
@@ -758,6 +759,7 @@ impl BTreeIndex {
             store,
             sub_index,
             batch_size,
+            fri,
         }
     }
 
@@ -773,9 +775,12 @@ impl BTreeIndex {
         metrics.record_part_load();
         info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
-        let serialized_page = index_reader
+        let mut serialized_page = index_reader
             .read_record_batch(page_number as u64, self.batch_size)
             .await?;
+        if let Some(fri_ref) = self.fri.as_ref() {
+            serialized_page = fri_ref.remap_row_ids_record_batch(serialized_page, 1)?;
+        }
         let subindex = self.sub_index.load_subindex(serialized_page).await?;
         self.page_cache.0.insert(page_number, subindex.clone());
         Ok(subindex)
@@ -806,6 +811,7 @@ impl BTreeIndex {
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
         batch_size: u64,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
         let mut null_pages = Vec::<u32>::new();
@@ -813,7 +819,9 @@ impl BTreeIndex {
         if data.num_rows() == 0 {
             let data_type = data.column(0).data_type().clone();
             let sub_index = Arc::new(FlatIndexMetadata::new(data_type));
-            return Ok(Self::new(map, null_pages, store, sub_index, batch_size));
+            return Ok(Self::new(
+                map, null_pages, store, sub_index, batch_size, fri,
+            ));
         }
 
         let mins = data.column(0);
@@ -855,7 +863,9 @@ impl BTreeIndex {
         // TODO: Support other page types?
         let sub_index = Arc::new(FlatIndexMetadata::new(data_type.clone()));
 
-        Ok(Self::new(map, null_pages, store, sub_index, batch_size))
+        Ok(Self::new(
+            map, null_pages, store, sub_index, batch_size, fri,
+        ))
     }
 
     /// Create a stream of all the data in the index, in the same format used to train the index
@@ -1006,7 +1016,10 @@ impl ScalarIndex for BTreeIndex {
         true
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BTREE_LOOKUP_NAME).await?;
         let num_rows_in_lookup = page_lookup_file.num_rows();
         let serialized_lookup = page_lookup_file
@@ -1022,6 +1035,7 @@ impl ScalarIndex for BTreeIndex {
             serialized_lookup,
             store,
             batch_size,
+            fri,
         )?))
     }
 
@@ -1447,7 +1461,7 @@ mod tests {
         .await
         .unwrap();
 
-        let index = BTreeIndex::load(test_store.clone()).await.unwrap();
+        let index = BTreeIndex::load(test_store.clone(), None).await.unwrap();
 
         assert_eq!(index.page_lookup.null_pages.len(), 10);
 
@@ -1464,7 +1478,7 @@ mod tests {
             .await
             .unwrap();
 
-        let remap_index = BTreeIndex::load(remap_store.clone()).await.unwrap();
+        let remap_index = BTreeIndex::load(remap_store.clone(), None).await.unwrap();
 
         assert_eq!(remap_index.page_lookup, index.page_lookup);
 
@@ -1527,7 +1541,7 @@ mod tests {
             .await
             .unwrap();
 
-        let index = BTreeIndex::load(test_store).await.unwrap();
+        let index = BTreeIndex::load(test_store, None).await.unwrap();
 
         for (idx, value) in values.into_iter().enumerate() {
             let query = SargableQuery::Equals(ScalarValue::Float64(Some(value)));

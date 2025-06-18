@@ -13,7 +13,14 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.query import BoostQuery, MatchQuery, MultiMatchQuery, PhraseQuery
+from lance.query import (
+    BooleanQuery,
+    BoostQuery,
+    MatchQuery,
+    MultiMatchQuery,
+    Occur,
+    PhraseQuery,
+)
 from lance.vector import vec_to_table
 
 
@@ -795,6 +802,20 @@ def test_fts_boolean_query(tmp_path):
     assert results.num_rows == 2
     assert set(results["text"].to_pylist()) == {
         "frodo was a happy puppy",
+        "frodo was a puppy with a tail",
+    }
+
+    results = ds.to_table(
+        full_text_query=BooleanQuery(
+            [
+                (Occur.MUST, MatchQuery("puppy", "text")),
+                (Occur.MUST_NOT, MatchQuery("happy", "text")),
+            ]
+        ),
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
         "frodo was a puppy with a tail",
     }
 

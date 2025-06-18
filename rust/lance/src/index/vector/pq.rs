@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 use arrow::compute::concat;
+use arrow_array::types::UInt64Type;
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
     Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
@@ -20,6 +21,7 @@ use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
+use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::{transpose, ProductQuantizationStorage};
@@ -36,7 +38,6 @@ use roaring::RoaringBitmap;
 use serde_json::json;
 use snafu::location;
 use tracing::{instrument, span, Level};
-
 // Re-export
 pub use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::kernels::normalize_fsl;
@@ -65,6 +66,8 @@ pub struct PQIndex {
 
     /// Metric type.
     metric_type: MetricType,
+
+    fri: Option<Arc<FragReuseIndex>>,
 }
 
 impl DeepSizeOf for PQIndex {
@@ -97,12 +100,17 @@ impl std::fmt::Debug for PQIndex {
 
 impl PQIndex {
     /// Load a PQ index (page) from the disk.
-    pub(crate) fn new(pq: ProductQuantizer, metric_type: MetricType) -> Self {
+    pub(crate) fn new(
+        pq: ProductQuantizer,
+        metric_type: MetricType,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Self {
         Self {
             code: None,
             row_ids: None,
             pq,
             metric_type,
+            fri,
         }
     }
 
@@ -341,11 +349,40 @@ impl VectorIndex for PQIndex {
             self.pq.num_sub_vectors,
         );
 
+        let (primitive_row_ids, transposed_pq_codes) = if let Some(fri_ref) = self.fri.as_ref() {
+            let num_vectors = row_ids.len();
+            let row_ids = row_ids.as_primitive::<UInt64Type>().values().iter();
+            let (remapped_row_ids, remapped_pq_codes): (Vec<u64>, Vec<Vec<u8>>) = row_ids
+                .enumerate()
+                .filter_map(|(vec_idx, old_row_id)| {
+                    let new_row_id = fri_ref.remap_row_id(*old_row_id);
+                    new_row_id.map(|new_row_id| {
+                        (
+                            new_row_id,
+                            Self::get_pq_codes(&pq_codes, vec_idx, num_vectors),
+                        )
+                    })
+                })
+                .unzip();
+            let transposed_codes = transpose(
+                &UInt8Array::from_iter_values(remapped_pq_codes.into_iter().flatten()),
+                remapped_row_ids.len(),
+                self.pq.num_sub_vectors,
+            );
+            (
+                Arc::new(UInt64Array::from_iter_values(remapped_row_ids)),
+                Arc::new(transposed_codes),
+            )
+        } else {
+            (Arc::new(row_ids.as_primitive().clone()), Arc::new(pq_codes))
+        };
+
         Ok(Box::new(Self {
-            code: Some(Arc::new(pq_codes)),
-            row_ids: Some(Arc::new(row_ids.as_primitive().clone())),
+            code: Some(transposed_pq_codes),
+            row_ids: Some(primitive_row_ids),
             pq: self.pq.clone(),
             metric_type: self.metric_type,
+            fri: self.fri.clone(),
         }))
     }
 
@@ -573,6 +610,8 @@ pub(crate) fn build_pq_storage(
         pq.dimension,
         distance_type,
         false,
+        // TODO: support auto-remap with FRI for HNSW
+        None,
     )?;
 
     Ok(pq_store)
