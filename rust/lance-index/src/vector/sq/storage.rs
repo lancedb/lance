@@ -268,6 +268,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>
     where
         Self: Sized,
@@ -277,7 +278,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
             distance_type,
             metadata.bounds.clone(),
             [batch],
-            None,
+            fri,
         )
     }
 

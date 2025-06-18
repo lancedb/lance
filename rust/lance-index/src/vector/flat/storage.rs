@@ -52,7 +52,14 @@ impl QuantizerStorage for FlatFloatStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
+        let batch = if let Some(fri_ref) = fri.as_ref() {
+            fri_ref.remap_row_ids_record_batch(batch, 0)?
+        } else {
+            batch
+        };
+
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)
@@ -203,7 +210,14 @@ impl QuantizerStorage for FlatBinStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
+        let batch = if let Some(fri_ref) = fri.as_ref() {
+            fri_ref.remap_row_ids_record_batch(batch, 0)?
+        } else {
+            batch
+        };
+
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)

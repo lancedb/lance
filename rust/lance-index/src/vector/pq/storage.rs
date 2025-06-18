@@ -448,6 +448,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>
     where
         Self: Sized,
@@ -476,7 +477,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             metadata.dimension,
             distance_type,
             metadata.transposed,
-            None,
+            fri,
         )
     }
 
