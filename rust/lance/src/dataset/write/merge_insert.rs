@@ -17,7 +17,6 @@
 //! meaningful key column to be able to perform a merge insert.
 
 use assign_action::merge_insert_action;
-use datafusion_expr::col;
 use futures::FutureExt;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -35,14 +34,19 @@ use datafusion::{
     execution::{
         context::{SessionConfig, SessionContext},
         memory_pool::MemoryConsumer,
-    }, logical_expr::{self, Expr, Extension, JoinType, LogicalPlan}, physical_plan::{
+    },
+    logical_expr::{self, Expr, Extension, JoinType, LogicalPlan},
+    physical_plan::{
         joins::{HashJoinExec, PartitionMode},
         projection::ProjectionExec,
         repartition::RepartitionExec,
         stream::RecordBatchStreamAdapter,
         union::UnionExec,
         ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
-    }, physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner}, prelude::DataFrame, scalar::ScalarValue
+    },
+    physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
+    prelude::DataFrame,
+    scalar::ScalarValue,
 };
 
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
@@ -79,13 +83,17 @@ use snafu::{location, ResultExt};
 use tokio::task::JoinSet;
 
 use crate::{
-    datafusion::dataframe::SessionContextExt, dataset::{
+    datafusion::dataframe::SessionContextExt,
+    dataset::{
         fragment::{FileFragment, FragReadConfig},
         transaction::{Operation, Transaction},
         write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
-    }, index::DatasetIndexInternalExt, io::exec::{
+    },
+    index::DatasetIndexInternalExt,
+    io::exec::{
         project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner, TakeExec,
-    }, session, Dataset
+    },
+    Dataset,
 };
 
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
@@ -174,8 +182,8 @@ impl std::hash::Hash for WhenNotMatchedBySource {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
-            WhenNotMatchedBySource::Keep | WhenNotMatchedBySource::Delete => {},
-            WhenNotMatchedBySource::DeleteIf(_) => {
+            Self::Keep | Self::Delete => {}
+            Self::DeleteIf(_) => {
                 format!("{:?}", self).hash(state);
             }
         }
@@ -192,25 +200,25 @@ impl Ord for WhenNotMatchedBySource {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         let self_disc = std::mem::discriminant(self);
         let other_disc = std::mem::discriminant(other);
-        
+
         // Compare discriminants first
         if self_disc != other_disc {
             // Use a simple ordering based on variant pattern
             let self_order = match self {
-                WhenNotMatchedBySource::Keep => 0u8,
-                WhenNotMatchedBySource::Delete => 1u8,
-                WhenNotMatchedBySource::DeleteIf(_) => 2u8,
+                Self::Keep => 0u8,
+                Self::Delete => 1u8,
+                Self::DeleteIf(_) => 2u8,
             };
             let other_order = match other {
-                WhenNotMatchedBySource::Keep => 0u8,
-                WhenNotMatchedBySource::Delete => 1u8,
-                WhenNotMatchedBySource::DeleteIf(_) => 2u8,
+                Self::Keep => 0u8,
+                Self::Delete => 1u8,
+                Self::DeleteIf(_) => 2u8,
             };
             return self_order.cmp(&other_order);
         }
-        
+
         // If same variant, compare contents for complex variants
-        if let (WhenNotMatchedBySource::DeleteIf(_), WhenNotMatchedBySource::DeleteIf(_)) = (self, other) {
+        if let (Self::DeleteIf(_), Self::DeleteIf(_)) = (self, other) {
             format!("{:?}", self).cmp(&format!("{:?}", other))
         } else {
             std::cmp::Ordering::Equal
@@ -259,8 +267,8 @@ impl std::hash::Hash for WhenMatched {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
-            WhenMatched::UpdateAll | WhenMatched::DoNothing => {},
-            WhenMatched::UpdateIf(_) => {
+            Self::UpdateAll | Self::DoNothing => {}
+            Self::UpdateIf(_) => {
                 format!("{:?}", self).hash(state);
             }
         }
@@ -277,25 +285,25 @@ impl Ord for WhenMatched {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         let self_disc = std::mem::discriminant(self);
         let other_disc = std::mem::discriminant(other);
-        
+
         // Compare discriminants first
         if self_disc != other_disc {
             // Use a simple ordering based on variant pattern
             let self_order = match self {
-                WhenMatched::UpdateAll => 0u8,
-                WhenMatched::DoNothing => 1u8,
-                WhenMatched::UpdateIf(_) => 2u8,
+                Self::UpdateAll => 0u8,
+                Self::DoNothing => 1u8,
+                Self::UpdateIf(_) => 2u8,
             };
             let other_order = match other {
-                WhenMatched::UpdateAll => 0u8,
-                WhenMatched::DoNothing => 1u8,
-                WhenMatched::UpdateIf(_) => 2u8,
+                Self::UpdateAll => 0u8,
+                Self::DoNothing => 1u8,
+                Self::UpdateIf(_) => 2u8,
             };
             return self_order.cmp(&other_order);
         }
-        
+
         // If same variant, compare contents for complex variants
-        if let (WhenMatched::UpdateIf(_), WhenMatched::UpdateIf(_)) = (self, other) {
+        if let (Self::UpdateIf(_), Self::UpdateIf(_)) = (self, other) {
             format!("{:?}", self).cmp(&format!("{:?}", other))
         } else {
             std::cmp::Ordering::Equal
@@ -349,10 +357,14 @@ impl PartialOrd for MergeInsertParams {
 
 impl Ord for MergeInsertParams {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.on.cmp(&other.on)
+        self.on
+            .cmp(&other.on)
             .then_with(|| self.when_matched.cmp(&other.when_matched))
             .then_with(|| self.insert_not_matched.cmp(&other.insert_not_matched))
-            .then_with(|| self.delete_not_matched_by_source.cmp(&other.delete_not_matched_by_source))
+            .then_with(|| {
+                self.delete_not_matched_by_source
+                    .cmp(&other.delete_not_matched_by_source)
+            })
             .then_with(|| self.conflict_retries.cmp(&other.conflict_retries))
             .then_with(|| self.retry_timeout.cmp(&other.retry_timeout))
     }
@@ -1322,8 +1334,8 @@ impl MergeInsertJob {
         let df = scan_aliased
             .join(source_df_aliased, JoinType::Right, &on_cols, &on_cols, None)?
             .with_column("action", merge_insert_action(&self.params)?)?;
-        dbg!(df.schema());
-        
+        // dbg!(df.schema());
+
         let (session_state, logical_plan) = df.into_parts();
 
         let write_node = logical_plan::MergeInsertWriteNode::new(
@@ -1337,9 +1349,8 @@ impl MergeInsertJob {
 
         let logical_plan = session_state.optimize(&logical_plan)?;
 
-        let planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
-            MergeInsertPlanner {},
-        )]);
+        let planner =
+            DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(MergeInsertPlanner {})]);
         // This method already does the optimization for us.
         let physical_plan = planner
             .create_physical_plan(&logical_plan, &session_state)
@@ -1361,7 +1372,7 @@ impl MergeInsertJob {
             datafusion_physical_expr::Partitioning::Hash(_, n) => *n,
             datafusion_physical_expr::Partitioning::UnknownPartitioning(n) => *n,
         };
-        
+
         if partition_count != 1 {
             return Err(Error::invalid_input(
                 format!("Expected exactly 1 partition, got {}", partition_count),
@@ -1372,13 +1383,16 @@ impl MergeInsertJob {
         // Execute partition 0 (the only partition)
         let task_context = Arc::new(datafusion::execution::TaskContext::default());
         let mut stream = plan.execute(0, task_context)?;
-        
+
         // Assert that the execution produces no output (this is a write operation)
         if let Some(batch) = stream.next().await {
             let batch = batch?;
             if batch.num_rows() > 0 {
                 return Err(Error::invalid_input(
-                    format!("Expected no output from write operation, got {} rows", batch.num_rows()),
+                    format!(
+                        "Expected no output from write operation, got {} rows",
+                        batch.num_rows()
+                    ),
                     location!(),
                 ));
             }
@@ -1388,15 +1402,23 @@ impl MergeInsertJob {
         let merge_insert_exec = plan
             .as_any()
             .downcast_ref::<exec::FullSchemaMergeInsertExec>()
-            .ok_or_else(|| Error::invalid_input("Expected FullSchemaMergeInsertExec", location!()))?;
-        
-        let stats = merge_insert_exec
-            .merge_stats()
-            .ok_or_else(|| Error::invalid_input("Merge stats not available - execution may not have completed", location!()))?;
+            .ok_or_else(|| {
+                Error::invalid_input("Expected FullSchemaMergeInsertExec", location!())
+            })?;
 
-        let transaction = merge_insert_exec
-            .transaction()
-            .ok_or_else(|| Error::invalid_input("Transaction not available - execution may not have completed", location!()))?;
+        let stats = merge_insert_exec.merge_stats().ok_or_else(|| {
+            Error::invalid_input(
+                "Merge stats not available - execution may not have completed",
+                location!(),
+            )
+        })?;
+
+        let transaction = merge_insert_exec.transaction().ok_or_else(|| {
+            Error::invalid_input(
+                "Transaction not available - execution may not have completed",
+                location!(),
+            )
+        })?;
 
         Ok((transaction, stats))
     }
@@ -1410,7 +1432,7 @@ impl MergeInsertJob {
         // any scalar index.
         if self.params.insert_not_matched
             && matches!(self.params.when_matched, WhenMatched::UpdateAll)
-            && todo!("there is no scalar index")
+            && self.dataset.scalar_index_names().is_empty()
         {
             let (transaction, stats) = self.execute_uncommitted_v2(source).await?;
             return Ok(UncommittedMergeInsert {
@@ -1429,6 +1451,22 @@ impl MergeInsertJob {
                 ..Default::default()
             },
         );
+
+        // We are migrating a new plan-based code path. For now, only using this
+        // for select supported queries: upsert with full schema, no scalar index, and keeping unmatched rows.
+        let has_scalar_index = self.join_key_as_scalar_index().await?.is_some();
+        let can_use_fast_path = self.params.insert_not_matched
+            && matches!(self.params.when_matched, WhenMatched::UpdateAll)
+            && !has_scalar_index
+            && is_full_schema
+            && matches!(
+                self.params.delete_not_matched_by_source,
+                WhenNotMatchedBySource::Keep
+            );
+
+        if can_use_fast_path {
+            return self.execute_uncommitted_v2(source).await;
+        }
 
         let source_schema = source.schema();
         let joined = self.create_joined_stream(source).await?;
@@ -1883,7 +1921,7 @@ mod tests {
         session::Session,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper},
     };
-    
+
     use crate::dataset::scanner::tests::assert_plan_node_equals;
 
     use super::*;
@@ -3068,14 +3106,12 @@ mod tests {
         let ds = Dataset::write(data, "memory://", None).await.unwrap();
 
         // Create upsert job
-        let merge_insert_job = crate::dataset::MergeInsertBuilder::try_new(
-            Arc::new(ds),
-            vec!["key".to_string()],
-        )
-        .unwrap()
-        .when_matched(crate::dataset::WhenMatched::UpdateAll)
-        .try_build()
-        .unwrap();
+        let merge_insert_job =
+            crate::dataset::MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(crate::dataset::WhenMatched::UpdateAll)
+                .try_build()
+                .unwrap();
 
         // Create new data for upsert
         let new_data = lance_datagen::gen()
@@ -3090,23 +3126,26 @@ mod tests {
         // Assert the plan structure using portable plan matching
         // The optimized plan should have:
         // 1. FullSchemaMergeInsertExec at the top
-        // 2. ProjectionExec that only selects necessary columns (source.value, source.key, target._rowaddr, action)
-        // 3. HashJoin with projection optimization
-        // 4. LanceScan that only reads the key column (projection pushdown working!)
+        // 2. ProjectionExec that creates action with key validation (source.key IS NOT NULL)
+        // 3. ProjectionExec that creates the common expression for key validation
+        // 4. HashJoin with projection optimization
+        // 5. LanceScan that only reads the key column (projection pushdown working!)
         assert_plan_node_equals(
             plan,
             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
-  ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN _rowaddr@0 IS NULL THEN 2 WHEN _rowaddr@0 IS NOT NULL THEN 1 ELSE 0 END as action]
-    CoalesceBatchesExec...
-      HashJoinExec: mode=Partitioned, join_type=Right, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
+  CoalescePartitionsExec
+    ProjectionExec: expr=[_rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN __common_expr_1@0 AND _rowaddr@1 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as action]
+      ProjectionExec: expr=[key@2 IS NOT NULL as __common_expr_1, _rowaddr@0 as _rowaddr, value@1 as value, key@2 as key]
         CoalesceBatchesExec...
-          RepartitionExec...
-            RepartitionExec...
-              LanceScan: uri=data, projection=[key], row_id=false, row_addr=true, ordered=false
-        CoalesceBatchesExec...
-          RepartitionExec...
-            RepartitionExec...
-              StreamingTableExec: partition_sizes=1, projection=[value, key]"
+          HashJoinExec: mode=Partitioned, join_type=Right, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
+            CoalesceBatchesExec...
+              RepartitionExec...
+                RepartitionExec...
+                  LanceScan: uri=data, projection=[key], row_id=false, row_addr=true, ordered=false
+            CoalesceBatchesExec...
+              RepartitionExec...
+                RepartitionExec...
+                  StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
 }

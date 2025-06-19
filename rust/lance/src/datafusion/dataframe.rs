@@ -36,7 +36,12 @@ impl LanceTableProvider {
         Self::new_with_ordering(dataset, with_row_id, with_row_addr, true)
     }
 
-    pub fn new_with_ordering(dataset: Arc<Dataset>, with_row_id: bool, with_row_addr: bool, ordered: bool) -> Self {
+    pub fn new_with_ordering(
+        dataset: Arc<Dataset>,
+        with_row_id: bool,
+        with_row_addr: bool,
+        ordered: bool,
+    ) -> Self {
         let mut full_schema = Schema::from(dataset.schema());
         let mut row_id_idx = None;
         let mut row_addr_idx = None;

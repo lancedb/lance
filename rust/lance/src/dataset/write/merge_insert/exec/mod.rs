@@ -14,7 +14,6 @@ pub(super) struct MergeInsertMetrics {
     pub num_deleted_rows: Count,
 }
 
-
 impl From<&MergeInsertMetrics> for MergeStats {
     fn from(value: &MergeInsertMetrics) -> Self {
         Self {

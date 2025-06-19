@@ -6,9 +6,7 @@ use std::sync::Arc;
 use super::{MergeInsertParams, WhenNotMatchedBySource};
 use crate::{dataset::WhenMatched, error::Result};
 use datafusion::scalar::ScalarValue;
-use datafusion_expr::{
-    col, expr::ScalarFunction, sqlparser::keywords::ROWID, Case, Expr, ScalarUDF,
-};
+use datafusion_expr::{col, expr::ScalarFunction, Case, Expr, ScalarUDF};
 use datafusion_functions::core::named_struct::NamedStructFunc;
 
 // Note: right now, this is a fixed enum. In the future, this will need to be
@@ -38,7 +36,27 @@ impl Action {
 /// Transforms merge insert parameters into a logical expression. The output
 /// is a single "action" column, that describes what to do with each row.
 pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
-    let source_has_key: Expr = datafusion_expr::lit(true); // TODO: Make sure at least one key column is non-null
+    // Check that at least one key column is non-null in the source
+    // This ensures we only process rows that have valid join keys
+    let source_has_key: Expr = if params.on.len() == 1 {
+        // Single key column case - check if the source key column is not null
+        // Need to qualify the column to avoid ambiguity between target.key and source.key
+        col(format!("source.{}", &params.on[0])).is_not_null()
+    } else {
+        // Multiple key columns - require that ALL key columns are non-null
+        // This is a stricter requirement than "at least one" to ensure proper joins
+        let key_conditions: Vec<Expr> = params
+            .on
+            .iter()
+            .map(|key| col(format!("source.{}", key)).is_not_null())
+            .collect();
+
+        // Use AND to combine all key column checks (all must be non-null)
+        key_conditions
+            .into_iter()
+            .reduce(|acc, expr| acc.and(expr))
+            .unwrap_or_else(|| datafusion_expr::lit(false))
+    };
 
     let row_addr_is_not_null = col("target._rowaddr").is_not_null();
     let matched = source_has_key.clone().and(row_addr_is_not_null);
@@ -59,7 +77,10 @@ pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
             cases.push((matched, Action::UpdateAll.as_literal_expr()));
         }
         WhenMatched::UpdateIf(condition) => {
-            cases.push((matched.and(condition.clone()), Action::UpdateAll.as_literal_expr()));
+            cases.push((
+                matched.and(condition.clone()),
+                Action::UpdateAll.as_literal_expr(),
+            ));
         }
         WhenMatched::DoNothing => {}
     }
@@ -90,6 +111,7 @@ pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
 // Collect given columns into a struct
 ///
 /// This is the inverse of [datafusion_expr::logical_plan::builder::get_struct_unnested_columns]
+#[allow(dead_code)]
 pub fn collect_to_struct(columns: &[&str], prefix: Option<&str>) -> Expr {
     let mut args = Vec::with_capacity(columns.len() * 2);
     for column in columns {

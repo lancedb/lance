@@ -13,10 +13,7 @@ use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNod
 use lance_core::ROW_ADDR;
 use std::{cmp::Ordering, sync::Arc};
 
-use crate::{
-    dataset::write::merge_insert::exec::{FullSchemaMergeInsertExec},
-    Dataset,
-};
+use crate::{dataset::write::merge_insert::exec::FullSchemaMergeInsertExec, Dataset};
 
 use super::MergeInsertParams;
 
@@ -68,11 +65,7 @@ impl PartialOrd for MergeInsertWriteNode {
 }
 
 impl MergeInsertWriteNode {
-    pub fn new(
-        input: LogicalPlan,
-        dataset: Arc<Dataset>,
-        params: MergeInsertParams,
-    ) -> Self {
+    pub fn new(input: LogicalPlan, dataset: Arc<Dataset>, params: MergeInsertParams) -> Self {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let schema = Arc::new(DFSchema::try_from(empty_schema).unwrap());
         Self {
@@ -132,30 +125,32 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
         // * all columns from the `source` relation
         // * `action` column (unqualified)
         // * `target._rowaddr` column specifically
-        
+
         let input_schema = self.input.schema();
         let mut necessary_columns = Vec::new();
-        
+
         for (i, (qualifier, field)) in input_schema.iter().enumerate() {
             let should_include = match qualifier {
                 // Include all source columns - they contain the new data to write
                 Some(qualifier) if qualifier.table() == "source" => true,
-                
+
                 // Include target._rowaddr specifically - needed to locate existing rows for updates
-                Some(qualifier) if qualifier.table() == "target" && field.name() == ROW_ADDR => true,
-                
+                Some(qualifier) if qualifier.table() == "target" && field.name() == ROW_ADDR => {
+                    true
+                }
+
                 // Include unqualified columns like "action" - tells us what operation to perform
                 None if field.name() == "action" => true,
-                
+
                 // Skip other target columns (target.value, target.key, target._rowid) - not needed for write
                 _ => false,
             };
-            
+
             if should_include {
                 necessary_columns.push(i);
             }
         }
-        
+
         Some(vec![necessary_columns])
     }
 }
