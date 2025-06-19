@@ -8,6 +8,7 @@ use crate::{dataset::WhenMatched, error::Result};
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::{col, expr::ScalarFunction, Case, Expr, ScalarUDF};
 use datafusion_functions::core::named_struct::NamedStructFunc;
+use snafu::location;
 
 // Note: right now, this is a fixed enum. In the future, this will need to be
 // dynamic to support multiple merge insert update clauses like:
@@ -17,14 +18,31 @@ use datafusion_functions::core::named_struct::NamedStructFunc;
 // WHEN MATCHED AND input.event = "new_name" THEN UPDATE SET my_table.name = input.new_name
 // ```
 // At that point we will have a variable number of actions.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-enum Action {
+pub enum Action {
     Nothing = 0,
     /// Update all columns with source values
     UpdateAll = 1,
     Insert = 2,
     Delete = 3,
+}
+
+impl TryFrom<u8> for Action {
+    type Error = crate::Error;
+
+    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Nothing),
+            1 => Ok(Self::UpdateAll),
+            2 => Ok(Self::Insert),
+            3 => Ok(Self::Delete),
+            _ => Err(crate::Error::InvalidInput {
+                source: format!("Invalid action code: {}", value).into(),
+                location: location!(),
+            }),
+        }
+    }
 }
 
 impl Action {

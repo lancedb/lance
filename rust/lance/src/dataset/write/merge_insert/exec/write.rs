@@ -19,12 +19,13 @@ use datafusion::{
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{stream, StreamExt};
 use roaring::RoaringTreemap;
+use snafu::location;
 
 use crate::{
     dataset::{
         transaction::{Operation, Transaction},
         write::{
-            merge_insert::{exec::MergeInsertMetrics, MergeInsertParams, MergeStats},
+            merge_insert::{assign_action::Action, exec::MergeInsertMetrics, MergeInsertParams, MergeStats},
             write_fragments_internal, WriteParams,
         },
     },
@@ -33,6 +34,121 @@ use crate::{
 use lance_core::ROW_ADDR;
 use lance_table::format::Fragment;
 use std::collections::BTreeMap;
+
+/// Shared state for merge insert operations to simplify lock management
+struct MergeState {
+    /// Row addresses that need to be deleted
+    delete_row_addrs: RwLock<RoaringTreemap>,
+    /// Count of actual deletions (not including updates)
+    actual_deletes: RwLock<usize>,
+    /// Merge operation metrics
+    metrics: Mutex<MergeInsertMetrics>,
+}
+
+impl MergeState {
+    fn new(metrics: MergeInsertMetrics) -> Self {
+        Self {
+            delete_row_addrs: RwLock::new(RoaringTreemap::new()),
+            actual_deletes: RwLock::new(0),
+            metrics: Mutex::new(metrics),
+        }
+    }
+
+    /// Process a single row based on its action, updating internal state
+    fn process_row_action(
+        &self,
+        action: Action,
+        row_idx: usize,
+        row_addr_array: &UInt64Array,
+    ) -> DFResult<Option<usize>> {
+        match action {
+            Action::Delete => {
+                // Delete action - only delete, don't write back
+                if !row_addr_array.is_null(row_idx) {
+                    let row_addr = row_addr_array.value(row_idx);
+                    
+                    let mut delete_addrs_guard = self.delete_row_addrs.write().map_err(|_| {
+                        datafusion::error::DataFusionError::Internal(
+                            "Failed to acquire write lock on delete_row_addrs".to_string(),
+                        )
+                    })?;
+                    delete_addrs_guard.insert(row_addr);
+                    
+                    let mut actual_deletes_guard = self.actual_deletes.write().map_err(|_| {
+                        datafusion::error::DataFusionError::Internal(
+                            "Failed to acquire write lock on actual_deletes".to_string(),
+                        )
+                    })?;
+                    *actual_deletes_guard += 1;
+                }
+                Ok(None) // Don't keep this row
+            }
+            Action::UpdateAll => {
+                // Update action - delete old row AND insert new data
+                if !row_addr_array.is_null(row_idx) {
+                    let row_addr = row_addr_array.value(row_idx);
+                    let mut delete_addrs_guard = self.delete_row_addrs.write().map_err(|_| {
+                        datafusion::error::DataFusionError::Internal(
+                            "Failed to acquire write lock on delete_row_addrs".to_string(),
+                        )
+                    })?;
+                    delete_addrs_guard.insert(row_addr);
+                    // Don't count as actual delete - this is an update
+                }
+                
+                if let Ok(metrics_guard) = self.metrics.lock() {
+                    metrics_guard.num_updated_rows.add(1);
+                }
+                Ok(Some(row_idx)) // Keep this row for writing
+            }
+            Action::Insert => {
+                // Insert action - just insert new data
+                if let Ok(metrics_guard) = self.metrics.lock() {
+                    metrics_guard.num_inserted_rows.add(1);
+                }
+                Ok(Some(row_idx)) // Keep this row for writing
+            }
+            Action::Nothing => {
+                // Do nothing action - keep the row but don't count it
+                Ok(Some(row_idx)) // Keep this row for writing
+            }
+        }
+    }
+
+    /// Get a clone of the current delete row addresses
+    fn get_delete_row_addrs(&self) -> Result<RoaringTreemap> {
+        let delete_addrs_guard = self.delete_row_addrs.read().map_err(|_| {
+            crate::Error::InvalidInput {
+                source: "Failed to acquire read lock on delete_row_addrs".into(),
+                location: location!(),
+            }
+        })?;
+        Ok(delete_addrs_guard.clone())
+    }
+
+    /// Get the current count of actual deletions
+    fn get_actual_deletes(&self) -> usize {
+        self.actual_deletes.read()
+            .map(|guard| *guard)
+            .unwrap_or(0)
+    }
+
+    /// Create MergeStats from the current state
+    fn create_merge_stats(&self) -> MergeStats {
+        if let Ok(metrics_guard) = self.metrics.lock() {
+            let mut stats = MergeStats::from(&*metrics_guard);
+            stats.num_deleted_rows = self.get_actual_deletes() as u64;
+            stats
+        } else {
+            MergeStats {
+                num_inserted_rows: 0,
+                num_updated_rows: 0,
+                num_deleted_rows: self.get_actual_deletes() as u64,
+                num_attempts: 1,
+            }
+        }
+    }
+}
 
 /// Inserts new rows and updates existing rows in the target table.
 ///
@@ -80,13 +196,13 @@ impl FullSchemaMergeInsertExec {
     /// Returns the merge statistics if the execution has completed.
     /// Returns `None` if the execution is still in progress or hasn't started.
     pub fn merge_stats(&self) -> Option<MergeStats> {
-        self.merge_stats.lock().unwrap().clone()
+        self.merge_stats.lock().ok().and_then(|guard| guard.clone())
     }
 
     /// Returns the transaction if the execution has completed.
     /// Returns `None` if the execution is still in progress or hasn't started.
     pub fn transaction(&self) -> Option<Transaction> {
-        self.transaction.lock().unwrap().clone()
+        self.transaction.lock().ok().and_then(|guard| guard.clone())
     }
 
     /// Creates a filtered stream that captures row addresses for deletion and returns
@@ -94,9 +210,7 @@ impl FullSchemaMergeInsertExec {
     fn create_filtered_write_stream(
         &self,
         input_stream: SendableRecordBatchStream,
-        delete_row_addrs: Arc<RwLock<RoaringTreemap>>,
-        merge_metrics: Arc<Mutex<MergeInsertMetrics>>,
-        actual_deletes: Arc<RwLock<usize>>,
+        merge_state: Arc<MergeState>,
     ) -> DFResult<SendableRecordBatchStream> {
         let input_schema = input_stream.schema();
 
@@ -176,54 +290,22 @@ impl FullSchemaMergeInsertExec {
                     )
                 })?;
 
-            // Collect row addresses for deletion and track non-delete rows
+            // Process each row using the shared state
             let mut keep_rows = Vec::new();
-            let mut delete_addrs_guard = delete_row_addrs.write().unwrap();
-            let mut actual_deletes_guard = actual_deletes.write().unwrap();
-            let mut insert_count = 0usize;
-            let mut update_count = 0usize;
 
             for row_idx in 0..batch.num_rows() {
-                let action = action_array.value(row_idx);
+                let action_code = action_array.value(row_idx);
+                let action = Action::try_from(action_code).map_err(|e| {
+                    datafusion::error::DataFusionError::Internal(format!(
+                        "Invalid action code {}: {}",
+                        action_code, e
+                    ))
+                })?;
 
-                match action {
-                    0 => {
-                        // Delete action - only delete, don't write back
-                        if !row_addr_array.is_null(row_idx) {
-                            let row_addr = row_addr_array.value(row_idx);
-                            delete_addrs_guard.insert(row_addr);
-                            *actual_deletes_guard += 1; // Count actual deletes
-                        }
-                    }
-                    1 => {
-                        // Update action - delete old row AND insert new data
-                        if !row_addr_array.is_null(row_idx) {
-                            let row_addr = row_addr_array.value(row_idx);
-                            delete_addrs_guard.insert(row_addr);
-                            // Don't count as actual delete - this is an update
-                        }
-                        keep_rows.push(row_idx);
-                        update_count += 1;
-                    }
-                    2 => {
-                        // Insert action - just insert new data
-                        keep_rows.push(row_idx);
-                        insert_count += 1;
-                    }
-                    _ => {
-                        // Other actions (like do nothing)
-                        // We still keep the row but don't count it
-                        keep_rows.push(row_idx);
-                    }
+                // Use the shared state to process the row action
+                if let Some(keep_row_idx) = merge_state.process_row_action(action, row_idx, row_addr_array)? {
+                    keep_rows.push(keep_row_idx);
                 }
-            }
-            drop(delete_addrs_guard);
-            drop(actual_deletes_guard);
-
-            // Update metrics
-            if let Ok(metrics_guard) = merge_metrics.lock() {
-                metrics_guard.num_inserted_rows.add(insert_count);
-                metrics_guard.num_updated_rows.add(update_count);
             }
 
             // If no rows to keep, return empty batch
@@ -409,10 +491,6 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let _baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
-        let merge_metrics = Arc::new(Mutex::new(MergeInsertMetrics::new(
-            &self.metrics,
-            partition,
-        )));
 
         // Input schema structure based on our logical plan:
         // - target._rowaddr: Address of existing rows to update/delete
@@ -422,22 +500,21 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         // Execute the input plan to get the merge data stream
         let input_stream = self.input.execute(partition, context)?;
 
-        // Step 1: Create streaming processor for row addresses and write data
-        let delete_row_addrs = Arc::new(RwLock::new(RoaringTreemap::new()));
-        let actual_deletes = Arc::new(RwLock::new(0usize));
+        // Step 1: Create shared state and streaming processor for row addresses and write data
+        let merge_state = Arc::new(MergeState::new(MergeInsertMetrics::new(
+            &self.metrics,
+            partition,
+        )));
         let write_data_stream = self.create_filtered_write_stream(
             input_stream,
-            delete_row_addrs.clone(),
-            merge_metrics.clone(),
-            actual_deletes.clone(),
+            merge_state.clone(),
         )?;
 
         // Use flat_map to handle the async write operation
         let dataset = self.dataset.clone();
-        let merge_stats = self.merge_stats.clone();
+        let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
-        let merge_metrics_clone = merge_metrics;
-        let actual_deletes_clone = actual_deletes;
+        let merge_state_clone = merge_state;
 
         let result_stream = stream::once(async move {
             // Step 2: Write new fragments using the filtered data (inserts + updates)
@@ -454,10 +531,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let new_fragments = write_result.default.0;
 
             // Step 3: Apply deletions to existing fragments
-            let delete_row_addrs_clone = {
-                let delete_addrs_guard = delete_row_addrs.read().unwrap();
-                delete_addrs_guard.clone()
-            };
+            let delete_row_addrs_clone = merge_state_clone.get_delete_row_addrs()?;
 
             let (updated_fragments, removed_fragment_ids) =
                 Self::apply_deletions(&dataset, &delete_row_addrs_clone).await?;
@@ -479,25 +553,15 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
             // Step 6: Store transaction and merge stats for later retrieval
             {
-                // Get the final metrics from the stream processing
-                let final_metrics = if let Ok(metrics_guard) = merge_metrics_clone.lock() {
-                    MergeStats::from(&*metrics_guard)
-                } else {
-                    MergeStats {
-                        num_inserted_rows: 0,
-                        num_updated_rows: 0,
-                        num_deleted_rows: 0,
-                        num_attempts: 1,
-                    }
-                };
+                // Get the final stats from the shared state
+                let stats = merge_state_clone.create_merge_stats();
 
-                // Update the delete count from actual deletes (not including updates)
-                let mut stats = final_metrics;
-                let actual_delete_count = *actual_deletes_clone.read().unwrap();
-                stats.num_deleted_rows = actual_delete_count as u64;
-
-                transaction_holder.lock().unwrap().replace(transaction);
-                merge_stats.lock().unwrap().replace(stats);
+                if let Ok(mut transaction_guard) = transaction_holder.lock() {
+                    transaction_guard.replace(transaction);
+                }
+                if let Ok(mut merge_stats_guard) = merge_stats_holder.lock() {
+                    merge_stats_guard.replace(stats);
+                }
             };
 
             // Step 7: Return empty result (write operations don't return data)
