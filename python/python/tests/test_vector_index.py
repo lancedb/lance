@@ -274,7 +274,7 @@ def test_torch_index_with_nans(tmp_path, index_file_version):
         num_sub_vectors=16,
         accelerator=torch.device("cpu"),
         one_pass_ivfpq=True,
-        index_file_version=str(index_file_version),
+        index_file_version=index_file_version,
     )
     validate_vector_index(dataset, "vector")
 

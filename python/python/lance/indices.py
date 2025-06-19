@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from .dependencies import torch
 
 
-class IndexFileVersion(Enum):
+class IndexFileVersion(str, Enum):
     LEGACY = "Legacy"
     V3 = "V3"
 
