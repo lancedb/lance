@@ -1324,6 +1324,7 @@ mod tests {
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
+    use rstest::rstest;
     use std::collections::HashSet;
     use tempfile::tempdir;
 
@@ -1789,8 +1790,9 @@ mod tests {
         assert_eq!(stats["num_indices"], 1);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_optimize_fts() {
+    async fn test_optimize_fts(#[values(false, true)] with_position: bool) {
         let words = ["apple", "banana", "cherry", "date"];
 
         let dir = tempdir().unwrap();
@@ -1805,7 +1807,7 @@ mod tests {
 
         let params = InvertedIndexParams::default()
             .lower_case(false)
-            .with_position(true);
+            .with_position(with_position);
         dataset
             .create_index(&["text"], IndexType::Inverted, None, &params, true)
             .await
