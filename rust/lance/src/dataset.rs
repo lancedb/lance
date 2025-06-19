@@ -871,8 +871,8 @@ impl Dataset {
     }
 
     /// Get the table config from manifest
-    pub fn config(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.manifest.config.iter()
+    pub fn config(&self) -> impl Iterator<Item = (String, String)> {
+        self.manifest.config.clone().into_iter()
     }
 
     /// Create a Scanner to scan the dataset.
