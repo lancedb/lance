@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 from pathlib import Path
-from typing import Dict, Optional, Union, List
+from typing import Dict, List, Optional, Union
 
 import pyarrow as pa
 
@@ -57,7 +57,12 @@ class LanceFileReader:
     """
 
     # TODO: make schema optional
-    def __init__(self, path: str, storage_options: Optional[Dict[str, str]] = None, columns: Optional[List[str]] = None):
+    def __init__(
+        self,
+        path: str,
+        storage_options: Optional[Dict[str, str]] = None,
+        columns: Optional[List[str]] = None,
+    ):
         """
         Creates a new file reader to read the given file
 
@@ -76,7 +81,9 @@ class LanceFileReader:
         """
         if isinstance(path, Path):
             path = str(path)
-        self._reader = _LanceFileReader(path, storage_options=storage_options, columns=columns)
+        self._reader = _LanceFileReader(
+            path, storage_options=storage_options, columns=columns
+        )
 
     def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
         """
