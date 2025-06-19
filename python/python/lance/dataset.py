@@ -1947,6 +1947,8 @@ class LanceDataset(pa.dataset.Dataset):
             - num_bits
                 The number of bits for PQ (Product Quantization). Default is 8.
                 Only 4, 8 are supported.
+            - index_file_version
+                The version of the index file. Default is "V3".
 
         Optional parameters for `IVF_HNSW_*`:
             max_level

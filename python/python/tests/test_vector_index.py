@@ -13,7 +13,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from lance import LanceFragment
-from lance.dataset import VectorIndexReader
+from lance.dataset import IndexFileVersion, VectorIndexReader
 from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
@@ -206,6 +206,15 @@ def test_invalid_subvectors(tmp_path):
         )
 
 
+def test_small_dataset(tmp_path):
+    tbl = create_table(nvec=10)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+    )
+    validate_vector_index(dataset, "vector")
+
+
 @pytest.mark.cuda
 def test_invalid_subvectors_cuda(tmp_path):
     tbl = create_table()
@@ -238,7 +247,10 @@ def test_f16_cuda(tmp_path):
     validate_vector_index(dataset, "vector")
 
 
-def test_index_with_nans(tmp_path):
+@pytest.mark.parametrize(
+    "index_file_version", [IndexFileVersion.V3, IndexFileVersion.Legacy]
+)
+def test_index_with_nans(tmp_path, index_file_version):
     # 1024 rows, the entire table should be sampled
     tbl = create_table(nvec=1000, nans=24)
 
@@ -248,11 +260,15 @@ def test_index_with_nans(tmp_path):
         index_type="IVF_PQ",
         num_partitions=4,
         num_sub_vectors=16,
+        index_file_version=index_file_version,
     )
     validate_vector_index(dataset, "vector")
 
 
-def test_torch_index_with_nans(tmp_path):
+@pytest.mark.parametrize(
+    "index_file_version", [IndexFileVersion.V3, IndexFileVersion.Legacy]
+)
+def test_torch_index_with_nans(tmp_path, index_file_version):
     torch = pytest.importorskip("torch")
 
     # 1024 rows, the entire table should be sampled
@@ -266,6 +282,7 @@ def test_torch_index_with_nans(tmp_path):
         num_sub_vectors=16,
         accelerator=torch.device("cpu"),
         one_pass_ivfpq=True,
+        index_file_version=index_file_version,
     )
     validate_vector_index(dataset, "vector")
 

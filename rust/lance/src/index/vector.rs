@@ -70,6 +70,19 @@ pub enum IndexFileVersion {
     V3,
 }
 
+impl IndexFileVersion {
+    pub fn try_from(version: &str) -> Result<Self> {
+        match version {
+            "Legacy" => Ok(IndexFileVersion::Legacy),
+            "V3" => Ok(IndexFileVersion::V3),
+            _ => Err(Error::Index {
+                message: format!("Invalid index file version: {}", version),
+                location: location!(),
+            }),
+        }
+    }
+}
+
 /// The parameters to build vector index.
 #[derive(Debug, Clone)]
 pub struct VectorIndexParams {

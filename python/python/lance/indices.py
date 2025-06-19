@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 import math
 import warnings
+from enum import Enum
 from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
@@ -14,6 +15,11 @@ from .lance import indices
 
 if TYPE_CHECKING:
     from .dependencies import torch
+
+
+class IndexFileVersion(Enum):
+    LEGACY = "Legacy"
+    V3 = "V3"
 
 
 class PqModel:
