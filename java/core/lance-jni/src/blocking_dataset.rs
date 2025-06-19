@@ -141,11 +141,17 @@ impl BlockingDataset {
         name: Option<String>,
         params: &dyn IndexParams,
         replace: bool,
+        train: bool,
     ) -> Result<()> {
-        RT.block_on(
-            self.inner
-                .create_index(columns, index_type, name, params, replace),
-        )?;
+        let mut builder = self
+            .inner
+            .create_index_builder(columns, index_type, params)
+            .replace(replace)
+            .train(train);
+        if let Some(name) = name {
+            builder = builder.name(name);
+        }
+        RT.block_on(builder.execute())?;
         Ok(())
     }
 
@@ -558,6 +564,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateIndex(
     name_jobj: JObject,   // Optional<String>
     params_jobj: JObject, // IndexParams
     replace_jobj: jboolean,
+    train_jobj: jboolean,
 ) {
     ok_or_throw_without_return!(
         env,
@@ -568,7 +575,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateIndex(
             index_type_code_jobj,
             name_jobj,
             params_jobj,
-            replace_jobj
+            replace_jobj,
+            train_jobj
         )
     );
 }
@@ -581,16 +589,25 @@ fn inner_create_index(
     name_jobj: JObject,   // Optional<String>
     params_jobj: JObject, // IndexParams
     replace_jobj: jboolean,
+    train_jobj: jboolean,
 ) -> Result<()> {
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
     let name = env.get_string_opt(&name_jobj)?;
     let params = get_index_params(env, params_jobj)?;
     let replace = replace_jobj != 0;
+    let train = train_jobj != 0;
     let columns_slice: Vec<&str> = columns.iter().map(AsRef::as_ref).collect();
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.create_index(&columns_slice, index_type, name, params.as_ref(), replace)?;
+    dataset_guard.create_index(
+        &columns_slice,
+        index_type,
+        name,
+        params.as_ref(),
+        replace,
+        train,
+    )?;
     Ok(())
 }
 

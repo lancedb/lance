@@ -14,7 +14,9 @@ use crate::{
     },
     index::{
         scalar::{build_inverted_index, build_scalar_index, inverted_index_details},
-        vector::{build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX},
+        vector::{
+            build_empty_vector_index, build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX,
+        },
         vector_index_details, DatasetIndexExt, DatasetIndexInternalExt,
     },
     Error, Result,
@@ -194,7 +196,15 @@ impl<'a> CreateIndexBuilder<'a> {
                     ))
                     .await?;
                 } else {
-                    todo!("create empty vector index when train=false");
+                    // Create empty vector index
+                    build_empty_vector_index(
+                        self.dataset,
+                        column,
+                        &index_name,
+                        &index_id.to_string(),
+                        vec_params,
+                    )
+                    .await?;
                 }
                 vector_index_details()
             }

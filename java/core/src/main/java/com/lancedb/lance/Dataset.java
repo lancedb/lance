@@ -567,9 +567,29 @@ public class Dataset implements Closeable {
       Optional<String> name,
       IndexParams params,
       boolean replace) {
+    createIndex(columns, indexType, name, params, replace, true);
+  }
+
+  /**
+   * Creates a new index on the dataset.
+   *
+   * @param columns the columns to index from
+   * @param indexType the index type
+   * @param name the name of the created index
+   * @param params index params
+   * @param replace whether to replace the existing index
+   * @param train whether to train the index on existing data
+   */
+  public void createIndex(
+      List<String> columns,
+      IndexType indexType,
+      Optional<String> name,
+      IndexParams params,
+      boolean replace,
+      boolean train) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeCreateIndex(columns, indexType.getValue(), name, params, replace);
+      nativeCreateIndex(columns, indexType.getValue(), name, params, replace, train);
     }
   }
 
@@ -578,7 +598,8 @@ public class Dataset implements Closeable {
       int indexTypeCode,
       Optional<String> name,
       IndexParams params,
-      boolean replace);
+      boolean replace,
+      boolean train);
 
   /**
    * Count the number of rows in the dataset.
