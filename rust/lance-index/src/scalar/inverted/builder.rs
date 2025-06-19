@@ -162,10 +162,10 @@ impl InvertedIndexBuilder {
         let sender = Arc::new(sender);
 
         let mut stream = Box::pin(flatten_stream.then({
-            let sender = sender.clone();
-            move |batch_result| {
+            |batch_result| {
                 let sender = sender.clone();
                 async move {
+                    let sender = sender.clone();
                     let batch = batch_result?;
                     let num_rows = batch.num_rows();
                     sender.send(batch).await.expect("failed to send batch");
