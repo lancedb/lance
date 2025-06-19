@@ -365,25 +365,26 @@ pub async fn open_scalar_index(
     let index_store = Arc::new(LanceIndexStore::from_dataset(dataset, &uuid_str));
     let index_type = detect_scalar_index_type(dataset, index, column, &dataset.session).await?;
     let fri = dataset.open_frag_reuse_index(metrics).await?;
+    let index_cache = dataset.index_cache.with_key_prefix(&uuid_str);
     match index_type {
         ScalarIndexType::Bitmap => {
-            let bitmap_index = BitmapIndex::load(index_store, fri).await?;
+            let bitmap_index = BitmapIndex::load(index_store, fri, index_cache).await?;
             Ok(bitmap_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::LabelList => {
-            let tag_index = LabelListIndex::load(index_store, fri).await?;
+            let tag_index = LabelListIndex::load(index_store, fri, index_cache).await?;
             Ok(tag_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::Inverted => {
-            let inverted_index = InvertedIndex::load(index_store, fri).await?;
+            let inverted_index = InvertedIndex::load(index_store, fri, index_cache).await?;
             Ok(inverted_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::NGram => {
-            let ngram_index = NGramIndex::load(index_store, fri).await?;
+            let ngram_index = NGramIndex::load(index_store, fri, index_cache).await?;
             Ok(ngram_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::BTree => {
-            let btree_index = BTreeIndex::load(index_store, fri).await?;
+            let btree_index = BTreeIndex::load(index_store, fri, index_cache).await?;
             Ok(btree_index as Arc<dyn ScalarIndex>)
         }
     }
@@ -452,11 +453,11 @@ pub async fn detect_scalar_index_type(
         }
     } else {
         let uuid = index.uuid.to_string();
-        if let Some(index_type) = session.index_cache.get_type(&uuid) {
-            return Ok(index_type);
+        if let Some(index_type) = session.index_cache.get::<ScalarIndexType>(&uuid) {
+            return Ok(*index_type.as_ref());
         }
         let index_type = infer_scalar_index_type(dataset, &index.uuid.to_string(), column).await?;
-        session.index_cache.insert_type(&uuid, index_type);
+        dataset.index_cache.insert(&uuid, Arc::new(index_type));
         Ok(index_type)
     }
 }

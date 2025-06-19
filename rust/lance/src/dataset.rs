@@ -389,7 +389,7 @@ impl Dataset {
         let manifest = Self::load_manifest(
             self.object_store.as_ref(),
             &manifest_location,
-            &base_path,
+            &self.uri,
             self.session.as_ref(),
         )
         .await?;
@@ -412,7 +412,7 @@ impl Dataset {
     async fn load_manifest(
         object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
-        base_path: &Path,
+        uri: &str,
         session: &Session,
     ) -> Result<Manifest> {
         let object_reader = if let Some(size) = manifest_location.size {
@@ -489,7 +489,7 @@ impl Dataset {
                     .map(Index::try_from)
                     .collect::<Result<Vec<_>>>()?;
 
-                let index_cache = session.index_cache.with_key_prefix(todo!("get uri"));
+                let index_cache = session.index_cache.with_key_prefix(uri);
                 let metadata_key = format!("{}", manifest_location.version);
                 index_cache.insert(&metadata_key, Arc::new(indices));
             }
@@ -1532,7 +1532,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         Dataset::load_manifest(
                             dataset.object_store(),
                             &location,
-                            &dataset.base,
+                            dataset.uri(),
                             dataset.session.as_ref(),
                         )
                     })

@@ -230,9 +230,12 @@ impl<'a> CommitBuilder<'a> {
             });
         }
 
-        let metadata_cache = match &dest {
-            WriteDestination::Dataset(ds) => ds.metadata_cache.clone(),
-            WriteDestination::Uri(uri) => Arc::new(session.metadata_cache.with_key_prefix(uri)),
+        let (metadata_cache, index_cache) = match &dest {
+            WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
+            WriteDestination::Uri(uri) => (
+                Arc::new(session.metadata_cache.with_key_prefix(uri)),
+                Arc::new(session.index_cache.with_key_prefix(uri)),
+            ),
         };
 
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
@@ -345,6 +348,7 @@ impl<'a> CommitBuilder<'a> {
                 session,
                 commit_handler,
                 tags,
+                index_cache,
                 metadata_cache,
             }),
         }

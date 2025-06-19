@@ -214,6 +214,13 @@ impl LanceCache {
             misses: self.misses.load(Ordering::Relaxed),
         }
     }
+
+    pub fn clear(&self) {
+        self.cache.invalidate_all();
+        self.cache.run_pending_tasks();
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -20,7 +20,11 @@ pub mod index_extension;
 /// A user session tracks the runtime state.
 #[derive(Clone)]
 pub struct Session {
-    /// Cache for opened indices.
+    /// Global cache for opened indices.
+    ///
+    /// Sub-caches are created from this cache for each dataset by adding the
+    /// URI and index UUID as a key prefix. This prevents collisions
+    /// between different datasets and indices.
     pub(crate) index_cache: LanceCache,
 
     /// Global cache for file metadata.
