@@ -2697,14 +2697,14 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.update_config(upsert_values)
 
-    def delete_config_keys(self, keys: [str]) -> None:
-        """
-        Delete the dataset configuration items based on given keys.
+    def delete_config_keys(self, keys: list[str]) -> None:
+        """Delete specified configuration keys from the dataset.
 
         Parameters
         ----------
-        keys: str array
-            The config keys to be deleted.
+        keys : list of str
+            A list of configuration keys to remove from the dataset.
+            Non-existent keys will be silently ignored.
         """
         self._ds.delete_config_keys(keys)
 
