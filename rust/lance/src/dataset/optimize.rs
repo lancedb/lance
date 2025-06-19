@@ -2803,7 +2803,7 @@ mod tests {
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
             )
             .col("id", lance_datagen::array::step::<Int32Type>())
-            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .into_ram_dataset(FragmentCount::from(110), FragmentRowCount::from(1000))
             .await
             .unwrap();
 
