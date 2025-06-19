@@ -3860,9 +3860,7 @@ class DatasetOptimizer:
         self._dataset._ds.update_config(
             {
                 "lance.auto_cleanup.interval": str(auto_cleanup_config["interval"]),
-                "lance.auto_cleanup.older_than": f"{
-                    auto_cleanup_config['older_than_seconds']
-                }s",
+                "lance.auto_cleanup.older_than": f"{auto_cleanup_config['older_than_seconds']}s",  # noqa E501
             }
         )
 
