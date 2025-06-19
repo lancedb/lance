@@ -3976,7 +3976,8 @@ mod tests {
         dataset.update_config(desired_config.clone()).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
         assert_eq!(
-            dataset.config()
+            dataset
+                .config()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect::<HashMap<_, _>>(),
             desired_config
@@ -3991,7 +3992,8 @@ mod tests {
         dataset.delete_config_keys(&["other-key"]).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
         assert_eq!(
-            dataset.config()
+            dataset
+                .config()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect::<HashMap<_, _>>(),
             desired_config
