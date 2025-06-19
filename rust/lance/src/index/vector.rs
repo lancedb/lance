@@ -73,8 +73,8 @@ pub enum IndexFileVersion {
 impl IndexFileVersion {
     pub fn try_from(version: &str) -> Result<Self> {
         match version {
-            "Legacy" => Ok(IndexFileVersion::Legacy),
-            "V3" => Ok(IndexFileVersion::V3),
+            "Legacy" => Ok(Self::Legacy),
+            "V3" => Ok(Self::V3),
             _ => Err(Error::Index {
                 message: format!("Invalid index file version: {}", version),
                 location: location!(),

@@ -626,7 +626,7 @@ mod tests {
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
 
-    use lance_core::{cache::FileMetadataCache, Result, ROW_ID};
+    use lance_core::{cache::LanceCache, Result, ROW_ID};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::v2::{
         reader::{FileReader, FileReaderOptions},
@@ -1789,7 +1789,7 @@ mod tests {
                 .await?,
             None,
             Arc::<DecoderPlugins>::default(),
-            &FileMetadataCache::no_cache(),
+            &LanceCache::no_cache(),
             FileReaderOptions::default(),
         )
         .await?;
