@@ -1024,13 +1024,22 @@ impl DatasetIndexInternalExt for Dataset {
                 .iter()
                 .any(|f| is_vector_field(f.data_type()));
 
-            // Only include indices with non-empty fragment bitmaps
+            // Check if this is an FTS index by looking at index details
+            let is_fts_index = if let Some(_details) = &idx.index_details {
+                use crate::index::scalar::infer_index_type;
+                matches!(infer_index_type(idx), Some(IndexType::Inverted))
+            } else {
+                false
+            };
+
+            // Only include indices with non-empty fragment bitmaps, except for FTS indices
+            // which need to be discoverable even when empty
             let has_non_empty_bitmap = idx
                 .fragment_bitmap
                 .as_ref()
                 .is_some_and(|bitmap| !bitmap.is_empty());
 
-            idx.fields.len() == 1 && !is_vector_index && has_non_empty_bitmap
+            idx.fields.len() == 1 && !is_vector_index && (has_non_empty_bitmap || is_fts_index)
         }) {
             let field = index.fields[0];
             let field = schema.field_by_id(field).ok_or_else(|| Error::Internal {
