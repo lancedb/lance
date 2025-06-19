@@ -1862,7 +1862,7 @@ mod tests {
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),
-                &FileMetadataCache::no_cache(),
+                &LanceCache::no_cache(),
                 FileReaderOptions::default(),
             )
             .await
