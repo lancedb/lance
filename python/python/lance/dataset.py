@@ -3847,7 +3847,7 @@ class DatasetOptimizer:
         """
         self._dataset._ds.optimize_indices(**kwargs)
 
-    def enable_autocleanup(self, auto_cleanup_config: AutoCleanupConfig, **kwargs):
+    def enable_auto_cleanup(self, auto_cleanup_config: AutoCleanupConfig, **kwargs):
         """Enable autocleaning for an existing dataset.
 
         Parameters
@@ -3864,7 +3864,7 @@ class DatasetOptimizer:
             }
         )
 
-    def disable_autocleanup(self, **kwargs):
+    def disable_auto_cleanup(self, **kwargs):
         """Disable autocleaning via delete related keys."""
         self._dataset._ds.delete_config_keys(
             ["lance.auto_cleanup.interval", "lance.auto_cleanup.older_than"]
