@@ -1,1125 +1,492 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+//! Bitpacking encodings
+//!
+//! These encodings look for unused higher order bits and discard them.  For example, if we
+//! have a u32 array and all values are between 0 and 5000 then we only need 12 bits to store
+//! each value.  The encoding will discard the upper 20 bits and only store 12 bits.
+//!
+//! This is a simple encoding that works well for data that has a small range.
+//!
+//! In order to decode the values we need to know the bit width of the values.  This can be stored
+//! inline with the data (miniblock) or in the encoding description, out of line (full zip).
+//!
+//! The encoding is transparent because the output has a fixed width (just like the input) and
+//! we can easily jump to the correct value.
 
-use arrow::datatypes::{
-    ArrowPrimitiveType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
-};
-use arrow::util::bit_util::ceil;
-use arrow_array::{cast::AsArray, Array, PrimitiveArray};
-use arrow_schema::DataType;
-use bytes::Bytes;
-use futures::future::{BoxFuture, FutureExt};
-use log::trace;
-use num_traits::{AsPrimitive, PrimInt, ToPrimitive};
+use arrow::datatypes::UInt64Type;
+use arrow_array::{Array, PrimitiveArray};
+use arrow_buffer::ArrowNativeType;
+use byteorder::{ByteOrder, LittleEndian};
 use snafu::location;
 
-use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
-use crate::decoder::{PageScheduler, PrimitivePageDecoder};
-use crate::encoder::{ArrayEncoder, EncodedArray};
-use crate::format::ProtobufUtils;
+use crate::compression::{
+    BlockCompressor, BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor,
+};
+use crate::compression_algo::fastlanes::BitPacking;
+use crate::data::BlockInfo;
+use crate::data::{DataBlock, FixedWidthDataBlock};
+use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
+use crate::encodings::logical::primitive::miniblock::{
+    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
+};
+use crate::format::{pb, ProtobufUtils};
+use crate::statistics::{GetStat, Stat};
+use bytemuck::{cast_slice, AnyBitPattern};
 
-#[derive(Debug)]
-pub struct BitpackParams {
-    pub num_bits: u64,
+const LOG_ELEMS_PER_CHUNK: u8 = 10;
+const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
 
-    pub signed: bool,
+#[derive(Debug, Default)]
+pub struct InlineBitpacking {
+    uncompressed_bit_width: u64,
 }
 
-// Compute the number of bits to use for each item, if this array can be encoded using
-// bitpacking encoding. Returns `None` if the type or array data is not supported.
-pub fn bitpack_params(arr: &dyn Array) -> Option<BitpackParams> {
-    match arr.data_type() {
-        DataType::UInt8 => bitpack_params_for_type::<UInt8Type>(arr.as_primitive()),
-        DataType::UInt16 => bitpack_params_for_type::<UInt16Type>(arr.as_primitive()),
-        DataType::UInt32 => bitpack_params_for_type::<UInt32Type>(arr.as_primitive()),
-        DataType::UInt64 => bitpack_params_for_type::<UInt64Type>(arr.as_primitive()),
-        DataType::Int8 => bitpack_params_for_signed_type::<Int8Type>(arr.as_primitive()),
-        DataType::Int16 => bitpack_params_for_signed_type::<Int16Type>(arr.as_primitive()),
-        DataType::Int32 => bitpack_params_for_signed_type::<Int32Type>(arr.as_primitive()),
-        DataType::Int64 => bitpack_params_for_signed_type::<Int64Type>(arr.as_primitive()),
-        // TODO -- eventually we could support temporal types as well
-        _ => None,
-    }
-}
-
-// Compute the number bits to to use for bitpacking generically.
-// returns None if the array is empty or all nulls
-fn bitpack_params_for_type<T>(arr: &PrimitiveArray<T>) -> Option<BitpackParams>
-where
-    T: ArrowPrimitiveType,
-    T::Native: PrimInt + AsPrimitive<u64>,
-{
-    let max = arrow::compute::bit_or(arr);
-    let num_bits =
-        max.map(|max| arr.data_type().byte_width() as u64 * 8 - max.leading_zeros() as u64);
-
-    // we can't bitpack into 0 bits, so the minimum is 1
-    num_bits
-        .map(|num_bits| num_bits.max(1))
-        .map(|bits| BitpackParams {
-            num_bits: bits,
-            signed: false,
-        })
-}
-
-/// determine the minimum number of bits that can be used to represent
-/// an array of signed values. It includes all the significant bits for
-/// the value + plus 1 bit to represent the sign. If there are no negative values
-/// then it will not add a signed bit
-fn bitpack_params_for_signed_type<T>(arr: &PrimitiveArray<T>) -> Option<BitpackParams>
-where
-    T: ArrowPrimitiveType,
-    T::Native: PrimInt + AsPrimitive<i64>,
-{
-    let mut add_signed_bit = false;
-    let mut min_leading_bits: Option<u64> = None;
-    for val in arr.iter() {
-        if val.is_none() {
-            continue;
-        }
-        let val = val.unwrap();
-        if min_leading_bits.is_none() {
-            min_leading_bits = Some(u64::MAX);
-        }
-
-        if val.to_i64().unwrap() < 0i64 {
-            min_leading_bits = min_leading_bits.map(|bits| bits.min(val.leading_ones() as u64));
-            add_signed_bit = true;
-        } else {
-            min_leading_bits = min_leading_bits.map(|bits| bits.min(val.leading_zeros() as u64));
-        }
-    }
-
-    let mut min_leading_bits = arr.data_type().byte_width() as u64 * 8 - min_leading_bits?;
-    if add_signed_bit {
-        // Need extra sign bit
-        min_leading_bits += 1;
-    }
-    // cannot bitpack into <1 bit
-    let num_bits = min_leading_bits.max(1);
-    Some(BitpackParams {
-        num_bits,
-        signed: add_signed_bit,
-    })
-}
-#[derive(Debug)]
-pub struct BitpackedArrayEncoder {
-    num_bits: u64,
-    signed_type: bool,
-}
-
-impl BitpackedArrayEncoder {
-    pub fn new(num_bits: u64, signed_type: bool) -> Self {
+impl InlineBitpacking {
+    pub fn new(uncompressed_bit_width: u64) -> Self {
         Self {
-            num_bits,
-            signed_type,
+            uncompressed_bit_width,
         }
     }
-}
 
-impl ArrayEncoder for BitpackedArrayEncoder {
-    fn encode(
-        &self,
-        data: DataBlock,
-        _data_type: &DataType,
-        buffer_index: &mut u32,
-    ) -> Result<EncodedArray> {
-        // calculate the total number of bytes we need to allocate for the destination.
-        // this will be the number of items in the source array times the number of bits.
-        let dst_bytes_total = ceil(data.num_values() as usize * self.num_bits as usize, 8);
+    pub fn from_description(description: &pb::InlineBitpacking) -> Self {
+        Self {
+            uncompressed_bit_width: description.uncompressed_bits_per_value,
+        }
+    }
 
-        let mut dst_buffer = vec![0u8; dst_bytes_total];
-        let mut dst_idx = 0;
-        let mut dst_offset = 0;
+    pub fn min_size_bytes(bit_width: u64) -> u64 {
+        (ELEMS_PER_CHUNK * bit_width).div_ceil(8)
+    }
 
-        let DataBlock::FixedWidth(unpacked) = data else {
-            return Err(Error::InvalidInput {
-                source: "Bitpacking only supports fixed width data blocks".into(),
-                location: location!(),
+    /// Bitpacks a FixedWidthDataBlock into compressed chunks of 1024 values
+    ///
+    /// Each chunk can have a different bit width
+    ///
+    /// Each chunk has the compressed bit width stored inline in the chunk itself.
+    fn bitpack_chunked<T: ArrowNativeType + BitPacking>(
+        mut data: FixedWidthDataBlock,
+    ) -> MiniBlockCompressed {
+        let data_buffer = data.data.borrow_to_typed_slice::<T>();
+        let data_buffer = data_buffer.as_ref();
+
+        let bit_widths = data.expect_stat(Stat::BitWidth);
+        let bit_widths_array = bit_widths
+            .as_any()
+            .downcast_ref::<PrimitiveArray<UInt64Type>>()
+            .unwrap();
+
+        let (packed_chunk_sizes, total_size) = bit_widths_array
+            .values()
+            .iter()
+            .map(|&bit_width| {
+                let chunk_size = ((1024 * bit_width) / data.bits_per_value) as usize;
+                (chunk_size, chunk_size + 1)
+            })
+            .fold(
+                (Vec::with_capacity(bit_widths_array.len()), 0),
+                |(mut sizes, total), (size, inc)| {
+                    sizes.push(size);
+                    (sizes, total + inc)
+                },
+            );
+
+        let mut output: Vec<T> = Vec::with_capacity(total_size);
+        let mut chunks = Vec::with_capacity(bit_widths_array.len());
+
+        for (i, packed_chunk_size) in packed_chunk_sizes
+            .iter()
+            .enumerate()
+            .take(bit_widths_array.len() - 1)
+        {
+            let start_elem = i * ELEMS_PER_CHUNK as usize;
+            let bit_width = bit_widths_array.value(i) as usize;
+            output.push(T::from_usize(bit_width).unwrap());
+            let output_len = output.len();
+            unsafe {
+                output.set_len(output_len + *packed_chunk_size);
+                BitPacking::unchecked_pack(
+                    bit_width,
+                    &data_buffer[start_elem..][..ELEMS_PER_CHUNK as usize],
+                    &mut output[output_len..][..*packed_chunk_size],
+                );
+            }
+            chunks.push(MiniBlockChunk {
+                buffer_sizes: vec![((1 + *packed_chunk_size) * std::mem::size_of::<T>()) as u16],
+                log_num_values: LOG_ELEMS_PER_CHUNK,
             });
+        }
+
+        // Handle the last chunk
+        let last_chunk_elem_num = if data.num_values % ELEMS_PER_CHUNK == 0 {
+            1024
+        } else {
+            data.num_values % ELEMS_PER_CHUNK
         };
-
-        pack_bits(
-            &unpacked.data,
-            self.num_bits,
-            &mut dst_buffer,
-            &mut dst_idx,
-            &mut dst_offset,
+        let mut last_chunk: Vec<T> = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
+        last_chunk[..last_chunk_elem_num as usize].clone_from_slice(
+            &data_buffer[data.num_values as usize - last_chunk_elem_num as usize..],
         );
-
-        let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: self.num_bits,
-            data: LanceBuffer::Owned(dst_buffer),
-            num_values: unpacked.num_values,
-            block_info: BlockInfo::new(),
+        let bit_width = bit_widths_array.value(bit_widths_array.len() - 1) as usize;
+        output.push(T::from_usize(bit_width).unwrap());
+        let output_len = output.len();
+        unsafe {
+            output.set_len(output_len + packed_chunk_sizes[bit_widths_array.len() - 1]);
+            BitPacking::unchecked_pack(
+                bit_width,
+                &last_chunk,
+                &mut output[output_len..][..packed_chunk_sizes[bit_widths_array.len() - 1]],
+            );
+        }
+        chunks.push(MiniBlockChunk {
+            buffer_sizes: vec![
+                ((1 + packed_chunk_sizes[bit_widths_array.len() - 1]) * std::mem::size_of::<T>())
+                    as u16,
+            ],
+            log_num_values: 0,
         });
 
-        let bitpacked_buffer_index = *buffer_index;
-        *buffer_index += 1;
-
-        let encoding = ProtobufUtils::bitpacked_encoding(
-            self.num_bits,
-            unpacked.bits_per_value,
-            bitpacked_buffer_index,
-            self.signed_type,
-        );
-
-        Ok(EncodedArray {
-            data: packed,
-            encoding,
-        })
-    }
-}
-
-fn pack_bits(
-    src: &LanceBuffer,
-    num_bits: u64,
-    dst: &mut [u8],
-    dst_idx: &mut usize,
-    dst_offset: &mut u8,
-) {
-    let bit_len = src.len() as u64 * 8;
-
-    let mask = u64::MAX >> (64 - num_bits);
-
-    let mut src_idx = 0;
-    while src_idx < src.len() {
-        let mut curr_mask = mask;
-        let mut curr_src = src[src_idx] & curr_mask as u8;
-        let mut src_offset = 0;
-        let mut src_bits_written = 0;
-
-        while src_bits_written < num_bits {
-            dst[*dst_idx] += (curr_src >> src_offset) << *dst_offset as u64;
-            let bits_written = (num_bits - src_bits_written)
-                .min(8 - src_offset)
-                .min(8 - *dst_offset as u64);
-            src_bits_written += bits_written;
-            *dst_offset += bits_written as u8;
-            src_offset += bits_written;
-
-            if *dst_offset == 8 {
-                *dst_idx += 1;
-                *dst_offset = 0;
-            }
-
-            if src_offset == 8 {
-                src_idx += 1;
-                src_offset = 0;
-                curr_mask >>= 8;
-                if src_idx == src.len() {
-                    break;
-                }
-                curr_src = src[src_idx] & curr_mask as u8;
-            }
-        }
-
-        // advance source_offset to the next byte if we're not at the end..
-        // note that we don't need to do this if we wrote the full number of bits
-        // because source index would have been advanced by the inner loop above
-        if bit_len != num_bits {
-            let partial_bytes_written = ceil(num_bits as usize, 8);
-
-            // we also want to the next location in src, unless we wrote something
-            // byte-aligned in which case the logic above would have already advanced
-            let mut to_next_byte = 1;
-            if num_bits % 8 == 0 {
-                to_next_byte = 0;
-            }
-
-            src_idx += src.len() - partial_bytes_written + to_next_byte;
+        MiniBlockCompressed {
+            data: vec![LanceBuffer::reinterpret_vec(output)],
+            chunks,
+            num_values: data.num_values,
         }
     }
-}
 
-// A physical scheduler for bitpacked buffers
-#[derive(Debug, Clone, Copy)]
-pub struct BitpackedScheduler {
-    bits_per_value: u64,
-    uncompressed_bits_per_value: u64,
-    buffer_offset: u64,
-    signed: bool,
-}
-
-impl BitpackedScheduler {
-    pub fn new(
-        bits_per_value: u64,
-        uncompressed_bits_per_value: u64,
-        buffer_offset: u64,
-        signed: bool,
-    ) -> Self {
-        Self {
-            bits_per_value,
-            uncompressed_bits_per_value,
-            buffer_offset,
-            signed,
-        }
-    }
-}
-
-impl PageScheduler for BitpackedScheduler {
-    fn schedule_ranges(
+    fn chunk_data(
         &self,
-        ranges: &[std::ops::Range<u64>],
-        scheduler: &Arc<dyn crate::EncodingsIo>,
-        top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
-        let mut min = u64::MAX;
-        let mut max = 0;
-
-        let mut buffer_bit_start_offsets: Vec<u8> = vec![];
-        let mut buffer_bit_end_offsets: Vec<Option<u8>> = vec![];
-        let byte_ranges = ranges
-            .iter()
-            .map(|range| {
-                let start_byte_offset = range.start * self.bits_per_value / 8;
-                let mut end_byte_offset = range.end * self.bits_per_value / 8;
-                if range.end * self.bits_per_value % 8 != 0 {
-                    // If the end of the range is not byte-aligned, we need to read one more byte
-                    end_byte_offset += 1;
-
-                    let end_bit_offset = range.end * self.bits_per_value % 8;
-                    buffer_bit_end_offsets.push(Some(end_bit_offset as u8));
-                } else {
-                    buffer_bit_end_offsets.push(None);
-                }
-
-                let start_bit_offset = range.start * self.bits_per_value % 8;
-                buffer_bit_start_offsets.push(start_bit_offset as u8);
-
-                let start = self.buffer_offset + start_byte_offset;
-                let end = self.buffer_offset + end_byte_offset;
-                min = min.min(start);
-                max = max.max(end);
-
-                start..end
-            })
-            .collect::<Vec<_>>();
-
-        trace!(
-            "Scheduling I/O for {} ranges spread across byte range {}..{}",
-            byte_ranges.len(),
-            min,
-            max
-        );
-
-        let bytes = scheduler.submit_request(byte_ranges, top_level_row);
-
-        let bits_per_value = self.bits_per_value;
-        let uncompressed_bits_per_value = self.uncompressed_bits_per_value;
-        let signed = self.signed;
-        async move {
-            let bytes = bytes.await?;
-            Ok(Box::new(BitpackedPageDecoder {
-                buffer_bit_start_offsets,
-                buffer_bit_end_offsets,
-                bits_per_value,
-                uncompressed_bits_per_value,
-                signed,
-                data: bytes,
-            }) as Box<dyn PrimitivePageDecoder>)
-        }
-        .boxed()
+        data: FixedWidthDataBlock,
+    ) -> (MiniBlockCompressed, crate::format::pb::ArrayEncoding) {
+        assert!(data.bits_per_value % 8 == 0);
+        assert_eq!(data.bits_per_value, self.uncompressed_bit_width);
+        let bits_per_value = data.bits_per_value;
+        let compressed = match bits_per_value {
+            8 => Self::bitpack_chunked::<u8>(data),
+            16 => Self::bitpack_chunked::<u16>(data),
+            32 => Self::bitpack_chunked::<u32>(data),
+            64 => Self::bitpack_chunked::<u64>(data),
+            _ => unreachable!(),
+        };
+        (compressed, ProtobufUtils::inline_bitpacking(bits_per_value))
     }
-}
 
-#[derive(Debug)]
-struct BitpackedPageDecoder {
-    // bit offsets of the first value within each buffer
-    buffer_bit_start_offsets: Vec<u8>,
+    fn unchunk<T: ArrowNativeType + BitPacking + AnyBitPattern>(
+        data: LanceBuffer,
+        num_values: u64,
+    ) -> Result<DataBlock> {
+        assert!(data.len() >= 8);
+        assert!(num_values <= ELEMS_PER_CHUNK);
 
-    // bit offsets of the last value within each buffer. e.g. if there was a buffer
-    // with 2 values, packed into 5 bits, this would be [Some(3)], indicating that
-    // the bits from the 3rd->8th bit in the last byte shouldn't be decoded.
-    buffer_bit_end_offsets: Vec<Option<u8>>,
+        // This macro decompresses a chunk(1024 values) of bitpacked values.
+        let uncompressed_bit_width = std::mem::size_of::<T>() * 8;
+        let mut decompressed = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
 
-    // the number of bits used to represent a compressed value. E.g. if the max value
-    // in the page was 7 (0b111), then this will be 3
-    bits_per_value: u64,
+        // Copy for memory alignment
+        let chunk_in_u8: Vec<u8> = data.to_vec();
+        let bit_width_bytes = &chunk_in_u8[..std::mem::size_of::<T>()];
+        let bit_width_value = LittleEndian::read_uint(bit_width_bytes, std::mem::size_of::<T>());
+        let chunk = cast_slice(&chunk_in_u8[std::mem::size_of::<T>()..]);
 
-    // number of bits in the uncompressed value. E.g. this will be 32 for u32
-    uncompressed_bits_per_value: u64,
+        // The bit-packed chunk should have number of bytes (bit_width_value * ELEMS_PER_CHUNK / 8)
+        assert!(std::mem::size_of_val(chunk) == (bit_width_value * ELEMS_PER_CHUNK) as usize / 8);
 
-    // whether or not to use the msb as a sign bit during decoding
-    signed: bool,
-
-    data: Vec<Bytes>,
-}
-
-impl PrimitivePageDecoder for BitpackedPageDecoder {
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
-        let num_bytes = self.uncompressed_bits_per_value / 8 * num_rows;
-        let mut dest = vec![0; num_bytes as usize];
-
-        // current maximum supported bits per value = 64
-        debug_assert!(self.bits_per_value <= 64);
-
-        let mut rows_to_skip = rows_to_skip;
-        let mut rows_taken = 0;
-        let byte_len = self.uncompressed_bits_per_value / 8;
-        let mut dst_idx = 0; // index for current byte being written to destination buffer
-
-        // create bit mask for source bits
-        let mask = u64::MAX >> (64 - self.bits_per_value);
-
-        for i in 0..self.data.len() {
-            let src = &self.data[i];
-            let (mut src_idx, mut src_offset) = match compute_start_offset(
-                rows_to_skip,
-                src.len(),
-                self.bits_per_value,
-                self.buffer_bit_start_offsets[i],
-                self.buffer_bit_end_offsets[i],
-            ) {
-                StartOffset::SkipFull(rows_to_skip_here) => {
-                    rows_to_skip -= rows_to_skip_here;
-                    continue;
-                }
-                StartOffset::SkipSome(buffer_start_offset) => (
-                    buffer_start_offset.index,
-                    buffer_start_offset.bit_offset as u64,
-                ),
-            };
-
-            while src_idx < src.len() && rows_taken < num_rows {
-                rows_taken += 1;
-                let mut curr_mask = mask; // copy mask
-
-                // current source byte being written to destination
-                let mut curr_src = src[src_idx] & (curr_mask << src_offset) as u8;
-
-                // how many bits from the current source value have been written to destination
-                let mut src_bits_written = 0;
-
-                // the offset within the current destination byte to write to
-                let mut dst_offset = 0;
-
-                let is_negative = is_encoded_item_negative(
-                    src,
-                    src_idx,
-                    src_offset,
-                    self.bits_per_value as usize,
-                );
-
-                while src_bits_written < self.bits_per_value {
-                    // write bits from current source byte into destination
-                    dest[dst_idx] += (curr_src >> src_offset) << dst_offset;
-                    let bits_written = (self.bits_per_value - src_bits_written)
-                        .min(8 - src_offset)
-                        .min(8 - dst_offset);
-                    src_bits_written += bits_written;
-                    dst_offset += bits_written;
-                    src_offset += bits_written;
-                    curr_mask >>= bits_written;
-
-                    if dst_offset == 8 {
-                        dst_idx += 1;
-                        dst_offset = 0;
-                    }
-
-                    if src_offset == 8 {
-                        src_idx += 1;
-                        src_offset = 0;
-                        if src_idx == src.len() {
-                            break;
-                        }
-                        curr_src = src[src_idx] & curr_mask as u8;
-                    }
-                }
-
-                // if the type is signed, need to pad out the rest of the byte with 1s
-                let mut negative_padded_current_byte = false;
-                if self.signed && is_negative && dst_offset > 0 {
-                    negative_padded_current_byte = true;
-                    while dst_offset < 8 {
-                        dest[dst_idx] |= 1 << dst_offset;
-                        dst_offset += 1;
-                    }
-                }
-
-                // advance destination offset to the next location
-                // note that we don't need to do this if we wrote the full number of bits
-                // because source index would have been advanced by the inner loop above
-                if self.uncompressed_bits_per_value != self.bits_per_value {
-                    let partial_bytes_written = ceil(self.bits_per_value as usize, 8);
-
-                    // we also want to move one location to the next location in destination,
-                    // unless we wrote something byte-aligned in which case the logic above
-                    // would have already advanced dst_idx
-                    let mut to_next_byte = 1;
-                    if self.bits_per_value % 8 == 0 {
-                        to_next_byte = 0;
-                    }
-                    let next_dst_idx =
-                        dst_idx + byte_len as usize - partial_bytes_written + to_next_byte;
-
-                    // pad remaining bytes with 1 for negative signed numbers
-                    if self.signed && is_negative {
-                        if !negative_padded_current_byte {
-                            dest[dst_idx] = 0xFF;
-                        }
-                        for i in dest.iter_mut().take(next_dst_idx).skip(dst_idx + 1) {
-                            *i = 0xFF;
-                        }
-                    }
-
-                    dst_idx = next_dst_idx;
-                }
-
-                // If we've reached the last byte, there may be some extra bits from the
-                // next value outside the range. We don't want to be taking those.
-                if let Some(buffer_bit_end_offset) = self.buffer_bit_end_offsets[i] {
-                    if src_idx == src.len() - 1 && src_offset >= buffer_bit_end_offset as u64 {
-                        break;
-                    }
-                }
-            }
+        unsafe {
+            BitPacking::unchecked_unpack(bit_width_value as usize, chunk, &mut decompressed);
         }
 
+        decompressed.truncate(num_values as usize);
         Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: LanceBuffer::from(dest),
-            bits_per_value: self.uncompressed_bits_per_value,
-            num_values: num_rows,
+            data: LanceBuffer::reinterpret_vec(decompressed),
+            bits_per_value: uncompressed_bit_width as u64,
+            num_values,
             block_info: BlockInfo::new(),
         }))
     }
 }
 
-fn is_encoded_item_negative(src: &Bytes, src_idx: usize, src_offset: u64, num_bits: usize) -> bool {
-    let mut last_byte_idx = src_idx + ((src_offset as usize + num_bits) / 8);
-    let shift_amount = (src_offset as usize + num_bits) % 8;
-    let shift_amount = if shift_amount == 0 {
-        last_byte_idx -= 1;
-        7
-    } else {
-        shift_amount - 1
-    };
-    let last_byte = src[last_byte_idx];
-    let sign_bit_mask = 1 << shift_amount;
-    let sign_bit = last_byte & sign_bit_mask;
-
-    sign_bit > 0
+impl MiniBlockCompressor for InlineBitpacking {
+    fn compress(
+        &self,
+        chunk: DataBlock,
+    ) -> Result<(MiniBlockCompressed, crate::format::pb::ArrayEncoding)> {
+        match chunk {
+            DataBlock::FixedWidth(fixed_width) => Ok(self.chunk_data(fixed_width)),
+            _ => Err(Error::InvalidInput {
+                source: format!(
+                    "Cannot compress a data block of type {} with BitpackMiniBlockEncoder",
+                    chunk.name()
+                )
+                .into(),
+                location: location!(),
+            }),
+        }
+    }
 }
 
-#[derive(Debug, PartialEq)]
-struct BufferStartOffset {
-    index: usize,
-    bit_offset: u8,
+impl BlockCompressor for InlineBitpacking {
+    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
+        let fixed_width = data.as_fixed_width().unwrap();
+        let (chunked, _) = self.chunk_data(fixed_width);
+        Ok(chunked.data.into_iter().next().unwrap())
+    }
 }
 
-#[derive(Debug, PartialEq)]
-enum StartOffset {
-    // skip the full buffer. The value is how many rows are skipped
-    // by skipping the full buffer (e.g., # rows in buffer)
-    SkipFull(u64),
-
-    // skip to some start offset in the buffer
-    SkipSome(BufferStartOffset),
+impl MiniBlockDecompressor for InlineBitpacking {
+    fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        assert_eq!(data.len(), 1);
+        let data = data.into_iter().next().unwrap();
+        match self.uncompressed_bit_width {
+            8 => Self::unchunk::<u8>(data, num_values),
+            16 => Self::unchunk::<u16>(data, num_values),
+            32 => Self::unchunk::<u32>(data, num_values),
+            64 => Self::unchunk::<u64>(data, num_values),
+            _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
+        }
+    }
 }
 
-/// compute how far ahead in this buffer should we skip ahead and start reading
+impl BlockDecompressor for InlineBitpacking {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        match self.uncompressed_bit_width {
+            8 => Self::unchunk::<u8>(data, num_values),
+            16 => Self::unchunk::<u16>(data, num_values),
+            32 => Self::unchunk::<u32>(data, num_values),
+            64 => Self::unchunk::<u64>(data, num_values),
+            _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
+        }
+    }
+}
+
+/// Bitpacks a FixedWidthDataBlock with a given bit width
 ///
-/// * `rows_to_skip` - how many rows to skip
-/// * `buffer_len` - length buf buffer (in bytes)
-/// * `bits_per_value` - number of bits used to represent a single bitpacked value
-/// * `buffer_start_bit_offset` - offset of the start of the first value within the
-///   buffer's  first byte
-/// * `buffer_end_bit_offset` - end bit of the last value within the buffer. Can be
-///   `None` if the end of the last value is byte aligned with end of buffer.
-fn compute_start_offset(
-    rows_to_skip: u64,
-    buffer_len: usize,
-    bits_per_value: u64,
-    buffer_start_bit_offset: u8,
-    buffer_end_bit_offset: Option<u8>,
-) -> StartOffset {
-    let rows_in_buffer = rows_in_buffer(
-        buffer_len,
-        bits_per_value,
-        buffer_start_bit_offset,
-        buffer_end_bit_offset,
-    );
-    if rows_to_skip >= rows_in_buffer {
-        return StartOffset::SkipFull(rows_in_buffer);
+/// This function is simpler as it does not do any chunking, but slightly less efficient.
+/// The compressed bits per value is constant across the entire buffer.
+///
+/// Note: even though we are not strictly "chunking" we are still operating on chunks of
+/// 1024 values because that's what the bitpacking primitives expect.  They just don't
+/// have a unique bit width for each chunk.
+fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
+    mut data: FixedWidthDataBlock,
+    bit_width: usize,
+) -> LanceBuffer {
+    let data_buffer = data.data.borrow_to_typed_slice::<T>();
+    let data_buffer = data_buffer.as_ref();
+
+    let num_chunks = data_buffer.len().div_ceil(ELEMS_PER_CHUNK as usize);
+    let last_chunk_is_runt = data_buffer.len() % ELEMS_PER_CHUNK as usize != 0;
+    let words_per_chunk =
+        (ELEMS_PER_CHUNK as usize * bit_width).div_ceil(data.bits_per_value as usize);
+    #[allow(clippy::uninit_vec)]
+    let mut output: Vec<T> = Vec::with_capacity(num_chunks * words_per_chunk);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(num_chunks * words_per_chunk);
     }
 
-    let start_bit = rows_to_skip * bits_per_value + buffer_start_bit_offset as u64;
-    let start_byte = start_bit / 8;
+    let num_whole_chunks = if last_chunk_is_runt {
+        num_chunks - 1
+    } else {
+        num_chunks
+    };
 
-    StartOffset::SkipSome(BufferStartOffset {
-        index: start_byte as usize,
-        bit_offset: (start_bit % 8) as u8,
-    })
+    // Simple case for complete chunks
+    for i in 0..num_whole_chunks {
+        let input_start = i * ELEMS_PER_CHUNK as usize;
+        let input_end = input_start + ELEMS_PER_CHUNK as usize;
+        let output_start = i * words_per_chunk;
+        let output_end = output_start + words_per_chunk;
+        unsafe {
+            BitPacking::unchecked_pack(
+                bit_width,
+                &data_buffer[input_start..input_end],
+                &mut output[output_start..output_end],
+            );
+        }
+    }
+
+    if !last_chunk_is_runt {
+        return LanceBuffer::reinterpret_vec(output);
+    }
+
+    // If we get here then the last chunk needs to be padded with zeros
+    let remaining_items = data_buffer.len() % ELEMS_PER_CHUNK as usize;
+    let last_chunk_start = num_whole_chunks * ELEMS_PER_CHUNK as usize;
+
+    let mut last_chunk: Vec<T> = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
+    last_chunk[..remaining_items].clone_from_slice(&data_buffer[last_chunk_start..]);
+    let output_start = num_whole_chunks * words_per_chunk;
+    unsafe {
+        BitPacking::unchecked_pack(bit_width, &last_chunk, &mut output[output_start..]);
+    }
+
+    LanceBuffer::reinterpret_vec(output)
 }
 
-/// calculates the number of rows in a buffer
-fn rows_in_buffer(
-    buffer_len: usize,
-    bits_per_value: u64,
-    buffer_start_bit_offset: u8,
-    buffer_end_bit_offset: Option<u8>,
-) -> u64 {
-    let mut bits_in_buffer = (buffer_len * 8) as u64 - buffer_start_bit_offset as u64;
+/// Unpacks a FixedWidthDataBlock that has been bitpacked with a constant bit width
+fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
+    mut data: FixedWidthDataBlock,
+    num_values: usize,
+    bits_per_value: usize,
+) -> FixedWidthDataBlock {
+    let words_per_chunk =
+        (ELEMS_PER_CHUNK as usize * bits_per_value).div_ceil(data.bits_per_value as usize);
+    let compressed_words = data.data.borrow_to_typed_slice::<T>();
 
-    // if the end of the last value of the buffer isn't byte aligned, subtract the
-    // end offset from the total number of bits in buffer
-    if let Some(buffer_end_bit_offset) = buffer_end_bit_offset {
-        bits_in_buffer -= (8 - buffer_end_bit_offset) as u64;
+    let num_chunks = data.num_values as usize / words_per_chunk;
+    debug_assert_eq!(data.num_values as usize % words_per_chunk, 0);
+
+    // This is slightly larger than num_values because the last chunk has some padding, we will truncate at the end
+    #[allow(clippy::uninit_vec)]
+    let mut decompressed = Vec::with_capacity(num_chunks * ELEMS_PER_CHUNK as usize);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        decompressed.set_len(num_chunks * ELEMS_PER_CHUNK as usize);
     }
 
-    bits_in_buffer / bits_per_value
+    for chunk_idx in 0..num_chunks {
+        let input_start = chunk_idx * words_per_chunk;
+        let input_end = input_start + words_per_chunk;
+        let output_start = chunk_idx * ELEMS_PER_CHUNK as usize;
+        let output_end = output_start + ELEMS_PER_CHUNK as usize;
+        unsafe {
+            BitPacking::unchecked_unpack(
+                bits_per_value,
+                &compressed_words[input_start..input_end],
+                &mut decompressed[output_start..output_end],
+            );
+        }
+    }
+
+    decompressed.truncate(num_values);
+
+    FixedWidthDataBlock {
+        data: LanceBuffer::reinterpret_vec(decompressed),
+        bits_per_value: data.bits_per_value,
+        num_values: num_values as u64,
+        block_info: BlockInfo::new(),
+    }
+}
+
+/// A transparent compressor that bit packs data
+///
+/// In order for the encoding to be transparent we must have a fixed bit width
+/// across the entire array.  Chunking within the buffer is not supported.  This
+/// means that we will be slightly less efficient than something like the mini-block
+/// approach.
+///
+/// WARNING: DO NOT USE YET.
+///
+/// This was an interesting experiment but it can't be used as a per-value compressor
+/// at the moment.  The resulting data IS transparent but it's not quite so simple.  We
+/// compress in blocks of 1024 and each block has a fixed size but also has some padding.
+///
+/// In other words, if we try the simple math to access the item at index `i` we will be
+/// out of luck because `bits_per_value * i` is not the location.  What we need is something
+/// like:
+///
+/// ```ignore
+/// let chunk_idx = i / 1024;
+/// let chunk_offset = i % 1024;
+/// bits_per_chunk * chunk_idx + bits_per_value * chunk_offset
+/// ```
+///
+/// However, this logic isn't expressible with the per-value traits we have today.  We can
+/// enhance these traits should we need to support it at some point in the future.
+#[derive(Debug)]
+pub struct OutOfLineBitpacking {
+    compressed_bit_width: usize,
+}
+
+impl PerValueCompressor for OutOfLineBitpacking {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
+        let fixed_width = data.as_fixed_width().unwrap();
+        let num_values = fixed_width.num_values;
+        let word_size = fixed_width.bits_per_value;
+        let compressed = match word_size {
+            8 => bitpack_out_of_line::<u8>(fixed_width, self.compressed_bit_width),
+            16 => bitpack_out_of_line::<u16>(fixed_width, self.compressed_bit_width),
+            32 => bitpack_out_of_line::<u32>(fixed_width, self.compressed_bit_width),
+            64 => bitpack_out_of_line::<u64>(fixed_width, self.compressed_bit_width),
+            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+        };
+        let compressed = FixedWidthDataBlock {
+            data: compressed,
+            bits_per_value: self.compressed_bit_width as u64,
+            num_values,
+            block_info: BlockInfo::new(),
+        };
+        let encoding =
+            ProtobufUtils::out_of_line_bitpacking(word_size, self.compressed_bit_width as u64);
+        Ok((PerValueDataBlock::Fixed(compressed), encoding))
+    }
+}
+
+impl FixedPerValueDecompressor for OutOfLineBitpacking {
+    fn decompress(&self, data: FixedWidthDataBlock, num_values: u64) -> Result<DataBlock> {
+        let unpacked = match data.bits_per_value {
+            8 => unpack_out_of_line::<u8>(data, num_values as usize, self.compressed_bit_width),
+            16 => unpack_out_of_line::<u16>(data, num_values as usize, self.compressed_bit_width),
+            32 => unpack_out_of_line::<u32>(data, num_values as usize, self.compressed_bit_width),
+            64 => unpack_out_of_line::<u64>(data, num_values as usize, self.compressed_bit_width),
+            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+        };
+        Ok(DataBlock::FixedWidth(unpacked))
+    }
+
+    fn bits_per_value(&self) -> u64 {
+        self.compressed_bit_width as u64
+    }
 }
 
 #[cfg(test)]
-pub mod test {
+mod test {
+    use std::{collections::HashMap, sync::Arc};
+
+    use arrow_array::{Int64Array, Int8Array};
+
+    use arrow_schema::DataType;
+
+    use arrow_array::Array;
+
     use crate::{
-        format::pb,
-        testing::{check_round_trip_encoding_generated, ArrayGeneratorProvider},
+        testing::{check_round_trip_encoding_of_data, TestCases},
         version::LanceFileVersion,
     };
 
-    use super::*;
-    use std::{marker::PhantomData, sync::Arc};
-
-    use arrow_array::{
-        types::{UInt16Type, UInt8Type},
-        ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
-    };
-
-    use arrow_schema::Field;
-    use lance_datagen::{
-        array::{fill, rand_with_distribution},
-        gen, ArrayGenerator, ArrayGeneratorExt, RowCount,
-    };
-    use rand::distributions::Uniform;
-
-    #[test]
-    fn test_bitpack_params() {
-        fn gen_array(generator: Box<dyn ArrayGenerator>) -> ArrayRef {
-            let arr = gen()
-                .anon_col(generator)
-                .into_batch_rows(RowCount::from(10000))
-                .unwrap()
-                .column(0)
-                .clone();
-
-            arr
-        }
-
-        macro_rules! do_test {
-            ($num_bits:expr, $data_type:ident, $null_probability:expr) => {
-                let max = 1 << $num_bits - 1;
-                let mut arr =
-                    gen_array(fill::<$data_type>(max).with_random_nulls($null_probability));
-
-                // ensure we don't randomly generate all nulls, that won't work
-                while arr.null_count() == arr.len() {
-                    arr = gen_array(fill::<$data_type>(max).with_random_nulls($null_probability));
-                }
-                let result = bitpack_params(arr.as_ref());
-                assert!(result.is_some());
-                assert_eq!($num_bits, result.unwrap().num_bits);
-            };
-        }
-
-        let test_cases = vec![
-            (5u64, 0.0f64),
-            (5u64, 0.9f64),
-            (1u64, 0.0f64),
-            (1u64, 0.5f64),
-            (8u64, 0.0f64),
-            (8u64, 0.5f64),
-        ];
-
-        for (num_bits, null_probability) in &test_cases {
-            do_test!(*num_bits, UInt8Type, *null_probability);
-            do_test!(*num_bits, UInt16Type, *null_probability);
-            do_test!(*num_bits, UInt32Type, *null_probability);
-            do_test!(*num_bits, UInt64Type, *null_probability);
-        }
-
-        // do some test cases that that will only work on larger types
-        let test_cases = vec![
-            (13u64, 0.0f64),
-            (13u64, 0.5f64),
-            (16u64, 0.0f64),
-            (16u64, 0.5f64),
-        ];
-        for (num_bits, null_probability) in &test_cases {
-            do_test!(*num_bits, UInt16Type, *null_probability);
-            do_test!(*num_bits, UInt32Type, *null_probability);
-            do_test!(*num_bits, UInt64Type, *null_probability);
-        }
-        let test_cases = vec![
-            (25u64, 0.0f64),
-            (25u64, 0.5f64),
-            (32u64, 0.0f64),
-            (32u64, 0.5f64),
-        ];
-        for (num_bits, null_probability) in &test_cases {
-            do_test!(*num_bits, UInt32Type, *null_probability);
-            do_test!(*num_bits, UInt64Type, *null_probability);
-        }
-        let test_cases = vec![
-            (48u64, 0.0f64),
-            (48u64, 0.5f64),
-            (64u64, 0.0f64),
-            (64u64, 0.5f64),
-        ];
-        for (num_bits, null_probability) in &test_cases {
-            do_test!(*num_bits, UInt64Type, *null_probability);
-        }
-
-        // test that it returns None for datatypes that don't support bitpacking
-        let arr = Float64Array::from_iter_values(vec![0.1, 0.2, 0.3]);
-        let result = bitpack_params(&arr);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_num_compressed_bits_signed_types() {
-        let values = Int32Array::from(vec![1, 2, -7]);
-        let arr = values;
-        let result = bitpack_params(&arr);
-        assert!(result.is_some());
-        let result = result.unwrap();
-        assert_eq!(4, result.num_bits);
-        assert!(result.signed);
-
-        // check that it doesn't add a sign bit if it doesn't need to
-        let values = Int32Array::from(vec![1, 2, 7]);
-        let arr = values;
-        let result = bitpack_params(&arr);
-        assert!(result.is_some());
-        let result = result.unwrap();
-        assert_eq!(3, result.num_bits);
-        assert!(!result.signed);
-    }
-
-    #[test]
-    fn test_rows_in_buffer() {
-        let test_cases = vec![
-            (5usize, 5u64, 0u8, None, 8u64),
-            (2, 3, 0, Some(5), 4),
-            (2, 3, 7, Some(6), 2),
-        ];
-
-        for (
-            buffer_len,
-            bits_per_value,
-            buffer_start_bit_offset,
-            buffer_end_bit_offset,
-            expected,
-        ) in test_cases
-        {
-            let result = rows_in_buffer(
-                buffer_len,
-                bits_per_value,
-                buffer_start_bit_offset,
-                buffer_end_bit_offset,
-            );
-            assert_eq!(expected, result);
-        }
-    }
-
-    #[test]
-    fn test_compute_start_offset() {
-        let result = compute_start_offset(0, 5, 5, 0, None);
-        assert_eq!(
-            StartOffset::SkipSome(BufferStartOffset {
-                index: 0,
-                bit_offset: 0
-            }),
-            result
-        );
-
-        let result = compute_start_offset(10, 5, 5, 0, None);
-        assert_eq!(StartOffset::SkipFull(8), result);
-    }
-
-    #[test_log::test(test)]
-    fn test_will_bitpack_allowed_types_when_possible() {
-        let test_cases: Vec<(DataType, ArrayRef, u64)> = vec![
-            (
-                DataType::UInt8,
-                Arc::new(UInt8Array::from_iter_values(vec![0, 1, 2, 3, 4, 5])),
-                3, // bits per value
-            ),
-            (
-                DataType::UInt16,
-                Arc::new(UInt16Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 8])),
-                11,
-            ),
-            (
-                DataType::UInt32,
-                Arc::new(UInt32Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 16])),
-                19,
-            ),
-            (
-                DataType::UInt64,
-                Arc::new(UInt64Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 32])),
-                35,
-            ),
-            (
-                DataType::Int8,
-                Arc::new(Int8Array::from_iter_values(vec![0, 2, 3, 4, -5])),
-                4,
-            ),
-            (
-                // check it will not pack with signed bit if all values of signed type are positive
-                DataType::Int8,
-                Arc::new(Int8Array::from_iter_values(vec![0, 2, 3, 4, 5])),
-                3,
-            ),
-            (
-                DataType::Int16,
-                Arc::new(Int16Array::from_iter_values(vec![0, 1, 2, 3, -4, 5 << 8])),
-                12,
-            ),
-            (
-                DataType::Int32,
-                Arc::new(Int32Array::from_iter_values(vec![0, 1, 2, 3, 4, -5 << 16])),
-                20,
-            ),
-            (
-                DataType::Int64,
-                Arc::new(Int64Array::from_iter_values(vec![
-                    0,
-                    1,
-                    2,
-                    -3,
-                    -4,
-                    -5 << 32,
-                ])),
-                36,
-            ),
-        ];
-
-        for (data_type, arr, bits_per_value) in test_cases {
-            let mut buffed_index = 1;
-            let params = bitpack_params(arr.as_ref()).unwrap();
-            let encoder = BitpackedArrayEncoder {
-                num_bits: params.num_bits,
-                signed_type: params.signed,
-            };
-            let data = DataBlock::from_array(arr);
-            let result = encoder.encode(data, &data_type, &mut buffed_index).unwrap();
-
-            let data = result.data.as_fixed_width().unwrap();
-            assert_eq!(bits_per_value, data.bits_per_value);
-
-            let array_encoding = result.encoding.array_encoding.unwrap();
-
-            match array_encoding {
-                pb::array_encoding::ArrayEncoding::Bitpacked(bitpacked) => {
-                    assert_eq!(bits_per_value, bitpacked.compressed_bits_per_value);
-                    assert_eq!(
-                        (data_type.byte_width() * 8) as u64,
-                        bitpacked.uncompressed_bits_per_value
-                    );
-                }
-                _ => {
-                    panic!("Array did not use bitpacking encoding")
-                }
-            }
-        }
-
-        // check it will otherwise use flat encoding
-        let test_cases: Vec<(DataType, ArrayRef)> = vec![
-            // it should use flat encoding for datatypes that don't support bitpacking
-            (
-                DataType::Float32,
-                Arc::new(Float32Array::from_iter_values(vec![0.1, 0.2, 0.3])),
-            ),
-            // it should still use flat encoding if bitpacked encoding would be packed
-            // into the full byte range
-            (
-                DataType::UInt8,
-                Arc::new(UInt8Array::from_iter_values(vec![0, 1, 2, 3, 4, 250])),
-            ),
-            (
-                DataType::UInt16,
-                Arc::new(UInt16Array::from_iter_values(vec![0, 1, 2, 3, 4, 250 << 8])),
-            ),
-            (
-                DataType::UInt32,
-                Arc::new(UInt32Array::from_iter_values(vec![
-                    0,
-                    1,
-                    2,
-                    3,
-                    4,
-                    250 << 24,
-                ])),
-            ),
-            (
-                DataType::UInt64,
-                Arc::new(UInt64Array::from_iter_values(vec![
-                    0,
-                    1,
-                    2,
-                    3,
-                    4,
-                    250 << 56,
-                ])),
-            ),
-            (
-                DataType::Int8,
-                Arc::new(Int8Array::from_iter_values(vec![-100])),
-            ),
-            (
-                DataType::Int16,
-                Arc::new(Int16Array::from_iter_values(vec![-100 << 8])),
-            ),
-            (
-                DataType::Int32,
-                Arc::new(Int32Array::from_iter_values(vec![-100 << 24])),
-            ),
-            (
-                DataType::Int64,
-                Arc::new(Int64Array::from_iter_values(vec![-100 << 56])),
-            ),
-        ];
-
-        for (data_type, arr) in test_cases {
-            if let Some(params) = bitpack_params(arr.as_ref()) {
-                assert_eq!(params.num_bits, data_type.byte_width() as u64 * 8);
-            }
-        }
-    }
-
-    struct DistributionArrayGeneratorProvider<
-        DataType,
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
-    >
-    where
-        DataType::Native: Copy + 'static,
-        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
-        DataType: ArrowPrimitiveType,
-    {
-        phantom: PhantomData<DataType>,
-        distribution: Dist,
-    }
-
-    impl<DataType, Dist> DistributionArrayGeneratorProvider<DataType, Dist>
-    where
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
-        DataType::Native: Copy + 'static,
-        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
-        DataType: ArrowPrimitiveType,
-    {
-        fn new(dist: Dist) -> Self {
-            Self {
-                distribution: dist,
-                phantom: Default::default(),
-            }
-        }
-    }
-
-    impl<DataType, Dist> ArrayGeneratorProvider for DistributionArrayGeneratorProvider<DataType, Dist>
-    where
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
-        DataType::Native: Copy + 'static,
-        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
-        DataType: ArrowPrimitiveType,
-    {
-        fn provide(&self) -> Box<dyn ArrayGenerator> {
-            rand_with_distribution::<DataType, Dist>(self.distribution.clone())
-        }
-
-        fn copy(&self) -> Box<dyn ArrayGeneratorProvider> {
-            Box::new(Self {
-                phantom: self.phantom,
-                distribution: self.distribution.clone(),
-            })
-        }
-    }
-
     #[test_log::test(tokio::test)]
-    async fn test_bitpack_primitive() {
-        let bitpacked_test_cases: &Vec<(DataType, Box<dyn ArrayGeneratorProvider>)> = &vec![
-            // check less than one byte for multi-byte type
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        Uniform::new(0, 19),
-                    ),
-                ),
-            ),
-            // // check that more than one byte for multi-byte type
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        Uniform::new(5 << 7, 6 << 7),
-                    ),
-                ),
-            ),
-            (
-                DataType::UInt64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        Uniform::new(5 << 42, 6 << 42),
-                    ),
-                ),
-            ),
-            // check less than one byte for single-byte type
-            (
-                DataType::UInt8,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt8Type, Uniform<u8>>::new(
-                        Uniform::new(0, 19),
-                    ),
-                ),
-            ),
-            // check less than one byte for single-byte type
-            (
-                DataType::UInt64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        Uniform::new(129, 259),
-                    ),
-                ),
-            ),
-            // check byte aligned for single byte
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        // this range should always give 8 bits
-                        Uniform::new(200, 250),
-                    ),
-                ),
-            ),
-            // check where the num_bits divides evenly into the bit length of the type
-            (
-                DataType::UInt64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        Uniform::new(1, 3), // 2 bits
-                    ),
-                ),
-            ),
-            // check byte aligned for multiple bytes
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        // this range should always always give 16 bits
-                        Uniform::new(200 << 8, 250 << 8),
-                    ),
-                ),
-            ),
-            // check byte aligned where the num bits doesn't divide evenly into the byte length
-            (
-                DataType::UInt64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        // this range should always give 24 hits
-                        Uniform::new(200 << 16, 250 << 16),
-                    ),
-                ),
-            ),
-            // check that we can still encode an all-0 array
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        Uniform::new(0, 1),
-                    ),
-                ),
-            ),
-            // check for signed types
-            (
-                DataType::Int16,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int16Type, Uniform<i16>>::new(
-                        Uniform::new(-5, 5),
-                    ),
-                ),
-            ),
-            (
-                DataType::Int64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int64Type, Uniform<i64>>::new(
-                        Uniform::new(-(5 << 42), 6 << 42),
-                    ),
-                ),
-            ),
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(-(5 << 7), 6 << 7),
-                    ),
-                ),
-            ),
-            // check signed where packed to < 1 byte for multi-byte type
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(-19, 19),
-                    ),
-                ),
-            ),
-            // check signed byte aligned to single byte
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        // this range should always give 8 bits
-                        Uniform::new(-120, 120),
-                    ),
-                ),
-            ),
-            // check signed byte aligned to multiple bytes
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        // this range should always give 16 bits
-                        Uniform::new(-120 << 8, 120 << 8),
-                    ),
-                ),
-            ),
-            // check that it works for all positive integers even if type is signed
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(10, 20),
-                    ),
-                ),
-            ),
-            // check that all 0 works for signed type
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(0, 1),
-                    ),
-                ),
-            ),
-        ];
+    async fn test_miniblock_bitpack() {
+        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
 
-        for (data_type, array_gen_provider) in bitpacked_test_cases {
-            let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding_generated(
-                field,
-                array_gen_provider.copy(),
-                LanceFileVersion::V2_1,
-            )
-            .await;
+        let arrays = vec![
+            Arc::new(Int8Array::from(vec![100; 1024])) as Arc<dyn Array>,
+            Arc::new(Int8Array::from(vec![1; 1024])) as Arc<dyn Array>,
+            Arc::new(Int8Array::from(vec![16; 1024])) as Arc<dyn Array>,
+            Arc::new(Int8Array::from(vec![-1; 1024])) as Arc<dyn Array>,
+            Arc::new(Int8Array::from(vec![5; 1])) as Arc<dyn Array>,
+        ];
+        check_round_trip_encoding_of_data(arrays, &test_cases, HashMap::new()).await;
+
+        for data_type in [DataType::Int16, DataType::Int32, DataType::Int64] {
+            let int64_arrays = vec![
+                Int64Array::from(vec![3; 1024]),
+                Int64Array::from(vec![8; 1024]),
+                Int64Array::from(vec![16; 1024]),
+                Int64Array::from(vec![100; 1024]),
+                Int64Array::from(vec![512; 1024]),
+                Int64Array::from(vec![1000; 1024]),
+                Int64Array::from(vec![2000; 1024]),
+                Int64Array::from(vec![-1; 10]),
+            ];
+
+            let mut arrays = vec![];
+            for int64_array in int64_arrays {
+                arrays.push(arrow_cast::cast(&int64_array, &data_type).unwrap());
+            }
+            check_round_trip_encoding_of_data(arrays, &test_cases, HashMap::new()).await;
         }
     }
 }
