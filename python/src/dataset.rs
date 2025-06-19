@@ -1769,7 +1769,7 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (key))]
+    #[pyo3(signature = (keys))]
     fn delete_config_keys(&mut self, keys: Vec<String>) -> PyResult<()> {
         let key_refs: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
         let mut new_self = self.ds.as_ref().clone();

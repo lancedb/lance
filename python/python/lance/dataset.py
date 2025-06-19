@@ -3848,7 +3848,7 @@ class DatasetOptimizer:
         self._dataset._ds.optimize_indices(**kwargs)
 
     def enable_autocleanup(self, auto_cleanup_config: AutoCleanupConfig, **kwargs):
-        """Enable autocleaning for an exists dataset.
+        """Enable autocleaning for an existing dataset.
 
         Parameters
         ----------
