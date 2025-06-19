@@ -32,7 +32,7 @@ pub use norm_l2::*;
 use crate::Result;
 
 /// Distance metrics type.
-#[derive(Debug, Copy, Clone, PartialEq, DeepSizeOf)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, DeepSizeOf)]
 pub enum DistanceType {
     L2,
     Cosine,

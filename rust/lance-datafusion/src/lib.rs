@@ -7,6 +7,7 @@ pub mod datagen;
 pub mod exec;
 pub mod expr;
 pub mod logical_expr;
+pub mod logical_plan;
 pub mod planner;
 pub mod projection;
 pub mod spill;
