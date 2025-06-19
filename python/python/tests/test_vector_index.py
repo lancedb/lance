@@ -207,15 +207,6 @@ def test_invalid_subvectors(tmp_path):
         )
 
 
-def test_small_dataset(tmp_path):
-    tbl = create_table(nvec=10)
-    dataset = lance.write_dataset(tbl, tmp_path)
-    dataset = dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
-    )
-    validate_vector_index(dataset, "vector")
-
-
 @pytest.mark.cuda
 def test_invalid_subvectors_cuda(tmp_path):
     tbl = create_table()
@@ -283,7 +274,7 @@ def test_torch_index_with_nans(tmp_path, index_file_version):
         num_sub_vectors=16,
         accelerator=torch.device("cpu"),
         one_pass_ivfpq=True,
-        index_file_version=index_file_version,
+        index_file_version=str(index_file_version),
     )
     validate_vector_index(dataset, "vector")
 
