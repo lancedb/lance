@@ -22,12 +22,12 @@ use crate::data::{
     BlockInfo, DataBlock, DictionaryDataBlock, FixedWidthDataBlock, NullableDataBlock,
     VariableWidthBlock,
 };
-use crate::decoder::LogicalPageDecoder;
-use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 use crate::format::ProtobufUtils;
+use crate::v2::decoder::LogicalPageDecoder;
+use crate::v2::encodings::logical::primitive::PrimitiveFieldDecoder;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, EncodedArray},
+    v2::encoder::{ArrayEncoder, EncodedArray},
     EncodingsIo,
 };
 

@@ -18,13 +18,13 @@ use lance_core::{datatypes::BLOB_DESC_FIELDS, Error, Result};
 use crate::{
     buffer::LanceBuffer,
     decoder::{
-        DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
-        MessageType, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
-        SchedulingJob,
+        DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
+        ScheduledScanLine, SchedulerContext,
     },
     encoder::{EncodeTask, FieldEncoder, OutOfLineBuffers},
     format::pb::{column_encoding, Blob, ColumnEncoding},
     repdef::RepDefBuilder,
+    v2::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
     EncodingsIo,
 };
 

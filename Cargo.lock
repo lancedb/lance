@@ -4294,7 +4294,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding-datafusion"
-version = "0.30.0"
+version = "0.29.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",

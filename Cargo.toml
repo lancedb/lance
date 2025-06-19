@@ -7,7 +7,6 @@ members = [
     "rust/lance-core",
     "rust/lance-datagen",
     "rust/lance-encoding",
-    "rust/lance-encoding-datafusion",
     "rust/lance-file",
     "rust/lance-index",
     "rust/lance-io",

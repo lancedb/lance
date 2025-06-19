@@ -133,10 +133,10 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use crate::decoder::PrimitivePageDecoder;
-    use crate::encodings::physical::bitmap::BitmapData;
     use crate::testing::{
         check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
     };
+    use crate::v2::encodings::physical::bitmap::BitmapData;
     use crate::version::LanceFileVersion;
 
     use super::BitmapDecoder;

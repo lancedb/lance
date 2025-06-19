@@ -18,7 +18,7 @@ use crate::{
     buffer::LanceBuffer,
     data::{DataBlock, FixedWidthDataBlock, StructDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, EncodedArray},
+    v2::encoder::{ArrayEncoder, EncodedArray},
     EncodingsIo,
 };
 

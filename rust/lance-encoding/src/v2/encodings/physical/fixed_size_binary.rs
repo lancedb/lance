@@ -12,8 +12,8 @@ use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
+    v2::encoder::{ArrayEncoder, EncodedArray},
     EncodingsIo,
 };
 
@@ -173,7 +173,7 @@ mod tests {
 
     use crate::data::{DataBlock, FixedWidthDataBlock};
     use crate::decoder::PrimitivePageDecoder;
-    use crate::encodings::physical::fixed_size_binary::FixedSizeBinaryDecoder;
+    use crate::v2::encodings::physical::fixed_size_binary::FixedSizeBinaryDecoder;
     use crate::{
         testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
         version::LanceFileVersion,
