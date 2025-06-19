@@ -27,3 +27,7 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   correctly, so there are duplicate field ids in the schema. There aren't great
   workarounds for readers. Writers should make sure to check the field ids in
   the schema and re-compute them if necessary.
+* `v0.27.1/pq_in_schema`: This dataset uses the old method of storing the PQ
+  metadata in the schema metadata in the index file. We switched to storing them
+  in a global buffer in https://github.com/lancedb/lance/pull/3829, but still
+  need to be able to read the old format.
