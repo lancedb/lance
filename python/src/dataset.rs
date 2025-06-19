@@ -1770,8 +1770,8 @@ impl Dataset {
     }
 
     #[pyo3(signature = (key))]
-    fn delete_config_keys(&mut self, key: Vec<String>) -> PyResult<()> {
-        let key_refs: Vec<&str> = key.iter().map(|k| k.as_str()).collect();
+    fn delete_config_keys(&mut self, keys: Vec<String>) -> PyResult<()> {
+        let key_refs: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
         let mut new_self = self.ds.as_ref().clone();
         RT.block_on(None, new_self.delete_config_keys(&key_refs))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;

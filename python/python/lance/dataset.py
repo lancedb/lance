@@ -2697,6 +2697,17 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.update_config(upsert_values)
 
+    def delete_config_keys(self, keys: [str]) -> None:
+        """
+        Delete the dataset configuration items based on given keys.
+
+        Parameters
+        ----------
+        keys: str array
+            The config keys to be deleted.
+        """
+        self._ds.delete_config_keys(keys)
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -3847,22 +3858,19 @@ class DatasetOptimizer:
             cleaned up according to this parameter.
         """
         self._dataset._ds.update_config(
-            upsert_values= {
-                "lance.auto_cleanup.interval": auto_cleanup_config.interval,
-                "lance.auto_cleanup.older_than": auto_cleanup_config.older_than_seconds,
+            {
+                "lance.auto_cleanup.interval": str(auto_cleanup_config["interval"]),
+                "lance.auto_cleanup.older_than": f"{
+                    auto_cleanup_config['older_than_seconds']
+                }s",
             }
         )
 
     def disable_autocleanup(self, **kwargs):
-        """
-
-        :param kwargs:
-        :return:
-        """
-        self._dataset._ds.delete_config_keys([
-            "lance.auto_cleanup.interval",
-            "lance.auto_cleanup.older_than"
-        ])
+        """Disable autocleaning via delete related keys."""
+        self._dataset._ds.delete_config_keys(
+            ["lance.auto_cleanup.interval", "lance.auto_cleanup.older_than"]
+        )
 
 
 class Tags:

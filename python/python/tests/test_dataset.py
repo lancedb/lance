@@ -1166,6 +1166,44 @@ def test_auto_cleanup_invalid(tmp_path):
     assert len(dataset.versions()) == 4
 
 
+def test_enable_disable_auto_cleanup(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir, mode="create")
+    auto_cleanup_options = AutoCleanupConfig(
+        interval=1,
+        older_than_seconds=1,
+    )
+    # enable auto cleanup
+    ds.checkout_version(ds.latest_version).optimize.enable_autocleanup(
+        auto_cleanup_options
+    )
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+
+    time.sleep(5)
+
+    # trigger cleanup
+    lance.write_dataset(table, base_dir, mode="append")
+    dataset = lance.dataset(base_dir)
+    assert len(dataset.versions()) == 2
+
+    # this is a transactional commit, so will increase a version
+    dataset.disable_autocleanup()
+
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+
+    time.sleep(5)
+
+    # wait to see if cleanup would be trigger
+    lance.write_dataset(table, base_dir, mode="append")
+
+    assert len(lance.dataset(base_dir).versions()) == 7
+
+
 def test_create_from_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
