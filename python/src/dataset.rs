@@ -1780,6 +1780,26 @@ impl Dataset {
         self.ds = Arc::new(new_self);
         Ok(())
     }
+
+    #[pyo3(signature = (keys))]
+    fn get_configs(&mut self, keys: Vec<String>) -> PyResult<PyObject> {
+        let key_refs: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
+        let mut new_self = self.ds.as_ref().clone();
+
+        let configs = RT
+            .block_on(None, new_self.get_configs(&key_refs))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        self.ds = Arc::new(new_self);
+
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            for (k, v) in configs {
+                dict.set_item(k, v)?;
+            }
+            Ok(dict.into())
+        })
+    }
 }
 
 #[derive(FromPyObject)]
