@@ -506,7 +506,6 @@ impl DatasetIndexExt for Dataset {
         } else {
             Ok(indices)
         }
-        
     }
 
     async fn commit_existing_index(
@@ -1141,19 +1140,22 @@ impl DatasetIndexInternalExt for Dataset {
     ) -> Result<Option<Arc<FragReuseIndex>>> {
         if let Some(fri_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
             let uuid = fri_meta.uuid.to_string();
-            let index = self.index_cache.get_or_insert(uuid.clone(), |_| async move {
-                let index_meta = self.load_index(&uuid).await?.ok_or_else(|| Error::Index {
-                    message: format!("Index with id {} does not exist", uuid),
-                    location: location!(),
-                })?;
-                let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
-                let index = open_frag_reuse_index(index_details.as_ref()).await?;
+            let index = self
+                .index_cache
+                .get_or_insert(uuid.clone(), |_| async move {
+                    let index_meta = self.load_index(&uuid).await?.ok_or_else(|| Error::Index {
+                        message: format!("Index with id {} does not exist", uuid),
+                        location: location!(),
+                    })?;
+                    let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
+                    let index = open_frag_reuse_index(index_details.as_ref()).await?;
 
-                info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_FRAG_REUSE);
-                metrics.record_index_load();
+                    info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_FRAG_REUSE);
+                    metrics.record_index_load();
 
-                Ok(index)
-            }).await?;
+                    Ok(index)
+                })
+                .await?;
 
             Ok(Some(index))
         } else {

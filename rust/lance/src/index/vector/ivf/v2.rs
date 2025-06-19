@@ -7,11 +7,9 @@ use std::marker::PhantomData;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use crate::index::vector::builder::{index_type_string, IvfIndexBuilder};
-use crate::{
-    index::{
-        vector::{utils::PartitionLoadLock, VectorIndex},
-        PreFilter,
-    },
+use crate::index::{
+    vector::{utils::PartitionLoadLock, VectorIndex},
+    PreFilter,
 };
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;

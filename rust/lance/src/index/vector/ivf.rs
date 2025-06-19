@@ -170,7 +170,7 @@ impl IVFIndex {
         write_cache: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
+        let cache_key = format!("ivf-{}", partition_id);
         let session = self.session.upgrade().ok_or(Error::Internal {
             message: "attempt to use index after dataset was destroyed".into(),
             location: location!(),
