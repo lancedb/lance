@@ -2232,6 +2232,7 @@ mod tests {
             fragment_bitmap: None,
             index_details: Some(vector_index_details()),
             index_version: index.index_type().version(),
+            created_at: None, // Test index, not setting timestamp
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
