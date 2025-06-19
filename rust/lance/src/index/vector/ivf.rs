@@ -170,12 +170,15 @@ impl IVFIndex {
         write_cache: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
+        let cache_key = format!("ivf-{}", partition_id);
         let session = self.session.upgrade().ok_or(Error::Internal {
             message: "attempt to use index after dataset was destroyed".into(),
             location: location!(),
         })?;
-        let part_index = if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
+        let part_index = if let Some(part_idx) = session
+            .index_cache
+            .get_unsized::<dyn VectorIndex>(&cache_key)
+        {
             part_idx
         } else {
             metrics.record_part_load();
@@ -185,7 +188,10 @@ impl IVFIndex {
             let _guard = mtx.lock().await;
             // check the cache again, as the partition may have been loaded by another
             // thread that held the lock on loading the partition
-            if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
+            if let Some(part_idx) = session
+                .index_cache
+                .get_unsized::<dyn VectorIndex>(&cache_key)
+            {
                 part_idx
             } else {
                 if partition_id >= self.ivf.num_partitions() {
@@ -211,7 +217,7 @@ impl IVFIndex {
                     .await?;
                 let idx: Arc<dyn VectorIndex> = idx.into();
                 if write_cache {
-                    session.index_cache.insert_vector(&cache_key, idx.clone());
+                    session.index_cache.insert_unsized(&cache_key, idx.clone());
                 }
                 idx
             }

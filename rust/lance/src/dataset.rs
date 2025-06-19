@@ -107,11 +107,13 @@ const INDICES_DIR: &str = "_indices";
 
 pub const DATA_DIR: &str = "data";
 pub const BLOB_DIR: &str = "_blobs";
-pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
+// We default to 6GB for the index cache, since indices are often large but
+// worth caching.
+pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
 // Default to 1 GiB for the metadata cache. Column metadata can be like 40MB,
 // so this should be enough for a few hundred columns. Other metadata is much
 // smaller.
-pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
+pub const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Lance Dataset
 #[derive(Clone)]
@@ -132,6 +134,7 @@ pub struct Dataset {
     pub tags: Tags,
 
     // These are references to session caches, but with the dataset URI as a prefix.
+    pub(crate) index_cache: Arc<LanceCache>,
     pub(crate) metadata_cache: Arc<LanceCache>,
 }
 
@@ -173,9 +176,9 @@ impl From<&Manifest> for Version {
 /// Customize read behavior of a dataset.
 #[derive(Clone, Debug)]
 pub struct ReadParams {
-    /// Cache size for index cache. If it is zero, index cache is disabled.
-    ///
-    pub index_cache_size: usize,
+    /// Size of the index cache in bytes. This cache stores index data in memory
+    /// for faster lookups. The default is 6 GiB.
+    pub index_cache_size_bytes: usize,
 
     /// Size of the metadata cache in bytes. This cache stores metadata in memory
     /// for faster open table and scans. The default is 1 GiB.
@@ -209,8 +212,18 @@ pub struct ReadParams {
 
 impl ReadParams {
     /// Set the cache size for indices. Set to zero, to disable the cache.
+    #[deprecated(
+        since = "0.30.0",
+        note = "Use `index_cache_size_bytes` instead, which accepts a size in bytes."
+    )]
     pub fn index_cache_size(&mut self, cache_size: usize) -> &mut Self {
-        self.index_cache_size = cache_size;
+        let assumed_entry_size = 20 * 1024 * 1024; // 20 MiB per entry
+        self.index_cache_size_bytes = cache_size * assumed_entry_size;
+        self
+    }
+
+    pub fn index_cache_size_bytes(&mut self, cache_size: usize) -> &mut Self {
+        self.index_cache_size_bytes = cache_size;
         self
     }
 
@@ -246,7 +259,7 @@ impl ReadParams {
 impl Default for ReadParams {
     fn default() -> Self {
         Self {
-            index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
+            index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             session: None,
             store_options: None,
@@ -376,7 +389,7 @@ impl Dataset {
         let manifest = Self::load_manifest(
             self.object_store.as_ref(),
             &manifest_location,
-            &base_path,
+            &self.uri,
             self.session.as_ref(),
         )
         .await?;
@@ -399,7 +412,7 @@ impl Dataset {
     async fn load_manifest(
         object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
-        base_path: &Path,
+        uri: &str,
         session: &Session,
     ) -> Result<Manifest> {
         let object_reader = if let Some(size) = manifest_location.size {
@@ -475,11 +488,10 @@ impl Dataset {
                     .into_iter()
                     .map(Index::try_from)
                     .collect::<Result<Vec<_>>>()?;
-                session.index_cache.insert_metadata(
-                    base_path.as_ref(),
-                    manifest_location.version,
-                    Arc::new(indices),
-                );
+
+                let index_cache = session.index_cache.with_key_prefix(uri);
+                let metadata_key = format!("{}", manifest_location.version);
+                index_cache.insert(&metadata_key, Arc::new(indices));
             }
         }
 
@@ -504,6 +516,7 @@ impl Dataset {
             base_path.clone(),
         );
         let metadata_cache = Arc::new(session.metadata_cache.with_key_prefix(&uri));
+        let index_cache = Arc::new(session.index_cache.with_key_prefix(&uri));
         Ok(Self {
             object_store,
             base: base_path,
@@ -514,6 +527,7 @@ impl Dataset {
             session,
             tags,
             metadata_cache,
+            index_cache,
         })
     }
 
@@ -1085,12 +1099,13 @@ impl Dataset {
 
     /// Get the number of entries currently in the index cache.
     pub fn index_cache_entry_count(&self) -> usize {
-        self.session.index_cache.get_size()
+        self.session.index_cache.size()
     }
 
     /// Get cache hit ratio.
     pub fn index_cache_hit_rate(&self) -> f32 {
-        self.session.index_cache.hit_rate()
+        let stats = self.session.index_cache_stats();
+        stats.hit_ratio()
     }
 
     pub fn cache_size_bytes(&self) -> u64 {
@@ -1517,7 +1532,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         Dataset::load_manifest(
                             dataset.object_store(),
                             &location,
-                            &dataset.base,
+                            dataset.uri(),
                             dataset.session.as_ref(),
                         )
                     })
