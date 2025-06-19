@@ -21,6 +21,8 @@ use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
 use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::v2::reader::ReaderProjection;
+use lance_file::v2::LanceEncodingsIo;
 use lance_file::{
     v2::{
         reader::{
@@ -390,6 +392,7 @@ impl LanceFileReader {
     async fn open(
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
+        columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let (object_store, path) =
             object_store_from_uri_or_path(uri_or_path, storage_options).await?;
@@ -403,10 +406,28 @@ impl LanceFileReader {
             .open_file(&path, &CachedFileSize::unknown())
             .await
             .infer_error()?;
-        let inner = FileReader::try_open(
-            file,
-            None,
+        let file_metadata = FileReader::read_all_metadata(&file)
+            .await
+            .map_err(|e| PyIOError::new_err(format!("Error reading file metadata: {}", e)))?;
+
+        let mut base_projection = None;
+        if let Some(columns) = columns {
+            base_projection = Some(
+                ReaderProjection::from_column_names(
+                    file_metadata.version(),
+                    &file_metadata.file_schema,
+                    &columns.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
+                )
+                .map_err(|e| PyIOError::new_err(format!("Error creating projection: {}", e)))?,
+            );
+        }
+
+        let inner = FileReader::try_open_with_file_metadata(
+            Arc::new(LanceEncodingsIo(file.clone())),
+            path,
+            base_projection,
             Arc::<DecoderPlugins>::default(),
+            Arc::new(file_metadata),
             &LanceCache::no_cache(),
             FileReaderOptions::default(),
         )
@@ -461,9 +482,14 @@ impl LanceFileReader {
 #[pymethods]
 impl LanceFileReader {
     #[new]
-    #[pyo3(signature=(path, storage_options=None))]
-    pub fn new(path: String, storage_options: Option<HashMap<String, String>>) -> PyResult<Self> {
-        RT.runtime.block_on(Self::open(path, storage_options))
+    #[pyo3(signature=(path, storage_options=None, columns=None))]
+    pub fn new(
+        path: String,
+        storage_options: Option<HashMap<String, String>>,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<Self> {
+        RT.runtime
+            .block_on(Self::open(path, storage_options, columns))
     }
 
     pub fn read_all(
