@@ -1765,6 +1765,18 @@ impl Dataset {
         Ok(())
     }
 
+    /// Get config items based on the given keys.
+    pub async fn get_configs(&mut self, keys: &[&str]) -> Result<HashMap<String, String>> {
+        let mut result = HashMap::new();
+        for &key in keys {
+            if let Some(value) = self.manifest.config.get(key) {
+                result.insert(key.to_string(), value.clone());
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Update key-value pairs in config.
     pub async fn update_config(
         &mut self,
@@ -3963,10 +3975,30 @@ mod tests {
 
         dataset.update_config(desired_config.clone()).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
+        assert_eq!(
+            dataset.config()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<HashMap<_, _>>(),
+            desired_config
+        );
+
+        let configs = dataset.get_configs(&["other-key"]).await.unwrap();
+        let mut expected = HashMap::new();
+        expected.insert("other-key".to_string(), "other-value".to_string());
+        assert_eq!(configs, expected);
 
         desired_config.remove("other-key");
         dataset.delete_config_keys(&["other-key"]).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
+        assert_eq!(
+            dataset.config()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<HashMap<_, _>>(),
+            desired_config
+        );
+
+        expected = HashMap::new();
+        assert_eq!(dataset.get_configs(&["other-key"]).await.unwrap(), expected);
     }
 
     #[rstest]
