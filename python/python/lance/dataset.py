@@ -2697,6 +2697,17 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.update_config(upsert_values)
 
+    def delete_config_keys(self, keys: list[str]) -> None:
+        """Delete specified configuration keys from the dataset.
+
+        Parameters
+        ----------
+        keys : list of str
+            A list of configuration keys to remove from the dataset.
+            Non-existent keys will be silently ignored.
+        """
+        self._ds.delete_config_keys(keys)
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -3835,6 +3846,29 @@ class DatasetOptimizer:
             This would be faster than re-create the index from scratch.
         """
         self._dataset._ds.optimize_indices(**kwargs)
+
+    def enable_auto_cleanup(self, auto_cleanup_config: AutoCleanupConfig, **kwargs):
+        """Enable autocleaning for an existing dataset.
+
+        Parameters
+        ----------
+        auto_cleanup_config: AutoCleanupConfig
+            Config options for automatic cleanup of the dataset.
+            If set, dataset's old versions will be automatically
+            cleaned up according to this parameter.
+        """
+        self._dataset._ds.update_config(
+            {
+                "lance.auto_cleanup.interval": str(auto_cleanup_config["interval"]),
+                "lance.auto_cleanup.older_than": f"{auto_cleanup_config['older_than_seconds']}s",  # noqa E501
+            }
+        )
+
+    def disable_auto_cleanup(self, **kwargs):
+        """Disable autocleaning via delete related keys."""
+        self._dataset._ds.delete_config_keys(
+            ["lance.auto_cleanup.interval", "lance.auto_cleanup.older_than"]
+        )
 
 
 class Tags:
