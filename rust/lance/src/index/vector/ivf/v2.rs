@@ -4,11 +4,7 @@
 //! IVF - Inverted File index.
 
 use std::marker::PhantomData;
-use std::{
-    any::Any,
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
 use crate::index::vector::builder::{index_type_string, IvfIndexBuilder};
 use crate::{
@@ -16,7 +12,6 @@ use crate::{
         vector::{utils::PartitionLoadLock, VectorIndex},
         PreFilter,
     },
-    session::Session,
 };
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
@@ -118,13 +113,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         index_dir: Path,
         uuid: String,
         fri: Option<Arc<FragReuseIndex>>,
-        file_metadata_cache: LanceCache,
+        file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
     ) -> Result<Self> {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
-        let file_metadata_cache = file_metadata_cache.clone();
         let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
         let index_reader = FileReader::try_open(
             scheduler
@@ -132,7 +126,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 .await?,
             None,
             Arc::<DecoderPlugins>::default(),
-            &file_metadata_cache,
+            file_metadata_cache,
             FileReaderOptions::default(),
         )
         .await?;
@@ -186,7 +180,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 .await?,
             None,
             Arc::<DecoderPlugins>::default(),
-            &file_metadata_cache,
+            file_metadata_cache,
             FileReaderOptions::default(),
         )
         .await?;

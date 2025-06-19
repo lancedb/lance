@@ -491,28 +491,22 @@ impl DatasetIndexExt for Dataset {
             let uuid = fri_meta.uuid.to_string();
             let fri = self
                 .index_cache
-                .get_or_insert(format!("fri-{}", uuid), || async move {
+                .get_or_insert(uuid, |_| async move {
                     let index_details = load_frag_reuse_index_details(self, fri_meta).await?;
                     open_frag_reuse_index(index_details.as_ref()).await
                 })
                 .await?;
-            // let fri = if let Some(index) = self.index_cache.get_frag_reuse(&uuid) {
-            //     log::debug!("Found fragment reuse index in cache uuid: {}", uuid);
-            //     index
-            // } else {
-            //     let index_details = load_frag_reuse_index_details(self, fri_meta).await?;
-            //     let index = open_frag_reuse_index(index_details.as_ref()).await?;
-            //     self.index_cache
-            //         .insert_frag_reuse(&uuid, index.clone());
-            //     index
-            // };
+            let mut indices = indices.as_ref().clone();
             indices.iter_mut().for_each(|idx| {
                 if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
                     fri.remap_fragment_bitmap(bitmap).unwrap();
                 }
             });
+            Ok(Arc::new(indices))
+        } else {
+            Ok(indices)
         }
-        Ok(indices)
+        
     }
 
     async fn commit_existing_index(
@@ -968,7 +962,6 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let cache_key = index_cache_key(self, uuid).await.unwrap();
         if let Some(index) = self.index_cache.get_unsized::<dyn VectorIndex>(uuid) {
             log::debug!("Found vector index in cache uuid: {}", uuid);
             return Ok(index);
@@ -1057,7 +1050,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.indices_dir(),
                                 uuid.to_owned(),
                                 fri,
-                                self.metadata_cache.clone(),
+                                self.metadata_cache.as_ref(),
                                 index_cache,
                             )
                             .await?;
@@ -1069,7 +1062,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.indices_dir(),
                                 uuid.to_owned(),
                                 fri,
-                                self.metadata_cache.clone(),
+                                self.metadata_cache.as_ref(),
                                 index_cache,
                             )
                             .await?;
@@ -1090,7 +1083,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.indices_dir(),
                             uuid.to_owned(),
                             fri,
-                            self.metadata_cache.clone(),
+                            self.metadata_cache.as_ref(),
                             index_cache,
                         )
                         .await?;
@@ -1103,7 +1096,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.indices_dir(),
                             uuid.to_owned(),
                             fri,
-                            self.metadata_cache.clone(),
+                            self.metadata_cache.as_ref(),
                             index_cache,
                         )
                         .await?;
@@ -1116,7 +1109,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.indices_dir(),
                             uuid.to_owned(),
                             fri,
-                            self.metadata_cache.clone(),
+                            self.metadata_cache.as_ref(),
                             index_cache,
                         )
                         .await?;
@@ -1146,27 +1139,22 @@ impl DatasetIndexInternalExt for Dataset {
         &self,
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<Arc<FragReuseIndex>>> {
-        // TODO: use correct index cache.
         if let Some(fri_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
             let uuid = fri_meta.uuid.to_string();
-            if let Some(index) = self.session.index_cache.get_frag_reuse(&uuid) {
-                log::debug!("Found vector index in cache uuid: {}", uuid);
-                return Ok(Some(index));
-            }
+            let index = self.index_cache.get_or_insert(uuid.clone(), |_| async move {
+                let index_meta = self.load_index(&uuid).await?.ok_or_else(|| Error::Index {
+                    message: format!("Index with id {} does not exist", uuid),
+                    location: location!(),
+                })?;
+                let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
+                let index = open_frag_reuse_index(index_details.as_ref()).await?;
 
-            let index_meta = self.load_index(&uuid).await?.ok_or_else(|| Error::Index {
-                message: format!("Index with id {} does not exist", uuid),
-                location: location!(),
-            })?;
-            let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
-            let index = open_frag_reuse_index(index_details.as_ref()).await?;
+                info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_FRAG_REUSE);
+                metrics.record_index_load();
 
-            info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_FRAG_REUSE);
-            metrics.record_index_load();
+                Ok(index)
+            }).await?;
 
-            self.session
-                .index_cache
-                .insert_frag_reuse(&uuid, index.clone());
             Ok(Some(index))
         } else {
             Ok(None)

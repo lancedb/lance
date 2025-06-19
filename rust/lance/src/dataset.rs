@@ -1105,7 +1105,7 @@ impl Dataset {
     /// Get cache hit ratio.
     pub fn index_cache_hit_rate(&self) -> f32 {
         let stats = self.session.index_cache_stats();
-        stats.hit_ratio() as f32
+        stats.hit_ratio()
     }
 
     pub fn cache_size_bytes(&self) -> u64 {
