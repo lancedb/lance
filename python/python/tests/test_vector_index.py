@@ -249,7 +249,7 @@ def test_f16_cuda(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "index_file_version", [IndexFileVersion.V3, IndexFileVersion.Legacy]
+    "index_file_version", [IndexFileVersion.V3, IndexFileVersion.LEGACY]
 )
 def test_index_with_nans(tmp_path, index_file_version):
     # 1024 rows, the entire table should be sampled
@@ -267,7 +267,7 @@ def test_index_with_nans(tmp_path, index_file_version):
 
 
 @pytest.mark.parametrize(
-    "index_file_version", [IndexFileVersion.V3, IndexFileVersion.Legacy]
+    "index_file_version", [IndexFileVersion.V3, IndexFileVersion.LEGACY]
 )
 def test_torch_index_with_nans(tmp_path, index_file_version):
     torch = pytest.importorskip("torch")
