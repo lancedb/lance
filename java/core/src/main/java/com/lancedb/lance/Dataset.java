@@ -37,10 +37,12 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -526,8 +528,8 @@ public class Dataset implements Closeable {
    * Checks out a specific tag of the dataset. If the underlying version is already checked out, it
    * returns a new Java Dataset object pointing to the same underlying Rust Dataset object
    *
-   * @param tag
-   * @return
+   * @param tag the tag to check out
+   * @return a new Dataset instance with the specified tag checked out
    */
   public Dataset checkoutTag(String tag) {
     Preconditions.checkArgument(tag != null, "Tag can not be null");
@@ -674,6 +676,44 @@ public class Dataset implements Closeable {
   }
 
   private native List<String> nativeListIndexes();
+
+  public Map<String, String> getConfig() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetConfig();
+    }
+  }
+
+  private native Map<String, String> nativeGetConfig();
+
+  /**
+   * Update the config of the dataset. This operation will only overwrite and NOT delete the
+   * existing config.
+   *
+   * @param tableConfig the config to update
+   */
+  public void updateConfig(Map<String, String> tableConfig) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeUpdateConfig(tableConfig);
+    }
+  }
+
+  private native void nativeUpdateConfig(Map<String, String> config);
+
+  /**
+   * Delete the config keys of the dataset.
+   *
+   * @param deleteKeys the config keys to delete
+   */
+  public void deleteConfigKeys(Set<String> deleteKeys) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeDeleteConfigKeys(new ArrayList<>(deleteKeys));
+    }
+  }
+
+  private native void nativeDeleteConfigKeys(List<String> deleteKeys);
 
   /**
    * Closes this dataset and releases any system resources associated with it. If the dataset is

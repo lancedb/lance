@@ -763,4 +763,47 @@ public class DatasetTest {
       }
     }
   }
+
+  @Test
+  void testConfig() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      assertEquals(1, dataset.version());
+      Map<String, String> originalConfig = dataset.getConfig();
+      Map<String, String> config = dataset.getConfig();
+      config.put("key1", "value1");
+      config.put("key2", "value2");
+      config.putAll(originalConfig);
+      dataset.updateConfig(config);
+      assertEquals(2, dataset.version());
+      Map<String, String> currentConfig = dataset.getConfig();
+      for (String configKey : currentConfig.keySet()) {
+        assertEquals(currentConfig.get(configKey), config.get(configKey));
+      }
+      assertEquals(originalConfig.size() + 2, currentConfig.size());
+
+      Map<String, String> config2 = new HashMap<>();
+      config2.put("key1", "value3");
+      dataset.updateConfig(config2);
+      assertEquals(3, dataset.version());
+      currentConfig = dataset.getConfig();
+      config.putAll(config2);
+      for (String configKey : currentConfig.keySet()) {
+        assertEquals(config.get(configKey), currentConfig.get(configKey));
+      }
+      assertEquals(originalConfig.size() + 2, currentConfig.size());
+
+      dataset.deleteConfigKeys(config2.keySet());
+      assertEquals(4, dataset.version());
+      currentConfig = dataset.getConfig();
+      for (String configKey : currentConfig.keySet()) {
+        assertEquals(currentConfig.get(configKey), config.get(configKey));
+      }
+      assertEquals(originalConfig.size() + 1, currentConfig.size());
+    }
+  }
 }
