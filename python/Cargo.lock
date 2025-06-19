@@ -5105,6 +5105,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5203598f366b11a02b13aa20cab591229ff0a89fd121a308a5df751d5fc9219"
 dependencies = [
  "cfg-if",
+ "chrono",
  "indoc",
  "libc",
  "memoffset",
