@@ -1175,9 +1175,7 @@ def test_enable_disable_auto_cleanup(tmp_path):
         older_than_seconds=1,
     )
     # enable auto cleanup
-    ds.checkout_version(ds.latest_version).optimize.enable_autocleanup(
-        auto_cleanup_options
-    )
+    ds.optimize.enable_autocleanup(auto_cleanup_options)
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
@@ -1186,11 +1184,10 @@ def test_enable_disable_auto_cleanup(tmp_path):
 
     # trigger cleanup
     lance.write_dataset(table, base_dir, mode="append")
-    dataset = lance.dataset(base_dir)
-    assert len(dataset.versions()) == 2
+    assert len(ds.versions()) == 2
 
     # this is a transactional commit, so will increase a version
-    dataset.disable_autocleanup()
+    ds.optimize.disable_autocleanup()
 
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
@@ -1201,7 +1198,7 @@ def test_enable_disable_auto_cleanup(tmp_path):
     # wait to see if cleanup would be trigger
     lance.write_dataset(table, base_dir, mode="append")
 
-    assert len(lance.dataset(base_dir).versions()) == 7
+    assert len(ds.versions()) == 7
 
 
 def test_create_from_commit(tmp_path: Path):
