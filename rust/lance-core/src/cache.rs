@@ -218,7 +218,9 @@ impl LanceCache {
 
 #[derive(Debug, Clone)]
 pub struct CacheStats {
+    /// Number of times `get`, `get_unsized`, or `get_or_insert` found an item in the cache.
     pub hits: u64,
+    /// Number of times `get`, `get_unsized`, or `get_or_insert` did not find an item in the cache.
     pub misses: u64,
 }
 
