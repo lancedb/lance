@@ -2147,7 +2147,6 @@ fn prepare_vector_index_params(
             let version: String = version.extract()?;
             index_file_version = IndexFileVersion::try_from(&version)
                 .map_err(|e| PyValueError::new_err(format!("Invalid index_file_version: {e}")))?;
-            // TODO: Use _index_file_version as needed
         }
     }
 

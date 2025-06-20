@@ -254,6 +254,8 @@ def test_index_with_nans(tmp_path, index_file_version):
         num_sub_vectors=16,
         index_file_version=index_file_version,
     )
+    idx_stats = dataset.stats.index_stats("vector_idx")
+    assert idx_stats["indices"][0]["index_file_version"] == index_file_version
     validate_vector_index(dataset, "vector")
 
 
@@ -276,6 +278,8 @@ def test_torch_index_with_nans(tmp_path, index_file_version):
         one_pass_ivfpq=True,
         index_file_version=index_file_version,
     )
+    idx_stats = dataset.stats.index_stats("vector_idx")
+    assert idx_stats["indices"][0]["index_file_version"] == index_file_version
     validate_vector_index(dataset, "vector")
 
 

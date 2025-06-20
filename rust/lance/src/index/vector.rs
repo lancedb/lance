@@ -41,6 +41,7 @@ use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
 use object_store::path::Path;
+use serde::Serialize;
 use snafu::location;
 use tempfile::tempdir;
 use tracing::instrument;
@@ -64,7 +65,7 @@ pub enum StageParams {
 // The version of the index file.
 // `Legacy` is used for only IVF_PQ index, and is the default value.
 // The other index types are using `V3`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum IndexFileVersion {
     Legacy,
     V3,
@@ -72,9 +73,9 @@ pub enum IndexFileVersion {
 
 impl IndexFileVersion {
     pub fn try_from(version: &str) -> Result<Self> {
-        match version {
-            "Legacy" => Ok(Self::Legacy),
-            "V3" => Ok(Self::V3),
+        match version.to_lowercase().as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "v3" => Ok(Self::V3),
             _ => Err(Error::Index {
                 message: format!("Invalid index file version: {}", version),
                 location: location!(),
