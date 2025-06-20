@@ -426,6 +426,9 @@ impl DisplayAs for FullSchemaMergeInsertExec {
                     when_not_matched_by_source
                 )
             }
+            datafusion::physical_plan::DisplayFormatType::TreeRender => {
+                write!(f, "MergeInsert[{}]", self.dataset.uri())
+            }
         }
     }
 }
@@ -541,6 +544,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
+                fields_modified: vec![], // No fields are modified in schema for upsert
             };
 
             // Step 5: Create and store the transaction
