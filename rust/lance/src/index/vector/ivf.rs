@@ -14,9 +14,9 @@ use super::{
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
 };
-use crate::dataset::builder::DatasetBuilder;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
+use crate::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use crate::{
     dataset::Dataset,
     index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
@@ -775,6 +775,7 @@ pub struct IvfIndexStatistics {
     partitions: Vec<IvfIndexPartitionStatistics>,
     centroids: Vec<Vec<f32>>,
     loss: Option<f64>,
+    index_file_version: IndexFileVersion,
 }
 
 fn centroids_to_vectors(centroids: &FixedSizeListArray) -> Result<Vec<Vec<f32>>> {
@@ -880,6 +881,7 @@ impl Index for IVFIndex {
             partitions: partitions_statistics,
             centroids: centroid_vecs,
             loss: self.ivf.loss(),
+            index_file_version: IndexFileVersion::Legacy,
         })?)
     }
 

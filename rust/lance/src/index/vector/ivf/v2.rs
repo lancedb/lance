@@ -10,7 +10,10 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use crate::index::vector::builder::{index_type_string, IvfIndexBuilder};
+use crate::index::vector::{
+    builder::{index_type_string, IvfIndexBuilder},
+    IndexFileVersion,
+};
 use crate::{
     index::{
         vector::{utils::PartitionLoadLock, VectorIndex},
@@ -412,6 +415,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             partitions: partitions_statistics,
             centroids: centroid_vecs,
             loss: self.ivf.loss(),
+            index_file_version: IndexFileVersion::V3,
         })?)
     }
 

@@ -14,6 +14,7 @@ import pyarrow.compute as pc
 import pytest
 from lance import LanceFragment
 from lance.dataset import VectorIndexReader
+from lance.indices import IndexFileVersion
 from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
@@ -238,7 +239,10 @@ def test_f16_cuda(tmp_path):
     validate_vector_index(dataset, "vector")
 
 
-def test_index_with_nans(tmp_path):
+@pytest.mark.parametrize(
+    "index_file_version", [IndexFileVersion.V3, IndexFileVersion.LEGACY]
+)
+def test_index_with_nans(tmp_path, index_file_version):
     # 1024 rows, the entire table should be sampled
     tbl = create_table(nvec=1000, nans=24)
 
@@ -248,11 +252,17 @@ def test_index_with_nans(tmp_path):
         index_type="IVF_PQ",
         num_partitions=4,
         num_sub_vectors=16,
+        index_file_version=index_file_version,
     )
+    idx_stats = dataset.stats.index_stats("vector_idx")
+    assert idx_stats["indices"][0]["index_file_version"] == index_file_version
     validate_vector_index(dataset, "vector")
 
 
-def test_torch_index_with_nans(tmp_path):
+@pytest.mark.parametrize(
+    "index_file_version", [IndexFileVersion.V3, IndexFileVersion.LEGACY]
+)
+def test_torch_index_with_nans(tmp_path, index_file_version):
     torch = pytest.importorskip("torch")
 
     # 1024 rows, the entire table should be sampled
@@ -266,7 +276,10 @@ def test_torch_index_with_nans(tmp_path):
         num_sub_vectors=16,
         accelerator=torch.device("cpu"),
         one_pass_ivfpq=True,
+        index_file_version=index_file_version,
     )
+    idx_stats = dataset.stats.index_stats("vector_idx")
+    assert idx_stats["indices"][0]["index_file_version"] == index_file_version
     validate_vector_index(dataset, "vector")
 
 
@@ -658,6 +671,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             "num_sub_vectors": 8,
             "transposed": True,
         },
+        "index_file_version": IndexFileVersion.V3,
     }
 
     with pytest.raises(KeyError, match='Index "non-existent_idx" not found'):
