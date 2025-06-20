@@ -179,6 +179,10 @@ class LanceFileReader:
         """
         return self._reader.read_global_buffer(index)
 
+    def num_rows(self) -> int:
+        """Return the number of rows belonging to the data file."""
+        return self._reader.num_rows()
+
 
 class LanceFileWriter:
     """
