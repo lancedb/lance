@@ -21,7 +21,6 @@ use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::location;
-use std::ops::Range;
 use std::sync::Arc;
 
 use super::{inverse_scalar_dist, scale_to_u8, ScalarQuantizer};
