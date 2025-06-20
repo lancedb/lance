@@ -1623,6 +1623,7 @@ class LanceDataset(pa.dataset.Dataset):
         name: Optional[str] = None,
         *,
         replace: bool = True,
+        train: bool = True,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -1699,6 +1700,10 @@ class LanceDataset(pa.dataset.Dataset):
             column name.
         replace : bool, default True
             Replace the existing index if it exists.
+        train : bool, default True
+            If True, the index will be trained on the data to determine optimal
+            structure. If False, an empty index will be created that can be
+            populated later.
 
         with_position: bool, default True
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -1831,7 +1836,7 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Scalar index column {column} cannot currently be a duration"
             )
 
-        self._ds.create_index([column], index_type, name, replace, None, kwargs)
+        self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
     def create_index(
         self,
@@ -1858,6 +1863,7 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]] = None,
         filter_nan: bool = True,
         one_pass_ivfpq: bool = False,
+        train: bool = True,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1924,6 +1930,10 @@ class LanceDataset(pa.dataset.Dataset):
             for nullable columns. Obtains a small speed boost.
         one_pass_ivfpq: bool
             Defaults to False. If enabled, index type must be "IVF_PQ". Reduces disk IO.
+        train : bool, default True
+            If True, the index will be trained on the data (e.g., compute IVF
+            centroids, PQ codebooks). If False, an empty index structure will be
+            created without training, which can be populated later.
         kwargs :
             Parameters passed to the index building process.
 
@@ -2358,7 +2368,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         timers["final_create_index:start"] = time.time()
         self._ds.create_index(
-            column, index_type, name, replace, storage_options, kwargs
+            column, index_type, name, replace, train, storage_options, kwargs
         )
         timers["final_create_index:end"] = time.time()
         final_create_index_time = (
