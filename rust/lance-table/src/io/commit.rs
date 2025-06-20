@@ -441,6 +441,109 @@ fn list_manifests<'a>(
         .boxed()
 }
 
+// Async wrapper around std::fs::read_dir that returns a stream
+fn async_read_dir(path: std::path::PathBuf) -> impl Stream<Item = Result<std::fs::DirEntry>> {
+    use futures::stream::{self, StreamExt};
+    
+    // Create a future that does the blocking work
+    let entries_future = tokio::task::spawn_blocking(move || {
+        let read_result = std::fs::read_dir(&path);
+        match read_result {
+            Ok(entries) => {
+                let entries_vec: std::io::Result<Vec<_>> = entries.collect();
+                match entries_vec {
+                    Ok(entries) => Ok(entries),
+                    Err(e) => Err(Error::IO {
+                        source: Box::new(e),
+                        location: location!(),
+                    }),
+                }
+            }
+            Err(e) => Err(Error::IO {
+                source: Box::new(e),
+                location: location!(),
+            }),
+        }
+    });
+    
+    // Convert the future to a stream that yields individual entries
+    stream::once(entries_future)
+        .map(|join_result| {
+            match join_result {
+                Ok(entries_result) => entries_result,
+                Err(e) => Err(Error::IO {
+                    source: Box::new(e),
+                    location: location!(),
+                }),
+            }
+        })
+        .map(|entries_result| {
+            match entries_result {
+                Ok(entries) => stream::iter(entries.into_iter().map(Ok)).left_stream(),
+                Err(e) => stream::once(future::ready(Err(e))).right_stream(),
+            }
+        })
+        .flatten()
+}
+
+// Optimized listing for local filesystems that avoids unnecessary stat calls
+fn list_manifests_local(base_path: &Path) -> impl Stream<Item = Result<ManifestLocation>> {
+    let versions_path = lance_io::local::to_local_path(&base_path.child(VERSIONS_DIR));
+    
+    async_read_dir(versions_path.into())
+        .filter_map(|entry_result| async move {
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(e) => return Some(Err(e)),
+            };
+            
+            let filename_raw = entry.file_name();
+            let filename = filename_raw.to_string_lossy();
+            
+            // Check if it's a valid manifest file
+            let scheme = ManifestNamingScheme::detect_scheme(&filename)?;
+            let version = scheme.parse_version(&filename)?;
+            
+            let path = match Path::from_filesystem_path(entry.path()) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(Error::IO {
+                    source: Box::new(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+                    location: location!(),
+                })),
+            };
+            
+            Some(Ok(ManifestLocation {
+                version,
+                path,
+                size: None,  // Will be filled later if needed
+                naming_scheme: scheme,
+                e_tag: None, // Will be filled later if needed
+            }))
+        })
+        .boxed()
+}
+
+// Helper function to fill in size and e_tag for a single local manifest location
+async fn fill_single_manifest_metadata_local(
+    mut location: ManifestLocation,
+) -> Result<ManifestLocation> {
+    let local_path = lance_io::local::to_local_path(&location.path);
+    let metadata = tokio::task::spawn_blocking(move || std::fs::metadata(&local_path))
+        .await
+        .map_err(|e| Error::IO {
+            source: Box::new(e),
+            location: location!(),
+        })?
+        .map_err(|e| Error::IO {
+            source: Box::new(e),
+            location: location!(),
+        })?;
+    
+    location.size = Some(metadata.len());
+    location.e_tag = Some(get_etag(&metadata));
+    Ok(location)
+}
+
 fn make_staging_manifest_path(base: &Path) -> Result<Path> {
     let id = uuid::Uuid::new_v4().to_string();
     Path::parse(format!("{base}-{id}")).map_err(|e| Error::IO {
@@ -491,10 +594,21 @@ pub trait CommitHandler: Debug + Send + Sync {
         object_store: &'a ObjectStore,
         sorted_descending: bool,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
-        let underlying_stream = list_manifests(base_path, &object_store.inner);
+        // Use optimized local listing for local filesystems
+        let underlying_stream: BoxStream<'a, Result<ManifestLocation>> = if object_store.is_local() {
+            list_manifests_local(base_path).boxed()
+        } else {
+            list_manifests(base_path, &object_store.inner).boxed()
+        };
 
         if !sorted_descending {
-            return underlying_stream.boxed();
+            // For unsorted results, fill metadata immediately for local filesystem
+            if object_store.is_local() {
+                return underlying_stream
+                    .and_then(fill_single_manifest_metadata_local)
+                    .boxed();
+            }
+            return underlying_stream;
         }
 
         async fn sort_stream(
@@ -503,6 +617,20 @@ pub trait CommitHandler: Debug + Send + Sync {
             let mut locations = input_stream.try_collect::<Vec<_>>().await?;
             locations.sort_by_key(|m| std::cmp::Reverse(m.version));
             Ok(futures::stream::iter(locations.into_iter().map(Ok)))
+        }
+
+        // Helper to add metadata on-demand for local filesystems in sorted streams
+        fn add_metadata_on_demand<'b>(
+            stream: impl futures::Stream<Item = Result<ManifestLocation>> + Unpin + Send + 'b,
+            is_local: bool,
+        ) -> BoxStream<'b, Result<ManifestLocation>> {
+            if is_local {
+                stream
+                    .and_then(fill_single_manifest_metadata_local)
+                    .boxed()
+            } else {
+                stream.boxed()
+            }
         }
 
         // If the object store supports lexicographically ordered lists and
@@ -522,9 +650,9 @@ pub trait CommitHandler: Debug + Send + Sync {
 
                 if naming_scheme == ManifestNamingScheme::V2 {
                     // If the first manifest is V2, we can use the optimized list operation.
-                    Ok(Either::Left(peekable))
+                    Ok(Either::Left(add_metadata_on_demand(peekable, object_store.is_local())))
                 } else {
-                    sort_stream(peekable).await.map(Either::Right)
+                    sort_stream(peekable).await.map(|s| Either::Right(add_metadata_on_demand(s, object_store.is_local())))
                 }
             })
             .try_flatten()
@@ -535,6 +663,7 @@ pub trait CommitHandler: Debug + Send + Sync {
             // supported (local fs, S3 express) are typically fast enough
             // that this is not a problem.
             futures::stream::once(sort_stream(underlying_stream))
+                .map_ok(|s| add_metadata_on_demand(s, object_store.is_local()))
                 .try_flatten()
                 .boxed()
         }
@@ -1188,5 +1317,103 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual_versions, expected_paths);
+    }
+
+    #[tokio::test]
+    async fn test_list_manifests_local_optimization() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = Path::from_absolute_path(tempdir.path().to_str().unwrap()).unwrap();
+        let object_store = ObjectStore::local();
+        let versions_dir = base.child(VERSIONS_DIR);
+        
+        // Create the versions directory
+        std::fs::create_dir_all(lance_io::local::to_local_path(&versions_dir)).unwrap();
+        
+        // Write some manifest files with different content sizes
+        let mut expected_versions = vec![];
+        for (i, content) in [(5, "test5"), (10, "test10"), (15, "test15"), (20, "test20")] {
+            let path = ManifestNamingScheme::V2.manifest_path(&base, i);
+            std::fs::write(lance_io::local::to_local_path(&path), content.as_bytes()).unwrap();
+            expected_versions.push(i);
+        }
+        
+        // Test unsorted listing (should fill metadata immediately for local)
+        let unsorted_locations: Vec<ManifestLocation> = ConditionalPutCommitHandler
+            .list_manifest_locations(&base, &object_store, false)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        
+        let mut versions: Vec<u64> = unsorted_locations.iter().map(|l| l.version).collect();
+        versions.sort();
+        expected_versions.sort();
+        assert_eq!(versions, expected_versions);
+        
+        // Verify metadata is filled for unsorted
+        for location in &unsorted_locations {
+            assert!(location.size.is_some());
+            assert!(location.e_tag.is_some());
+        }
+        
+        // Test sorted listing (should fill metadata on-demand)
+        let sorted_locations: Vec<ManifestLocation> = ConditionalPutCommitHandler
+            .list_manifest_locations(&base, &object_store, true)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        
+        // Should be sorted by version descending
+        let sorted_versions: Vec<u64> = sorted_locations.iter().map(|l| l.version).collect();
+        let mut expected_desc = expected_versions.clone();
+        expected_desc.sort_by(|a, b| b.cmp(a)); // Descending
+        assert_eq!(sorted_versions, expected_desc);
+        
+        // Verify metadata is filled for sorted as well
+        for location in &sorted_locations {
+            assert!(location.size.is_some());
+            assert!(location.e_tag.is_some());
+        }
+        
+        // Test that metadata is correct
+        for location in sorted_locations {
+            let expected_size = match location.version {
+                5 => 5,   // "test5"
+                10 => 6,  // "test10"
+                15 => 6,  // "test15" 
+                20 => 6,  // "test20"
+                _ => panic!("Unexpected version {}", location.version),
+            };
+            assert_eq!(location.size, Some(expected_size));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fill_single_manifest_metadata_local() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = Path::from_absolute_path(tempdir.path().to_str().unwrap()).unwrap();
+        let versions_dir = base.child(VERSIONS_DIR);
+        
+        // Create the versions directory
+        std::fs::create_dir_all(lance_io::local::to_local_path(&versions_dir)).unwrap();
+        
+        // Write a test manifest file
+        let path = ManifestNamingScheme::V2.manifest_path(&base, 42);
+        std::fs::write(lance_io::local::to_local_path(&path), b"test content").unwrap();
+        
+        // Create a ManifestLocation without metadata
+        let location = ManifestLocation {
+            version: 42,
+            path,
+            size: None,
+            naming_scheme: ManifestNamingScheme::V2,
+            e_tag: None,
+        };
+        
+        // Fill metadata
+        let filled_location = fill_single_manifest_metadata_local(location).await.unwrap();
+        
+        // Verify metadata is filled correctly
+        assert_eq!(filled_location.size, Some(12)); // "test content" is 12 bytes
+        assert!(filled_location.e_tag.is_some());
     }
 }
