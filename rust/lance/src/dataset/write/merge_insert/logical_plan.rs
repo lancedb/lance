@@ -19,16 +19,14 @@ use super::MergeInsertParams;
 
 /// Logical plan node for merge insert write.
 ///
-/// This takes a schema:
-/// * `target`
-/// * `source`
-/// * `_rowid`
-/// * `_rowaddr`
-/// * `action`
+/// Expects input schema:
+/// * `source.{col1, col2, ...}` - columns from the source relation
+/// * `target.{col1, col2, ...}` - columns from the target relation
+/// * `target._rowaddr` - special column to locate existing rows in the target
+/// * `action` - unqualified column that describes the action to perform.
+///   See [`super::assign_action::merge_insert_action`]
 ///
-/// And does the appropriate write operation.
-///
-/// The output of this node is a single row containing statistics about the operation.
+/// Output is empty.
 #[derive(Debug)]
 pub struct MergeInsertWriteNode {
     input: LogicalPlan,

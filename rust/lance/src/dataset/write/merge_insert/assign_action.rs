@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
-
 use super::{MergeInsertParams, WhenNotMatchedBySource};
 use crate::{dataset::WhenMatched, error::Result};
 use datafusion::scalar::ScalarValue;
-use datafusion_expr::{col, expr::ScalarFunction, Case, Expr, ScalarUDF};
-use datafusion_functions::core::named_struct::NamedStructFunc;
+use datafusion_expr::{col, Case, Expr};
 use snafu::location;
 
 // Note: right now, this is a fixed enum. In the future, this will need to be
@@ -124,24 +121,4 @@ pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
             .collect(),
         else_expr: Some(Box::new(Action::Nothing.as_literal_expr())),
     }))
-}
-
-// Collect given columns into a struct
-///
-/// This is the inverse of [datafusion_expr::logical_plan::builder::get_struct_unnested_columns]
-#[allow(dead_code)]
-pub fn collect_to_struct(columns: &[&str], prefix: Option<&str>) -> Expr {
-    let mut args = Vec::with_capacity(columns.len() * 2);
-    for column in columns {
-        let prefix_len = prefix.map(|p| p.len()).unwrap_or(0);
-        args.push(Expr::Literal(ScalarValue::Utf8(Some(
-            column[prefix_len..column.len()].to_string(),
-        ))));
-        args.push(col(*column));
-    }
-
-    Expr::ScalarFunction(ScalarFunction {
-        func: Arc::new(ScalarUDF::new_from_impl(NamedStructFunc::new())),
-        args,
-    })
 }

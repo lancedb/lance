@@ -140,7 +140,7 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
 /// Describes how rows should be handled when there is no matching row in the source table
 ///
 /// These are old rows which do not match any new data
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub enum WhenNotMatchedBySource {
     /// Do not delete rows from the target table
     ///
@@ -178,56 +178,8 @@ impl WhenNotMatchedBySource {
     }
 }
 
-impl std::hash::Hash for WhenNotMatchedBySource {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match self {
-            Self::Keep | Self::Delete => {}
-            Self::DeleteIf(_) => {
-                format!("{:?}", self).hash(state);
-            }
-        }
-    }
-}
-
-impl PartialOrd for WhenNotMatchedBySource {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for WhenNotMatchedBySource {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let self_disc = std::mem::discriminant(self);
-        let other_disc = std::mem::discriminant(other);
-
-        // Compare discriminants first
-        if self_disc != other_disc {
-            // Use a simple ordering based on variant pattern
-            let self_order = match self {
-                Self::Keep => 0u8,
-                Self::Delete => 1u8,
-                Self::DeleteIf(_) => 2u8,
-            };
-            let other_order = match other {
-                Self::Keep => 0u8,
-                Self::Delete => 1u8,
-                Self::DeleteIf(_) => 2u8,
-            };
-            return self_order.cmp(&other_order);
-        }
-
-        // If same variant, compare contents for complex variants
-        if let (Self::DeleteIf(_), Self::DeleteIf(_)) = (self, other) {
-            format!("{:?}", self).cmp(&format!("{:?}", other))
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    }
-}
-
 /// Describes how rows should be handled when there is a match between the target table and source table
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub enum WhenMatched {
     /// The row is deleted from the target table and a new row is inserted based on the source table
     ///
@@ -263,54 +215,6 @@ impl WhenMatched {
     }
 }
 
-impl std::hash::Hash for WhenMatched {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match self {
-            Self::UpdateAll | Self::DoNothing => {}
-            Self::UpdateIf(_) => {
-                format!("{:?}", self).hash(state);
-            }
-        }
-    }
-}
-
-impl PartialOrd for WhenMatched {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for WhenMatched {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let self_disc = std::mem::discriminant(self);
-        let other_disc = std::mem::discriminant(other);
-
-        // Compare discriminants first
-        if self_disc != other_disc {
-            // Use a simple ordering based on variant pattern
-            let self_order = match self {
-                Self::UpdateAll => 0u8,
-                Self::DoNothing => 1u8,
-                Self::UpdateIf(_) => 2u8,
-            };
-            let other_order = match other {
-                Self::UpdateAll => 0u8,
-                Self::DoNothing => 1u8,
-                Self::UpdateIf(_) => 2u8,
-            };
-            return self_order.cmp(&other_order);
-        }
-
-        // If same variant, compare contents for complex variants
-        if let (Self::UpdateIf(_), Self::UpdateIf(_)) = (self, other) {
-            format!("{:?}", self).cmp(&format!("{:?}", other))
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    }
-}
-
 /// Describes how rows should be handled when there is no matching row in the target table
 ///
 /// These are new rows which do not match any old data
@@ -324,7 +228,7 @@ pub enum WhenNotMatched {
     DoNothing,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 struct MergeInsertParams {
     // The column(s) to join on
     on: Vec<String>,
@@ -336,38 +240,6 @@ struct MergeInsertParams {
     delete_not_matched_by_source: WhenNotMatchedBySource,
     conflict_retries: u32,
     retry_timeout: Duration,
-}
-
-impl std::hash::Hash for MergeInsertParams {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.on.hash(state);
-        self.when_matched.hash(state);
-        self.insert_not_matched.hash(state);
-        self.delete_not_matched_by_source.hash(state);
-        self.conflict_retries.hash(state);
-        self.retry_timeout.hash(state);
-    }
-}
-
-impl PartialOrd for MergeInsertParams {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MergeInsertParams {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.on
-            .cmp(&other.on)
-            .then_with(|| self.when_matched.cmp(&other.when_matched))
-            .then_with(|| self.insert_not_matched.cmp(&other.insert_not_matched))
-            .then_with(|| {
-                self.delete_not_matched_by_source
-                    .cmp(&other.delete_not_matched_by_source)
-            })
-            .then_with(|| self.conflict_retries.cmp(&other.conflict_retries))
-            .then_with(|| self.retry_timeout.cmp(&other.retry_timeout))
-    }
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -1305,13 +1177,6 @@ impl MergeInsertJob {
         self,
         source: SendableRecordBatchStream,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // For upsert, we create a plan:
-        // MergeInsertWriteExec
-        //   ProjectionExec [action=merge_insert_action(), +keep input columns]
-        //     HashJoin [type=left, on=id]
-        //       OneShotRead [input]
-        //       Scan columns=[id, _rowid, _rowaddr]
-
         // Goal: we shouldn't manually have to specify which columns to scan.
         //       DataFusion's optimizer should be able to automatically perform
         //       projection pushdown for us.
@@ -1319,7 +1184,6 @@ impl MergeInsertJob {
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
         let session_config = SessionConfig::default();
         let session_ctx = SessionContext::new_with_config(session_config);
-        // todo!("register planning rules to session ctx");
         let scan = session_ctx.read_lance_unordered(self.dataset.clone(), false, true)?;
         let on_cols = self
             .params
@@ -1328,13 +1192,11 @@ impl MergeInsertJob {
             .map(|name| name.as_str())
             .collect::<Vec<_>>();
         let source_df = session_ctx.read_one_shot(source)?;
-        // For now, let's create a simple join and handle duplicates
         let source_df_aliased = source_df.alias("source")?;
         let scan_aliased = scan.alias("target")?;
         let df = scan_aliased
             .join(source_df_aliased, JoinType::Right, &on_cols, &on_cols, None)?
             .with_column("action", merge_insert_action(&self.params)?)?;
-        // dbg!(df.schema());
 
         let (session_state, logical_plan) = df.into_parts();
 
@@ -1429,25 +1291,6 @@ impl MergeInsertJob {
         self,
         source: SendableRecordBatchStream,
     ) -> Result<UncommittedMergeInsert> {
-        // We are migrating a new plan-based code path. For now, only using this
-        // for select supported queries. Right now that is just upsert without
-        // any scalar index.
-        if self.params.insert_not_matched
-            && matches!(self.params.when_matched, WhenMatched::UpdateAll)
-            && self
-                .dataset
-                .load_indices()
-                .await
-                .unwrap_or_default()
-                .is_empty()
-        {
-            let (transaction, stats, affected_rows) = self.execute_uncommitted_v2(source).await?;
-            return Ok(UncommittedMergeInsert {
-                transaction,
-                affected_rows,
-                stats,
-            });
-        }
         // Erase metadata on source / dataset schemas to avoid comparing metadata
         let schema = lance_core::datatypes::Schema::try_from(source.schema().as_ref())?;
         let full_schema = self.dataset.local_schema();
