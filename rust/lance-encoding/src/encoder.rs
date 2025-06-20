@@ -851,8 +851,11 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                     } else {
                         Ok(Box::new(BinaryMiniBlockEncoder::default()))
                     }
+                } else if variable_width_data.bits_per_offset == 64 {
+                    // TODO: Support TSSTMiniBlockEncoder
+                    Ok(Box::new(BinaryMiniBlockEncoder::default()))
                 } else {
-                    todo!("Implement MiniBlockCompression for VariableWidth DataBlock with 64 bits offsets.")
+                    todo!("Implement MiniBlockCompression for VariableWidth DataBlock with {} bits offsets.", variable_width_data.bits_per_offset)
                 }
             }
             DataBlock::Struct(struct_data_block) => {

@@ -1328,6 +1328,7 @@ impl MiniBlockScheduler {
             .collect::<Vec<_>>();
         let value_decompressor = decompressors
             .create_miniblock_decompressor(layout.value_compression.as_ref().unwrap())?;
+
         let dictionary = if let Some(dictionary_encoding) = layout.dictionary.as_ref() {
             let num_dictionary_items = layout.num_dictionary_items;
             match dictionary_encoding.array_encoding.as_ref().unwrap() {
@@ -2780,6 +2781,7 @@ impl StructuralPrimitiveFieldScheduler {
     pub fn try_new(
         column_info: &ColumnInfo,
         decompressors: &dyn DecompressorStrategy,
+        bits_per_offset: u8,
     ) -> Result<Self> {
         let page_schedulers = column_info
             .page_infos
@@ -2791,6 +2793,7 @@ impl StructuralPrimitiveFieldScheduler {
                     page_index,
                     column_info.index as usize,
                     decompressors,
+                    bits_per_offset,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2805,6 +2808,7 @@ impl StructuralPrimitiveFieldScheduler {
         page_index: usize,
         _column_index: usize,
         decompressors: &dyn DecompressorStrategy,
+        bits_per_offset: u8,
     ) -> Result<PageInfoAndScheduler> {
         let scheduler: Box<dyn StructuralPageScheduler> =
             match page_info.encoding.as_structural().layout.as_ref() {
@@ -2824,7 +2828,7 @@ impl StructuralPrimitiveFieldScheduler {
                         page_info.num_rows,
                         full_zip,
                         decompressors,
-                        /*bits_per_offset=*/ 32,
+                        bits_per_offset,
                     )?)
                 }
                 Some(pb::page_layout::Layout::AllNullLayout(all_null)) => {
