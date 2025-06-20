@@ -103,7 +103,12 @@ class LanceFileWriter:
     def add_global_buffer(self, data: bytes) -> int: ...
 
 class LanceFileReader:
-    def __init__(self, path: str, storage_options: Optional[Dict[str, str]]): ...
+    def __init__(
+        self,
+        path: str,
+        storage_options: Optional[Dict[str, str]],
+        columns: Optional[List[str]] = None,
+    ): ...
     def read_all(
         self, batch_size: int, batch_readahead: int
     ) -> pa.RecordBatchReader: ...
