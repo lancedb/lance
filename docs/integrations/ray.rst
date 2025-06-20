@@ -11,7 +11,7 @@ Basic Operations
 Lance format is one of the official `Ray data sources <https://docs.ray.io/en/latest/data/api/input_output.html#lance>`_:
 
 * Lance Data Source :py:meth:`ray.data.read_lance`
-* Lance Data Sink :py:meth:`ray.data.Dataste.write_lance`
+* Lance Data Sink :py:meth:`ray.data.Dataset.write_lance`
 
 .. testsetup::
 
