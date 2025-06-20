@@ -138,7 +138,10 @@ impl<'a> CleanupTask<'a> {
         // or clean around the manifest
 
         let tags = self.dataset.tags.list().await?;
-        let tagged_versions: HashSet<u64> = tags.values().map(|v| v.version).collect();
+        let tagged_versions: HashSet<u64> = tags
+            .values()
+            .map(|tag_content| tag_content.version)
+            .collect();
 
         let inspection = self.process_manifests(&tagged_versions).await?;
 

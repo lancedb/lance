@@ -93,8 +93,6 @@ pub mod optimize;
 pub mod stats;
 
 const DEFAULT_NPROBS: usize = 20;
-const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
-const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
@@ -316,7 +314,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None))]
     fn new(
         py: Python,
         uri: String,
@@ -327,17 +325,24 @@ impl Dataset {
         commit_handler: Option<PyObject>,
         storage_options: Option<HashMap<String, String>>,
         manifest: Option<&[u8]>,
+        metadata_cache_size_bytes: Option<usize>,
     ) -> PyResult<Self> {
-        let mut params = ReadParams {
-            index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
-            metadata_cache_size: metadata_cache_size.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
-            store_options: Some(ObjectStoreParams {
-                block_size,
+        let mut params = ReadParams::default();
+        if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
+            params.metadata_cache_size_bytes(metadata_cache_size_bytes);
+        } else if let Some(metadata_cache_size) = metadata_cache_size {
+            #[allow(deprecated)]
+            params.metadata_cache_size(metadata_cache_size);
+        }
+        if let Some(index_cache_size) = index_cache_size {
+            params.index_cache_size(index_cache_size);
+        }
+        if let Some(block_size) = block_size {
+            params.store_options = Some(ObjectStoreParams {
+                block_size: Some(block_size),
                 ..Default::default()
-            }),
-            ..Default::default()
+            });
         };
-
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);
             params.set_commit_lock(Arc::new(py_commit_lock));
@@ -1207,10 +1212,31 @@ impl Dataset {
         })
     }
 
+    fn tags_ordered(self_: PyRef<'_, Self>, order: Option<String>) -> PyResult<PyObject> {
+        let tags = self_
+            .list_tags_ordered(order.as_deref())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Python::with_gil(|py| {
+            let pylist = PyList::empty(py);
+
+            for (tag_name, tag_content) in tags {
+                let dict = PyDict::new(py);
+                dict.set_item("version", tag_content.version)?;
+                dict.set_item("manifest_size", tag_content.manifest_size)?;
+
+                pylist.append((tag_name.as_str(), dict))?;
+            }
+
+            Ok(PyObject::from(pylist))
+        })
+    }
+
     fn tags(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let tags = self_
             .list_tags()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
         Python::with_gil(|py| {
             let pytags = PyDict::new(py);
             for (k, v) in tags.iter() {
@@ -1220,6 +1246,20 @@ impl Dataset {
                 pytags.set_item(k, dict.into_py_any(py)?).unwrap();
             }
             pytags.into_py_any(py)
+        })
+    }
+
+    fn get_version(self_: PyRef<'_, Self>, tag: String) -> PyResult<u64> {
+        let inner_result = RT.block_on(None, self_.ds.tags.get_version(&tag))?;
+
+        inner_result.map_err(|err: lance::Error| match err {
+            lance::Error::NotFound { .. } => {
+                PyValueError::new_err(format!("Tag not found: {}", err))
+            }
+            lance::Error::RefNotFound { .. } => {
+                PyValueError::new_err(format!("Ref not found: {}", err))
+            }
+            _ => PyIOError::new_err(format!("Storage error: {}", err)),
         })
     }
 
@@ -1728,6 +1768,16 @@ impl Dataset {
         self.ds = Arc::new(new_self);
         Ok(())
     }
+
+    #[pyo3(signature = (keys))]
+    fn delete_config_keys(&mut self, keys: Vec<String>) -> PyResult<()> {
+        let key_refs: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.delete_config_keys(&key_refs))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
 }
 
 #[derive(FromPyObject)]
@@ -1766,6 +1816,32 @@ impl Dataset {
 
     fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
         RT.runtime.block_on(self.ds.tags.list())
+    }
+
+    fn list_tags_ordered(
+        &self,
+        order: Option<&str>,
+    ) -> ::lance::error::Result<Vec<(String, TagContents)>> {
+        let ordering = match order {
+            Some("asc") => Some(std::cmp::Ordering::Less),
+            Some("desc") => Some(std::cmp::Ordering::Greater),
+            Some(invalid_order) => {
+                let error_msg = format!(
+                    "Invalid sort order '{}'. Valid values are: asc, desc",
+                    invalid_order
+                );
+                return Err(::lance::error::Error::InvalidInput {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        error_msg,
+                    )),
+                    location: location!(),
+                });
+            }
+            None => None,
+        };
+        RT.runtime
+            .block_on(async { self.ds.tags.list_tags_ordered(ordering).await })
     }
 
     fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {

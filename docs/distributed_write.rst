@@ -4,7 +4,7 @@ Distributed Write
 .. warning::
 
     Lance provides out-of-the-box :doc:`Ray <./integrations/ray>` and
-    `Spark <https://github.com/lancedb/lance/tree/main/java/spark>`_ integrations.
+    `Spark <https://github.com/lancedb/lance-spark>`_ integrations.
 
     This page is intended for users who wish to perform distributed operations in a custom manner,
     i.e. using `slurm` or `Kubernetes` without the Lance integration.

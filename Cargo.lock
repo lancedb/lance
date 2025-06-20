@@ -3060,7 +3060,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -3378,11 +3378,11 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hf-hub"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc03dcb0b0a83ae3f3363ec811014ae669f083e4e499c66602f447c4828737a1"
+checksum = "629d8f3bbeda9d148036d6b0de0a3ab947abd08ce90626327fc3547a49d59d97"
 dependencies = [
- "dirs 5.0.1",
+ "dirs 6.0.0",
  "futures",
  "http 1.3.1",
  "indicatif",
@@ -3390,14 +3390,14 @@ dependencies = [
  "log",
  "native-tls",
  "num_cpus",
- "rand 0.8.5",
+ "rand 0.9.1",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.12",
  "tokio",
  "ureq",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4056,7 +4056,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4142,7 +4142,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4159,7 +4159,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4198,7 +4198,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4229,7 +4229,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4246,7 +4246,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "arrayref",
  "arrow",
@@ -4294,7 +4294,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding-datafusion"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4327,7 +4327,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4353,7 +4353,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4397,7 +4397,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "approx",
  "arrow",
@@ -4452,6 +4452,7 @@ dependencies = [
  "random_word",
  "rayon",
  "roaring",
+ "rstest",
  "serde",
  "serde_json",
  "snafu",
@@ -4465,7 +4466,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4510,7 +4511,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -4536,7 +4537,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "approx",
  "arrow-arith",
@@ -4565,7 +4566,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4612,7 +4613,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4621,7 +4622,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "0.29.1"
+version = "0.30.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4769,7 +4770,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.53.0",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -8686,6 +8687,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows-sys"
+version = "0.60.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb"
+dependencies = [
+ "windows-targets 0.53.2",
+]
+
+[[package]]
 name = "windows-targets"
 version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8733,9 +8743,9 @@ dependencies = [
 
 [[package]]
 name = "windows-targets"
-version = "0.53.0"
+version = "0.53.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1e4c7e8ceaaf9cb7d7507c974735728ab453b67ef8f18febdd7c11fe59dca8b"
+checksum = "c66f69fcc9ce11da9966ddb31a40968cad001c5bedeb5c2b82ede4253ab48aef"
 dependencies = [
  "windows_aarch64_gnullvm 0.53.0",
  "windows_aarch64_msvc 0.53.0",

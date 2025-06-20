@@ -6,7 +6,7 @@ use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_select::take::take;
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_datagen::ArrayGeneratorExt;
 use lance_encoding::{
     decoder::{DecoderPlugins, FilterExpression},
@@ -85,7 +85,7 @@ fn bench_decode(c: &mut Criterion) {
                         Arc::<DecoderPlugins>::default(),
                         false,
                         LanceFileVersion::default(),
-                        Some(Arc::new(FileMetadataCache::no_cache())),
+                        Some(Arc::new(LanceCache::no_cache())),
                     ))
                     .unwrap();
                 assert_eq!(data.num_rows(), batch.num_rows());
@@ -149,7 +149,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                                     Arc::<DecoderPlugins>::default(),
                                     false,
                                     version,
-                                    Some(Arc::new(FileMetadataCache::no_cache())),
+                                    Some(Arc::new(LanceCache::no_cache())),
                                 ))
                                 .unwrap();
                             assert_eq!(data.num_rows(), batch.num_rows());
@@ -215,7 +215,7 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
                     Arc::<DecoderPlugins>::default(),
                     false,
                     LanceFileVersion::default(),
-                    Some(Arc::new(FileMetadataCache::no_cache())),
+                    Some(Arc::new(LanceCache::no_cache())),
                 ))
                 .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
@@ -291,7 +291,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
                     Arc::<DecoderPlugins>::default(),
                     false,
                     LanceFileVersion::default(),
-                    Some(Arc::new(FileMetadataCache::no_cache())),
+                    Some(Arc::new(LanceCache::no_cache())),
                 ))
                 .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
@@ -347,7 +347,7 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
                     Arc::<DecoderPlugins>::default(),
                     false,
                     LanceFileVersion::default(),
-                    Some(Arc::new(FileMetadataCache::no_cache())),
+                    Some(Arc::new(LanceCache::no_cache())),
                 ))
                 .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());

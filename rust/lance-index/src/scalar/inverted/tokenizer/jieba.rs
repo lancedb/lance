@@ -1,17 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::path::{Path, PathBuf};
+use std::{fs::File, io::BufReader, path::Path, path::PathBuf};
 
-use super::TokenizerBuilder;
 use lance_core::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use snafu::location;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct JiebaConfig {
     main: Option<String>,
     users: Option<Vec<String>>,
+}
+
+pub const JIEBA_LANGUAGE_MODEL_CONFIG_FILE: &str = "config.json";
+
+pub trait JiebaTokenizerBuilder: Sized {
+    type Config: DeserializeOwned + Default;
+
+    fn load(p: &Path) -> Result<Self> {
+        if !p.is_dir() {
+            return Err(Error::io(
+                format!("{} is not a valid directory", p.display()),
+                snafu::location!(),
+            ));
+        }
+        let config_path = p.join(JIEBA_LANGUAGE_MODEL_CONFIG_FILE);
+        let config = if config_path.exists() {
+            let file = File::open(config_path)?;
+            let reader = BufReader::new(file);
+            serde_json::from_reader::<BufReader<File>, Self::Config>(reader)?
+        } else {
+            Self::Config::default()
+        };
+        Self::new(config, p)
+    }
+
+    fn new(config: Self::Config, root: &Path) -> Result<Self>;
+
+    fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder>;
 }
 
 pub struct JiebaBuilder {
@@ -35,7 +62,7 @@ impl JiebaBuilder {
     }
 }
 
-impl TokenizerBuilder for JiebaBuilder {
+impl JiebaTokenizerBuilder for JiebaBuilder {
     type Config = JiebaConfig;
 
     fn new(config: Self::Config, root: &Path) -> Result<Self> {

@@ -13,7 +13,7 @@ use future::try_join_all;
 use futures::prelude::*;
 use lance_arrow::RecordBatchExt;
 use lance_core::{
-    cache::FileMetadataCache,
+    cache::LanceCache,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
     Error, Result,
 };
@@ -282,7 +282,7 @@ impl ShuffleReader for IvfShufflerReader {
                 .await?,
             None,
             Arc::<DecoderPlugins>::default(),
-            &FileMetadataCache::no_cache(),
+            &LanceCache::no_cache(),
             FileReaderOptions::default(),
         )
         .await?;
@@ -340,6 +340,26 @@ impl ShuffleReader for SinglePartitionReader {
         // it's used for determining the order of building the index and skipping empty partitions
         // so we just return 1 here
         Ok(1)
+    }
+
+    fn total_loss(&self) -> Option<f64> {
+        None
+    }
+}
+
+pub struct EmptyReader;
+
+#[async_trait::async_trait]
+impl ShuffleReader for EmptyReader {
+    async fn read_partition(
+        &self,
+        _partition_id: usize,
+    ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
+        Ok(None)
+    }
+
+    fn partition_size(&self, _partition_id: usize) -> Result<usize> {
+        Ok(0)
     }
 
     fn total_loss(&self) -> Option<f64> {

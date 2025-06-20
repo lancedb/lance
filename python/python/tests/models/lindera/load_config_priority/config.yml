@@ -1,0 +1,10 @@
+segmenter:
+  mode: "normal"
+  dictionary:
+    path: "./python/tests/models/lindera/ipadic/main"
+
+character_filters:
+  - kind: mapping
+    args:
+       mapping:
+          成田: ほげほげ

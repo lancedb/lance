@@ -208,12 +208,8 @@ impl Quantization for FlatQuantizer {
         }))
     }
 
-    fn metadata(
-        &self,
-        _: Option<crate::vector::quantizer::QuantizationMetadata>,
-    ) -> Result<serde_json::Value> {
-        let metadata = FlatMetadata { dim: self.dim };
-        Ok(serde_json::to_value(metadata)?)
+    fn metadata(&self, _: Option<crate::vector::quantizer::QuantizationMetadata>) -> FlatMetadata {
+        FlatMetadata { dim: self.dim }
     }
 
     fn metadata_key() -> &'static str {
@@ -290,12 +286,8 @@ impl Quantization for FlatBinQuantizer {
         }))
     }
 
-    fn metadata(
-        &self,
-        _: Option<crate::vector::quantizer::QuantizationMetadata>,
-    ) -> Result<serde_json::Value> {
-        let metadata = FlatMetadata { dim: self.dim };
-        Ok(serde_json::to_value(metadata)?)
+    fn metadata(&self, _: Option<crate::vector::quantizer::QuantizationMetadata>) -> FlatMetadata {
+        FlatMetadata { dim: self.dim }
     }
 
     fn metadata_key() -> &'static str {

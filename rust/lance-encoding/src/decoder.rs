@@ -224,7 +224,7 @@ use futures::future::{maybe_done, BoxFuture, MaybeDone};
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
-use lance_core::cache::{CapacityMode, FileMetadataCache};
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
 use log::{debug, trace, warn};
 use snafu::location;
@@ -398,7 +398,7 @@ impl RootScheduler {
 pub struct DecodeBatchScheduler {
     root_scheduler: RootScheduler,
     pub root_fields: Fields,
-    cache: Arc<FileMetadataCache>,
+    cache: Arc<LanceCache>,
 }
 
 pub struct ColumnInfoIter<'a> {
@@ -1043,7 +1043,7 @@ impl DecodeBatchScheduler {
         num_rows: u64,
         _decoder_plugins: Arc<DecoderPlugins>,
         io: Arc<dyn EncodingsIo>,
-        cache: Arc<FileMetadataCache>,
+        cache: Arc<LanceCache>,
         filter: &FilterExpression,
     ) -> Result<Self> {
         assert!(num_rows > 0);
@@ -1105,7 +1105,7 @@ impl DecodeBatchScheduler {
     pub fn from_scheduler(
         root_scheduler: Arc<dyn FieldScheduler>,
         root_fields: Fields,
-        cache: Arc<FileMetadataCache>,
+        cache: Arc<LanceCache>,
     ) -> Self {
         Self {
             root_scheduler: RootScheduler::Legacy(root_scheduler),
@@ -1863,7 +1863,7 @@ pub struct SchedulerDecoderConfig {
     pub decoder_plugins: Arc<DecoderPlugins>,
     pub batch_size: u32,
     pub io: Arc<dyn EncodingsIo>,
-    pub cache: Arc<FileMetadataCache>,
+    pub cache: Arc<LanceCache>,
     pub should_validate: bool,
 }
 
@@ -2310,7 +2310,7 @@ impl PriorityRange for ListPriorityRange {
 pub struct SchedulerContext {
     recv: Option<mpsc::UnboundedReceiver<DecoderMessage>>,
     io: Arc<dyn EncodingsIo>,
-    cache: Arc<FileMetadataCache>,
+    cache: Arc<LanceCache>,
     name: String,
     path: Vec<u32>,
     path_names: Vec<String>,
@@ -2328,7 +2328,7 @@ impl<'a> ScopedSchedulerContext<'a> {
 }
 
 impl SchedulerContext {
-    pub fn new(io: Arc<dyn EncodingsIo>, cache: Arc<FileMetadataCache>) -> Self {
+    pub fn new(io: Arc<dyn EncodingsIo>, cache: Arc<LanceCache>) -> Self {
         Self {
             io,
             cache,
@@ -2343,7 +2343,7 @@ impl SchedulerContext {
         &self.io
     }
 
-    pub fn cache(&self) -> &Arc<FileMetadataCache> {
+    pub fn cache(&self) -> &Arc<LanceCache> {
         &self.cache
     }
 
@@ -2742,19 +2742,14 @@ pub async fn decode_batch(
     decoder_plugins: Arc<DecoderPlugins>,
     should_validate: bool,
     version: LanceFileVersion,
-    cache: Option<Arc<FileMetadataCache>>,
+    cache: Option<Arc<LanceCache>>,
 ) -> Result<RecordBatch> {
     // The io is synchronous so it shouldn't be possible for any async stuff to still be in progress
     // Still, if we just use now_or_never we hit misfires because some futures (channels) need to be
     // polled twice.
 
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
-    let cache = cache.unwrap_or_else(|| {
-        Arc::new(FileMetadataCache::with_capacity(
-            128 * 1024 * 1024,
-            CapacityMode::Bytes,
-        ))
-    });
+    let cache = cache.unwrap_or_else(|| Arc::new(LanceCache::with_capacity(128 * 1024 * 1024)));
     let mut decode_scheduler = DecodeBatchScheduler::try_new(
         batch.schema.as_ref(),
         &batch.top_level_columns,

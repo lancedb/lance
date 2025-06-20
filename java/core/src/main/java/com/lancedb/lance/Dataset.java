@@ -202,7 +202,7 @@ public class Dataset implements Closeable {
             options.getVersion(),
             options.getBlockSize(),
             options.getIndexCacheSize(),
-            options.getMetadataCacheSize(),
+            options.getMetadataCacheSizeBytes(),
             options.getStorageOptions());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
@@ -214,7 +214,7 @@ public class Dataset implements Closeable {
       Optional<Integer> version,
       Optional<Integer> blockSize,
       int indexCacheSize,
-      int metadataCacheSize,
+      int metadataCacheSizeBytes,
       Map<String, String> storageOptions);
 
   /**

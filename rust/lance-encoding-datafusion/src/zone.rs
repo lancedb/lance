@@ -38,7 +38,7 @@ use lance_encoding::{
     EncodingsIo,
 };
 
-use lance_core::{cache::FileMetadataCache, datatypes::Schema, Error, Result};
+use lance_core::{cache::LanceCache, datatypes::Schema, Error, Result};
 use lance_file::{
     v2::{reader::EncodedBatchReaderExt, writer::EncodedBatchWriteExt},
     version::LanceFileVersion,
@@ -233,7 +233,7 @@ impl ZoneMapsFieldScheduler {
     async fn load_pushdowns(
         &self,
         io: &dyn EncodingsIo,
-        _cache: &FileMetadataCache,
+        _cache: &LanceCache,
         pushdowns: &[&UnloadedPushdown],
     ) -> Result<Vec<ZoneMap>> {
         // TODO: Use cache
@@ -263,7 +263,7 @@ impl ZoneMapsFieldScheduler {
     async fn load_maps(
         &self,
         io: &dyn EncodingsIo,
-        cache: &FileMetadataCache,
+        cache: &LanceCache,
         filter_schema: &Schema,
     ) -> Result<Vec<ZoneMap>> {
         let pushdowns_to_load = filter_schema
@@ -281,7 +281,7 @@ impl ZoneMapsFieldScheduler {
     async fn do_initialize(
         &self,
         io: &dyn EncodingsIo,
-        cache: &FileMetadataCache,
+        cache: &LanceCache,
         filter: &FilterExpression,
     ) -> Result<()> {
         if filter.is_noop() {

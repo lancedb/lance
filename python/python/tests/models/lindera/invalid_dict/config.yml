@@ -1,0 +1,7 @@
+segmenter:
+  mode: "normal"
+  dictionary:
+    path: "./python/tests/models/lindera/ipadic/main"
+  user_dictionary:
+    path: "./python/tests/models/lindera/invalid_dict/invalid.bin"
+    kind: "ipadic"

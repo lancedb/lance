@@ -356,6 +356,10 @@ class ShardedFragmentSampler(FragmentSampler):
         self._world_size = world_size
         self._randomize = randomize
         self._seed = seed
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self._epoch = epoch
 
     @staticmethod
     def from_torch(randomize: bool = False, seed: int = 0) -> ShardedFragmentSampler:
@@ -399,6 +403,7 @@ class ShardedBatchSampler(Sampler):
     not assigned to it.  The resulting stream is then randomized via a reservoir
     sampler.  This does not perfectly randomize the stream but it should generate
     a stream that is random enough for many use cases.
+
     """
 
     def __init__(
@@ -408,6 +413,13 @@ class ShardedBatchSampler(Sampler):
         self._world_size = world_size
         self._randomize = randomize
         self._seed = seed
+        self._epoch = 0
+
+    def __len__(self):
+        return self._len
+
+    def set_epoch(self, epoch: int):
+        self._epoch = epoch
 
     @staticmethod
     def from_torch(randomize: bool = False, seed: int = 0) -> ShardedBatchSampler:
@@ -488,7 +500,7 @@ class ShardedBatchSampler(Sampler):
         if not self._randomize:
             yield from shard_scan
 
-        random.seed(self._seed)
+        random.seed(self._seed + self._epoch)
         heap = []
         # We want to randomize the incoming sequence.  The normal approach
         # is to pull the whole thing in memory and run fisher-yates.  We
@@ -563,3 +575,96 @@ class ShardedBatchSampler(Sampler):
             return self._sample_filtered(
                 dataset, batch_size, columns, batch_readahead, filter
             )
+
+
+class ShardedFixedBatchSampler(ShardedBatchSampler):
+    """
+    Sharded fixed batch sampler for distributed index-based batching.
+
+    This sampler is designed for static datasets with a known total number of rows.
+    It divides the dataset into consecutive index ranges (batches) and assigns each
+    process (rank) a unique subset of these batches for efficient distributed loading.
+
+    Features:
+    - Requires `total_num_rows` and `batch_size` to be specified.
+    - Each rank receives consecutive, non-overlapping index ranges.
+    - Optionally randomizes the order of batches per epoch if `randomize=True`.
+    - Suitable for integration with PyTorch DataLoader or similar frameworks.
+
+    Example (total_num_rows=1000, world_size=4, batch_size=100):
+    - Rank 0: [0-99], [100-199], [200-299]
+    - Rank 1: [250-349], [350-449], [450-549]
+    - Rank 2: [500-599], [600-699], [700-799]
+    - Rank 3: [750-849], [850-949], [950-999]
+
+    Parameters
+    ----------
+    rank : int
+        The rank (process index) in the distributed cluster.
+    world_size : int
+        The total number of processes in the distributed cluster.
+    randomize : bool, default False
+        Whether to randomize the order of batches for each epoch.
+    seed : int, default 0
+        Random seed for reproducibility when randomize is enabled.
+    batch_size : int, default 0
+        The number of rows per batch.
+    total_num_rows : int, default 0
+        The total number of rows in the dataset.
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        world_size: int,
+        randomize: bool = False,
+        seed: int = 0,
+        batch_size: int = 0,
+        total_num_rows: int = 0,
+    ):
+        super().__init__(rank, world_size, randomize, seed)
+        self._total_num_rows = total_num_rows
+        self._batch_size = batch_size
+        self._len = self._compute_length()
+
+    # The sampler here is mainly implemented with the hope that
+    # the data of batch_size are all adjacent, so we don't want
+    # to use filter to break this adjacent feature.
+    def _compute_length(self):
+        if self._batch_size == 0 and self._total_num_rows == 0:
+            return 0
+        per_rank = math.ceil(self._total_num_rows / self._world_size)
+        return math.ceil(per_rank / self._batch_size)
+
+    def __len__(self):
+        return self._len
+
+    def __iter__(self) -> Generator[List[int], None, None]:
+        per_rank = math.ceil(self._total_num_rows / self._world_size)
+        start = self._rank * per_rank
+        end = min(start + per_rank, self._total_num_rows)
+
+        batches = []
+        current = start
+        while current < end:
+            batch_end = min(current + self._batch_size, end)
+            batches.append(list(range(current, batch_end)))
+            current = batch_end
+
+        if self._randomize:
+            random.seed(self._seed + self._epoch)
+            random.shuffle(batches)
+
+        yield from batches
+
+    @staticmethod
+    def from_torch(
+        total_num_rows: int, batch_size: int, randomize: bool = False, seed: int = 0
+    ) -> ShardedFixedBatchSampler:
+        import torch
+
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        return ShardedFixedBatchSampler(
+            rank, world_size, total_num_rows, batch_size, randomize, seed
+        )

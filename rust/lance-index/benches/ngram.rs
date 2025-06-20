@@ -9,7 +9,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -33,7 +33,7 @@ fn bench_ngram(c: &mut Criterion) {
         Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             index_dir,
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ))
     });
 
@@ -92,7 +92,7 @@ fn bench_ngram(c: &mut Criterion) {
     group
         .sample_size(10)
         .measurement_time(Duration::from_secs(10));
-    let index = rt.block_on(NGramIndex::load(store)).unwrap();
+    let index = rt.block_on(NGramIndex::load(store, None)).unwrap();
     group.bench_function(format!("ngram_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             let sample_idx = rand::random::<usize>() % batch.num_rows();

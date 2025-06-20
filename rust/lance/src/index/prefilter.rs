@@ -122,13 +122,6 @@ impl DatasetPreFilter {
     async fn do_create_deletion_mask_row_id(dataset: Arc<Dataset>) -> Result<Arc<RowIdMask>> {
         // This can only be computed as an allow list, since we have no idea
         // what the row ids were in the missing fragments.
-
-        let path = dataset
-            .base
-            .child(format!("row_id_mask{}", dataset.manifest().version));
-
-        let session = dataset.session();
-
         async fn load_row_ids_and_deletions(
             dataset: &Dataset,
         ) -> Result<Vec<(Arc<RowIdSequence>, Option<Arc<DeletionVector>>)>> {
@@ -144,9 +137,12 @@ impl DatasetPreFilter {
                 .await
         }
 
-        session
-            .file_metadata_cache
-            .get_or_insert(&path, move |_| {
+        let cache_key = format!("row_id_mask/{}", dataset.manifest().version);
+
+        dataset
+            .metadata_cache
+            .clone()
+            .get_or_insert(cache_key, move |_| {
                 async move {
                     let row_ids_and_deletions = load_row_ids_and_deletions(&dataset).await?;
 

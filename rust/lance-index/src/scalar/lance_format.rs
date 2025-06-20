@@ -12,7 +12,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
-use lance_core::{cache::FileMetadataCache, Error, Result};
+use lance_core::{cache::LanceCache, Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
@@ -37,7 +37,7 @@ use super::{IndexReader, IndexStore, IndexWriter};
 pub struct LanceIndexStore {
     object_store: Arc<ObjectStore>,
     index_dir: Path,
-    metadata_cache: FileMetadataCache,
+    metadata_cache: Arc<LanceCache>,
     scheduler: Arc<ScanScheduler>,
 }
 
@@ -54,7 +54,7 @@ impl LanceIndexStore {
     pub fn new(
         object_store: Arc<ObjectStore>,
         index_dir: Path,
-        metadata_cache: FileMetadataCache,
+        metadata_cache: Arc<LanceCache>,
     ) -> Self {
         let scheduler = ScanScheduler::new(
             object_store.clone(),
@@ -330,7 +330,7 @@ pub mod tests {
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
-    use lance_core::{cache::CapacityMode, utils::mask::RowIdTreeMap};
+    use lance_core::utils::mask::RowIdTreeMap;
     use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
@@ -341,7 +341,7 @@ pub mod tests {
                 .now_or_never()
                 .unwrap()
                 .unwrap();
-        let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
+        let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
@@ -409,7 +409,7 @@ pub mod tests {
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, DataType::Int32, None).await;
-        let index = BTreeIndex::load(index_store).await.unwrap();
+        let index = BTreeIndex::load(index_store, None).await.unwrap();
 
         let result = index
             .search(
@@ -466,7 +466,7 @@ pub mod tests {
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, DataType::Int32, None).await;
-        let index = BTreeIndex::load(index_store).await.unwrap();
+        let index = BTreeIndex::load(index_store, None).await.unwrap();
 
         let data = gen()
             .col("values", array::step_custom::<Int32Type>(4096 * 100, 1))
@@ -482,7 +482,7 @@ pub mod tests {
             )
             .await
             .unwrap();
-        let updated_index = BTreeIndex::load(updated_index_store).await.unwrap();
+        let updated_index = BTreeIndex::load(updated_index_store, None).await.unwrap();
 
         let result = updated_index
             .search(
@@ -553,7 +553,7 @@ pub mod tests {
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_index(&index_store, data, DataType::Int32, Some(4)).await;
-        let index = BTreeIndex::load(index_store).await.unwrap();
+        let index = BTreeIndex::load(index_store, None).await.unwrap();
 
         // The above should create four pages
         //
@@ -789,7 +789,7 @@ pub mod tests {
             );
 
             train_index(&index_store, training_data, data_type.clone(), None).await;
-            let index = BTreeIndex::load(index_store).await.unwrap();
+            let index = BTreeIndex::load(index_store, None).await.unwrap();
 
             let result = index
                 .search(&SargableQuery::Equals(sample_value), &NoOpMetricsCollector)
@@ -837,7 +837,7 @@ pub mod tests {
         .await
         .unwrap();
 
-        let index = BTreeIndex::load(index_store).await.unwrap();
+        let index = BTreeIndex::load(index_store, None).await.unwrap();
 
         let result = index
             .search(
@@ -907,7 +907,7 @@ pub mod tests {
         let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
         train_bitmap(&index_store, data).await;
 
-        let index = BitmapIndex::load(index_store).await.unwrap();
+        let index = BitmapIndex::load(index_store, None).await.unwrap();
 
         let result = index
             .search(
@@ -947,7 +947,7 @@ pub mod tests {
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store).await.unwrap();
+        let index = BitmapIndex::load(index_store, None).await.unwrap();
 
         let result = index
             .search(
@@ -1033,7 +1033,7 @@ pub mod tests {
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store).await.unwrap();
+        let index = BitmapIndex::load(index_store, None).await.unwrap();
 
         // The above should create four pages
         //
@@ -1219,7 +1219,7 @@ pub mod tests {
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store).await.unwrap();
+        let index = BitmapIndex::load(index_store, None).await.unwrap();
 
         let data = gen()
             .col("values", array::step_custom::<Int32Type>(4096, 1))
@@ -1235,7 +1235,7 @@ pub mod tests {
             )
             .await
             .unwrap();
-        let updated_index = BitmapIndex::load(updated_index_store).await.unwrap();
+        let updated_index = BitmapIndex::load(updated_index_store, None).await.unwrap();
 
         let result = updated_index
             .search(
@@ -1260,7 +1260,7 @@ pub mod tests {
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(50), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store).await.unwrap();
+        let index = BitmapIndex::load(index_store, None).await.unwrap();
 
         let mapping = (0..50)
             .map(|i| {
@@ -1281,7 +1281,7 @@ pub mod tests {
             .remap(&mapping, remapped_store.as_ref())
             .await
             .unwrap();
-        let remapped_index = BitmapIndex::load(remapped_store).await.unwrap();
+        let remapped_index = BitmapIndex::load(remapped_store, None).await.unwrap();
 
         // Remapped to new value
         assert!(remapped_index
@@ -1355,7 +1355,7 @@ pub mod tests {
             let index_store = index_store.clone();
             let data = data.clone();
             async move {
-                let index = LabelListIndex::load(index_store).await.unwrap();
+                let index = LabelListIndex::load(index_store, None).await.unwrap();
                 let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
                 assert!(result.is_exact());
                 let row_ids = result.row_ids();

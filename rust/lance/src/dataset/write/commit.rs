@@ -230,6 +230,11 @@ impl<'a> CommitBuilder<'a> {
             });
         }
 
+        let metadata_cache = match &dest {
+            WriteDestination::Dataset(ds) => ds.metadata_cache.clone(),
+            WriteDestination::Uri(uri) => Arc::new(session.metadata_cache.with_key_prefix(uri)),
+        };
+
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
             ds.manifest_location.naming_scheme
         } else if self.enable_v2_manifest_paths {
@@ -313,7 +318,7 @@ impl<'a> CommitBuilder<'a> {
                 &transaction,
                 &manifest_config,
                 manifest_naming_scheme,
-                &session,
+                metadata_cache.as_ref(),
             )
             .await?
         };
@@ -340,6 +345,7 @@ impl<'a> CommitBuilder<'a> {
                 session,
                 commit_handler,
                 tags,
+                metadata_cache,
             }),
         }
     }
