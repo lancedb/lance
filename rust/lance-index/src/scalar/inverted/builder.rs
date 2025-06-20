@@ -159,12 +159,20 @@ impl InvertedIndexBuilder {
             index_tasks.push(task);
         }
 
-        let mut stream = flatten_stream.map(|batch| {
-            let batch = batch?;
-            let num_rows = batch.num_rows();
-            sender.send_blocking(batch).expect("failed to send batch");
-            Result::Ok(num_rows)
-        });
+        let sender = Arc::new(sender);
+
+        let mut stream = Box::pin(flatten_stream.then({
+            |batch_result| {
+                let sender = sender.clone();
+                async move {
+                    let sender = sender.clone();
+                    let batch = batch_result?;
+                    let num_rows = batch.num_rows();
+                    sender.send(batch).await.expect("failed to send batch");
+                    Result::Ok(num_rows)
+                }
+            }
+        }));
         log::info!("indexing FTS with {} workers", num_workers);
 
         let mut last_num_rows = 0;

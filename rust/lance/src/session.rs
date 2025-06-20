@@ -160,6 +160,10 @@ impl Session {
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
         self.store_registry.clone()
     }
+
+    pub fn metadata_cache_stats(&self) -> lance_core::cache::CacheStats {
+        self.metadata_cache.stats()
+    }
 }
 
 impl Default for Session {

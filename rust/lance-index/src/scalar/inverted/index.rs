@@ -573,7 +573,11 @@ impl InvertedPartition {
         builder
             .posting_lists
             .reserve_exact(self.inverted_list.len());
-        for posting_list in self.inverted_list.read_all(true).await? {
+        for posting_list in self
+            .inverted_list
+            .read_all(self.inverted_list.has_positions())
+            .await?
+        {
             let posting_list = posting_list?;
             builder
                 .posting_lists

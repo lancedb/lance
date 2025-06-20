@@ -626,7 +626,16 @@ mod tests {
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
 
-    use lance_core::{cache::FileMetadataCache, Result, ROW_ID};
+    use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
+    use crate::index::DatasetIndexInternalExt;
+    use crate::utils::test::copy_test_data_to_tmp;
+    use crate::{
+        dataset::optimize::{compact_files, CompactionOptions},
+        index::vector::{is_ivf_pq, IndexFileVersion},
+    };
+    use crate::{index::vector::VectorIndexParams, Dataset};
+    use lance_core::cache::LanceCache;
+    use lance_core::{Result, ROW_ID};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::v2::{
         reader::{FileReader, FileReaderOptions},
@@ -657,15 +666,6 @@ mod tests {
     use rand::distributions::uniform::SampleUniform;
     use rstest::rstest;
     use tempfile::tempdir;
-
-    use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
-    use crate::index::DatasetIndexInternalExt;
-    use crate::utils::test::copy_test_data_to_tmp;
-    use crate::{
-        dataset::optimize::{compact_files, CompactionOptions},
-        index::vector::{is_ivf_pq, IndexFileVersion},
-    };
-    use crate::{index::vector::VectorIndexParams, Dataset};
 
     const NUM_ROWS: usize = 500;
     const DIM: usize = 32;
@@ -1789,7 +1789,7 @@ mod tests {
                 .await?,
             None,
             Arc::<DecoderPlugins>::default(),
-            &FileMetadataCache::no_cache(),
+            &LanceCache::no_cache(),
             FileReaderOptions::default(),
         )
         .await?;
@@ -1862,7 +1862,7 @@ mod tests {
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),
-                &FileMetadataCache::no_cache(),
+                &LanceCache::no_cache(),
                 FileReaderOptions::default(),
             )
             .await
