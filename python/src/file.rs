@@ -527,6 +527,10 @@ impl LanceFileReader {
             .infer_error()?;
         Ok(buffer_bytes.to_vec())
     }
+
+    pub fn num_rows(&mut self) -> u64 {
+        self.inner.num_rows()
+    }
 }
 
 #[cfg(test)]

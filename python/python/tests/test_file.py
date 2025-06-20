@@ -100,6 +100,17 @@ def test_take(tmp_path):
     assert table == pa.table({"a": [0, 77, 83]})
 
 
+def test_num_rows(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    writer = LanceFileWriter(str(path), schema)
+    writer.write_batch(pa.table({"a": [i for i in range(100)]}))
+    writer.close()
+
+    reader = LanceFileReader(str(path))
+    assert reader.num_rows() == 100
+
+
 def check_round_trip(tmp_path, table):
     path = tmp_path / "foo.lance"
     with LanceFileWriter(str(path), table.schema) as writer:
