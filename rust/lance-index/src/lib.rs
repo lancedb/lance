@@ -195,7 +195,8 @@ impl IndexType {
             | Self::IvfSq
             | Self::IvfPq
             | Self::IvfHnswSq
-            | Self::IvfHnswPq => 1,
+            | Self::IvfHnswPq
+            | Self::IvfHnswFlat => 1,
         }
     }
 }
