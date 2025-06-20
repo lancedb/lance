@@ -237,7 +237,8 @@ class LanceDataset(torch.utils.data.IterableDataset):
         """
         super().__init__()
         if isinstance(dataset, (str, Path)):
-            dataset = lance.dataset(dataset)
+            storage_options = kwargs.get("storage_options", {})
+            dataset = lance.dataset(dataset, storage_options=storage_options)
         self.dataset = dataset
         self.columns = columns
         self.batch_size = batch_size
@@ -378,14 +379,15 @@ class LanceDataset(torch.utils.data.IterableDataset):
 
 
 class SafeLanceDataset(torch.utils.data.Dataset):
-    def __init__(self, uri):
+    def __init__(self, uri, **kwargs):
         self.uri = uri
+        self.storage_options = kwargs.get("storage_options", {})
         self._len = self._safe_preload()
         self._ds = None  # Deferred initialization
 
     def _safe_preload(self):
         """Main-process safe metadata loading"""
-        ds = lance.dataset(self.uri)
+        ds = lance.dataset(self.uri, storage_options=self.storage_options)
         length = ds.count_rows()
         del ds  # Critical: release before spawning
         return length
