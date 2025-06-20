@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
 /// Load fragment reuse index details from index metadata
 pub async fn load_frag_reuse_index_details(
@@ -73,7 +74,7 @@ pub async fn load_frag_reuse_index_details(
 
 /// open fragment reuse index based on its metadata details
 pub(crate) async fn open_frag_reuse_index(
-    uuid: String,
+    uuid: Uuid,
     details: &FragReuseIndexDetails,
 ) -> lance_core::Result<FragReuseIndex> {
     let mut row_id_maps: Vec<HashMap<u64, Option<u64>>> =

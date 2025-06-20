@@ -47,6 +47,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use take::row_indices_to_row_addresses;
 use tracing::{info, instrument};
+use uuid::Uuid;
 
 mod blob;
 pub mod builder;
@@ -133,7 +134,8 @@ pub struct Dataset {
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
 
-    // TODO: we need to get the fragment reuse index a lot.
+    // cached UUID of fragment reuse index, if it exists.
+    pub(crate) frag_reuse_index_uuid: std::sync::OnceLock<Option<Uuid>>,
 
     // These are references to session caches, but with the dataset URI as a prefix.
     pub(crate) index_cache: Arc<LanceCache>,
@@ -528,6 +530,7 @@ impl Dataset {
             commit_handler,
             session,
             tags,
+            frag_reuse_index_uuid: std::sync::OnceLock::new(),
             metadata_cache,
             index_cache,
         })

@@ -48,6 +48,7 @@ use utils::get_vector_type;
 use uuid::Uuid;
 
 use super::{pb, DatasetIndexInternalExt, IndexParams};
+use crate::index::index_cache_key;
 use crate::{dataset::Dataset, index::pb::vector_index_stage::Stage, Error, Result};
 
 pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
@@ -460,6 +461,13 @@ pub(crate) async fn open_vector_index(
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
 
+    let frag_reuse_uuid = dataset
+        .frag_reuse_index_uuid
+        .get()
+        .expect("Fragment reuse index UUID should be set")
+        .as_ref();
+    let key_prefix = index_cache_key(uuid, frag_reuse_uuid);
+
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
             #[allow(unused_variables)]
@@ -485,7 +493,7 @@ pub(crate) async fn open_vector_index(
                     reader.clone(),
                     last_stage.unwrap(),
                     metric_type,
-                    dataset.index_cache.with_key_prefix(uuid),
+                    dataset.index_cache.with_key_prefix(key_prefix.as_ref()),
                 )?));
             }
             Some(Stage::Pq(pq_proto)) => {
@@ -537,6 +545,13 @@ pub(crate) async fn open_vector_index_v2(
     let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
+    let frag_reuse_uuid = dataset
+        .frag_reuse_index_uuid
+        .get()
+        .expect("Fragment reuse index UUID should be set")
+        .as_ref();
+    let key_prefix = index_cache_key(uuid, frag_reuse_uuid);
+
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
             let aux_path = dataset
@@ -562,7 +577,7 @@ pub(crate) async fn open_vector_index_v2(
                 reader.object_reader.clone(),
                 Arc::new(hnsw),
                 distance_type,
-                dataset.index_cache.with_key_prefix(uuid),
+                dataset.index_cache.with_key_prefix(key_prefix.as_ref()),
             )?)
         }
 
@@ -593,7 +608,7 @@ pub(crate) async fn open_vector_index_v2(
                 reader.object_reader.clone(),
                 Arc::new(hnsw),
                 distance_type,
-                dataset.index_cache.with_key_prefix(uuid),
+                dataset.index_cache.with_key_prefix(key_prefix.as_ref()),
             )?)
         }
 

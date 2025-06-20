@@ -489,11 +489,12 @@ impl DatasetIndexExt for Dataset {
 
         if let Some(fri_meta) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
             let uuid = fri_meta.uuid.to_string();
+            let _ = self.frag_reuse_index_uuid.set(Some(fri_meta.uuid));
             let fri = self
                 .index_cache
                 .get_or_insert(uuid.clone(), |_| async move {
                     let index_details = load_frag_reuse_index_details(self, fri_meta).await?;
-                    open_frag_reuse_index(uuid, index_details.as_ref()).await
+                    open_frag_reuse_index(fri_meta.uuid, index_details.as_ref()).await
                 })
                 .await?;
             let mut indices = indices.as_ref().clone();
@@ -504,6 +505,7 @@ impl DatasetIndexExt for Dataset {
             });
             Ok(Arc::new(indices))
         } else {
+            let _ = self.frag_reuse_index_uuid.set(None);
             Ok(indices)
         }
     }
@@ -898,13 +900,26 @@ impl DatasetIndexInternalExt for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>> {
         // Checking for cache existence is cheap so we just check both scalar and vector caches
-        if let Some(index) = self.index_cache.get_unsized::<dyn ScalarIndex>(uuid) {
+        let frag_reuse_uuid = self
+            .frag_reuse_index_uuid
+            .get()
+            .expect("Fragment reuse index UUID should be set")
+            .as_ref();
+        let cache_key = index_cache_key(uuid, frag_reuse_uuid);
+
+        if let Some(index) = self
+            .index_cache
+            .get_unsized::<dyn ScalarIndex>(cache_key.as_ref())
+        {
             return Ok(index.as_index());
         }
-        if let Some(index) = self.index_cache.get_unsized::<dyn VectorIndex>(uuid) {
+        if let Some(index) = self
+            .index_cache
+            .get_unsized::<dyn VectorIndex>(cache_key.as_ref())
+        {
             return Ok(index.as_index());
         }
-        if let Some(index) = self.index_cache.get::<FragReuseIndex>(uuid) {
+        if let Some(index) = self.index_cache.get::<FragReuseIndex>(cache_key.as_ref()) {
             return Ok(index.as_index());
         }
 
@@ -933,7 +948,12 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let cache_key = index_cache_key(self, uuid).await.unwrap();
+        let frag_reuse_uuid = self
+            .frag_reuse_index_uuid
+            .get()
+            .expect("Fragment reuse index UUID should be set")
+            .as_ref();
+        let cache_key = index_cache_key(uuid, frag_reuse_uuid);
         if let Some(index) = self
             .index_cache
             .get_unsized::<dyn ScalarIndex>(cache_key.as_ref())
@@ -961,7 +981,17 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        if let Some(index) = self.index_cache.get_unsized::<dyn VectorIndex>(uuid) {
+        let frag_reuse_uuid = self
+            .frag_reuse_index_uuid
+            .get()
+            .expect("Fragment reuse index UUID should be set")
+            .as_ref();
+        let cache_key = index_cache_key(uuid, frag_reuse_uuid);
+
+        if let Some(index) = self
+            .index_cache
+            .get_unsized::<dyn VectorIndex>(cache_key.as_ref())
+        {
             log::debug!("Found vector index in cache uuid: {}", uuid);
             return Ok(index);
         }
@@ -975,7 +1005,7 @@ impl DatasetIndexInternalExt for Dataset {
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
 
         // Namespace the index cache by the UUID of the index.
-        let index_cache = self.index_cache.with_key_prefix(uuid);
+        let index_cache = self.index_cache.with_key_prefix(cache_key.as_ref());
 
         // the index file is in lance format since version (0,2)
         // TODO: we need to change the legacy IVF_PQ to be in lance format
@@ -1148,7 +1178,8 @@ impl DatasetIndexInternalExt for Dataset {
                         location: location!(),
                     })?;
                     let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
-                    let index = open_frag_reuse_index(uuid.clone(), index_details.as_ref()).await?;
+                    let index =
+                        open_frag_reuse_index(fri_meta.uuid, index_details.as_ref()).await?;
 
                     info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_FRAG_REUSE);
                     metrics.record_index_load();
@@ -1291,7 +1322,7 @@ fn is_vector_field(data_type: DataType) -> bool {
 
 /// Index cache key should be the ID of the index plus the ID of the FRI.
 /// If FRI has changed, the index would have changed further
-fn index_cache_key<'a>(uuid: &'a str, fri_uuid: Option<&str>) -> Cow<'a, str> {
+fn index_cache_key<'a>(uuid: &'a str, fri_uuid: Option<&Uuid>) -> Cow<'a, str> {
     if let Some(fri_uuid) = fri_uuid {
         Cow::Owned(format!("{}-{}", uuid, fri_uuid))
     } else {

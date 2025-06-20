@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_file::version::LanceFileVersion;
@@ -348,6 +348,7 @@ impl<'a> CommitBuilder<'a> {
                 session,
                 commit_handler,
                 tags,
+                frag_reuse_index_uuid: OnceLock::new(),
                 index_cache,
                 metadata_cache,
             }),

@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::index::DatasetIndexInternalExt;
+use crate::index::{index_cache_key, DatasetIndexInternalExt};
 use crate::session::Session;
 use crate::{
     dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
@@ -365,7 +365,9 @@ pub async fn open_scalar_index(
     let index_store = Arc::new(LanceIndexStore::from_dataset(dataset, &uuid_str));
     let index_type = detect_scalar_index_type(dataset, index, column, &dataset.session).await?;
     let fri = dataset.open_frag_reuse_index(metrics).await?;
-    let index_cache = dataset.index_cache.with_key_prefix(&uuid_str);
+
+    let cache_key = index_cache_key(&uuid_str, fri.as_ref().map(|f| &f.uuid));
+    let index_cache = dataset.index_cache.with_key_prefix(&cache_key);
     match index_type {
         ScalarIndexType::Bitmap => {
             let bitmap_index = BitmapIndex::load(index_store, fri, index_cache).await?;
