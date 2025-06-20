@@ -4,10 +4,10 @@
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::IndexType;
+use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::InvertedIndex};
 use lance_table::format::Index as IndexMetadata;
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -18,6 +18,13 @@ use super::DatasetIndexInternalExt;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
+
+pub struct IndexMergeResults<'a> {
+    pub new_uuid: Uuid,
+    pub removed_indices: Vec<&'a IndexMetadata>,
+    pub new_fragment_bitmap: RoaringBitmap,
+    pub new_index_version: i32,
+}
 
 /// Merge in-inflight unindexed data, with a specific number of previous indices
 /// into a new index, to improve the query performance.
@@ -33,7 +40,7 @@ pub async fn merge_indices<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
     options: &OptimizeOptions,
-) -> Result<Option<(Uuid, Vec<&'a IndexMetadata>, RoaringBitmap)>> {
+) -> Result<Option<IndexMergeResults<'a>>> {
     if old_indices.is_empty() {
         return Err(Error::Index {
             message: "Append index: no previous index found".to_string(),
@@ -76,7 +83,8 @@ pub async fn merge_indices<'a>(
         frag_bitmap.insert(frag.id as u32);
     });
 
-    let (new_uuid, indices_merged) = match indices[0].index_type() {
+    let index_type = indices[0].index_type();
+    let (new_uuid, indices_merged) = match index_type {
         it if it.is_scalar() => {
             // There are no delta indices for scalar, so adding all indexed
             // fragments to the new index.
@@ -92,16 +100,35 @@ pub async fn merge_indices<'a>(
                 )
                 .await?;
 
+            let need_full_data = match index.index_type() {
+                IndexType::Inverted => {
+                    // we can't directly update the legacy inverted index to the new format,
+                    // so we need to read the full data and rebuild it.
+                    let index =
+                        index
+                            .as_any()
+                            .downcast_ref::<InvertedIndex>()
+                            .ok_or(Error::Index {
+                                message: "Append index: invalid index type".to_string(),
+                                location: location!(),
+                            })?;
+                    index.is_legacy()
+                }
+                _ => false,
+            };
+
             let mut scanner = dataset.scan();
             let orodering = match index.index_type() {
                 IndexType::Inverted => None,
                 _ => Some(vec![ColumnOrdering::asc_nulls_first(column.name.clone())]),
             };
             scanner
-                .with_fragments(unindexed)
                 .with_row_id()
                 .order_by(orodering)?
                 .project(&[&column.name])?;
+            if !need_full_data {
+                scanner.with_fragments(unindexed);
+            }
             let new_data_stream = scanner.try_into_stream().await?;
 
             let new_uuid = Uuid::new_v4();
@@ -152,11 +179,17 @@ pub async fn merge_indices<'a>(
         }),
     }?;
 
-    Ok(Some((
+    let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();
+    for removed in removed_indices.iter() {
+        frag_bitmap |= removed.fragment_bitmap.as_ref().unwrap();
+    }
+
+    Ok(Some(IndexMergeResults {
         new_uuid,
-        old_indices[old_indices.len() - indices_merged..].to_vec(),
-        frag_bitmap,
-    )))
+        removed_indices,
+        new_fragment_bitmap: frag_bitmap,
+        new_index_version: index_type.version(),
+    }))
 }
 
 #[cfg(test)]

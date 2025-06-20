@@ -1108,22 +1108,29 @@ pub mod tests {
         check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_binary_dictionary_encoding() {
+    async fn test_binary_dictionary_encoding(
+        #[values(true, false)] with_nulls: bool,
+        #[values(100, 500, 35000)] dict_size: u32,
+    ) {
         let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
-        let strings = [
-            "Hal Abelson",
-            "Charles Babbage",
-            "Vint Cerf",
-            "Jim Gray",
-            "Alonzo Church",
-            "Edgar F. Codd",
-        ];
+        let strings = (0..dict_size)
+            .map(|i| i.to_string())
+            .collect::<Vec<String>>();
+
         let repeated_strings: Vec<_> = strings
             .iter()
             .cycle()
-            .take(strings.len() * 10000)
-            .cloned()
+            .take(70000)
+            .enumerate()
+            .map(|(i, s)| {
+                if with_nulls && i % 7 == 0 {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            })
             .collect();
         let string_array = Arc::new(StringArray::from(repeated_strings)) as ArrayRef;
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;

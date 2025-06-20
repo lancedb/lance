@@ -4,13 +4,15 @@
 //! They do not work against any local emulator right now.
 #![cfg(feature = "gcs-test")]
 
+use std::sync::Arc;
+
 // TODO: Once we re-use this logic for S3, we can instead use tests against
 // Minio to validate the multipart upload logic.
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 
-async fn get_store() -> ObjectStore {
+async fn get_store() -> Arc<ObjectStore> {
     let bucket_name = std::env::var("OBJECT_STORE_BUCKET").unwrap_or_else(|_| "test-bucket".into());
     ObjectStore::from_uri(&format!("gs://{}/object", bucket_name))
         .await

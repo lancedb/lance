@@ -25,7 +25,8 @@ public class Query {
   private final String column;
   private final float[] key;
   private final int k;
-  private final int nprobes;
+  private final int minimumNprobes;
+  private final Optional<Integer> maximumNprobes;
   private final Optional<Integer> ef;
   private final Optional<Integer> refineFactor;
   private final DistanceType distanceType;
@@ -36,9 +37,15 @@ public class Query {
     Preconditions.checkArgument(!builder.column.isEmpty(), "Column must not be empty");
     this.key = Preconditions.checkNotNull(builder.key, "Key must be set");
     Preconditions.checkArgument(builder.k > 0, "K must be greater than 0");
-    Preconditions.checkArgument(builder.nprobes > 0, "Nprobes must be greater than 0");
+    Preconditions.checkArgument(
+        builder.minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
+    Preconditions.checkArgument(
+        !builder.maximumNprobes.isPresent()
+            || builder.maximumNprobes.get() >= builder.minimumNprobes,
+        "Maximum Nprobes must be greater than minimum Nprobes");
     this.k = builder.k;
-    this.nprobes = builder.nprobes;
+    this.minimumNprobes = builder.minimumNprobes;
+    this.maximumNprobes = builder.maximumNprobes;
     this.ef = builder.ef;
     this.refineFactor = builder.refineFactor;
     this.distanceType = Preconditions.checkNotNull(builder.distanceType, "Metric type must be set");
@@ -57,8 +64,12 @@ public class Query {
     return k;
   }
 
-  public int getNprobes() {
-    return nprobes;
+  public int getMinimumNprobes() {
+    return minimumNprobes;
+  }
+
+  public Optional<Integer> getMaximumNprobes() {
+    return maximumNprobes;
   }
 
   public Optional<Integer> getEf() {
@@ -83,7 +94,8 @@ public class Query {
         .append("column", column)
         .append("key", key)
         .append("k", k)
-        .append("nprobes", nprobes)
+        .append("minimumNprobes", minimumNprobes)
+        .append("maximumNprobes", maximumNprobes.orElse(null))
         .append("ef", ef.orElse(null))
         .append("refineFactor", refineFactor.orElse(null))
         .append("distanceType", distanceType)
@@ -95,7 +107,8 @@ public class Query {
     private String column;
     private float[] key;
     private int k = 10;
-    private int nprobes = 1;
+    private int minimumNprobes = 20;
+    private Optional<Integer> maximumNprobes = Optional.empty();
     private Optional<Integer> ef = Optional.empty();
     private Optional<Integer> refineFactor = Optional.empty();
     private DistanceType distanceType = DistanceType.L2;
@@ -137,11 +150,46 @@ public class Query {
     /**
      * Sets the number of probes to load and search.
      *
+     * <p>This is a convenience method that sets both the minimum and maximum number of probes to
+     * the same value.
+     *
      * @param nprobes The number of probes.
      * @return The Builder instance for method chaining.
      */
     public Builder setNprobes(int nprobes) {
-      this.nprobes = nprobes;
+      this.minimumNprobes = nprobes;
+      this.maximumNprobes = Optional.of(nprobes);
+      return this;
+    }
+
+    /**
+     * Sets the minimum number of partitions to search.
+     *
+     * <p>This many partitions will always be loaded and searched on the query. Increasing this
+     * number can improve recall at the cost of latency.
+     *
+     * @param minimumNprobes The minimum number of partitions to search.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setMinimumNprobes(int minimumNprobes) {
+      this.minimumNprobes = minimumNprobes;
+      return this;
+    }
+
+    /**
+     * Sets the maximum number of partitions to search.
+     *
+     * <p>These partitions will only be loaded and searched if we have not found the desired number
+     * of results after searching the minimum number of partitions. Increasing this number can avoid
+     * false negatives on queries with a highly selective prefilter. This setting does not affect
+     * the recall of the query and will only affect the latency if the prefilter is highly
+     * selective.
+     *
+     * @param maximumNprobes The maximum number of partitions to search.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setMaximumNprobes(int maximumNprobes) {
+      this.maximumNprobes = Optional.of(maximumNprobes);
       return this;
     }
 

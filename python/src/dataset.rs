@@ -15,46 +15,9 @@ use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use blob::LanceBlobFile;
-use chrono::Duration;
+use chrono::{Duration, TimeDelta};
 use futures::{StreamExt, TryFutureExt};
-
-use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::refs::{Ref, TagContents};
-use lance::dataset::scanner::{DatasetRecordBatchStream, MaterializationStyle};
-use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
-use lance::dataset::{
-    fragment::FileFragment as LanceFileFragment,
-    progress::WriteFragmentProgress,
-    scanner::Scanner as LanceScanner,
-    transaction::{Operation, Transaction},
-    Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
-    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
-    WriteParams,
-};
-use lance::dataset::{
-    BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
-    WriteDestination,
-};
-use lance::dataset::{ColumnAlteration, ProjectionRequest};
-use lance::index::vector::utils::get_vector_type;
-use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
-use lance_arrow::as_fixed_size_list_array;
-use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
-use lance_index::scalar::InvertedIndexParams;
-use lance_index::{
-    optimize::OptimizeOptions,
-    scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType},
-    vector::{
-        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
-        sq::builder::SQBuildParams,
-    },
-    DatasetIndexExt, IndexParams, IndexType,
-};
-use lance_io::object_store::ObjectStoreParams;
-use lance_linalg::distance::MetricType;
-use lance_table::format::Fragment;
-use lance_table::io::commit::CommitHandler;
+use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
@@ -68,12 +31,55 @@ use pyo3::{
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
+use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::refs::{Ref, TagContents};
+use lance::dataset::scanner::{
+    DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
+};
+use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
+use lance::dataset::AutoCleanupParams;
+use lance::dataset::{
+    fragment::FileFragment as LanceFileFragment,
+    progress::WriteFragmentProgress,
+    scanner::Scanner as LanceScanner,
+    transaction::{Operation, Transaction},
+    Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
+    UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource, WriteMode, WriteParams,
+};
+use lance::dataset::{
+    BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
+    WriteDestination,
+};
+use lance::dataset::{ColumnAlteration, ProjectionRequest};
+use lance::index::vector::utils::get_vector_type;
+use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
+use lance_arrow::as_fixed_size_list_array;
+use lance_index::scalar::inverted::query::{
+    BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
+};
+use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::query::Occur};
+use lance_index::{
+    optimize::OptimizeOptions,
+    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams, ScalarIndexType},
+    vector::{
+        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+        sq::builder::SQBuildParams,
+    },
+    DatasetIndexExt, IndexParams, IndexType,
+};
+use lance_io::object_store::ObjectStoreParams;
+use lance_linalg::distance::MetricType;
+use lance_table::format::Fragment;
+use lance_table::io::commit::CommitHandler;
+
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
+use crate::scanner::ScanStatistics;
 use crate::schema::LanceSchema;
 use crate::session::Session;
-use crate::utils::{parse_fts_query, PyLance};
+use crate::utils::PyLance;
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
@@ -86,9 +92,7 @@ pub mod commit;
 pub mod optimize;
 pub mod stats;
 
-const DEFAULT_NPROBS: usize = 1;
-const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
-const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
+const DEFAULT_NPROBS: usize = 20;
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
@@ -183,6 +187,22 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn conflict_retries(
+        mut slf: PyRefMut<'_, Self>,
+        max_retries: u32,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.conflict_retries(max_retries);
+        Ok(slf)
+    }
+
+    pub fn retry_timeout(
+        mut slf: PyRefMut<'_, Self>,
+        timeout: std::time::Duration,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.retry_timeout(timeout);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<PyObject> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;
@@ -215,7 +235,9 @@ impl MergeInsertBuilder {
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let (transaction, stats) = RT
+        let UncommittedMergeInsert {
+            transaction, stats, ..
+        } = RT
             .spawn(Some(py), job.execute_uncommitted(new_data))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
@@ -292,7 +314,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None))]
     fn new(
         py: Python,
         uri: String,
@@ -303,17 +325,24 @@ impl Dataset {
         commit_handler: Option<PyObject>,
         storage_options: Option<HashMap<String, String>>,
         manifest: Option<&[u8]>,
+        metadata_cache_size_bytes: Option<usize>,
     ) -> PyResult<Self> {
-        let mut params = ReadParams {
-            index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
-            metadata_cache_size: metadata_cache_size.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
-            store_options: Some(ObjectStoreParams {
-                block_size,
+        let mut params = ReadParams::default();
+        if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
+            params.metadata_cache_size_bytes(metadata_cache_size_bytes);
+        } else if let Some(metadata_cache_size) = metadata_cache_size {
+            #[allow(deprecated)]
+            params.metadata_cache_size(metadata_cache_size);
+        }
+        if let Some(index_cache_size) = index_cache_size {
+            params.index_cache_size(index_cache_size);
+        }
+        if let Some(block_size) = block_size {
+            params.store_options = Some(ObjectStoreParams {
+                block_size: Some(block_size),
                 ..Default::default()
-            }),
-            ..Default::default()
+            });
         };
-
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);
             params.set_commit_lock(Arc::new(py_commit_lock));
@@ -333,7 +362,16 @@ impl Dataset {
                 ));
             };
         }
-        if let Some(storage_options) = storage_options {
+        if let Some(mut storage_options) = storage_options {
+            if let Some(user_agent) = storage_options.get_mut("user_agent") {
+                user_agent.push_str(&format!(" pylance/{}", env!("CARGO_PKG_VERSION")));
+            } else {
+                storage_options.insert(
+                    "user_agent".to_string(),
+                    format!("pylance/{}", env!("CARGO_PKG_VERSION")),
+                );
+            }
+
             builder = builder.with_storage_options(storage_options);
         }
         if let Some(manifest) = manifest {
@@ -481,7 +519,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -502,10 +540,12 @@ impl Dataset {
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
-        full_text_query: Option<&Bound<'_, PyDict>>,
+        full_text_query: Option<&Bound<'_, PyAny>>,
         late_materialization: Option<PyObject>,
         use_scalar_index: Option<bool>,
         include_deleted_rows: Option<bool>,
+        scan_stats_callback: Option<&Bound<'_, PyAny>>,
+        strict_batch_size: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -537,12 +577,11 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(full_text_query) = full_text_query {
-            let query = full_text_query
-                .get_item("query")?
-                .ok_or_else(|| PyKeyError::new_err("query must be specified"))?;
-
-            let fts_query = if let Ok(query) = query.downcast::<PyString>() {
-                let mut query = query.to_string();
+            let fts_query = if let Ok(full_text_query) = full_text_query.downcast::<PyDict>() {
+                let mut query = full_text_query
+                    .get_item("query")?
+                    .ok_or_else(|| PyKeyError::new_err("query must be specified"))?
+                    .to_string();
                 let columns = if let Some(columns) = full_text_query.get_item("columns")? {
                     if columns.is_none() {
                         None
@@ -586,9 +625,9 @@ impl Dataset {
                     })?;
                 }
                 query
-            } else if let Ok(query) = query.downcast::<PyDict>() {
-                let query = parse_fts_query(query)?;
-                FullTextSearchQuery::new_query(query)
+            } else if let Ok(query) = full_text_query.downcast::<PyFullTextQuery>() {
+                let query = query.borrow();
+                FullTextSearchQuery::new_query(query.inner.clone())
             } else {
                 return Err(PyValueError::new_err(
                     "query must be a string or a Query object",
@@ -657,6 +696,11 @@ impl Dataset {
             scanner.with_fragments(fragments);
         }
 
+        if let Some(scan_stats_callback) = scan_stats_callback {
+            let callback = Self::make_scan_stats_callback(scan_stats_callback.clone())?;
+            scanner.scan_stats_callback(callback);
+        }
+
         if let Some(late_materialization) = late_materialization {
             if let Ok(style_as_bool) = late_materialization.extract::<bool>(self_.py()) {
                 if style_as_bool {
@@ -678,6 +722,10 @@ impl Dataset {
 
         if let Some(use_scalar_index) = use_scalar_index {
             scanner.use_scalar_index(use_scalar_index);
+        }
+
+        if let Some(strict_batch_size) = strict_batch_size {
+            scanner.strict_batch_size(strict_batch_size);
         }
 
         if let Some(nearest) = nearest {
@@ -703,15 +751,41 @@ impl Dataset {
                 10
             };
 
-            let nprobes: usize = if let Some(nprobes) = nearest.get_item("nprobes")? {
-                if nprobes.is_none() {
-                    DEFAULT_NPROBS
-                } else {
-                    nprobes.extract()?
+            let mut minimum_nprobes = DEFAULT_NPROBS;
+            let mut maximum_nprobes = None;
+
+            if let Some(nprobes) = nearest.get_item("nprobes")? {
+                if !nprobes.is_none() {
+                    minimum_nprobes = nprobes.extract()?;
+                    maximum_nprobes = Some(minimum_nprobes);
                 }
-            } else {
-                DEFAULT_NPROBS
-            };
+            }
+
+            if let Some(min_nprobes) = nearest.get_item("minimum_nprobes")? {
+                if !min_nprobes.is_none() {
+                    minimum_nprobes = min_nprobes.extract()?;
+                }
+            }
+
+            if let Some(max_nprobes) = nearest.get_item("maximum_nprobes")? {
+                if !max_nprobes.is_none() {
+                    maximum_nprobes = Some(max_nprobes.extract()?);
+                }
+            }
+
+            if minimum_nprobes > maximum_nprobes.unwrap_or(usize::MAX) {
+                return Err(PyValueError::new_err(
+                    "minimum_nprobes must be <= maximum_nprobes",
+                ));
+            }
+
+            if minimum_nprobes < 1 {
+                return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
+            }
+
+            if maximum_nprobes.unwrap_or(usize::MAX) < 1 {
+                return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
+            }
 
             let metric_type: Option<MetricType> =
                 if let Some(metric) = nearest.get_item("metric")? {
@@ -770,7 +844,10 @@ impl Dataset {
             };
             scanner
                 .map(|s| {
-                    let mut s = s.nprobs(nprobes);
+                    let mut s = s.minimum_nprobes(minimum_nprobes);
+                    if let Some(maximum_nprobes) = maximum_nprobes {
+                        s = s.maximum_nprobes(maximum_nprobes);
+                    }
                     if let Some(factor) = refine_factor {
                         s = s.refine(factor);
                     }
@@ -864,6 +941,20 @@ impl Dataset {
             .block_on(
                 Some(self_.py()),
                 self_.ds.take_blobs(&row_indices, blob_column),
+            )?
+            .infer_error()?;
+        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+    }
+
+    fn take_blobs_by_indices(
+        self_: PyRef<'_, Self>,
+        row_indices: Vec<u64>,
+        blob_column: &str,
+    ) -> PyResult<Vec<LanceBlobFile>> {
+        let blobs = RT
+            .block_on(
+                Some(self_.py()),
+                self_.ds.take_blobs_by_indices(&row_indices, blob_column),
             )?
             .infer_error()?;
         Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
@@ -1121,10 +1212,31 @@ impl Dataset {
         })
     }
 
+    fn tags_ordered(self_: PyRef<'_, Self>, order: Option<String>) -> PyResult<PyObject> {
+        let tags = self_
+            .list_tags_ordered(order.as_deref())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Python::with_gil(|py| {
+            let pylist = PyList::empty(py);
+
+            for (tag_name, tag_content) in tags {
+                let dict = PyDict::new(py);
+                dict.set_item("version", tag_content.version)?;
+                dict.set_item("manifest_size", tag_content.manifest_size)?;
+
+                pylist.append((tag_name.as_str(), dict))?;
+            }
+
+            Ok(PyObject::from(pylist))
+        })
+    }
+
     fn tags(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let tags = self_
             .list_tags()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
         Python::with_gil(|py| {
             let pytags = PyDict::new(py);
             for (k, v) in tags.iter() {
@@ -1134,6 +1246,20 @@ impl Dataset {
                 pytags.set_item(k, dict.into_py_any(py)?).unwrap();
             }
             pytags.into_py_any(py)
+        })
+    }
+
+    fn get_version(self_: PyRef<'_, Self>, tag: String) -> PyResult<u64> {
+        let inner_result = RT.block_on(None, self_.ds.tags.get_version(&tag))?;
+
+        inner_result.map_err(|err: lance::Error| match err {
+            lance::Error::NotFound { .. } => {
+                PyValueError::new_err(format!("Tag not found: {}", err))
+            }
+            lance::Error::RefNotFound { .. } => {
+                PyValueError::new_err(format!("Ref not found: {}", err))
+            }
+            _ => PyIOError::new_err(format!("Storage error: {}", err)),
         })
     }
 
@@ -1245,45 +1371,35 @@ impl Dataset {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
                     if let Some(with_position) = kwargs.get_item("with_position")? {
-                        params.with_position = with_position.extract()?;
+                        params = params.with_position(with_position.extract()?);
                     }
                     if let Some(base_tokenizer) = kwargs.get_item("base_tokenizer")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .base_tokenizer(base_tokenizer.extract()?);
+                        params = params.base_tokenizer(base_tokenizer.extract()?);
                     }
                     if let Some(language) = kwargs.get_item("language")? {
                         let language: PyBackedStr =
                             language.downcast::<PyString>()?.clone().try_into()?;
-                        params.tokenizer_config =
-                            params.tokenizer_config.language(&language).map_err(|e| {
-                                PyValueError::new_err(format!(
-                                    "can't set tokenizer language to {}: {:?}",
-                                    language, e
-                                ))
-                            })?;
+                        params = params.language(&language).map_err(|e| {
+                            PyValueError::new_err(format!(
+                                "can't set tokenizer language to {}: {:?}",
+                                language, e
+                            ))
+                        })?;
                     }
                     if let Some(max_token_length) = kwargs.get_item("max_token_length")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .max_token_length(max_token_length.extract()?);
+                        params = params.max_token_length(max_token_length.extract()?);
                     }
                     if let Some(lower_case) = kwargs.get_item("lower_case")? {
-                        params.tokenizer_config =
-                            params.tokenizer_config.lower_case(lower_case.extract()?);
+                        params = params.lower_case(lower_case.extract()?);
                     }
                     if let Some(stem) = kwargs.get_item("stem")? {
-                        params.tokenizer_config = params.tokenizer_config.stem(stem.extract()?);
+                        params = params.stem(stem.extract()?);
                     }
                     if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .remove_stop_words(remove_stop_words.extract()?);
+                        params = params.remove_stop_words(remove_stop_words.extract()?);
                     }
                     if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .ascii_folding(ascii_folding.extract()?);
+                        params = params.ascii_folding(ascii_folding.extract()?);
                     }
                 }
                 Box::new(params)
@@ -1319,6 +1435,11 @@ impl Dataset {
         self.ds = Arc::new(new_self);
 
         Ok(())
+    }
+
+    fn prewarm_index(&self, name: &str) -> PyResult<()> {
+        RT.block_on(None, self.ds.prewarm_index(name))?
+            .infer_error()
     }
 
     fn count_fragments(&self) -> usize {
@@ -1635,6 +1756,30 @@ impl Dataset {
         )));
         Ok(PyArrowType(reader))
     }
+
+    #[pyo3(signature = (upsert_values))]
+    fn update_config(&mut self, upsert_values: &Bound<'_, PyDict>) -> PyResult<()> {
+        let upsert: HashMap<String, String> = upsert_values
+            .iter()
+            .map(|(k, v)| Ok((k.extract::<String>()?, v.extract::<String>()?)))
+            .collect::<PyResult<_>>()?;
+
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.update_config(upsert))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    #[pyo3(signature = (keys))]
+    fn delete_config_keys(&mut self, keys: Vec<String>) -> PyResult<()> {
+        let key_refs: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.delete_config_keys(&key_refs))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
 }
 
 #[derive(FromPyObject)]
@@ -1673,6 +1818,53 @@ impl Dataset {
 
     fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
         RT.runtime.block_on(self.ds.tags.list())
+    }
+
+    fn list_tags_ordered(
+        &self,
+        order: Option<&str>,
+    ) -> ::lance::error::Result<Vec<(String, TagContents)>> {
+        let ordering = match order {
+            Some("asc") => Some(std::cmp::Ordering::Less),
+            Some("desc") => Some(std::cmp::Ordering::Greater),
+            Some(invalid_order) => {
+                let error_msg = format!(
+                    "Invalid sort order '{}'. Valid values are: asc, desc",
+                    invalid_order
+                );
+                return Err(::lance::error::Error::InvalidInput {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        error_msg,
+                    )),
+                    location: location!(),
+                });
+            }
+            None => None,
+        };
+        RT.runtime
+            .block_on(async { self.ds.tags.list_tags_ordered(ordering).await })
+    }
+
+    fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {
+        if !callback.is_callable() {
+            return Err(PyValueError::new_err("Callback must be callable"));
+        }
+
+        let callback = callback.unbind();
+
+        Ok(Arc::new(move |stats| {
+            Python::with_gil(|py| {
+                let stats = ScanStatistics::from_lance(stats);
+                match callback.call1(py, (stats,)) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        // Don't fail scan if callback fails
+                        error!("Error in scan stats callback: {}", e);
+                    }
+                }
+            });
+        }))
     }
 }
 
@@ -1794,6 +1986,27 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             get_dict_opt::<bool>(options, "enable_v2_manifest_paths")?
         {
             p.enable_v2_manifest_paths = enable_v2_manifest_paths;
+        }
+
+        if let Some(auto_cleanup) = get_dict_opt::<Bound<PyAny>>(options, "auto_cleanup_options")? {
+            let mut auto_cleanup_params = AutoCleanupParams::default();
+
+            auto_cleanup_params.interval = auto_cleanup
+                .get_item("interval")
+                .and_then(|i| i.extract::<usize>())
+                .ok()
+                .unwrap_or(auto_cleanup_params.interval);
+
+            auto_cleanup_params.older_than = auto_cleanup
+                .get_item("older_than_seconds")
+                .and_then(|i| i.extract::<i64>())
+                .ok()
+                .map(TimeDelta::seconds)
+                .unwrap_or(auto_cleanup_params.older_than);
+
+            p.auto_cleanup = Some(auto_cleanup_params);
+        } else {
+            p.auto_cleanup = None;
         }
 
         p.commit_handler = get_commit_handler(options)?;
@@ -2121,6 +2334,100 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
                 ),
                 location!(),
             )
+        })
+    }
+}
+
+#[pyclass(name = "PyFullTextQuery")]
+#[derive(Debug, Clone)]
+pub struct PyFullTextQuery {
+    pub(crate) inner: FtsQuery,
+}
+
+#[pymethods]
+impl PyFullTextQuery {
+    #[staticmethod]
+    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR", prefix_length=0))]
+    fn match_query(
+        query: String,
+        column: String,
+        boost: f32,
+        fuzziness: Option<u32>,
+        max_expansions: usize,
+        operator: &str,
+        prefix_length: u32,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            inner: MatchQuery::new(query)
+                .with_column(Some(column))
+                .with_boost(boost)
+                .with_fuzziness(fuzziness)
+                .with_max_expansions(max_expansions)
+                .with_operator(
+                    Operator::try_from(operator)
+                        .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?,
+                )
+                .with_prefix_length(prefix_length)
+                .into(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (query, column, slop))]
+    fn phrase_query(query: String, column: String, slop: u32) -> PyResult<Self> {
+        Ok(Self {
+            inner: PhraseQuery::new(query)
+                .with_column(Some(column))
+                .with_slop(slop)
+                .into(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (positive, negative,negative_boost=None))]
+    fn boost_query(positive: Self, negative: Self, negative_boost: Option<f32>) -> PyResult<Self> {
+        Ok(Self {
+            inner: BoostQuery::new(positive.inner, negative.inner, negative_boost).into(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (query, columns, boosts=None, operator="OR"))]
+    fn multi_match_query(
+        query: String,
+        columns: Vec<String>,
+        boosts: Option<Vec<f32>>,
+        operator: &str,
+    ) -> PyResult<Self> {
+        let q = MultiMatchQuery::try_new(query, columns)
+            .map_err(|e| PyValueError::new_err(format!("Invalid query: {}", e)))?;
+        let q = if let Some(boosts) = boosts {
+            q.try_with_boosts(boosts)
+                .map_err(|e| PyValueError::new_err(format!("Invalid boosts: {}", e)))?
+        } else {
+            q
+        };
+
+        let op = Operator::try_from(operator)
+            .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?;
+
+        Ok(Self {
+            inner: q.with_operator(op).into(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (queries))]
+    fn boolean_query(queries: Vec<(String, Self)>) -> PyResult<Self> {
+        let mut sub_queries = Vec::with_capacity(queries.len());
+        for (occur, q) in queries {
+            let occur = Occur::try_from(occur.as_str())
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            sub_queries.push((occur, q.inner));
+        }
+
+        Ok(Self {
+            inner: BooleanQuery::new(sub_queries).into(),
         })
     }
 }

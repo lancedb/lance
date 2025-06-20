@@ -164,3 +164,9 @@ with 1024 rows per batch is more appropriate.
 In summary, scans could use up to ``(2 * io_buffer_size) + (batch_size * num_compute_threads)`` bytes of memory.
 Keep in mind that ``io_buffer_size`` is a soft limit (e.g. we cannot read less than one page at a time right now)
 and so it is not necessarily a bug if you see memory usage exceed this limit by a small margin.
+
+The above limits refer to limits per-scan.  There is an additional limit on the number of IOPS that is applied
+across the entire process.  This limit is specified by the ``LANCE_PROCESS_IO_THREADS_LIMIT`` environment variable.
+The default is 128 which is more than enough for most workloads.  You can increase this limit if you are working
+with a high-throughput workload.  You can even disable this limit entirely by setting it to zero.  Note that this
+can often lead to issues with excessive retries and timeouts from the object store.

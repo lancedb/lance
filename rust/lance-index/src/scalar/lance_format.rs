@@ -12,7 +12,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
-use lance_core::{cache::FileMetadataCache, Error, Result};
+use lance_core::{cache::LanceCache, Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
@@ -21,6 +21,7 @@ use lance_file::{
     writer::{FileWriter, ManifestProvider},
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
@@ -36,7 +37,7 @@ use super::{IndexReader, IndexStore, IndexWriter};
 pub struct LanceIndexStore {
     object_store: Arc<ObjectStore>,
     index_dir: Path,
-    metadata_cache: FileMetadataCache,
+    metadata_cache: Arc<LanceCache>,
     scheduler: Arc<ScanScheduler>,
 }
 
@@ -51,11 +52,10 @@ impl DeepSizeOf for LanceIndexStore {
 impl LanceIndexStore {
     /// Create a new index store at the given directory
     pub fn new(
-        object_store: ObjectStore,
+        object_store: Arc<ObjectStore>,
         index_dir: Path,
-        metadata_cache: FileMetadataCache,
+        metadata_cache: Arc<LanceCache>,
     ) -> Self {
-        let object_store = Arc::new(object_store);
         let scheduler = ScanScheduler::new(
             object_store.clone(),
             SchedulerConfig::max_bandwidth(&object_store),
@@ -127,7 +127,7 @@ impl IndexReader for FileReader {
         self.read_range(range, &projection).await
     }
 
-    async fn num_batches(&self) -> u32 {
+    async fn num_batches(&self, _batch_size: u64) -> u32 {
         self.num_batches() as u32
     }
 
@@ -160,7 +160,11 @@ impl IndexReader for v2::reader::FileReader {
             )));
         }
         let projection = if let Some(projection) = projection {
-            v2::reader::ReaderProjection::from_column_names(self.schema(), projection)?
+            v2::reader::ReaderProjection::from_column_names(
+                self.metadata().version(),
+                self.schema(),
+                projection,
+            )?
         } else {
             v2::reader::ReaderProjection::from_whole_schema(
                 self.schema(),
@@ -183,8 +187,8 @@ impl IndexReader for v2::reader::FileReader {
 
     // V2 format has removed the row group concept,
     // so here we assume each batch is with 4096 rows.
-    async fn num_batches(&self) -> u32 {
-        unimplemented!("v2 format has no concept of row groups")
+    async fn num_batches(&self, batch_size: u64) -> u32 {
+        Self::num_rows(self).div_ceil(batch_size) as u32
     }
 
     fn num_rows(&self) -> usize {
@@ -224,7 +228,10 @@ impl IndexStore for LanceIndexStore {
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
-        let file_scheduler = self.scheduler.open_file(&path).await?;
+        let file_scheduler = self
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await?;
         match v2::reader::FileReader::try_open(
             file_scheduler,
             None,
@@ -257,26 +264,29 @@ impl IndexStore for LanceIndexStore {
         let path = self.index_dir.child(name);
 
         let other_store = dest_store.as_any().downcast_ref::<Self>();
-        if let Some(dest_lance_store) = other_store {
-            // If both this store and the destination are lance stores we can use object_store's copy
-            // This does blindly assume that both stores are using the same underlying object_store
-            // but there is no easy way to verify this and it happens to always be true at the moment
-            let dest_path = dest_lance_store.index_dir.child(name);
-            self.object_store.copy(&path, &dest_path).await
-        } else {
-            let reader = self.open_index_file(name).await?;
-            let mut writer = dest_store
-                .new_index_file(name, Arc::new(reader.schema().into()))
-                .await?;
-
-            for offset in (0..reader.num_rows()).step_by(4096) {
-                let next_offset = min(offset + 4096, reader.num_rows());
-                let batch = reader.read_range(offset..next_offset, None).await?;
-                writer.write_record_batch(batch).await?;
+        match other_store {
+            Some(dest_store) if dest_store.object_store.scheme() == self.object_store.scheme() => {
+                // If both this store and the destination are lance stores we can use object_store's copy
+                // This does blindly assume that both stores are using the same underlying object_store
+                // but there is no easy way to verify this and it happens to always be true at the moment
+                let dest_path = dest_store.index_dir.child(name);
+                self.object_store.copy(&path, &dest_path).await
             }
-            writer.finish().await?;
+            _ => {
+                let reader = self.open_index_file(name).await?;
+                let mut writer = dest_store
+                    .new_index_file(name, Arc::new(reader.schema().into()))
+                    .await?;
 
-            Ok(())
+                for offset in (0..reader.num_rows()).step_by(4096) {
+                    let next_offset = min(offset + 4096, reader.num_rows());
+                    let batch = reader.read_range(offset..next_offset, None).await?;
+                    writer.write_record_batch(batch).await?;
+                }
+                writer.finish().await?;
+
+                Ok(())
+            }
         }
     }
 
@@ -319,15 +329,19 @@ pub mod tests {
     use arrow_select::take::TakeOptions;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
-    use lance_core::{cache::CapacityMode, utils::mask::RowIdTreeMap};
+    use futures::FutureExt;
+    use lance_core::utils::mask::RowIdTreeMap;
     use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path: &Path = tempdir.path();
         let (object_store, test_path) =
-            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
+            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+        let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
@@ -395,7 +409,7 @@ pub mod tests {
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, DataType::Int32, None).await;
-        let index = BTreeIndex::load(index_store).await.unwrap();
+        let index = BTreeIndex::load(index_store, None).await.unwrap();
 
         let result = index
             .search(
@@ -452,7 +466,7 @@ pub mod tests {
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, DataType::Int32, None).await;
-        let index = BTreeIndex::load(index_store).await.unwrap();
+        let index = BTreeIndex::load(index_store, None).await.unwrap();
 
         let data = gen()
             .col("values", array::step_custom::<Int32Type>(4096 * 100, 1))
@@ -468,7 +482,7 @@ pub mod tests {
             )
             .await
             .unwrap();
-        let updated_index = BTreeIndex::load(updated_index_store).await.unwrap();
+        let updated_index = BTreeIndex::load(updated_index_store, None).await.unwrap();
 
         let result = updated_index
             .search(
@@ -539,7 +553,7 @@ pub mod tests {
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_index(&index_store, data, DataType::Int32, Some(4)).await;
-        let index = BTreeIndex::load(index_store).await.unwrap();
+        let index = BTreeIndex::load(index_store, None).await.unwrap();
 
         // The above should create four pages
         //
@@ -775,7 +789,7 @@ pub mod tests {
             );
 
             train_index(&index_store, training_data, data_type.clone(), None).await;
-            let index = BTreeIndex::load(index_store).await.unwrap();
+            let index = BTreeIndex::load(index_store, None).await.unwrap();
 
             let result = index
                 .search(&SargableQuery::Equals(sample_value), &NoOpMetricsCollector)
@@ -823,7 +837,7 @@ pub mod tests {
         .await
         .unwrap();
 
-        let index = BTreeIndex::load(index_store).await.unwrap();
+        let index = BTreeIndex::load(index_store, None).await.unwrap();
 
         let result = index
             .search(
@@ -893,7 +907,7 @@ pub mod tests {
         let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
         train_bitmap(&index_store, data).await;
 
-        let index = BitmapIndex::load(index_store).await.unwrap();
+        let index = BitmapIndex::load(index_store, None).await.unwrap();
 
         let result = index
             .search(
@@ -933,7 +947,7 @@ pub mod tests {
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store).await.unwrap();
+        let index = BitmapIndex::load(index_store, None).await.unwrap();
 
         let result = index
             .search(
@@ -1019,7 +1033,7 @@ pub mod tests {
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store).await.unwrap();
+        let index = BitmapIndex::load(index_store, None).await.unwrap();
 
         // The above should create four pages
         //
@@ -1205,7 +1219,7 @@ pub mod tests {
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store).await.unwrap();
+        let index = BitmapIndex::load(index_store, None).await.unwrap();
 
         let data = gen()
             .col("values", array::step_custom::<Int32Type>(4096, 1))
@@ -1221,7 +1235,7 @@ pub mod tests {
             )
             .await
             .unwrap();
-        let updated_index = BitmapIndex::load(updated_index_store).await.unwrap();
+        let updated_index = BitmapIndex::load(updated_index_store, None).await.unwrap();
 
         let result = updated_index
             .search(
@@ -1246,7 +1260,7 @@ pub mod tests {
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(50), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store).await.unwrap();
+        let index = BitmapIndex::load(index_store, None).await.unwrap();
 
         let mapping = (0..50)
             .map(|i| {
@@ -1267,7 +1281,7 @@ pub mod tests {
             .remap(&mapping, remapped_store.as_ref())
             .await
             .unwrap();
-        let remapped_index = BitmapIndex::load(remapped_store).await.unwrap();
+        let remapped_index = BitmapIndex::load(remapped_store, None).await.unwrap();
 
         // Remapped to new value
         assert!(remapped_index
@@ -1341,7 +1355,7 @@ pub mod tests {
             let index_store = index_store.clone();
             let data = data.clone();
             async move {
-                let index = LabelListIndex::load(index_store).await.unwrap();
+                let index = LabelListIndex::load(index_store, None).await.unwrap();
                 let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
                 assert!(result.is_exact());
                 let row_ids = result.row_ids();

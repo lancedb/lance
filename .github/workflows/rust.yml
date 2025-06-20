@@ -33,31 +33,43 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
       - name: Check formatting
         run: cargo fmt -- --check
   clippy:
+    permissions:
+      checks: write
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
-      - name: Run clippy
+      - name: Get features
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo clippy --version
-          cargo clippy --locked --features ${ALL_FEATURES} --tests --benches -- -D warnings
+          echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
+      - uses: auguwu/clippy-action@1.4.0
+        with:
+          check-args: --locked --features ${{ env.ALL_FEATURES }} --tests --benches --examples
+          token: ${{secrets.GITHUB_TOKEN}}
+          deny: warnings
   cargo-deny:
     name: Check Rust dependencies (cargo-deny)
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
-    - uses: EmbarkStudios/cargo-deny-action@v2
-      with:
-        log-level: warn
-        command: check
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          log-level: warn
+          command: check
   linux-build:
     runs-on: "ubuntu-24.04"
     timeout-minutes: 60
@@ -143,12 +155,19 @@ jobs:
       CC: clang
       CXX: clang++
     steps:
+      # Remove not needed tools from runner
+      - uses: easimon/maximize-build-space@v10
+        with:
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
+          remove-docker-images: true
       - uses: actions/checkout@v4
       # Remote cargo.lock to force a fresh build
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
       - uses: rui314/setup-mold@v1
-      - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: |
           sudo apt update
@@ -167,7 +186,7 @@ jobs:
           - nightly
     defaults:
       run:
-        working-directory: ./rust/lance
+        working-directory: ./rust
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -194,7 +213,7 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: rust/lance
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2

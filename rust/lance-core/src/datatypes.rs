@@ -36,11 +36,11 @@ pub const STRUCTURAL_ENCODING_FULLZIP: &str = "fullzip";
 lazy_static::lazy_static! {
     pub static ref BLOB_DESC_FIELDS: Fields =
         Fields::from(vec![
-            ArrowField::new("position", DataType::UInt64, false),
-            ArrowField::new("size", DataType::UInt64, false),
+            ArrowField::new("position", DataType::UInt64, true),
+            ArrowField::new("size", DataType::UInt64, true),
         ]);
     pub static ref BLOB_DESC_FIELD: ArrowField =
-    ArrowField::new("description", DataType::Struct(BLOB_DESC_FIELDS.clone()), false);
+    ArrowField::new("description", DataType::Struct(BLOB_DESC_FIELDS.clone()), true);
     pub static ref BLOB_DESC_LANCE_FIELD: Field = Field::try_from(&*BLOB_DESC_FIELD).unwrap();
 }
 

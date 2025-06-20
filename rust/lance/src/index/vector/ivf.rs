@@ -9,16 +9,27 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
+use super::{
+    pq::{build_pq_model, PQIndex},
+    utils::maybe_sample_training_data,
+};
+use crate::dataset::builder::DatasetBuilder;
+use crate::index::vector::utils::{get_vector_dim, get_vector_type};
+use crate::index::DatasetIndexInternalExt;
+use crate::{
+    dataset::Dataset,
+    index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
+    session::Session,
+};
 use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
 use arrow_array::{
-    cast::{as_struct_array, AsArray},
+    cast::AsArray,
     types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type},
-    Array, FixedSizeListArray, PrimitiveArray, RecordBatch, StructArray, UInt32Array,
+    Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
 };
-use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Schema};
-use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
@@ -30,10 +41,7 @@ use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::{
     traits::DatasetTakeRows,
-    utils::{
-        tokio::get_num_compute_intensive_cpus,
-        tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
-    },
+    utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
     Error, Result, ROW_ID_FIELD,
 };
 use lance_file::{
@@ -60,7 +68,7 @@ use lance_index::{
         pq::{PQBuildParams, ProductQuantizer},
         quantizer::{Quantization, QuantizationMetadata, Quantizer},
         sq::ScalarQuantizer,
-        Query, VectorIndex, DIST_COL,
+        Query, VectorIndex,
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
 };
@@ -73,32 +81,15 @@ use lance_io::{
     traits::{Reader, WriteExt, Writer},
 };
 use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
-use lance_linalg::{
-    distance::Normalize,
-    kernels::{normalize_arrow, normalize_fsl},
-};
+use lance_linalg::{distance::Normalize, kernels::normalize_fsl};
 use log::{info, warn};
 use object_store::path::Path;
-use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
 use snafu::location;
 use tracing::instrument;
 use uuid::Uuid;
-
-use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
-use super::{
-    pq::{build_pq_model, PQIndex},
-    utils::maybe_sample_training_data,
-};
-use crate::dataset::builder::DatasetBuilder;
-use crate::index::vector::utils::{get_vector_dim, get_vector_type};
-use crate::{
-    dataset::Dataset,
-    index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
-    session::Session,
-};
 
 pub mod builder;
 pub mod io;
@@ -344,6 +335,8 @@ pub(crate) async fn optimize_vector_indices(
         });
     };
 
+    // never change the index version,
+    // because we won't update the legacy vector index format
     Ok((new_uuid, merged))
 }
 
@@ -374,6 +367,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     let distance_type = existing_indices[0].metric_type();
     let num_partitions = ivf_model.num_partitions();
     let index_type = existing_indices[0].sub_index_type();
+    let fri = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
     let num_indices_to_merge = if options.retrain {
         existing_indices.len()
@@ -403,6 +397,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                     distance_type,
                     shuffler,
                     (),
+                    fri,
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
@@ -420,6 +415,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                     distance_type,
                     shuffler,
                     (),
+                    fri,
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
@@ -440,6 +436,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 distance_type,
                 shuffler,
                 (),
+                fri,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
@@ -484,6 +481,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 None,
                 // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
+                fri,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
@@ -506,6 +504,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 None,
                 // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
+                fri,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
@@ -856,6 +855,11 @@ impl Index for IVFIndex {
         }
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: We should prewarm the IVF index by loading the partitions into memory
+        Ok(())
+    }
+
     fn statistics(&self) -> Result<serde_json::Value> {
         let partitions_statistics = (0..self.ivf.num_partitions())
             .map(|part_id| IvfIndexPartitionStatistics {
@@ -896,44 +900,11 @@ impl VectorIndex for IVFIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
     async fn search(
         &self,
-        query: &Query,
-        pre_filter: Arc<dyn PreFilter>,
-        metrics: &dyn MetricsCollector,
+        _query: &Query,
+        _pre_filter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        let mut query = query.clone();
-        if self.metric_type == MetricType::Cosine {
-            let key = normalize_arrow(&query.key)?;
-            query.key = key;
-        };
-
-        let partition_ids = self.find_partitions(&query)?;
-        assert!(partition_ids.len() <= query.nprobes);
-        let part_ids = partition_ids.values().to_vec();
-        let batches = stream::iter(part_ids)
-            .map(|part_id| {
-                self.search_in_partition(part_id as usize, &query, pre_filter.clone(), metrics)
-            })
-            .buffer_unordered(get_num_compute_intensive_cpus())
-            .try_collect::<Vec<_>>()
-            .await?;
-        let batch = concat_batches(&batches[0].schema(), &batches)?;
-
-        let dist_col = batch.column_by_name(DIST_COL).ok_or_else(|| {
-            Error::io(
-                format!(
-                    "_distance column does not exist in batch: {}",
-                    batch.schema()
-                ),
-                location!(),
-            )
-        })?;
-
-        // TODO: Use a heap sort to get the top-k.
-        let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
-        let selection = sort_to_indices(dist_col, None, Some(limit))?;
-        let struct_arr = StructArray::from(batch);
-        let taken_distances = take(&struct_arr, &selection, None)?;
-        Ok(as_struct_array(&taken_distances).into())
+        unimplemented!("IVFIndex not currently used as sub-index and top-level indices do partition-aware search")
     }
 
     /// find the IVF partitions ids given the query vector.
@@ -948,7 +919,9 @@ impl VectorIndex for IVFIndex {
             self.metric_type
         };
 
-        self.ivf.find_partitions(&query.key, query.nprobes, mt)
+        let max_nprobes = query.maximum_nprobes.unwrap_or(self.ivf.num_partitions());
+
+        self.ivf.find_partitions(&query.key, max_nprobes, mt)
     }
 
     async fn search_in_partition(
@@ -965,16 +938,16 @@ impl VectorIndex for IVFIndex {
         Ok(batch)
     }
 
+    fn total_partitions(&self) -> usize {
+        self.ivf.num_partitions()
+    }
+
     fn is_loadable(&self) -> bool {
         false
     }
 
     fn use_residual(&self) -> bool {
         false
-    }
-
-    fn check_can_remap(&self) -> Result<()> {
-        Ok(())
     }
 
     async fn load(
@@ -1300,7 +1273,7 @@ async fn scan_index_field_stream(
     scanner.try_into_stream().await
 }
 
-async fn load_precomputed_partitions_if_available(
+pub async fn load_precomputed_partitions_if_available(
     ivf_params: &IvfBuildParams,
 ) -> Result<Option<HashMap<u64, u32>>> {
     match &ivf_params.precomputed_partitions_file {
@@ -1750,7 +1723,7 @@ async fn write_ivf_hnsw_file(
 
 async fn do_train_ivf_model<T: ArrowPrimitiveType>(
     centroids: Option<Arc<FixedSizeListArray>>,
-    data: &[T::Native],
+    data: &PrimitiveArray<T>,
     dimension: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
@@ -1759,7 +1732,6 @@ where
     <T as ArrowPrimitiveType>::Native: Dot + L2 + Normalize,
     PrimitiveArray<T>: From<Vec<T::Native>>,
 {
-    let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
     let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
         centroids,
@@ -1768,7 +1740,6 @@ where
         params.num_partitions,
         params.max_iters as u32,
         REDOS,
-        rng,
         metric_type,
         params.sample_rate,
     )?;
@@ -1795,7 +1766,7 @@ async fn train_ivf_model(
         (DataType::Float16, _) => {
             do_train_ivf_model::<Float16Type>(
                 centroids,
-                values.as_primitive::<Float16Type>().values(),
+                values.as_primitive::<Float16Type>(),
                 dim,
                 distance_type,
                 params,
@@ -1805,7 +1776,7 @@ async fn train_ivf_model(
         (DataType::Float32, _) => {
             do_train_ivf_model::<Float32Type>(
                 centroids,
-                values.as_primitive::<Float32Type>().values(),
+                values.as_primitive::<Float32Type>(),
                 dim,
                 distance_type,
                 params,
@@ -1815,7 +1786,7 @@ async fn train_ivf_model(
         (DataType::Float64, _) => {
             do_train_ivf_model::<Float64Type>(
                 centroids,
-                values.as_primitive::<Float64Type>().values(),
+                values.as_primitive::<Float64Type>(),
                 dim,
                 distance_type,
                 params,
@@ -1829,8 +1800,7 @@ async fn train_ivf_model(
                 centroids,
                 data.convert_to_floating_point()?
                     .values()
-                    .as_primitive::<Float32Type>()
-                    .values(),
+                    .as_primitive::<Float32Type>(),
                 dim,
                 distance_type,
                 params,
@@ -1840,7 +1810,7 @@ async fn train_ivf_model(
         (DataType::UInt8, DistanceType::Hamming) => {
             do_train_ivf_model::<UInt8Type>(
                 centroids,
-                values.as_primitive::<UInt8Type>().values(),
+                values.as_primitive::<UInt8Type>(),
                 dim,
                 distance_type,
                 params,
@@ -1863,7 +1833,7 @@ mod tests {
     use super::*;
 
     use std::collections::HashSet;
-    use std::iter::repeat;
+    use std::iter::repeat_n;
     use std::ops::Range;
 
     use arrow_array::types::UInt64Type;
@@ -2077,14 +2047,22 @@ mod tests {
                     k: 5,
                     lower_bound: None,
                     upper_bound: None,
-                    nprobes: 1,
+                    minimum_nprobes: 1,
+                    maximum_nprobes: None,
                     ef: None,
                     refine_factor: None,
                     metric_type: MetricType::L2,
                     use_index: true,
                 };
+                let partitions = index.find_partitions(&query).unwrap();
+                let nearest_partition_id = partitions.value(0) as usize;
                 let search_result = index
-                    .search(&query, prefilter.clone(), &NoOpMetricsCollector)
+                    .search_in_partition(
+                        nearest_partition_id,
+                        &query,
+                        prefilter.clone(),
+                        &NoOpMetricsCollector,
+                    )
                     .await
                     .unwrap();
 
@@ -2275,6 +2253,7 @@ mod tests {
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
             index_details: Some(vector_index_details()),
+            index_version: index.index_type().version(),
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -2489,7 +2468,7 @@ mod tests {
             .nearest("vec", &query, 2_000)
             .unwrap()
             .ef(100_000)
-            .nprobs(2)
+            .minimum_nprobes(2)
             .try_into_batch()
             .await
             .unwrap();
@@ -2534,7 +2513,7 @@ mod tests {
                 .scan()
                 .nearest("vec", &query, 2_000)
                 .unwrap()
-                .nprobs(2)
+                .minimum_nprobes(2)
                 .try_into_batch()
                 .await
                 .unwrap();
@@ -2762,7 +2741,7 @@ mod tests {
             .scan()
             .nearest(
                 "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                &Float32Array::from_iter_values(repeat_n(0.5, DIM)),
                 5,
             )
             .unwrap()
@@ -2830,7 +2809,7 @@ mod tests {
             .scan()
             .nearest(
                 "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                &Float32Array::from_iter_values(repeat_n(0.5, DIM)),
                 5,
             )
             .unwrap()
@@ -2956,7 +2935,7 @@ mod tests {
             .with_row_id()
             .nearest("vector", query, k)
             .unwrap()
-            .nprobs(nlist)
+            .minimum_nprobes(nlist)
             .try_into_stream()
             .await
             .unwrap()
@@ -3038,7 +3017,7 @@ mod tests {
             .with_row_id()
             .nearest("vector", query, k)
             .unwrap()
-            .nprobs(nlist)
+            .minimum_nprobes(nlist)
             .try_into_stream()
             .await
             .unwrap()

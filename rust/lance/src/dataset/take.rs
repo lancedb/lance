@@ -25,24 +25,15 @@ use snafu::location;
 use super::ProjectionRequest;
 use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
 
-pub async fn take(
+/// Convert A list of ROW ids to a list of row addresses.
+pub(super) async fn row_indices_to_row_addresses(
     dataset: &Dataset,
-    offsets: &[u64],
-    projection: ProjectionRequest,
-) -> Result<RecordBatch> {
-    let projection = projection.into_projection_plan(dataset.schema())?;
-
-    if offsets.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::new(
-            projection.output_schema()?,
-        )));
-    }
-
-    // First, convert the dataset offsets into row addresses
+    row_indices: &[u64],
+) -> Result<Vec<u64>> {
     let fragments = dataset.get_fragments();
 
-    let mut perm = permutation::sort(offsets);
-    let sorted_offsets = perm.apply_slice(offsets);
+    let mut perm = permutation::sort(row_indices);
+    let sorted_offsets = perm.apply_slice(row_indices);
 
     let mut frag_iter = fragments.iter();
     let mut cur_frag = frag_iter.next();
@@ -91,6 +82,24 @@ pub async fn take(
 
     // Restore the original order
     perm.apply_inv_slice_in_place(&mut addrs);
+    Ok(addrs)
+}
+
+pub async fn take(
+    dataset: &Dataset,
+    offsets: &[u64],
+    projection: ProjectionRequest,
+) -> Result<RecordBatch> {
+    let projection = projection.into_projection_plan(dataset.schema())?;
+
+    if offsets.is_empty() {
+        return Ok(RecordBatch::new_empty(Arc::new(
+            projection.output_schema()?,
+        )));
+    }
+
+    // First, convert the dataset offsets into row addresses
+    let addrs = row_indices_to_row_addresses(dataset, offsets).await?;
 
     let builder = TakeBuilder::try_new_from_addresses(
         Arc::new(dataset.clone()),

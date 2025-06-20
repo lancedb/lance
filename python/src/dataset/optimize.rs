@@ -545,10 +545,13 @@ impl PyCompaction {
         let dataset = Python::with_gil(|py| dataset_ref.borrow(py).clone());
         let rewrites: Vec<RewriteResult> = rewrites.into_iter().map(|r| r.0).collect();
         let mut new_ds = dataset.ds.as_ref().clone();
+        // TODO: pass compaction option from plan and execute time
+        let options: CompactionOptions = CompactionOptions::default();
         let fut = commit_compaction(
             &mut new_ds,
             rewrites,
             Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
         );
         let metrics = RT
             .block_on(None, fut)?

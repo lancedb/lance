@@ -16,7 +16,7 @@ use lance_arrow::*;
 use snafu::location;
 
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
-use crate::{Error, Result, ROW_ADDR, ROW_ID};
+use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
@@ -60,6 +60,13 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
+    /// The unenforced primary key fields in the schema
+    pub fn unenforced_primary_key(&self) -> Vec<&Field> {
+        self.fields_pre_order()
+            .filter(|f| f.unenforced_primary_key)
+            .collect::<Vec<_>>()
+    }
+
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
         compare_fields(&self.fields, &expected.fields, options)
             && (!options.compare_metadata || self.metadata == expected.metadata)
@@ -598,6 +605,40 @@ impl TryFrom<&ArrowSchema> for Schema {
         };
         schema.set_field_id(None);
 
+        let pk = schema.unenforced_primary_key();
+        for pk_col in pk.into_iter() {
+            if !pk_col.is_leaf() {
+                return Err(Error::Schema {
+                    message: format!("Primary key column must be a leaf: {}", pk_col),
+                    location: location!(),
+                });
+            }
+
+            if let Some(ancestors) = schema.field_ancestry_by_id(pk_col.id) {
+                for ancestor in ancestors {
+                    if ancestor.nullable {
+                        return Err(Error::Schema {
+                            message: format!(
+                                "Primary key column and all its ancestors must not be nullable: {}",
+                                ancestor
+                            ),
+                            location: location!(),
+                        });
+                    }
+
+                    if ancestor.logical_type.is_list() || ancestor.logical_type.is_large_list() {
+                        return Err(Error::Schema {
+                            message: format!(
+                                "Primary key column must not be in a list type: {}",
+                                ancestor
+                            ),
+                            location: location!(),
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(schema)
     }
 }
@@ -828,6 +869,11 @@ impl Projection {
         }
     }
 
+    pub fn full(base: Arc<dyn Projectable>) -> Self {
+        let schema = base.schema().clone();
+        Self::empty(base).union_schema(&schema)
+    }
+
     pub fn with_row_id(mut self) -> Self {
         self.with_row_id = true;
         self
@@ -1012,9 +1058,9 @@ impl Projection {
         self
     }
 
-    /// True if the projection does not select any fields
+    /// True if the projection does not select any fields or take the row id / addr
     pub fn is_empty(&self) -> bool {
-        self.field_ids.is_empty()
+        self.field_ids.is_empty() && !self.with_row_addr && !self.with_row_id
     }
 
     /// Convert the projection to a schema
@@ -1031,6 +1077,19 @@ impl Projection {
     /// Convert the projection to a schema reference
     pub fn into_schema_ref(self) -> Arc<Schema> {
         Arc::new(self.into_schema())
+    }
+
+    /// Convert the projection into an Arrow schema
+    pub fn to_arrow_schema(&self) -> Result<arrow_schema::Schema> {
+        let mut arrow_schema: arrow_schema::Schema = (&self.to_schema()).into();
+        // Should we be adding row_id / row_addr on to_schema?
+        if self.with_row_id {
+            arrow_schema = arrow_schema.try_with_column(ROW_ID_FIELD.clone())?;
+        }
+        if self.with_row_addr {
+            arrow_schema = arrow_schema.try_with_column(ROW_ADDR_FIELD.clone())?;
+        }
+        Ok(arrow_schema)
     }
 }
 
@@ -1309,6 +1368,30 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(actual, expected);
+
+        let schema_with_list_struct = ArrowSchema::new(vec![ArrowField::new(
+            "struct_list",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                ])),
+                true,
+            ))),
+            true,
+        )]);
+        let schema_with_list_struct = Schema::try_from(&schema_with_list_struct).unwrap();
+
+        let with_missing_field = schema_with_list_struct.project_by_ids(&[1, 3], false);
+        let intersection = schema_with_list_struct
+            .intersection_ignore_types(&with_missing_field)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
+        let intersection = with_missing_field
+            .intersection_ignore_types(&schema_with_list_struct)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
     }
 
     #[test]
@@ -1695,6 +1778,144 @@ mod tests {
                 metadata: Default::default(),
             };
             assert_eq!(schema.all_fields_nullable(), expected);
+        }
+    }
+
+    #[test]
+    fn test_schema_unenforced_primary_key() {
+        let cases = vec![
+            ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)]),
+            ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)
+                .with_metadata(
+                    vec![(
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    )]
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
+                )]),
+            ArrowSchema::new(vec![
+                ArrowField::new("a", DataType::Int32, false).with_metadata(
+                    vec![(
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    )]
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
+                ),
+                ArrowField::new(
+                    "b",
+                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                        "f1",
+                        DataType::Utf8,
+                        false,
+                    )
+                    .with_metadata(
+                        vec![(
+                            "lance-schema:unenforced-primary-key".to_owned(),
+                            "true".to_owned(),
+                        )]
+                        .into_iter()
+                        .collect::<HashMap<_, _>>(),
+                    )])),
+                    false,
+                ),
+            ]),
+        ];
+        let expected = [
+            vec![],
+            vec!["a".to_owned()],
+            vec!["a".to_owned(), "f1".to_owned()],
+        ];
+
+        for (idx, case) in cases.into_iter().enumerate() {
+            let schema = Schema::try_from(&case).unwrap();
+            assert_eq!(
+                schema
+                    .unenforced_primary_key()
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .collect::<Vec<_>>(),
+                expected[idx]
+            );
+        }
+    }
+
+    #[test]
+    fn test_schema_unenforced_primary_key_failures() {
+        let cases = vec![
+            ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, true)
+                .with_metadata(
+                    vec![(
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    )]
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
+                )]),
+            ArrowSchema::new(vec![ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "f1",
+                    DataType::Utf8,
+                    false,
+                )])),
+                false,
+            )
+            .with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            )]),
+            ArrowSchema::new(vec![ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "f1",
+                    DataType::Utf8,
+                    false,
+                )
+                .with_metadata(
+                    vec![(
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    )]
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
+                )])),
+                true,
+            )]),
+            ArrowSchema::new(vec![ArrowField::new(
+                "b",
+                DataType::List(Arc::new(
+                    ArrowField::new("f1", DataType::Utf8, false).with_metadata(
+                        vec![(
+                            "lance-schema:unenforced-primary-key".to_owned(),
+                            "true".to_owned(),
+                        )]
+                        .into_iter()
+                        .collect::<HashMap<_, _>>(),
+                    ),
+                )),
+                false,
+            )]),
+        ];
+        let error_message_contains = [
+            "Primary key column and all its ancestors must not be nullable",
+            "Primary key column must be a leaf",
+            "Primary key column and all its ancestors must not be nullable",
+            "Primary key column must not be in a list type",
+        ];
+
+        for (idx, case) in cases.into_iter().enumerate() {
+            let result = Schema::try_from(&case);
+            assert!(result.is_err());
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains(error_message_contains[idx]));
         }
     }
 }

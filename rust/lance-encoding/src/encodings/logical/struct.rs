@@ -7,18 +7,6 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
-use arrow_schema::{DataType, Field, Fields};
-use futures::{
-    future::BoxFuture,
-    stream::{FuturesOrdered, FuturesUnordered},
-    FutureExt, StreamExt, TryStreamExt,
-};
-use itertools::Itertools;
-use lance_arrow::FieldExt;
-use log::trace;
-use snafu::location;
-
 use crate::{
     decoder::{
         DecodeArrayTask, DecodedArray, DecoderReady, FieldScheduler, FilterExpression, LoadedPage,
@@ -30,7 +18,19 @@ use crate::{
     format::pb,
     repdef::RepDefBuilder,
 };
+use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
+use arrow_schema::{DataType, Field, Fields};
+use futures::{
+    future::BoxFuture,
+    stream::{FuturesOrdered, FuturesUnordered},
+    FutureExt, StreamExt, TryStreamExt,
+};
+use itertools::Itertools;
+use lance_arrow::deepcopy::deep_copy_nulls;
+use lance_arrow::FieldExt;
 use lance_core::{Error, Result};
+use log::trace;
+use snafu::location;
 
 use super::{list::StructuralListDecoder, primitive::StructuralPrimitiveFieldDecoder};
 
@@ -946,12 +946,16 @@ impl DecodeArrayTask for SimpleStructDecodeTask {
 /// The struct's validity is added to the rep/def builder
 /// and the builder is cloned to all children.
 pub struct StructStructuralEncoder {
+    keep_original_array: bool,
     children: Vec<Box<dyn FieldEncoder>>,
 }
 
 impl StructStructuralEncoder {
-    pub fn new(children: Vec<Box<dyn FieldEncoder>>) -> Self {
-        Self { children }
+    pub fn new(keep_original_array: bool, children: Vec<Box<dyn FieldEncoder>>) -> Self {
+        Self {
+            keep_original_array,
+            children,
+        }
     }
 }
 
@@ -966,7 +970,11 @@ impl FieldEncoder for StructStructuralEncoder {
     ) -> Result<Vec<EncodeTask>> {
         let struct_array = array.as_struct();
         if let Some(validity) = struct_array.nulls() {
-            repdef.add_validity_bitmap(validity.clone());
+            if self.keep_original_array {
+                repdef.add_validity_bitmap(validity.clone())
+            } else {
+                repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap())
+            }
         } else {
             repdef.add_no_null(struct_array.len());
         }

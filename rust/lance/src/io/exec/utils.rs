@@ -170,6 +170,9 @@ impl DisplayAs for ReplayExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "Replay: capacity={:?}", self.capacity)
             }
+            DisplayFormatType::TreeRender => {
+                write!(f, "Replay\ncapacity={:?}", self.capacity)
+            }
         }
     }
 }
@@ -324,6 +327,12 @@ impl ExecutionPlan for ReplayExec {
         _: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         unimplemented!()
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // We aren't doing any work here, and it would be a little confusing
+        // to have multiple replay queues.
+        vec![false]
     }
 
     fn execute(

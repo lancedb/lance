@@ -3,7 +3,10 @@
 
 //! Utilities for working with datafusion execution plans
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
@@ -105,18 +108,26 @@ impl DisplayAs for OneShotExec {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         let stream = self.stream.lock().unwrap();
+        let exhausted = if stream.is_some() { "" } else { "EXHAUSTED" };
+        let columns = self
+            .schema
+            .field_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let exhausted = if stream.is_some() { "" } else { "EXHAUSTED" };
-                let columns = self
-                    .schema
-                    .field_names()
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>();
                 write!(
                     f,
                     "OneShotStream: {}columns=[{}]",
+                    exhausted,
+                    columns.join(",")
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "OneShotStream\nexhausted={}\ncolumns=[{}]",
                     exhausted,
                     columns.join(",")
                 )
@@ -177,12 +188,31 @@ impl ExecutionPlan for OneShotExec {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+/// Callback for reporting statistics after a scan
+pub type ExecutionStatsCallback = Arc<dyn Fn(&ExecutionSummaryCounts) + Send + Sync>;
+
+#[derive(Default, Clone)]
 pub struct LanceExecutionOptions {
     pub use_spilling: bool,
     pub mem_pool_size: Option<u64>,
     pub batch_size: Option<usize>,
     pub target_partition: Option<usize>,
+    pub execution_stats_callback: Option<ExecutionStatsCallback>,
+}
+
+impl std::fmt::Debug for LanceExecutionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LanceExecutionOptions")
+            .field("use_spilling", &self.use_spilling)
+            .field("mem_pool_size", &self.mem_pool_size)
+            .field("batch_size", &self.batch_size)
+            .field("target_partition", &self.target_partition)
+            .field(
+                "execution_stats_callback",
+                &self.execution_stats_callback.is_some(),
+            )
+            .finish()
+    }
 }
 
 const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
@@ -267,54 +297,57 @@ fn get_task_context(
     state.task_ctx()
 }
 
-#[derive(Default)]
-struct SummaryCounts {
-    iops: usize,
-    requests: usize,
-    bytes_read: usize,
-    indices_loaded: usize,
-    parts_loaded: usize,
-    index_comparisons: usize,
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionSummaryCounts {
+    /// The number of I/O operations performed
+    pub iops: usize,
+    /// The number of requests made to the storage layer (may be larger or smaller than iops
+    /// depending on coalescing configuration)
+    pub requests: usize,
+    /// The number of bytes read during the execution of the plan
+    pub bytes_read: usize,
+    /// The number of top-level indices loaded
+    pub indices_loaded: usize,
+    /// The number of index partitions loaded
+    pub parts_loaded: usize,
+    /// The number of index comparisons performed (the exact meaning depends on the index type)
+    pub index_comparisons: usize,
+    /// Additional metrics for more detailed statistics.  These are subject to change in the future
+    /// and should only be used for debugging purposes.
+    pub all_counts: HashMap<String, usize>,
 }
 
-fn visit_node(node: &dyn ExecutionPlan, counts: &mut SummaryCounts) {
+fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
-        counts.iops += metrics
-            .find_count(IOPS_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.requests += metrics
-            .find_count(REQUESTS_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.bytes_read += metrics
-            .find_count(BYTES_READ_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.indices_loaded += metrics
-            .find_count(INDICES_LOADED_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.parts_loaded += metrics
-            .find_count(PARTS_LOADED_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.index_comparisons += metrics
-            .find_count(INDEX_COMPARISONS_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
+        for (metric_name, count) in metrics.iter_counts() {
+            match metric_name.as_ref() {
+                IOPS_METRIC => counts.iops += count.value(),
+                REQUESTS_METRIC => counts.requests += count.value(),
+                BYTES_READ_METRIC => counts.bytes_read += count.value(),
+                INDICES_LOADED_METRIC => counts.indices_loaded += count.value(),
+                PARTS_LOADED_METRIC => counts.parts_loaded += count.value(),
+                INDEX_COMPARISONS_METRIC => counts.index_comparisons += count.value(),
+                _ => {
+                    let existing = counts
+                        .all_counts
+                        .entry(metric_name.as_ref().to_string())
+                        .or_insert(0);
+                    *existing += count.value();
+                }
+            }
+        }
     }
     for child in node.children() {
         visit_node(child.as_ref(), counts);
     }
 }
 
-fn report_plan_summary_metrics(plan: &dyn ExecutionPlan) {
+fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutionOptions) {
     let output_rows = plan
         .metrics()
         .map(|m| m.output_rows().unwrap_or(0))
         .unwrap_or(0);
-    let mut counts = SummaryCounts::default();
+    let mut counts = ExecutionSummaryCounts::default();
     visit_node(plan, &mut counts);
     tracing::info!(
         target: TRACE_EXECUTION,
@@ -327,6 +360,9 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan) {
         parts_loaded = counts.parts_loaded,
         index_comparisons = counts.index_comparisons,
     );
+    if let Some(callback) = options.execution_stats_callback.as_ref() {
+        callback(&counts);
+    }
 }
 
 /// Executes a plan using default session & runtime configuration
@@ -350,7 +386,7 @@ pub fn execute_plan(
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
-        report_plan_summary_metrics(plan.as_ref());
+        report_plan_summary_metrics(plan.as_ref(), &options);
     });
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }

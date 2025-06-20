@@ -13,7 +13,7 @@ rust-version.workspace = true
 
 [dependencies]
 
-object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
+object_store = { workspace = true }
 lance-arrow.workspace = true
 lance-core.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
@@ -26,8 +26,8 @@ arrow-schema.workspace = true
 arrow-select.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
-aws-config.workspace = true
-aws-credential-types.workspace = true
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
@@ -37,6 +37,7 @@ lazy_static.workspace = true
 log.workspace = true
 pin-project.workspace = true
 prost.workspace = true
+serde.workspace = true
 shellexpand.workspace = true
 snafu.workspace = true
 tokio.workspace = true
@@ -48,7 +49,6 @@ async-priority-channel = "0.2.0"
 
 [dev-dependencies]
 criterion.workspace = true
-parquet.workspace = true
 tempfile.workspace = true
 test-log.workspace = true
 mockall.workspace = true
@@ -62,7 +62,11 @@ name = "scheduler"
 harness = false
 
 [features]
+default = ["aws", "azure", "gcp"]
 gcs-test = []
+gcp = ["object_store/gcp"]
+aws = ["object_store/aws", "aws-config", "aws-credential-types"]
+azure = ["object_store/azure"]
 
 [lints]
 workspace = true

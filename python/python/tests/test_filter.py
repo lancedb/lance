@@ -240,6 +240,24 @@ def create_table_for_duckdb(nvec=10000, ndim=768):
     return tbl
 
 
+def test_datatypes(tmp_path):
+    table = pa.table(
+        {
+            "binary": pa.array([b"abc", None], type=pa.binary()),
+            "largebin": pa.array([b"abc", None], type=pa.large_binary()),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path)
+
+    for filter, expected_matches in [
+        ("binary = X'616263'", 1),
+        ("binary is NULL", 1),
+        ("largebin = X'616263'", 1),
+        ("largebin is NULL", 1),
+    ]:
+        assert dataset.count_rows(filter=filter) == expected_matches
+
+
 def test_duckdb(tmp_path):
     duckdb = pytest.importorskip("duckdb")
     tbl = create_table_for_duckdb()

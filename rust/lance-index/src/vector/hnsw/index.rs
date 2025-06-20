@@ -135,6 +135,11 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
         }))
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: HNSW can (and should) support pre-warming
+        Ok(())
+    }
+
     /// Get the type of the index
     fn index_type(&self) -> IndexType {
         IndexType::Vector
@@ -185,6 +190,10 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         unimplemented!("only for IVF")
     }
 
+    fn total_partitions(&self) -> usize {
+        1
+    }
+
     async fn search_in_partition(
         &self,
         _: usize,
@@ -201,10 +210,6 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
 
     fn use_residual(&self) -> bool {
         self.options.use_residual
-    }
-
-    fn check_can_remap(&self) -> Result<()> {
-        Ok(())
     }
 
     async fn load(

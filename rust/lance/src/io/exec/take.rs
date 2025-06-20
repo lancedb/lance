@@ -165,8 +165,13 @@ impl TakeStream {
         let row_addrs_arr = self.get_row_addrs(&batch).await?;
         let row_addrs = row_addrs_arr.as_primitive::<UInt64Type>();
 
+        debug_assert!(
+            row_addrs.null_count() == 0,
+            "{} nulls in row addresses",
+            row_addrs.null_count()
+        );
         // Check if the row addresses are already sorted to avoid unnecessary reorders
-        let is_sorted = row_addrs.values().windows(2).all(|w| w[0] <= w[1]);
+        let is_sorted = row_addrs.values().is_sorted();
 
         let sorted_addrs: Arc<dyn Array>;
         let (sorted_addrs, permutation) = if is_sorted {
@@ -291,7 +296,6 @@ pub struct TakeExec {
     schema_to_take: Arc<Schema>,
     // The schema of the output
     output_schema: SchemaRef,
-    scan_scheduler: Arc<ScanScheduler>,
     input: Arc<dyn ExecutionPlan>,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -305,23 +309,26 @@ impl DisplayAs for TakeExec {
             .iter()
             .map(|f| f.name.clone())
             .collect::<HashSet<_>>();
+        let columns = self
+            .output_schema
+            .fields
+            .iter()
+            .map(|f| {
+                let name = f.name();
+                if extra_fields.contains(name) {
+                    format!("({})", name)
+                } else {
+                    name.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let columns = self
-                    .output_schema
-                    .fields
-                    .iter()
-                    .map(|f| {
-                        let name = f.name();
-                        if extra_fields.contains(name) {
-                            format!("({})", name)
-                        } else {
-                            name.to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 write!(f, "Take: columns={:?}", columns)
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "Take\ncolumns={:?}", columns)
             }
         }
     }
@@ -343,7 +350,7 @@ impl TakeExec {
         let original_projection = projection.clone();
         let projection =
             projection.subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
-        if projection.is_empty() {
+        if !projection.has_data_fields() {
             return Ok(None);
         }
 
@@ -375,10 +382,6 @@ impl TakeExec {
             .clone()
             .with_eq_properties(EquivalenceProperties::new(output_arrow.clone()));
 
-        let obj_store = dataset.object_store.clone();
-        let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
-        let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
-
         Ok(Some(Self {
             dataset,
             output_projection: original_projection,
@@ -387,7 +390,6 @@ impl TakeExec {
             output_schema: output_arrow,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-            scan_scheduler,
         }))
     }
 
@@ -445,8 +447,6 @@ impl TakeExec {
     }
 
     /// Get the dataset.
-    ///
-    /// WARNING: Internal API with no stability guarantees.
     pub fn dataset(&self) -> &Arc<Dataset> {
         &self.dataset
     }
@@ -467,6 +467,14 @@ impl ExecutionPlan for TakeExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // This is an I/O bound operation and wouldn't really benefit from partitioning
+        //
+        // Plus, if we did that, we would be creating multiple schedulers which could use
+        // a lot of RAM.
+        vec![false]
     }
 
     /// This preserves the output schema.
@@ -498,19 +506,33 @@ impl ExecutionPlan for TakeExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-        let take_stream = Arc::new(TakeStream::new(
-            self.dataset.clone(),
-            self.schema_to_take.clone(),
-            self.output_schema.clone(),
-            self.scan_scheduler.clone(),
-            &self.metrics,
-            partition,
-        ));
-        let output_stream = take_stream.apply(input_stream);
+        let dataset = self.dataset.clone();
+        let schema_to_take = self.schema_to_take.clone();
+        let output_schema = self.output_schema.clone();
+        let metrics = self.metrics.clone();
+
+        // ScanScheduler::new launches the I/O scheduler in the background.
+        // We aren't allowed to do work in `execute` and so we defer creation of the
+        // TakeStream until the stream is polled.
+        let lazy_take_stream = futures::stream::once(async move {
+            let obj_store = dataset.object_store.clone();
+            let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
+            let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
+
+            let take_stream = Arc::new(TakeStream::new(
+                dataset,
+                schema_to_take,
+                output_schema,
+                scan_scheduler,
+                &metrics,
+                partition,
+            ));
+            take_stream.apply(input_stream)
+        });
         let output_schema = self.output_schema.clone();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
-            output_stream,
+            lazy_take_stream.flatten(),
         )))
     }
 
@@ -541,13 +563,15 @@ mod tests {
     use datafusion::execution::TaskContext;
     use lance_arrow::SchemaExt;
     use lance_core::{datatypes::OnMissing, ROW_ID};
-    use lance_datafusion::{exec::OneShotExec, utils::MetricsExt};
+    use lance_datafusion::{datagen::DatafusionDatagenExt, exec::OneShotExec, utils::MetricsExt};
+    use lance_datagen::{BatchCount, RowCount};
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
 
     use crate::{
         dataset::WriteParams,
         io::exec::{LanceScanConfig, LanceScanExec},
+        utils::test::NoContextTestFixture,
     };
 
     struct TestFixture {
@@ -773,7 +797,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_struct() {
         // When taking fields into an existing struct, the field order should be maintained
-        // according the the schema of the struct.
+        // according to the schema of the struct.
         let TestFixture {
             dataset,
             _tmp_dir_guard,
@@ -891,5 +915,31 @@ mod tests {
         let edited = outer_take.with_new_children(vec![input])?;
         assert_eq!(edited.schema().field_names(), vec!["i", ROW_ID, "f", "s"],);
         Ok(())
+    }
+
+    #[test]
+    fn no_context_take() {
+        // These tests ensure we can create nodes and call execute without a tokio Runtime
+        // being active.  This is a requirement for proper implementation of a Datafusion foreign
+        // table provider.
+        let fixture = NoContextTestFixture::new();
+        let arc_dasaset = Arc::new(fixture.dataset);
+
+        let input = lance_datagen::gen()
+            .col(ROW_ID, lance_datagen::array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(50), BatchCount::from(2));
+
+        let take = TakeExec::try_new(
+            arc_dasaset.clone(),
+            input,
+            arc_dasaset
+                .empty_projection()
+                .union_column("text", OnMissing::Error)
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+
+        take.execute(0, Arc::new(TaskContext::default())).unwrap();
     }
 }

@@ -12,7 +12,8 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::StreamExt;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::{ROW_ADDR_FIELD, ROW_ID};
 use lance_table::rowids::RowIdIndex;
 
@@ -26,6 +27,7 @@ use super::utils::InstrumentedRecordBatchStreamAdapter;
 ///
 /// It's generally more efficient to scan the `_rowaddr` column, but this can be
 /// useful when reading secondary indices, which only have the `_rowid` column.
+#[derive(Clone)]
 pub struct AddRowAddrExec {
     input: Arc<dyn ExecutionPlan>,
     dataset: Arc<Dataset>,
@@ -158,53 +160,8 @@ impl AddRowAddrExec {
             Ok(row_ids.clone())
         }
     }
-}
 
-impl DisplayAs for AddRowAddrExec {
-    fn fmt_as(
-        &self,
-        _format_type: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        write!(f, "AddRowAddrExec")
-    }
-}
-
-impl ExecutionPlan for AddRowAddrExec {
-    fn name(&self) -> &str {
-        "AddRowAddrExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn schema(&self) -> Arc<Schema> {
-        self.output_schema.clone()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            Err(DataFusionError::Internal(
-                "AddRowAddrExec: invalid number of children".into(),
-            ))
-        } else {
-            Ok(Arc::new(Self::try_new(
-                children.into_iter().next().unwrap(),
-                self.dataset.clone(),
-                self.rowaddr_pos,
-            )?))
-        }
-    }
-
-    fn execute(
+    fn do_execute(
         &self,
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
@@ -251,6 +208,68 @@ impl ExecutionPlan for AddRowAddrExec {
             &self.metrics,
         );
         Ok(Box::pin(stream))
+    }
+}
+
+impl DisplayAs for AddRowAddrExec {
+    fn fmt_as(
+        &self,
+        _format_type: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "AddRowAddrExec")
+    }
+}
+
+impl ExecutionPlan for AddRowAddrExec {
+    fn name(&self) -> &str {
+        "AddRowAddrExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> Arc<Schema> {
+        self.output_schema.clone()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // We aren't doing much work here, best to avoid the thread overhead
+        vec![false]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            Err(DataFusionError::Internal(
+                "AddRowAddrExec: invalid number of children".into(),
+            ))
+        } else {
+            Ok(Arc::new(Self::try_new(
+                children.into_iter().next().unwrap(),
+                self.dataset.clone(),
+                self.rowaddr_pos,
+            )?))
+        }
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let schema = self.schema();
+        let this = self.clone();
+        let stream = futures::stream::once(async move { this.do_execute(partition, context) });
+        let stream = stream.try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
     fn statistics(&self) -> Result<datafusion::physical_plan::Statistics> {

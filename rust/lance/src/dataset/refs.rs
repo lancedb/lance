@@ -3,7 +3,6 @@
 
 use std::ops::Range;
 
-use futures::future;
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
@@ -13,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::{Error, Result};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// Lance Ref
@@ -54,14 +54,9 @@ impl Tags {
         }
     }
 
-    /// Get all tags.
-    pub async fn list(&self) -> Result<HashMap<String, TagContents>> {
-        let mut tags = HashMap::<String, TagContents>::new();
-
-        let tag_files = self
-            .object_store()
-            .read_dir(base_tags_path(&self.base))
-            .await?;
+    async fn fetch_tags(&self) -> Result<Vec<(String, TagContents)>> {
+        let base_path = base_tags_path(&self.base);
+        let tag_files = self.object_store().read_dir(base_path).await?;
 
         let tag_names: Vec<String> = tag_files
             .iter()
@@ -70,21 +65,41 @@ impl Tags {
             .collect_vec();
 
         futures::stream::iter(tag_names)
-            .map(|tag_name| {
-                let tag_file = tag_path(&self.base, &tag_name);
-                async move {
-                    let contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-                    Ok((tag_name, contents))
-                }
+            .map(|tag_name| async move {
+                let contents =
+                    TagContents::from_path(&tag_path(&self.base, &tag_name), self.object_store())
+                        .await?;
+                Ok((tag_name, contents))
             })
             .buffer_unordered(10)
-            .try_for_each(|result| {
-                let (tag_name, contents) = result;
-                tags.insert(tag_name, contents);
-                future::ready(Ok::<(), Error>(()))
-            })
-            .await?;
+            .try_collect()
+            .await
+    }
 
+    pub(crate) fn sort_tags(tags: &mut [(String, TagContents)], order: Option<std::cmp::Ordering>) {
+        tags.sort_by(|a, b| {
+            let desired_ordering = order.unwrap_or(Ordering::Greater);
+            let version_ordering = a.1.version.cmp(&b.1.version);
+            let version_result = match desired_ordering {
+                Ordering::Less => version_ordering,
+                _ => version_ordering.reverse(),
+            };
+            version_result.then_with(|| a.0.cmp(&b.0))
+        });
+    }
+
+    pub async fn list(&self) -> Result<HashMap<String, TagContents>> {
+        self.fetch_tags()
+            .await
+            .map(|tags| tags.into_iter().collect())
+    }
+
+    pub async fn list_tags_ordered(
+        &self,
+        order: Option<std::cmp::Ordering>,
+    ) -> Result<Vec<(String, TagContents)>> {
+        let mut tags = self.fetch_tags().await?;
+        Self::sort_tags(&mut tags, order);
         Ok(tags)
     }
 
