@@ -480,12 +480,12 @@ pub(crate) async fn open_vector_index(
                 }
                 let ivf = IvfModel::try_from(ivf_pb.to_owned())?;
                 last_stage = Some(Arc::new(IVFIndex::try_new(
-                    dataset.session.clone(),
                     uuid,
                     ivf,
                     reader.clone(),
                     last_stage.unwrap(),
                     metric_type,
+                    dataset.index_cache.with_key_prefix(uuid),
                 )?));
             }
             Some(Stage::Pq(pq_proto)) => {
@@ -557,12 +557,12 @@ pub(crate) async fn open_vector_index_v2(
             let ivf = IvfModel::try_from(pb_ivf)?;
 
             Arc::new(IVFIndex::try_new(
-                dataset.session.clone(),
                 uuid,
                 ivf,
                 reader.object_reader.clone(),
                 Arc::new(hnsw),
                 distance_type,
+                dataset.index_cache.with_key_prefix(uuid),
             )?)
         }
 
@@ -588,12 +588,12 @@ pub(crate) async fn open_vector_index_v2(
             let ivf = IvfModel::try_from(pb_ivf)?;
 
             Arc::new(IVFIndex::try_new(
-                dataset.session.clone(),
                 uuid,
                 ivf,
                 reader.object_reader.clone(),
                 Arc::new(hnsw),
                 distance_type,
+                dataset.index_cache.with_key_prefix(uuid),
             )?)
         }
 

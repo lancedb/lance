@@ -710,7 +710,7 @@ impl LazyIndexReader {
 ///
 /// Note: this is very similar to the IVF index except we store the IVF part in a btree
 /// for faster lookup
-#[derive(Clone, Debug, DeepSizeOf)]
+#[derive(Clone, Debug)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
     index_cache: LanceCache,
@@ -718,6 +718,14 @@ pub struct BTreeIndex {
     sub_index: Arc<dyn BTreeSubIndex>,
     batch_size: u64,
     fri: Option<Arc<FragReuseIndex>>,
+}
+
+impl DeepSizeOf for BTreeIndex {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        // We don't include the index cache, or anything stored in it. For example:
+        // sub_index and fri.
+        self.page_lookup.deep_size_of_children(context) + self.store.deep_size_of_children(context)
+    }
 }
 
 impl BTreeIndex {

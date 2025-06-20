@@ -206,16 +206,19 @@ impl FragReuseIndexDetails {
 /// Each version contains the mapping for one round of compaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct FragReuseIndex {
+    pub uuid: String,
     pub row_id_maps: Vec<HashMap<u64, Option<u64>>>,
     pub details: FragReuseIndexDetails,
 }
 
 impl FragReuseIndex {
     pub fn new(
+        uuid: String,
         row_id_maps: Vec<HashMap<u64, Option<u64>>>,
         details: FragReuseIndexDetails,
     ) -> Self {
         Self {
+            uuid,
             row_id_maps,
             details,
         }

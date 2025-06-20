@@ -133,6 +133,8 @@ pub struct Dataset {
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
 
+    // TODO: we need to get the fragment reuse index a lot.
+
     // These are references to session caches, but with the dataset URI as a prefix.
     pub(crate) index_cache: Arc<LanceCache>,
     pub(crate) metadata_cache: Arc<LanceCache>,

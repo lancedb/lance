@@ -73,6 +73,7 @@ pub async fn load_frag_reuse_index_details(
 
 /// open fragment reuse index based on its metadata details
 pub(crate) async fn open_frag_reuse_index(
+    uuid: String,
     details: &FragReuseIndexDetails,
 ) -> lance_core::Result<FragReuseIndex> {
     let mut row_id_maps: Vec<HashMap<u64, Option<u64>>> =
@@ -92,7 +93,7 @@ pub(crate) async fn open_frag_reuse_index(
         row_id_maps.push(row_id_map);
     }
 
-    Ok(FragReuseIndex::new(row_id_maps, details.clone()))
+    Ok(FragReuseIndex::new(uuid, row_id_maps, details.clone()))
 }
 
 pub(crate) async fn build_new_frag_reuse_index(

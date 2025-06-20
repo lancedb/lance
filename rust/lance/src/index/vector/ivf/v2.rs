@@ -99,7 +99,11 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
 impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.uuid.deep_size_of_children(context) + self.storage.deep_size_of_children(context)
+        self.uri.deep_size_of_children(context)
+            + self.ivf.deep_size_of_children(context)
+            + self.sub_index_metadata.deep_size_of_children(context)
+            + self.uuid.deep_size_of_children(context)
+            + self.storage.deep_size_of_children(context)
         // Skipping session since it is a weak ref
     }
 }

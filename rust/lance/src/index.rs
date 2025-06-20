@@ -491,9 +491,9 @@ impl DatasetIndexExt for Dataset {
             let uuid = fri_meta.uuid.to_string();
             let fri = self
                 .index_cache
-                .get_or_insert(uuid, |_| async move {
+                .get_or_insert(uuid.clone(), |_| async move {
                     let index_details = load_frag_reuse_index_details(self, fri_meta).await?;
-                    open_frag_reuse_index(index_details.as_ref()).await
+                    open_frag_reuse_index(uuid, index_details.as_ref()).await
                 })
                 .await?;
             let mut indices = indices.as_ref().clone();
@@ -1148,7 +1148,7 @@ impl DatasetIndexInternalExt for Dataset {
                         location: location!(),
                     })?;
                     let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
-                    let index = open_frag_reuse_index(index_details.as_ref()).await?;
+                    let index = open_frag_reuse_index(uuid.clone(), index_details.as_ref()).await?;
 
                     info!(target: TRACE_IO_EVENTS, index_uuid=uuid, type=IO_TYPE_OPEN_FRAG_REUSE);
                     metrics.record_index_load();
@@ -1291,11 +1291,11 @@ fn is_vector_field(data_type: DataType) -> bool {
 
 /// Index cache key should be the ID of the index plus the ID of the FRI.
 /// If FRI has changed, the index would have changed further
-async fn index_cache_key<'a>(dataset: &Dataset, index_id: &'a str) -> Result<Cow<'a, str>> {
-    if let Some(fri) = dataset.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
-        Ok(Cow::Owned(format!("{}-{}", index_id, fri.uuid)))
+fn index_cache_key<'a>(uuid: &'a str, fri_uuid: Option<&str>) -> Cow<'a, str> {
+    if let Some(fri_uuid) = fri_uuid {
+        Cow::Owned(format!("{}-{}", uuid, fri_uuid))
     } else {
-        Ok(Cow::Borrowed(index_id))
+        Cow::Borrowed(uuid)
     }
 }
 
