@@ -1782,12 +1782,16 @@ impl Dataset {
     }
 
     #[pyo3(signature = (keys))]
-    fn get_configs(&mut self, keys: Vec<String>) -> PyResult<PyObject> {
-        let key_refs: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
+    fn get_configs(&mut self, keys: Option<Vec<String>>) -> PyResult<PyObject> {
+        let key_refs: Option<Vec<&str>> = keys
+            .as_ref()
+            .map(|ks| ks.iter().map(|k| k.as_str()).collect());
+        let key_refs = key_refs.as_ref().map(|v| v.as_slice());
+
         let mut new_self = self.ds.as_ref().clone();
 
         let configs = RT
-            .block_on(None, new_self.get_configs(&key_refs))?
+            .block_on(None, new_self.get_configs(key_refs))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         self.ds = Arc::new(new_self);

@@ -1149,6 +1149,7 @@ def test_get_configs(tmp_path):
     ds.update_config({"test_key": "test_value"})
     config_value = ds.get_configs(["test_key"])
     assert config_value["test_key"] == "test_value"
+    assert 1 == len(ds.get_configs())
 
 
 def test_auto_cleanup_invalid(tmp_path):

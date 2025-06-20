@@ -1766,12 +1766,19 @@ impl Dataset {
     }
 
     /// Get config items based on the given keys.
-    pub async fn get_configs(&mut self, keys: &[&str]) -> Result<HashMap<String, String>> {
-        let mut result = HashMap::new();
-        for &key in keys {
-            if let Some(value) = self.manifest.config.get(key) {
-                result.insert(key.to_string(), value.clone());
+    pub async fn get_configs(&mut self, keys: Option<&[&str]>) -> Result<HashMap<String, String>> {
+        let mut result;
+
+        match keys {
+            Some(keys) => {
+                result = HashMap::new();
+                for &key in keys {
+                    if let Some(value) = self.manifest.config.get(key) {
+                        result.insert(key.to_string(), value.clone());
+                    }
+                }
             }
+            None => result = self.manifest.config.clone(),
         }
 
         Ok(result)
@@ -3975,6 +3982,7 @@ mod tests {
 
         dataset.update_config(desired_config.clone()).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
+        assert_eq!(dataset.get_configs(None).await.unwrap(), desired_config);
         assert_eq!(
             dataset
                 .config()
@@ -3983,7 +3991,7 @@ mod tests {
             desired_config
         );
 
-        let configs = dataset.get_configs(&["other-key"]).await.unwrap();
+        let configs = dataset.get_configs(Some(&["other-key"])).await.unwrap();
         let mut expected = HashMap::new();
         expected.insert("other-key".to_string(), "other-value".to_string());
         assert_eq!(configs, expected);
@@ -3991,6 +3999,7 @@ mod tests {
         desired_config.remove("other-key");
         dataset.delete_config_keys(&["other-key"]).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
+        assert_eq!(dataset.get_configs(None).await.unwrap(), desired_config);
         assert_eq!(
             dataset
                 .config()
@@ -4000,7 +4009,10 @@ mod tests {
         );
 
         expected = HashMap::new();
-        assert_eq!(dataset.get_configs(&["other-key"]).await.unwrap(), expected);
+        assert_eq!(
+            dataset.get_configs(Some(&["other-key"])).await.unwrap(),
+            expected
+        );
     }
 
     #[rstest]
