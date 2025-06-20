@@ -590,7 +590,7 @@ pub fn index_matches_criteria(
             } else {
                 false
             };
-            
+
             if is_fts_requested || is_fts_index {
                 // FTS index - allow empty bitmap
             } else {

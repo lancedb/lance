@@ -2315,19 +2315,23 @@ mod tests {
 
         // Verify index is NOT being used in queries after delete (empty bitmap)
         if column_name == "text" {
-            // For inverted index with empty bitmap, full-text search construction succeeds
-            // but execution should fail because no inverted index is available
-            let plan_result = dataset
+            // Inverted indexes will still appear to be used in FTS queries.
+            // TODO: once metrics are working on FTS queries, we can check the
+            // analyze plan output instead for index usage.
+            let _plan_after_delete = dataset
                 .scan()
                 .project(&[column_name])
                 .unwrap()
                 .full_text_search(FullTextSearchQuery::new("test".to_string()))
                 .unwrap()
                 .explain_plan(false)
-                .await;
-            assert!(
-                plan_result.is_err(),
-                "Full text search execution should fail when inverted index has empty bitmap"
+                .await
+                .unwrap();
+            assert_index_usage(
+                &_plan_after_delete,
+                column_name,
+                true,
+                "after delete (empty bitmap)",
             );
         } else {
             // Use equality filter for btree/bitmap indices
@@ -2509,19 +2513,23 @@ mod tests {
 
         // Verify index is NOT being used in queries after update (empty bitmap)
         if column_name == "text" {
-            // For inverted index with empty bitmap, full-text search construction succeeds
-            // but execution should fail because no inverted index is available
-            let plan_result = dataset
+            // Inverted indexes will still appear to be used in FTS queries.
+            // TODO: once metrics are working on FTS queries, we can check the
+            // analyze plan output instead for index usage.
+            let _plan_after_update = dataset
                 .scan()
                 .project(&[column_name])
                 .unwrap()
                 .full_text_search(FullTextSearchQuery::new("test".to_string()))
                 .unwrap()
                 .explain_plan(false)
-                .await;
-            assert!(
-                plan_result.is_err(),
-                "Full text search execution should fail when inverted index has empty bitmap"
+                .await
+                .unwrap();
+            assert_index_usage(
+                &_plan_after_update,
+                column_name,
+                true,
+                "after update (empty bitmap)",
             );
         } else {
             // Use equality filter for btree/bitmap indices

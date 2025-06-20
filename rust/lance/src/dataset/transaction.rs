@@ -1484,6 +1484,14 @@ impl Transaction {
         }
     }
 
+    fn is_vector_index(index: &Index) -> bool {
+        if let Some(details) = &index.index_details {
+            details.type_url.ends_with("VectorIndexDetails")
+        } else {
+            false
+        }
+    }
+
     fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, fragments: &[Fragment]) {
         let field_ids = schema
             .fields_pre_order()
@@ -1548,13 +1556,16 @@ impl Transaction {
                     });
 
                 if non_empty_indices.is_empty() {
-                    // All indices are empty - keep only the first (oldest) one
+                    // All indices are empty - for scalar indices, keep only the first (oldest) one
+                    // For vector indices, remove all of them
                     let mut sorted_indices = empty_indices;
                     sorted_indices.sort_by_key(|index: &&Index| index.dataset_version); // Sort by ascending dataset_version
 
-                    // Keep only the first (oldest)
+                    // Keep only the first (oldest) if it's not a vector index
                     if let Some(oldest) = sorted_indices.first() {
-                        uuids_to_keep.insert(oldest.uuid);
+                        if !Self::is_vector_index(oldest) {
+                            uuids_to_keep.insert(oldest.uuid);
+                        }
                     }
                 } else {
                     // At least one index has non-empty bitmap - keep all non-empty indices
@@ -1563,9 +1574,18 @@ impl Transaction {
                     }
                 }
             } else {
-                // Single index - always keep it
+                // Single index - keep it unless it's an empty vector index
                 if let Some(index) = same_name_indices.first() {
-                    uuids_to_keep.insert(index.uuid);
+                    let is_empty = index
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_none_or(|bitmap| bitmap.is_empty());
+                    let is_vector = Self::is_vector_index(index);
+
+                    // Keep the index unless it's an empty vector index
+                    if !is_empty || !is_vector {
+                        uuids_to_keep.insert(index.uuid);
+                    }
                 }
             }
         }

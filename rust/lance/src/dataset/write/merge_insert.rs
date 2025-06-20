@@ -2623,16 +2623,19 @@ mod tests {
                 .unwrap();
 
             // The other_value_index behavior depends on whether other_value was included in the merge operation.
-            // For full schema merges, fragments are removed. For partial merges that don't include 
+            // For full schema merges, fragments are removed. For partial merges that don't include
             // other_value, the index is unchanged.
             let expected_fragments = match id_frags.len() {
-                4 => 4u64,  // Initial state - all fragments present
-                3 => 3u64,  // After first full merge - fragment 3 removed from all indices
-                2 => 4u64,  // After second partial merge - other_value_index unchanged (only id and value were merged)
-                0 => 4u64,  // After final partial merge - other_value_index still unchanged (only id and value were merged)
+                4 => 4u64,                  // Initial state - all fragments present
+                3 => 3u64, // After first full merge - fragment 3 removed from all indices
+                2 => 4u64, // After second partial merge - other_value_index unchanged (only id and value were merged)
+                0 => 4u64, // After final partial merge - other_value_index still unchanged (only id and value were merged)
                 _ => id_frags.len() as u64, // Default fallback
             };
-            assert_eq!(other_value_index.fragment_bitmap.as_ref().unwrap().len(), expected_fragments);
+            assert_eq!(
+                other_value_index.fragment_bitmap.as_ref().unwrap().len(),
+                expected_fragments
+            );
         };
 
         let dataset = test_dataset().await;
