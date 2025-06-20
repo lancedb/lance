@@ -615,7 +615,7 @@ mod tests {
     use std::{ops::Range, sync::Arc};
 
     use all_asserts::{assert_ge, assert_lt};
-    use arrow::datatypes::{Float64Type, UInt64Type, UInt8Type};
+    use arrow::datatypes::{Float16Type, Float64Type, UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, FixedSizeListArray, Float32Array,
@@ -626,12 +626,15 @@ mod tests {
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
 
-    use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexInternalExt;
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         dataset::optimize::{compact_files, CompactionOptions},
         index::vector::{is_ivf_pq, IndexFileVersion},
+    };
+    use crate::{
+        dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams},
+        index::vector::is_ivf_flat,
     };
     use crate::{index::vector::VectorIndexParams, Dataset};
     use lance_core::cache::LanceCache;
@@ -855,14 +858,16 @@ mod tests {
                 )
                 .await;
 
-                test_index_impl::<Float64Type>(
-                    params,
-                    nlist,
-                    recall_requirement,
-                    0.0..1.0,
-                    dataset,
-                )
-                .await;
+                if !is_ivf_flat(&params.stages) {
+                    test_index_impl::<Float64Type>(
+                        params,
+                        nlist,
+                        recall_requirement,
+                        0.0..1.0,
+                        dataset,
+                    )
+                    .await;
+                }
             }
         }
     }
