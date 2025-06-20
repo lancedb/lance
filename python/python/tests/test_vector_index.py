@@ -659,6 +659,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             "num_sub_vectors": 8,
             "transposed": True,
         },
+        "index_file_version": IndexFileVersion.V3,
     }
 
     with pytest.raises(KeyError, match='Index "non-existent_idx" not found'):
