@@ -166,6 +166,7 @@ pub struct FullSchemaMergeInsertExec {
     metrics: ExecutionPlanMetricsSet,
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
     transaction: Arc<Mutex<Option<Transaction>>>,
+    affected_rows: Arc<Mutex<Option<RoaringTreemap>>>,
 }
 
 impl FullSchemaMergeInsertExec {
@@ -190,6 +191,7 @@ impl FullSchemaMergeInsertExec {
             metrics: ExecutionPlanMetricsSet::new(),
             merge_stats: Arc::new(Mutex::new(None)),
             transaction: Arc::new(Mutex::new(None)),
+            affected_rows: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -203,6 +205,12 @@ impl FullSchemaMergeInsertExec {
     /// Returns `None` if the execution is still in progress or hasn't started.
     pub fn transaction(&self) -> Option<Transaction> {
         self.transaction.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Returns the affected rows (deleted/updated row addresses) if the execution has completed.
+    /// Returns `None` if the execution is still in progress or hasn't started.
+    pub fn affected_rows(&self) -> Option<RoaringTreemap> {
+        self.affected_rows.lock().ok().and_then(|guard| guard.clone())
     }
 
     /// Creates a filtered stream that captures row addresses for deletion and returns
@@ -467,6 +475,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             metrics: self.metrics.clone(),
             merge_stats: self.merge_stats.clone(),
             transaction: self.transaction.clone(),
+            affected_rows: self.affected_rows.clone(),
         }))
     }
 
@@ -517,6 +526,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let dataset = self.dataset.clone();
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
+        let affected_rows_holder = self.affected_rows.clone();
         let merge_state_clone = merge_state;
 
         let result_stream = stream::once(async move {
@@ -555,7 +565,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 None,
             );
 
-            // Step 6: Store transaction and merge stats for later retrieval
+            // Step 6: Store transaction, merge stats, and affected rows for later retrieval
             {
                 // Get the final stats from the shared state
                 let stats = merge_state_clone.create_merge_stats();
@@ -565,6 +575,9 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 }
                 if let Ok(mut merge_stats_guard) = merge_stats_holder.lock() {
                     merge_stats_guard.replace(stats);
+                }
+                if let Ok(mut affected_rows_guard) = affected_rows_holder.lock() {
+                    affected_rows_guard.replace(delete_row_addrs_clone);
                 }
             };
 

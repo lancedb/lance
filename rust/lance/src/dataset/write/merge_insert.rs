@@ -1362,7 +1362,7 @@ impl MergeInsertJob {
     async fn execute_uncommitted_v2(
         self,
         source: SendableRecordBatchStream,
-    ) -> Result<(Transaction, MergeStats)> {
+    ) -> Result<(Transaction, MergeStats, Option<RowIdTreeMap>)> {
         let plan = self.create_plan(source).await?;
 
         // Execute the plan
@@ -1420,7 +1420,9 @@ impl MergeInsertJob {
             )
         })?;
 
-        Ok((transaction, stats))
+        let affected_rows = merge_insert_exec.affected_rows().map(RowIdTreeMap::from);
+
+        Ok((transaction, stats, affected_rows))
     }
 
     async fn execute_uncommitted_impl(
@@ -1434,10 +1436,10 @@ impl MergeInsertJob {
             && matches!(self.params.when_matched, WhenMatched::UpdateAll)
             && self.dataset.load_indices().await.unwrap_or_default().is_empty()
         {
-            let (transaction, stats) = self.execute_uncommitted_v2(source).await?;
+            let (transaction, stats, affected_rows) = self.execute_uncommitted_v2(source).await?;
             return Ok(UncommittedMergeInsert {
                 transaction,
-                affected_rows: None,
+                affected_rows,
                 stats,
             });
         }
@@ -1465,10 +1467,10 @@ impl MergeInsertJob {
             );
 
         if can_use_fast_path {
-            let (transaction, stats) = self.execute_uncommitted_v2(source).await?;
+            let (transaction, stats, affected_rows) = self.execute_uncommitted_v2(source).await?;
             return Ok(UncommittedMergeInsert {
                 transaction,
-                affected_rows: None,
+                affected_rows,
                 stats,
             });
         }
