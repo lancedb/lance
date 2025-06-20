@@ -1091,6 +1091,18 @@ impl DatasetIndexInternalExt for Dataset {
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
+                    "IVF_HNSW_FLAT" => {
+                        let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
+                            uuid.to_owned(),
+                            Arc::downgrade(&self.session),
+                            fri,
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
                     "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
                             self.object_store.clone(),

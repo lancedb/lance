@@ -1344,7 +1344,9 @@ impl Dataset {
             "NGRAM" => IndexType::NGram,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
-            "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
+            "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
+                IndexType::Vector
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -2151,6 +2153,12 @@ fn prepare_vector_index_params(
 
         "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(
             m_type, ivf_params, pq_params,
+        ))),
+
+        "IVF_HNSW_FLAT" => Ok(Box::new(VectorIndexParams::ivf_hnsw(
+            m_type,
+            ivf_params,
+            hnsw_params,
         ))),
 
         "IVF_HNSW_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
