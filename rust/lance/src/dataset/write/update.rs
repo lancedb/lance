@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use super::super::utils::make_rowid_capture_stream;
-use super::{write_fragments_internal, WriteParams};
+use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
@@ -18,6 +18,7 @@ use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::Fragment;
@@ -288,6 +289,7 @@ impl UpdateJob {
             .into_inner()
             .unwrap();
         let (old_fragments, removed_fragment_ids) = self.apply_deletions(&removed_row_ids).await?;
+        let affected_rows = RowIdTreeMap::from(removed_row_ids);
 
         let num_updated_rows = new_fragments
             .iter()
@@ -295,7 +297,12 @@ impl UpdateJob {
             .sum::<u64>();
         // Commit updated and new fragments
         let new_dataset = self
-            .commit(removed_fragment_ids, old_fragments, new_fragments)
+            .commit(
+                removed_fragment_ids,
+                old_fragments,
+                new_fragments,
+                affected_rows,
+            )
             .await?;
         Ok(UpdateResult {
             new_dataset,
@@ -368,11 +375,14 @@ impl UpdateJob {
         removed_fragment_ids: Vec<u64>,
         updated_fragments: Vec<Fragment>,
         new_fragments: Vec<Fragment>,
+        affected_rows: RowIdTreeMap,
     ) -> Result<Arc<Dataset>> {
         let operation = Operation::Update {
             removed_fragment_ids,
             updated_fragments,
             new_fragments,
+            // This job only deletes rows, it does not modify any field values.
+            fields_modified: vec![],
         };
         let transaction = Transaction::new(
             self.dataset.manifest.version,
@@ -381,28 +391,37 @@ impl UpdateJob {
             None,
         );
 
-        let mut dataset = self.dataset.as_ref().clone();
-        dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-
-        Ok(Arc::new(dataset))
+        CommitBuilder::new(self.dataset.clone())
+            .with_affected_rows(affected_rows)
+            .execute(transaction)
+            .await
+            .map(Arc::new)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::dataset::WriteParams;
+    use std::time::Duration;
+
+    use crate::{
+        dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteParams},
+        session::Session,
+        utils::test::ThrottledStoreWrapper,
+    };
 
     use super::*;
 
-    use arrow_array::{Int64Array, RecordBatchIterator, StringArray};
+    use arrow::{array::AsArray, datatypes::UInt32Type};
+    use arrow_array::{Int64Array, RecordBatchIterator, StringArray, UInt32Array};
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
-    use futures::TryStreamExt;
+    use futures::{future::try_join_all, TryStreamExt};
     use lance_file::version::LanceFileVersion;
+    use lance_io::object_store::ObjectStoreParams;
+    use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
+    use tokio::sync::Barrier;
 
     /// Returns a dataset with 3 fragments, each with 10 rows.
     ///
@@ -418,9 +437,9 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(Int64Array::from_iter_values(0..30)),
-                Arc::new(StringArray::from_iter_values(
-                    std::iter::repeat("foo").take(30),
-                )),
+                Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                    "foo", 30,
+                ))),
             ],
         )
         .unwrap();
@@ -587,5 +606,99 @@ mod tests {
         );
         // One fragment fully modified
         assert_eq!(fragments[2].metadata.physical_rows, Some(15));
+    }
+
+    #[tokio::test]
+    async fn test_update_concurrency() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let concurrency = 3;
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..concurrency)),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(
+                    0,
+                    concurrency as usize,
+                ))),
+            ],
+        )
+        .unwrap();
+
+        // Increase likelihood of contention by throttling the store
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: Duration::from_millis(1),
+                wait_get_per_call: Duration::from_millis(1),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(concurrency as usize));
+        let mut handles = Vec::new();
+        for i in 0..concurrency {
+            let session_ref = session.clone();
+            let barrier_ref = barrier.clone();
+            let throttled_ref = throttled.clone();
+            let handle = tokio::task::spawn(async move {
+                let dataset = DatasetBuilder::from_uri("memory://")
+                    .with_read_params(ReadParams {
+                        store_options: Some(ObjectStoreParams {
+                            object_store_wrapper: Some(throttled_ref.clone()),
+                            ..Default::default()
+                        }),
+                        session: Some(session_ref.clone()),
+                        ..Default::default()
+                    })
+                    .load()
+                    .await
+                    .unwrap();
+
+                let job = UpdateBuilder::new(Arc::new(dataset))
+                    .update_where(&format!("id = {}", i))
+                    .unwrap()
+                    .set("value", "1")
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                barrier_ref.wait().await;
+
+                job.execute().await.unwrap();
+            });
+            handles.push(handle);
+        }
+
+        try_join_all(handles).await.unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+
+        let data = dataset.scan().try_into_batch().await.unwrap();
+
+        let mut ids = data["id"]
+            .as_primitive::<UInt32Type>()
+            .values()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec![0, 1, 2],);
+        let values = data["value"].as_primitive::<UInt32Type>().values();
+        assert!(values.iter().all(|&value| value == 1));
     }
 }

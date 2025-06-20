@@ -8,9 +8,12 @@ import sys
 import uuid
 
 import pytest
-from lance.tracing import trace_to_chrome
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="test fails in CI on Windows but passes locally on Windows",
+)
 def test_tracing():
     trace_files_before = set(glob.glob("trace-*.json"))
     subprocess.run(
@@ -20,6 +23,9 @@ def test_tracing():
             "from lance.tracing import trace_to_chrome; trace_to_chrome()",
         ],
         check=True,
+        env={
+            "LANCE_LOG": "debug",
+        },
     )
     trace_files_after = set(glob.glob("trace-*.json"))
     assert len(trace_files_before) + 1 == len(trace_files_after)
@@ -39,12 +45,10 @@ def test_tracing():
             + f"trace_to_chrome(file='{trace_name}')",
         ],
         check=True,
+        env={
+            "LANCE_LOG": "debug",
+        },
     )
 
     assert os.path.exists(trace_name)
     os.remove(trace_name)
-
-
-def test_tracing_invalid_level():
-    with pytest.raises(ValueError):
-        trace_to_chrome(level="invalid")

@@ -10,6 +10,16 @@ import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
 
+def test_file_read_projection(tmp_path):
+    table = pa.table({"a": [1, 2, 3], "b": [4, 5, 6]})
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(table)
+
+    reader = LanceFileReader(str(path), columns=["a"])
+    assert reader.read_all().to_table() == table.select("a")
+
+
 def test_file_writer(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
@@ -474,4 +484,13 @@ def test_blob(tmp_path):
 
     reader = LanceFileReader(str(path))
     assert len(reader.metadata().columns[0].pages) == 1
-    assert reader.read_all().to_table() == pa.table({"val": vals})
+
+    actual = reader.read_all().to_table()
+    expected = pa.table({"val": vals})
+
+    assert actual.num_rows == expected.num_rows
+    for row_num in range(expected.num_rows):
+        actual_bytes = actual.column("val").chunk(0)[row_num].as_py()
+        expected_bytes = expected.column("val").chunk(0)[row_num].as_py()
+        assert len(actual_bytes) == len(expected_bytes)
+        assert actual_bytes == expected_bytes

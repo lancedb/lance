@@ -4,8 +4,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptions,
-    DEFAULT_CLOUD_IO_PARALLELISM,
+    ObjectStore, ObjectStoreParams, StorageOptions, DEFAULT_CLOUD_IO_PARALLELISM,
 };
 use lance_table::{
     format::Manifest,
@@ -31,7 +30,7 @@ pub struct DatasetBuilder {
     index_cache_size: usize,
     /// Metadata cache size for the fragment metadata. If it is zero, metadata
     /// cache is disabled.
-    metadata_cache_size: usize,
+    metadata_cache_size_bytes: usize,
     /// Optional pre-loaded manifest to avoid loading it again.
     manifest: Option<Manifest>,
     session: Option<Arc<Session>>,
@@ -39,21 +38,19 @@ pub struct DatasetBuilder {
     options: ObjectStoreParams,
     version: Option<Ref>,
     table_uri: String,
-    object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl DatasetBuilder {
     pub fn from_uri<T: AsRef<str>>(table_uri: T) -> Self {
         Self {
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
-            metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
+            metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             table_uri: table_uri.as_ref().to_string(),
             options: ObjectStoreParams::default(),
             commit_handler: None,
             session: None,
             version: None,
             manifest: None,
-            object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
@@ -67,9 +64,21 @@ impl DatasetBuilder {
         self
     }
 
+    /// Size of the metadata cache in bytes. This cache stores metadata in memory
+    /// for faster open table and scans. The default is 1 GiB.
+    pub fn with_metadata_cache_size_bytes(mut self, cache_size: usize) -> Self {
+        self.metadata_cache_size_bytes = cache_size;
+        self
+    }
+
     /// Set the cache size for the file metadata. Set to zero to disable this cache.
+    #[deprecated(
+        since = "0.30.0",
+        note = "Use `with_metadata_cache_size_bytes` instead"
+    )]
     pub fn with_metadata_cache_size(mut self, cache_size: usize) -> Self {
-        self.metadata_cache_size = cache_size;
+        let assumed_entry_size = 4 * 1024 * 1024; // 4MB per entry
+        self.metadata_cache_size_bytes = cache_size * assumed_entry_size;
         self
     }
 
@@ -114,6 +123,8 @@ impl DatasetBuilder {
     }
 
     /// Directly set the object store to use.
+    #[deprecated(note = "Implement an ObjectStoreProvider instead")]
+    #[allow(deprecated)]
     pub fn with_object_store(
         mut self,
         object_store: Arc<DynObjectStore>,
@@ -165,7 +176,7 @@ impl DatasetBuilder {
     pub fn with_read_params(mut self, read_params: ReadParams) -> Self {
         self = self
             .with_index_cache_size(read_params.index_cache_size)
-            .with_metadata_cache_size(read_params.metadata_cache_size);
+            .with_metadata_cache_size_bytes(read_params.metadata_cache_size_bytes);
 
         if let Some(options) = read_params.store_options {
             self.options = options;
@@ -178,8 +189,6 @@ impl DatasetBuilder {
         if let Some(commit_handler) = read_params.commit_handler {
             self.commit_handler = Some(commit_handler);
         }
-
-        self.object_store_registry = read_params.object_store_registry.clone();
 
         self
     }
@@ -194,8 +203,6 @@ impl DatasetBuilder {
             self.commit_handler = Some(commit_handler);
         }
 
-        self.object_store_registry = write_params.object_store_registry.clone();
-
         self
     }
 
@@ -209,13 +216,10 @@ impl DatasetBuilder {
         self
     }
 
-    pub fn with_object_store_registry(mut self, registry: Arc<ObjectStoreRegistry>) -> Self {
-        self.object_store_registry = registry;
-        self
-    }
-
     /// Build a lance object store for the given config
-    pub async fn build_object_store(self) -> Result<(ObjectStore, Path, Arc<dyn CommitHandler>)> {
+    pub async fn build_object_store(
+        self,
+    ) -> Result<(Arc<ObjectStore>, Path, Arc<dyn CommitHandler>)> {
         let commit_handler = match self.commit_handler {
             Some(commit_handler) => Ok(commit_handler),
             None => commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await,
@@ -229,9 +233,16 @@ impl DatasetBuilder {
             .unwrap_or_default();
         let download_retry_count = storage_options.download_retry_count();
 
+        let store_registry = self
+            .session
+            .as_ref()
+            .map(|s| s.store_registry())
+            .unwrap_or_default();
+
+        #[allow(deprecated)]
         match &self.options.object_store {
             Some(store) => Ok((
-                ObjectStore::new(
+                Arc::new(ObjectStore::new(
                     store.0.clone(),
                     store.1.clone(),
                     self.options.block_size,
@@ -242,13 +253,13 @@ impl DatasetBuilder {
                     // cloud-like
                     DEFAULT_CLOUD_IO_PARALLELISM,
                     download_retry_count,
-                ),
+                )),
                 Path::from(store.1.path()),
                 commit_handler,
             )),
             None => {
                 let (store, path) = ObjectStore::from_uri_and_params(
-                    self.object_store_registry.clone(),
+                    store_registry,
                     &self.table_uri,
                     &self.options,
                 )
@@ -260,11 +271,12 @@ impl DatasetBuilder {
 
     #[instrument(skip_all)]
     pub async fn load(mut self) -> Result<Dataset> {
-        let session = match self.session.take() {
-            Some(session) => session,
+        let session = match self.session.as_ref() {
+            Some(session) => session.clone(),
             None => Arc::new(Session::new(
                 self.index_cache_size,
-                self.metadata_cache_size,
+                self.metadata_cache_size_bytes,
+                Default::default(),
             )),
         };
 
@@ -283,7 +295,7 @@ impl DatasetBuilder {
                 Ref::Version(v) => Some(v),
                 Ref::Tag(t) => {
                     let tags = Tags::new(
-                        Arc::new(object_store.clone()),
+                        object_store.clone(),
                         commit_handler.clone(),
                         base_path.clone(),
                     );
@@ -318,21 +330,24 @@ impl DatasetBuilder {
                     })?,
             };
 
-            let manifest = Dataset::load_manifest(&object_store, &manifest_location).await?;
+            let manifest = Dataset::load_manifest(
+                &object_store,
+                &manifest_location,
+                &base_path,
+                session.as_ref(),
+            )
+            .await?;
             (manifest, manifest_location)
         };
 
         Dataset::checkout_manifest(
-            Arc::new(object_store),
+            object_store,
             base_path,
             table_uri,
-            manifest,
-            location.path,
+            Arc::new(manifest),
+            location,
             session,
             commit_handler,
-            location.naming_scheme,
-            location.e_tag,
         )
-        .await
     }
 }

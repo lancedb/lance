@@ -242,6 +242,7 @@ pub fn transform_vectors(
     )?
 }
 
+#[allow(deprecated)]
 async fn do_shuffle_transformed_vectors(
     unsorted_filenames: Vec<String>,
     dir_path: &str,

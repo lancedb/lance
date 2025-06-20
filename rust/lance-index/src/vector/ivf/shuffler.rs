@@ -27,7 +27,7 @@ use arrow_schema::{DataType, Field, Fields};
 use futures::stream::repeat_with;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::{CapacityMode, FileMetadataCache};
+use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -38,6 +38,7 @@ use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
+use lance_io::utils::CachedFileSize;
 use lance_io::ReadBatchParams;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
@@ -55,7 +56,7 @@ const SHUFFLE_BATCH_SIZE: usize = 1024;
 
 fn get_temp_dir() -> Result<Path> {
     // Note: using into_path here means we will not delete this TempDir automatically
-    let dir = TempDir::new()?.into_path();
+    let dir = TempDir::new()?.keep();
     let tmp_dir_path = Path::from_filesystem_path(dir).map_err(|e| Error::IO {
         source: Box::new(e),
         location: location!(),
@@ -507,9 +508,10 @@ impl IvfShuffler {
             } else {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
                 let scheduler = ScanScheduler::new(object_store.into(), scheduler_config);
-                let file = scheduler.open_file(&path).await?;
-                let cache =
-                    FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
+                let file = scheduler
+                    .open_file(&path, &CachedFileSize::unknown())
+                    .await?;
+                let cache = LanceCache::with_capacity(128 * 1024 * 1024);
 
                 let reader = Lancev2FileReader::try_open(
                     file,
@@ -565,12 +567,14 @@ impl IvfShuffler {
                     });
                 }
             } else {
-                let file = scheduler.open_file(&path).await?;
+                let file = scheduler
+                    .open_file(&path, &CachedFileSize::unknown())
+                    .await?;
                 let reader = Lancev2FileReader::try_open(
                     file,
                     None,
                     Default::default(),
-                    &FileMetadataCache::no_cache(),
+                    &LanceCache::no_cache(),
                     FileReaderOptions::default(),
                 )
                 .await?;
@@ -637,12 +641,14 @@ impl IvfShuffler {
             } else {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
                 let scheduler = ScanScheduler::new(Arc::new(object_store), scheduler_config);
-                let file = scheduler.open_file(&path).await?;
+                let file = scheduler
+                    .open_file(&path, &CachedFileSize::unknown())
+                    .await?;
                 let reader = Lancev2FileReader::try_open(
                     file,
                     None,
                     Default::default(),
-                    &FileMetadataCache::no_cache(),
+                    &LanceCache::no_cache(),
                     FileReaderOptions::default(),
                 )
                 .await?;
@@ -808,12 +814,14 @@ impl IvfShuffler {
             let path = basedir.child(file);
             let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
             let scan_scheduler = ScanScheduler::new(object_store, scheduler_config);
-            let file_scheduler = scan_scheduler.open_file(&path).await?;
+            let file_scheduler = scan_scheduler
+                .open_file(&path, &CachedFileSize::unknown())
+                .await?;
             let reader = lance_file::v2::reader::FileReader::try_open(
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),
-                &FileMetadataCache::no_cache(),
+                &LanceCache::no_cache(),
                 FileReaderOptions::default(),
             )
             .await?;

@@ -9,6 +9,7 @@ pub mod expr;
 pub mod logical_expr;
 pub mod planner;
 pub mod projection;
+pub mod spill;
 pub mod sql;
 #[cfg(feature = "substrait")]
 pub mod substrait;

@@ -127,7 +127,7 @@ that with:
   import lance
 
   dataset = lance.dataset("./alice_and_bob.lance")
-  dataset.update({"name": "'Bob'"}), where="name = 'Blob'")
+  dataset.update({"name": "'Bob'"}, where="name = 'Blob'")
 
 The update values are SQL expressions, which is why ``'Bob'`` is wrapped in single
 quotes. This means we can use complex expressions that reference existing columns if

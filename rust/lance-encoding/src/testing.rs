@@ -12,11 +12,7 @@ use futures::{future::BoxFuture, FutureExt, StreamExt};
 use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use lance_core::{
-    cache::{CapacityMode, FileMetadataCache},
-    utils::bit::pad_bytes,
-    Result,
-};
+use lance_core::{cache::LanceCache, utils::bit::pad_bytes, Result};
 use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
 
 use crate::{
@@ -166,10 +162,7 @@ async fn test_decode(
     ) -> BoxFuture<'static, ()>,
 ) {
     let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
-    let cache = Arc::new(FileMetadataCache::with_capacity(
-        128 * 1024 * 1024,
-        CapacityMode::Bytes,
-    ));
+    let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
     let column_indices = column_indices_from_schema(schema, is_structural_encoding);
     let decode_scheduler = DecodeBatchScheduler::try_new(
         &lance_schema,
@@ -455,16 +448,14 @@ impl SimulatedWriter {
         self.encoded_data.extend_from_slice(&buffer);
         let size = self.encoded_data.len() as u64 - offset;
         let pad_bytes = pad_bytes::<TEST_ALIGNMENT>(self.encoded_data.len());
-        self.encoded_data
-            .extend(std::iter::repeat(0).take(pad_bytes));
+        self.encoded_data.extend(std::iter::repeat_n(0, pad_bytes));
         (offset, size)
     }
 
     fn write_lance_buffer(&mut self, buffer: LanceBuffer) {
         self.encoded_data.extend_from_slice(&buffer);
         let pad_bytes = pad_bytes::<TEST_ALIGNMENT>(self.encoded_data.len());
-        self.encoded_data
-            .extend(std::iter::repeat(0).take(pad_bytes));
+        self.encoded_data.extend(std::iter::repeat_n(0, pad_bytes));
     }
 
     fn write_page(&mut self, encoded_page: EncodedPage) {

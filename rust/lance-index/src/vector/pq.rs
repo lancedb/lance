@@ -452,25 +452,22 @@ impl Quantization for ProductQuantizer {
         QuantizationType::Product
     }
 
-    fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
+    fn metadata(&self, args: Option<QuantizationMetadata>) -> Self::Metadata {
         let codebook_position = match &args {
             Some(args) => args.codebook_position,
             None => Some(0),
         };
-        let codebook_position = codebook_position.ok_or(Error::Index {
-            message: "codebook_position not found".to_owned(),
-            location: location!(),
-        })?;
-        let tensor = pb::Tensor::try_from(&self.codebook)?;
-        Ok(serde_json::to_value(ProductQuantizationMetadata {
+
+        let codebook_position = codebook_position.expect("codebook position should be set");
+        ProductQuantizationMetadata {
             codebook_position,
             nbits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
-            codebook: None,
-            codebook_tensor: tensor.encode_to_vec(),
+            codebook: Some(self.codebook.clone()),
+            codebook_tensor: Vec::new(),
             transposed: args.map(|args| args.transposed).unwrap_or_default(),
-        })?)
+        }
     }
 
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
@@ -527,7 +524,7 @@ impl TryFrom<Quantizer> for ProductQuantizer {
 mod tests {
     use super::*;
 
-    use std::iter::repeat;
+    use std::iter::repeat_n;
 
     use approx::assert_relative_eq;
     use arrow::datatypes::UInt8Type;
@@ -546,7 +543,7 @@ mod tests {
             8,
             16,
             FixedSizeListArray::try_new_from_values(
-                Float16Array::from_iter_values(repeat(f16::zero()).take(256 * 16)),
+                Float16Array::from_iter_values(repeat_n(f16::zero(), 256 * 16)),
                 16,
             )
             .unwrap(),

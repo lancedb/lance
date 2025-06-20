@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::prelude::*;
+use deepsize::DeepSizeOf;
 use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
 use lance_file::reader::FileReader;
 use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
@@ -18,7 +19,7 @@ use prost_types::Timestamp;
 use super::Fragment;
 use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_MOVE_STABLE_ROW_IDS};
 use crate::format::pb;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Schema, StorageClass};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
@@ -31,7 +32,7 @@ use snafu::location;
 ///  * Version
 ///  * Fragments.
 ///  * Indices.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
@@ -339,13 +340,13 @@ impl Manifest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct WriterVersion {
     pub library: String,
     pub version: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DataStorageFormat {
     pub file_format: String,
     pub version: String,
@@ -599,7 +600,7 @@ pub trait SelfDescribingFileReader {
     async fn try_new_self_described(
         object_store: &ObjectStore,
         path: &Path,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Self>
     where
         Self: Sized,
@@ -610,7 +611,7 @@ pub trait SelfDescribingFileReader {
 
     async fn try_new_self_described_from_reader(
         reader: Arc<dyn Reader>,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Self>
     where
         Self: Sized;
@@ -620,7 +621,7 @@ pub trait SelfDescribingFileReader {
 impl SelfDescribingFileReader for FileReader {
     async fn try_new_self_described_from_reader(
         reader: Arc<dyn Reader>,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Self> {
         let metadata = Self::read_metadata(reader.as_ref(), cache).await?;
         let manifest_position = metadata.manifest_position.ok_or(Error::Internal {
@@ -793,8 +794,8 @@ mod tests {
             /*blob_dataset_version= */ None,
         );
 
-        let mut config = HashMap::new();
-        config.insert("lance:test".to_string(), "value".to_string());
+        let mut config = manifest.config.clone();
+        config.insert("lance.test".to_string(), "value".to_string());
         config.insert("other-key".to_string(), "other-value".to_string());
 
         manifest.update_config(config.clone());

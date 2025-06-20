@@ -19,12 +19,14 @@ use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::convert::TryFrom;
 
+pub mod frag_reuse;
 pub mod metrics;
 pub mod optimize;
 pub mod prefilter;
 pub mod scalar;
 pub mod traits;
 pub mod vector;
+
 pub use crate::traits::*;
 
 pub const INDEX_FILE_NAME: &str = "index.idx";
@@ -56,6 +58,11 @@ pub trait Index: Send + Sync + DeepSizeOf {
     /// Retrieve index statistics as a JSON Value
     fn statistics(&self) -> Result<serde_json::Value>;
 
+    /// Prewarm the index.
+    ///
+    /// This will load the index into memory and cache it.
+    async fn prewarm(&self) -> Result<()>;
+
     /// Get the type of the index
     fn index_type(&self) -> IndexType;
 
@@ -82,6 +89,8 @@ pub enum IndexType {
 
     NGram = 5, // NGram
 
+    FragmentReuse = 6,
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -100,6 +109,7 @@ impl std::fmt::Display for IndexType {
             Self::LabelList => write!(f, "LabelList"),
             Self::Inverted => write!(f, "Inverted"),
             Self::NGram => write!(f, "NGram"),
+            Self::FragmentReuse => write!(f, "FragmentReuse"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -157,6 +167,32 @@ impl IndexType {
                 | Self::IvfFlat
                 | Self::IvfSq
         )
+    }
+
+    /// Returns the current format version of the index type,
+    /// bump this when the index format changes.
+    /// Indices which higher version than these will be ignored for compatibility,
+    /// This would happen when creating index in a newer version of Lance,
+    /// but then opening the index in older version of Lance
+    pub fn version(&self) -> i32 {
+        match self {
+            Self::Scalar => 0,
+            Self::BTree => 0,
+            Self::Bitmap => 0,
+            Self::LabelList => 0,
+            Self::Inverted => 0,
+            Self::NGram => 0,
+            Self::FragmentReuse => 0,
+
+            // for now all vector indices are built by the same builder,
+            // so they share the same version.
+            Self::Vector
+            | Self::IvfFlat
+            | Self::IvfSq
+            | Self::IvfPq
+            | Self::IvfHnswSq
+            | Self::IvfHnswPq => 1,
+        }
     }
 }
 

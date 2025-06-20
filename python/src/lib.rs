@@ -25,12 +25,18 @@
 use std::env;
 use std::sync::Arc;
 
+use std::ffi::CString;
+
 use ::arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
+use ::lance::datafusion::LanceTableProvider;
+
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::ArrowError;
+use datafusion::error::Result;
+use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
 use dataset::blob::LanceBlobFile;
@@ -38,7 +44,7 @@ use dataset::cleanup::CleanupStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::MergeInsertBuilder;
+use dataset::{MergeInsertBuilder, PyFullTextQuery};
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
@@ -49,6 +55,8 @@ use lance_index::DatasetIndexExt;
 use log::Level;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
+use scanner::ScanStatistics;
 use session::Session;
 
 #[macro_use]
@@ -126,6 +134,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let log_builder = env_logger::Builder::from_env(env);
     init_logging(log_builder);
 
+    m.add_class::<FFILanceTableProvider>()?;
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_class::<FileFragment>()?;
@@ -149,9 +158,11 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionPlan>()?;
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
+    m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
     m.add_class::<TraceGuard>()?;
     m.add_class::<schema::LanceSchema>()?;
+    m.add_class::<PyFullTextQuery>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
@@ -356,4 +367,47 @@ fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(::lance::io::commit::manifest_needs_migration(
         &manifest, &indices,
     ))
+}
+
+#[pyclass(name = "FFILanceTableProvider", module = "lance", subclass)]
+#[derive(Clone)]
+struct FFILanceTableProvider {
+    dataset: Arc<::lance::Dataset>,
+    with_row_id: bool,
+    with_row_addr: bool,
+}
+
+#[pymethods]
+impl FFILanceTableProvider {
+    #[new]
+    #[pyo3(signature = (dataset, *, with_row_id = false, with_row_addr = false))]
+    fn new(dataset: &Bound<'_, PyAny>, with_row_id: bool, with_row_addr: bool) -> PyResult<Self> {
+        let py = dataset.py();
+        let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
+        let dataset_ref = &dataset.bind(py).borrow().ds;
+        // TODO: https://github.com/lancedb/lance/issues/3966 remove this workaround
+        let _ = RT.block_on(Some(py), dataset_ref.load_indices())?;
+        Ok(Self {
+            dataset: dataset_ref.clone(),
+            with_row_id,
+            with_row_addr,
+        })
+    }
+
+    fn __datafusion_table_provider__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let name = CString::new("datafusion_table_provider").unwrap();
+        let a_lance_table_provider = Arc::new(LanceTableProvider::new(
+            self.dataset.clone(),
+            self.with_row_id,
+            self.with_row_addr,
+        ));
+
+        let ffi_provider =
+            FFI_TableProvider::new(a_lance_table_provider, true, RT.get_runtime_handle());
+        let capsule = PyCapsule::new(py, ffi_provider, Some(name.clone()));
+        capsule
+    }
 }

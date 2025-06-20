@@ -112,6 +112,10 @@ mod test {
             Ok(self)
         }
 
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
         fn statistics(&self) -> Result<serde_json::Value> {
             Ok(json!(()))
         }
@@ -140,6 +144,10 @@ mod test {
             unimplemented!()
         }
 
+        fn total_partitions(&self) -> usize {
+            unimplemented!()
+        }
+
         async fn search_in_partition(
             &self,
             _: usize,
@@ -156,10 +164,6 @@ mod test {
 
         fn use_residual(&self) -> bool {
             true
-        }
-
-        fn check_can_remap(&self) -> Result<()> {
-            Ok(())
         }
 
         async fn load(

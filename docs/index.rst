@@ -66,6 +66,9 @@ Preview releases receive the same level of testing as regular releases.
    Tensorflow <./integrations/tensorflow>
    PyTorch <./integrations/pytorch>
    Ray <./integrations/ray>
+   Spark <https://lancedb.github.io/lance-spark>
+   Trino <https://github.com/lancedb/lance-trino>
+   PostgreSQL <https://github.com/lancedb/pglance>
 
 .. toctree::
    :maxdepth: 1

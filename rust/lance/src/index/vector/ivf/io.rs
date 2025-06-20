@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
 
+use super::IVFIndex;
+use crate::dataset::ROW_ID;
+use crate::index::vector::pq::{build_pq_storage, PQIndex};
 use arrow::compute::concat;
 use arrow_array::UInt64Array;
 use arrow_array::{
@@ -42,10 +45,6 @@ use object_store::path::Path;
 use snafu::location;
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
-
-use super::IVFIndex;
-use crate::dataset::ROW_ID;
-use crate::index::vector::pq::{build_pq_storage, PQIndex};
 
 use crate::Result;
 

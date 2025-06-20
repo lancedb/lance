@@ -6,15 +6,43 @@ import abc
 from enum import Enum
 from typing import Optional
 
+from .lance import PyFullTextQuery
+
 
 class FullTextQueryType(Enum):
     MATCH = "match"
     MATCH_PHRASE = "match_phrase"
     BOOST = "boost"
     MULTI_MATCH = "multi_match"
+    BOOLEAN = "boolean"
+
+
+class FullTextOperator(Enum):
+    AND = "AND"
+    OR = "OR"
+
+
+class Occur(Enum):
+    SHOULD = "SHOULD"
+    MUST = "MUST"
+    MUST_NOT = "MUST_NOT"
 
 
 class FullTextQuery(abc.ABC):
+    _inner: PyFullTextQuery
+
+    @property
+    def inner(self) -> PyFullTextQuery:
+        """
+        Get the inner query object.
+
+        Returns
+        -------
+        PyFullTextQuery
+            The inner query object.
+        """
+        return self._inner
+
     @abc.abstractmethod
     def query_type(self) -> FullTextQueryType:
         """
@@ -26,16 +54,37 @@ class FullTextQuery(abc.ABC):
             The type of the query.
         """
 
-    @abc.abstractmethod
-    def to_dict(self) -> dict:
+    def __and__(self, other: "FullTextQuery") -> "FullTextQuery":
         """
-        Convert the query to a dictionary.
+        Combine two queries with a logical AND operation.
+
+        Parameters
+        ----------
+        other : FullTextQuery
+            The other query to combine with.
 
         Returns
         -------
-        dict
-            The query as a dictionary.
+        FullTextQuery
+            A new query that combines both queries with AND.
         """
+        return BooleanQuery([(Occur.MUST, self), (Occur.MUST, other)])
+
+    def __or__(self, other: "FullTextQuery") -> "FullTextQuery":
+        """
+        Combine two queries with a logical OR operation.
+
+        Parameters
+        ----------
+        other : FullTextQuery
+            The other query to combine with.
+
+        Returns
+        -------
+        FullTextQuery
+            A new query that combines both queries with OR.
+        """
+        return BooleanQuery([(Occur.SHOULD, self), (Occur.SHOULD, other)])
 
 
 class MatchQuery(FullTextQuery):
@@ -47,6 +96,8 @@ class MatchQuery(FullTextQuery):
         boost: float = 1.0,
         fuzziness: int = 0,
         max_expansions: int = 50,
+        operator: FullTextOperator = FullTextOperator.OR,
+        prefix_length: int = 0,
     ):
         """
         Match query for full-text search.
@@ -70,31 +121,31 @@ class MatchQuery(FullTextQuery):
         max_expansions : int, optional
             The maximum number of terms to consider for fuzzy matching.
             Defaults to 50.
+        operator : FullTextOperator, default OR
+            The operator to use for combining the query results.
+            Can be either `AND` or `OR`.
+            If `AND`, all terms in the query must match.
+            If `OR`, at least one term in the query must match.
+        prefix_length : int, default 0
+            The number of beginning characters being unchanged for fuzzy matching.
+            This is useful to achieve prefix matching.
         """
-        self.column = column
-        self.query = query
-        self.boost = boost
-        self.fuzziness = fuzziness
-        self.max_expansions = max_expansions
+        self._inner = PyFullTextQuery.match_query(
+            query,
+            column,
+            boost=boost,
+            fuzziness=fuzziness,
+            max_expansions=max_expansions,
+            operator=operator.value,
+            prefix_length=prefix_length,
+        )
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MATCH
 
-    def to_dict(self) -> dict:
-        return {
-            "match": {
-                self.column: {
-                    "query": self.query,
-                    "boost": self.boost,
-                    "fuzziness": self.fuzziness,
-                    "max_expansions": self.max_expansions,
-                }
-            }
-        }
-
 
 class PhraseQuery(FullTextQuery):
-    def __init__(self, query: str, column: str):
+    def __init__(self, query: str, column: str, *, slop: int = 0):
         """
         Phrase query for full-text search.
 
@@ -105,18 +156,10 @@ class PhraseQuery(FullTextQuery):
         column : str
             The name of the column to match against.
         """
-        self.column = column
-        self.query = query
+        self._inner = PyFullTextQuery.phrase_query(query, column, slop)
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MATCH_PHRASE
-
-    def to_dict(self) -> dict:
-        return {
-            "match_phrase": {
-                self.column: self.query,
-            }
-        }
 
 
 class BoostQuery(FullTextQuery):
@@ -124,7 +167,8 @@ class BoostQuery(FullTextQuery):
         self,
         positive: FullTextQuery,
         negative: FullTextQuery,
-        negative_boost: float,
+        *,
+        negative_boost: float = 0.5,
     ):
         """
         Boost query for full-text search.
@@ -135,24 +179,15 @@ class BoostQuery(FullTextQuery):
             The positive query object.
         negative : dict
             The negative query object.
-        negative_boost : float
+        negative_boost : float, default 0.5
             The boost factor for the negative query.
         """
-        self.positive = positive
-        self.negative = negative
-        self.negative_boost = negative_boost
+        self._inner = PyFullTextQuery.boost_query(
+            positive.inner, negative.inner, negative_boost
+        )
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.BOOST
-
-    def to_dict(self) -> dict:
-        return {
-            "boost": {
-                "positive": self.positive.to_dict(),
-                "negative": self.negative.to_dict(),
-                "negative_boost": self.negative_boost,
-            }
-        }
 
 
 class MultiMatchQuery(FullTextQuery):
@@ -162,6 +197,7 @@ class MultiMatchQuery(FullTextQuery):
         columns: list[str],
         *,
         boosts: Optional[list[float]] = None,
+        operator: FullTextOperator = FullTextOperator.OR,
     ):
         """
         Multi-match query for full-text search.
@@ -170,28 +206,40 @@ class MultiMatchQuery(FullTextQuery):
         ----------
         query : str | list[Query]
             If a string, the query string to match against.
-
         columns : list[str]
             The list of columns to match against.
-
         boosts : list[float], optional
             The list of boost factors for each column. If not provided,
             all columns will have the same boost factor.
+        operator : FullTextOperator, default OR
+            The operator to use for combining the query results.
+            Can be either `AND` or `OR`.
+            It would be applied to all columns individually.
+            For example, if the operator is `AND`,
+            then the query "hello world" is equal to
+            `match("hello AND world", column1) OR match("hello AND world", column2)`.
         """
-        self.query = query
-        self.columns = columns
-        if boosts is None:
-            boosts = [1.0] * len(columns)
-        self.boosts = boosts
+        self._inner = PyFullTextQuery.multi_match_query(
+            query, columns, boosts=boosts, operator=operator.value
+        )
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MULTI_MATCH
 
-    def to_dict(self) -> dict:
-        return {
-            "multi_match": {
-                "query": self.query,
-                "columns": self.columns,
-                "boost": self.boosts,
-            }
-        }
+
+class BooleanQuery(FullTextQuery):
+    def __init__(self, queries: list[tuple[Occur, FullTextQuery]]):
+        """
+        Boolean query for full-text search.
+
+        Parameters
+        ----------
+        queries : list[tuple(Occur, FullTextQuery)]
+            The list of queries with their occurrence requirements.
+        """
+        self._inner = PyFullTextQuery.boolean_query(
+            [(occur.value, query.inner) for occur, query in queries]
+        )
+
+    def query_type(self) -> FullTextQueryType:
+        return FullTextQueryType.BOOLEAN

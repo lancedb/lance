@@ -12,14 +12,16 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::NoFilter;
-use lance_index::scalar::inverted::query::FtsSearchParams;
+use lance_index::scalar::inverted::query::{FtsSearchParams, Operator};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
+use lance_index::{
+    metrics::NoOpMetricsCollector, scalar::inverted::tokenizer::InvertedIndexParams,
+};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
@@ -34,13 +36,12 @@ fn bench_inverted(c: &mut Criterion) {
     let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
     let store = rt.block_on(async {
         Arc::new(LanceIndexStore::new(
-            ObjectStore::local(),
+            Arc::new(ObjectStore::local()),
             index_dir,
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ))
     });
 
-    let mut builder = InvertedIndexBuilder::default();
     // generate 2000 different tokens
     let tokens = random_word::all(random_word::Lang::En);
     let row_id_col = Arc::new(UInt64Array::from(
@@ -65,24 +66,38 @@ fn bench_inverted(c: &mut Criterion) {
         vec![doc_col, row_id_col],
     )
     .unwrap();
-    let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
-    let stream = Box::pin(stream);
 
-    rt.block_on(async { builder.update(stream, store.as_ref()).await.unwrap() });
-    let invert_index = rt.block_on(InvertedIndex::load(store)).unwrap();
+    c.bench_function(format!("invert_indexing({TOTAL})").as_str(), |b| {
+        b.to_async(&rt).iter(|| async {
+            let stream = RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::iter(vec![Ok(batch.clone())]),
+            );
+            let stream = Box::pin(stream);
+            let mut builder =
+                InvertedIndexBuilder::new(InvertedIndexParams::default().with_position(false));
+            black_box({
+                builder.update(stream, store.as_ref()).await.unwrap();
+                builder
+            });
+        })
+    });
+    let invert_index = rt.block_on(InvertedIndex::load(store, None)).unwrap();
 
     let params = FtsSearchParams::new().with_limit(Some(10));
     let no_filter = Arc::new(NoFilter);
-    c.bench_function(format!("invert({TOTAL})").as_str(), |b| {
+    c.bench_function(format!("invert_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             black_box(
                 invert_index
                     .bm25_search(
-                        &[tokens[rand::random::<usize>() % tokens.len()].to_owned()],
-                        &params,
-                        false,
+                        [tokens[rand::random::<usize>() % tokens.len()].to_owned()]
+                            .to_vec()
+                            .into(),
+                        params.clone().into(),
+                        Operator::Or,
                         no_filter.clone(),
-                        &NoOpMetricsCollector,
+                        Arc::new(NoOpMetricsCollector),
                     )
                     .await
                     .unwrap(),

@@ -21,8 +21,11 @@ use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::location;
+use std::ops::Range;
+use std::sync::Arc;
 
-use crate::vector::storage::STORAGE_METADATA_KEY;
+use super::{inverse_scalar_dist, scale_to_u8, ScalarQuantizer};
+use crate::frag_reuse::FragReuseIndex;
 use crate::{
     vector::{
         quantizer::{QuantizerMetadata, QuantizerStorage},
@@ -32,8 +35,6 @@ use crate::{
     },
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
 };
-
-use super::{inverse_scalar_dist, scale_to_u8, ScalarQuantizer};
 
 pub const SQ_METADATA_KEY: &str = "lance:sq";
 
@@ -180,11 +181,15 @@ impl ScalarQuantizationStorage {
         distance_type: DistanceType,
         bounds: Range<f64>,
         batches: impl IntoIterator<Item = RecordBatch>,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let mut chunks = Vec::with_capacity(SQ_CHUNK_CAPACITY);
         let mut offsets = Vec::with_capacity(SQ_CHUNK_CAPACITY + 1);
         offsets.push(0);
-        for batch in batches.into_iter() {
+        for mut batch in batches.into_iter() {
+            if let Some(fri_ref) = fri.as_ref() {
+                batch = fri_ref.remap_row_ids_record_batch(batch, 0)?
+            }
             offsets.push(offsets.last().unwrap() + batch.num_rows() as u32);
             let chunk = SQStorageChunk::new(batch)?;
             chunks.push(chunk);
@@ -213,7 +218,11 @@ impl ScalarQuantizationStorage {
         }
     }
 
-    pub async fn load(object_store: &ObjectStore, path: &Path) -> Result<Self> {
+    pub async fn load(
+        object_store: &ObjectStore,
+        path: &Path,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         let reader = FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
 
@@ -235,7 +244,7 @@ impl ScalarQuantizationStorage {
         let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
         let metadata = ScalarQuantizationMetadata::load(&reader).await?;
 
-        Self::load_partition(&reader, 0..reader.len(), distance_type, &metadata).await
+        Self::load_partition(&reader, 0..reader.len(), distance_type, &metadata, fri).await
     }
 
     fn optimize(self) -> Result<Self> {
@@ -257,6 +266,29 @@ impl ScalarQuantizationStorage {
 #[async_trait]
 impl QuantizerStorage for ScalarQuantizationStorage {
     type Metadata = ScalarQuantizationMetadata;
+
+    fn try_from_batch(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Self::try_new(
+            metadata.num_bits,
+            distance_type,
+            metadata.bounds.clone(),
+            [batch],
+            fri,
+        )
+    }
+
+    fn metadata(&self) -> &Self::Metadata {
+        &self.quantizer.metadata
+    }
+
     /// Load a partition of SQ storage from disk.
     ///
     /// Parameters
@@ -270,6 +302,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let schema = reader.schema();
         let batch = reader.read_range(range, schema).await?;
@@ -279,29 +312,13 @@ impl QuantizerStorage for ScalarQuantizationStorage {
             distance_type,
             metadata.bounds.clone(),
             [batch],
+            fri,
         )
     }
 }
 
 impl VectorStore for ScalarQuantizationStorage {
     type DistanceCalculator<'a> = SQDistCalculator<'a>;
-
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        let metadata_json = batch
-            .schema_ref()
-            .metadata()
-            .get(STORAGE_METADATA_KEY)
-            .ok_or(Error::Schema {
-                message: "metadata not found".to_string(),
-                location: location!(),
-            })?;
-        let metadata: ScalarQuantizationMetadata = serde_json::from_str(metadata_json)?;
-
-        Self::try_new(metadata.num_bits, distance_type, metadata.bounds, [batch])
-    }
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         Ok(self.chunks.iter().map(|c| c.batch.clone()))
@@ -512,6 +529,7 @@ mod tests {
             DistanceType::L2,
             -0.7..0.7,
             (0..4).map(|start| create_record_batch(start * 100..(start + 1) * 100)),
+            None,
         )
         .unwrap();
 

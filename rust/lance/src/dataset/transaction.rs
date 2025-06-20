@@ -50,10 +50,14 @@ use std::{
     sync::Arc,
 };
 
+use super::ManifestWriteConfig;
+use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_io::object_store::ObjectStore;
+use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
@@ -70,15 +74,11 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
 
-use super::ManifestWriteConfig;
-use crate::utils::temporal::timestamp_to_nanos;
-use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
-
 /// A change to a dataset that can be retried
 ///
 /// This contains enough information to be able to build the next manifest,
 /// given the current manifest.
-#[derive(Debug, Clone, DeepSizeOf)]
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct Transaction {
     /// The version of the table this transaction is based off of. If this is
     /// the first transaction, this should be 0.
@@ -101,7 +101,7 @@ pub enum BlobsOperation {
     Updated(u64),
 }
 
-#[derive(Debug, Clone, DeepSizeOf)]
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct DataReplacementGroup(pub u64, pub DataFile);
 
 /// An operation on a dataset.
@@ -144,23 +144,25 @@ pub enum Operation {
         groups: Vec<RewriteGroup>,
         /// Indices that have been updated with the new row addresses
         rewritten_indices: Vec<RewrittenIndex>,
+        /// The fragment reuse index to be created or updated to
+        frag_reuse_index: Option<Index>,
     },
-    /// Replace data in a column in the dataset with a new data. This is used for
+    /// Replace data in a column in the dataset with new data. This is used for
     /// null column population where we replace an entirely null column with a
     /// new column that has data.
     ///
     /// This operation will only allow replacing files that contain the same schema
-    /// e.g. if the original files contains column A, B, C and the new files contains
-    /// only column A, B then the operation is not allowed. As we would need to split
+    /// e.g. if the original files contain columns A, B, C and the new files contain
+    /// only columns A, B then the operation is not allowed. As we would need to split
     /// the original files into two files, one with column A, B and the other with column C.
     ///
     /// Corollary to the above: the operation will also not allow replacing files unless the
     /// affected columns all have the same datafile layout across the fragments being replaced.
     ///
-    /// e.g. if fragments being replaced contains files with different schema layouts on
+    /// e.g. if fragments being replaced contain files with different schema layouts on
     /// the column being replaced, the operation is not allowed.
     /// say frag_1: [A] [B, C] and frag_2: [A, B] [C] and we are trying to replace column A
-    /// with a new column A the operation is not allowed.
+    /// with a new column A, the operation is not allowed.
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
     },
@@ -178,6 +180,21 @@ pub enum Operation {
     ReserveFragments { num_fragments: u32 },
 
     /// Update values in the dataset.
+    ///
+    /// Updates are generally vertical or horizontal.
+    ///
+    /// A vertical update adds new rows.  In this case, the updated_fragments
+    /// will only have existing rows deleted and will not have any new fields added.
+    /// All new data will be contained in new_fragments.
+    /// This is what is used by a merge_insert that matches the whole schema and what
+    /// is used by the dataset updater.
+    ///
+    /// A horizontal update adds new columns.  In this case, the updated fragments
+    /// may have fields removed or added.  It is even possible for a field to be tombstoned
+    /// and then added back in the same update. (which is a field modification).  If any
+    /// fields are modified in this way then they need to be added to the fields_modified list.
+    /// This way we can correctly update the indices.
+    /// This is what is used by a merge insert that does not match the whole schema.
     Update {
         /// Ids of fragments that have been moved
         removed_fragment_ids: Vec<u64>,
@@ -185,6 +202,8 @@ pub enum Operation {
         updated_fragments: Vec<Fragment>,
         /// Fragments that have been added
         new_fragments: Vec<Fragment>,
+        /// The fields that have been modified
+        fields_modified: Vec<u32>,
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
@@ -199,7 +218,576 @@ pub enum Operation {
     },
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Append { .. } => write!(f, "Append"),
+            Self::Delete { .. } => write!(f, "Delete"),
+            Self::Overwrite { .. } => write!(f, "Overwrite"),
+            Self::CreateIndex { .. } => write!(f, "CreateIndex"),
+            Self::Rewrite { .. } => write!(f, "Rewrite"),
+            Self::Merge { .. } => write!(f, "Merge"),
+            Self::Restore { .. } => write!(f, "Restore"),
+            Self::ReserveFragments { .. } => write!(f, "ReserveFragments"),
+            Self::Update { .. } => write!(f, "Update"),
+            Self::Project { .. } => write!(f, "Project"),
+            Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
+            Self::DataReplacement { .. } => write!(f, "DataReplacement"),
+        }
+    }
+}
+
+impl PartialEq for Operation {
+    fn eq(&self, other: &Self) -> bool {
+        // Many of the operations contain `Vec<T>` where the order of the
+        // elements don't matter. So we need to compare them in a way that
+        // ignores the order of the elements.
+        // TODO: we can make it so the vecs are always constructed in order.
+        // Then we can use `==` instead of `compare_vec`.
+        fn compare_vec<T: PartialEq>(a: &[T], b: &[T]) -> bool {
+            a.len() == b.len() && a.iter().all(|f| b.contains(f))
+        }
+        match (self, other) {
+            (Self::Append { fragments: a }, Self::Append { fragments: b }) => compare_vec(a, b),
+            (
+                Self::Delete {
+                    updated_fragments: a_updated,
+                    deleted_fragment_ids: a_deleted,
+                    predicate: a_predicate,
+                },
+                Self::Delete {
+                    updated_fragments: b_updated,
+                    deleted_fragment_ids: b_deleted,
+                    predicate: b_predicate,
+                },
+            ) => {
+                compare_vec(a_updated, b_updated)
+                    && compare_vec(a_deleted, b_deleted)
+                    && a_predicate == b_predicate
+            }
+            (
+                Self::Overwrite {
+                    fragments: a_fragments,
+                    schema: a_schema,
+                    config_upsert_values: a_config,
+                },
+                Self::Overwrite {
+                    fragments: b_fragments,
+                    schema: b_schema,
+                    config_upsert_values: b_config,
+                },
+            ) => {
+                compare_vec(a_fragments, b_fragments)
+                    && a_schema == b_schema
+                    && a_config == b_config
+            }
+            (
+                Self::CreateIndex {
+                    new_indices: a_new,
+                    removed_indices: a_removed,
+                },
+                Self::CreateIndex {
+                    new_indices: b_new,
+                    removed_indices: b_removed,
+                },
+            ) => compare_vec(a_new, b_new) && compare_vec(a_removed, b_removed),
+            (
+                Self::Rewrite {
+                    groups: a_groups,
+                    rewritten_indices: a_indices,
+                    frag_reuse_index: a_frag_reuse_index,
+                },
+                Self::Rewrite {
+                    groups: b_groups,
+                    rewritten_indices: b_indices,
+                    frag_reuse_index: b_frag_reuse_index,
+                },
+            ) => {
+                compare_vec(a_groups, b_groups)
+                    && compare_vec(a_indices, b_indices)
+                    && a_frag_reuse_index == b_frag_reuse_index
+            }
+            (
+                Self::Merge {
+                    fragments: a_fragments,
+                    schema: a_schema,
+                },
+                Self::Merge {
+                    fragments: b_fragments,
+                    schema: b_schema,
+                },
+            ) => compare_vec(a_fragments, b_fragments) && a_schema == b_schema,
+            (Self::Restore { version: a }, Self::Restore { version: b }) => a == b,
+            (
+                Self::ReserveFragments { num_fragments: a },
+                Self::ReserveFragments { num_fragments: b },
+            ) => a == b,
+            (
+                Self::Update {
+                    removed_fragment_ids: a_removed,
+                    updated_fragments: a_updated,
+                    new_fragments: a_new,
+                    fields_modified: a_fields,
+                },
+                Self::Update {
+                    removed_fragment_ids: b_removed,
+                    updated_fragments: b_updated,
+                    new_fragments: b_new,
+                    fields_modified: b_fields,
+                },
+            ) => {
+                compare_vec(a_removed, b_removed)
+                    && compare_vec(a_updated, b_updated)
+                    && compare_vec(a_new, b_new)
+                    && compare_vec(a_fields, b_fields)
+            }
+            (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
+            (
+                Self::UpdateConfig {
+                    upsert_values: a_upsert,
+                    delete_keys: a_delete,
+                    schema_metadata: a_schema,
+                    field_metadata: a_field,
+                },
+                Self::UpdateConfig {
+                    upsert_values: b_upsert,
+                    delete_keys: b_delete,
+                    schema_metadata: b_schema,
+                    field_metadata: b_field,
+                },
+            ) => {
+                a_upsert == b_upsert
+                    && a_delete.as_ref().map(|v| {
+                        let mut v = v.clone();
+                        v.sort();
+                        v
+                    }) == b_delete.as_ref().map(|v| {
+                        let mut v = v.clone();
+                        v.sort();
+                        v
+                    })
+                    && a_schema == b_schema
+                    && a_field == b_field
+            }
+            (
+                Self::DataReplacement { replacements: a },
+                Self::DataReplacement { replacements: b },
+            ) => a.len() == b.len() && a.iter().all(|r| b.contains(r)),
+            // Handle all remaining combinations.
+            // We spell out all combinations explicitly to prevent
+            // us accidentally handling a new case in the wrong way.
+            (Self::Append { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Delete { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Overwrite { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::CreateIndex { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Rewrite { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Merge { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Restore { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::ReserveFragments { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Update { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::Project { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::UpdateConfig { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::DataReplacement { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct RewrittenIndex {
     pub old_id: Uuid,
     pub new_id: Uuid,
@@ -217,50 +805,17 @@ pub struct RewriteGroup {
     pub new_fragments: Vec<Fragment>,
 }
 
-impl Operation {
-    /// Returns the IDs of fragments that have been modified by this operation.
-    ///
-    /// This does not include new fragments.
-    fn modified_fragment_ids(&self) -> Box<dyn Iterator<Item = u64> + '_> {
-        match self {
-            // These operations add new fragments or don't modify any.
-            Self::Append { .. }
-            | Self::Overwrite { .. }
-            | Self::CreateIndex { .. }
-            | Self::ReserveFragments { .. }
-            | Self::Project { .. }
-            | Self::UpdateConfig { .. }
-            | Self::Restore { .. } => Box::new(std::iter::empty()),
-            Self::Delete {
-                updated_fragments,
-                deleted_fragment_ids,
-                ..
-            } => Box::new(
-                updated_fragments
-                    .iter()
-                    .map(|f| f.id)
-                    .chain(deleted_fragment_ids.iter().copied()),
-            ),
-            Self::Rewrite { groups, .. } => Box::new(
-                groups
-                    .iter()
-                    .flat_map(|f| f.old_fragments.iter().map(|f| f.id)),
-            ),
-            Self::Merge { fragments, .. } => Box::new(fragments.iter().map(|f| f.id)),
-            Self::Update {
-                updated_fragments,
-                removed_fragment_ids,
-                ..
-            } => Box::new(
-                updated_fragments
-                    .iter()
-                    .map(|f| f.id)
-                    .chain(removed_fragment_ids.iter().copied()),
-            ),
-            Self::DataReplacement { replacements } => Box::new(replacements.iter().map(|r| r.0)),
+impl PartialEq for RewriteGroup {
+    fn eq(&self, other: &Self) -> bool {
+        fn compare_vec<T: PartialEq>(a: &[T], b: &[T]) -> bool {
+            a.len() == b.len() && a.iter().all(|f| b.contains(f))
         }
+        compare_vec(&self.old_fragments, &other.old_fragments)
+            && compare_vec(&self.new_fragments, &other.new_fragments)
     }
+}
 
+impl Operation {
     /// Returns the config keys that have been upserted by this operation.
     fn get_upsert_config_keys(&self) -> Vec<String> {
         match self {
@@ -293,14 +848,7 @@ impl Operation {
         }
     }
 
-    /// Check whether another operation modifies the same fragment IDs as this one.
-    fn modifies_same_ids(&self, other: &Self) -> bool {
-        let self_ids = self.modified_fragment_ids().collect::<HashSet<_>>();
-        let mut other_ids = other.modified_fragment_ids();
-        other_ids.any(|id| self_ids.contains(&id))
-    }
-
-    fn modifies_same_metadata(&self, other: &Self) -> bool {
+    pub(crate) fn modifies_same_metadata(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::UpdateConfig {
@@ -333,7 +881,7 @@ impl Operation {
     }
 
     /// Check whether another operation upserts a key that is referenced by another operation
-    fn upsert_key_conflict(&self, other: &Self) -> bool {
+    pub(crate) fn upsert_key_conflict(&self, other: &Self) -> bool {
         let self_upsert_keys = self.get_upsert_config_keys();
         let other_upsert_keys = other.get_upsert_config_keys();
 
@@ -367,6 +915,21 @@ impl Operation {
 }
 
 impl Transaction {
+    pub fn new_from_version(read_version: u64, operation: Operation) -> Self {
+        let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
+        Self {
+            read_version,
+            uuid,
+            operation,
+            blobs_op: None,
+            tag: None,
+        }
+    }
+
+    pub fn with_blobs_op(self, blobs_op: Option<Operation>) -> Self {
+        Self { blobs_op, ..self }
+    }
+
     pub fn new(
         read_version: u64,
         operation: Operation,
@@ -380,152 +943,6 @@ impl Transaction {
             operation,
             blobs_op,
             tag,
-        }
-    }
-
-    /// Returns true if the transaction cannot be committed if the other
-    /// transaction is committed first.
-    pub fn conflicts_with(&self, other: &Self) -> bool {
-        // This assumes IsolationLevel is Snapshot Isolation, which is more
-        // permissive than Serializable. In particular, it allows a Delete
-        // transaction to succeed after a concurrent Append, even if the Append
-        // added rows that would be deleted.
-        match &self.operation {
-            Operation::Append { .. } => match &other.operation {
-                // Append is compatible with anything that doesn't change the schema
-                Operation::Append { .. } => false,
-                Operation::Rewrite { .. } => false,
-                Operation::CreateIndex { .. } => false,
-                Operation::Delete { .. } | Operation::Update { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                Operation::Project { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                Operation::DataReplacement { .. } => false,
-                _ => true,
-            },
-            Operation::Rewrite { .. } => match &other.operation {
-                // Rewrite is only compatible with operations that don't touch
-                // existing fragments.
-                // TODO: it could also be compatible with operations that update
-                // fragments we don't touch.
-                Operation::Append { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
-                    // As long as they rewrite disjoint fragments they shouldn't conflict.
-                    self.operation.modifies_same_ids(&other.operation)
-                }
-                Operation::Project { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                Operation::DataReplacement { .. } => {
-                    // TODO(rmeng): check that the fragments being replaced are not part of the groups
-                    true
-                }
-                _ => true,
-            },
-            // Restore always succeeds
-            Operation::Restore { .. } => false,
-            // ReserveFragments is compatible with anything that doesn't reset the
-            // max fragment id.
-            Operation::ReserveFragments { .. } => matches!(
-                &other.operation,
-                Operation::Overwrite { .. } | Operation::Restore { .. }
-            ),
-            Operation::CreateIndex { .. } => match &other.operation {
-                Operation::Append { .. } => false,
-                // Indices are identified by UUIDs, so they shouldn't conflict.
-                Operation::CreateIndex { .. } => false,
-                // Although some of the rows we indexed may have been deleted / moved,
-                // row ids are still valid, so we allow this optimistically.
-                Operation::Delete { .. } | Operation::Update { .. } => false,
-                // Merge & reserve don't change row ids, so this should be fine.
-                Operation::Merge { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                // Rewrite likely changed many of the row ids, so our index is
-                // likely useless. It should be rebuilt.
-                // TODO: we could be smarter here and only invalidate the index
-                // if the rewrite changed more than X% of row ids.
-                Operation::Rewrite { .. } => true,
-                Operation::UpdateConfig { .. } => false,
-                Operation::DataReplacement { .. } => {
-                    // TODO(rmeng): check that the new indices isn't on the column being replaced
-                    true
-                }
-                _ => true,
-            },
-            Operation::Delete { .. } | Operation::Update { .. } => match &other.operation {
-                Operation::CreateIndex { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
-                    // If we update the same fragments, we conflict.
-                    self.operation.modifies_same_ids(&other.operation)
-                }
-                Operation::Project { .. } => false,
-                Operation::Append { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
-            },
-            Operation::Overwrite { .. } => match &other.operation {
-                // Overwrite only conflicts with another operation modifying the same update config
-                Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
-                    self.operation.upsert_key_conflict(&other.operation)
-                }
-                _ => false,
-            },
-            Operation::UpdateConfig {
-                schema_metadata,
-                field_metadata,
-                ..
-            } => match &other.operation {
-                Operation::Overwrite { .. } => {
-                    // Updates to schema metadata or field metadata conflict with any kind
-                    // of overwrite.
-                    if schema_metadata.is_some() || field_metadata.is_some() {
-                        true
-                    } else {
-                        self.operation.upsert_key_conflict(&other.operation)
-                    }
-                }
-                Operation::UpdateConfig { .. } => {
-                    self.operation.upsert_key_conflict(&other.operation)
-                        | self.operation.modifies_same_metadata(&other.operation)
-                }
-                _ => false,
-            },
-            // Merge changes the schema, but preserves row ids, so the only operations
-            // it's compatible with is CreateIndex, ReserveFragments, SetMetadata and DeleteMetadata.
-            Operation::Merge { .. } => !matches!(
-                &other.operation,
-                Operation::CreateIndex { .. }
-                    | Operation::ReserveFragments { .. }
-                    | Operation::UpdateConfig { .. }
-            ),
-            Operation::Project { .. } => match &other.operation {
-                // Project is compatible with anything that doesn't change the schema
-                Operation::CreateIndex { .. } => false,
-                Operation::Overwrite { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
-            },
-            Operation::DataReplacement { .. } => match &other.operation {
-                Operation::Append { .. }
-                | Operation::Delete { .. }
-                | Operation::Update { .. }
-                | Operation::Merge { .. }
-                | Operation::UpdateConfig { .. } => false,
-                Operation::CreateIndex { .. } => {
-                    // TODO(rmeng): check that the new indices isn't on the column being replaced
-                    true
-                }
-                Operation::Rewrite { .. } => {
-                    // TODO(rmeng): check that the fragments being replaced are not part of the groups
-                    true
-                }
-                Operation::DataReplacement { .. } => {
-                    // TODO(rmeng): check cell conflicts
-                    true
-                }
-                _ => true,
-            },
         }
     }
 
@@ -582,7 +999,7 @@ impl Transaction {
         let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
         manifest.transaction_file = Some(tx_path.to_string());
-        let indices = read_manifest_indexes(object_store, &location.path, &manifest).await?;
+        let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
         Ok((manifest, indices))
     }
 
@@ -698,6 +1115,7 @@ impl Transaction {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
+                fields_modified,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.iter().filter_map(|f| {
                     if removed_fragment_ids.contains(&f.id) {
@@ -709,6 +1127,14 @@ impl Transaction {
                         Some(f.clone())
                     }
                 }));
+
+                // If we updated any fields, remove those fragments from indices covering those fields
+                Self::prune_updated_fields_from_indices(
+                    &mut final_indices,
+                    updated_fragments,
+                    fields_modified,
+                );
+
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
@@ -731,6 +1157,7 @@ impl Transaction {
             Operation::Rewrite {
                 ref groups,
                 ref rewritten_indices,
+                ref frag_reuse_index,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
@@ -752,6 +1179,11 @@ impl Transaction {
                     }
                 } else {
                     Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+                }
+
+                if let Some(frag_reuse_index) = frag_reuse_index {
+                    final_indices.retain(|idx| idx.name != frag_reuse_index.name);
+                    final_indices.push(frag_reuse_index.clone());
                 }
             }
             Operation::CreateIndex {
@@ -861,8 +1293,9 @@ impl Transaction {
                             && file.file_major_version == new_file.file_major_version
                             && file.file_minor_version == new_file.file_minor_version
                         {
-                            // assign the new file path to the fragment
+                            // assign the new file path / size to the fragment
                             file.path = new_file.path.clone();
+                            file.file_size_bytes = new_file.file_size_bytes.clone();
                         }
                         columns_covered.extend(file.fields.iter());
                     }
@@ -879,6 +1312,7 @@ impl Transaction {
                                 new_file.file_minor_version,
                             )
                             .expect("Expected valid file version"),
+                            new_file.file_size_bytes.get(),
                         );
                     }
 
@@ -1006,6 +1440,35 @@ impl Transaction {
         Ok((manifest, final_indices))
     }
 
+    /// If an operation modifies one or more fields in a fragment then we need to remove
+    /// that fragment from any indices that cover one of the modified fields.
+    fn prune_updated_fields_from_indices(
+        indices: &mut [Index],
+        updated_fragments: &[Fragment],
+        fields_modified: &[u32],
+    ) {
+        if fields_modified.is_empty() {
+            return;
+        }
+
+        // If we modified any fields in the fragments then we need to remove those fragments
+        // from the index if the index covers one of those modified fields.
+        let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();
+        for index in indices.iter_mut() {
+            if index
+                .fields
+                .iter()
+                .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
+            {
+                if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
+                    for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
+                        fragment_bitmap.remove(fragment_id);
+                    }
+                }
+            }
+        }
+    }
+
     fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, fragments: &[Fragment]) {
         let field_ids = schema
             .fields_pre_order()
@@ -1016,17 +1479,20 @@ impl Transaction {
                 .fields
                 .iter()
                 .all(|field_id| field_ids.contains(field_id))
+                || existing_index.name == FRAG_REUSE_INDEX_NAME
         });
+
+        let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
 
         // We might have also removed all fragments that an index was covering, so
         // we should remove those indices as well.
-        let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
         indices.retain(|existing_index| {
             existing_index
                 .fragment_bitmap
                 .as_ref()
                 .map(|bitmap| bitmap.iter().any(|id| fragment_ids.contains(&(id as u64))))
                 .unwrap_or(true)
+                || existing_index.name == FRAG_REUSE_INDEX_NAME
         });
     }
 
@@ -1270,6 +1736,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 Operation::Rewrite {
                     groups,
                     rewritten_indices,
+                    frag_reuse_index: None,
                 }
             }
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
@@ -1303,6 +1770,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
+                fields_modified,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -1313,6 +1781,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
+                fields_modified,
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -1508,6 +1977,7 @@ impl From<&Transaction> for pb::Transaction {
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
+                frag_reuse_index: _,
             } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 groups: groups
                     .iter()
@@ -1540,6 +2010,7 @@ impl From<&Transaction> for pb::Transaction {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
+                fields_modified,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
@@ -1547,6 +2018,7 @@ impl From<&Transaction> for pb::Transaction {
                     .map(pb::DataFragment::from)
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
+                fields_modified: fields_modified.clone(),
             }),
             Operation::Project { schema } => {
                 pb::transaction::Operation::Project(pb::transaction::Project {
@@ -1732,301 +2204,6 @@ fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_conflicts() {
-        let index0 = Index {
-            uuid: uuid::Uuid::new_v4(),
-            name: "test".to_string(),
-            fields: vec![0],
-            dataset_version: 1,
-            fragment_bitmap: None,
-            index_details: None,
-        };
-        let fragment0 = Fragment::new(0);
-        let fragment1 = Fragment::new(1);
-        let fragment2 = Fragment::new(2);
-        // The transactions that will be checked against
-        let other_operations = [
-            Operation::Append {
-                fragments: vec![fragment0.clone()],
-            },
-            Operation::CreateIndex {
-                new_indices: vec![index0.clone()],
-                removed_indices: vec![index0.clone()],
-            },
-            Operation::Delete {
-                updated_fragments: vec![fragment0.clone()],
-                deleted_fragment_ids: vec![2],
-                predicate: "x > 2".to_string(),
-            },
-            Operation::Merge {
-                fragments: vec![fragment0.clone(), fragment2.clone()],
-                schema: Schema::default(),
-            },
-            Operation::Overwrite {
-                fragments: vec![fragment0.clone(), fragment2.clone()],
-                schema: Schema::default(),
-                config_upsert_values: Some(HashMap::from_iter(vec![(
-                    "overwrite-key".to_string(),
-                    "value".to_string(),
-                )])),
-            },
-            Operation::Rewrite {
-                groups: vec![RewriteGroup {
-                    old_fragments: vec![fragment0.clone()],
-                    new_fragments: vec![fragment1.clone()],
-                }],
-                rewritten_indices: vec![],
-            },
-            Operation::ReserveFragments { num_fragments: 3 },
-            Operation::Update {
-                removed_fragment_ids: vec![1],
-                updated_fragments: vec![fragment0.clone()],
-                new_fragments: vec![fragment2.clone()],
-            },
-            Operation::UpdateConfig {
-                upsert_values: Some(HashMap::from_iter(vec![(
-                    "lance.test".to_string(),
-                    "value".to_string(),
-                )])),
-                delete_keys: Some(vec!["remove-key".to_string()]),
-                schema_metadata: Some(HashMap::from_iter(vec![(
-                    "schema-key".to_string(),
-                    "schema-value".to_string(),
-                )])),
-                field_metadata: Some(HashMap::from_iter(vec![(
-                    0,
-                    HashMap::from_iter(vec![("field-key".to_string(), "field-value".to_string())]),
-                )])),
-            },
-        ];
-        let other_transactions = other_operations
-            .iter()
-            .map(|op| Transaction::new(0, op.clone(), None, None))
-            .collect::<Vec<_>>();
-
-        // Transactions and whether they are expected to conflict with each
-        // of other_transactions
-        let cases = [
-            (
-                Operation::Append {
-                    fragments: vec![fragment0.clone()],
-                },
-                [false, false, false, true, true, false, false, false, false],
-            ),
-            (
-                Operation::Delete {
-                    // Delete that affects fragments different from other transactions
-                    updated_fragments: vec![fragment1.clone()],
-                    deleted_fragment_ids: vec![],
-                    predicate: "x > 2".to_string(),
-                },
-                [false, false, false, true, true, false, false, true, false],
-            ),
-            (
-                Operation::Delete {
-                    // Delete that affects same fragments as other transactions
-                    updated_fragments: vec![fragment0.clone(), fragment2.clone()],
-                    deleted_fragment_ids: vec![],
-                    predicate: "x > 2".to_string(),
-                },
-                [false, false, true, true, true, true, false, true, false],
-            ),
-            (
-                Operation::Overwrite {
-                    fragments: vec![fragment0.clone(), fragment2.clone()],
-                    schema: Schema::default(),
-                    config_upsert_values: None,
-                },
-                // No conflicts: overwrite can always happen since it doesn't
-                // depend on previous state of the table.
-                [
-                    false, false, false, false, false, false, false, false, false,
-                ],
-            ),
-            (
-                Operation::CreateIndex {
-                    new_indices: vec![index0.clone()],
-                    removed_indices: vec![index0],
-                },
-                // Will only conflict with operations that modify row ids.
-                [false, false, false, false, true, true, false, false, false],
-            ),
-            (
-                // Rewrite that affects different fragments
-                Operation::Rewrite {
-                    groups: vec![RewriteGroup {
-                        old_fragments: vec![fragment1],
-                        new_fragments: vec![fragment0.clone()],
-                    }],
-                    rewritten_indices: Vec::new(),
-                },
-                [false, true, false, true, true, false, false, true, false],
-            ),
-            (
-                // Rewrite that affects the same fragments
-                Operation::Rewrite {
-                    groups: vec![RewriteGroup {
-                        old_fragments: vec![fragment0.clone(), fragment2.clone()],
-                        new_fragments: vec![fragment0.clone()],
-                    }],
-                    rewritten_indices: Vec::new(),
-                },
-                [false, true, true, true, true, true, false, true, false],
-            ),
-            (
-                Operation::Merge {
-                    fragments: vec![fragment0.clone(), fragment2.clone()],
-                    schema: Schema::default(),
-                },
-                // Merge conflicts with everything except CreateIndex and ReserveFragments.
-                [true, false, true, true, true, true, false, true, false],
-            ),
-            (
-                Operation::ReserveFragments { num_fragments: 2 },
-                // ReserveFragments only conflicts with Overwrite and Restore.
-                [false, false, false, false, true, false, false, false, false],
-            ),
-            (
-                Operation::Update {
-                    // Update that affects same fragments as other transactions
-                    updated_fragments: vec![fragment0],
-                    removed_fragment_ids: vec![],
-                    new_fragments: vec![fragment2],
-                },
-                [false, false, true, true, true, true, false, true, false],
-            ),
-            (
-                // Update config that should not conflict with anything
-                Operation::UpdateConfig {
-                    upsert_values: Some(HashMap::from_iter(vec![(
-                        "other-key".to_string(),
-                        "new-value".to_string(),
-                    )])),
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
-                [
-                    false, false, false, false, false, false, false, false, false,
-                ],
-            ),
-            (
-                // Update config that conflicts with key being upserted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: Some(HashMap::from_iter(vec![(
-                        "lance.test".to_string(),
-                        "new-value".to_string(),
-                    )])),
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
-                [false, false, false, false, false, false, false, false, true],
-            ),
-            (
-                // Update config that conflicts with key being deleted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: Some(HashMap::from_iter(vec![(
-                        "remove-key".to_string(),
-                        "new-value".to_string(),
-                    )])),
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
-                [false, false, false, false, false, false, false, false, true],
-            ),
-            (
-                // Delete config keys currently being deleted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: Some(vec!["remove-key".to_string()]),
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
-                [
-                    false, false, false, false, false, false, false, false, false,
-                ],
-            ),
-            (
-                // Delete config keys currently being upserted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: Some(vec!["lance.test".to_string()]),
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
-                [false, false, false, false, false, false, false, false, true],
-            ),
-            (
-                // Changing schema metadata conflicts with another update changing schema
-                // metadata or with an overwrite
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: None,
-                    schema_metadata: Some(HashMap::from_iter(vec![(
-                        "schema-key".to_string(),
-                        "new-value".to_string(),
-                    )])),
-                    field_metadata: None,
-                },
-                [false, false, false, false, true, false, false, false, true],
-            ),
-            (
-                // Changing field metadata conflicts with another update changing same field
-                // metadata or overwrite
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: Some(HashMap::from_iter(vec![(
-                        0,
-                        HashMap::from_iter(vec![(
-                            "field_key".to_string(),
-                            "field_value".to_string(),
-                        )]),
-                    )])),
-                },
-                [false, false, false, false, true, false, false, false, true],
-            ),
-            (
-                // Updates to different field metadata are allowed
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: Some(HashMap::from_iter(vec![(
-                        1,
-                        HashMap::from_iter(vec![(
-                            "field_key".to_string(),
-                            "field_value".to_string(),
-                        )]),
-                    )])),
-                },
-                [false, false, false, false, true, false, false, false, false],
-            ),
-        ];
-
-        for (operation, expected_conflicts) in &cases {
-            let transaction = Transaction::new(0, operation.clone(), None, None);
-            for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
-                assert_eq!(
-                    transaction.conflicts_with(other),
-                    *expected_conflict,
-                    "Transaction {:?} should {} with {:?}",
-                    transaction,
-                    if *expected_conflict {
-                        "conflict"
-                    } else {
-                        "not conflict"
-                    },
-                    other
-                );
-            }
-        }
-    }
 
     #[test]
     fn test_rewrite_fragments() {

@@ -86,10 +86,13 @@ impl FromPyObject<'_> for PyLance<Operation> {
 
                 let new_fragments = extract_vec(&ob.getattr("new_fragments")?)?;
 
+                let fields_modified = ob.getattr("fields_modified")?.extract()?;
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
+                    fields_modified,
                 };
                 Ok(Self(op))
             }
@@ -115,6 +118,8 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let op = Operation::Rewrite {
                     groups,
                     rewritten_indices,
+                    // TODO: pass frag_reuse_index when available
+                    frag_reuse_index: None,
                 };
                 Ok(Self(op))
             }
@@ -123,7 +128,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let name = ob.getattr("name")?.extract()?;
                 let fields = ob.getattr("fields")?.extract()?;
                 let dataset_version = ob.getattr("dataset_version")?.extract()?;
-
+                let index_version = ob.getattr("index_version")?.extract()?;
                 let fragment_ids = ob.getattr("fragment_ids")?;
                 let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.downcast()?;
                 let fragment_ids = fragment_ids_ref
@@ -142,6 +147,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     // TODO: we should use lance::dataset::Dataset::commit_existing_index once
                     // we have a way to determine index details from an existing index.
                     index_details: None,
+                    index_version,
                 }];
 
                 let op = Operation::CreateIndex {
@@ -208,14 +214,21 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
+                fields_modified,
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
                 let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
                 let new_fragments = export_vec(py, new_fragments.as_slice())?;
+                let fields_modified = fields_modified.into_pyobject(py)?;
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
-                cls.call1((removed_fragment_ids, updated_fragments, new_fragments))
+                cls.call1((
+                    removed_fragment_ids,
+                    updated_fragments,
+                    new_fragments,
+                    fields_modified,
+                ))
             }
             Operation::DataReplacement { replacements } => {
                 let replacements = export_vec(py, replacements.as_slice())?;

@@ -29,6 +29,7 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.ByteArrayInputStream;
@@ -201,7 +202,7 @@ public class Dataset implements Closeable {
             options.getVersion(),
             options.getBlockSize(),
             options.getIndexCacheSize(),
-            options.getMetadataCacheSize(),
+            options.getMetadataCacheSizeBytes(),
             options.getStorageOptions());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
@@ -213,7 +214,7 @@ public class Dataset implements Closeable {
       Optional<Integer> version,
       Optional<Integer> blockSize,
       int indexCacheSize,
-      int metadataCacheSize,
+      int metadataCacheSizeBytes,
       Map<String, String> storageOptions);
 
   /**
@@ -303,6 +304,34 @@ public class Dataset implements Closeable {
 
   private native void nativeAddColumnsByReader(
       long arrowStreamMemoryAddress, Optional<Long> batchSize);
+
+  /**
+   * Add columns to the dataset.
+   *
+   * @param schema The Arrow schema definitions to add columns.
+   */
+  public void addColumns(Schema schema) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(schema != null, "Schema is empty");
+      try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportSchema(allocator, schema, null, arrowSchema);
+        nativeAddColumnsBySchema(arrowSchema.memoryAddress());
+      }
+    }
+  }
+
+  /**
+   * Add columns to the dataset.
+   *
+   * @param fields The Arrow field definitions to add columns.
+   */
+  public void addColumns(List<Field> fields) {
+    Preconditions.checkArgument(fields != null && !fields.isEmpty(), "Fields are empty");
+    addColumns(new Schema(fields));
+  }
+
+  private native void nativeAddColumnsBySchema(long schemaPtr);
 
   /**
    * Drop columns from the dataset.
@@ -420,28 +449,108 @@ public class Dataset implements Closeable {
   private native String nativeUri();
 
   /**
+   * Get the currently checked out version id of the dataset
+   *
+   * @return the version id of the dataset
+   */
+  public long version() {
+    return getVersion().getId();
+  }
+
+  /**
    * Gets the currently checked out version of the dataset.
    *
    * @return the version of the dataset
    */
-  public long version() {
+  public Version getVersion() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeVersion();
+      return nativeGetVersion();
     }
   }
 
-  private native long nativeVersion();
+  private native Version nativeGetVersion();
+
+  /**
+   * Get the version history of the dataset.
+   *
+   * @return the version history of the dataset
+   */
+  public List<Version> listVersions() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeListVersions();
+    }
+  }
+
+  private native List<Version> nativeListVersions();
 
   /** @return the latest version of the dataset. */
   public long latestVersion() {
-    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeLatestVersion();
+      return nativeGetLatestVersionId();
     }
   }
 
-  private native long nativeLatestVersion();
+  private native long nativeGetLatestVersionId();
+
+  /** Checkout the dataset to the latest version. */
+  public void checkoutLatest() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeCheckoutLatest();
+    }
+  }
+
+  private native void nativeCheckoutLatest();
+
+  /**
+   * Checks out a specific version of the dataset. If the version is already checked out, it returns
+   * a new Java Dataset object pointing to the same underlying Rust Dataset object
+   *
+   * @param version the version to check out
+   * @return a new Dataset instance with the specified version checked out
+   */
+  public Dataset checkoutVersion(long version) {
+    Preconditions.checkArgument(version > 0, "version number must be greater than 0");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCheckoutVersion(version);
+    }
+  }
+
+  private native Dataset nativeCheckoutVersion(long version);
+
+  /**
+   * Checks out a specific tag of the dataset. If the underlying version is already checked out, it
+   * returns a new Java Dataset object pointing to the same underlying Rust Dataset object
+   *
+   * @param tag
+   * @return
+   */
+  public Dataset checkoutTag(String tag) {
+    Preconditions.checkArgument(tag != null, "Tag can not be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCheckoutTag(tag);
+    }
+  }
+
+  private native Dataset nativeCheckoutTag(String tag);
+
+  /**
+   * Restore the currently checked out version of the dataset as the latest version. This operation
+   * produces a new version and doesn't influence any old versions and tags.
+   */
+  public void restore() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeRestore();
+    }
+  }
+
+  private native void nativeRestore();
 
   /**
    * Creates a new index on the dataset. Only vector indexes are supported.
@@ -607,4 +716,91 @@ public class Dataset implements Closeable {
   }
 
   private native FragmentMetadata getFragmentNative(int fragmentId);
+
+  /**
+   * Returns a {@link Tags} instance for performing tag-related operations on the dataset.
+   *
+   * @return new {@code Tags} instance for dataset tag operations
+   * @see Tags
+   */
+  public Tags tags() {
+    return new Tags();
+  }
+
+  /** Tag operations of the dataset. */
+  public class Tags {
+
+    /**
+     * Create a new tag for this dataset.
+     *
+     * @param tag the tag name
+     * @param version the version to tag
+     */
+    public void create(String tag, long version) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeCreateTag(tag, version);
+      }
+    }
+
+    /**
+     * Delete a tag from this dataset.
+     *
+     * @param tag the tag name
+     */
+    public void delete(String tag) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeDeleteTag(tag);
+      }
+    }
+
+    /**
+     * Update a tag to a new version for the dataset.
+     *
+     * @param tag the tag name
+     * @param version the version to tag
+     */
+    public void update(String tag, long version) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeUpdateTag(tag, version);
+      }
+    }
+
+    /**
+     * List all tags of the dataset.
+     *
+     * @return a list of tags
+     */
+    public List<Tag> list() {
+      try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        return nativeListTags();
+      }
+    }
+
+    /**
+     * Get the version of a tag in the dataset.
+     *
+     * @param tag the tag name
+     * @return the version of the tag
+     */
+    public long getVersion(String tag) {
+      try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        return nativeGetVersionByTag(tag);
+      }
+    }
+  }
+
+  private native void nativeCreateTag(String tag, long version);
+
+  private native void nativeDeleteTag(String tag);
+
+  private native void nativeUpdateTag(String tag, long version);
+
+  private native List<Tag> nativeListTags();
+
+  private native long nativeGetVersionByTag(String tag);
 }

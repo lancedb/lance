@@ -123,6 +123,19 @@ pub async fn maybe_sample_training_data(
     })?;
     let is_nullable = vector_field.nullable;
 
+    let sample_size_hint = match vector_field.data_type() {
+        arrow::datatypes::DataType::List(_) => {
+            // for multivector, we need `sample_size_hint` vectors for training,
+            // but each multivector is a list of vectors, but we don't know how many
+            // vectors are in each multivector. For now we just assume there are 1030 vectors
+            // in each multivector (Copali case).
+            // Set a minimum sample size of 128 to avoid too small samples,
+            // it's not a problem because 128 multivectors is just about 64 MiB
+            sample_size_hint.div_ceil(1030).max(128)
+        }
+        _ => sample_size_hint,
+    };
+
     let batch = if num_rows > sample_size_hint && !is_nullable {
         let projection = dataset.schema().project(&[column])?;
         let batch = dataset.sample(sample_size_hint, &projection).await?;
@@ -193,7 +206,14 @@ pub async fn maybe_sample_training_data(
             "Sample training data: retrieved {} rows by sampling after filtering out nulls",
             batch.num_rows()
         );
-        batch
+
+        // it's possible that we have more rows than sample_size_hint for this case,
+        // truncate the batch to sample_size_hint
+        if batch.num_rows() > sample_size_hint {
+            batch.slice(0, sample_size_hint)
+        } else {
+            batch
+        }
     } else {
         let mut scanner = dataset.scan();
         scanner.project(&[column])?;

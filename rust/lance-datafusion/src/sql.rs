@@ -112,7 +112,10 @@ fn parse_statement(statement: &str) -> Result<Statement> {
 mod tests {
     use super::*;
 
-    use datafusion::sql::sqlparser::ast::{BinaryOperator, Ident, Value};
+    use datafusion::sql::sqlparser::{
+        ast::{BinaryOperator, Ident, Value, ValueWithSpan},
+        tokenizer::Span,
+    };
 
     #[test]
     fn test_double_equal() {
@@ -134,7 +137,10 @@ mod tests {
             Expr::Like {
                 negated: false,
                 expr: Box::new(Expr::Identifier(Ident::new("a"))),
-                pattern: Box::new(Expr::Value(Value::SingleQuotedString("abc%".to_string()))),
+                pattern: Box::new(Expr::Value(ValueWithSpan {
+                    value: Value::SingleQuotedString("abc%".to_string()),
+                    span: Span::empty(),
+                })),
                 escape_char: None,
                 any: false,
             },
@@ -163,7 +169,10 @@ mod tests {
                     Ident::with_quote('`', "inner field")
                 ])),
                 op: BinaryOperator::Eq,
-                right: Box::new(Expr::Value(Value::Number("1".to_string(), false))),
+                right: Box::new(Expr::Value(ValueWithSpan {
+                    value: Value::Number("1".to_string(), false),
+                    span: Span::empty(),
+                })),
             },
             expr
         );

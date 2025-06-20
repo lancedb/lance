@@ -23,8 +23,15 @@ it takes just one line of Python to convert a HuggingFace dataset to a Lance dat
     lance.write_dataset(hf_ds, "diffusiondb_train.lance")
 
 Then, you can use the Lance dataset in PyTorch training and inference loops.
-Not that the PyTorch dataset automatically convert data into :class:`torch.Tensor`
 
+Note:
+
+1. the PyTorch dataset automatically convert data into :class:`torch.Tensor`
+
+2. lance is not fork-safe. If you are using multiprocessing, use spawn instead.
+The safe dataloader uses the spawning method.
+
+* UnSafe Dataloader
 .. code-block:: python
 
     import torch
@@ -47,6 +54,26 @@ Not that the PyTorch dataset automatically convert data into :class:`torch.Tenso
         inputs, targets = batch["prompt"], batch["image"]
         outputs = model(inputs)
         ...
+
+
+* Safe Dataloader
+.. code-block:: python
+
+    from lance.torch.data import SafeLanceDataset, get_safe_loader
+
+    dataset = SafeLanceDataset(temp_lance_dataset)
+    # use spawn method to avoid fork-safe issue
+    loader = get_safe_loader(
+        dataset,
+        num_workers=2,
+        batch_size=16,
+        drop_last=False,
+    )
+
+    total_samples = 0
+    for batch in loader:
+        total_samples += batch["id"].shape[0]
+
 
 :class:`~lance.torch.data.LanceDataset` can composite with the :class:`~lance.sampler.Sampler` classes
 to control the sampling strategy. For example, you can use :class:`~lance.sampler.ShardedFragmentSampler`

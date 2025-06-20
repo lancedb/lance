@@ -6,7 +6,6 @@ use std::sync::Arc;
 use arrow_array::{types::ArrowPrimitiveType, FixedSizeListArray, PrimitiveArray};
 use lance_arrow::FixedSizeListArrayExt;
 use log::info;
-use rand::{seq::IteratorRandom, Rng};
 use snafu::location;
 
 use lance_core::{Error, Result};
@@ -25,18 +24,16 @@ use lance_linalg::{
 /// - *k*: number of clusters
 /// - *max_iterations*: maximum number of iterations
 /// - *redos*: number of times to redo the k-means clustering
-/// - *rng*: random number generator
 /// - *distance_type*: distance type to compute pair-wise vector distance
 /// - *sample_rate*: sample rate to select the data for training
 #[allow(clippy::too_many_arguments)]
 pub fn train_kmeans<T: ArrowPrimitiveType>(
     centroids: Option<Arc<FixedSizeListArray>>,
-    array: &[T::Native],
+    array: &PrimitiveArray<T>,
     dimension: usize,
     k: usize,
     max_iterations: u32,
     redos: usize,
-    mut rng: impl Rng,
     distance_type: DistanceType,
     sample_rate: usize,
 ) -> Result<KMeans>
@@ -61,15 +58,9 @@ where
             k,
         );
         let sample_size = sample_rate * k;
-        let chosen = (0..num_rows).choose_multiple(&mut rng, sample_size);
-        let mut builder = Vec::with_capacity(sample_size * dimension);
-        for idx in chosen.iter() {
-            let s = &array[idx * dimension..(idx + 1) * dimension];
-            builder.extend_from_slice(s);
-        }
-        PrimitiveArray::<T>::from(builder)
+        array.slice(0, sample_size * dimension)
     } else {
-        PrimitiveArray::<T>::from(array.to_vec())
+        array.clone()
     };
 
     let params = KMeansParams::new(centroids, max_iterations, redos, distance_type);

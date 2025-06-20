@@ -452,7 +452,7 @@ async fn add_columns_from_stream(
 
 /// Modify columns in the dataset, changing their name, type, or nullability.
 ///
-/// If a column has an index, it's index will be preserved.
+/// If a column has an index, its index will be preserved.
 pub(super) async fn alter_columns(
     dataset: &mut Dataset,
     alterations: &[ColumnAlteration],

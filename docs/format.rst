@@ -264,6 +264,63 @@ Would be represented as the following field list:
      - 2
      - ``"int32"``
 
+* Field Encoding Specification
+
+Column-level encoding configurations are specified through PyArrow field metadata:
+
+.. code-block::
+
+    import pyarrow as pa
+
+    schema = pa.schema([
+        pa.field(
+            "compressible_strings",
+            pa.string(),
+            metadata={
+                "lance-encoding:compression": "zstd",
+                "lance-encoding:compression-level": "3",
+                "lance-encoding:structural-encoding": "miniblock",
+                "lance-encoding:packed": "true"
+            }
+        )
+    ])
+
+
+.. list-table::
+   :widths: 20 20 20 20 25
+   :header-rows: 1
+
+   * - Metadata Key
+     - Type
+     - Description
+     - Example Values
+     - Example Usage (Python)
+   * - ``lance-encoding:compression``
+     - Compression
+     - Specifies compression algorithm
+     - zstd
+     - ``metadata={"lance-encoding:compression": "zstd"}``
+   * - ``lance-encoding:compression-level``
+     - Compression
+     - Zstd compression level (1-22)
+     - 3
+     - ``metadata={"lance-encoding:compression-level": "3"}``
+   * - ``lance-encoding:blob``
+     - Storage
+     - Marks binary data (>4MB) for chunked storage
+     - true/false
+     - ``metadata={"lance-encoding:blob": "true"}``
+   * - ``lance-encoding:packed``
+     - Optimization
+     - Struct memory layout optimization
+     - true/false
+     - ``metadata={"lance-encoding:packed": "true"}``
+   * - ``lance-encoding:structural-encoding``
+     - Nested Data
+     - Encoding strategy for nested structures
+     - miniblock/fullzip
+     - ``metadata={"lance-encoding:structural-encoding": "miniblock"}``
+
 
 Dataset Update and Schema Evolution
 -----------------------------------
@@ -335,9 +392,9 @@ must be atomic and consistent for all writers. If two writers try to commit
 using different mechanisms, they may overwrite each other's changes. For any
 storage system that natively supports atomic rename-if-not-exists or
 put-if-not-exists, these operations should be used. This is true of local file
-systems and cloud object stores, with the notable except of AWS S3. For ones
-that lack this functionality, an external locking mechanism can be configured
-by the user.
+systems and most cloud object stores including Amazon S3, Google Cloud Storage,
+Microsoft Azure Blob Storage. For ones that lack this functionality,
+an external locking mechanism can be configured by the user.
 
 Manifest Naming Schemes
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -365,7 +422,7 @@ Conflict resolution
 
 If two writers try to commit at the same time, one will succeed and the other
 will fail. The failed writer should attempt to retry the commit, but only if
-it's changes are compatible with the changes made by the successful writer.
+its changes are compatible with the changes made by the successful writer.
 
 The changes for a given commit are recorded as a transaction file, under the
 ``_transactions`` prefix in the dataset directory. The transaction file is a
@@ -378,7 +435,7 @@ The commit process is as follows:
 
  1. The writer finishes writing all data files.
  2. The writer creates a transaction file in the ``_transactions`` directory.
-    This files describes the operations that were performed, which is used for two
+    This file describes the operations that were performed, which is used for two
     purposes: (1) to detect conflicts, and (2) to re-build the manifest during
     retries.
  3. Look for any new commits since the writer started writing. If there are any,
@@ -416,7 +473,7 @@ The commit process is as follows:
 Note that the commit is effectively complete after step 2. If the writer fails
 after step 2, a reader will be able to detect the external store and object store
 are out-of-sync, and will try to synchronize the two stores. If the reattempt at
-synchronization fails, the reader will refuse to load. This is to ensure the that
+synchronization fails, the reader will refuse to load. This is to ensure that
 the dataset is always portable by copying the dataset directory without special
 tool.
 
@@ -445,7 +502,7 @@ Statistic values
 Three types of statistics are stored per column: null count, min value, max value.
 The min and max values are stored as their native data types in arrays.
 
-There are special behavior for different data types to account for nulls:
+There are special behaviors for different data types to account for nulls:
 
 For integer-based data types (including signed and unsigned integers, dates,
 and timestamps), if the min and max are unknown (all values are null), then the
@@ -542,7 +599,7 @@ If the commit fails, the writer will re-read the new ``next_row_id``, update
 the new row ids, and then try again. This is similar to how the ``max_fragment_id``
 is used to assign new fragment ids.
 
-When a row id updated, it it typically assigned a new row id rather than
+When a row id updated, it is typically assigned a new row id rather than
 reusing the old one. This is because this feature doesn't have a mechanism to
 update secondary indices that may reference the old values for the row id. By
 deleting the old row id and creating a new one, the secondary indices will avoid

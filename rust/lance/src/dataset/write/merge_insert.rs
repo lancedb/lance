@@ -16,9 +16,12 @@
 //! key columns are identical in both the source and the target.  This means that you will need some kind of
 //! meaningful key column to be able to perform a merge insert.
 
+use futures::FutureExt;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
+    future::Future,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use arrow_array::{
@@ -52,13 +55,17 @@ use lance_datafusion::{
 
 use datafusion_physical_expr::expressions::Column;
 use futures::{
+    future::Either,
     stream::{self},
-    Stream, StreamExt, TryStreamExt,
+    Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::{
+        backoff::SlotBackoff, futures::Capacity, mask::RowIdTreeMap,
+        tokio::get_num_compute_intensive_cpus,
+    },
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -66,7 +73,7 @@ use lance_datafusion::{
     utils::StreamingWriteSource,
 };
 use lance_file::version::LanceFileVersion;
-use lance_index::DatasetIndexExt;
+use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
 use lance_table::format::{Fragment, Index};
 use log::info;
 use roaring::RoaringTreemap;
@@ -224,10 +231,13 @@ struct MergeInsertParams {
     insert_not_matched: bool,
     // Controls whether data that is not matched by the source is deleted or not
     delete_not_matched_by_source: WhenNotMatchedBySource,
+    conflict_retries: u32,
+    retry_timeout: Duration,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
 /// part of a single transaction.
+#[derive(Clone)]
 pub struct MergeInsertJob {
     // The column to merge the new data into
     dataset: Arc<Dataset>,
@@ -299,6 +309,8 @@ impl MergeInsertBuilder {
                 when_matched: WhenMatched::DoNothing,
                 insert_not_matched: true,
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
+                conflict_retries: 10,
+                retry_timeout: Duration::from_secs(30),
             },
         })
     }
@@ -325,6 +337,32 @@ impl MergeInsertBuilder {
     /// These are typically "old rows"
     pub fn when_not_matched_by_source(&mut self, behavior: WhenNotMatchedBySource) -> &mut Self {
         self.params.delete_not_matched_by_source = behavior;
+        self
+    }
+
+    /// Set number of times to retry the operation if there is contention.
+    ///
+    /// If this is set > 0, then the operation will keep a copy of the input data
+    /// either in memory or on disk (depending on the size of the data) and will
+    /// retry the operation if there is contention.
+    ///
+    /// Default is 10.
+    pub fn conflict_retries(&mut self, retries: u32) -> &mut Self {
+        self.params.conflict_retries = retries;
+        self
+    }
+
+    /// Set the timeout used to limit retries.
+    ///
+    /// This is the maximum time to spend on the operation before giving up. At
+    /// least one attempt will be made, regardless of how long it takes to complete.
+    /// Subsequent attempts will be cancelled once this timeout is reached. If
+    /// the timeout has been reached during the first attempt, the operation
+    /// will be cancelled immediately.
+    ///
+    /// The default is 30 seconds.
+    pub fn retry_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.params.retry_timeout = timeout;
         self
     }
 
@@ -403,7 +441,14 @@ impl MergeInsertJob {
             Ok(None)
         } else {
             let col = &self.params.on[0];
-            self.dataset.load_scalar_index_for_column(col).await
+            self.dataset
+                .load_scalar_index(
+                    ScalarIndexCriteria::default()
+                        .for_column(col)
+                        // Unclear if this would work if the index does not support exact equality
+                        .supports_exact_equality(),
+                )
+                .await
         }
     }
 
@@ -443,6 +488,7 @@ impl MergeInsertJob {
             // create index from original data and key column
             self.dataset.clone(),
             index_column.clone(),
+            index.name.clone(),
             index_mapper_input,
         ));
 
@@ -660,7 +706,7 @@ impl MergeInsertJob {
     async fn update_fragments(
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
-    ) -> Result<(Vec<Fragment>, Vec<Fragment>)> {
+    ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
         let session_ctx = get_session_context(&LanceExecutionOptions {
@@ -966,10 +1012,17 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
+        // We keep track of all fields that are updated so we can prune the indices.
+        // We could maybe be more precise since some fields are not modified in some
+        // fragments (if they were already null) but this is simpler and good enough
+        // for now.
+        let mut all_fields_updated = HashSet::new();
+
         // Collect the updated fragments, and map the field ids. Tombstone old ones
         // as needed.
         for fragment in &mut updated_fragments {
             let updated_fields = fragment.files.last().unwrap().fields.clone();
+            all_fields_updated.extend(updated_fields.iter().map(|&f| f as u32));
             for data_file in &mut fragment.files.iter_mut().rev().skip(1) {
                 for field in &mut data_file.fields {
                     if updated_fields.contains(field) {
@@ -985,7 +1038,11 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        Ok((updated_fragments, new_fragments))
+        Ok((
+            updated_fragments,
+            new_fragments,
+            all_fields_updated.into_iter().collect(),
+        ))
     }
 
     /// Executes the merge insert job
@@ -993,13 +1050,109 @@ impl MergeInsertJob {
     /// This will take in the source, merge it with the existing target data, and insert new
     /// rows, update existing rows, and delete existing rows
     pub async fn execute(
-        self,
+        mut self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let ds = self.dataset.clone();
-        let (transaction, stats) = self.execute_uncommitted_impl(source).await?;
-        let dataset = CommitBuilder::new(ds).execute(transaction).await?;
-        Ok((Arc::new(dataset), stats))
+        let start = Instant::now();
+        let mut source_iter =
+            super::new_source_iter(source, self.params.conflict_retries > 0).await?;
+
+        let mut dataset_ref = self.dataset.clone();
+        let max_retries = self.params.conflict_retries;
+        let mut backoff = SlotBackoff::default();
+
+        fn timeout_error(retry_timeout: Duration, attempts: u32) -> Error {
+            Error::TooMuchWriteContention {
+                message: format!(
+                    "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
+                    attempts,
+                    retry_timeout.as_secs_f32()
+                ),
+                location: location!(),
+            }
+        }
+
+        fn maybe_timeout<T>(
+            backoff: &SlotBackoff,
+            start: Instant,
+            retry_timeout: Duration,
+            future: impl Future<Output = T>,
+        ) -> impl Future<Output = Result<T>> {
+            let attempt = backoff.attempt();
+            if attempt == 0 {
+                // No timeout on first attempt
+                Either::Left(future.map(|res| Ok(res)))
+            } else {
+                let remaining = retry_timeout.saturating_sub(start.elapsed());
+                Either::Right(
+                    tokio::time::timeout(remaining, future)
+                        .map_err(move |_| timeout_error(retry_timeout, attempt + 1)),
+                )
+            }
+        }
+
+        while backoff.attempt() <= max_retries {
+            let ds = dataset_ref.clone();
+            let execute_fut = self
+                .clone()
+                .execute_uncommitted_impl(source_iter.next().unwrap());
+            let execute_fut =
+                maybe_timeout(&backoff, start, self.params.retry_timeout, execute_fut);
+            let UncommittedMergeInsert {
+                transaction,
+                mut stats,
+                affected_rows,
+            } = execute_fut.await??;
+            stats.num_attempts = backoff.attempt() + 1;
+
+            let mut commit_builder = CommitBuilder::new(ds.clone());
+            if let Some(affected_rows) = affected_rows {
+                commit_builder = commit_builder.with_affected_rows(affected_rows);
+            }
+            let commit_future = commit_builder.execute(transaction);
+            let commit_future =
+                maybe_timeout(&backoff, start, self.params.retry_timeout, commit_future);
+            match commit_future.await? {
+                Ok(ds) => return Ok((Arc::new(ds), stats)),
+                Err(Error::RetryableCommitConflict { .. }) => {
+                    // Check whether we have exhausted our retries *before*
+                    // we sleep.
+                    if backoff.attempt() >= max_retries {
+                        break;
+                    }
+                    if start.elapsed() > self.params.retry_timeout {
+                        return Err(timeout_error(
+                            self.params.retry_timeout,
+                            backoff.attempt() + 1,
+                        ));
+                    }
+                    if backoff.attempt() == 0 {
+                        // We add 10% buffer here, to allow concurrent writes to complete.
+                        // We pass the first attempt's time to the backoff so it's used
+                        // as the unit for backoff time slots.
+                        // See SlotBackoff implementation for more details on how this works.
+                        backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
+                    }
+
+                    let sleep_fut = tokio::time::sleep(backoff.next_backoff());
+                    let sleep_fut =
+                        maybe_timeout(&backoff, start, self.params.retry_timeout, sleep_fut);
+                    sleep_fut.await?;
+
+                    let mut ds = dataset_ref.as_ref().clone();
+                    ds.checkout_latest().await?;
+
+                    dataset_ref = Arc::new(ds);
+                    self.dataset = dataset_ref.clone();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+        }
+        Err(Error::TooMuchWriteContention {
+            message: format!("Attempted {} retries.", max_retries),
+            location: location!(),
+        })
     }
 
     /// Execute the merge insert job without committing the changes.
@@ -1008,7 +1161,7 @@ impl MergeInsertJob {
     pub async fn execute_uncommitted(
         self,
         source: impl StreamingWriteSource,
-    ) -> Result<(Transaction, MergeStats)> {
+    ) -> Result<UncommittedMergeInsert> {
         let stream = source.into_stream();
         self.execute_uncommitted_impl(stream).await
     }
@@ -1016,7 +1169,7 @@ impl MergeInsertJob {
     async fn execute_uncommitted_impl(
         self,
         source: SendableRecordBatchStream,
-    ) -> Result<(Transaction, MergeStats)> {
+    ) -> Result<UncommittedMergeInsert> {
         // Erase metadata on source / dataset schemas to avoid comparing metadata
         let schema = lance_core::datatypes::Schema::try_from(source.schema().as_ref())?;
         let full_schema = self.dataset.local_schema();
@@ -1039,7 +1192,7 @@ impl MergeInsertJob {
             .try_flatten();
         let stream = RecordBatchStreamAdapter::new(merger_schema, stream);
 
-        let operation = if !is_full_schema {
+        let (operation, affected_rows) = if !is_full_schema {
             if !matches!(
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
@@ -1050,14 +1203,18 @@ impl MergeInsertJob {
 
             // We will have a different commit path here too, as we are modifying
             // fragments rather than writing new ones
-            let (updated_fragments, new_fragments) =
+            let (updated_fragments, new_fragments, fields_modified) =
                 Self::update_fragments(self.dataset.clone(), Box::pin(stream)).await?;
 
-            Operation::Update {
+            let operation = Operation::Update {
                 removed_fragment_ids: Vec::new(),
                 updated_fragments,
                 new_fragments,
-            }
+                fields_modified,
+            };
+            // We have rewritten the fragments, not just the deletion files, so
+            // we can't use affected rows here.
+            (operation, None)
         } else {
             let written = write_fragments_internal(
                 Some(&self.dataset),
@@ -1079,11 +1236,17 @@ impl MergeInsertJob {
                 Self::apply_deletions(&self.dataset, &removed_row_ids).await?;
 
             // Commit updated and new fragments
-            Operation::Update {
+            let operation = Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: old_fragments,
                 new_fragments,
-            }
+                // On this path we only make deletions against updated_fragments and will not
+                // modify any field values.
+                fields_modified: vec![],
+            };
+
+            let affected_rows = Some(RowIdTreeMap::from(removed_row_ids));
+            (operation, affected_rows)
         };
 
         let stats = Arc::into_inner(merge_statistics)
@@ -1098,7 +1261,11 @@ impl MergeInsertJob {
             None,
         );
 
-        Ok((transaction, stats))
+        Ok(UncommittedMergeInsert {
+            transaction,
+            affected_rows,
+            stats,
+        })
     }
 
     // Delete a batch of rows by id, returns the fragments modified and the fragments removed
@@ -1160,6 +1327,16 @@ pub struct MergeStats {
     /// Note: This is different from internal references to 'deleted_rows', since we technically "delete" updated rows during processing.
     /// However those rows are not shared with the user.
     pub num_deleted_rows: u64,
+    /// Number of attempts performed.
+    ///
+    /// See [`MergeInsertBuilder::conflict_retries`] for more information.
+    pub num_attempts: u32,
+}
+
+pub struct UncommittedMergeInsert {
+    pub transaction: Transaction,
+    pub affected_rows: Option<RowIdTreeMap>,
+    pub stats: MergeStats,
 }
 
 // A sync-safe structure that is shared by all of the "process batch" tasks.
@@ -1442,12 +1619,21 @@ mod tests {
     };
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
-    use lance_datafusion::utils::reader_to_stream;
+    use futures::future::try_join_all;
+    use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::{scalar::ScalarIndexParams, IndexType};
+    use lance_io::object_store::ObjectStoreParams;
+    use object_store::throttle::ThrottleConfig;
+    use roaring::RoaringBitmap;
     use tempfile::tempdir;
+    use tokio::sync::{Barrier, Notify};
 
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::{
+        dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
+        session::Session,
+        utils::test::{DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper},
+    };
 
     use super::*;
 
@@ -2086,5 +2272,535 @@ mod tests {
                 assert_eq!(values.value(1024), 1024 + new_data.num_rows() as u32 - 2);
             }
         }
+    }
+
+    // For some reason, Windows isn't able to handle the timeout test. Possibly
+    // a performance bug in their timer implementation?
+    #[cfg(not(windows))]
+    #[rstest::rstest]
+    #[case::all_success(Duration::from_secs(100_000))]
+    #[case::timeout(Duration::from_millis(200))]
+    #[tokio::test]
+    async fn test_merge_insert_concurrency(#[case] timeout: Duration) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        // To benchmark scaling curve: measure how long to run
+        //
+        // And vary `concurrency` to see how it scales. Compare this again `main`.
+        let concurrency = 10;
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..concurrency)),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(
+                    0,
+                    concurrency as usize,
+                ))),
+            ],
+        )
+        .unwrap();
+
+        // Increase likelihood of contention by throttling the store
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                // For benchmarking: Increase this to simulate object storage.
+                wait_list_per_call: Duration::from_millis(20),
+                wait_get_per_call: Duration::from_millis(20),
+                wait_put_per_call: Duration::from_millis(20),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+
+        // do merge inserts in parallel based on the concurrency. Each will open the dataset,
+        // signal they have opened, and then wait for a signal to proceed. Once the signal
+        // is received, they will do a merge insert and close the dataset.
+
+        let barrier = Arc::new(Barrier::new(concurrency as usize));
+        let mut handles = Vec::new();
+        for i in 0..concurrency {
+            let session_ref = session.clone();
+            let schema_ref = schema.clone();
+            let barrier_ref = barrier.clone();
+            let throttled_ref = throttled.clone();
+            let handle = tokio::task::spawn(async move {
+                let dataset = DatasetBuilder::from_uri("memory://")
+                    .with_read_params(ReadParams {
+                        store_options: Some(ObjectStoreParams {
+                            object_store_wrapper: Some(throttled_ref.clone()),
+                            ..Default::default()
+                        }),
+                        session: Some(session_ref.clone()),
+                        ..Default::default()
+                    })
+                    .load()
+                    .await
+                    .unwrap();
+                let dataset = Arc::new(dataset);
+
+                let new_data = RecordBatch::try_new(
+                    schema_ref.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(vec![i])),
+                        Arc::new(UInt32Array::from(vec![1])),
+                    ],
+                )
+                .unwrap();
+                let source = Box::new(RecordBatchIterator::new([Ok(new_data)], schema_ref.clone()));
+
+                let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .conflict_retries(100)
+                    .retry_timeout(timeout)
+                    .try_build()
+                    .unwrap();
+                barrier_ref.wait().await;
+
+                job.execute_reader(source)
+                    .await
+                    .map(|(_ds, stats)| stats.num_attempts)
+            });
+            handles.push(handle);
+        }
+
+        let results = try_join_all(handles).await.unwrap();
+
+        for attempts in results.iter() {
+            match attempts {
+                Ok(attempts) => {
+                    assert!(*attempts <= 10, "Attempt count should be <= 10");
+                }
+                Err(err) => {
+                    // If we get an error, it means the task was cancelled
+                    // due to timeout. This is expected if the timeout is
+                    // set to a low value.
+                    assert!(
+                        matches!(err, Error::TooMuchWriteContention { message, .. } if message.contains("failed on retry_timeout")),
+                        "Expected TooMuchWriteContention error, got: {:?}",
+                        err
+                    );
+                }
+            }
+        }
+
+        if timeout.as_secs() > 10 {
+            dataset.checkout_latest().await.unwrap();
+            let batches = dataset.scan().try_into_batch().await.unwrap();
+
+            let values = batches["value"].as_primitive::<UInt32Type>();
+            assert!(
+                values.values().iter().all(|&v| v == 1),
+                "All values should be 1 after merge insert. Got: {:?}",
+                values
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_large_concurrent() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let num_rows = 10;
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..num_rows)),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(
+                    0,
+                    num_rows as usize,
+                ))),
+            ],
+        )
+        .unwrap();
+
+        // Adding latency helps ensure we get contention
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: Duration::from_millis(10),
+                wait_get_per_call: Duration::from_millis(10),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Start one merge insert, but don't commit it yet.
+        let new_data1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1])),
+                Arc::new(UInt32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let UncommittedMergeInsert {
+            transaction: transaction1,
+            ..
+        } = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted(RecordBatchIterator::new(
+                vec![Ok(new_data1)],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
+
+        // Setup a "large" merge insert, with many batches
+        let new_data2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..1000)),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(2, 1000))),
+            ],
+        )
+        .unwrap();
+        let notify = Arc::new(Notify::new());
+        let source = RecordBatchIterator::new(
+            (0..10)
+                .map(|i| {
+                    let batch = new_data2.slice(i * 100, 100);
+                    if i == 9 {
+                        notify.notify_one();
+                    }
+                    Ok(batch)
+                })
+                .collect::<Vec<_>>(),
+            schema.clone(),
+        );
+        let dataset2 = DatasetBuilder::from_uri("memory://")
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset2), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(source);
+        let task = tokio::task::spawn(job);
+
+        // Right as the large merge insert has finished reading the last batch,
+        // we will commit the first merge insert. This should trigger a conflict,
+        // but we should resolve it automatically.
+        notify.notified().await;
+        let mut dataset = CommitBuilder::new(dataset)
+            .execute(transaction1)
+            .await
+            .unwrap();
+
+        task.await.unwrap().unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        let batches = dataset.scan().try_into_batch().await.unwrap();
+        let values = batches["value"].as_primitive::<UInt32Type>();
+        assert!(
+            values.values().iter().all(|&v| v == 2),
+            "All values should be 1 after merge insert. Got: {:?}",
+            values
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_updates_indices() {
+        let test_dataset = async || {
+            let mut dataset = lance_datagen::gen()
+                .col("id", array::step::<UInt32Type>())
+                .col("value", array::step::<UInt32Type>())
+                .col("other_value", array::step::<UInt32Type>())
+                .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(20))
+                .await
+                .unwrap();
+
+            dataset
+                .create_index(
+                    &["id"],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            dataset
+                .create_index(
+                    &["value"],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            dataset
+                .create_index(
+                    &["other_value"],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            Arc::new(dataset)
+        };
+
+        let check_indices = async |dataset: &Dataset, id_frags: &[u32], value_frags: &[u32]| {
+            let id_index = dataset
+                .load_scalar_index(ScalarIndexCriteria::default().with_name("id_idx"))
+                .await
+                .unwrap();
+
+            if id_frags.is_empty() {
+                assert!(id_index.is_none());
+            } else {
+                let id_index = id_index.unwrap();
+                let id_frags_bitmap = RoaringBitmap::from_iter(id_frags.iter().copied());
+                assert_eq!(id_index.fragment_bitmap.unwrap(), id_frags_bitmap);
+            }
+
+            let value_index = dataset
+                .load_scalar_index(ScalarIndexCriteria::default().with_name("value_idx"))
+                .await
+                .unwrap();
+
+            if value_frags.is_empty() {
+                assert!(value_index.is_none());
+            } else {
+                let value_index = value_index.unwrap();
+                let value_frags_bitmap = RoaringBitmap::from_iter(value_frags.iter().copied());
+                assert_eq!(value_index.fragment_bitmap.unwrap(), value_frags_bitmap);
+            }
+
+            let other_value_index = dataset
+                .load_scalar_index(ScalarIndexCriteria::default().with_name("other_value_idx"))
+                .await
+                .unwrap()
+                .unwrap();
+
+            // We should never remove any fragments from the other_value index.
+            assert_eq!(other_value_index.fragment_bitmap.as_ref().unwrap().len(), 4);
+        };
+
+        let dataset = test_dataset().await;
+
+        // Sanity test on the initial dataset
+        check_indices(&dataset, &[0, 1, 2, 3], &[0, 1, 2, 3]).await;
+
+        // Vertical merge insert (full schema), one fragment is deleted and should be removed from
+        // the index.
+        let merge_insert = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let (dataset, _) = merge_insert
+            .execute_reader(
+                lance_datagen::gen()
+                    .col("id", array::step_custom::<UInt32Type>(50, 1))
+                    .col("value", array::step_custom::<UInt32Type>(50, 1))
+                    .col("other_value", array::step_custom::<UInt32Type>(50, 1))
+                    .into_df_stream(RowCount::from(40), BatchCount::from(1)),
+            )
+            .await
+            .unwrap();
+
+        // Fragment 3 removed but we don't remove it from the index bitmap since it is
+        // fully deleted and can't be searched anymore anyways.
+        check_indices(&dataset, &[0, 1, 2, 3], &[0, 1, 2, 3]).await;
+
+        // Now we do the same thing with a partial merge insert (only id and value)
+        let dataset = test_dataset().await;
+
+        // Vertical merge insert (full schema), one fragment is deleted and should be removed from
+        // the index.
+        let merge_insert = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let (dataset, _) = merge_insert
+            .execute_reader(
+                lance_datagen::gen()
+                    .col("id", array::step_custom::<UInt32Type>(50, 1))
+                    .col("value", array::step_custom::<UInt32Type>(50, 1))
+                    .into_df_stream(RowCount::from(40), BatchCount::from(1)),
+            )
+            .await
+            .unwrap();
+
+        // Fragment 3 is fully removed.  We could keep it technically but today it is removed
+        // which is also fine.  Fragment 2 is partially and must be removed.
+        //
+        // TODO: We should not be modifying the id_index here.  A merge_insert should not need
+        // to rewrite the id field.  However, it seems we are doing that today.  This should be
+        // fixed in
+        check_indices(&dataset, &[0, 1], &[0, 1]).await;
+
+        // One more test but this time we touch all fragments which causes the index to be removed
+        // entirely.
+        let dataset = test_dataset().await;
+
+        // Vertical merge insert (full schema), one fragment is deleted and should be removed from
+        // the index.
+        let merge_insert = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let (dataset, _) = merge_insert
+            .execute_reader(
+                lance_datagen::gen()
+                    .col("id", array::step_custom::<UInt32Type>(10, 1))
+                    .col("value", array::step_custom::<UInt32Type>(10, 1))
+                    .into_df_stream(RowCount::from(80), BatchCount::from(1)),
+            )
+            .await
+            .unwrap();
+
+        check_indices(&dataset, &[], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn test_upsert_concurrent_full_frag() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1])),
+                Arc::new(UInt32Array::from(vec![0, 0])),
+            ],
+        )
+        .unwrap();
+
+        // Increase likelihood of contention by throttling the store
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: Duration::from_millis(5),
+                wait_get_per_call: Duration::from_millis(5),
+                wait_put_per_call: Duration::from_millis(5),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+
+        // Each merge insert will update one row. Combined, they should delete
+        // all rows in the first fragment, and it should be dropped.
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for i in 0..2 {
+            let new_data = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![i])),
+                    Arc::new(UInt32Array::from(vec![1])),
+                ],
+            )
+            .unwrap();
+            let source = Box::new(RecordBatchIterator::new([Ok(new_data)], schema.clone()));
+
+            let dataset_ref = Arc::new(dataset.clone());
+            let barrier = barrier.clone();
+            let handle = tokio::spawn(async move {
+                barrier.wait().await;
+                MergeInsertBuilder::try_new(dataset_ref, vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap()
+                    .execute_reader(source)
+                    .await
+                    .unwrap();
+            });
+            handles.push(handle);
+        }
+        try_join_all(handles).await.unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+        assert!(
+            dataset
+                .get_fragments()
+                .iter()
+                .all(|f| f.metadata().num_rows().unwrap() > 0),
+            "No fragments should have zero rows after upsert"
+        );
+
+        let batches = dataset.scan().try_into_batch().await.unwrap();
+        let values = batches["value"].as_primitive::<UInt32Type>();
+        assert!(
+            values.values().iter().all(|&v| v == 1),
+            "All values should be 1 after merge insert. Got: {:?}",
+            values
+        );
     }
 }

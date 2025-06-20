@@ -9,7 +9,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -31,9 +31,9 @@ fn bench_ngram(c: &mut Criterion) {
     let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
     let store = rt.block_on(async {
         Arc::new(LanceIndexStore::new(
-            ObjectStore::local(),
+            Arc::new(ObjectStore::local()),
             index_dir,
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ))
     });
 
@@ -77,6 +77,7 @@ fn bench_ngram(c: &mut Criterion) {
             let mut builder =
                 NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
             let num_spill_files = builder.train(stream).await.unwrap();
+
             builder
                 .write_index(store.as_ref(), num_spill_files, None)
                 .await
@@ -91,7 +92,7 @@ fn bench_ngram(c: &mut Criterion) {
     group
         .sample_size(10)
         .measurement_time(Duration::from_secs(10));
-    let index = rt.block_on(NGramIndex::load(store)).unwrap();
+    let index = rt.block_on(NGramIndex::load(store, None)).unwrap();
     group.bench_function(format!("ngram_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             let sample_idx = rand::random::<usize>() % batch.num_rows();

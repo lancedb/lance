@@ -10,9 +10,8 @@ use uuid::Uuid;
 
 use super::pb;
 use lance_core::{Error, Result};
-
 /// Index metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Index {
     /// Unique ID across all dataset versions.
     pub uuid: Uuid,
@@ -36,6 +35,9 @@ pub struct Index {
     /// This is an Option because older versions of Lance may not have this defined.  However, it should always
     /// be present in newer versions.
     pub index_details: Option<prost_types::Any>,
+
+    /// The index version.
+    pub index_version: i32,
 }
 
 impl DeepSizeOf for Index {
@@ -76,6 +78,7 @@ impl TryFrom<pb::IndexMetadata> for Index {
             dataset_version: proto.dataset_version,
             fragment_bitmap,
             index_details: proto.index_details,
+            index_version: proto.index_version.unwrap_or_default(),
         })
     }
 }
@@ -99,6 +102,7 @@ impl From<&Index> for pb::IndexMetadata {
             dataset_version: idx.dataset_version,
             fragment_bitmap,
             index_details: idx.index_details.clone(),
+            index_version: Some(idx.index_version),
         }
     }
 }
