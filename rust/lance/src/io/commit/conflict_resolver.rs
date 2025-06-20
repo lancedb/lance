@@ -1610,6 +1610,7 @@ mod tests {
             fragment_bitmap: None,
             index_details: None,
             index_version: 0,
+            created_at: None, // Test index, not setting timestamp
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);

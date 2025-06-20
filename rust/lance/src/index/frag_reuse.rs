@@ -173,5 +173,6 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         fragment_bitmap: Some(new_fragment_bitmap),
         index_details: Some(prost_types::Any::from_msg(&proto)?),
         index_version: index_meta.map_or(0, |index_meta| index_meta.index_version),
+        created_at: Some(chrono::Utc::now()),
     })
 }

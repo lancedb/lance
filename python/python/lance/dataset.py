@@ -3137,6 +3137,7 @@ class LanceOperation:
         dataset_version: int
         fragment_ids: Set[int]
         index_version: int
+        created_at: Optional[datetime] = None
 
     @dataclass
     class DataReplacementGroup:
