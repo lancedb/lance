@@ -1786,7 +1786,7 @@ impl Dataset {
         let key_refs: Option<Vec<&str>> = keys
             .as_ref()
             .map(|ks| ks.iter().map(|k| k.as_str()).collect());
-        let key_refs = key_refs.as_ref().map(|v| v.as_slice());
+        let key_refs = key_refs.as_deref();
 
         let mut new_self = self.ds.as_ref().clone();
 
