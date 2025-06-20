@@ -25,7 +25,9 @@ use crate::{
     dataset::{
         transaction::{Operation, Transaction},
         write::{
-            merge_insert::{assign_action::Action, exec::MergeInsertMetrics, MergeInsertParams, MergeStats},
+            merge_insert::{
+                assign_action::Action, exec::MergeInsertMetrics, MergeInsertParams, MergeStats,
+            },
             write_fragments_internal, WriteParams,
         },
     },
@@ -66,14 +68,14 @@ impl MergeState {
                 // Delete action - only delete, don't write back
                 if !row_addr_array.is_null(row_idx) {
                     let row_addr = row_addr_array.value(row_idx);
-                    
+
                     let mut delete_addrs_guard = self.delete_row_addrs.write().map_err(|_| {
                         datafusion::error::DataFusionError::Internal(
                             "Failed to acquire write lock on delete_row_addrs".to_string(),
                         )
                     })?;
                     delete_addrs_guard.insert(row_addr);
-                    
+
                     let mut actual_deletes_guard = self.actual_deletes.write().map_err(|_| {
                         datafusion::error::DataFusionError::Internal(
                             "Failed to acquire write lock on actual_deletes".to_string(),
@@ -95,7 +97,7 @@ impl MergeState {
                     delete_addrs_guard.insert(row_addr);
                     // Don't count as actual delete - this is an update
                 }
-                
+
                 if let Ok(metrics_guard) = self.metrics.lock() {
                     metrics_guard.num_updated_rows.add(1);
                 }
@@ -117,20 +119,19 @@ impl MergeState {
 
     /// Get a clone of the current delete row addresses
     fn get_delete_row_addrs(&self) -> Result<RoaringTreemap> {
-        let delete_addrs_guard = self.delete_row_addrs.read().map_err(|_| {
-            crate::Error::InvalidInput {
-                source: "Failed to acquire read lock on delete_row_addrs".into(),
-                location: location!(),
-            }
-        })?;
+        let delete_addrs_guard =
+            self.delete_row_addrs
+                .read()
+                .map_err(|_| crate::Error::InvalidInput {
+                    source: "Failed to acquire read lock on delete_row_addrs".into(),
+                    location: location!(),
+                })?;
         Ok(delete_addrs_guard.clone())
     }
 
     /// Get the current count of actual deletions
     fn get_actual_deletes(&self) -> usize {
-        self.actual_deletes.read()
-            .map(|guard| *guard)
-            .unwrap_or(0)
+        self.actual_deletes.read().map(|guard| *guard).unwrap_or(0)
     }
 
     /// Create MergeStats from the current state
@@ -210,7 +211,10 @@ impl FullSchemaMergeInsertExec {
     /// Returns the affected rows (deleted/updated row addresses) if the execution has completed.
     /// Returns `None` if the execution is still in progress or hasn't started.
     pub fn affected_rows(&self) -> Option<RoaringTreemap> {
-        self.affected_rows.lock().ok().and_then(|guard| guard.clone())
+        self.affected_rows
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     /// Creates a filtered stream that captures row addresses for deletion and returns
@@ -311,7 +315,9 @@ impl FullSchemaMergeInsertExec {
                 })?;
 
                 // Use the shared state to process the row action
-                if let Some(keep_row_idx) = merge_state.process_row_action(action, row_idx, row_addr_array)? {
+                if let Some(keep_row_idx) =
+                    merge_state.process_row_action(action, row_idx, row_addr_array)?
+                {
                     keep_rows.push(keep_row_idx);
                 }
             }
@@ -517,10 +523,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             &self.metrics,
             partition,
         )));
-        let write_data_stream = self.create_filtered_write_stream(
-            input_stream,
-            merge_state.clone(),
-        )?;
+        let write_data_stream =
+            self.create_filtered_write_stream(input_stream, merge_state.clone())?;
 
         // Use flat_map to handle the async write operation
         let dataset = self.dataset.clone();

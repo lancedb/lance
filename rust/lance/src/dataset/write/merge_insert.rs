@@ -1434,7 +1434,12 @@ impl MergeInsertJob {
         // any scalar index.
         if self.params.insert_not_matched
             && matches!(self.params.when_matched, WhenMatched::UpdateAll)
-            && self.dataset.load_indices().await.unwrap_or_default().is_empty()
+            && self
+                .dataset
+                .load_indices()
+                .await
+                .unwrap_or_default()
+                .is_empty()
         {
             let (transaction, stats, affected_rows) = self.execute_uncommitted_v2(source).await?;
             return Ok(UncommittedMergeInsert {
