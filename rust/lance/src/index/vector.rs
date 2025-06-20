@@ -416,6 +416,7 @@ pub(crate) async fn build_vector_index(
                 Some(ivf_params.clone()),
                 Some(()),
                 hnsw_params.clone(),
+                fri,
             )?
             .build()
             .await?;

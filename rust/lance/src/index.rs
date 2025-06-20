@@ -1097,6 +1097,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.indices_dir(),
                             uuid.to_owned(),
                             Arc::downgrade(&self.session),
+                            fri,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)

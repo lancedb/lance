@@ -459,6 +459,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 None,
                 // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
+                fri,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
