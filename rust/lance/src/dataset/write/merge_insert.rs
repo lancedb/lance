@@ -1427,6 +1427,20 @@ impl MergeInsertJob {
         self,
         source: SendableRecordBatchStream,
     ) -> Result<UncommittedMergeInsert> {
+        // We are migrating a new plan-based code path. For now, only using this
+        // for select supported queries. Right now that is just upsert without
+        // any scalar index.
+        if self.params.insert_not_matched
+            && matches!(self.params.when_matched, WhenMatched::UpdateAll)
+            && self.dataset.load_indices().await.unwrap_or_default().is_empty()
+        {
+            let (transaction, stats) = self.execute_uncommitted_v2(source).await?;
+            return Ok(UncommittedMergeInsert {
+                transaction,
+                affected_rows: None,
+                stats,
+            });
+        }
         // Erase metadata on source / dataset schemas to avoid comparing metadata
         let schema = lance_core::datatypes::Schema::try_from(source.schema().as_ref())?;
         let full_schema = self.dataset.local_schema();
