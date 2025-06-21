@@ -8,10 +8,7 @@ use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
 
 use lance::dataset::{Dataset, WriteMode, WriteParams};
-use lance::{
-    arrow::FixedSizeListArrayExt,
-    dataset::{ProjectionRequest},
-};
+use lance::{arrow::FixedSizeListArrayExt, dataset::ProjectionRequest};
 use lance_file::version::LanceFileVersion;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
