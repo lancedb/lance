@@ -161,7 +161,7 @@ criterion_group!(
     name=benches;
     config = Criterion::default()
         .significance_level(0.01)
-        .sample_size(10)
+        .sample_size(10000)
         .warm_up_time(Duration::from_secs_f32(3.0))
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_random_take);
