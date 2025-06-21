@@ -2294,6 +2294,80 @@ def test_scan_with_batch_size(tmp_path: Path):
         assert batch.num_rows != 12
 
 
+def test_dictionaries(tmp_path: Path):
+    data = pa.table(
+        {
+            "id": pa.array([1, 2, 3]),
+            "dict": pa.array(
+                ["foo", "bar", "baz"], pa.dictionary(pa.int32(), pa.string())
+            ),
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    assert ds.schema == pa.schema(
+        {"id": pa.int64(), "dict": pa.dictionary(pa.int32(), pa.string())}
+    )
+    assert ds.to_table() == data
+
+    # Can insert data with new values
+    new_data = pa.table(
+        {
+            "id": [4, 5, 6],
+            "dict": pa.array(
+                ["qux", "quux", "corge"], pa.dictionary(pa.int32(), pa.string())
+            ),
+        }
+    )
+    ds.insert(new_data)
+    table = ds.to_table().combine_chunks()
+    assert table == pa.table(
+        {
+            "id": [1, 2, 3, 4, 5, 6],
+            "dict": pa.array(
+                ["foo", "bar", "baz", "qux", "quux", "corge"],
+                pa.dictionary(pa.int32(), pa.string()),
+            ),
+        }
+    )
+
+    dict_arr = table.column("dict").chunk(0)
+    assert dict_arr.type == pa.dictionary(pa.int32(), pa.string())
+    assert dict_arr.to_pylist() == ["foo", "bar", "baz", "qux", "quux", "corge"]
+
+    assert dict_arr.dictionary.to_pylist() == [
+        "foo",
+        "bar",
+        "baz",
+        "qux",
+        "quux",
+        "corge",
+    ]
+
+    # Can merge insert data that has even more values
+    new_data = pa.table(
+        {
+            "id": [1, 7],
+            "dict": pa.array(
+                ["grault", "garply"], pa.dictionary(pa.int32(), pa.string())
+            ),
+        }
+    )
+    ds.merge_insert(
+        "id"
+    ).when_matched_update_all().when_not_matched_insert_all().execute(new_data)
+    table = ds.to_table().combine_chunks().sort_by("id")
+    assert table.column("id").to_pylist() == [1, 2, 3, 4, 5, 6, 7]
+    assert table.column("dict").to_pylist() == [
+        "grault",
+        "bar",
+        "baz",
+        "qux",
+        "quux",
+        "corge",
+        "garply",
+    ]
+
+
 @pytest.mark.slow
 def test_io_buffer_size(tmp_path: Path):
     # These cases regress deadlock issues that happen when the

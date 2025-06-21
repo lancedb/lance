@@ -369,7 +369,7 @@ pub async fn write_fragments_internal(
                         compare_nullability: NullabilityComparison::Ignore,
                         allow_missing_if_nullable: true,
                         ignore_field_order: true,
-                        compare_dictionary: true,
+                        compare_dictionary: dataset.is_legacy_storage(),
                         ..Default::default()
                     },
                 )?;

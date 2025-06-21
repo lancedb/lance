@@ -403,7 +403,7 @@ impl MergeInsertJob {
         let is_compatible = lance_schema.check_compatible(
             self.dataset.schema(),
             &SchemaCompareOptions {
-                compare_dictionary: true,
+                compare_dictionary: self.dataset.is_legacy_storage(),
                 ..Default::default()
             },
         );

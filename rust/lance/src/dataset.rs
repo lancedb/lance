@@ -483,7 +483,9 @@ impl Dataset {
             }
         }
 
-        populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
+        if manifest.should_use_legacy_format() {
+            populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
+        }
 
         Ok(manifest)
     }
@@ -629,7 +631,7 @@ impl Dataset {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
-        if manifest.schema.has_dictionary_types() {
+        if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
             let reader = if let Some(size) = location.size {
                 self.object_store
                     .open_with_size(&location.path, size as usize)
@@ -2651,8 +2653,12 @@ mod tests {
         assert!(matches!(result, Err(Error::SchemaMismatch { .. })))
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn append_dictionary() {
+    async fn append_dictionary(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         // We store the dictionary as part of the schema, so we check that the
         // dictionary is consistent between appends.
 
@@ -2676,6 +2682,7 @@ mod tests {
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2711,10 +2718,14 @@ mod tests {
         )
         .unwrap()];
 
-        // Try write to dataset (fail)
+        // Try write to dataset (fails with legacy format)
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let result = Dataset::write(batches, test_uri, Some(write_params)).await;
-        assert!(result.is_err());
+        if data_storage_version == LanceFileVersion::Legacy {
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok());
+        }
     }
 
     #[rstest]
