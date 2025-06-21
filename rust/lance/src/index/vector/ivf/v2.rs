@@ -863,8 +863,8 @@ mod tests {
                 .await;
 
                 // *_FLAT doesn't support float16/float64
-                if !is_ivf_flat(&params.stages) // IVF_FLAT
-                    && !(is_ivf_hnsw(&params.stages) && params.stages.len() == 2) // IVF_HNSW_FLAT
+                if !(is_ivf_flat(&params.stages) // IVF_FLAT
+                    || (is_ivf_hnsw(&params.stages) && params.stages.len() == 2)) // IVF_HNSW_FLAT
                     && dataset.is_none()
                 // if dataset is provided, it has been created, so the data type is already determined, no need to test float64
                 {
