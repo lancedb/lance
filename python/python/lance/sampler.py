@@ -659,12 +659,12 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
 
     @staticmethod
     def from_torch(
-        total_num_rows: int, batch_size: int, randomize: bool = False, seed: int = 0
+        batch_size: int, total_num_rows: int, randomize: bool = False, seed: int = 0
     ) -> ShardedFixedBatchSampler:
         import torch
 
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         return ShardedFixedBatchSampler(
-            rank, world_size, total_num_rows, batch_size, randomize, seed
+            rank, world_size, randomize, seed, batch_size, total_num_rows
         )
