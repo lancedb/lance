@@ -630,7 +630,7 @@ mod tests {
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
 
-    use crate::index::DatasetIndexInternalExt;
+    use crate::index::{vector::is_ivf_hnsw, DatasetIndexInternalExt};
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         dataset::optimize::{compact_files, CompactionOptions},
@@ -862,7 +862,12 @@ mod tests {
                 )
                 .await;
 
-                if !is_ivf_flat(&params.stages) && dataset.is_none() {
+                // *_FLAT doesn't support float16/float64
+                if !is_ivf_flat(&params.stages) // IVF_FLAT
+                    && !(is_ivf_hnsw(&params.stages) && params.stages.len() == 2) // IVF_HNSW_FLAT
+                    && dataset.is_none()
+                // if dataset is provided, it has been created, so the data type is already determined, no need to test float64
+                {
                     test_index_impl::<Float64Type>(
                         params,
                         nlist,
