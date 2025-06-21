@@ -27,6 +27,8 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
+const ENV_OBJECT_STORE_SCHEME: &str = "OBJECT_STORE_SCHEME";
+
 const BATCH_SIZE: u64 = 1024;
 
 fn gen_ranges(num_rows: u64, file_size: u64, n: usize) -> Vec<u64> {
@@ -72,8 +74,9 @@ fn dataset_take(
     version: LanceFileVersion,
     version_name: &str,
 ) {
+    let (dataset_path, _temp_dir) = generate_lance_dataset_path();
     let dataset = rt.block_on(create_dataset(
-        "memory://test.lance",
+        &dataset_path,
         version,
         num_batches as i32,
         file_size as i32,
@@ -175,14 +178,10 @@ fn file_reader_take(
     rows_gen: Box<dyn Fn(u64, u64, usize) -> Vec<Vec<u32>>>,
 ) {
     let (dataset, file_path) = rt.block_on(async {
+        let (dataset_path, _temp_dir) = generate_lance_dataset_path();
         // Make sure there is only one fragment.
-        let dataset = create_dataset(
-            "memory://test.lance",
-            version,
-            num_batches as i32,
-            file_size as i32,
-        )
-        .await;
+        let dataset =
+            create_dataset(&dataset_path, version, num_batches as i32, file_size as i32).await;
 
         assert_eq!(dataset.get_fragments().len(), 1);
         let fragments = dataset.get_fragments();
@@ -327,8 +326,9 @@ fn fragment_take(
     version_name: &str,
     rows_gen: Box<dyn Fn(u64, u64, usize) -> Vec<Vec<u32>>>,
 ) {
+    let (dataset_path, _temp_dir) = generate_lance_dataset_path();
     let dataset = rt.block_on(create_dataset(
-        "memory://test.lance",
+        &dataset_path,
         version,
         num_batches as i32,
         file_size as i32,
@@ -350,6 +350,27 @@ fn fragment_take(
                 }
             })
         });
+    }
+}
+
+fn generate_lance_dataset_path() -> (String, Option<tempfile::TempDir>) {
+    let object_store_scheme =
+        std::env::var(ENV_OBJECT_STORE_SCHEME).unwrap_or("memory".to_string());
+    match object_store_scheme.as_str() {
+        "memory" => ("memory://test.lance".to_string(), None),
+        "local" => {
+            let uuid = uuid::Uuid::new_v4().to_string();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let file_path = temp_dir.path().join(uuid);
+            println!("Creating Lance dataset at: {}", file_path.to_str().unwrap());
+            (
+                format!("file:///{}.lance", file_path.to_str().unwrap().to_string()),
+                Some(temp_dir),
+            )
+        }
+        _ => {
+            panic!("Unknown object store scheme: {}", object_store_scheme)
+        }
     }
 }
 
