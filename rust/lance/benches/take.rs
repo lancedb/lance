@@ -7,9 +7,10 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
 
+use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::{
     arrow::FixedSizeListArrayExt,
-    dataset::{builder::DatasetBuilder, ProjectionRequest},
+    dataset::{ProjectionRequest},
 };
 use lance_file::version::LanceFileVersion;
 #[cfg(target_os = "linux")]
@@ -18,8 +19,6 @@ use rand::Rng;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
-
-use lance::dataset::{Dataset, WriteMode, WriteParams};
 
 const BATCH_SIZE: u64 = 1024;
 
@@ -92,25 +91,6 @@ async fn create_dataset(
     num_batches: i32,
     file_size: i32,
 ) -> Dataset {
-    create_file(
-        std::path::Path::new(path),
-        WriteMode::Create,
-        data_storage_version,
-        num_batches,
-        file_size,
-    )
-    .await;
-
-    DatasetBuilder::from_uri(path).load().await.unwrap()
-}
-
-async fn create_file(
-    path: &std::path::Path,
-    mode: WriteMode,
-    data_storage_version: LanceFileVersion,
-    num_batches: i32,
-    file_size: i32,
-) {
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("i", DataType::Int32, false),
         Field::new("f", DataType::Float32, false),
@@ -163,18 +143,17 @@ async fn create_file(
         })
         .collect();
 
-    let test_uri = path.to_str().unwrap();
     let write_params = WriteParams {
         max_rows_per_file: file_size as usize,
         max_rows_per_group: batch_size as usize,
-        mode,
+        mode: WriteMode::Create,
         data_storage_version: Some(data_storage_version),
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-    Dataset::write(reader, test_uri, Some(write_params))
+    Dataset::write(reader, path, Some(write_params))
         .await
-        .unwrap();
+        .unwrap()
 }
 
 #[cfg(target_os = "linux")]
@@ -182,7 +161,7 @@ criterion_group!(
     name=benches;
     config = Criterion::default()
         .significance_level(0.01)
-        .sample_size(10000)
+        .sample_size(10)
         .warm_up_time(Duration::from_secs_f32(3.0))
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_random_take);
