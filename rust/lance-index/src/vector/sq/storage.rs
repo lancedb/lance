@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::ops::Range;
+
+use arrow::datatypes::Float64Type;
 use arrow::{compute::concat_batches, datatypes::Float16Type};
 use arrow_array::{
     cast::AsArray,
@@ -18,7 +21,6 @@ use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::location;
-use std::ops::Range;
 use std::sync::Arc;
 
 use super::{inverse_scalar_dist, scale_to_u8, ScalarQuantizer};
@@ -404,6 +406,9 @@ impl<'a> SQDistCalculator<'a> {
             }
             DataType::Float32 => {
                 scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), &bounds)
+            }
+            DataType::Float64 => {
+                scale_to_u8::<Float64Type>(query.as_primitive::<Float64Type>().values(), &bounds)
             }
             _ => {
                 panic!("Unsupported data type for ScalarQuantizationStorage");

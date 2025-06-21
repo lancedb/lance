@@ -619,7 +619,7 @@ mod tests {
     use std::{ops::Range, sync::Arc};
 
     use all_asserts::{assert_ge, assert_lt};
-    use arrow::datatypes::{UInt64Type, UInt8Type};
+    use arrow::datatypes::{Float64Type, UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, FixedSizeListArray, Float32Array,
@@ -630,12 +630,15 @@ mod tests {
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
 
-    use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
-    use crate::index::DatasetIndexInternalExt;
+    use crate::index::{vector::is_ivf_hnsw, DatasetIndexInternalExt};
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         dataset::optimize::{compact_files, CompactionOptions},
         index::vector::{is_ivf_pq, IndexFileVersion},
+    };
+    use crate::{
+        dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams},
+        index::vector::is_ivf_flat,
     };
     use crate::{index::vector::VectorIndexParams, Dataset};
     use lance_core::cache::LanceCache;
@@ -851,13 +854,29 @@ mod tests {
             }
             _ => {
                 test_index_impl::<Float32Type>(
-                    params,
+                    params.clone(),
                     nlist,
                     recall_requirement,
                     0.0..1.0,
-                    dataset,
+                    dataset.clone(),
                 )
                 .await;
+
+                // *_FLAT doesn't support float16/float64
+                if !(is_ivf_flat(&params.stages) // IVF_FLAT
+                    || (is_ivf_hnsw(&params.stages) && params.stages.len() == 2)) // IVF_HNSW_FLAT
+                    && dataset.is_none()
+                // if dataset is provided, it has been created, so the data type is already determined, no need to test float64
+                {
+                    test_index_impl::<Float64Type>(
+                        params,
+                        nlist,
+                        recall_requirement,
+                        0.0..1.0,
+                        dataset,
+                    )
+                    .await;
+                }
             }
         }
     }
