@@ -54,16 +54,6 @@ impl PartitionTransformer {
             output_column: PART_ID_COLUMN.to_owned(),
         }
     }
-
-    /// Compute the partition for each row in the input Matrix.
-    ///
-    #[instrument(level = "debug", skip_all)]
-    pub(super) fn compute_partitions(&self, data: &FixedSizeListArray) -> UInt32Array {
-        compute_partitions_arrow_array(&self.centroids, data, self.distance_type)
-            .expect("failed to compute partitions")
-            .0
-            .into()
-    }
 }
 impl Transformer for PartitionTransformer {
     #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
