@@ -130,6 +130,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let dataset_version = ob.getattr("dataset_version")?.extract()?;
                 let index_version = ob.getattr("index_version")?.extract()?;
                 let fragment_ids = ob.getattr("fragment_ids")?;
+                let created_at = ob.getattr("created_at")?.extract()?;
                 let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.downcast()?;
                 let fragment_ids = fragment_ids_ref
                     .into_iter()
@@ -148,6 +149,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     // we have a way to determine index details from an existing index.
                     index_details: None,
                     index_version,
+                    created_at,
                 }];
 
                 let op = Operation::CreateIndex {

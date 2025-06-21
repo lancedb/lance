@@ -197,6 +197,12 @@ message IndexMetadata {
 
   /// The minimum lance version that this index is compatible with.
   optional int32 index_version = 7;
+
+  /// Timestamp when the index was created (UTC timestamp in milliseconds since epoch)
+  ///
+  /// This field is optional for backward compatibility. For existing indices created before
+  /// this field was added, this will be None/null.
+  optional uint64 created_at = 8;
 }
 
 // Index Section, containing a list of index metadata for one dataset version.

@@ -410,6 +410,7 @@ impl DatasetIndexExt for Dataset {
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
             index_details: Some(index_details),
             index_version: index_type.version(),
+            created_at: Some(chrono::Utc::now()),
         };
         let transaction = Transaction::new(
             self.manifest.version,
@@ -560,6 +561,7 @@ impl DatasetIndexExt for Dataset {
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
             index_details: None,
             index_version: 0,
+            created_at: Some(chrono::Utc::now()),
         };
 
         let transaction = Transaction::new(
@@ -658,6 +660,7 @@ impl DatasetIndexExt for Dataset {
                 fragment_bitmap: Some(res.new_fragment_bitmap),
                 index_details: last_idx.index_details.clone(),
                 index_version: res.new_index_version,
+                created_at: Some(chrono::Utc::now()),
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             if deltas.len() > removed_indices.len() {
@@ -793,6 +796,13 @@ impl DatasetIndexExt for Dataset {
         let num_indexed_rows: usize = num_indexed_rows_per_delta.iter().cloned().sum();
         let num_unindexed_rows = self.count_rows(None).await? - num_indexed_rows;
 
+        // Calculate updated_at as max(created_at) from all index metadata
+        let updated_at = metadatas
+            .iter()
+            .filter_map(|m| m.created_at)
+            .max()
+            .map(|dt| dt.timestamp_millis() as u64);
+
         let stats = json!({
             "index_type": index_type,
             "name": index_name,
@@ -803,6 +813,7 @@ impl DatasetIndexExt for Dataset {
             "num_unindexed_fragments": num_unindexed_fragments,
             "num_unindexed_rows": num_unindexed_rows,
             "num_indexed_rows_per_delta": num_indexed_rows_per_delta,
+            "updated_at_timestamp_ms": updated_at,
         });
 
         serde_json::to_string(&stats).map_err(|e| Error::Index {
@@ -1091,6 +1102,18 @@ impl DatasetIndexInternalExt for Dataset {
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
+                    "IVF_HNSW_FLAT" => {
+                        let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
+                            uuid.to_owned(),
+                            Arc::downgrade(&self.session),
+                            fri,
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
                     "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
                             self.object_store.clone(),
@@ -1306,7 +1329,10 @@ mod tests {
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::{ReadParams, WriteParams};
     use crate::session::Session;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, StatsHolder};
+    use crate::utils::test::{
+        copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount, StatsHolder,
+    };
+    use arrow_array::Int32Array;
 
     use super::*;
 
@@ -2238,5 +2264,236 @@ mod tests {
         for id in ids.values() {
             assert!(seen.insert(*id), "Duplicate id found: {}", id);
         }
+    }
+
+    #[tokio::test]
+    async fn test_index_created_at_timestamp() {
+        // Test that created_at is set when creating an index
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("values", DataType::Utf8, false),
+        ]));
+
+        let values = StringArray::from_iter_values(["hello", "world", "foo", "bar"]);
+        let record_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..4)),
+                Arc::new(values),
+            ],
+        )
+        .unwrap();
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Record time before creating index
+        let before_index = chrono::Utc::now();
+
+        // Create a scalar index
+        dataset
+            .create_index(
+                &["values"],
+                IndexType::Scalar,
+                Some("test_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Record time after creating index
+        let after_index = chrono::Utc::now();
+
+        // Get index metadata
+        let indices = dataset.load_indices().await.unwrap();
+        let test_index = indices.iter().find(|idx| idx.name == "test_idx").unwrap();
+
+        // Verify created_at is set and within reasonable bounds
+        assert!(test_index.created_at.is_some());
+        let created_at = test_index.created_at.unwrap();
+        assert!(created_at >= before_index);
+        assert!(created_at <= after_index);
+    }
+
+    #[tokio::test]
+    async fn test_index_statistics_updated_at() {
+        // Test that updated_at appears in index statistics
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("values", DataType::Utf8, false),
+        ]));
+
+        let values = StringArray::from_iter_values(["hello", "world", "foo", "bar"]);
+        let record_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..4)),
+                Arc::new(values),
+            ],
+        )
+        .unwrap();
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Create a scalar index
+        dataset
+            .create_index(
+                &["values"],
+                IndexType::Scalar,
+                Some("test_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Get index statistics
+        let stats_str = dataset.index_statistics("test_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_str).unwrap();
+
+        // Verify updated_at_timestamp_ms field exists in statistics
+        assert!(stats["updated_at_timestamp_ms"].is_number());
+        let updated_at = stats["updated_at_timestamp_ms"].as_u64().unwrap();
+
+        // Get the index metadata to compare with created_at
+        let indices = dataset.load_indices().await.unwrap();
+        let test_index = indices.iter().find(|idx| idx.name == "test_idx").unwrap();
+        let created_at = test_index.created_at.unwrap().timestamp_millis() as u64;
+
+        // For a single index, updated_at should equal created_at
+        assert_eq!(updated_at, created_at);
+    }
+
+    #[tokio::test]
+    async fn test_index_statistics_updated_at_multiple_deltas() {
+        // Test that updated_at reflects max(created_at) across multiple delta indices
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                false,
+            ),
+        ]));
+
+        // Create initial dataset (need more rows for PQ training)
+        let num_rows = 300;
+        let float_arr = generate_random_array(4 * num_rows);
+        let vectors = FixedSizeListArray::try_new_from_values(float_arr, 4).unwrap();
+        let record_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Create vector index
+        let params = VectorIndexParams::ivf_pq(1, 8, 2, MetricType::L2, 2);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("test_vec_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Get initial statistics
+        let stats_str_1 = dataset.index_statistics("test_vec_idx").await.unwrap();
+        let stats_1: serde_json::Value = serde_json::from_str(&stats_str_1).unwrap();
+        let initial_updated_at = stats_1["updated_at_timestamp_ms"].as_u64().unwrap();
+
+        // Add more data to create additional delta indices
+        std::thread::sleep(std::time::Duration::from_millis(10)); // Ensure different timestamp
+
+        let num_rows_2 = 50;
+        let float_arr_2 = generate_random_array(4 * num_rows_2);
+        let vectors_2 = FixedSizeListArray::try_new_from_values(float_arr_2, 4).unwrap();
+        let record_batch_2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(
+                    num_rows as i32..(num_rows + num_rows_2) as i32,
+                )),
+                Arc::new(vectors_2),
+            ],
+        )
+        .unwrap();
+
+        let reader_2 =
+            RecordBatchIterator::new(vec![record_batch_2].into_iter().map(Ok), schema.clone());
+
+        dataset.append(reader_2, None).await.unwrap();
+
+        // Update the index
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("test_vec_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Get updated statistics
+        let stats_str_2 = dataset.index_statistics("test_vec_idx").await.unwrap();
+        let stats_2: serde_json::Value = serde_json::from_str(&stats_str_2).unwrap();
+        let final_updated_at = stats_2["updated_at_timestamp_ms"].as_u64().unwrap();
+
+        // The updated_at should be newer than the initial one
+        assert!(final_updated_at >= initial_updated_at);
+    }
+
+    #[tokio::test]
+    async fn test_index_statistics_updated_at_none_when_no_created_at() {
+        // Test backward compatibility: when indices were created before the created_at field,
+        // updated_at_timestamp_ms should be null
+
+        // Use test data created with Lance 0.29.0 (before created_at field was added)
+        let test_dir =
+            copy_test_data_to_tmp("v0.30.0_pre_created_at/index_without_created_at").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+
+        // Get the index metadata to verify created_at is None
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(!indices.is_empty(), "Test dataset should have indices");
+
+        // Verify that the index created with old version has no created_at
+        for index in indices.iter() {
+            assert!(
+                index.created_at.is_none(),
+                "Index from old version should have created_at = None"
+            );
+        }
+
+        // Get index statistics - should work even with old indices
+        let index_name = &indices[0].name;
+        let stats_str = dataset.index_statistics(index_name).await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_str).unwrap();
+
+        // Verify updated_at_timestamp_ms field is null when no indices have created_at
+        assert!(
+            stats["updated_at_timestamp_ms"].is_null(),
+            "updated_at_timestamp_ms should be null when no indices have created_at timestamps"
+        );
     }
 }

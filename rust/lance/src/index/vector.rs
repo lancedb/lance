@@ -41,6 +41,7 @@ use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
 use object_store::path::Path;
+use serde::Serialize;
 use snafu::location;
 use tempfile::tempdir;
 use tracing::instrument;
@@ -64,10 +65,23 @@ pub enum StageParams {
 // The version of the index file.
 // `Legacy` is used for only IVF_PQ index, and is the default value.
 // The other index types are using `V3`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum IndexFileVersion {
     Legacy,
     V3,
+}
+
+impl IndexFileVersion {
+    pub fn try_from(version: &str) -> Result<Self> {
+        match version.to_lowercase().as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "v3" => Ok(Self::V3),
+            _ => Err(Error::Index {
+                message: format!("Invalid index file version: {}", version),
+                location: location!(),
+            }),
+        }
+    }
 }
 
 /// The parameters to build vector index.
@@ -141,6 +155,19 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
+            version: IndexFileVersion::V3,
+        }
+    }
+
+    pub fn ivf_hnsw(
+        distance_type: DistanceType,
+        ivf: IvfBuildParams,
+        hnsw: HnswBuildParams,
+    ) -> Self {
+        let stages = vec![StageParams::Ivf(ivf), StageParams::Hnsw(hnsw)];
+        Self {
+            stages,
+            metric_type: distance_type,
             version: IndexFileVersion::V3,
         }
     }
@@ -392,6 +419,21 @@ pub(crate) async fn build_vector_index(
                     });
                 }
             }
+        } else {
+            // without quantization
+            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                dataset.clone(),
+                column.to_owned(),
+                dataset.indices_dir().child(uuid),
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params.clone()),
+                Some(()),
+                hnsw_params.clone(),
+                fri,
+            )?
+            .build()
+            .await?;
         }
     } else {
         return Err(Error::Index {

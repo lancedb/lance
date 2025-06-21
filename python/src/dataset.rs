@@ -31,7 +31,6 @@ use pyo3::{
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
-use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
@@ -54,6 +53,7 @@ use lance::dataset::{
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
+use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
@@ -1344,7 +1344,9 @@ impl Dataset {
             "NGRAM" => IndexType::NGram,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
-            "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
+            "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
+                IndexType::Vector
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -2025,6 +2027,7 @@ fn prepare_vector_index_params(
     let mut hnsw_params = HnswBuildParams::default();
     let mut pq_params = PQBuildParams::default();
     let mut sq_params = SQBuildParams::default();
+    let mut index_file_version = IndexFileVersion::V3;
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -2141,9 +2144,15 @@ fn prepare_vector_index_params(
             let codebook = as_fixed_size_list_array(batch.column(0));
             pq_params.codebook = Some(codebook.values().clone())
         };
+
+        if let Some(version) = kwargs.get_item("index_file_version")? {
+            let version: String = version.extract()?;
+            index_file_version = IndexFileVersion::try_from(&version)
+                .map_err(|e| PyValueError::new_err(format!("Invalid index_file_version: {e}")))?;
+        }
     }
 
-    match index_type {
+    let mut params = match index_type {
         "IVF_FLAT" => Ok(Box::new(VectorIndexParams::ivf_flat(
             ivf_params.num_partitions,
             m_type,
@@ -2151,6 +2160,12 @@ fn prepare_vector_index_params(
 
         "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(
             m_type, ivf_params, pq_params,
+        ))),
+
+        "IVF_HNSW_FLAT" => Ok(Box::new(VectorIndexParams::ivf_hnsw(
+            m_type,
+            ivf_params,
+            hnsw_params,
         ))),
 
         "IVF_HNSW_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
@@ -2170,7 +2185,9 @@ fn prepare_vector_index_params(
         _ => Err(PyValueError::new_err(format!(
             "Index type '{index_type}' is not supported."
         ))),
-    }
+    }?;
+    params.version(index_file_version);
+    Ok(params)
 }
 
 #[pyclass(name = "_FragmentWriteProgress", module = "_lib")]

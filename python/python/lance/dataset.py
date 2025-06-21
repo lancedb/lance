@@ -1947,6 +1947,8 @@ class LanceDataset(pa.dataset.Dataset):
             - num_bits
                 The number of bits for PQ (Product Quantization). Default is 8.
                 Only 4, 8 are supported.
+            - index_file_version
+                The version of the index file. Default is "V3".
 
         Optional parameters for `IVF_HNSW_*`:
             max_level
@@ -2068,7 +2070,13 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
-        valid_index_types = ["IVF_FLAT", "IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
+        valid_index_types = [
+            "IVF_FLAT",
+            "IVF_PQ",
+            "IVF_HNSW_FLAT",
+            "IVF_HNSW_PQ",
+            "IVF_HNSW_SQ",
+        ]
         if index_type not in valid_index_types:
             raise NotImplementedError(
                 f"Only {valid_index_types} index types supported. Got {index_type}"
@@ -3129,6 +3137,7 @@ class LanceOperation:
         dataset_version: int
         fragment_ids: Set[int]
         index_version: int
+        created_at: Optional[datetime] = None
 
     @dataclass
     class DataReplacementGroup:
