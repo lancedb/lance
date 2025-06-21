@@ -4216,6 +4216,7 @@ dependencies = [
  "lance-arrow",
  "lance-core",
  "lance-datagen",
+ "lance-linalg",
  "lazy_static",
  "log",
  "pin-project",

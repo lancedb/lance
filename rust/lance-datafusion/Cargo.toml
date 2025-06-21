@@ -26,6 +26,7 @@ futures.workspace = true
 lance-arrow.workspace = true
 lance-core = { workspace = true, features = ["datafusion"] }
 lance-datagen.workspace = true
+lance-linalg.workspace = true
 lazy_static.workspace = true
 log.workspace = true
 pin-project.workspace = true
