@@ -3347,7 +3347,14 @@ impl PrimitiveFieldEncoder {
                 row_number: 0, // legacy encoders do not use
             })
         })
-        .map(|res_res| res_res.unwrap())
+        .map(|res_res| {
+            res_res.unwrap_or_else(|err| {
+                Err(Error::Internal {
+                    message: format!("Encoding task failed with error: {:?}", err),
+                    location: location!(),
+                })
+            })
+        })
         .boxed())
     }
 
