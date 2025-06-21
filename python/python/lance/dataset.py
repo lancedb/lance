@@ -2716,6 +2716,21 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.delete_config_keys(keys)
 
+    def get_configs(self, keys: Optional[list[str]] = None) -> dict[str, str]:
+        """Get config items of the dataset based on the given keys.
+
+        Parameters
+        ----------
+        keys : optional, list of str
+            A list of configuration keys to get from the dataset.
+            If none, will return all the configuration entries.
+        Returns
+        -------
+        dict[str, str]
+            A list of configuration items.
+        """
+        return self._ds.get_configs(keys)
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
