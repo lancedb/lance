@@ -13,13 +13,13 @@ class BlobIterator:
     def __init__(self, binary_iter: Iterator[pa.BinaryScalar]):
         self.binary_iter = binary_iter
 
-    def __next__(self) -> Optional[IO[bytes] | None]:
+    def __next__(self) -> Optional[IO[bytes]]:
         value = next(self.binary_iter)
         if value is None:
             return None
         return io.BytesIO(value.as_py())
 
-    def __iter__(self) -> Iterator[IO[bytes] | None]:
+    def __iter__(self) -> Iterator[Optional[IO[bytes]]]:
         return self
 
 
