@@ -773,7 +773,7 @@ impl BTreeIndex {
             return Ok(cached);
         }
         metrics.record_part_load();
-        info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
+        info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
         let mut serialized_page = index_reader
             .read_record_batch(page_number as u64, self.batch_size)

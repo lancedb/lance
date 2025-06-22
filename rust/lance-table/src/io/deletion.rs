@@ -91,7 +91,7 @@ pub async fn write_deletion_file(
 
             object_store.put(&path, &out).await?;
 
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_DELETION, path = path.to_string());
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
 
             Some(deletion_file)
         }
@@ -110,7 +110,7 @@ pub async fn write_deletion_file(
 
             object_store.put(&path, &out).await?;
 
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_DELETION, path = path.to_string());
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
 
             Some(deletion_file)
         }

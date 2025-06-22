@@ -203,7 +203,7 @@ impl NGramPostingListReader {
         self.cache
             .try_get_with(row_offset, async move {
                 metrics.record_part_load();
-                tracing::info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="ngram", part_id=row_offset);
+                tracing::info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="ngram", part_id=row_offset);
                 let batch = self
                     .reader
                     .read_range(
