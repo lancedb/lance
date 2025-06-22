@@ -11,7 +11,7 @@ import logging
 import math
 import warnings
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Union
 
 import pyarrow as pa
 
@@ -182,6 +182,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         dataset: Union[torch.utils.data.Dataset, str, Path],
         batch_size: int,
         *args,
+        dataset_options: Optional[Dict[str, Any]] = None,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[str] = None,
         samples: Optional[int] = 0,
@@ -237,7 +238,8 @@ class LanceDataset(torch.utils.data.IterableDataset):
         """
         super().__init__()
         if isinstance(dataset, (str, Path)):
-            dataset = lance.dataset(dataset)
+            dataset_options = dataset_options or {}
+            dataset = lance.dataset(dataset, **dataset_options)
         self.dataset = dataset
         self.columns = columns
         self.batch_size = batch_size
@@ -378,16 +380,18 @@ class LanceDataset(torch.utils.data.IterableDataset):
 
 
 class SafeLanceDataset(torch.utils.data.Dataset):
-    def __init__(self, uri):
+    def __init__(self, uri, *, dataset_options=None, **kwargs):
+        super().__init__(**kwargs)
         self.uri = uri
+        self.dataset_options = dataset_options or {}
         self._len = self._safe_preload()
-        self._ds = None  # Deferred initialization
+        self._ds = None
 
     def _safe_preload(self):
         """Main-process safe metadata loading"""
-        ds = lance.dataset(self.uri)
+        ds = lance.dataset(self.uri, **self.dataset_options)
         length = ds.count_rows()
-        del ds  # Critical: release before spawning
+        del ds
         return length
 
     def __len__(self):
