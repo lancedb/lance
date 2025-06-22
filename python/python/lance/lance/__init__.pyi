@@ -527,3 +527,6 @@ class ScanStatistics:
 
 __version__: str
 language_model_home: Callable[[], str]
+
+class FFILanceTableProvider:
+    def __init__(self, dataset: _Dataset, *, with_row_id = False, with_row_addr = False) -> None: ...

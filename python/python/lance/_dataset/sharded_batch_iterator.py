@@ -140,7 +140,7 @@ class ShardedBatchIterator:
 
         return self._ds._ds.take_scan(
             _gen_ranges(),
-            columns=self._columns,
+            columns=self._columns, # type: ignore
         )
 
     def __iter__(self):

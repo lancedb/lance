@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import os
+from typing import Any
 import uuid
 from pathlib import Path
 
@@ -75,7 +76,7 @@ def check_add_columns(
 def check_add_columns_fails(
     dataset: LanceDataset,
     use_fragments: bool,
-    expected_exception: any,
+    expected_exception: Any,
     match: str,
     *args,
     **kwargs,

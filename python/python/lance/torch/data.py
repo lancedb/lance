@@ -11,7 +11,7 @@ import logging
 import math
 import warnings
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Literal, Optional, Union
+from typing import Callable, Dict, Iterable, List, Literal, Optional, Union, no_type_check
 
 import pyarrow as pa
 
@@ -45,6 +45,7 @@ def _fsl_to_tensor(arr: pa.FixedSizeListArray, dimension: int) -> torch.Tensor:
     return torch.from_numpy(nparr)
 
 
+@no_type_check
 def _to_tensor(
     batch: Union[pa.RecordBatch, Dict[str, pa.Array]],
     *,
@@ -124,7 +125,7 @@ class TensorDataset(torch.utils.data.Dataset):
         super().__init__(*args, **kwargs)
         if _check_for_numpy(data) and isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
-        self._data: torch.Tensor = data
+        self._data: torch.Tensor = data # type: ignore
         self._batch_size = batch_size
 
     def __repr__(self):
@@ -248,7 +249,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self._to_tensor_fn = to_tensor_fn
         self._hf_converter = None
 
-        self._blob_columns = self._blob_columns()
+        self._blob_columns = self._blob_columns() # type: ignore
         if self._blob_columns:
             self.with_row_id = True
 
@@ -262,8 +263,8 @@ class LanceDataset(torch.utils.data.IterableDataset):
 
         # Dataset with huggingface metadata
         if (
-            dataset.schema.metadata is not None
-            and (hf_meta := dataset.schema.metadata.get(b"huggingface")) is not None
+            dataset.schema.metadata is not None # type: ignore
+            and (hf_meta := dataset.schema.metadata.get(b"huggingface")) is not None # type: ignore
         ):
             from ..hf import HuggingFaceConverter
 
@@ -274,14 +275,14 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.cached_ds: Optional[CachedDataset] = None
 
     def __repr__(self) -> str:
-        return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})"
+        return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})" # type: ignore
 
     @property
     def schema(self) -> pa.Schema:
         if not self.columns:
-            return self.dataset.schema
-        fields = [self.dataset.schema.field(col) for col in self.columns]
-        return pa.schema(fields, metadata=self.dataset.schema.metadata)
+            return self.dataset.schema # type: ignore
+        fields = [self.dataset.schema.field(col) for col in self.columns] # type: ignore
+        return pa.schema(fields, metadata=self.dataset.schema.metadata) # type: ignore
 
     def __iter__(self):
         if self.sampler is None:
@@ -305,10 +306,10 @@ class LanceDataset(torch.utils.data.IterableDataset):
         else:
             sampler = self.sampler
 
-        projected_columns = self.columns or self.dataset.schema.names
+        projected_columns = self.columns or self.dataset.schema.names # type: ignore
         if self._blob_columns:
             projected_columns = [
-                c for c in projected_columns if c not in self._blob_columns
+                c for c in projected_columns if c not in self._blob_columns # type: ignore
             ]
 
         stream: Iterable[pa.RecordBatch]
@@ -319,14 +320,14 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 raw_stream = maybe_sample(
                     self.dataset,
                     n=self.samples,
-                    columns=projected_columns,
+                    columns=projected_columns, # type: ignore
                     batch_size=self.batch_size,
                     filt=self.filter,
                 )
             else:
                 raw_stream = sampler(
                     self.dataset,
-                    columns=projected_columns,
+                    columns=projected_columns, # type: ignore
                     filter=self.filter,
                     batch_size=self.batch_size,
                     with_row_id=self.with_row_id,
@@ -347,14 +348,14 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 row_ids = batch["_rowid"]
                 for col in batch.column_names:
                     dict_batch[col] = batch[col]
-                for col in self._blob_columns:
-                    dict_batch[col] = self.dataset.take_blobs(
+                for col in self._blob_columns: # type: ignore
+                    dict_batch[col] = self.dataset.take_blobs( # type: ignore
                         ids=row_ids.to_pylist(), blob_column=col
                     )
                 batch = dict_batch
             if self._to_tensor_fn is not None:
                 batch = self._to_tensor_fn(
-                    batch, hf_converter=self._hf_converter, use_blob_api=use_blob_api
+                    batch, hf_converter=self._hf_converter, use_blob_api=use_blob_api # type: ignore
                 )
             yield batch
             del batch
@@ -363,10 +364,10 @@ class LanceDataset(torch.utils.data.IterableDataset):
         """Returns True if one of the projected column is Large Blob encoded."""
         cols = self.columns
         if not cols:
-            cols = self.dataset.schema.names
+            cols = self.dataset.schema.names # type: ignore
         blob_cols = []
         for col in cols:
-            field = self.dataset.schema.field(col)
+            field = self.dataset.schema.field(col) # type: ignore
             if (
                 field.type == pa.large_binary()
                 and field.metadata is not None

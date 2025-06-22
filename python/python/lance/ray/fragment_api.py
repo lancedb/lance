@@ -27,7 +27,7 @@ RecordBatchTransformer = Callable[[pa.RecordBatch], pa.RecordBatch]
 def execute_fragment_operation(
     task_dispatcher: "DispatchFragmentTasks",
     value_function: Union[Dict[str, str], RecordBatchTransformer],
-    operation_parameters: Dict[str, Any] = None,
+    operation_parameters: Dict[str, Any] | None = None,
 ) -> None:
     """
     Execute distributed fragment operations and commit results.
@@ -40,7 +40,7 @@ def execute_fragment_operation(
     operation_parameters = operation_parameters or {}
 
     # Generate and execute distributed tasks
-    processing_tasks = task_dispatcher.get_tasks(value_function, operation_parameters)
+    processing_tasks = task_dispatcher.get_tasks(value_function, operation_parameters) # type: ignore
     task_dataset = from_items(processing_tasks).map(lambda task: task[ITEM_KEY]())
 
     # Collect and commit results

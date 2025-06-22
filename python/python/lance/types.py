@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Optional, Union
+from typing import TYPE_CHECKING, Iterable, Optional, Union, no_type_check
 
 import pyarrow as pa
 from pyarrow import RecordBatch
@@ -16,8 +16,8 @@ if TYPE_CHECKING:
     ReaderLike = Union[
         pd.Timestamp,
         pa.Table,
-        pa.dataset.Dataset,
-        pa.dataset.Scanner,
+        pa.dataset.Dataset, # type: ignore
+        pa.dataset.Scanner, # type: ignore
         pa.RecordBatch,
         Iterable[RecordBatch],
         pa.RecordBatchReader,
@@ -43,7 +43,7 @@ def _casting_recordbatch_iter(
             try:
                 # RecordBatch doesn't have a cast method, but table does.
                 batch = pa.Table.from_batches([batch]).cast(schema).to_batches()[0]
-            except pa.lib.ArrowInvalid:
+            except pa.lib.ArrowInvalid: # type: ignore
                 raise ValueError(
                     f"Input RecordBatch iterator yielded a batch with schema that "
                     f"does not match the expected schema.\nExpected:\n{schema}\n"
@@ -52,6 +52,7 @@ def _casting_recordbatch_iter(
         yield batch
 
 
+@no_type_check
 def _coerce_reader(
     data_obj: ReaderLike, schema: Optional[pa.Schema] = None
 ) -> pa.RecordBatchReader:
@@ -73,7 +74,7 @@ def _coerce_reader(
         type(data_obj).__module__.startswith("polars")
         and data_obj.__class__.__name__ == "DataFrame"
     ):
-        return data_obj.to_arrow().to_reader()
+        return data_obj.to_arrow().to_reader() # type: ignore
     elif isinstance(data_obj, dict):
         batch = pa.RecordBatch.from_pydict(data_obj, schema=schema)
         return pa.RecordBatchReader.from_batches(batch.schema, [batch])

@@ -48,7 +48,7 @@ class FragmentTask:
         self.task_input = task_input
 
     def __call__(self) -> Dict[str, Any]:
-        output = self._fn()
+        output = self.task_input.fn()
         return {
             TASK_ID_KEY: self.task_input.task_id,
             PARTITION_KEY: {FRAGMENT_KEY: self.task_input.fragment, "output": output},

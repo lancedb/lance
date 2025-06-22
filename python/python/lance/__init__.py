@@ -135,7 +135,7 @@ def dataset(
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
         ver_cutoff = max(
-            [v["version"] for v in ds.versions() if v["timestamp"] < ts_cutoff],
+            [v["version"] for v in ds.versions() if v["timestamp"] < ts_cutoff], # type: ignore
             default=None,
         )
         if ver_cutoff is None:

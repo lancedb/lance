@@ -70,7 +70,7 @@ class DeletionFile:
         ...
 
     @classmethod
-    def from_json(json: str) -> DeletionFile:
+    def from_json(cls, json: str) -> DeletionFile:
         """
         Load a deletion file from a JSON representation.
 
@@ -105,7 +105,7 @@ class RowIdMeta:
         ...
 
     @classmethod
-    def from_json(json: str) -> RowIdMeta:
+    def from_json(cls, json: str) -> RowIdMeta:
         """
         Load row id metadata from a JSON representation.
 

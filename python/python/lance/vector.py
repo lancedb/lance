@@ -134,10 +134,10 @@ CUDA_REGEX = re.compile(r"^cuda(:\d+)?$")
 def train_pq_codebook_on_accelerator(
     dataset: LanceDataset | Path | str,
     metric_type: MetricType,
-    accelerator: Union[str, "torch.Device"],
+    accelerator: Union[str, "torch.Device"], # type: ignore
     num_sub_vectors: int,
     batch_size: int = 1024 * 10 * 4,
-    dtype: np.dtype = np.float32,
+    dtype: np.dtype = np.float32, # type: ignore
 ) -> Tuple[np.ndarray, List[Any]]:
     """Use accelerator (GPU or MPS) to train pq codebook."""
 
@@ -182,14 +182,14 @@ def train_pq_codebook_on_accelerator(
             max_iters=50,
             metric=metric_type,
             device=accelerator,
-            centroids=init_centroids_slice,
+            centroids=init_centroids_slice, # type: ignore
         )
         if num_sub_vectors == 1:
             kmeans_local.fit(ds_fit)
         else:
             kmeans_local.fit(ds_fit, column=field_names[sub_vector])
 
-        ivf_centroids_local = kmeans_local.centroids.cpu().numpy()
+        ivf_centroids_local = kmeans_local.centroids.cpu().numpy() # type: ignore
         centroids_list.append(ivf_centroids_local)
         kmeans_list.append(kmeans_local)
 
@@ -202,7 +202,7 @@ def train_ivf_centroids_on_accelerator(
     column: str,
     k: int,
     metric_type: MetricType,
-    accelerator: Union[str, "torch.Device"],
+    accelerator: Union[str, "torch.Device"], # type: ignore
     batch_size: int = 1024 * 10 * 4,
     *,
     sample_rate: int = 256,
@@ -245,7 +245,7 @@ def train_ivf_centroids_on_accelerator(
     )
 
     init_centroids = next(iter(ds))
-    LOGGER.info("Done sampling: centroids shape: %s", init_centroids.shape)
+    LOGGER.info("Done sampling: centroids shape: %s", init_centroids.shape) # type: ignore
 
     ds = TorchDataset(
         dataset,
@@ -262,12 +262,12 @@ def train_ivf_centroids_on_accelerator(
         max_iters=max_iters,
         metric=metric_type,
         device=accelerator,
-        centroids=init_centroids,
+        centroids=init_centroids, # type: ignore
     )
     kmeans.fit(ds)
 
     centroids = (
-        kmeans.centroids.cpu().numpy().astype(vector_value_type.to_pandas_dtype())
+        kmeans.centroids.cpu().numpy().astype(vector_value_type.to_pandas_dtype()) # type: ignore
     )
 
     with tempfile.NamedTemporaryFile(delete=False) as f:
@@ -519,13 +519,13 @@ def compute_partitions(
                     residual_vecs = vecs[mask_gpu] - kmeans.centroids[partitions]
                     for i in range(num_sub_vectors):
                         subvector_tensor = residual_vecs[
-                            :, i * subvector_size : (i + 1) * subvector_size
+                            :, i * subvector_size : (i + 1) * subvector_size # type: ignore
                         ]
                         subvector_arr = pa.array(
                             subvector_tensor.cpu().detach().numpy().reshape(-1)
                         )
                         subvector_fsl = pa.FixedSizeListArray.from_arrays(
-                            subvector_arr, subvector_size
+                            subvector_arr, subvector_size # type: ignore
                         )
                         split_columns.append(subvector_fsl)
 
@@ -568,7 +568,7 @@ def one_pass_train_ivf_pq_on_accelerator(
     column: str,
     k: int,
     metric_type: MetricType,
-    accelerator: Union[str, "torch.Device"],
+    accelerator: Union[str, "torch.Device"], # type: ignore
     num_sub_vectors: int,
     batch_size: int = 1024 * 10 * 4,
     *,
@@ -608,7 +608,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
     dataset: LanceDataset,
     column: str,
     metric_type: MetricType,
-    accelerator: Union[str, "torch.Device"],
+    accelerator: Union[str, "torch.Device"], # type: ignore
     ivf_kmeans: Any,  # KMeans
     pq_kmeans_list: List[Any],  # List[KMeans]
     dst_dataset_uri: Optional[Union[str, Path]] = None,
