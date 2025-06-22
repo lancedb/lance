@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from typing import Any, Callable, Dict, List, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import pyarrow as pa
 from ray.data import from_items
@@ -27,7 +27,7 @@ RecordBatchTransformer = Callable[[pa.RecordBatch], pa.RecordBatch]
 def execute_fragment_operation(
     task_dispatcher: "DispatchFragmentTasks",
     value_function: Union[Dict[str, str], RecordBatchTransformer],
-    operation_parameters: Dict[str, Any] | None = None,
+    operation_parameters: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Execute distributed fragment operations and commit results.
