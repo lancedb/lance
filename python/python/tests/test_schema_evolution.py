@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import os
-from typing import Any
 import uuid
 from pathlib import Path
+from typing import Any
 
 import lance
 import numpy as np
