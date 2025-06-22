@@ -20,10 +20,10 @@ from typing import (
 import pyarrow as pa
 
 import lance  # type: ignore
-from lance.fragment import (  # type: ignore
-    DEFAULT_MAX_BYTES_PER_FILE,
-    FragmentMetadata,
-    write_fragments,
+from lance.fragment import (
+    DEFAULT_MAX_BYTES_PER_FILE,  # type: ignore
+    FragmentMetadata,  # type: ignore
+    write_fragments,  # type: ignore
 )
 
 from ..dependencies import ray
@@ -137,7 +137,7 @@ class _BaseLanceDatasink(ray.data.Datasink):
 
     def on_write_complete(
         self,
-        write_result: List[List[Tuple[str, str]]],
+        write_result,
     ):
         import warnings
 

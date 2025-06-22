@@ -312,9 +312,9 @@ class FragmentSampler(Sampler):
     @abstractmethod
     def iter_fragments(
         self,
-        ds: lance.LanceDataset,
+        ds: lance.LanceDataset,  # type: ignore
         *args,
-        **kwargs,  # type: ignore
+        **kwargs,
     ) -> Generator[lance.LanceFragment, None, None]:  # type: ignore
         """Iterate over data fragments."""
         pass
@@ -325,8 +325,8 @@ class FullScanSampler(FragmentSampler):
 
     def iter_fragments(
         self,
-        dataset: lance.LanceDataset,
-        **kwargs,  # type: ignore
+        dataset: lance.LanceDataset,  # type: ignore
+        **kwargs,
     ) -> Generator[lance.LanceFragment, None, None]:  # type: ignore
         for fragment in dataset.get_fragments():
             yield fragment
@@ -380,8 +380,8 @@ class ShardedFragmentSampler(FragmentSampler):
 
     def iter_fragments(
         self,
-        dataset: lance.LanceDataset,
-        **kwargs,  # type: ignore
+        dataset: lance.LanceDataset,  # type: ignore
+        **kwargs,
     ) -> Generator[lance.LanceFragment, None, None]:  # type: ignore
         fragments = dataset.get_fragments()
         if self._randomize:

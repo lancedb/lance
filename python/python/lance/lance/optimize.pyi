@@ -45,10 +45,14 @@ class CompactionPlan:
 class Compaction:
     @staticmethod
     def execute(
-        dataset: "LanceDataset", options: CompactionOptions
+        dataset: "LanceDataset",
+        options: CompactionOptions,  # type: ignore
     ) -> CompactionMetrics: ...
     @staticmethod
-    def plan(dataset: "LanceDataset", options: CompactionOptions) -> CompactionPlan: ...
+    def plan(
+        dataset: "LanceDataset",
+        options: CompactionOptions,  # type: ignore
+    ) -> CompactionPlan: ...
     @staticmethod
     def commit(
         dataset: "LanceDataset", rewrites: List[RewriteResult]
