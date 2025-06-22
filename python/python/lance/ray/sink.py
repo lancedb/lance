@@ -137,7 +137,7 @@ class _BaseLanceDatasink(ray.data.Datasink):
 
     def on_write_complete(
         self,
-        write_result,
+        write_result: ray.data.datasource.WriteResult | List[List[Tuple[str, str]]],
     ):
         import warnings
 
