@@ -15,6 +15,7 @@ from typing import (
     Optional,
     Tuple,
     Union,
+    no_type_check,
 )
 
 import pyarrow as pa
@@ -135,9 +136,10 @@ class _BaseLanceDatasink(ray.data.Datasink):
             if self.schema is None:
                 self.schema = ds.schema
 
+    @no_type_check
     def on_write_complete(
         self,
-        write_result: ray.data.datasource.WriteResult | List[List[Tuple[str, str]]],
+        write_result,
     ):
         import warnings
 
