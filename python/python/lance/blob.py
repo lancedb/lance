@@ -101,7 +101,7 @@ class BlobFile(io.RawIOBase):
     def readall(self) -> bytes:
         return self.inner.readall()
 
-    def readinto(self, b: bytearray) -> int: # type: ignore
+    def readinto(self, b: bytearray) -> int:  # type: ignore
         return self.inner.read_into(b)
 
     def __repr__(self) -> str:

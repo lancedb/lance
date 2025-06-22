@@ -231,7 +231,7 @@ class ImageURIArray(ImageArray):
         else:
             raise TypeError("Cannot build a ImageURIArray from {}".format(type(uris)))
 
-        return cls.from_storage(ImageURIType(uris.type), uris) # type: ignore
+        return cls.from_storage(ImageURIType(uris.type), uris)  # type: ignore
 
     def read_uris(self, storage_type=pa.binary()) -> "EncodedImageArray":
         """
