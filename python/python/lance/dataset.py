@@ -208,7 +208,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         return super(MergeInsertBuilder, self).retry_timeout(timeout)
 
 
-class LanceDataset(pa.dataset.Dataset): # type: ignore
+class LanceDataset(pa.dataset.Dataset):  # type: ignore
     """A Lance Dataset in Lance format where the data is stored at the given uri."""
 
     def __init__(
@@ -360,7 +360,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
     def scanner(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None, # type: ignore
+        filter: Optional[Union[str, pa.compute.Expression]] = None,  # type: ignore
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
@@ -602,7 +602,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None, # type: ignore
+        filter: Optional[Union[str, pa.compute.Expression]] = None,  # type: ignore
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
@@ -794,7 +794,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
     def to_batches(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None, # type: ignore
+        filter: Optional[Union[str, pa.compute.Expression]] = None,  # type: ignore
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
@@ -1004,7 +1004,9 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
         return self.scanner(**kwargs).to_table()
 
     def count_rows(
-        self, filter: Optional[Union[str, pa.compute.Expression]] = None, **kwargs # type: ignore
+        self,
+        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        **kwargs,  # type: ignore
     ) -> int:
         """Count rows matching the scanner filter.
 
@@ -1019,7 +1021,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
             The total number of rows in the dataset.
 
         """
-        if isinstance(filter, pa.compute.Expression): # type: ignore
+        if isinstance(filter, pa.compute.Expression):  # type: ignore
             # TODO: consolidate all to use scanner
             return self.scanner(
                 columns=[], with_row_id=True, filter=filter
@@ -1293,7 +1295,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
         # Indices might have changed
         self._list_indices_res = None
 
-    def delete(self, predicate: Union[str, pa.compute.Expression]): # type: ignore
+    def delete(self, predicate: Union[str, pa.compute.Expression]):  # type: ignore
         """
         Delete rows from the dataset.
 
@@ -1321,7 +1323,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
         a: [[3]]
         b: [["c"]]
         """
-        if isinstance(predicate, pa.compute.Expression): # type: ignore
+        if isinstance(predicate, pa.compute.Expression):  # type: ignore
             predicate = str(predicate)
         self._ds.delete(predicate)
 
@@ -1498,7 +1500,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
         1  4  b
         2  5  c
         """
-        if isinstance(where, pa.compute.Expression): # type: ignore
+        if isinstance(where, pa.compute.Expression):  # type: ignore
             where = str(where)
         return self._ds.update(updates, where)
 
@@ -1769,7 +1771,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
 
         """
         if isinstance(column, str):
-            column = [column] # type: ignore
+            column = [column]  # type: ignore
 
         if len(column) > 1:
             raise NotImplementedError(
@@ -1780,7 +1782,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
         if column not in self.schema.names:
             raise KeyError(f"{column} not found in schema")
 
-        index_type = index_type.upper() # type: ignore
+        index_type = index_type.upper()  # type: ignore
         if index_type not in ["BTREE", "BITMAP", "NGRAM", "LABEL_LIST", "INVERTED"]:
             raise NotImplementedError(
                 (
@@ -1851,7 +1853,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
             Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
         ] = None,
         num_sub_vectors: Optional[int] = None,
-        accelerator: Optional[Union[str, "torch.Device"]] = None, # type: ignore
+        accelerator: Optional[Union[str, "torch.Device"]] = None,  # type: ignore
         index_cache_size: Optional[int] = None,
         shuffle_partition_batches: Optional[int] = None,
         shuffle_partition_concurrency: Optional[int] = None,
@@ -2111,7 +2113,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
                 self,
                 column[0],
                 num_partitions,
-                metric, # type: ignore
+                metric,  # type: ignore
                 accelerator,
                 num_sub_vectors=num_sub_vectors,
                 batch_size=20480,
@@ -2124,7 +2126,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
             shuffle_output_dir, shuffle_buffers = one_pass_assign_ivf_pq_on_accelerator(
                 self,
                 column[0],
-                metric, # type: ignore
+                metric,  # type: ignore
                 accelerator,
                 ivf_kmeans,
                 pq_kmeans_list,
@@ -2154,7 +2156,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
                 fs, path = FileSystem.from_uri(ivf_centroids_file)
                 with fs.open_input_file(path) as f:
                     ivf_centroids = np.load(f)
-                num_partitions = ivf_centroids.shape[0] # type: ignore
+                num_partitions = ivf_centroids.shape[0]  # type: ignore
 
             if num_partitions is None:
                 raise ValueError(
@@ -2212,7 +2214,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
                     self,
                     column[0],
                     num_partitions,
-                    metric, # type: ignore
+                    metric,  # type: ignore
                     accelerator,
                     filter_nan=filter_nan,
                 )
@@ -2296,10 +2298,10 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
                 timers["pq_train:start"] = time.time()
                 pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
                     partitions_ds,
-                    metric, # type: ignore
+                    metric,  # type: ignore
                     accelerator=accelerator,
                     num_sub_vectors=num_sub_vectors,
-                    dtype=element_type.to_pandas_dtype(), # type: ignore
+                    dtype=element_type.to_pandas_dtype(),  # type: ignore
                 )
                 timers["pq_train:end"] = time.time()
                 pq_train_time = timers["pq_train:end"] - timers["pq_train:start"]
@@ -2524,7 +2526,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
         elif isinstance(base_uri, LanceDataset):
-            base_uri = base_uri._ds # type: ignore
+            base_uri = base_uri._ds  # type: ignore
         elif not isinstance(base_uri, str):
             raise TypeError(
                 f"base_uri must be str, Path, or LanceDataset, got {type(base_uri)}"
@@ -2645,7 +2647,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
         if isinstance(dest, Path):
             dest = str(dest)
         elif isinstance(dest, LanceDataset):
-            dest = dest._ds # type: ignore
+            dest = dest._ds  # type: ignore
         elif not isinstance(dest, str):
             raise TypeError(
                 f"base_uri must be str, Path, or LanceDataset, got {type(dest)}"
@@ -3327,8 +3329,8 @@ class ScannerBuilder:
             )
         return self
 
-    def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder: # type: ignore
-        if isinstance(filter, pa.compute.Expression): # type: ignore
+    def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:  # type: ignore
+        if isinstance(filter, pa.compute.Expression):  # type: ignore
             try:
                 from pyarrow.substrait import serialize_expressions
 
@@ -3475,7 +3477,7 @@ class ScannerBuilder:
 
         if q_dim != dim:
             raise ValueError(
-                f"Query vector size {len(q)} does not match index column size {dim}" # type: ignore
+                f"Query vector size {len(q)} does not match index column size {dim}"  # type: ignore
             )
 
         if k is not None and int(k) <= 0:
@@ -3605,7 +3607,7 @@ class ScannerBuilder:
             self._batch_readahead,
             self._fragment_readahead,
             self._scan_in_order,
-            self._fragments, # type: ignore
+            self._fragments,  # type: ignore
             self._with_row_id,
             self._with_row_address,
             self._use_stats,
@@ -3621,7 +3623,7 @@ class ScannerBuilder:
         return LanceScanner(scanner, self.ds)
 
 
-class LanceScanner(pa.dataset.Scanner): # type: ignore
+class LanceScanner(pa.dataset.Scanner):  # type: ignore
     def __init__(self, scanner: _Scanner, dataset: LanceDataset):
         self._scanner = scanner
         self._ds = dataset
@@ -3828,7 +3830,7 @@ class DatasetOptimizer:
             num_threads=num_threads,
             batch_size=batch_size,
         )
-        return Compaction.execute(self._dataset, opts) # type: ignore
+        return Compaction.execute(self._dataset, opts)  # type: ignore
 
     def optimize_indices(self, **kwargs):
         """Optimizes index performance.
@@ -4169,7 +4171,7 @@ def write_dataset(
     if isinstance(uri, Path):
         uri = os.fspath(uri)
     elif isinstance(uri, LanceDataset):
-        uri = uri._ds # type: ignore
+        uri = uri._ds  # type: ignore
     elif not isinstance(uri, str):
         raise TypeError(f"dest must be a str, Path, or LanceDataset. Got {type(uri)}")
 
@@ -4181,6 +4183,7 @@ def write_dataset(
     ds._uri = inner_ds.uri
     ds._default_scan_options = None
     return ds
+
 
 @no_type_check
 def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:

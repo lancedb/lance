@@ -144,7 +144,7 @@ def _filtered_efficient_sample(
             batch_size=shard_size,
         )
         if len(columns) == 1 and filter.lower() == f"{columns[0]} is not null":
-            table = pc.drop_null(table) # type: ignore
+            table = pc.drop_null(table)  # type: ignore
         elif filter is not None:
             raise NotImplementedError(f"Can't yet run filter <{filter}> in-memory")
         if table.num_rows > 0:
@@ -414,6 +414,7 @@ class ShardedBatchSampler(Sampler):
         self._randomize = randomize
         self._seed = seed
         self._epoch = 0
+        self._len = 0
 
     def __len__(self):
         return self._len
@@ -658,7 +659,7 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
         yield from batches
 
     @staticmethod
-    def from_torch(
+    def from_torch( # type: ignore[reportIncompatibleMethodOverride]
         total_num_rows: int, batch_size: int, randomize: bool = False, seed: int = 0
     ) -> ShardedFixedBatchSampler:
         import torch
@@ -666,5 +667,5 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         return ShardedFixedBatchSampler(
-            rank, world_size, total_num_rows, batch_size, randomize, seed
+            rank, world_size, total_num_rows=total_num_rows, batch_size=batch_size, randomize=randomize, seed=seed
         )

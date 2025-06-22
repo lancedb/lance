@@ -40,7 +40,7 @@ def execute_fragment_operation(
     operation_parameters = operation_parameters or {}
 
     # Generate and execute distributed tasks
-    processing_tasks = task_dispatcher.get_tasks(value_function, operation_parameters) # type: ignore
+    processing_tasks = task_dispatcher.get_tasks(value_function, operation_parameters)  # type: ignore
     task_dataset = from_items(processing_tasks).map(lambda task: task[ITEM_KEY]())
 
     # Collect and commit results

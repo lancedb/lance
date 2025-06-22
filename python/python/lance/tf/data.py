@@ -13,7 +13,16 @@ implementation for Lance.
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union, no_type_check
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    no_type_check,
+)
 
 import pyarrow as pa
 
@@ -112,7 +121,7 @@ def schema_to_spec(schema: pa.Schema) -> tf.TypeSpec:
     for name in schema.names:
         field = schema.field(name)
         signature[name] = data_type_to_tensor_spec(field.type)
-    return signature # type: ignore
+    return signature  # type: ignore
 
 
 @no_type_check
@@ -139,7 +148,9 @@ def from_lance(
     columns: Optional[Union[List[str], Dict[str, str]]] = None,
     batch_size: int = 256,
     filter: Optional[str] = None,
-    fragments: Union[Iterable[int], Iterable[LanceFragment], tf.data.Dataset, None] = None,
+    fragments: Union[
+        Iterable[int], Iterable[LanceFragment], tf.data.Dataset, None
+    ] = None,
     output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
 ) -> tf.data.Dataset:
     """Create a ``tf.data.Dataset`` from a Lance dataset.
@@ -204,9 +215,9 @@ def from_lance(
         dataset = lance.dataset(dataset)
 
     if isinstance(fragments, tf.data.Dataset):
-        fragments = list(fragments.as_numpy_iterator()) # type: ignore
+        fragments = list(fragments.as_numpy_iterator())  # type: ignore
     elif _check_for_numpy(fragments) and isinstance(fragments, np.ndarray):
-        fragments = list(fragments) # type: ignore
+        fragments = list(fragments)  # type: ignore
 
     if fragments is not None:
 
@@ -232,13 +243,13 @@ def from_lance(
 
     if output_signature is None:
         schema = scanner.projected_schema
-        output_signature = schema_to_spec(schema) # type: ignore
+        output_signature = schema_to_spec(schema)  # type: ignore
     LOGGER.debug("Output signature: %s", output_signature)
 
     def generator():
         for batch in scanner.to_batches():
             yield {
-                name: column_to_tensor(batch[name], output_signature[name]) # type: ignore
+                name: column_to_tensor(batch[name], output_signature[name])  # type: ignore
                 for name in batch.schema.names
             }
 
@@ -357,7 +368,7 @@ def lance_take_batches(
 
     if output_signature is None:
         schema = dataset.scanner(columns=columns).projected_schema
-        output_signature = schema_to_spec(schema) # type: ignore
+        output_signature = schema_to_spec(schema)  # type: ignore
     LOGGER.debug("Output signature: %s", output_signature)
 
     def gen_ranges():
@@ -372,7 +383,7 @@ def lance_take_batches(
         )
         for batch in batches:
             yield {
-                name: column_to_tensor(batch[name], output_signature[name]) # type: ignore
+                name: column_to_tensor(batch[name], output_signature[name])  # type: ignore
                 for name in batch.schema.names
             }
 
@@ -382,5 +393,5 @@ def lance_take_batches(
 
 
 # Register `from_lance` to ``tf.data.Dataset``.
-tf.data.Dataset.from_lance = from_lance # type: ignore
-tf.data.Dataset.from_lance_batches = from_lance_batches # type: ignore
+tf.data.Dataset.from_lance = from_lance  # type: ignore
+tf.data.Dataset.from_lance_batches = from_lance_batches  # type: ignore

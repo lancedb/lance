@@ -47,7 +47,7 @@ def _pd_to_arrow(
         return tbl
     elif isinstance(df, pa.Table):
         if schema is not None:
-            return df.cast(schema) # type: ignore
+            return df.cast(schema)  # type: ignore
     return df
 
 
@@ -66,7 +66,7 @@ def _write_fragment(
     from ..dependencies import pandas as pd
 
     if schema is None:
-        first = next(stream) # type: ignore
+        first = next(stream)  # type: ignore
         if _PANDAS_AVAILABLE and isinstance(first, pd.DataFrame):
             schema = pa.Schema.from_pandas(first).remove_metadata()
         elif isinstance(first, Dict):
@@ -170,9 +170,9 @@ class _BaseLanceDatasink(ray.data.Datasink):
         schema = None
         for batch in write_results:
             for fragment_str, schema_str in batch:
-                fragment = pickle.loads(fragment_str) # type: ignore
+                fragment = pickle.loads(fragment_str)  # type: ignore
                 fragments.append(fragment)
-                schema = pickle.loads(schema_str) # type: ignore
+                schema = pickle.loads(schema_str)  # type: ignore
         # Check weather writer has fragments or not.
         # Skip commit when there are no fragments.
         if not schema:
@@ -183,7 +183,7 @@ class _BaseLanceDatasink(ray.data.Datasink):
             op = lance.LanceOperation.Append(fragments)
         lance.LanceDataset.commit(
             self.uri,
-            op, # type: ignore
+            op,  # type: ignore
             read_version=self.read_version,
             storage_options=self.storage_options,
         )
@@ -374,7 +374,7 @@ class LanceFragmentWriter:
             self.uri,
             schema=self.schema,
             max_rows_per_file=self.max_rows_per_file,
-            max_rows_per_group=self.max_rows_per_group, # type: ignore
+            max_rows_per_group=self.max_rows_per_group,  # type: ignore
             data_storage_version=self.data_storage_version,
             storage_options=self.storage_options,
         )

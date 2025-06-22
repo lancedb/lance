@@ -189,7 +189,7 @@ class IndicesBuilder:
         num_partitions=None,
         *,
         distance_type="l2",
-        accelerator: Optional[Union[str, "torch.Device"]] = None, # type: ignore
+        accelerator: Optional[Union[str, "torch.Device"]] = None,  # type: ignore
         sample_rate: int = 256,
         max_iters: int = 50,
     ) -> IvfModel:
@@ -258,7 +258,7 @@ class IndicesBuilder:
                 self.dataset,
                 self.column[0],
                 num_partitions,
-                distance_type, # type: ignore
+                distance_type,  # type: ignore
                 accelerator,
                 sample_rate=sample_rate,
                 max_iters=max_iters,
@@ -311,7 +311,7 @@ class IndicesBuilder:
         """
         num_rows = self.dataset.count_rows()
         self.dataset.schema.field(self.column[0]).type.list_size
-        num_subvectors = self._normalize_pq_params(num_subvectors, self.dimension) # type: ignore
+        num_subvectors = self._normalize_pq_params(num_subvectors, self.dimension)  # type: ignore
         self._verify_pq_sample_rate(num_rows, sample_rate)
         distance_type = ivf_model.distance_type
         pq_codebook = indices.train_pq_model(
@@ -329,7 +329,7 @@ class IndicesBuilder:
     def assign_ivf_partitions(
         self,
         ivf_model: IvfModel,
-        accelerator: Union[str, "torch.Device"], # type: ignore
+        accelerator: Union[str, "torch.Device"],  # type: ignore
         *,
         output_uri: Optional[str] = None,
     ) -> str:
@@ -373,7 +373,7 @@ class IndicesBuilder:
         ).to(accelerator)
         kmeans = KMeans(
             ivf_model.num_partitions,
-            metric=ivf_model.distance_type, # type: ignore
+            metric=ivf_model.distance_type,  # type: ignore
             device=accelerator,
             centroids=centroids,
         )
@@ -420,7 +420,7 @@ class IndicesBuilder:
         elif len(fragments) == 0:
             raise ValueError("fragments must be a non-empty list or None")
         else:
-            fragments = [f._fragment for f in fragments] # type: ignore
+            fragments = [f._fragment for f in fragments]  # type: ignore
 
         indices.transform_vectors(
             self.dataset._ds,
@@ -431,7 +431,7 @@ class IndicesBuilder:
             ivf.centroids,
             pq.codebook,
             dest_uri,
-            fragments, # type: ignore
+            fragments,  # type: ignore
             partition_ds_uri,
         )
 
@@ -467,7 +467,7 @@ class IndicesBuilder:
             form `shuffle_output_root_filename_i.lance`.
         """
         if isinstance(unsorted_filenames, list):
-            return indices.shuffle_transformed_vectors( # type: ignore
+            return indices.shuffle_transformed_vectors(  # type: ignore
                 unsorted_filenames,
                 dir_path,
                 ivf.centroids,
@@ -508,7 +508,7 @@ class IndicesBuilder:
         distance_type = ivf.distance_type
 
         if isinstance(filenames, list):
-            return indices.load_shuffled_vectors( # type: ignore
+            return indices.load_shuffled_vectors(  # type: ignore
                 filenames,
                 dir_path,
                 self.dataset._ds,

@@ -77,11 +77,11 @@ def ground_truth(
     -------
     a 2-D array of row_ids for the nearest vectors from each query vector.
     """
-    device = preferred_device(device=device) # type: ignore
+    device = preferred_device(device=device)  # type: ignore
 
     if _check_for_numpy(query) and isinstance(query, np.ndarray):
         query = torch.from_numpy(query)
-    query = query.to(device) # type: ignore
+    query = query.to(device)  # type: ignore
     metric_type = metric_type.lower()
 
     all_ids = None
@@ -118,7 +118,7 @@ def ground_truth(
             all_dists, all_ids = sort_tensors(all_dists, all_ids, k)
             progress_bar.update(vectors.shape[0])
 
-    return all_ids # type: ignore
+    return all_ids  # type: ignore
 
 
 def recall(expected: np.ndarray, actual: np.ndarray) -> np.ndarray:

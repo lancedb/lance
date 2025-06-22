@@ -135,12 +135,12 @@ else:
     # Define Pandas and register Pandas extensions
     @register_extension_dtype
     class PandasBFloat16Type(ExtensionDtype):
-        kind = "f" # type: ignore
-        na_value = None # type: ignore
-        name = "lance.bfloat16" # type: ignore
-        names = None # type: ignore
-        type = BFloat16 # type: ignore
-        _is_numeric = True # type: ignore
+        kind = "f"  # type: ignore
+        na_value = None  # type: ignore
+        name = "lance.bfloat16"  # type: ignore
+        names = None  # type: ignore
+        type = BFloat16  # type: ignore
+        _is_numeric = True  # type: ignore
 
         def __from_arrow__(
             self, array: Union[pa.Array, pa.ChunkedArray]
@@ -159,13 +159,13 @@ else:
                 raise TypeError(f"Cannot construct a '{cls.__name__}' from '{string}'")
 
     class PandasBFloat16Array(ExtensionArray):
-        dtype = PandasBFloat16Type() # type: ignore
+        dtype = PandasBFloat16Type()  # type: ignore
 
         def __init__(self, data):
             self.data = data
 
         @classmethod
-        def _from_sequence( # type: ignore
+        def _from_sequence(  # type: ignore
             cls, scalars, *, dtype: PandasBFloat16Type, copy: bool = False
         ):
             return PandasBFloat16Array(bfloat16_array(scalars))

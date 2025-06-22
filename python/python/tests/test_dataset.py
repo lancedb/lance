@@ -504,17 +504,17 @@ def test_tag_order(tmp_path: Path):
     tags_asc = ds.tags.list_ordered(order="asc")
     assert len(tags_asc) == 3
     tag_names_asc = [t[0] for t in tags_asc]
-    assert tag_names_asc == sorted(expected_tags.keys()), (
-        f"Unexpected ascending order: {tag_names_asc}"
-    )
+    assert tag_names_asc == sorted(
+        expected_tags.keys()
+    ), f"Unexpected ascending order: {tag_names_asc}"
 
     # Test descending order (default)
     tags_desc = ds.tags.list_ordered(order="desc")
     assert len(tags_desc) == 3
     tag_names_desc = [t[0] for t in tags_desc]
-    assert tag_names_desc == list(expected_tags.keys()), (
-        f"Unexpected descending order: {tag_names_desc}"
-    )
+    assert tag_names_desc == list(
+        expected_tags.keys()
+    ), f"Unexpected descending order: {tag_names_desc}"
 
     # Test without parameter (should default to descending)
     tags_default = ds.tags.list_ordered()

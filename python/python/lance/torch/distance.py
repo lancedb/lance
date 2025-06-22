@@ -25,7 +25,10 @@ def _pairwise_cosine(
 
 
 def pairwise_cosine(
-    x: torch.Tensor, y: torch.Tensor, *, y2: Optional[torch.Tensor] = None # type: ignore
+    x: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    y2: Optional[torch.Tensor] = None,  # type: ignore
 ) -> torch.Tensor:
     """Compute pair-wise cosine distance between x and y.
 

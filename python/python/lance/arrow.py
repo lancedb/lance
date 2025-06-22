@@ -257,7 +257,7 @@ class ImageURIArray(ImageArray):
         from urllib.parse import urlparse
         from urllib.request import Request, urlopen
 
-        from pyarrow import fs # type: ignore
+        from pyarrow import fs  # type: ignore
 
         def download(url):
             req = Request(url)
@@ -268,7 +268,8 @@ class ImageURIArray(ImageArray):
                     print("Failed to reach the server: ", e.reason)
                 elif hasattr(e, "code"):
                     print(
-                        "The server could not fulfill the request. Error code: ", getattr(e, "code")
+                        "The server could not fulfill the request. Error code: ",
+                        getattr(e, "code"),
                     )
 
         images = []
@@ -303,7 +304,7 @@ class EncodedImageArray(ImageArray):
             return img
 
         def tensorflow_metadata_decoder(images):
-            import tensorflow as tf # type: ignore
+            import tensorflow as tf  # type: ignore
 
             img = tf.io.decode_image(images[0].as_py())
             return img
@@ -371,16 +372,16 @@ class EncodedImageArray(ImageArray):
                 from PIL import Image
 
                 return np.stack(
-                    [Image.open(io.BytesIO(img)) for img in images.to_pylist()] # type: ignore
+                    [Image.open(io.BytesIO(img)) for img in images.to_pylist()]  # type: ignore
                 )
 
             def tensorflow_decoder(images):
-                import tensorflow as tf # type: ignore
+                import tensorflow as tf  # type: ignore
 
                 decoded_to_tensor = tuple(
                     tf.io.decode_image(img) for img in images.to_pylist()
                 )
-                return tf.stack(decoded_to_tensor, axis=0).numpy() # type: ignore
+                return tf.stack(decoded_to_tensor, axis=0).numpy()  # type: ignore
 
             decoders = [
                 ("tensorflow", tensorflow_decoder),
@@ -399,10 +400,10 @@ class EncodedImageArray(ImageArray):
                     "tensorflow, pillow, or pass a decoder argument."
                 )
 
-        image_array = decoder(self.storage) # type: ignore
+        image_array = decoder(self.storage)  # type: ignore
         if isinstance(image_array, pa.FixedShapeTensorType):
             shape = image_array.shape
-            arrow_type = image_array.storage_type # type: ignore
+            arrow_type = image_array.storage_type  # type: ignore
             tensor_array = image_array
         else:
             shape = image_array.shape[1:]
@@ -410,7 +411,8 @@ class EncodedImageArray(ImageArray):
             tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(image_array)
 
         return pa.ExtensionArray.from_storage(
-            FixedShapeImageTensorType(arrow_type, shape), tensor_array.storage  # type: ignore
+            FixedShapeImageTensorType(arrow_type, shape),
+            tensor_array.storage,  # type: ignore
         )
 
 
@@ -486,7 +488,7 @@ class FixedShapeImageTensorArray(ImageArray):
             return pa.array(encoded_images, type=storage_type)
 
         def tensorflow_encoder(x):
-            import tensorflow as tf # type: ignore
+            import tensorflow as tf  # type: ignore
 
             encoded_images = (
                 tf.io.encode_png(y).numpy() for y in tf.convert_to_tensor(x)
@@ -571,7 +573,7 @@ def cast(
                 + f"got: {target_type}"
             )
         np_arr = arr.to_numpy()
-        float_arr = np_arr.astype(target_type.to_pandas_dtype()) # type: ignore
+        float_arr = np_arr.astype(target_type.to_pandas_dtype())  # type: ignore
         return pa.array(float_arr)
     elif isinstance(target_type, BFloat16Type) or target_type in ["bfloat16", "bf16"]:
         if not pa.types.is_floating(arr.type):
@@ -586,15 +588,16 @@ def cast(
         target_type
     ):
         # Casting fixed size list to fixed size list
-        if arr.type.list_size != target_type.list_size: # type: ignore
+        if arr.type.list_size != target_type.list_size:  # type: ignore
             raise ValueError(
                 "Only support casting fixed size list to fixed size list "
                 f"with the same size, got: {arr.type} to {target_type}"
             )
-        values = cast(arr.values, target_type.value_type) # type: ignore
+        values = cast(arr.values, target_type.value_type)  # type: ignore
         return pa.FixedSizeListArray.from_arrays(
-            values=values, list_size=target_type.list_size # type: ignore
+            values=values,
+            list_size=target_type.list_size,  # type: ignore
         )
 
     # Fallback to normal cast.
-    return pa.compute.cast(arr, target_type, *args, **kwargs) # type: ignore
+    return pa.compute.cast(arr, target_type, *args, **kwargs)  # type: ignore

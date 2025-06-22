@@ -92,8 +92,9 @@ class KMeans:
         self, data: Union[pa.FixedSizeListArray, np.ndarray, torch.Tensor]
     ) -> torch.Tensor:
         if isinstance(data, pa.FixedSizeListArray):
-            np_tensor = data.values.to_numpy(zero_copy_only=False).reshape( # type: ignore
-                -1, data.type.list_size # type: ignore
+            np_tensor = data.values.to_numpy(zero_copy_only=False).reshape(  # type: ignore
+                -1,
+                data.type.list_size,  # type: ignore
             )
             data = torch.from_numpy(np_tensor)
         elif _check_for_numpy(data) and isinstance(data, np.ndarray):
@@ -121,7 +122,7 @@ class KMeans:
             indices = np.random.choice(data.shape[0], self.k)
             if is_numpy:
                 data = torch.from_numpy(data)
-            self.centroids = data[indices] # type: ignore
+            self.centroids = data[indices]  # type: ignore
 
     def fit(
         self,
@@ -142,9 +143,9 @@ class KMeans:
         """
         start = time.time()
         if isinstance(data, pa.FixedSizeListArray):
-            data = np.stack(data.to_numpy(zero_copy_only=False)) # type: ignore
+            data = np.stack(data.to_numpy(zero_copy_only=False))  # type: ignore
         elif isinstance(data, pa.FixedShapeTensorArray):
-            data = data.to_numpy_ndarray() # type: ignore
+            data = data.to_numpy_ndarray()  # type: ignore
         if (_check_for_torch(data) and isinstance(data, torch.Tensor)) or (
             _check_for_numpy(data) and isinstance(data, np.ndarray)
         ):
@@ -161,7 +162,10 @@ class KMeans:
         for i in tqdm(range(self.max_iters)):
             try:
                 self.total_distance = self._fit_once(
-                    data, i, last_dist=self.total_distance, column=column # type: ignore
+                    data, # type: ignore
+                    i,
+                    last_dist=self.total_distance,
+                    column=column,  # type: ignore
                 )
             except StopIteration:
                 break
@@ -181,9 +185,9 @@ class KMeans:
             # do this twice so we effectively split the largest cluster into 2
             # rand_like returns on [0, 1) so we need to shift it to [-0.5, 0.5)
             noise = (torch.rand_like(centroids[idx]) - 0.5) * 0.01 + 1
-            centroids[idx] = centroids[max_idx] * noise # type: ignore
+            centroids[idx] = centroids[max_idx] * noise  # type: ignore
             noise = (torch.rand_like(centroids[idx]) - 0.5) * 0.01 + 1
-            centroids[max_idx] = centroids[max_idx] * noise # type: ignore
+            centroids[max_idx] = centroids[max_idx] * noise  # type: ignore
 
         if self.metric == "cosine":
             # normalize the centroids
@@ -227,16 +231,18 @@ class KMeans:
         # Use float32 to accumulate centroids, esp. if the vectors are
         # float16 / bfloat16 types.
         new_centroids = torch.zeros_like(
-            self.centroids, device=self.device, dtype=torch.float32 # type: ignore
+            self.centroids, # type: ignore
+            device=self.device,
+            dtype=torch.float32,  # type: ignore
         )
-        counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device) # type: ignore
+        counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)  # type: ignore
         ones = torch.ones(1024 * 16, device=self.device)
         self.rebuild_index()
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
                 LOGGER.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
             if column is not None:
-                chunk = chunk[column] # type: ignore
+                chunk = chunk[column]  # type: ignore
             chunk: torch.Tensor = chunk
             dtype = chunk.dtype
             chunk = chunk.to(self.device)
@@ -275,12 +281,12 @@ class KMeans:
 
         # cast to the type we get the data in
         self.centroids = self._updated_centroids(new_centroids, counts_per_part).type(
-            dtype # type: ignore
+            dtype  # type: ignore
         )
         return total_dist
 
     def rebuild_index(self):
-        self.y2 = (self.centroids * self.centroids).sum(dim=1) # type: ignore
+        self.y2 = (self.centroids * self.centroids).sum(dim=1)  # type: ignore
 
     def _transform(
         self,
@@ -291,9 +297,9 @@ class KMeans:
             data = torch.nn.functional.normalize(data)
 
         if self.metric in ["l2", "cosine"]:
-            return self.dist_func(data, self.centroids, y2=y2) # type: ignore
+            return self.dist_func(data, self.centroids, y2=y2)  # type: ignore
         else:
-            return self.dist_func(data, self.centroids) # type: ignore
+            return self.dist_func(data, self.centroids)  # type: ignore
 
     def transform(
         self, data: Union[pa.Array, np.ndarray, torch.Tensor]

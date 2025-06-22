@@ -507,11 +507,13 @@ class PyFullTextQuery:
         fuzziness: Optional[int] = 0,
         max_expansions: int = 50,
         operator: str = "OR",
+        prefix_length: int = 0,
     ) -> PyFullTextQuery: ...
     @staticmethod
     def phrase_query(
         query: str,
         column: str,
+        slop: int = 0,
     ) -> PyFullTextQuery: ...
     @staticmethod
     def boost_query(
@@ -526,6 +528,10 @@ class PyFullTextQuery:
         boosts: Optional[List[float]] = None,
         operator: str = "OR",
     ) -> PyFullTextQuery: ...
+    @staticmethod
+    def boolean_query(
+        queries: List[Tuple[str, PyFullTextQuery]],
+    ) -> PyFullTextQuery: ...
 
 class ScanStatistics:
     iops: int
@@ -537,4 +543,6 @@ __version__: str
 language_model_home: Callable[[], str]
 
 class FFILanceTableProvider:
-    def __init__(self, dataset: _Dataset, *, with_row_id = False, with_row_addr = False) -> None: ...
+    def __init__(
+        self, dataset: _Dataset, *, with_row_id=False, with_row_addr=False
+    ) -> None: ...

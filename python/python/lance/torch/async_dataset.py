@@ -13,7 +13,7 @@ from lance.log import LOGGER
 def _worker_ep(
     dataset_creator: Callable[[], IterableDataset],
     queue: Queue,
-    shutdown: Value, # type: ignore
+    shutdown: Value,  # type: ignore
 ) -> None:
     dataset = dataset_creator()
     while not shutdown.value:

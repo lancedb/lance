@@ -210,7 +210,7 @@ class DataFile:
         return self.fields
 
 
-class LanceFragment(pa.dataset.Fragment): # type: ignore
+class LanceFragment(pa.dataset.Fragment):  # type: ignore
     def __init__(
         self,
         dataset: "LanceDataset",
@@ -222,7 +222,7 @@ class LanceFragment(pa.dataset.Fragment): # type: ignore
         if fragment is None:
             if fragment_id is None:
                 raise ValueError("Either fragment or fragment_id must be specified")
-            fragment = dataset.get_fragment(fragment_id)._fragment # type: ignore
+            fragment = dataset.get_fragment(fragment_id)._fragment  # type: ignore
         self._fragment: _Fragment = fragment
         if self._fragment is None:
             raise ValueError(f"Fragment id does not exist: {fragment_id}")
@@ -361,9 +361,10 @@ class LanceFragment(pa.dataset.Fragment): # type: ignore
         return self._fragment.id()
 
     def count_rows(
-        self, filter: Optional[Union[pa.compute.Expression, str]] = None # type: ignore
+        self,
+        filter: Optional[Union[pa.compute.Expression, str]] = None,  # type: ignore
     ) -> int:
-        if isinstance(filter, pa.compute.Expression): # type: ignore
+        if isinstance(filter, pa.compute.Expression):  # type: ignore
             return self.scanner(
                 with_row_id=True, columns=[], filter=filter
             ).count_rows()
@@ -402,7 +403,7 @@ class LanceFragment(pa.dataset.Fragment): # type: ignore
         *,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None, # type: ignore
+        filter: Optional[Union[str, pa.compute.Expression]] = None,  # type: ignore
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
@@ -427,7 +428,7 @@ class LanceFragment(pa.dataset.Fragment): # type: ignore
             with_row_id=with_row_id,
             with_row_address=with_row_address,
             batch_readahead=batch_readahead,
-            **columns_arg, # type: ignore
+            **columns_arg,  # type: ignore
         )
         from .dataset import LanceScanner
 
@@ -445,7 +446,7 @@ class LanceFragment(pa.dataset.Fragment): # type: ignore
         *,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None, # type: ignore
+        filter: Optional[Union[str, pa.compute.Expression]] = None,  # type: ignore
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
@@ -464,7 +465,7 @@ class LanceFragment(pa.dataset.Fragment): # type: ignore
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None, # type: ignore
+        filter: Optional[Union[str, pa.compute.Expression]] = None,  # type: ignore
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
@@ -804,7 +805,7 @@ def write_fragments(
     if isinstance(dataset_uri, Path):
         dataset_uri = str(dataset_uri)
     elif isinstance(dataset_uri, LanceDataset):
-        dataset_uri = dataset_uri._ds # type: ignore
+        dataset_uri = dataset_uri._ds  # type: ignore
     elif not isinstance(dataset_uri, str):
         raise TypeError(f"Unknown dataset_uri type {type(dataset_uri)}")
 
