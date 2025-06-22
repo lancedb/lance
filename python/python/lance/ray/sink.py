@@ -20,7 +20,11 @@ from typing import (
 import pyarrow as pa
 
 import lance  # type: ignore
-from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, FragmentMetadata, write_fragments  # type: ignore
+from lance.fragment import (  # type: ignore
+    DEFAULT_MAX_BYTES_PER_FILE,
+    FragmentMetadata,
+    write_fragments,
+)
 
 from ..dependencies import ray
 
