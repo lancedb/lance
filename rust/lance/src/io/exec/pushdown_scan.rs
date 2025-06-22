@@ -243,18 +243,28 @@ impl ExecutionPlan for LancePushdownScanExec {
 
 impl DisplayAs for LancePushdownScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let columns = self
+            .projection
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let columns = self
-                    .projection
-                    .fields
-                    .iter()
-                    .map(|f| f.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 write!(
                     f,
                     "LancePushdownScan: uri={}, projection=[{}], predicate={}, row_id={}, row_addr={}, ordered={}",
+                    self.dataset.data_dir(),
+                    columns,
+                    self.predicate,
+                    self.config.with_row_id,
+                    self.config.with_row_address,
+                    self.config.ordered_output
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "LancePushdownScan\nuri={}\nprojection=[{}]\npredicate={}\nrow_id={}\nrow_addr={}\nordered={}",
                     self.dataset.data_dir(),
                     columns,
                     self.predicate,

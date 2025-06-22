@@ -29,58 +29,32 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Convert a DF Expr into a Substrait ExtendedExpressions message
+///
+/// The schema needs to contain all of the fields that are referenced in the expression.
+/// It is ok if the schema has more fields than are required.  However, we cannot currently
+/// convert all field types (e.g. extension types, FSL) and if these fields are present then
+/// the conversion will fail.
+///
+/// As a result, it may be a good idea for now to remove those types from the schema before
+/// calling this function.
 pub fn encode_substrait(expr: Expr, schema: Arc<ArrowSchema>) -> Result<Vec<u8>> {
-    use datafusion::logical_expr::{builder::LogicalTableSource, logical_plan, LogicalPlan};
-    use datafusion_substrait::substrait::proto::{plan_rel, ExpressionReference, NamedStruct};
+    use arrow_schema::Field;
+    use datafusion::logical_expr::ExprSchemable;
+    use datafusion_common::DFSchema;
 
-    let table_source = Arc::new(LogicalTableSource::new(schema.clone()));
+    let ctx = SessionContext::new();
 
-    // DF doesn't handled ExtendedExpressions and so we need to create
-    // a dummy plan with a single filter node
-    let plan = LogicalPlan::Filter(logical_plan::Filter::try_new(
-        expr,
-        Arc::new(LogicalPlan::TableScan(logical_plan::TableScan::try_new(
-            "dummy",
-            table_source,
-            None,
-            vec![],
-            None,
-        )?)),
-    )?);
-
-    let session_context = SessionContext::new();
-
-    let substrait_plan = datafusion_substrait::logical_plan::producer::to_substrait_plan(
-        &plan,
-        &session_context.state(),
+    let df_schema = Arc::new(DFSchema::try_from(schema)?);
+    let output_type = expr.get_type(&df_schema)?;
+    // Nullability doesn't matter
+    let output_field = Field::new("output", output_type, /*nullable=*/ true);
+    let extended_expr = datafusion_substrait::logical_plan::producer::to_substrait_extended_expr(
+        &[(&expr, &output_field)],
+        &df_schema,
+        &ctx.state(),
     )?;
 
-    if let Some(plan_rel::RelType::Root(root)) = &substrait_plan.relations[0].rel_type {
-        if let Some(rel::RelType::Filter(filt)) = &root.input.as_ref().unwrap().rel_type {
-            let expr = filt.condition.as_ref().unwrap().clone();
-            let schema = NamedStruct {
-                names: schema.fields().iter().map(|f| f.name().clone()).collect(),
-                r#struct: None,
-            };
-            let envelope = ExtendedExpression {
-                advanced_extensions: substrait_plan.advanced_extensions.clone(),
-                base_schema: Some(schema),
-                expected_type_urls: substrait_plan.expected_type_urls.clone(),
-                extension_uris: substrait_plan.extension_uris.clone(),
-                extensions: substrait_plan.extensions.clone(),
-                referred_expr: vec![ExpressionReference {
-                    output_names: vec![],
-                    expr_type: Some(ExprType::Expression(*expr)),
-                }],
-                version: substrait_plan.version.clone(),
-            };
-            Ok(envelope.encode_to_vec())
-        } else {
-            unreachable!()
-        }
-    } else {
-        unreachable!()
-    }
+    Ok(extended_expr.encode_to_vec())
 }
 
 fn count_fields(dtype: &Type) -> usize {
@@ -156,7 +130,10 @@ fn remove_type_extensions(
 fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Result<()> {
     match expr.rex_type.as_mut().unwrap() {
         // Simple, no field references possible
-        RexType::Literal(_) | RexType::Nested(_) | RexType::Enum(_) => Ok(()),
+        RexType::Literal(_)
+        | RexType::Nested(_)
+        | RexType::Enum(_)
+        | RexType::DynamicParameter(_) => Ok(()),
         // Complex operators not supported in filters
         RexType::WindowFunction(_) | RexType::Subquery(_) => Err(Error::invalid_input(
             "Window functions or subqueries not allowed in filter expression",
@@ -322,6 +299,7 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Res
         version: None,
         extensions: remove_type_extensions(&envelope.extensions),
         advanced_extensions: envelope.advanced_extensions.clone(),
+        parameter_bindings: vec![],
         expected_type_urls: vec![],
         extension_uris: vec![],
         relations: vec![PlanRel {
@@ -421,7 +399,7 @@ mod tests {
         helpers::{literals::literal, schema::SchemaInfo},
     };
 
-    use crate::substrait::parse_substrait;
+    use crate::substrait::{encode_substrait, parse_substrait};
 
     #[tokio::test]
     async fn test_substrait_conversion() {
@@ -457,5 +435,22 @@ mod tests {
             right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
         });
         assert_eq!(df_expr, expected);
+    }
+
+    #[tokio::test]
+    async fn test_expr_substrait_roundtrip() {
+        let schema = arrow_schema::Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("x"))),
+            op: Operator::Lt,
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
+        });
+
+        let bytes = encode_substrait(expr.clone(), Arc::new(schema.clone())).unwrap();
+
+        let decoded = parse_substrait(bytes.as_slice(), Arc::new(schema.clone()))
+            .await
+            .unwrap();
+        assert_eq!(decoded, expr);
     }
 }

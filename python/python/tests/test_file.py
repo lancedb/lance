@@ -10,6 +10,16 @@ import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
 
+def test_file_read_projection(tmp_path):
+    table = pa.table({"a": [1, 2, 3], "b": [4, 5, 6]})
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(table)
+
+    reader = LanceFileReader(str(path), columns=["a"])
+    assert reader.read_all().to_table() == table.select("a")
+
+
 def test_file_writer(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
@@ -98,6 +108,17 @@ def test_take(tmp_path):
 
     table = reader.take_rows([0, 77, 83]).to_table()
     assert table == pa.table({"a": [0, 77, 83]})
+
+
+def test_num_rows(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    writer = LanceFileWriter(str(path), schema)
+    writer.write_batch(pa.table({"a": [i for i in range(100)]}))
+    writer.close()
+
+    reader = LanceFileReader(str(path))
+    assert reader.num_rows() == 100
 
 
 def check_round_trip(tmp_path, table):

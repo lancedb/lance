@@ -230,6 +230,11 @@ impl<'a> CommitBuilder<'a> {
             });
         }
 
+        let metadata_cache = match &dest {
+            WriteDestination::Dataset(ds) => ds.metadata_cache.clone(),
+            WriteDestination::Uri(uri) => Arc::new(session.metadata_cache.with_key_prefix(uri)),
+        };
+
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
             ds.manifest_location.naming_scheme
         } else if self.enable_v2_manifest_paths {
@@ -313,7 +318,7 @@ impl<'a> CommitBuilder<'a> {
                 &transaction,
                 &manifest_config,
                 manifest_naming_scheme,
-                &session,
+                metadata_cache.as_ref(),
             )
             .await?
         };
@@ -340,6 +345,7 @@ impl<'a> CommitBuilder<'a> {
                 session,
                 commit_handler,
                 tags,
+                metadata_cache,
             }),
         }
     }
@@ -417,8 +423,13 @@ pub struct BatchCommitResult {
 mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use lance_io::utils::CachedFileSize;
+    use lance_io::{object_store::ChainedWrappingObjectStore, utils::CachedFileSize};
     use lance_table::format::{DataFile, Fragment};
+    use std::time::Duration;
+
+    use object_store::throttle::ThrottleConfig;
+
+    use crate::utils::test::ThrottledStoreWrapper;
 
     use crate::{
         dataset::{InsertBuilder, WriteParams},
@@ -482,12 +493,13 @@ mod tests {
             .with_params(&WriteParams {
                 store_params: Some(store_params.clone()),
                 session: Some(session.clone()),
+                enable_v2_manifest_paths: true,
                 ..Default::default()
             })
             .execute(vec![batch])
             .await
             .unwrap();
-        let mut dataset = Arc::new(dataset);
+        let dataset = Arc::new(dataset);
 
         let reset_iops = || {
             io_stats.lock().unwrap().read_iops = 0;
@@ -510,8 +522,7 @@ mod tests {
                 .execute(sample_transaction(1))
                 .await
                 .unwrap();
-            dataset = Arc::new(new_ds);
-            assert_eq!(dataset.manifest().version, i + 2);
+            assert_eq!(new_ds.manifest.version, i + 2);
 
             // Because we are writing transactions sequentially, and caching them,
             // we shouldn't need to read anything from disk. Except we do need
@@ -534,10 +545,10 @@ mod tests {
             .unwrap();
         assert_eq!(new_ds.manifest().version, 7);
         // Session should still be re-used
-        // However, the dataset needs to be loaded, so an additional two IOPs
-        // are needed.
+        // However, the dataset needs to be loaded and the read version checked out,
+        // so an additional 4 IOPs are needed.
         let (reads, writes) = get_new_iops();
-        assert_eq!(reads, 3);
+        assert_eq!(reads, 5);
         assert_eq!(writes, 2);
 
         // Commit transaction with URI and new session. Re-use the store
@@ -552,7 +563,7 @@ mod tests {
         assert_eq!(new_ds.manifest().version, 8);
         // Now we have to load all previous transactions.
         let (reads, writes) = get_new_iops();
-        assert!(reads > 20);
+        assert!(reads > 10);
         assert_eq!(writes, 2);
     }
 
@@ -595,9 +606,9 @@ mod tests {
 
         // Assert io requests
         let io_stats = io_tracker.incremental_stats();
-        // this can be minimized to 0 by avoiding the initial listing from check_latest(),
-        // but it will result in 2 more iops when retrying,
-        // so we will keep the iops at 1 for now
+        // This could be zero, if we decided to be optimistic. However, that
+        // would mean two wasted write requests (txn + manifest) if there was
+        // a conflict. We choose to be pessimistic for more consistent performance.
         assert_eq!(io_stats.read_iops, 1);
         assert_eq!(io_stats.write_iops, 2);
         // We can't write them in parallel. The transaction file must exist before
@@ -611,9 +622,22 @@ mod tests {
         let cache_size = if use_cache { 10_000 } else { 0 };
         let session = Arc::new(Session::new(0, cache_size, Default::default()));
         let io_tracker = Arc::new(StatsHolder::default());
+        // We need throttled to correctly count num hops. Otherwise, memory store
+        // returns synchronously, and each request is 1 hop.
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: Duration::from_millis(5),
+                wait_get_per_call: Duration::from_millis(5),
+                wait_put_per_call: Duration::from_millis(5),
+                ..Default::default()
+            },
+        });
         let write_params = WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(io_tracker.clone()),
+                object_store_wrapper: Some(Arc::new(ChainedWrappingObjectStore::new(vec![
+                    throttled,
+                    io_tracker.clone(),
+                ]))),
                 ..Default::default()
             }),
             session: Some(session.clone()),
@@ -665,11 +689,11 @@ mod tests {
             assert_eq!(io_stats.num_hops, 3);
         } else {
             // We need to read the other manifests and transactions.
-            // TODO: currently there is a high read and write amplification without caching
-            //  when data is not cached, some operations like checkout and read are repeatedly performed
-            //  so we cannot really get to the ideal 1 + num_other_txns * 2 situation
-            assert_eq!(io_stats.read_iops, 14);
-            assert_eq!(io_stats.num_hops, 16);
+            assert_eq!(io_stats.read_iops, 1 + num_other_txns * 2);
+            // It's possible to read the txns for some versions before we
+            // finish reading later versions and so the entire "read versions
+            // and txs" may appear as 1 hop instead of 2.
+            assert!(io_stats.num_hops <= 5);
         }
         assert_eq!(io_stats.write_iops, 2); // txn + manifest
     }
@@ -706,6 +730,7 @@ mod tests {
                 updated_fragments: vec![],
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
+                fields_modified: vec![],
             },
             read_version: 1,
             blobs_op: None,

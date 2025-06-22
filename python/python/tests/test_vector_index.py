@@ -14,8 +14,7 @@ import pyarrow.compute as pc
 import pytest
 from lance import LanceFragment
 from lance.dataset import VectorIndexReader
-
-torch = pytest.importorskip("torch")
+from lance.indices import IndexFileVersion
 from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
@@ -240,7 +239,10 @@ def test_f16_cuda(tmp_path):
     validate_vector_index(dataset, "vector")
 
 
-def test_index_with_nans(tmp_path):
+@pytest.mark.parametrize(
+    "index_file_version", [IndexFileVersion.V3, IndexFileVersion.LEGACY]
+)
+def test_index_with_nans(tmp_path, index_file_version):
     # 1024 rows, the entire table should be sampled
     tbl = create_table(nvec=1000, nans=24)
 
@@ -250,11 +252,19 @@ def test_index_with_nans(tmp_path):
         index_type="IVF_PQ",
         num_partitions=4,
         num_sub_vectors=16,
+        index_file_version=index_file_version,
     )
+    idx_stats = dataset.stats.index_stats("vector_idx")
+    assert idx_stats["indices"][0]["index_file_version"] == index_file_version
     validate_vector_index(dataset, "vector")
 
 
-def test_torch_index_with_nans(tmp_path):
+@pytest.mark.parametrize(
+    "index_file_version", [IndexFileVersion.V3, IndexFileVersion.LEGACY]
+)
+def test_torch_index_with_nans(tmp_path, index_file_version):
+    torch = pytest.importorskip("torch")
+
     # 1024 rows, the entire table should be sampled
     tbl = create_table(nvec=1000, nans=24)
 
@@ -266,11 +276,16 @@ def test_torch_index_with_nans(tmp_path):
         num_sub_vectors=16,
         accelerator=torch.device("cpu"),
         one_pass_ivfpq=True,
+        index_file_version=index_file_version,
     )
+    idx_stats = dataset.stats.index_stats("vector_idx")
+    assert idx_stats["indices"][0]["index_file_version"] == index_file_version
     validate_vector_index(dataset, "vector")
 
 
 def test_index_with_no_centroid_movement(tmp_path):
+    torch = pytest.importorskip("torch")
+
     # this test makes the centroids essentially [1..]
     # this makes sure the early stop condition in the index building code
     # doesn't do divide by zero
@@ -343,6 +358,10 @@ def test_create_index_using_cuda(tmp_path, nullify):
 
 
 def test_create_index_unsupported_accelerator(tmp_path):
+    # Even attempting to use an accelerator will trigger torch import
+    # so make sure it's available
+    pytest.importorskip("torch")
+
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
     with pytest.raises(ValueError):
@@ -555,6 +574,18 @@ def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
 
 
+def test_create_ivf_hnsw_flat_index(dataset, tmp_path):
+    assert not dataset.has_index
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_FLAT",
+        num_partitions=4,
+        num_sub_vectors=16,
+    )
+    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
 def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
     query = np.random.rand(5, 128)
     results = indexed_multivec_dataset.scanner(
@@ -640,6 +671,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             "num_sub_vectors": 8,
             "transposed": True,
         },
+        "index_file_version": IndexFileVersion.V3,
     }
 
     with pytest.raises(KeyError, match='Index "non-existent_idx" not found'):
@@ -896,6 +928,7 @@ def test_index_cache_size(tmp_path):
                 nearest={
                     "column": "vector",
                     "q": q if q is not None else rng.standard_normal(ndim),
+                    "minimum_nprobes": 1,
                 },
             )
 
@@ -1033,6 +1066,8 @@ def test_dynamic_projection_with_vectors_index(tmp_path: Path):
 
 
 def test_index_cast_centroids(tmp_path):
+    torch = pytest.importorskip("torch")
+
     tbl = create_table(nvec=1000)
 
     dataset = lance.write_dataset(tbl, tmp_path)
@@ -1260,3 +1295,74 @@ def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
         prefilter=True,
     )
     assert len(res) == 10
+
+
+def test_vector_index_with_nprobes(indexed_dataset):
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "nprobes": 7,
+        }
+    ).explain_plan()
+
+    assert "minimum_nprobes=7" in res
+    assert "maximum_nprobes=Some(7)" in res
+
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "minimum_nprobes": 7,
+        }
+    ).explain_plan()
+
+    assert "minimum_nprobes=7" in res
+    assert "maximum_nprobes=None" in res
+
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "minimum_nprobes": 7,
+            "maximum_nprobes": 10,
+        }
+    ).explain_plan()
+
+    assert "minimum_nprobes=7" in res
+    assert "maximum_nprobes=Some(10)" in res
+
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "maximum_nprobes": 30,
+        }
+    ).analyze_plan()
+
+    print(res)
+
+
+def test_knn_deleted_rows(tmp_path):
+    data = create_table()
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="cosine",
+        num_partitions=4,
+        num_sub_vectors=4,
+    )
+    ds.insert(create_table())
+
+    ds.delete("id = 0")
+    assert ds.count_rows() == data.num_rows * 2 - 2
+    results = ds.to_table(
+        nearest={"column": "vector", "q": data["vector"][0], "k": ds.count_rows()}
+    )
+    assert 0 not in results["id"]
+    assert results.num_rows == ds.count_rows()

@@ -50,10 +50,14 @@ use std::{
     sync::Arc,
 };
 
+use super::ManifestWriteConfig;
+use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_io::object_store::ObjectStore;
+use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
@@ -69,10 +73,6 @@ use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
-
-use super::ManifestWriteConfig;
-use crate::utils::temporal::timestamp_to_nanos;
-use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 
 /// A change to a dataset that can be retried
 ///
@@ -144,23 +144,25 @@ pub enum Operation {
         groups: Vec<RewriteGroup>,
         /// Indices that have been updated with the new row addresses
         rewritten_indices: Vec<RewrittenIndex>,
+        /// The fragment reuse index to be created or updated to
+        frag_reuse_index: Option<Index>,
     },
-    /// Replace data in a column in the dataset with a new data. This is used for
+    /// Replace data in a column in the dataset with new data. This is used for
     /// null column population where we replace an entirely null column with a
     /// new column that has data.
     ///
     /// This operation will only allow replacing files that contain the same schema
-    /// e.g. if the original files contains column A, B, C and the new files contains
-    /// only column A, B then the operation is not allowed. As we would need to split
+    /// e.g. if the original files contain columns A, B, C and the new files contain
+    /// only columns A, B then the operation is not allowed. As we would need to split
     /// the original files into two files, one with column A, B and the other with column C.
     ///
     /// Corollary to the above: the operation will also not allow replacing files unless the
     /// affected columns all have the same datafile layout across the fragments being replaced.
     ///
-    /// e.g. if fragments being replaced contains files with different schema layouts on
+    /// e.g. if fragments being replaced contain files with different schema layouts on
     /// the column being replaced, the operation is not allowed.
     /// say frag_1: [A] [B, C] and frag_2: [A, B] [C] and we are trying to replace column A
-    /// with a new column A the operation is not allowed.
+    /// with a new column A, the operation is not allowed.
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
     },
@@ -178,6 +180,21 @@ pub enum Operation {
     ReserveFragments { num_fragments: u32 },
 
     /// Update values in the dataset.
+    ///
+    /// Updates are generally vertical or horizontal.
+    ///
+    /// A vertical update adds new rows.  In this case, the updated_fragments
+    /// will only have existing rows deleted and will not have any new fields added.
+    /// All new data will be contained in new_fragments.
+    /// This is what is used by a merge_insert that matches the whole schema and what
+    /// is used by the dataset updater.
+    ///
+    /// A horizontal update adds new columns.  In this case, the updated fragments
+    /// may have fields removed or added.  It is even possible for a field to be tombstoned
+    /// and then added back in the same update. (which is a field modification).  If any
+    /// fields are modified in this way then they need to be added to the fields_modified list.
+    /// This way we can correctly update the indices.
+    /// This is what is used by a merge insert that does not match the whole schema.
     Update {
         /// Ids of fragments that have been moved
         removed_fragment_ids: Vec<u64>,
@@ -185,6 +202,8 @@ pub enum Operation {
         updated_fragments: Vec<Fragment>,
         /// Fragments that have been added
         new_fragments: Vec<Fragment>,
+        /// The fields that have been modified
+        fields_modified: Vec<u32>,
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
@@ -276,12 +295,18 @@ impl PartialEq for Operation {
                 Self::Rewrite {
                     groups: a_groups,
                     rewritten_indices: a_indices,
+                    frag_reuse_index: a_frag_reuse_index,
                 },
                 Self::Rewrite {
                     groups: b_groups,
                     rewritten_indices: b_indices,
+                    frag_reuse_index: b_frag_reuse_index,
                 },
-            ) => compare_vec(a_groups, b_groups) && compare_vec(a_indices, b_indices),
+            ) => {
+                compare_vec(a_groups, b_groups)
+                    && compare_vec(a_indices, b_indices)
+                    && a_frag_reuse_index == b_frag_reuse_index
+            }
             (
                 Self::Merge {
                     fragments: a_fragments,
@@ -302,16 +327,19 @@ impl PartialEq for Operation {
                     removed_fragment_ids: a_removed,
                     updated_fragments: a_updated,
                     new_fragments: a_new,
+                    fields_modified: a_fields,
                 },
                 Self::Update {
                     removed_fragment_ids: b_removed,
                     updated_fragments: b_updated,
                     new_fragments: b_new,
+                    fields_modified: b_fields,
                 },
             ) => {
                 compare_vec(a_removed, b_removed)
                     && compare_vec(a_updated, b_updated)
                     && compare_vec(a_new, b_new)
+                    && compare_vec(a_fields, b_fields)
             }
             (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
             (
@@ -788,49 +816,6 @@ impl PartialEq for RewriteGroup {
 }
 
 impl Operation {
-    /// Returns the IDs of fragments that have been modified by this operation.
-    ///
-    /// This does not include new fragments.
-    pub(crate) fn modified_fragment_ids(&self) -> Box<dyn Iterator<Item = u64> + '_> {
-        match self {
-            // These operations add new fragments or don't modify any.
-            Self::Append { .. }
-            | Self::Overwrite { .. }
-            | Self::CreateIndex { .. }
-            | Self::ReserveFragments { .. }
-            | Self::Project { .. }
-            | Self::UpdateConfig { .. }
-            | Self::Restore { .. } => Box::new(std::iter::empty()),
-            Self::Delete {
-                updated_fragments,
-                deleted_fragment_ids,
-                ..
-            } => Box::new(
-                updated_fragments
-                    .iter()
-                    .map(|f| f.id)
-                    .chain(deleted_fragment_ids.iter().copied()),
-            ),
-            Self::Rewrite { groups, .. } => Box::new(
-                groups
-                    .iter()
-                    .flat_map(|f| f.old_fragments.iter().map(|f| f.id)),
-            ),
-            Self::Merge { fragments, .. } => Box::new(fragments.iter().map(|f| f.id)),
-            Self::Update {
-                updated_fragments,
-                removed_fragment_ids,
-                ..
-            } => Box::new(
-                updated_fragments
-                    .iter()
-                    .map(|f| f.id)
-                    .chain(removed_fragment_ids.iter().copied()),
-            ),
-            Self::DataReplacement { replacements } => Box::new(replacements.iter().map(|r| r.0)),
-        }
-    }
-
     /// Returns the config keys that have been upserted by this operation.
     fn get_upsert_config_keys(&self) -> Vec<String> {
         match self {
@@ -863,14 +848,7 @@ impl Operation {
         }
     }
 
-    /// Check whether another operation modifies the same fragment IDs as this one.
-    fn modifies_same_ids(&self, other: &Self) -> bool {
-        let self_ids = self.modified_fragment_ids().collect::<HashSet<_>>();
-        let mut other_ids = other.modified_fragment_ids();
-        other_ids.any(|id| self_ids.contains(&id))
-    }
-
-    fn modifies_same_metadata(&self, other: &Self) -> bool {
+    pub(crate) fn modifies_same_metadata(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::UpdateConfig {
@@ -903,7 +881,7 @@ impl Operation {
     }
 
     /// Check whether another operation upserts a key that is referenced by another operation
-    fn upsert_key_conflict(&self, other: &Self) -> bool {
+    pub(crate) fn upsert_key_conflict(&self, other: &Self) -> bool {
         let self_upsert_keys = self.get_upsert_config_keys();
         let other_upsert_keys = other.get_upsert_config_keys();
 
@@ -936,24 +914,6 @@ impl Operation {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConflictResult {
-    /// The operation is compatible with the other operation
-    ///
-    /// For example, two operations that modify different fragments are compatible.
-    Compatible,
-    /// The operation is not compatible with the other operation
-    ///
-    /// For example, an Overwrite with a change in schema and an Append are
-    /// not compatible.
-    NotCompatible,
-    /// The operation is not compatible, but the current operation can be
-    /// retried on top of the others changes.
-    ///
-    /// For example, two operations that modify the same fragment.
-    Retryable,
-}
-
 impl Transaction {
     pub fn new_from_version(read_version: u64, operation: Operation) -> Self {
         let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
@@ -983,232 +943,6 @@ impl Transaction {
             operation,
             blobs_op,
             tag,
-        }
-    }
-
-    /// Returns true if the transaction cannot be committed if the other
-    /// transaction is committed first.
-    pub fn conflicts_with(&self, other: &Self) -> ConflictResult {
-        use ConflictResult::*;
-        // This assumes IsolationLevel is Snapshot Isolation, which is more
-        // permissive than Serializable. In particular, it allows a Delete
-        // transaction to succeed after a concurrent Append, even if the Append
-        // added rows that would be deleted.
-        match &self.operation {
-            Operation::Append { .. } => match &other.operation {
-                Operation::Append { .. }
-                | Operation::Rewrite { .. }
-                | Operation::CreateIndex { .. }
-                | Operation::Delete { .. }
-                | Operation::Update { .. }
-                | Operation::ReserveFragments { .. }
-                | Operation::Project { .. }
-                | Operation::Merge { .. }
-                | Operation::UpdateConfig { .. }
-                | Operation::DataReplacement { .. } => Compatible,
-                // Append is not compatible with any operation that completely
-                // overwrites the schema.
-                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
-            },
-            Operation::Rewrite { .. } => match &other.operation {
-                // Rewrite is only compatible with operations that don't touch
-                // existing fragments or update fragments we don't touch.
-                Operation::Append { .. }
-                | Operation::ReserveFragments { .. }
-                | Operation::Project { .. }
-                | Operation::UpdateConfig { .. } => Compatible,
-                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
-                    // As long as they rewrite disjoint fragments they shouldn't conflict.
-                    if self.operation.modifies_same_ids(&other.operation) {
-                        Retryable
-                    } else {
-                        Compatible
-                    }
-                }
-                Operation::DataReplacement { .. } | Operation::Merge { .. } => {
-                    // TODO(rmeng): check that the fragments being replaced are not part of the groups
-                    Retryable
-                }
-                Operation::CreateIndex { new_indices, .. } => {
-                    let mut affected_ids = HashSet::new();
-                    for index in new_indices {
-                        if let Some(frag_bitmap) = &index.fragment_bitmap {
-                            affected_ids.extend(frag_bitmap.iter());
-                        } else {
-                            return Retryable;
-                        }
-                    }
-                    if self
-                        .operation
-                        .modified_fragment_ids()
-                        .any(|id| affected_ids.contains(&(id as u32)))
-                    {
-                        Retryable
-                    } else {
-                        Compatible
-                    }
-                }
-                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
-            },
-            // Restore always succeeds
-            Operation::Restore { .. } => Compatible,
-            // ReserveFragments is compatible with anything that doesn't reset the
-            // max fragment id.
-            Operation::ReserveFragments { .. } => match &other.operation {
-                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
-                _ => Compatible,
-            },
-            Operation::CreateIndex { new_indices, .. } => match &other.operation {
-                Operation::Append { .. } => Compatible,
-                // Indices are identified by UUIDs, so they shouldn't conflict.
-                Operation::CreateIndex { .. } => Compatible,
-                // Although some of the rows we indexed may have been deleted / moved,
-                // row ids are still valid, so we allow this optimistically.
-                Operation::Delete { .. } | Operation::Update { .. } => Compatible,
-                // Merge, reserve, and project don't change row ids, so this should be fine.
-                Operation::Merge { .. } => Compatible,
-                Operation::ReserveFragments { .. } => Compatible,
-                Operation::Project { .. } => Compatible,
-                // Should be compatible with rewrite if it didn't move the rows
-                // we indexed. If it did, we could retry.
-                // TODO: this will change with stable row ids.
-                Operation::Rewrite { .. } => {
-                    let mut affected_ids = HashSet::new();
-                    for index in new_indices {
-                        if let Some(frag_bitmap) = &index.fragment_bitmap {
-                            affected_ids.extend(frag_bitmap.iter());
-                        } else {
-                            return Retryable;
-                        }
-                    }
-                    if other
-                        .operation
-                        .modified_fragment_ids()
-                        .any(|id| affected_ids.contains(&(id as u32)))
-                    {
-                        Retryable
-                    } else {
-                        Compatible
-                    }
-                }
-                Operation::UpdateConfig { .. } => Compatible,
-                Operation::DataReplacement { .. } => {
-                    // TODO(rmeng): check that the new indices isn't on the column being replaced
-                    Retryable
-                }
-                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
-            },
-            Operation::Delete { .. } | Operation::Update { .. } => match &other.operation {
-                Operation::CreateIndex { .. }
-                | Operation::ReserveFragments { .. }
-                | Operation::Project { .. }
-                | Operation::Append { .. }
-                | Operation::UpdateConfig { .. } => Compatible,
-                Operation::Delete { .. }
-                | Operation::Rewrite { .. }
-                | Operation::Update { .. }
-                | Operation::DataReplacement { .. } => {
-                    // If we update the same fragments, we conflict.
-                    if self.operation.modifies_same_ids(&other.operation) {
-                        Retryable
-                    } else {
-                        Compatible
-                    }
-                }
-                Operation::Merge { .. } => Retryable,
-                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
-            },
-            Operation::Overwrite { .. } => match &other.operation {
-                // Overwrite only conflicts with another operation modifying the same update config
-                Operation::Overwrite { .. } | Operation::UpdateConfig { .. }
-                    if self.operation.upsert_key_conflict(&other.operation) =>
-                {
-                    NotCompatible
-                }
-                _ => Compatible,
-            },
-            Operation::UpdateConfig {
-                schema_metadata,
-                field_metadata,
-                ..
-            } => match &other.operation {
-                Operation::Overwrite { .. } => {
-                    // Updates to schema metadata or field metadata conflict with any kind
-                    // of overwrite.
-                    if schema_metadata.is_some()
-                        || field_metadata.is_some()
-                        || self.operation.upsert_key_conflict(&other.operation)
-                    {
-                        NotCompatible
-                    } else {
-                        Compatible
-                    }
-                }
-                Operation::UpdateConfig { .. } => {
-                    if self.operation.upsert_key_conflict(&other.operation)
-                        | self.operation.modifies_same_metadata(&other.operation)
-                    {
-                        NotCompatible
-                    } else {
-                        Compatible
-                    }
-                }
-                _ => Compatible,
-            },
-            // Merge changes the schema, but preserves row ids, so the only operations
-            // it's compatible with is CreateIndex, ReserveFragments, SetMetadata and DeleteMetadata.
-            Operation::Merge { .. } => match &other.operation {
-                Operation::CreateIndex { .. }
-                | Operation::ReserveFragments { .. }
-                | Operation::UpdateConfig { .. } => Compatible,
-                Operation::Update { .. }
-                | Operation::Append { .. }
-                | Operation::Delete { .. }
-                | Operation::Rewrite { .. }
-                | Operation::Merge { .. }
-                | Operation::DataReplacement { .. } => Retryable,
-                Operation::Overwrite { .. }
-                | Operation::Restore { .. }
-                | Operation::Project { .. } => NotCompatible,
-            },
-            Operation::Project { .. } => match &other.operation {
-                // Project is compatible with anything that doesn't change the schema
-                Operation::Append { .. }
-                | Operation::Update { .. }
-                | Operation::Delete { .. }
-                | Operation::UpdateConfig { .. }
-                | Operation::CreateIndex { .. }
-                | Operation::DataReplacement { .. }
-                | Operation::Rewrite { .. }
-                | Operation::ReserveFragments { .. } => Compatible,
-                Operation::Merge { .. } | Operation::Project { .. } => {
-                    // Need to recompute the schema
-                    Retryable
-                }
-                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
-            },
-            Operation::DataReplacement { .. } => match &other.operation {
-                Operation::Append { .. }
-                | Operation::Delete { .. }
-                | Operation::Update { .. }
-                | Operation::Merge { .. }
-                | Operation::UpdateConfig { .. }
-                | Operation::ReserveFragments { .. }
-                | Operation::Project { .. } => Compatible,
-                Operation::CreateIndex { .. } => {
-                    // TODO(rmeng): check that the new indices isn't on the column being replaced
-                    NotCompatible
-                }
-                Operation::Rewrite { .. } => {
-                    // TODO(rmeng): check that the fragments being replaced are not part of the groups
-                    NotCompatible
-                }
-                Operation::DataReplacement { .. } => {
-                    // TODO(rmeng): check cell conflicts
-                    NotCompatible
-                }
-                Operation::Overwrite { .. } | Operation::Restore { .. } => NotCompatible,
-            },
         }
     }
 
@@ -1381,6 +1115,7 @@ impl Transaction {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
+                fields_modified,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.iter().filter_map(|f| {
                     if removed_fragment_ids.contains(&f.id) {
@@ -1392,6 +1127,14 @@ impl Transaction {
                         Some(f.clone())
                     }
                 }));
+
+                // If we updated any fields, remove those fragments from indices covering those fields
+                Self::prune_updated_fields_from_indices(
+                    &mut final_indices,
+                    updated_fragments,
+                    fields_modified,
+                );
+
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
@@ -1414,6 +1157,7 @@ impl Transaction {
             Operation::Rewrite {
                 ref groups,
                 ref rewritten_indices,
+                ref frag_reuse_index,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
@@ -1435,6 +1179,11 @@ impl Transaction {
                     }
                 } else {
                     Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+                }
+
+                if let Some(frag_reuse_index) = frag_reuse_index {
+                    final_indices.retain(|idx| idx.name != frag_reuse_index.name);
+                    final_indices.push(frag_reuse_index.clone());
                 }
             }
             Operation::CreateIndex {
@@ -1691,6 +1440,35 @@ impl Transaction {
         Ok((manifest, final_indices))
     }
 
+    /// If an operation modifies one or more fields in a fragment then we need to remove
+    /// that fragment from any indices that cover one of the modified fields.
+    fn prune_updated_fields_from_indices(
+        indices: &mut [Index],
+        updated_fragments: &[Fragment],
+        fields_modified: &[u32],
+    ) {
+        if fields_modified.is_empty() {
+            return;
+        }
+
+        // If we modified any fields in the fragments then we need to remove those fragments
+        // from the index if the index covers one of those modified fields.
+        let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();
+        for index in indices.iter_mut() {
+            if index
+                .fields
+                .iter()
+                .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
+            {
+                if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
+                    for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
+                        fragment_bitmap.remove(fragment_id);
+                    }
+                }
+            }
+        }
+    }
+
     fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, fragments: &[Fragment]) {
         let field_ids = schema
             .fields_pre_order()
@@ -1701,17 +1479,20 @@ impl Transaction {
                 .fields
                 .iter()
                 .all(|field_id| field_ids.contains(field_id))
+                || existing_index.name == FRAG_REUSE_INDEX_NAME
         });
+
+        let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
 
         // We might have also removed all fragments that an index was covering, so
         // we should remove those indices as well.
-        let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
         indices.retain(|existing_index| {
             existing_index
                 .fragment_bitmap
                 .as_ref()
                 .map(|bitmap| bitmap.iter().any(|id| fragment_ids.contains(&(id as u64))))
                 .unwrap_or(true)
+                || existing_index.name == FRAG_REUSE_INDEX_NAME
         });
     }
 
@@ -1955,6 +1736,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 Operation::Rewrite {
                     groups,
                     rewritten_indices,
+                    frag_reuse_index: None,
                 }
             }
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
@@ -1988,6 +1770,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
+                fields_modified,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -1998,6 +1781,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
+                fields_modified,
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -2193,6 +1977,7 @@ impl From<&Transaction> for pb::Transaction {
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
+                frag_reuse_index: _,
             } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 groups: groups
                     .iter()
@@ -2225,6 +2010,7 @@ impl From<&Transaction> for pb::Transaction {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
+                fields_modified,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
@@ -2232,6 +2018,7 @@ impl From<&Transaction> for pb::Transaction {
                     .map(pb::DataFragment::from)
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
+                fields_modified: fields_modified.clone(),
             }),
             Operation::Project { schema } => {
                 pb::transaction::Operation::Project(pb::transaction::Project {
@@ -2417,443 +2204,6 @@ fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_conflicts() {
-        use ConflictResult::*;
-
-        let index0 = Index {
-            uuid: uuid::Uuid::new_v4(),
-            name: "test".to_string(),
-            fields: vec![0],
-            dataset_version: 1,
-            fragment_bitmap: None,
-            index_details: None,
-        };
-        let fragment0 = Fragment::new(0);
-        let fragment1 = Fragment::new(1);
-        let fragment2 = Fragment::new(2);
-        // The transactions that will be checked against
-        let other_operations = [
-            Operation::Append {
-                fragments: vec![fragment0.clone()],
-            },
-            Operation::CreateIndex {
-                new_indices: vec![index0.clone()],
-                removed_indices: vec![index0.clone()],
-            },
-            Operation::Delete {
-                updated_fragments: vec![fragment0.clone()],
-                deleted_fragment_ids: vec![2],
-                predicate: "x > 2".to_string(),
-            },
-            Operation::Merge {
-                fragments: vec![fragment0.clone(), fragment2.clone()],
-                schema: Schema::default(),
-            },
-            Operation::Overwrite {
-                fragments: vec![fragment0.clone(), fragment2.clone()],
-                schema: Schema::default(),
-                config_upsert_values: Some(HashMap::from_iter(vec![(
-                    "overwrite-key".to_string(),
-                    "value".to_string(),
-                )])),
-            },
-            Operation::Rewrite {
-                groups: vec![RewriteGroup {
-                    old_fragments: vec![fragment0.clone()],
-                    new_fragments: vec![fragment1.clone()],
-                }],
-                rewritten_indices: vec![],
-            },
-            Operation::ReserveFragments { num_fragments: 3 },
-            Operation::Update {
-                removed_fragment_ids: vec![1],
-                updated_fragments: vec![fragment0.clone()],
-                new_fragments: vec![fragment2.clone()],
-            },
-            Operation::UpdateConfig {
-                upsert_values: Some(HashMap::from_iter(vec![(
-                    "lance.test".to_string(),
-                    "value".to_string(),
-                )])),
-                delete_keys: Some(vec!["remove-key".to_string()]),
-                schema_metadata: Some(HashMap::from_iter(vec![(
-                    "schema-key".to_string(),
-                    "schema-value".to_string(),
-                )])),
-                field_metadata: Some(HashMap::from_iter(vec![(
-                    0,
-                    HashMap::from_iter(vec![("field-key".to_string(), "field-value".to_string())]),
-                )])),
-            },
-        ];
-        let other_transactions = other_operations
-            .iter()
-            .map(|op| Transaction::new(0, op.clone(), None, None))
-            .collect::<Vec<_>>();
-
-        // Transactions and whether they are expected to conflict with each
-        // of other_transactions
-        let cases = [
-            (
-                Operation::Append {
-                    fragments: vec![fragment0.clone()],
-                },
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    NotCompatible, // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    Compatible,    // update config
-                ],
-            ),
-            (
-                Operation::Delete {
-                    // Delete that affects fragments different from other transactions
-                    updated_fragments: vec![fragment1.clone()],
-                    deleted_fragment_ids: vec![],
-                    predicate: "x > 2".to_string(),
-                },
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Retryable,     // merge
-                    NotCompatible, // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Retryable,     // update
-                    Compatible,    // update config
-                ],
-            ),
-            (
-                Operation::Delete {
-                    // Delete that affects same fragments as other transactions
-                    updated_fragments: vec![fragment0.clone(), fragment2.clone()],
-                    deleted_fragment_ids: vec![],
-                    predicate: "x > 2".to_string(),
-                },
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Retryable,     // delete
-                    Retryable,     // merge
-                    NotCompatible, // overwrite
-                    Retryable,     // rewrite
-                    Compatible,    // reserve
-                    Retryable,     // update
-                    Compatible,    // update config
-                ],
-            ),
-            (
-                Operation::Overwrite {
-                    fragments: vec![fragment0.clone(), fragment2.clone()],
-                    schema: Schema::default(),
-                    config_upsert_values: None,
-                },
-                // No conflicts: overwrite can always happen since it doesn't
-                // depend on previous state of the table.
-                [Compatible; 9],
-            ),
-            (
-                Operation::CreateIndex {
-                    new_indices: vec![index0.clone()],
-                    removed_indices: vec![index0],
-                },
-                // Will only conflict with operations that modify row ids.
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    NotCompatible, // overwrite
-                    Retryable,     // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    Compatible,    // update config
-                ],
-            ),
-            (
-                // Rewrite that affects different fragments
-                Operation::Rewrite {
-                    groups: vec![RewriteGroup {
-                        old_fragments: vec![fragment1],
-                        new_fragments: vec![fragment0.clone()],
-                    }],
-                    rewritten_indices: Vec::new(),
-                },
-                [
-                    Compatible,    // append
-                    Retryable,     // create index
-                    Compatible,    // delete
-                    Retryable,     // merge
-                    NotCompatible, // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Retryable,     // update
-                    Compatible,    // update config
-                ],
-            ),
-            (
-                // Rewrite that affects the same fragments
-                Operation::Rewrite {
-                    groups: vec![RewriteGroup {
-                        old_fragments: vec![fragment0.clone(), fragment2.clone()],
-                        new_fragments: vec![fragment0.clone()],
-                    }],
-                    rewritten_indices: Vec::new(),
-                },
-                [
-                    Compatible,    // append
-                    Retryable,     // create index
-                    Retryable,     // delete
-                    Retryable,     // merge
-                    NotCompatible, // overwrite
-                    Retryable,     // rewrite
-                    Compatible,    // reserve
-                    Retryable,     // update
-                    Compatible,    // update config
-                ],
-            ),
-            (
-                Operation::Merge {
-                    fragments: vec![fragment0.clone(), fragment2.clone()],
-                    schema: Schema::default(),
-                },
-                // Merge conflicts with everything except CreateIndex and ReserveFragments.
-                [
-                    Retryable,     // append
-                    Compatible,    // create index
-                    Retryable,     // delete
-                    Retryable,     // merge
-                    NotCompatible, // overwrite
-                    Retryable,     // rewrite
-                    Compatible,    // reserve
-                    Retryable,     // update
-                    Compatible,    // update config
-                ],
-            ),
-            (
-                Operation::ReserveFragments { num_fragments: 2 },
-                // ReserveFragments only conflicts with Overwrite and Restore.
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    NotCompatible, // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    Compatible,    // update config
-                ],
-            ),
-            (
-                Operation::Update {
-                    // Update that affects same fragments as other transactions
-                    updated_fragments: vec![fragment0],
-                    removed_fragment_ids: vec![],
-                    new_fragments: vec![fragment2],
-                },
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Retryable,     // delete
-                    Retryable,     // merge
-                    NotCompatible, // overwrite
-                    Retryable,     // rewrite
-                    Compatible,    // reserve
-                    Retryable,     // update
-                    Compatible,    // update config
-                ],
-            ),
-            (
-                // Update config that should not conflict with anything
-                Operation::UpdateConfig {
-                    upsert_values: Some(HashMap::from_iter(vec![(
-                        "other-key".to_string(),
-                        "new-value".to_string(),
-                    )])),
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
-                [Compatible; 9],
-            ),
-            (
-                // Update config that conflicts with key being upserted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: Some(HashMap::from_iter(vec![(
-                        "lance.test".to_string(),
-                        "new-value".to_string(),
-                    )])),
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    Compatible,    // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    NotCompatible, // update config
-                ],
-            ),
-            (
-                // Update config that conflicts with key being deleted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: Some(HashMap::from_iter(vec![(
-                        "remove-key".to_string(),
-                        "new-value".to_string(),
-                    )])),
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    Compatible,    // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    NotCompatible, // update config
-                ],
-            ),
-            (
-                // Delete config keys currently being deleted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: Some(vec!["remove-key".to_string()]),
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
-                [Compatible; 9],
-            ),
-            (
-                // Delete config keys currently being upserted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: Some(vec!["lance.test".to_string()]),
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    Compatible,    // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    NotCompatible, // update config
-                ],
-            ),
-            (
-                // Changing schema metadata conflicts with another update changing schema
-                // metadata or with an overwrite
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: None,
-                    schema_metadata: Some(HashMap::from_iter(vec![(
-                        "schema-key".to_string(),
-                        "new-value".to_string(),
-                    )])),
-                    field_metadata: None,
-                },
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    NotCompatible, // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    NotCompatible, // update config
-                ],
-            ),
-            (
-                // Changing field metadata conflicts with another update changing same field
-                // metadata or overwrite
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: Some(HashMap::from_iter(vec![(
-                        0,
-                        HashMap::from_iter(vec![(
-                            "field_key".to_string(),
-                            "field_value".to_string(),
-                        )]),
-                    )])),
-                },
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    NotCompatible, // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    NotCompatible, // update config
-                ],
-            ),
-            (
-                // Updates to different field metadata are allowed
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: Some(HashMap::from_iter(vec![(
-                        1,
-                        HashMap::from_iter(vec![(
-                            "field_key".to_string(),
-                            "field_value".to_string(),
-                        )]),
-                    )])),
-                },
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    NotCompatible, // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    Compatible,    // update config
-                ],
-            ),
-        ];
-
-        for (operation, expected_conflicts) in &cases {
-            let transaction = Transaction::new(0, operation.clone(), None, None);
-            for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
-                assert_eq!(
-                    transaction.conflicts_with(other),
-                    *expected_conflict,
-                    "Transaction {:?} should {:?} with {:?}",
-                    transaction,
-                    expected_conflict,
-                    other
-                );
-            }
-        }
-    }
 
     #[test]
     fn test_rewrite_fragments() {

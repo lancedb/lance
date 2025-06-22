@@ -3,6 +3,7 @@
 
 //! Metadata for index
 
+use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -10,7 +11,6 @@ use uuid::Uuid;
 
 use super::pb;
 use lance_core::{Error, Result};
-
 /// Index metadata
 #[derive(Debug, Clone, PartialEq)]
 pub struct Index {
@@ -36,6 +36,15 @@ pub struct Index {
     /// This is an Option because older versions of Lance may not have this defined.  However, it should always
     /// be present in newer versions.
     pub index_details: Option<prost_types::Any>,
+
+    /// The index version.
+    pub index_version: i32,
+
+    /// Timestamp when the index was created
+    ///
+    /// This field is optional for backward compatibility. For existing indices created before
+    /// this field was added, this will be None.
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 impl DeepSizeOf for Index {
@@ -76,6 +85,11 @@ impl TryFrom<pb::IndexMetadata> for Index {
             dataset_version: proto.dataset_version,
             fragment_bitmap,
             index_details: proto.index_details,
+            index_version: proto.index_version.unwrap_or_default(),
+            created_at: proto.created_at.map(|ts| {
+                DateTime::from_timestamp_millis(ts as i64)
+                    .expect("Invalid timestamp in index metadata")
+            }),
         })
     }
 }
@@ -99,6 +113,8 @@ impl From<&Index> for pb::IndexMetadata {
             dataset_version: idx.dataset_version,
             fragment_bitmap,
             index_details: idx.index_details.clone(),
+            index_version: Some(idx.index_version),
+            created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
         }
     }
 }

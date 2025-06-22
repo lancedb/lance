@@ -78,6 +78,7 @@ def dataset(
     index_cache_size: Optional[int] = None,
     storage_options: Optional[Dict[str, str]] = None,
     default_scan_options: Optional[Dict[str, str]] = None,
+    metadata_cache_size_bytes: Optional[int] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -123,6 +124,10 @@ def dataset(
         fields such as ``_rowid`` or ``_rowaddr``.  If ``default_scan_options`` is
         provided then the schema returned by :py:meth:`lance.LanceDataset.schema` will
         include these fields if the appropriate scan options are set.
+    metadata_cache_size_bytes : optional, int
+        Size of the metadata cache in bytes. This cache is used to store metadata
+        information about the dataset, such as schema and statistics. If not specified,
+        a default size will be used.
     """
     ds = LanceDataset(
         uri,
@@ -132,6 +137,7 @@ def dataset(
         index_cache_size=index_cache_size,
         storage_options=storage_options,
         default_scan_options=default_scan_options,
+        metadata_cache_size_bytes=metadata_cache_size_bytes,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -150,6 +156,7 @@ def dataset(
                 block_size,
                 commit_lock=commit_lock,
                 index_cache_size=index_cache_size,
+                metadata_cache_size_bytes=metadata_cache_size_bytes,
             )
     else:
         return ds

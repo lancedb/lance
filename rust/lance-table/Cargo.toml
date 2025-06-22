@@ -51,6 +51,8 @@ arrow-schema.workspace = true
 criterion.workspace = true
 pretty_assertions.workspace = true
 proptest.workspace = true
+rstest.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof = { workspace = true }

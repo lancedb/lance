@@ -170,6 +170,9 @@ impl DisplayAs for ReplayExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "Replay: capacity={:?}", self.capacity)
             }
+            DisplayFormatType::TreeRender => {
+                write!(f, "Replay\ncapacity={:?}", self.capacity)
+            }
         }
     }
 }

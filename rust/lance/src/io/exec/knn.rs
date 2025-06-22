@@ -3,7 +3,8 @@
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
@@ -11,7 +12,7 @@ use arrow_array::{
     cast::AsArray,
     ArrayRef, RecordBatch, StringArray,
 };
-use arrow_array::{Array, Float32Array, UInt64Array};
+use arrow_array::{Array, Float32Array, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::PlanProperties;
@@ -29,11 +30,18 @@ use datafusion::{
     physical_plan::metrics::MetricsSet,
 };
 use datafusion_physical_expr::{Distribution, EquivalenceProperties};
-use futures::stream::repeat_with;
-use futures::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
+use futures::{future, stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
+use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::ROW_ID;
 use lance_core::{utils::tokio::get_num_compute_intensive_cpus, ROW_ID_FIELD};
+use lance_datafusion::utils::{
+    ExecutionPlanMetricsSetExt, DELTAS_SEARCHED_METRIC, PARTITIONS_RANKED_METRIC,
+    PARTITIONS_SEARCHED_METRIC,
+};
+use lance_index::prefilter::PreFilter;
+use lance_index::vector::VectorIndex;
 use lance_index::vector::{
     flat::compute_distance, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
 };
@@ -41,6 +49,7 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::Index;
 use snafu::location;
+use tokio::sync::Notify;
 
 use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
@@ -54,14 +63,36 @@ use super::utils::{
     SelectionVectorToPrefilter,
 };
 
-pub struct AnnMetrics {
+pub struct AnnPartitionMetrics {
     index_metrics: IndexMetrics,
+    partitions_ranked: Count,
+    deltas_searched: Count,
+    baseline_metrics: BaselineMetrics,
 }
 
-impl AnnMetrics {
+impl AnnPartitionMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             index_metrics: IndexMetrics::new(metrics, partition),
+            partitions_ranked: metrics.new_count(PARTITIONS_RANKED_METRIC, partition),
+            deltas_searched: metrics.new_count(DELTAS_SEARCHED_METRIC, partition),
+            baseline_metrics: BaselineMetrics::new(metrics, partition),
+        }
+    }
+}
+
+pub struct AnnIndexMetrics {
+    index_metrics: IndexMetrics,
+    partitions_searched: Count,
+    baseline_metrics: BaselineMetrics,
+}
+
+impl AnnIndexMetrics {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            index_metrics: IndexMetrics::new(metrics, partition),
+            partitions_searched: metrics.new_count(PARTITIONS_SEARCHED_METRIC, partition),
+            baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
 }
@@ -80,8 +111,8 @@ pub struct KNNVectorDistanceExec {
 
     /// The vector query to execute.
     pub query: ArrayRef,
-    column: String,
-    distance_type: DistanceType,
+    pub column: String,
+    pub distance_type: DistanceType,
 
     output_schema: SchemaRef,
     properties: PlanProperties,
@@ -94,6 +125,9 @@ impl DisplayAs for KNNVectorDistanceExec {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "KNNVectorDistance: metric={}", self.distance_type,)
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "KNNVectorDistance\nmetric={}", self.distance_type,)
             }
         }
     }
@@ -285,9 +319,18 @@ pub fn new_knn_exec(
 ///
 /// It searches the partition IDs using the input query.
 ///
-/// It allows to search multiple delta indices in parallel, and returns a
-/// single RecordBatch, where each row contains the partition IDs and the delta index
-/// `uuid`:
+/// It searches all index deltas in parallel.  For each delta it returns a
+/// single batch with the partition IDs and the delta index `uuid`:
+///
+/// The number of partitions returned is at most `maximum_nprobes`.  If
+/// `maximum_nprobes` is not set, it will return all partitions.  The partitions
+/// are returned in sorted order from closest to farthest.
+///
+/// Typically, all partition ids will be identical for each delta index (since delta
+/// indices have identical partitions) but the downstream nodes do not rely on this.
+///
+/// TODO: We may want to search the partitions once instead of once per delta index
+/// since the centroids are the same.
 ///
 /// ```text
 /// {
@@ -345,9 +388,20 @@ impl DisplayAs for ANNIvfPartitionExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "ANNIvfPartition: uuid={}, nprobes={}, deltas={}",
+                    "ANNIvfPartition: uuid={}, minimum_nprobes={}, maximum_nprobes={:?}, deltas={}",
                     self.index_uuids[0],
-                    self.query.nprobes,
+                    self.query.minimum_nprobes,
+                    self.query.maximum_nprobes,
+                    self.index_uuids.len()
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "ANNIvfPartition\nuuid={}\nminimum_nprobes={}\nmaximum_nprobes={:?}\ndeltas={}",
+                    self.index_uuids[0],
+                    self.query.minimum_nprobes,
+                    self.query.maximum_nprobes,
                     self.index_uuids.len()
                 )
             }
@@ -370,13 +424,17 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
         Ok(Statistics {
-            num_rows: Precision::Exact(self.query.nprobes),
+            num_rows: Precision::Exact(self.query.minimum_nprobes),
             ..Statistics::new_unknown(self.schema().as_ref())
         })
     }
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -403,23 +461,29 @@ impl ExecutionPlan for ANNIvfPartitionExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
         let ds = self.dataset.clone();
-        let metrics = Arc::new(AnnMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(AnnPartitionMetrics::new(&self.metrics, partition));
+
+        metrics.deltas_searched.add(self.index_uuids.len());
+        let metrics_clone = metrics.clone();
+
         let stream = stream::iter(self.index_uuids.clone())
             .map(move |uuid| {
                 let query = query.clone();
                 let ds = ds.clone();
                 let metrics = metrics.clone();
-
                 async move {
                     let index = ds
                         .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
                         .await?;
 
+                    let _timer = metrics.baseline_metrics.elapsed_compute().timer();
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
                         let key = normalize_arrow(&query.key)?;
                         query.key = key;
                     };
+
+                    metrics.partitions_ranked.add(index.total_partitions());
 
                     let partitions = index.find_partitions(&query).map_err(|e| {
                         DataFusionError::Execution(format!("Failed to find partitions: {}", e))
@@ -434,21 +498,23 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                         KNN_PARTITION_SCHEMA.clone(),
                         vec![Arc::new(partition_col), Arc::new(uuid_col)],
                     )?;
+                    metrics.baseline_metrics.record_output(batch.num_rows());
                     Ok::<_, DataFusionError>(batch)
                 }
             })
-            .buffered(self.index_uuids.len());
+            .buffered(self.index_uuids.len())
+            .finally(move || {
+                metrics_clone.baseline_metrics.done();
+            });
         let schema = self.schema();
-        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
-            schema,
-            stream.boxed(),
-            partition,
-            &self.metrics,
-        )) as SendableRecordBatchStream)
+        Ok(
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
+                as SendableRecordBatchStream,
+        )
     }
 }
 
-/// Datafusion [ExecutionPlan] to run search on IVF partitions.
+/// Datafusion [ExecutionPlan] to run search on vector index partitions.
 ///
 /// A IVF-{PQ/SQ/HNSW} query plan is:
 ///
@@ -456,6 +522,25 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 /// AnnSubIndexExec: k=10
 ///   AnnPartitionExec: nprobes=20
 /// ```
+///
+/// The partition index returns one batch per delta with `maximum_nprobes` partitions in sorted order.
+///
+/// The sub-index then runs a KNN search on each partition in parallel.
+///
+/// First, the index will search `minimum_probes` partitions on each delta.  If there are enough results
+/// at that point to satisfy K then the results will be sorted and returned.
+///
+/// If there are not enough results then the prefilter will be consulted to determine how many potential
+/// results exist.  If the number is smaller than K then those additional results will be fetched directly
+/// and given maximum distance.
+///
+/// If the number of results is larger then additional partitions will be searched in batches of
+/// `cpu_parallelism` until min(K, num_filtered_results) are found or `maximum_nprobes` partitions
+/// have been searched.
+///
+/// TODO: In the future, if we can know that a filter will be highly selective (through cost estimation or
+/// user-provided hints) we wait for the prefilter results before we load any partitions.  If there are less
+/// than K (or some threshold) results then we can return without search.
 #[derive(Debug)]
 pub struct ANNIvfSubIndexExec {
     /// Inner input source node.
@@ -524,7 +609,239 @@ impl DisplayAs for ANNIvfSubIndexExec {
                     self.indices.len()
                 )
             }
+            DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "ANNSubIndex\nname={}\nk={}\ndeltas={}",
+                    self.indices[0].name,
+                    self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
+                    self.indices.len()
+                )
+            }
         }
+    }
+}
+
+struct ANNIvfEarlySearchResults {
+    k: usize,
+    initial_ids: Mutex<Vec<u64>>,
+    num_results_found: AtomicUsize,
+    deltas_remaining: AtomicUsize,
+    all_deltas_done: Notify,
+    took_no_rows_shortcut: AtomicBool,
+}
+
+impl ANNIvfEarlySearchResults {
+    fn new(deltas_remaining: usize, k: usize) -> Self {
+        Self {
+            k,
+            initial_ids: Mutex::new(Vec::with_capacity(k)),
+            num_results_found: AtomicUsize::new(0),
+            deltas_remaining: AtomicUsize::new(deltas_remaining),
+            all_deltas_done: Notify::new(),
+            took_no_rows_shortcut: AtomicBool::new(false),
+        }
+    }
+
+    fn record_batch(&self, batch: &RecordBatch) {
+        let mut initial_ids = self.initial_ids.lock().unwrap();
+        let ids_to_record = (self.k - initial_ids.len()).min(batch.num_rows());
+        initial_ids.extend(
+            batch
+                .column(1)
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .take(ids_to_record),
+        );
+    }
+
+    fn record_late_batch(&self, num_rows: usize) {
+        self.num_results_found
+            .fetch_add(num_rows, Ordering::Relaxed);
+    }
+
+    async fn wait_for_minimum_to_finish(&self) -> usize {
+        if self.deltas_remaining.fetch_sub(1, Ordering::Relaxed) == 1 {
+            {
+                let new_num_results_found = self.initial_ids.lock().unwrap().len();
+                self.num_results_found
+                    .store(new_num_results_found, Ordering::Relaxed);
+            }
+            self.all_deltas_done.notify_waiters();
+        } else {
+            self.all_deltas_done.notified().await;
+        }
+        self.num_results_found.load(Ordering::Relaxed)
+    }
+}
+
+impl ANNIvfSubIndexExec {
+    fn late_search(
+        index: Arc<dyn VectorIndex>,
+        query: Query,
+        partitions: Arc<UInt32Array>,
+        prefilter: Arc<DatasetPreFilter>,
+        metrics: Arc<AnnIndexMetrics>,
+        state: Arc<ANNIvfEarlySearchResults>,
+    ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+        let stream = futures::stream::once(async move {
+            let max_nprobes = query.maximum_nprobes.unwrap_or(partitions.len());
+            if max_nprobes == query.minimum_nprobes {
+                // We've already searched all partitions, no late search needed
+                return futures::stream::empty().boxed();
+            }
+
+            let found_so_far = state.wait_for_minimum_to_finish().await;
+            if found_so_far >= query.k {
+                // We found enough results, no need for late search
+                return futures::stream::empty().boxed();
+            }
+
+            // We know the prefilter should be ready at this point so we shouldn't
+            // need to call wait_for_ready
+            let prefilter_mask = prefilter.mask();
+
+            let max_results = prefilter_mask.max_len().map(|x| x as usize);
+
+            if let Some(max_results) = max_results {
+                if found_so_far < max_results && max_results <= query.k {
+                    // In this case there are fewer than k results matching the prefilter so
+                    // just return the prefilter ids and don't bother searching any further
+
+                    // This next if check should be true, because we wouldn't get max_results otherwise
+                    if let Some(iter_ids) = prefilter_mask.iter_ids() {
+                        // We only run this on the first delta because the prefilter mask is shared
+                        // by all deltas and we don't want to duplicate the rows.
+                        if state
+                            .took_no_rows_shortcut
+                            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            let initial_ids = state.initial_ids.lock().unwrap();
+                            let found_ids = HashSet::<_>::from_iter(initial_ids.iter().copied());
+                            drop(initial_ids);
+                            let mask_ids = HashSet::from_iter(iter_ids.map(u64::from));
+                            let not_found_ids = mask_ids.difference(&found_ids);
+                            let not_found_ids =
+                                UInt64Array::from_iter_values(not_found_ids.copied());
+                            let not_found_distance =
+                                Float32Array::from_value(f32::INFINITY, not_found_ids.len());
+                            let not_found_batch = RecordBatch::try_new(
+                                KNN_INDEX_SCHEMA.clone(),
+                                vec![Arc::new(not_found_distance), Arc::new(not_found_ids)],
+                            )
+                            .unwrap();
+                            return futures::stream::once(async move { Ok(not_found_batch) })
+                                .boxed();
+                        } else {
+                            // We meet all the criteria for an early exit, but we aren't first
+                            // delta so we just return an empty stream and skip the late search
+                            return futures::stream::empty().boxed();
+                        }
+                    }
+                }
+            }
+
+            // Stop searching if we have k results or we've found all the results
+            // that could possible match the prefilter
+            let max_results = max_results.unwrap_or(usize::MAX).min(query.k);
+
+            let state_clone = state.clone();
+            let metrics_clone = metrics.clone();
+            // There are more partitions to search, start the late search
+            futures::stream::iter(query.minimum_nprobes..max_nprobes)
+                .map(move |idx| {
+                    let part_id = partitions.value(idx);
+                    let query = query.clone();
+                    let metrics = metrics.clone();
+                    let pre_filter = prefilter.clone();
+                    let state = state.clone();
+                    let index = index.clone();
+                    async move {
+                        let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+                        let mut query = query.clone();
+                        if index.metric_type() == DistanceType::Cosine {
+                            let key = normalize_arrow(&query.key)?;
+                            query.key = key;
+                        };
+
+                        metrics.partitions_searched.add(1);
+                        let batch = index
+                            .search_in_partition(
+                                part_id as usize,
+                                &query,
+                                pre_filter,
+                                &metrics.index_metrics,
+                            )
+                            .map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to calculate KNN: {}",
+                                    e
+                                ))
+                            })
+                            .await?;
+                        metrics.baseline_metrics.record_output(batch.num_rows());
+                        state.record_late_batch(batch.num_rows());
+                        Ok(batch)
+                    }
+                })
+                .take_while(move |_| {
+                    let found_so_far = state_clone.num_results_found.load(Ordering::Relaxed);
+                    std::future::ready(found_so_far < max_results)
+                })
+                .buffered(get_num_compute_intensive_cpus())
+                .finally(move || {
+                    metrics_clone.baseline_metrics.done();
+                })
+                .boxed()
+        });
+        stream.flatten()
+    }
+
+    fn initial_search(
+        index: Arc<dyn VectorIndex>,
+        query: Query,
+        partitions: Arc<UInt32Array>,
+        prefilter: Arc<DatasetPreFilter>,
+        metrics: Arc<AnnIndexMetrics>,
+        state: Arc<ANNIvfEarlySearchResults>,
+    ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+        let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
+        metrics.partitions_searched.add(minimum_nprobes);
+        futures::stream::iter(0..minimum_nprobes)
+            .map(move |idx| {
+                let part_id = partitions.value(idx);
+                let query = query.clone();
+                let metrics = metrics.clone();
+                let index = index.clone();
+                let pre_filter = prefilter.clone();
+                let state = state.clone();
+                async move {
+                    let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+                    let mut query = query.clone();
+                    if index.metric_type() == DistanceType::Cosine {
+                        let key = normalize_arrow(&query.key)?;
+                        query.key = key;
+                    };
+
+                    let batch = index
+                        .search_in_partition(
+                            part_id as usize,
+                            &query,
+                            pre_filter,
+                            &metrics.index_metrics,
+                        )
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!("Failed to calculate KNN: {}", e))
+                        })
+                        .await?;
+                    metrics.baseline_metrics.record_output(batch.num_rows());
+                    state.record_batch(&batch);
+                    Ok(batch)
+                }
+            })
+            .buffered(get_num_compute_intensive_cpus())
     }
 }
 
@@ -606,8 +923,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let column = self.query.column.clone();
         let indices = self.indices.clone();
         let prefilter_source = self.prefilter_source.clone();
-        let metrics = Arc::new(AnnMetrics::new(&self.metrics, partition));
-        let metrics_clone = metrics.clone();
+        let metrics = Arc::new(AnnIndexMetrics::new(&self.metrics, partition));
+
         // Per-delta-index stream:
         //   Stream<(parttitions, index uuid)>
         let per_index_stream = input_stream
@@ -621,21 +938,17 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     .expect("ANNSubIndexExec: input missing index_uuid column");
                 let index_uuid = index_uuid_col.as_string::<i32>().clone();
 
-                let plan = part_id_arr
+                let plan: Vec<DataFusionResult<(_, _)>> = part_id_arr
                     .iter()
                     .zip(index_uuid.iter())
                     .map(|(part_id, uuid)| {
-                        // TODO: eliminate exceesive copying here to fight with lifetime.
-                        let partitions = part_id
-                            .unwrap()
-                            .as_primitive::<UInt32Type>()
-                            .values()
-                            .to_vec();
+                        let partitions =
+                            Arc::new(part_id.unwrap().as_primitive::<UInt32Type>().clone());
                         let uuid = uuid.unwrap().to_string();
                         Ok((partitions, uuid))
                     })
                     .collect_vec();
-                async move { Ok(stream::iter(plan)) }
+                async move { DataFusionResult::Ok(stream::iter(plan)) }
             })
             .try_flatten();
         let prefilter_loader = match &prefilter_source {
@@ -656,7 +969,9 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             prefilter_loader,
         ));
 
-        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
+        let state = Arc::new(ANNIvfEarlySearchResults::new(indices.len(), query.k));
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
             per_index_stream
                 .and_then(move |(part_ids, index_uuid)| {
@@ -664,52 +979,38 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let column = column.clone();
                     let metrics = metrics.clone();
                     let pre_filter = pre_filter.clone();
+                    let state = state.clone();
+                    let query = query.clone();
 
                     async move {
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
                             .await?;
 
-                        Ok::<_, DataFusionError>(
-                            stream::iter(part_ids)
-                                .zip(repeat_with(move || (raw_index.clone(), pre_filter.clone())))
-                                .map(Ok::<_, DataFusionError>),
-                        )
+                        let early_search = Self::initial_search(
+                            raw_index.clone(),
+                            query.clone(),
+                            part_ids.clone(),
+                            pre_filter.clone(),
+                            metrics.clone(),
+                            state.clone(),
+                        );
+                        let late_search = Self::late_search(
+                            raw_index.clone(),
+                            query,
+                            part_ids,
+                            pre_filter,
+                            metrics,
+                            state,
+                        );
+                        DataFusionResult::Ok(early_search.chain(late_search).boxed())
                     }
                 })
-                .try_flatten()
-                .map(move |result| {
-                    let query = query.clone();
-                    let metrics = metrics_clone.clone();
-                    async move {
-                        let (part_id, (index, pre_filter)) = result?;
-
-                        let mut query = query.clone();
-                        if index.metric_type() == DistanceType::Cosine {
-                            let key = normalize_arrow(&query.key)?;
-                            query.key = key;
-                        };
-
-                        index
-                            .search_in_partition(
-                                part_id as usize,
-                                &query,
-                                pre_filter,
-                                &metrics.index_metrics,
-                            )
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "Failed to calculate KNN: {}",
-                                    e
-                                ))
-                            })
-                            .await
-                    }
-                })
-                .buffered(get_num_compute_intensive_cpus())
+                // Must use flatten_unordered to avoid deadlock.
+                // Each delta stream is split into an early and late search.  The late search
+                // will not start until the early search is complete across all deltas.
+                .try_flatten_unordered(None)
                 .boxed(),
-            partition,
-            &self.metrics,
         )))
     }
 
@@ -763,6 +1064,9 @@ impl DisplayAs for MultivectorScoringExec {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "MultivectorScoring: k={}", self.query.k)
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "MultivectorScoring\nk={}", self.query.k)
             }
         }
     }
@@ -933,10 +1237,19 @@ mod tests {
     use arrow::datatypes::Float32Type;
     use arrow_array::{FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
+    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_index::optimize::OptimizeOptions;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::pq::PQBuildParams;
+    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
-    use tempfile::tempdir;
+    use rstest::rstest;
+    use tempfile::{tempdir, TempDir};
 
-    use crate::dataset::WriteParams;
+    use crate::dataset::{WriteMode, WriteParams};
+    use crate::index::vector::VectorIndexParams;
     use crate::io::exec::testing::TestingExec;
 
     #[tokio::test]
@@ -1073,7 +1386,8 @@ mod tests {
             k: 10,
             lower_bound: None,
             upper_bound: None,
-            nprobes: 1,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
             ef: None,
             refine_factor: None,
             metric_type: DistanceType::Cosine,
@@ -1134,5 +1448,345 @@ mod tests {
                 res = Some(new_res);
             }
         }
+    }
+
+    /// A test dataset for testing the nprobes parameter.
+    ///
+    /// The dataset has 100 partitions and filterable columns setup to easily create
+    /// filters whose results are spread across the partitions evenly.
+    struct NprobesTestFixture {
+        dataset: Dataset,
+        centroids: Arc<dyn Array>,
+        _tmp_dir: TempDir,
+    }
+
+    impl NprobesTestFixture {
+        pub async fn new(num_centroids: usize, num_deltas: usize) -> Self {
+            let tempdir = tempdir().unwrap();
+            let tmppath = tempdir.path().to_str().unwrap();
+
+            // We create 100 centroids
+            // We generate 10,000 vectors evenly divided (100 vectors per centroid)
+            // We assign labels 0..60 to the vectors so each label has ~164 vectors
+            //   spread out through all of the centroids
+            let centroids = array::cycle_unit_circle(num_centroids as u32)
+                .generate_default(RowCount::from(num_centroids as u64))
+                .unwrap();
+
+            // Let's not deal with fractions
+            assert!(100 % num_deltas == 0, "num_deltas must divide 100");
+            let rows_per_frag = 100;
+            let num_frags = 100;
+            let frags_per_delta = num_frags / num_deltas;
+
+            let batches = lance_datagen::gen()
+                .col("vector", array::jitter_centroids(centroids.clone(), 0.0001))
+                .col("label", array::cycle::<UInt32Type>(Vec::from_iter(0..61)))
+                .col("userid", array::step::<UInt64Type>())
+                .into_reader_rows(
+                    RowCount::from(rows_per_frag),
+                    BatchCount::from(num_frags as u32),
+                )
+                .collect::<Vec<_>>();
+            let schema = batches[0].as_ref().unwrap().schema();
+
+            let mut first = true;
+            for batches in batches.chunks(frags_per_delta) {
+                let delta_batches = batches
+                    .iter()
+                    .map(|maybe_batch| Ok(maybe_batch.as_ref().unwrap().clone()))
+                    .collect::<Vec<_>>();
+                let reader = RecordBatchIterator::new(delta_batches, schema.clone());
+                let mut dataset = Dataset::write(
+                    reader,
+                    tmppath,
+                    Some(WriteParams {
+                        mode: WriteMode::Append,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+
+                let ivf_params = IvfBuildParams::try_with_centroids(
+                    num_centroids,
+                    Arc::new(centroids.as_fixed_size_list().clone()),
+                )
+                .unwrap();
+
+                let codebook = array::rand::<Float32Type>()
+                    .generate_default(RowCount::from(256 * 2))
+                    .unwrap();
+                let pq_params = PQBuildParams::with_codebook(2, 8, codebook);
+                let index_params =
+                    VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);
+
+                if first {
+                    first = false;
+                    dataset
+                        .create_index(&["vector"], IndexType::Vector, None, &index_params, false)
+                        .await
+                        .unwrap();
+                } else {
+                    dataset
+                        .optimize_indices(&OptimizeOptions {
+                            num_indices_to_merge: 0,
+                            index_names: None,
+                            retrain: false,
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+
+            let dataset = Dataset::open(tmppath).await.unwrap();
+            Self {
+                dataset,
+                centroids,
+                _tmp_dir: tempdir,
+            }
+        }
+
+        pub fn get_centroid(&self, idx: usize) -> Arc<dyn Array> {
+            let centroids = self.centroids.as_fixed_size_list();
+            centroids.value(idx).clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct StatsHolder {
+        pub collected_stats: Arc<Mutex<Option<ExecutionSummaryCounts>>>,
+    }
+
+    impl StatsHolder {
+        fn get_setter(&self) -> ExecutionStatsCallback {
+            let collected_stats = self.collected_stats.clone();
+            Arc::new(move |stats| {
+                *collected_stats.lock().unwrap() = Some(stats.clone());
+            })
+        }
+
+        fn consume(self) -> ExecutionSummaryCounts {
+            self.collected_stats.lock().unwrap().take().unwrap()
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_no_max_nprobes(#[values(1, 20)] num_deltas: usize) {
+        let fixture = NprobesTestFixture::new(100, num_deltas).await;
+
+        let q = fixture.get_centroid(0);
+        let stats_holder = StatsHolder::default();
+
+        let results = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 50)
+            .unwrap()
+            .minimum_nprobes(10)
+            .prefilter(true)
+            .scan_stats_callback(stats_holder.get_setter())
+            .filter("label = 17")
+            .unwrap()
+            .project(&Vec::<String>::new())
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(results.num_rows(), 50);
+
+        let stats = stats_holder.consume();
+
+        // We should not search _all_ partitions because we should hit 50 results partway
+        // through the late search.
+        // The exact number here is deterministic but depends on the number of CPUs
+        if get_num_compute_intensive_cpus() <= 32 {
+            assert!(*stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap() < 100 * num_deltas);
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_no_prefilter_results(#[values(1, 20)] num_deltas: usize) {
+        let fixture = NprobesTestFixture::new(100, num_deltas).await;
+
+        let q = fixture.get_centroid(0);
+        let stats_holder = StatsHolder::default();
+
+        let results = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 50)
+            .unwrap()
+            .minimum_nprobes(10)
+            .prefilter(true)
+            .scan_stats_callback(stats_holder.get_setter())
+            .filter("label = 17 AND label = 18")
+            .unwrap()
+            .project(&Vec::<String>::new())
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(results.num_rows(), 0);
+
+        let stats = stats_holder.consume();
+        // We still do the early search because we don't wait for the prefilter to execute
+        // We skip the late search because by then we know there are no results
+        assert_eq!(
+            stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
+            &(10 * num_deltas)
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_some_max_nprobes(#[values(1, 20)] num_deltas: usize) {
+        let fixture = NprobesTestFixture::new(100, num_deltas).await;
+
+        for (max_nprobes, expected_results) in [(10, 16), (20, 33), (30, 48)] {
+            let q = fixture.get_centroid(0);
+            let stats_holder = StatsHolder::default();
+            let results = fixture
+                .dataset
+                .scan()
+                .nearest("vector", q.as_ref(), 50)
+                .unwrap()
+                .minimum_nprobes(10)
+                .maximum_nprobes(max_nprobes)
+                .prefilter(true)
+                .filter("label = 17")
+                .unwrap()
+                .scan_stats_callback(stats_holder.get_setter())
+                .project(&Vec::<String>::new())
+                .unwrap()
+                .with_row_id()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let stats = stats_holder.consume();
+
+            assert_eq!(results.num_rows(), expected_results);
+            assert_eq!(
+                stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
+                &(max_nprobes * num_deltas)
+            );
+            assert_eq!(
+                stats.all_counts.get(PARTITIONS_RANKED_METRIC).unwrap(),
+                &(100 * num_deltas)
+            );
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fewer_than_k_results(#[values(1, 20)] num_deltas: usize) {
+        let fixture = NprobesTestFixture::new(100, num_deltas).await;
+
+        let q = fixture.get_centroid(0);
+        let stats_holder = StatsHolder::default();
+        let results = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 50)
+            .unwrap()
+            .minimum_nprobes(10)
+            .prefilter(true)
+            .filter("userid < 20")
+            .unwrap()
+            .scan_stats_callback(stats_holder.get_setter())
+            .project(&Vec::<String>::new())
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let stats = stats_holder.consume();
+
+        // We should only search minimum_nprobes before we look at the prefilter and realize
+        // we can cheaply stop early.
+        assert_eq!(
+            stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
+            &(10 * num_deltas)
+        );
+        assert_eq!(results.num_rows(), 20);
+
+        // 15 of the results come from beyond the closest 10 partitions and these will have infinite
+        // distance.
+        let num_infinite_results = results
+            .column(0)
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .filter(|val| val.is_infinite())
+            .count();
+        assert_eq!(num_infinite_results, 15);
+
+        // If we set a refine factor then the distance should not be infinite.
+        let results = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 50)
+            .unwrap()
+            .minimum_nprobes(10)
+            .prefilter(true)
+            .refine(1)
+            .filter("userid < 20")
+            .unwrap()
+            .project(&Vec::<String>::new())
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(results.num_rows(), 20);
+        let num_infinite_results = results
+            .column(0)
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .filter(|val| val.is_infinite())
+            .count();
+        assert_eq!(num_infinite_results, 0);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_dataset_too_small(#[values(1, 20)] num_deltas: usize) {
+        let fixture = NprobesTestFixture::new(100, num_deltas).await;
+
+        let q = fixture.get_centroid(0);
+        let stats_holder = StatsHolder::default();
+        // There is no filter but we only have 10K rows.  Since maximum_nprobes is not set
+        // we will search all partitions.
+        let results = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 40000)
+            .unwrap()
+            .minimum_nprobes(10)
+            .scan_stats_callback(stats_holder.get_setter())
+            .project(&Vec::<String>::new())
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let stats = stats_holder.consume();
+
+        assert_eq!(
+            stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
+            &(100 * num_deltas)
+        );
+        assert_eq!(results.num_rows(), 10000);
     }
 }

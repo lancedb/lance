@@ -126,11 +126,12 @@ pub async fn read_manifest_indexes(
         };
         let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
 
-        Ok(section
+        let indices = section
             .indices
             .into_iter()
             .map(Index::try_from)
-            .collect::<Result<Vec<_>>>()?)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(indices)
     } else {
         Ok(vec![])
     }
@@ -161,9 +162,10 @@ pub async fn write_manifest(
 ) -> Result<usize> {
     // Write dictionary values.
     let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);
+    let is_legacy_storage = manifest.should_use_legacy_format();
     for field_id in 0..max_field_id + 1 {
         if let Some(field) = manifest.schema.mut_field_by_id(field_id) {
-            if field.data_type().is_dictionary() {
+            if field.data_type().is_dictionary() && is_legacy_storage {
                 let dict_info = field.dictionary.as_mut().ok_or_else(|| {
                     Error::io(
                         format!("Lance field {} misses dictionary info", field.name),

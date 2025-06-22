@@ -206,7 +206,14 @@ pub async fn maybe_sample_training_data(
             "Sample training data: retrieved {} rows by sampling after filtering out nulls",
             batch.num_rows()
         );
-        batch
+
+        // it's possible that we have more rows than sample_size_hint for this case,
+        // truncate the batch to sample_size_hint
+        if batch.num_rows() > sample_size_hint {
+            batch.slice(0, sample_size_hint)
+        } else {
+            batch
+        }
     } else {
         let mut scanner = dataset.scan();
         scanner.project(&[column])?;

@@ -13,7 +13,14 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.query import BoostQuery, MatchQuery, MultiMatchQuery, PhraseQuery
+from lance.query import (
+    BooleanQuery,
+    BoostQuery,
+    MatchQuery,
+    MultiMatchQuery,
+    Occur,
+    PhraseQuery,
+)
 from lance.vector import vec_to_table
 
 
@@ -527,7 +534,9 @@ def test_fts_fts(tmp_path):
         ),
         tmp_path,
     )
-    dataset.create_scalar_index("text", "INVERTED", with_position=True)
+    dataset.create_scalar_index(
+        "text", "INVERTED", with_position=True, remove_stop_words=False
+    )
 
     results = dataset.to_table(full_text_query='"was a puppy"', prefilter=True)
     assert results.num_rows == 1
@@ -597,9 +606,9 @@ def test_fts_stats(dataset):
     assert params["language"] == "English"
     assert params["max_token_length"] == 40
     assert params["lower_case"] is True
-    assert params["stem"] is False
+    assert params["stem"] is True
     assert params["remove_stop_words"] is True
-    assert params["ascii_folding"] is False
+    assert params["ascii_folding"] is True
 
 
 def test_fts_on_list(tmp_path):
@@ -658,6 +667,16 @@ def test_fts_fuzzy_query(tmp_path):
     )
     assert results.num_rows == 3
 
+    # prefix matching
+    results = ds.to_table(
+        full_text_query=MatchQuery("foo", "text", fuzziness=1, prefix_length=3)
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "foo",
+        "food",
+    }
+
 
 def test_fts_phrase_query(tmp_path):
     data = pa.table(
@@ -672,7 +691,9 @@ def test_fts_phrase_query(tmp_path):
     )
 
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", "INVERTED")
+    ds.create_scalar_index(
+        "text", "INVERTED", with_position=True, remove_stop_words=False
+    )
 
     results = ds.to_table(
         full_text_query='"frodo was a puppy"',
@@ -691,6 +712,19 @@ def test_fts_phrase_query(tmp_path):
         "frodo was a puppy",
         "frodo was a puppy with a tail",
     }
+
+    results = ds.to_table(full_text_query=PhraseQuery("frodo was happy", "text"))
+    assert results.num_rows == 0
+
+    results = ds.to_table(
+        full_text_query=PhraseQuery("frodo was happy", "text", slop=1)
+    )
+    assert results.num_rows == 1
+
+    results = ds.to_table(
+        full_text_query=PhraseQuery("frodo was happy", "text", slop=2)
+    )
+    assert results.num_rows == 2
 
 
 def test_fts_boost_query(tmp_path):
@@ -740,6 +774,52 @@ def test_fts_multi_match_query(tmp_path):
     assert set(results["content"].to_pylist()) == {"content world", "content common"}
 
 
+def test_fts_boolean_query(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "frodo was a puppy",
+                "frodo was a happy puppy",
+                "frodo was a puppy with a tail",
+            ]
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+
+    query = MatchQuery("puppy", "text") & MatchQuery("happy", "text")
+    results = ds.to_table(
+        full_text_query=query,
+    )
+    assert results.num_rows == 1
+    assert results["text"][0].as_py() == "frodo was a happy puppy"
+
+    query = MatchQuery("tail", "text") | MatchQuery("happy", "text")
+    results = ds.to_table(
+        full_text_query=query,
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a happy puppy",
+        "frodo was a puppy with a tail",
+    }
+
+    results = ds.to_table(
+        full_text_query=BooleanQuery(
+            [
+                (Occur.MUST, MatchQuery("puppy", "text")),
+                (Occur.MUST_NOT, MatchQuery("happy", "text")),
+            ]
+        ),
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+    }
+
+
 def test_fts_with_postfilter(tmp_path):
     tab = pa.table({"text": ["Frodo the puppy"] * 100, "id": range(100)})
     dataset = lance.write_dataset(tab, tmp_path)
@@ -777,12 +857,118 @@ def test_fts_all_deleted(dataset):
     dataset.to_table(full_text_query=first_row_doc)
 
 
+def test_fts_deleted_rows(tmp_path):
+    data = pa.table({"text": ["lance is cool", "databases are cool", "search is neat"]})
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+    ds.insert(
+        pa.table({"text": ["lance is cool", "databases are cool", "search is neat"]})
+    )
+
+    ds.delete("text = 'lance is cool'")
+    results = ds.to_table(full_text_query="cool")
+    assert results.num_rows == 2
+
+
+def test_index_after_merge_insert(tmp_path):
+    # This regresses a defect where a horizontal merge insert was not taking modified
+    # fragments out of the index if the column is modified.
+    dataset = lance.write_dataset(
+        pa.table({"id": range(100), "payload": range(100), "other": range(100)}),
+        tmp_path,
+    )
+    dataset.create_scalar_index("id", index_type="BTREE")
+    dataset.create_scalar_index("payload", index_type="BTREE")
+
+    assert dataset.to_table(filter="payload >= 30").num_rows == 70
+
+    # Partial merge insert triggers horizontal merge insert
+    dataset.merge_insert(
+        "id"
+    ).when_matched_update_all().when_not_matched_insert_all().execute(
+        pa.table({"id": range(50, 150), "payload": [0] * 100})
+    )
+
+    assert dataset.to_table(filter="payload >= 30").num_rows == 20
+
+
+def test_lindera_load_config_fallback(tmp_path, lindera_ipadic, monkeypatch):
+    data = pa.table(
+        {
+            "text": [
+                "成田国際空港",
+                "東京国際空港",
+                "羽田空港",
+            ],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    with pytest.raises(OSError):
+        ds.create_scalar_index(
+            "text", "INVERTED", base_tokenizer="lindera/load_config_fallback"
+        )
+
+    config_path = os.path.join(
+        os.path.dirname(__file__),
+        "models/lindera/load_config_fallback/config_not_exists.yml",
+    )
+    monkeypatch.setenv("LINDERA_CONFIG_PATH", config_path)
+    with pytest.raises(OSError):
+        ds.create_scalar_index(
+            "text", "INVERTED", base_tokenizer="lindera/load_config_fallback"
+        )
+
+    config_path = os.path.join(
+        os.path.dirname(__file__), "models/lindera/load_config_fallback/config_env.yml"
+    )
+    monkeypatch.setenv("LINDERA_CONFIG_PATH", config_path)
+    ds.create_scalar_index(
+        "text", "INVERTED", base_tokenizer="lindera/load_config_fallback"
+    )
+    results = ds.to_table(
+        full_text_query="成田",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [0]
+
+
+def test_lindera_load_config_priority(tmp_path, lindera_ipadic, monkeypatch):
+    data = pa.table(
+        {
+            "text": [
+                "成田国際空港",
+                "東京国際空港",
+                "羽田空港",
+            ],
+        }
+    )
+    config_path = os.path.join(
+        os.path.dirname(__file__), "models/lindera/load_config_priority/config_env.yml"
+    )
+    monkeypatch.setenv("LINDERA_CONFIG_PATH", config_path)
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text", "INVERTED", base_tokenizer="lindera/load_config_priority"
+    )
+    results = ds.to_table(
+        full_text_query="成田",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [0]
+
+    results = ds.to_table(
+        full_text_query="ほげほげ",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [0]
+
+
 def test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer(
     tmp_path, lindera_ipadic
 ):
-    os.environ["LANCE_LANGUAGE_MODEL_HOME"] = os.path.join(
-        os.path.dirname(__file__), "models"
-    )
     data = pa.table(
         {
             "text": [
@@ -871,6 +1057,18 @@ def test_lindera_ipadic_jp_tokenizer_bin_user_dict(tmp_path, lindera_ipadic):
     )
     ds = lance.write_dataset(data, tmp_path, mode="overwrite")
     ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera/user_dict2")
+    results = ds.to_table(
+        full_text_query="成田",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert len(results) == 0
+    results = ds.to_table(
+        full_text_query="成田国際空港",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [0]
 
 
 def test_jieba_tokenizer(tmp_path):
@@ -980,6 +1178,36 @@ def test_bitmap_remap(tmp_path: Path):
 
 def test_ngram_index(tmp_path: Path):
     """Test create ngram index"""
+
+    def test_with(tbl: pa.Table):
+        dataset = lance.write_dataset(tbl, tmp_path / "dataset", mode="overwrite")
+        dataset.create_scalar_index("words", index_type="NGRAM")
+        indices = dataset.list_indices()
+        assert len(indices) == 1
+        assert indices[0]["type"] == "NGram"
+
+        scan_plan = dataset.scanner(filter="contains(words, 'apple')").explain_plan(
+            True
+        )
+        assert "MaterializeIndex" in scan_plan
+
+        assert dataset.to_table(filter="contains(words, 'apple')").num_rows == 50
+        assert dataset.to_table(filter="contains(words, 'banana')").num_rows == 25
+        assert dataset.to_table(filter="contains(words, 'coconut')").num_rows == 25
+        assert dataset.to_table(filter="contains(words, 'apples')").num_rows == 25
+        assert (
+            dataset.to_table(
+                filter="contains(words, 'apple') AND contains(words, 'banana')"
+            ).num_rows
+            == 0
+        )
+        assert (
+            dataset.to_table(
+                filter="contains(words, 'apple') OR contains(words, 'banana')"
+            ).num_rows
+            == 75
+        )
+
     tbl = pa.Table.from_arrays(
         [
             pa.array(
@@ -988,31 +1216,19 @@ def test_ngram_index(tmp_path: Path):
         ],
         names=["words"],
     )
-    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
-    dataset.create_scalar_index("words", index_type="NGRAM")
-    indices = dataset.list_indices()
-    assert len(indices) == 1
-    assert indices[0]["type"] == "NGram"
+    test_with(tbl)
 
-    scan_plan = dataset.scanner(filter="contains(words, 'apple')").explain_plan(True)
-    assert "MaterializeIndex" in scan_plan
-
-    assert dataset.to_table(filter="contains(words, 'apple')").num_rows == 50
-    assert dataset.to_table(filter="contains(words, 'banana')").num_rows == 25
-    assert dataset.to_table(filter="contains(words, 'coconut')").num_rows == 25
-    assert dataset.to_table(filter="contains(words, 'apples')").num_rows == 25
-    assert (
-        dataset.to_table(
-            filter="contains(words, 'apple') AND contains(words, 'banana')"
-        ).num_rows
-        == 0
+    # Test with large string
+    tbl = pa.Table.from_arrays(
+        [
+            pa.array(
+                [["apple", "apples", "banana", "coconut"][i % 4] for i in range(100)],
+                type=pa.large_string(),
+            )
+        ],
+        names=["words"],
     )
-    assert (
-        dataset.to_table(
-            filter="contains(words, 'apple') OR contains(words, 'banana')"
-        ).num_rows
-        == 75
-    )
+    test_with(tbl)
 
 
 def test_null_handling(tmp_path: Path):
@@ -1275,23 +1491,82 @@ def test_index_prewarm(tmp_path: Path):
     test_table_size = 100
     test_table = pa.table(
         {
-            "fts": ["a" for _ in range(test_table_size)],
+            "fts": ["word" for _ in range(test_table_size)],
         }
     )
 
     # Write index, cache should not be populated
     ds = lance.write_dataset(test_table, tmp_path)
     ds.create_scalar_index("fts", index_type="INVERTED")
-    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback, full_text_query="word"
+    ).to_table()
     assert scan_stats.parts_loaded > 0
 
     # Fresh load, no prewarm, cache should not be populated
     ds = lance.dataset(tmp_path)
-    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback, full_text_query="word"
+    ).to_table()
     assert scan_stats.parts_loaded > 0
 
     # Prewarm index, cache should be populated
     ds = lance.dataset(tmp_path)
     ds.prewarm_index("fts_idx")
-    ds.scanner(scan_stats_callback=scan_stats_callback, full_text_query="a").to_table()
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback, full_text_query="word"
+    ).to_table()
     assert scan_stats.parts_loaded == 0
+
+
+def test_fts_backward_v0_27_0(tmp_path: Path):
+    path = (
+        Path(__file__).parent.parent.parent.parent
+        / "test_data"
+        / "0.27.0"
+        / "legacy_fts_index"
+    )
+    shutil.copytree(path, tmp_path, dirs_exist_ok=True)
+    ds = lance.dataset(tmp_path)
+
+    # we can read the old index
+    results = ds.to_table(
+        full_text_query=BoostQuery(
+            MatchQuery("puppy", "text"),
+            MatchQuery("happy", "text"),
+            negative_boost=0.5,
+        ),
+    )
+    assert results.num_rows == 3
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+        "frodo was a happy puppy",
+    }
+
+    data = pa.table(
+        {
+            "text": [
+                "new data",
+            ]
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="append")
+    ds.optimize.optimize_indices()
+    results = ds.to_table(
+        full_text_query=BoostQuery(
+            MatchQuery("puppy", "text"),
+            MatchQuery("happy", "text"),
+            negative_boost=0.5,
+        ),
+    )
+    assert results.num_rows == 3
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+        "frodo was a happy puppy",
+    }
+    res = ds.to_table(
+        full_text_query="new",
+    )
+    assert res.num_rows == 1

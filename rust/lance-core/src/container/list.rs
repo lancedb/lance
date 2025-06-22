@@ -43,12 +43,9 @@ impl<T> ExpLinkedList<T> {
     /// Creates a new `ExpLinkedList` with a specified capacity limit.
     /// The limit is the maximum capacity of a single node in the list.
     /// If the limit is 0, there is no limit.
-    pub fn with_capacity_limit(limit: u16) -> Self {
-        Self {
-            inner: LinkedList::new(),
-            len: 0,
-            limit,
-        }
+    pub fn with_capacity_limit(mut self, limit: u16) -> Self {
+        self.limit = limit;
+        self
     }
 
     /// Pushes a new element into the list. If the last element in the list
@@ -130,6 +127,10 @@ impl<T> ExpLinkedList<T> {
     pub fn iter(&self) -> ExpLinkedListIter<'_, T> {
         ExpLinkedListIter::new(self)
     }
+
+    pub fn block_iter(&self) -> impl Iterator<Item = &[T]> {
+        self.inner.iter().map(|v| v.as_slice())
+    }
 }
 
 impl<T: DeepSizeOf> DeepSizeOf for ExpLinkedList<T> {
@@ -154,9 +155,21 @@ impl<T> FromIterator<T> for ExpLinkedList<T> {
     }
 }
 
+impl<T> PartialEq for ExpLinkedList<T>
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().zip(other.iter()).all(|(a, b)| a == b)
+    }
+}
+
+impl<T> Eq for ExpLinkedList<T> where T: Eq {}
+
 pub struct ExpLinkedListIter<'a, T> {
     inner: std::collections::linked_list::Iter<'a, Vec<T>>,
     inner_iter: Option<std::slice::Iter<'a, T>>,
+    len: usize,
 }
 
 impl<'a, T> ExpLinkedListIter<'a, T> {
@@ -164,6 +177,7 @@ impl<'a, T> ExpLinkedListIter<'a, T> {
         Self {
             inner: inner.inner.iter(),
             inner_iter: None,
+            len: inner.len(),
         }
     }
 }
@@ -182,6 +196,10 @@ impl<'a, T> Iterator for ExpLinkedListIter<'a, T> {
             return self.next();
         }
         None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
     }
 }
 
@@ -277,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_exp_linked_list_with_capacity_limit() {
-        let mut list = ExpLinkedList::with_capacity_limit(10);
+        let mut list = ExpLinkedList::new().with_capacity_limit(10);
         for i in 0..100 {
             list.push(i);
             assert_eq!(list.len(), i + 1);

@@ -12,7 +12,8 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::StreamExt;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::{ROW_ADDR_FIELD, ROW_ID};
 use lance_table::rowids::RowIdIndex;
 
@@ -26,6 +27,7 @@ use super::utils::InstrumentedRecordBatchStreamAdapter;
 ///
 /// It's generally more efficient to scan the `_rowaddr` column, but this can be
 /// useful when reading secondary indices, which only have the `_rowid` column.
+#[derive(Clone)]
 pub struct AddRowAddrExec {
     input: Arc<dyn ExecutionPlan>,
     dataset: Arc<Dataset>,
@@ -158,6 +160,55 @@ impl AddRowAddrExec {
             Ok(row_ids.clone())
         }
     }
+
+    fn do_execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let index_prereq = self
+            .row_id_index
+            .get_or_init(|| {
+                let dataset = self.dataset.clone();
+                let fut = async move { get_row_id_index(dataset.as_ref()).await };
+                SharedPrerequisite::spawn(fut)
+            })
+            .clone();
+
+        let input_stream = self.input.execute(partition, context)?;
+
+        let rowid_pos = self.rowid_pos;
+        let rowaddr_pos = self.rowaddr_pos;
+        let output_schema = self.output_schema.clone();
+        let stream = input_stream.then(move |batch| {
+            let output_schema = output_schema.clone();
+            let index_prereq = index_prereq.clone();
+            async move {
+                let batch = batch?;
+                index_prereq.wait_ready().await?;
+                let row_id_index = index_prereq.get_ready();
+                let index_ref = row_id_index.as_deref();
+
+                let row_addr = Self::compute_row_addrs(batch.column(rowid_pos), index_ref)?;
+
+                let mut columns = Vec::with_capacity(batch.num_columns() + 1);
+                let existing_columns = batch.columns();
+                columns.extend_from_slice(&existing_columns[..rowaddr_pos]);
+                columns.push(row_addr);
+                columns.extend_from_slice(&existing_columns[rowaddr_pos..]);
+
+                Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+            }
+        });
+
+        let stream = InstrumentedRecordBatchStreamAdapter::new(
+            self.output_schema.clone(),
+            stream.boxed(),
+            partition,
+            &self.metrics,
+        );
+        Ok(Box::pin(stream))
+    }
 }
 
 impl DisplayAs for AddRowAddrExec {
@@ -214,48 +265,11 @@ impl ExecutionPlan for AddRowAddrExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let index_prereq = self
-            .row_id_index
-            .get_or_init(|| {
-                let dataset = self.dataset.clone();
-                let fut = async move { get_row_id_index(dataset.as_ref()).await };
-                SharedPrerequisite::spawn(fut)
-            })
-            .clone();
-
-        let input_stream = self.input.execute(partition, context)?;
-
-        let rowid_pos = self.rowid_pos;
-        let rowaddr_pos = self.rowaddr_pos;
-        let output_schema = self.output_schema.clone();
-        let stream = input_stream.then(move |batch| {
-            let output_schema = output_schema.clone();
-            let index_prereq = index_prereq.clone();
-            async move {
-                let batch = batch?;
-                index_prereq.wait_ready().await?;
-                let row_id_index = index_prereq.get_ready();
-                let index_ref = row_id_index.as_deref();
-
-                let row_addr = Self::compute_row_addrs(batch.column(rowid_pos), index_ref)?;
-
-                let mut columns = Vec::with_capacity(batch.num_columns() + 1);
-                let existing_columns = batch.columns();
-                columns.extend_from_slice(&existing_columns[..rowaddr_pos]);
-                columns.push(row_addr);
-                columns.extend_from_slice(&existing_columns[rowaddr_pos..]);
-
-                Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
-            }
-        });
-
-        let stream = InstrumentedRecordBatchStreamAdapter::new(
-            self.output_schema.clone(),
-            stream.boxed(),
-            partition,
-            &self.metrics,
-        );
-        Ok(Box::pin(stream))
+        let schema = self.schema();
+        let this = self.clone();
+        let stream = futures::stream::once(async move { this.do_execute(partition, context) });
+        let stream = stream.try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
     fn statistics(&self) -> Result<datafusion::physical_plan::Statistics> {

@@ -12,12 +12,12 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Fields};
 use futures::{future::BoxFuture, FutureExt};
+use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_arrow::list::ListArrayExt;
+use lance_core::{cache::LanceCache, Error, Result};
 use log::trace;
 use snafu::location;
 use tokio::task::JoinHandle;
-
-use lance_core::{cache::FileMetadataCache, Error, Result};
 
 use crate::{
     buffer::LanceBuffer,
@@ -329,7 +329,7 @@ async fn indirect_schedule_task(
     items_scheduler: Arc<dyn FieldScheduler>,
     items_type: DataType,
     io: Arc<dyn EncodingsIo>,
-    cache: Arc<FileMetadataCache>,
+    cache: Arc<LanceCache>,
     priority: Box<dyn PriorityRange>,
 ) -> Result<IndirectlyLoaded> {
     let num_offsets = offsets_decoder.num_rows();
@@ -1268,12 +1268,16 @@ impl FieldEncoder for ListFieldEncoder {
 /// The values will have any garbage values removed and will be trimmed
 /// to only include the values that are actually used.
 pub struct ListStructuralEncoder {
+    keep_original_array: bool,
     child: Box<dyn FieldEncoder>,
 }
 
 impl ListStructuralEncoder {
-    pub fn new(child: Box<dyn FieldEncoder>) -> Self {
-        Self { child }
+    pub fn new(keep_original_array: bool, child: Box<dyn FieldEncoder>) -> Self {
+        Self {
+            keep_original_array,
+            child,
+        }
     }
 }
 
@@ -1287,16 +1291,23 @@ impl FieldEncoder for ListStructuralEncoder {
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let values = if let Some(list_arr) = array.as_list_opt::<i32>() {
-            let has_garbage_values =
-                repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned());
+            let has_garbage_values = if self.keep_original_array {
+                repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned())
+            } else {
+                // there is no need to deep copy offsets, because offset buffers will be cast to a common type (i64).
+                repdef.add_offsets(list_arr.offsets().clone(), deep_copy_nulls(array.nulls()))
+            };
             if has_garbage_values {
                 list_arr.filter_garbage_nulls().trimmed_values()
             } else {
                 list_arr.trimmed_values()
             }
         } else if let Some(list_arr) = array.as_list_opt::<i64>() {
-            let has_garbage_values =
-                repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned());
+            let has_garbage_values = if self.keep_original_array {
+                repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned())
+            } else {
+                repdef.add_offsets(list_arr.offsets().clone(), deep_copy_nulls(array.nulls()))
+            };
             if has_garbage_values {
                 list_arr.filter_garbage_nulls().trimmed_values()
             } else {
@@ -1833,8 +1844,19 @@ mod tests {
             .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_empty_lists() {
+    async fn test_empty_lists(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
         // Scenario 1: Some lists are empty
 
         let values = [vec![Some(1), Some(2), Some(3)], vec![], vec![None]];
@@ -1850,15 +1872,21 @@ mod tests {
                 .with_indices(vec![1])
                 .with_indices(vec![0])
                 .with_indices(vec![2])
-                .with_indices(vec![0, 1]);
+                .with_indices(vec![0, 1])
+                .with_file_version(version);
             check_round_trip_encoding_of_data(
                 vec![list_array.clone()],
                 &test_cases,
-                HashMap::new(),
+                field_metadata.clone(),
             )
             .await;
             let test_cases = test_cases.with_batch_size(1);
-            check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+            check_round_trip_encoding_of_data(
+                vec![list_array],
+                &test_cases,
+                field_metadata.clone(),
+            )
+            .await;
         }
 
         // Scenario 2: All lists are empty
@@ -1872,13 +1900,21 @@ mod tests {
         list_builder.append(true);
         let list_array = Arc::new(list_builder.finish());
 
-        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
-        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases, HashMap::new())
-            .await;
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_indices(vec![1])
+            .with_file_version(version);
+        check_round_trip_encoding_of_data(
+            vec![list_array.clone()],
+            &test_cases,
+            field_metadata.clone(),
+        )
+        .await;
         let test_cases = test_cases.with_batch_size(1);
-        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata.clone())
+            .await;
 
-        // Scenario 2: All lists are empty (but now with strings)
+        // Scenario 2B: All lists are empty (but now with strings)
 
         // When encoding a list of empty lists there are no items to encode
         // which is strange and we want to ensure we handle it
@@ -1889,11 +1925,80 @@ mod tests {
         list_builder.append(true);
         let list_array = Arc::new(list_builder.finish());
 
-        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
-        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases, HashMap::new())
-            .await;
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_indices(vec![1])
+            .with_file_version(version);
+        check_round_trip_encoding_of_data(
+            vec![list_array.clone()],
+            &test_cases,
+            field_metadata.clone(),
+        )
+        .await;
         let test_cases = test_cases.with_batch_size(1);
-        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata.clone())
+            .await;
+
+        // Scenario 3: All lists are null
+
+        let items_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append_null();
+        list_builder.append_null();
+        list_builder.append_null();
+        let list_array = Arc::new(list_builder.finish());
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_indices(vec![1])
+            .with_file_version(version);
+        check_round_trip_encoding_of_data(
+            vec![list_array.clone()],
+            &test_cases,
+            field_metadata.clone(),
+        )
+        .await;
+        let test_cases = test_cases.with_batch_size(1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata.clone())
+            .await;
+
+        if version < LanceFileVersion::V2_1 {
+            return;
+        }
+
+        // Scenario 4: All lists are null and inside a struct (only valid for 2.1 since 2.0 doesn't
+        // support null structs)
+        let items_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append_null();
+        list_builder.append_null();
+        list_builder.append_null();
+        let list_array = Arc::new(list_builder.finish());
+
+        let struct_validity = NullBuffer::new(BooleanBuffer::from(vec![true, false, true]));
+        let struct_array = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new(
+                "lists",
+                list_array.data_type().clone(),
+                true,
+            )]),
+            vec![list_array],
+            Some(struct_validity),
+        ));
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_indices(vec![1])
+            .with_file_version(version);
+        check_round_trip_encoding_of_data(
+            vec![struct_array.clone()],
+            &test_cases,
+            field_metadata.clone(),
+        )
+        .await;
+        let test_cases = test_cases.with_batch_size(1);
+        check_round_trip_encoding_of_data(vec![struct_array], &test_cases, field_metadata.clone())
+            .await;
     }
 
     #[test_log::test(tokio::test)]

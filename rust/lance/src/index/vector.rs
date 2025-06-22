@@ -15,9 +15,11 @@ pub mod utils;
 #[cfg(test)]
 mod fixture_test;
 
+use self::{ivf::*, pq::PQIndex};
 use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
+use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
@@ -39,13 +41,12 @@ use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
 use object_store::path::Path;
+use serde::Serialize;
 use snafu::location;
 use tempfile::tempdir;
 use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
-
-use self::{ivf::*, pq::PQIndex};
 
 use super::{pb, DatasetIndexInternalExt, IndexParams};
 use crate::{dataset::Dataset, index::pb::vector_index_stage::Stage, Error, Result};
@@ -64,10 +65,23 @@ pub enum StageParams {
 // The version of the index file.
 // `Legacy` is used for only IVF_PQ index, and is the default value.
 // The other index types are using `V3`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum IndexFileVersion {
     Legacy,
     V3,
+}
+
+impl IndexFileVersion {
+    pub fn try_from(version: &str) -> Result<Self> {
+        match version.to_lowercase().as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "v3" => Ok(Self::V3),
+            _ => Err(Error::Index {
+                message: format!("Invalid index file version: {}", version),
+                location: location!(),
+            }),
+        }
+    }
 }
 
 /// The parameters to build vector index.
@@ -141,6 +155,19 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
+            version: IndexFileVersion::V3,
+        }
+    }
+
+    pub fn ivf_hnsw(
+        distance_type: DistanceType,
+        ivf: IvfBuildParams,
+        hnsw: HnswBuildParams,
+    ) -> Self {
+        let stages = vec![StageParams::Ivf(ivf), StageParams::Hnsw(hnsw)];
+        Self {
+            stages,
+            metric_type: distance_type,
             version: IndexFileVersion::V3,
         }
     }
@@ -234,6 +261,7 @@ pub(crate) async fn build_vector_index(
     name: &str,
     uuid: &str,
     params: &VectorIndexParams,
+    fri: Option<Arc<FragReuseIndex>>,
 ) -> Result<()> {
     let stages = &params.stages;
 
@@ -277,6 +305,7 @@ pub(crate) async fn build_vector_index(
                     Some(ivf_params.clone()),
                     Some(()),
                     (),
+                    fri,
                 )?
                 .build()
                 .await?;
@@ -291,6 +320,7 @@ pub(crate) async fn build_vector_index(
                     Some(ivf_params.clone()),
                     Some(()),
                     (),
+                    fri,
                 )?
                 .build()
                 .await?;
@@ -334,6 +364,7 @@ pub(crate) async fn build_vector_index(
                     Some(ivf_params.clone()),
                     Some(pq_params.clone()),
                     (),
+                    fri,
                 )?
                 .build()
                 .await?;
@@ -361,6 +392,7 @@ pub(crate) async fn build_vector_index(
                         Some(ivf_params.clone()),
                         Some(pq_params.clone()),
                         hnsw_params.clone(),
+                        fri,
                     )?
                     .build()
                     .await?;
@@ -375,6 +407,7 @@ pub(crate) async fn build_vector_index(
                         Some(ivf_params.clone()),
                         Some(sq_params.clone()),
                         hnsw_params.clone(),
+                        fri,
                     )?
                     .build()
                     .await?;
@@ -386,6 +419,21 @@ pub(crate) async fn build_vector_index(
                     });
                 }
             }
+        } else {
+            // without quantization
+            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                dataset.clone(),
+                column.to_owned(),
+                dataset.indices_dir().child(uuid),
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params.clone()),
+                Some(()),
+                hnsw_params.clone(),
+                fri,
+            )?
+            .build()
+            .await?;
         }
     } else {
         return Err(Error::Index {
@@ -409,7 +457,6 @@ pub(crate) async fn remap_vector_index(
     let old_index = dataset
         .open_vector_index(column, &old_uuid.to_string(), &NoOpMetricsCollector)
         .await?;
-    old_index.check_can_remap()?;
 
     if let Some(ivf_index) = old_index.as_any().downcast_ref::<IVFIndex>() {
         remap_index_file(
@@ -449,6 +496,7 @@ pub(crate) async fn open_vector_index(
     uuid: &str,
     vec_idx: &lance_index::pb::VectorIndex,
     reader: Arc<dyn Reader>,
+    fri: Option<Arc<FragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();
 
@@ -490,7 +538,7 @@ pub(crate) async fn open_vector_index(
                     });
                 };
                 let pq = ProductQuantizer::from_proto(pq_proto, metric_type)?;
-                last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
+                last_stage = Some(Arc::new(PQIndex::new(pq, metric_type, fri.clone())));
             }
             Some(Stage::Diskann(_)) => {
                 return Err(Error::Index {
@@ -518,6 +566,7 @@ pub(crate) async fn open_vector_index_v2(
     column: &str,
     uuid: &str,
     reader: FileReader,
+    fri: Option<Arc<FragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let index_metadata = reader
         .schema()

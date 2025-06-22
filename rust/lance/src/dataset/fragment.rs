@@ -70,7 +70,6 @@ pub struct FileFragment {
 const DEFAULT_BATCH_READ_SIZE: u32 = 1024;
 
 /// A trait for file readers to be implemented by both the v1 and v2 readers
-#[async_trait::async_trait]
 #[allow(clippy::len_without_is_empty)]
 pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     /// Reads the requested range of rows from the file, returning as a stream
@@ -176,7 +175,6 @@ impl V1Reader {
     }
 }
 
-#[async_trait::async_trait]
 impl GenericFileReader for V1Reader {
     /// Reads the requested range of rows from the file, returning as a stream
     fn read_range_tasks(
@@ -321,7 +319,6 @@ mod v2_adapter {
         }
     }
 
-    #[async_trait::async_trait]
     impl GenericFileReader for Reader {
         /// Reads the requested range of rows from the file, returning as a stream
         fn read_range_tasks(
@@ -331,7 +328,7 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
             let projection = ReaderProjection::from_field_ids(
-                self.reader.as_ref(),
+                self.reader.metadata().version(),
                 projection.as_ref(),
                 self.field_id_to_column_idx.as_ref(),
             )?;
@@ -357,7 +354,7 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
             let projection = ReaderProjection::from_field_ids(
-                self.reader.as_ref(),
+                self.reader.metadata().version(),
                 projection.as_ref(),
                 self.field_id_to_column_idx.as_ref(),
             )?;
@@ -382,7 +379,7 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
             let projection = ReaderProjection::from_field_ids(
-                self.reader.as_ref(),
+                self.reader.metadata().version(),
                 projection.as_ref(),
                 self.field_id_to_column_idx.as_ref(),
             )?;
@@ -410,7 +407,7 @@ mod v2_adapter {
         ) -> Result<ReadBatchTaskStream> {
             let indices = UInt32Array::from(indices.to_vec());
             let projection = ReaderProjection::from_field_ids(
-                self.reader.as_ref(),
+                self.reader.metadata().version(),
                 projection.as_ref(),
                 self.field_id_to_column_idx.as_ref(),
             )?;
@@ -513,7 +510,6 @@ impl NullReader {
     }
 }
 
-#[async_trait::async_trait]
 impl GenericFileReader for NullReader {
     fn read_range_tasks(
         &self,
@@ -728,7 +724,7 @@ impl FileFragment {
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),
-                &dataset.session.file_metadata_cache,
+                &dataset.metadata_cache,
                 FileReaderOptions::default(),
             )
             .await?;
@@ -908,7 +904,7 @@ impl FileFragment {
                     self.id() as u32,
                     field_id_offset as i32,
                     *max_field_id,
-                    Some(&self.dataset.session.file_metadata_cache),
+                    Some(&self.dataset.metadata_cache),
                 )
                 .await?;
                 let initialized_schema = reader.schema().project_by_schema(
@@ -952,7 +948,7 @@ impl FileFragment {
                     None,
                     Arc::<DecoderPlugins>::default(),
                     file_metadata,
-                    &self.dataset.session.file_metadata_cache,
+                    &self.dataset.metadata_cache,
                     FileReaderOptions::default(),
                 )
                 .await?,
@@ -1326,11 +1322,11 @@ impl FileFragment {
         &self,
         file_scheduler: &FileScheduler,
     ) -> Result<Arc<CachedFileMetadata>> {
-        let cache = &self.dataset.session.file_metadata_cache;
+        let cache = &self.dataset.metadata_cache;
         let path = file_scheduler.reader().path();
 
         let file_metadata = cache
-            .get_or_insert(path, |_path| async {
+            .get_or_insert(path.to_string(), |_path| async {
                 let file_metadata: CachedFileMetadata =
                     v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
                 Ok(file_metadata)

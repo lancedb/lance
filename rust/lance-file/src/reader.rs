@@ -22,7 +22,7 @@ use async_recursion::async_recursion;
 use deepsize::DeepSizeOf;
 use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::*;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
 use lance_io::encodings::dictionary::DictionaryDecoder;
@@ -89,7 +89,7 @@ impl FileReader {
         fragment_id: u32,
         field_id_offset: i32,
         max_field_id: i32,
-        session: Option<&FileMetadataCache>,
+        session: Option<&LanceCache>,
     ) -> Result<Self> {
         let object_reader = object_store.open(path).await?;
 
@@ -117,7 +117,7 @@ impl FileReader {
         fragment_id: u32,
         field_id_offset: i32,
         max_field_id: i32,
-        session: Option<&FileMetadataCache>,
+        session: Option<&LanceCache>,
     ) -> Result<Self> {
         let metadata = match metadata {
             Some(metadata) => metadata,
@@ -125,7 +125,7 @@ impl FileReader {
         };
 
         let page_table = async {
-            Self::load_from_cache(session, path, |_| async {
+            Self::load_from_cache(session, path.to_string(), |_| async {
                 PageTable::load(
                     object_reader.as_ref(),
                     metadata.page_table_position,
@@ -155,9 +155,9 @@ impl FileReader {
 
     pub async fn read_metadata(
         object_reader: &dyn Reader,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Arc<Metadata>> {
-        Self::load_from_cache(cache, object_reader.path(), |_| async {
+        Self::load_from_cache(cache, object_reader.path().to_string(), |_| async {
             let file_size = object_reader.size().await?;
             let begin = if file_size < object_reader.block_size() {
                 0
@@ -184,10 +184,10 @@ impl FileReader {
     /// The page table is cached.
     async fn read_stats_page_table(
         reader: &dyn Reader,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Arc<Option<PageTable>>> {
         // To prevent collisions, we cache this at a child path
-        Self::load_from_cache(cache, &reader.path().child("stats"), |_| async {
+        Self::load_from_cache(cache, reader.path().child("stats").to_string(), |_| async {
             let metadata = Self::read_metadata(reader, cache).await?;
 
             if let Some(stats_meta) = metadata.stats_metadata.as_ref() {
@@ -210,18 +210,18 @@ impl FileReader {
 
     /// Load some metadata about the fragment from the cache, if there is one.
     async fn load_from_cache<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
-        cache: Option<&FileMetadataCache>,
-        path: &Path,
+        cache: Option<&LanceCache>,
+        key: String,
         loader: F,
     ) -> Result<Arc<T>>
     where
-        F: Fn(&Path) -> Fut,
+        F: Fn(&str) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
         if let Some(cache) = cache {
-            cache.get_or_insert(path, loader).await
+            cache.get_or_insert(key, loader).await
         } else {
-            Ok(Arc::new(loader(path).await?))
+            Ok(Arc::new(loader(key.as_str()).await?))
         }
     }
 

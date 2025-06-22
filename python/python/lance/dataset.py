@@ -222,6 +222,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
         storage_options: Optional[Dict[str, str]] = None,
         serialized_manifest: Optional[bytes] = None,
         default_scan_options: Optional[Dict[str, Any]] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -235,6 +236,7 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
             commit_lock,
             storage_options,
             serialized_manifest,
+            metadata_cache_size_bytes=metadata_cache_size_bytes,
         )
         self._default_scan_options = default_scan_options
 
@@ -406,7 +408,8 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
                     "column": <embedding col name>,
                     "q": <query vector as pa.Float32Array>,
                     "k": 10,
-                    "nprobes": 1,
+                    "minimum_nprobes": 20,
+                    "maximum_nprobes": 50,
                     "refine_factor": 1
                 }
 
@@ -645,7 +648,8 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
                     "q": <query vector as pa.Float32Array>,
                     "k": 10,
                     "metric": "cosine",
-                    "nprobes": 1,
+                    "minimum_nprobes": 20,
+                    "maximum_nprobes": 50,
                     "refine_factor": 1
                 }
 
@@ -1809,7 +1813,9 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
             if not pa.types.is_list(field_type):
                 raise TypeError(f"LABEL_LIST index column {column} must be a list")
         elif index_type == "NGRAM":
-            if not pa.types.is_string(field_type):
+            if not pa.types.is_string(field_type) and not pa.types.is_large_string(
+                field_type
+            ):
                 raise TypeError(f"NGRAM index column {column} must be a string")
         elif index_type in ["INVERTED", "FTS"]:
             value_type = field_type
@@ -1944,6 +1950,8 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
             - num_bits
                 The number of bits for PQ (Product Quantization). Default is 8.
                 Only 4, 8 are supported.
+            - index_file_version
+                The version of the index file. Default is "V3".
 
         Optional parameters for `IVF_HNSW_*`:
             max_level
@@ -2065,7 +2073,13 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
         kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
-        valid_index_types = ["IVF_FLAT", "IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
+        valid_index_types = [
+            "IVF_FLAT",
+            "IVF_PQ",
+            "IVF_HNSW_FLAT",
+            "IVF_HNSW_PQ",
+            "IVF_HNSW_SQ",
+        ]
         if index_type not in valid_index_types:
             raise NotImplementedError(
                 f"Only {valid_index_types} index types supported. Got {index_type}"
@@ -2684,6 +2698,31 @@ class LanceDataset(pa.dataset.Dataset): # type: ignore
         """
         self._ds.migrate_manifest_paths_v2()
 
+    def update_config(self, upsert_values: Dict[str, str]) -> None:
+        """
+        Update the dataset configuration.
+
+        This method inserts or updates configuration key-value pairs for the dataset.
+
+        Parameters
+        ----------
+        upsert_values : dict of str to str
+            The configuration items to insert or update.
+            Both keys and values should be strings.
+        """
+        self._ds.update_config(upsert_values)
+
+    def delete_config_keys(self, keys: list[str]) -> None:
+        """Delete specified configuration keys from the dataset.
+
+        Parameters
+        ----------
+        keys : list of str
+            A list of configuration keys to remove from the dataset.
+            Non-existent keys will be silently ignored.
+        """
+        self._ds.delete_config_keys(keys)
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -2750,6 +2789,11 @@ class Index(TypedDict):
     fields: List[str]
     version: int
     fragment_ids: Set[int]
+
+
+class AutoCleanupConfig(TypedDict):
+    interval: int
+    older_than_seconds: int
 
 
 # LanceOperation is a namespace for operations that can be applied to a dataset.
@@ -2952,11 +2996,16 @@ class LanceOperation:
             The fragments that have been updated with new deletion vectors.
         new_fragments: list[FragmentMetadata]
             The fragments that contain the new rows.
+        fields_modified: list[int]
+            If any fields are modified in updated_fragments, then they must be
+            listed here so those fragments can be removed from indices covering
+            those fields.
         """
 
         removed_fragment_ids: List[int]
         updated_fragments: List[FragmentMetadata]
         new_fragments: List[FragmentMetadata]
+        fields_modified: List[int]
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -3094,6 +3143,8 @@ class LanceOperation:
         fields: List[int]
         dataset_version: int
         fragment_ids: Set[int]
+        index_version: int
+        created_at: Optional[datetime] = None
 
     @dataclass
     class DataReplacementGroup:
@@ -3396,6 +3447,8 @@ class ScannerBuilder:
         k: Optional[int] = None,
         metric: Optional[str] = None,
         nprobes: Optional[int] = None,
+        minimum_nprobes: Optional[int] = None,
+        maximum_nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
@@ -3429,6 +3482,26 @@ class ScannerBuilder:
             raise ValueError(f"Nearest-K must be > 0 but got {k}")
         if nprobes is not None and int(nprobes) <= 0:
             raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
+        if minimum_nprobes is not None and int(minimum_nprobes) < 0:
+            raise ValueError(f"Minimum nprobes must be >= 0 but got {minimum_nprobes}")
+        if maximum_nprobes is not None and int(maximum_nprobes) < 0:
+            raise ValueError(f"Maximum nprobes must be >= 0 but got {maximum_nprobes}")
+
+        if nprobes is not None:
+            if minimum_nprobes is not None or maximum_nprobes is not None:
+                raise ValueError(
+                    "nprobes cannot be set in combination with minimum_nprobes or "
+                    "maximum_nprobes"
+                )
+            else:
+                minimum_nprobes = nprobes
+                maximum_nprobes = nprobes
+        if (
+            minimum_nprobes is not None
+            and maximum_nprobes is not None
+            and minimum_nprobes > maximum_nprobes
+        ):
+            raise ValueError("minimum_nprobes must be <= maximum_nprobes")
         if refine_factor is not None and int(refine_factor) < 1:
             raise ValueError(f"Refine factor must be 1 or more got {refine_factor}")
         if ef is not None and int(ef) <= 0:
@@ -3440,7 +3513,8 @@ class ScannerBuilder:
             "q": q,
             "k": k,
             "metric": metric,
-            "nprobes": nprobes,
+            "minimum_nprobes": minimum_nprobes,
+            "maximum_nprobes": maximum_nprobes,
             "refine_factor": refine_factor,
             "use_index": use_index,
             "ef": ef,
@@ -3789,6 +3863,29 @@ class DatasetOptimizer:
         """
         self._dataset._ds.optimize_indices(**kwargs)
 
+    def enable_auto_cleanup(self, auto_cleanup_config: AutoCleanupConfig, **kwargs):
+        """Enable autocleaning for an existing dataset.
+
+        Parameters
+        ----------
+        auto_cleanup_config: AutoCleanupConfig
+            Config options for automatic cleanup of the dataset.
+            If set, dataset's old versions will be automatically
+            cleaned up according to this parameter.
+        """
+        self._dataset._ds.update_config(
+            {
+                "lance.auto_cleanup.interval": str(auto_cleanup_config["interval"]),
+                "lance.auto_cleanup.older_than": f"{auto_cleanup_config['older_than_seconds']}s",  # noqa E501
+            }
+        )
+
+    def disable_auto_cleanup(self, **kwargs):
+        """Disable autocleaning via delete related keys."""
+        self._dataset._ds.delete_config_keys(
+            ["lance.auto_cleanup.interval", "lance.auto_cleanup.older_than"]
+        )
+
 
 class Tags:
     """
@@ -3808,6 +3905,40 @@ class Tags:
             A dictionary mapping tag names to version numbers.
         """
         return self._ds.tags()
+
+    def get_version(self, tag: str) -> Optional[int]:
+        """
+        Get the version of a specific tag by name.
+
+        Parameters
+        ----------
+        tag: str
+            The name of the tag to retrieve.
+
+        Returns
+        -------
+        int or None
+            The version number of the tag if it exists, otherwise None.
+        """
+        return self._ds.get_version(tag)
+
+    def list_ordered(self, order: Optional[str] = None) -> list[str, Tag]:
+        """
+        List all dataset tags.
+
+        Parameters
+        ----------
+        order: str, optional
+            The order in which to return the tags.
+            "asc" or "desc" can be used to specify the order explicitly.
+            default 'desc'.
+
+        Returns
+        -------
+        list[str, Tag]
+            An ordered list of tuples mapping tag names to its `Tag` metadata.
+        """
+        return self._ds.tags_ordered(order)
 
     def create(self, tag: str, version: int) -> None:
         """
@@ -3923,6 +4054,7 @@ def write_dataset(
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
     enable_move_stable_row_ids: bool = False,
+    auto_cleanup_options: Optional[AutoCleanupConfig] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -3981,6 +4113,17 @@ def write_dataset(
         These row ids are stable after compaction operations, but not after updates.
         This makes compaction more efficient, since with stable row ids no
         secondary indices need to be updated to point to new row ids.
+    auto_cleanup_options: optional, AutoCleanupConfig
+        Config options for automatic cleanup of the dataset.
+        If set, and this is a new dataset, old dataset versions will be automatically
+        cleaned up according to this parameter.
+        To add autocleaning to an existing dataset, use Dataset::update_config to set
+        lance.auto_cleanup.interval and lance.auto_cleanup.older_than.
+        Both parameters must be set to invoke autocleaning.
+        If you do not set this parameter(default behavior),
+        then no autocleaning will be performed.
+        Note: this option only takes effect when creating a new dataset,
+        it has no effect on existing datasets.
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -4015,6 +4158,7 @@ def write_dataset(
         "data_storage_version": data_storage_version,
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
         "enable_move_stable_row_ids": enable_move_stable_row_ids,
+        "auto_cleanup_options": auto_cleanup_options,
     }
 
     if commit_lock:

@@ -58,7 +58,7 @@ jobs:
           echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
       - uses: auguwu/clippy-action@1.4.0
         with:
-          check-args: --locked --features ${{ env.ALL_FEATURES }} --tests --benches
+          check-args: --locked --features ${{ env.ALL_FEATURES }} --tests --benches --examples
           token: ${{secrets.GITHUB_TOKEN}}
           deny: warnings
   cargo-deny:
@@ -155,12 +155,19 @@ jobs:
       CC: clang
       CXX: clang++
     steps:
+      # Remove not needed tools from runner
+      - uses: easimon/maximize-build-space@v10
+        with:
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
+          remove-docker-images: true
       - uses: actions/checkout@v4
       # Remote cargo.lock to force a fresh build
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
       - uses: rui314/setup-mold@v1
-      - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: |
           sudo apt update

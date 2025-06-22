@@ -15,6 +15,7 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.file.LanceFileReader;
 import com.lancedb.lance.file.LanceFileWriter;
+import com.lancedb.lance.util.Range;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -32,6 +33,9 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -89,7 +93,7 @@ public class FileReaderWriterTest {
     assertEquals(100, reader.numRows());
     assertEquals(expectedSchema, reader.schema());
 
-    try (ArrowReader batches = reader.readAll(100)) {
+    try (ArrowReader batches = reader.readAll(null, null, 100)) {
       assertTrue(batches.loadNextBatch());
       VectorSchemaRoot batch = batches.getVectorSchemaRoot();
       assertEquals(100, batch.getRowCount());
@@ -97,7 +101,7 @@ public class FileReaderWriterTest {
       assertFalse(batches.loadNextBatch());
     }
 
-    try (ArrowReader batches = reader.readAll(15)) {
+    try (ArrowReader batches = reader.readAll(null, null, 15)) {
       for (int i = 0; i < 100; i += 15) {
         int expected = Math.min(15, 100 - i);
         assertTrue(batches.loadNextBatch());
@@ -124,6 +128,78 @@ public class FileReaderWriterTest {
   }
 
   @Test
+  void testReadWithProjection() throws Exception {
+    BufferAllocator allocator = new RootAllocator();
+    String filePath = tempDir.resolve("basic_read.lance").toString();
+    createSimpleFile(filePath);
+    LanceFileReader reader = LanceFileReader.open(filePath, allocator);
+
+    Schema expectedSchema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("x", new ArrowType.Int(64, true)),
+                Field.nullable("y", new ArrowType.Utf8())),
+            null);
+
+    assertEquals(100, reader.numRows());
+    assertEquals(expectedSchema, reader.schema());
+
+    try (ArrowReader batches = reader.readAll(Collections.singletonList("x"), null, 100)) {
+      assertTrue(batches.loadNextBatch());
+      VectorSchemaRoot batch = batches.getVectorSchemaRoot();
+      assertEquals(100, batch.getRowCount());
+      assertEquals(1, batch.getSchema().getFields().size());
+      assertEquals("x", batch.getSchema().getFields().get(0).getName());
+      assertFalse(batches.loadNextBatch());
+    }
+
+    try (ArrowReader batches = reader.readAll(Collections.singletonList("y"), null, 100)) {
+      assertTrue(batches.loadNextBatch());
+      VectorSchemaRoot batch = batches.getVectorSchemaRoot();
+      assertEquals(100, batch.getRowCount());
+      assertEquals(1, batch.getSchema().getFields().size());
+      assertEquals("y", batch.getSchema().getFields().get(0).getName());
+      assertFalse(batches.loadNextBatch());
+    }
+
+    try (ArrowReader batches =
+        reader.readAll(
+            null, Arrays.asList(Range.of(1, 11), Range.of(14, 19), Range.of(20, 21)), 100)) {
+      assertTrue(batches.loadNextBatch());
+      VectorSchemaRoot batch = batches.getVectorSchemaRoot();
+      assertEquals(16, batch.getRowCount());
+      assertEquals(2, batch.getSchema().getFields().size());
+      assertFalse(batches.loadNextBatch());
+    }
+
+    try (ArrowReader batches =
+        reader.readAll(
+            Collections.singletonList("x"),
+            Arrays.asList(Range.of(23, 25), Range.of(27, 29)),
+            100)) {
+      assertTrue(batches.loadNextBatch());
+      VectorSchemaRoot batch = batches.getVectorSchemaRoot();
+      assertEquals(4, batch.getRowCount());
+      assertEquals(1, batch.getSchema().getFields().size());
+      assertFalse(batches.loadNextBatch());
+    }
+
+    try (ArrowReader batches =
+        reader.readAll(
+            Collections.singletonList("y"),
+            Arrays.asList(Range.of(23, 25), Range.of(27, 29)),
+            100)) {
+      assertTrue(batches.loadNextBatch());
+      VectorSchemaRoot batch = batches.getVectorSchemaRoot();
+      assertEquals(4, batch.getRowCount());
+      assertEquals(1, batch.getSchema().getFields().size());
+      assertFalse(batches.loadNextBatch());
+    }
+
+    reader.close();
+  }
+
+  @Test
   void testBasicWrite() throws Exception {
     String filePath = tempDir.resolve("basic_write.lance").toString();
     createSimpleFile(filePath);
@@ -141,6 +217,27 @@ public class FileReaderWriterTest {
       fail("Expected IllegalArgumentException to be thrown");
     } catch (IllegalArgumentException e) {
       assertTrue(e.getMessage().contains("no data provided"));
+    }
+  }
+
+  @Test
+  void testWriteWithStorage() {
+    String filePath = "az://fail_bucket" + tempDir.resolve("test_write_with_storage");
+    BufferAllocator allocator = new RootAllocator();
+    Map<String, String> storageOptions = new HashMap<>();
+    try {
+      LanceFileWriter.open(filePath, allocator, null, storageOptions);
+    } catch (IOException e) {
+      assertTrue(e.getMessage().contains("Account must be specified"));
+    }
+
+    storageOptions.put("account_name", "some_account");
+    storageOptions.put("account_key", "some_key");
+    try {
+      // Verify the config in storage options is worked. The message will change.
+      LanceFileWriter.open(filePath, allocator, null, storageOptions);
+    } catch (IOException e) {
+      assertTrue(e.getMessage().contains("Invalid Access Key"));
     }
   }
 
