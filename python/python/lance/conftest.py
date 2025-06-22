@@ -4,7 +4,7 @@
 import os
 
 import numpy.random
-import pytest
+import pytest  # type: ignore
 
 # Make sure we have a consistent seed
 numpy.random.seed(42)

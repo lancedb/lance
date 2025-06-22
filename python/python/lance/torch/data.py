@@ -250,7 +250,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         super().__init__()
         if isinstance(dataset, (str, Path)):
             dataset_options = dataset_options or {}
-            dataset = lance.dataset(dataset, **dataset_options)
+            dataset = lance.dataset(dataset, **dataset_options)  # type: ignore
         self.dataset = dataset
         self.columns = columns
         self.batch_size = batch_size
@@ -404,7 +404,7 @@ class SafeLanceDataset(torch.utils.data.Dataset):
 
     def _safe_preload(self):
         """Main-process safe metadata loading"""
-        ds = lance.dataset(self.uri, **self.dataset_options)
+        ds = lance.dataset(self.uri, **self.dataset_options)  # type: ignore
         length = ds.count_rows()
         del ds
         return length
@@ -428,7 +428,7 @@ class SafeLanceDataset(torch.utils.data.Dataset):
             # Worker-process initialization
             import os
 
-            self._ds = lance.dataset(self.uri)
+            self._ds = lance.dataset(self.uri)  # type: ignore
             print(f"Worker {os.getpid()} initialized dataset")
 
         # Leverage native batch reading

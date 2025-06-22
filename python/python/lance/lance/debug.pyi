@@ -3,8 +3,8 @@
 
 from typing import List
 
-from lance import LanceDataset
-from lance.fragment import FragmentMetadata
+from lance import LanceDataset  # type: ignore
+from lance.fragment import FragmentMetadata  # type: ignore
 
 def format_schema(dataset: LanceDataset) -> str:
     pass

@@ -49,7 +49,7 @@ def execute_fragment_operation(
 
 
 def add_columns(
-    dataset: lance.LanceDataset,
+    dataset: lance.LanceDataset,  # type: ignore
     column_generator: RecordBatchTransformer,
     source_columns: List[str],
 ) -> None:

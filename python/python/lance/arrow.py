@@ -302,7 +302,7 @@ class EncodedImageArray(ImageArray):
         def pillow_metadata_decoder(images):
             import io
 
-            from PIL import Image
+            from PIL import Image  # type: ignore
 
             img = Image.open(io.BytesIO(images[0].as_py()))
             return img
@@ -373,7 +373,7 @@ class EncodedImageArray(ImageArray):
             def pillow_decoder(images):
                 import io
 
-                from PIL import Image
+                from PIL import Image  # type: ignore
 
                 return np.stack(
                     [Image.open(io.BytesIO(img)) for img in images.to_pylist()]  # type: ignore
@@ -482,7 +482,7 @@ class FixedShapeImageTensorArray(ImageArray):
         def pillow_encoder(x):
             import io
 
-            from PIL import Image
+            from PIL import Image  # type: ignore
 
             encoded_images = []
             for y in x:

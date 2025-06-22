@@ -44,7 +44,7 @@ __all__ = [
 
 
 def _efficient_sample(
-    dataset: lance.LanceDataset,
+    dataset: lance.LanceDataset,  # type: ignore
     n: int,
     columns: Optional[Union[List[str], Dict[str, str]]],
     batch_size: int,
@@ -117,7 +117,7 @@ def _efficient_sample(
 
 
 def _filtered_efficient_sample(
-    dataset: lance.LanceDataset,
+    dataset: lance.LanceDataset,  # type: ignore
     n: int,
     columns: List[str],
     batch_size: int,
@@ -169,7 +169,7 @@ def _filtered_efficient_sample(
 
 
 def maybe_sample(
-    dataset: Union[str, Path, lance.LanceDataset],
+    dataset: Union[str, Path, lance.LanceDataset],  # type: ignore
     n: int,
     columns: Union[list[str], str],
     batch_size: int = 10240,
@@ -204,14 +204,14 @@ def maybe_sample(
         A generator that yields [RecordBatch] of data.
     """
     if isinstance(dataset, (str, Path)):
-        dataset = lance.dataset(dataset)
+        dataset = lance.dataset(dataset)  # type: ignore
 
     if isinstance(columns, str):
         columns = [columns]
 
-    if n >= len(dataset):
+    if n >= len(dataset):  # type: ignore
         # Dont have enough data in the dataset. Just do a full scan
-        yield from dataset.to_batches(
+        yield from dataset.to_batches(  # type: ignore
             columns=columns, batch_size=batch_size, filter=filt
         )
     elif filt is not None:
@@ -221,11 +221,11 @@ def maybe_sample(
     elif n > max_takes:
         yield from _efficient_sample(dataset, n, columns, batch_size, max_takes)
     else:
-        choices = np.random.choice(len(dataset), n, replace=False)
+        choices = np.random.choice(len(dataset), n, replace=False)  # type: ignore
         idx = 0
         while idx < len(choices):
             end = min(idx + batch_size, len(choices))
-            tbl = dataset.take(choices[idx:end], columns=columns).combine_chunks()
+            tbl = dataset.take(choices[idx:end], columns=columns).combine_chunks()  # type: ignore
             yield tbl.to_batches()[0]
             idx += batch_size
 
@@ -267,7 +267,7 @@ class Sampler(ABC):
     @abstractmethod
     def __call__(
         self,
-        ds: lance.LanceDataset,
+        ds: lance.LanceDataset,  # type: ignore
         *args,
         batch_size: int = 128,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
@@ -289,7 +289,7 @@ class FragmentSampler(Sampler):
 
     def __call__(
         self,
-        dataset: lance.LanceDataset,
+        dataset: lance.LanceDataset,  # type: ignore
         *args,
         batch_size: int = 128,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
@@ -311,8 +311,11 @@ class FragmentSampler(Sampler):
 
     @abstractmethod
     def iter_fragments(
-        self, ds: lance.LanceDataset, *args, **kwargs
-    ) -> Generator[lance.LanceFragment, None, None]:
+        self,
+        ds: lance.LanceDataset,
+        *args,
+        **kwargs,  # type: ignore
+    ) -> Generator[lance.LanceFragment, None, None]:  # type: ignore
         """Iterate over data fragments."""
         pass
 
@@ -321,8 +324,10 @@ class FullScanSampler(FragmentSampler):
     """Default Sampler, which scan the entire dataset sequentially."""
 
     def iter_fragments(
-        self, dataset: lance.LanceDataset, **kwargs
-    ) -> Generator[lance.LanceFragment, None, None]:
+        self,
+        dataset: lance.LanceDataset,
+        **kwargs,  # type: ignore
+    ) -> Generator[lance.LanceFragment, None, None]:  # type: ignore
         for fragment in dataset.get_fragments():
             yield fragment
 
@@ -374,8 +379,10 @@ class ShardedFragmentSampler(FragmentSampler):
         return ShardedFragmentSampler(rank, world_size, randomize=randomize, seed=seed)
 
     def iter_fragments(
-        self, dataset: lance.LanceDataset, **kwargs
-    ) -> Generator[lance.LanceFragment, None, None]:
+        self,
+        dataset: lance.LanceDataset,
+        **kwargs,  # type: ignore
+    ) -> Generator[lance.LanceFragment, None, None]:  # type: ignore
         fragments = dataset.get_fragments()
         if self._randomize:
             random.seed(self._seed)
@@ -438,7 +445,7 @@ class ShardedBatchSampler(Sampler):
     # rows (where N is the world size)
     def _shard_scan(
         self,
-        dataset: lance.LanceDataset,
+        dataset: lance.LanceDataset,  # type: ignore
         batch_size: int,
         columns: Optional[Union[List[str], Dict[str, str]]],
         batch_readahead: int,
@@ -489,7 +496,7 @@ class ShardedBatchSampler(Sampler):
 
     def _sample_filtered(
         self,
-        dataset: lance.LanceDataset,
+        dataset: lance.LanceDataset,  # type: ignore
         batch_size: int,
         columns: Optional[Union[List[str], Dict[str, str]]],
         batch_readahead: int,
@@ -529,7 +536,7 @@ class ShardedBatchSampler(Sampler):
 
     def _sample_all(
         self,
-        dataset: lance.LanceDataset,
+        dataset: lance.LanceDataset,  # type: ignore
         batch_size: int,
         columns: Optional[List[str]],
         batch_readahead: int,
@@ -557,7 +564,7 @@ class ShardedBatchSampler(Sampler):
 
     def __call__(
         self,
-        dataset: lance.LanceDataset,
+        dataset: lance.LanceDataset,  # type: ignore
         *args,
         batch_size: int = 128,
         columns: Optional[List[str]] = None,

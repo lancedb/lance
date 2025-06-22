@@ -78,7 +78,7 @@ class ShardedBatchIterator:
         self._batch_readahead = batch_readahead
 
         self._ds: LanceDataset = (
-            data if isinstance(data, LanceDataset) else lance.dataset(data)
+            data if isinstance(data, LanceDataset) else lance.dataset(data)  # type: ignore
         )
 
     @staticmethod

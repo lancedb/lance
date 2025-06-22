@@ -19,8 +19,8 @@ from typing import (
 
 import pyarrow as pa
 
-import lance
-from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, FragmentMetadata, write_fragments
+import lance  # type: ignore
+from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, FragmentMetadata, write_fragments  # type: ignore
 
 from ..dependencies import ray
 
@@ -126,27 +126,26 @@ class _BaseLanceDatasink(ray.data.Datasink):
 
     def on_write_start(self):
         if self.mode == "append":
-            ds = lance.LanceDataset(self.uri, storage_options=self.storage_options)
+            ds = lance.LanceDataset(self.uri, storage_options=self.storage_options)  # type: ignore
             self.read_version = ds.version
             if self.schema is None:
                 self.schema = ds.schema
 
     def on_write_complete(
         self,
-        write_results: List[List[Tuple[str, str]]],
+        write_result: List[List[Tuple[str, str]]],
     ):
         import warnings
 
-        if not write_results:
+        if not write_result:
             warnings.warn(
                 "write_results is empty.",
                 DeprecationWarning,
             )
             return
         if (
-            not isinstance(write_results, list)
-            or not isinstance(write_results[0], list)
-        ) and not hasattr(write_results, "write_returns"):
+            not isinstance(write_result, list) or not isinstance(write_result[0], list)
+        ) and not hasattr(write_result, "write_returns"):
             warnings.warn(
                 "write_results type is wrong. please check version, "
                 "upgrade or downgrade your ray version. ray versions >= 2.38 "
@@ -156,10 +155,10 @@ class _BaseLanceDatasink(ray.data.Datasink):
                 DeprecationWarning,
             )
             return
-        if hasattr(write_results, "write_returns"):
-            write_results = getattr(write_results, "write_returns")
+        if hasattr(write_result, "write_returns"):
+            write_results = getattr(write_result, "write_returns")
 
-        if len(write_results) == 0:
+        if len(write_result) == 0:
             warnings.warn(
                 "write results is empty. please check ray version or internal error",
                 DeprecationWarning,
@@ -168,7 +167,7 @@ class _BaseLanceDatasink(ray.data.Datasink):
 
         fragments = []
         schema = None
-        for batch in write_results:
+        for batch in write_result:
             for fragment_str, schema_str in batch:
                 fragment = pickle.loads(fragment_str)  # type: ignore
                 fragments.append(fragment)
@@ -178,10 +177,10 @@ class _BaseLanceDatasink(ray.data.Datasink):
         if not schema:
             return
         if self.mode in set(["create", "overwrite"]):
-            op = lance.LanceOperation.Overwrite(schema, fragments)
+            op = lance.LanceOperation.Overwrite(schema, fragments)  # type: ignore
         elif self.mode == "append":
-            op = lance.LanceOperation.Append(fragments)
-        lance.LanceDataset.commit(
+            op = lance.LanceOperation.Append(fragments)  # type: ignore
+        lance.LanceDataset.commit(  # type: ignore
             self.uri,
             op,  # type: ignore
             read_version=self.read_version,
@@ -276,7 +275,7 @@ class LanceDatasink(_BaseLanceDatasink):
     def write(
         self,
         blocks: Iterable[Union[pa.Table, "pd.DataFrame"]],
-        _ctx,
+        ctx,
     ):
         fragments_and_schema = _write_fragment(
             blocks,
@@ -403,7 +402,7 @@ class LanceCommitter(_BaseLanceDatasink):
     def write(
         self,
         blocks: Iterable[Union[pa.Table, "pd.DataFrame"]],
-        _ctx,
+        ctx,
     ):
         """Passthrough the fragments to commit phase"""
         v = []
@@ -495,4 +494,4 @@ def _register_hooks():
         .write_lance("~/data.lance")
     ```
     """
-    ray.data.Dataset.write_lance = write_lance
+    ray.data.Dataset.write_lance = write_lance  # type: ignore

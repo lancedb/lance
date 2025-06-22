@@ -14,9 +14,9 @@
 
 from typing import List
 
-from lance import LanceDataset
-from lance.fragment import FragmentMetadata
-from lance.optimize import CompactionOptions
+from lance import LanceDataset  # type: ignore
+from lance.fragment import FragmentMetadata  # type: ignore
+from lance.optimize import CompactionOptions  # type: ignore
 
 class CompactionMetrics:
     fragments_removed: int

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import numpy as np
 import pyarrow as pa
 
-from lance import LanceFragment
+from lance import LanceFragment  # type: ignore
 from lance.file import LanceFileReader, LanceFileWriter
 
 from .lance import indices
