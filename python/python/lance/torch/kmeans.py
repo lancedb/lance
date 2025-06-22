@@ -162,7 +162,7 @@ class KMeans:
         for i in tqdm(range(self.max_iters)):
             try:
                 self.total_distance = self._fit_once(
-                    data, # type: ignore
+                    data,  # type: ignore
                     i,
                     last_dist=self.total_distance,
                     column=column,  # type: ignore
@@ -231,7 +231,7 @@ class KMeans:
         # Use float32 to accumulate centroids, esp. if the vectors are
         # float16 / bfloat16 types.
         new_centroids = torch.zeros_like(
-            self.centroids, # type: ignore
+            self.centroids,  # type: ignore
             device=self.device,
             dtype=torch.float32,  # type: ignore
         )

@@ -370,7 +370,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
             if self._to_tensor_fn is not None:
                 batch = self._to_tensor_fn(
                     batch,
-                    hf_converter=self._hf_converter, # type: ignore
+                    hf_converter=self._hf_converter,  # type: ignore
                     use_blob_api=use_blob_api,  # type: ignore
                 )
             yield batch

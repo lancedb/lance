@@ -659,7 +659,7 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
         yield from batches
 
     @staticmethod
-    def from_torch( # type: ignore[reportIncompatibleMethodOverride]
+    def from_torch(  # type: ignore[reportIncompatibleMethodOverride]
         total_num_rows: int, batch_size: int, randomize: bool = False, seed: int = 0
     ) -> ShardedFixedBatchSampler:
         import torch
@@ -667,5 +667,10 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         return ShardedFixedBatchSampler(
-            rank, world_size, total_num_rows=total_num_rows, batch_size=batch_size, randomize=randomize, seed=seed
+            rank,
+            world_size,
+            total_num_rows=total_num_rows,
+            batch_size=batch_size,
+            randomize=randomize,
+            seed=seed,
         )
