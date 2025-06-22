@@ -156,7 +156,7 @@ class _BaseLanceDatasink(ray.data.Datasink):
             )
             return
         if hasattr(write_result, "write_returns"):
-            write_results = getattr(write_result, "write_returns")
+            write_result = getattr(write_result, "write_returns")
 
         if len(write_result) == 0:
             warnings.warn(
