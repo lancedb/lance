@@ -48,7 +48,7 @@ class BlobColumn:
 
         self.blob_column = blob_column
 
-    def __iter__(self) -> Iterator[IO[bytes] | None]:
+    def __iter__(self) -> Iterator[Optional[IO[bytes]]]:
         return BlobIterator(iter(self.blob_column))
 
 
