@@ -225,7 +225,12 @@ impl LanceFilter {
                 let schema = Arc::new(ArrowSchema::from(full_schema));
                 let planner = Planner::new(schema);
                 let filter = planner.parse_filter(sql)?;
-                planner.optimize_expr(filter)
+                planner.optimize_expr(filter).map_err(|e| {
+                    Error::invalid_input(
+                        format!("Error optimizing sql filter: {sql} ({e})"),
+                        location!(),
+                    )
+                })
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
@@ -236,7 +241,12 @@ impl LanceFilter {
                     .now_or_never()
                     .expect("could not parse the Substrait filter in a synchronous fashion")?;
                 let planner = Planner::new(schema);
-                planner.optimize_expr(expr)
+                planner.optimize_expr(expr.clone()).map_err(|e| {
+                    Error::invalid_input(
+                        format!("Error optimizing substrait filter: {expr:?} ({e})"),
+                        location!(),
+                    )
+                })
             }
             #[cfg(not(feature = "substrait"))]
             Self::Substrait(_) => {
