@@ -1264,23 +1264,24 @@ impl MergeInsertJob {
         let merge_insert_exec = plan
             .as_any()
             .downcast_ref::<exec::FullSchemaMergeInsertExec>()
-            .ok_or_else(|| {
-                Error::invalid_input("Expected FullSchemaMergeInsertExec", location!())
+            .ok_or_else(|| Error::Internal {
+                message: "Expected FullSchemaMergeInsertExec".into(),
+                location: location!(),
             })?;
 
-        let stats = merge_insert_exec.merge_stats().ok_or_else(|| {
-            Error::invalid_input(
-                "Merge stats not available - execution may not have completed",
-                location!(),
-            )
-        })?;
+        let stats = merge_insert_exec
+            .merge_stats()
+            .ok_or_else(|| Error::Internal {
+                message: "Merge stats not available - execution may not have completed".into(),
+                location: location!(),
+            })?;
 
-        let transaction = merge_insert_exec.transaction().ok_or_else(|| {
-            Error::invalid_input(
-                "Transaction not available - execution may not have completed",
-                location!(),
-            )
-        })?;
+        let transaction = merge_insert_exec
+            .transaction()
+            .ok_or_else(|| Error::Internal {
+                message: "Transaction not available - execution may not have completed".into(),
+                location: location!(),
+            })?;
 
         let affected_rows = merge_insert_exec.affected_rows().map(RowIdTreeMap::from);
 
@@ -1774,10 +1775,11 @@ mod tests {
     use crate::{
         dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
         session::Session,
-        utils::test::{DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper},
+        utils::test::{
+            assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount,
+            ThrottledStoreWrapper,
+        },
     };
-
-    use crate::dataset::scanner::tests::assert_plan_node_equals;
 
     use super::*;
 
