@@ -137,14 +137,16 @@ impl DatasetPreFilter {
                 .await
         }
 
-        let cache_key = format!("row_id_mask/{}", dataset.manifest().version);
-
+        let dataset_clone = dataset.clone();
+        let key = crate::session::RowIdMaskKey {
+            version: dataset.manifest().version,
+        };
         dataset
             .metadata_cache
-            .clone()
-            .get_or_insert(cache_key, move |_| {
+            .as_ref()
+            .get_or_insert_with_key(key, move || {
                 async move {
-                    let row_ids_and_deletions = load_row_ids_and_deletions(&dataset).await?;
+                    let row_ids_and_deletions = load_row_ids_and_deletions(&dataset_clone).await?;
 
                     // The process of computing the final mask is CPU-bound, so we spawn it
                     // on a blocking thread.

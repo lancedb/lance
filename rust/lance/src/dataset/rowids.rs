@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::Dataset;
+use crate::session::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use snafu::location;
@@ -18,26 +19,34 @@ pub async fn load_row_id_sequence(
     fragment: &Fragment,
 ) -> Result<Arc<RowIdSequence>> {
     // Virtual path to prevent collisions in the cache.
-    let path = dataset.base.child(fragment.id.to_string()).child("row_ids");
     match &fragment.row_id_meta {
         None => Err(Error::Internal {
             message: "Missing row id meta".into(),
             location: location!(),
         }),
         Some(RowIdMeta::Inline(data)) => {
+            let data = data.clone();
+            let key = RowIdSequenceKey {
+                fragment_id: fragment.id,
+            };
             dataset
                 .metadata_cache
-                .get_or_insert(path.to_string(), |_path| async { read_row_ids(data) })
+                .get_or_insert_with_key(key, || async move { read_row_ids(&data) })
                 .await
         }
         Some(RowIdMeta::External(file_slice)) => {
+            let file_slice = file_slice.clone();
+            let dataset_clone = dataset.clone();
+            let key = RowIdSequenceKey {
+                fragment_id: fragment.id,
+            };
             dataset
                 .metadata_cache
-                .get_or_insert(path.to_string(), |_path| async {
-                    let path = dataset.base.child(file_slice.path.as_str());
+                .get_or_insert_with_key(key, || async move {
+                    let path = dataset_clone.base.child(file_slice.path.as_str());
                     let range = file_slice.offset as usize
                         ..(file_slice.offset as usize + file_slice.size as usize);
-                    let data = dataset
+                    let data = dataset_clone
                         .object_store
                         .open(&path)
                         .await?
@@ -69,12 +78,12 @@ pub async fn get_row_id_index(
     dataset: &Dataset,
 ) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
     if dataset.manifest.uses_move_stable_row_ids() {
-        let cache_key = format!("row_id_index/{}", dataset.manifest.version);
+        let key = RowIdIndexKey {
+            version: dataset.manifest.version,
+        };
         let index = dataset
             .metadata_cache
-            .get_or_insert(cache_key, |_path| async {
-                load_row_id_index(dataset).await
-            })
+            .get_or_insert_with_key(key, || load_row_id_index(dataset))
             .await?;
         Ok(Some(index))
     } else {

@@ -83,7 +83,13 @@ impl LanceIndexStoreExt for LanceIndexStore {
         Self::new(
             dataset.object_store.clone(),
             index_dir,
-            dataset.metadata_cache.clone(),
+            Arc::new(
+                dataset
+                    .metadata_cache
+                    .file_metadata_cache("lance_index")
+                    .as_lance_cache()
+                    .clone(),
+            ),
         )
     }
 }
