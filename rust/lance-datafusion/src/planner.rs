@@ -422,11 +422,9 @@ impl Planner {
 
         let mut planner_context = PlannerContext::default();
         let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
-        Ok(sql_to_rel
+        sql_to_rel
             .sql_to_expr(function, &schema, &mut planner_context)
-            .map_err(|e| {
-                Error::invalid_input(format!("Error parsing function: {e}"), location!())
-            })?)
+            .map_err(|e| Error::invalid_input(format!("Error parsing function: {e}"), location!()))
     }
 
     fn parse_type(&self, data_type: &SQLDataType) -> Result<ArrowDataType> {

@@ -112,7 +112,7 @@ fn parse_statement(statement: &str) -> Result<Statement> {
     }
     tokens.push(prev_token);
 
-    Ok(Parser::new(&dialect)
+    Parser::new(&dialect)
         .with_tokens(tokens)
         .parse_statement()
         .map_err(|e| {
@@ -120,7 +120,7 @@ fn parse_statement(statement: &str) -> Result<Statement> {
                 format!("Error parsing statement: {statement} ({e})"),
                 location!(),
             )
-        })?)
+        })
 }
 
 #[cfg(test)]
