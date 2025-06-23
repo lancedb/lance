@@ -422,7 +422,11 @@ impl Planner {
 
         let mut planner_context = PlannerContext::default();
         let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
-        Ok(sql_to_rel.sql_to_expr(function, &schema, &mut planner_context)?)
+        Ok(sql_to_rel
+            .sql_to_expr(function, &schema, &mut planner_context)
+            .map_err(|e| {
+                Error::invalid_input(format!("Error parsing function: {e}"), location!())
+            })?)
     }
 
     fn parse_type(&self, data_type: &SQLDataType) -> Result<ArrowDataType> {
@@ -776,8 +780,13 @@ impl Planner {
         let ast_expr = parse_sql_filter(filter)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
-        let resolved = resolve_expr(&expr, &schema)?;
-        coerce_filter_type_to_boolean(resolved)
+        let resolved = resolve_expr(&expr, &schema).map_err(|e| {
+            Error::invalid_input(
+                format!("Error resolving filter expression {filter}: {e}"),
+                location!(),
+            )
+        })?;
+        Ok(coerce_filter_type_to_boolean(resolved))
     }
 
     /// Create Logical [Expr] from a SQL expression.

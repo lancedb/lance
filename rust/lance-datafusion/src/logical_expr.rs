@@ -197,18 +197,18 @@ pub fn coerce_expr(expr: &Expr, dtype: &DataType) -> Result<Expr> {
 /// Parameters
 ///
 /// - *expr*: a datafusion logical expression
-pub fn coerce_filter_type_to_boolean(expr: Expr) -> Result<Expr> {
+pub fn coerce_filter_type_to_boolean(expr: Expr) -> Expr {
     match &expr {
         // TODO: consider making this dispatch more generic, i.e. fun.output_type -> coerce
         // instead of hardcoding coerce method for each function
         Expr::ScalarFunction(ScalarFunction { func, .. }) => {
             if func.name() == "regexp_match" {
-                Ok(Expr::IsNotNull(Box::new(expr)))
+                Expr::IsNotNull(Box::new(expr))
             } else {
-                Ok(expr)
+                expr
             }
         }
-        _ => Ok(expr),
+        _ => expr,
     }
 }
 
