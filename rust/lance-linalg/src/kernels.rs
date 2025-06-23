@@ -56,8 +56,8 @@ pub fn argmax_opt<T: Num + Bounded + PartialOrd>(
 ///
 /// Returns the index of the min value in the array.
 ///
-pub fn argmin<T: Num + PartialOrd + Copy + Bounded>(iter: impl Iterator<Item = T>) -> Option<u32> {
-    argmin_value(iter).map(|(idx, _)| idx)
+pub fn argmin<T: Num + PartialOrd + Copy + Bounded>(iter: impl Iterator<Item = T>) -> u32 {
+    argmin_value(iter).0
 }
 
 /// Return both argmin and minimal value over an iterator.
@@ -68,30 +68,31 @@ pub fn argmin<T: Num + PartialOrd + Copy + Bounded>(iter: impl Iterator<Item = T
 /// - `None` if iterator is empty or all are `Nan/Inf`.
 pub fn argmin_value<T: Num + Bounded + PartialOrd + Copy>(
     iter: impl Iterator<Item = T>,
-) -> Option<(u32, T)> {
-    argmin_value_opt(iter.map(Some))
+) -> (u32, T) {
+    let (min_idx, min_value) = argmin_value_opt(iter.map(Some));
+    (min_idx.unwrap(), min_value)
 }
 
 /// Returns the minimal value (float) and the index (argmin) from an Iterator.
 ///
 /// Return `None` if the iterator is empty or all are `Nan/Inf`.
 #[inline]
-pub fn argmin_value_float<T: Float>(iter: impl Iterator<Item = T>) -> Option<(u32, T)> {
-    let mut min_idx = None;
+pub fn argmin_value_float<T: Float>(iter: impl Iterator<Item = T>) -> (u32, T) {
+    let mut min_idx = 0;
     let mut min_value = T::infinity();
     for (idx, value) in iter.enumerate() {
         if value < min_value {
             min_value = value;
-            min_idx = Some(idx as u32);
+            min_idx = idx as u32;
         }
     }
-    min_idx.map(|idx| (idx, min_value))
+    (min_idx, min_value)
 }
 
 pub fn argmin_value_opt<T: Num + Bounded + PartialOrd>(
     iter: impl Iterator<Item = Option<T>>,
-) -> Option<(u32, T)> {
-    let mut min_idx: Option<u32> = None;
+) -> (Option<u32>, T) {
+    let mut min_idx = None;
     let mut min_value = T::max_value();
     for (idx, value) in iter.enumerate() {
         if let Some(value) = value {
@@ -101,7 +102,7 @@ pub fn argmin_value_opt<T: Num + Bounded + PartialOrd>(
             }
         }
     }
-    min_idx.map(|idx| (idx, min_value))
+    (min_idx, min_value)
 }
 
 /// Argmin over an `Option<Float>` iterator.
@@ -110,7 +111,7 @@ pub fn argmin_value_opt<T: Num + Bounded + PartialOrd>(
 pub fn argmin_opt<T: Num + Bounded + PartialOrd>(
     iter: impl Iterator<Item = Option<T>>,
 ) -> Option<u32> {
-    argmin_value_opt(iter).map(|(idx, _)| idx)
+    argmin_value_opt(iter).0
 }
 
 /// L2 normalize a vector.
@@ -259,7 +260,7 @@ mod tests {
     #[test]
     fn test_argmin() {
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);
-        assert_eq!(argmin(f.values().iter().copied()), Some(2));
+        assert_eq!(argmin(f.values().iter().copied()), 2);
 
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, f32::NAN]);
         assert_eq!(argmin_opt(f.iter()), Some(2));
@@ -268,19 +269,19 @@ mod tests {
         assert_eq!(argmin_opt(f.iter()), Some(0));
 
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, f32::NEG_INFINITY, f32::NAN]);
-        assert_eq!(argmin(f.values().iter().copied()), Some(3));
+        assert_eq!(argmin(f.values().iter().copied()), 3);
 
         let f = Float32Array::from_iter(vec![f32::NAN; 4]);
-        assert_eq!(argmin(f.values().iter().copied()), None);
+        assert_eq!(argmin(f.values().iter().copied()), 0);
 
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);
-        assert_eq!(argmin(f.values().iter().copied()), Some(2));
+        assert_eq!(argmin(f.values().iter().copied()), 2);
 
         let i = Int16Array::from_iter(vec![5, 3, 2, 20, 8, 16]);
-        assert_eq!(argmin(i.values().iter().copied()), Some(2));
+        assert_eq!(argmin(i.values().iter().copied()), 2);
 
         let u = UInt32Array::from_iter(vec![5, 3, 2, 20, 8, 16]);
-        assert_eq!(argmin(u.values().iter().copied()), Some(2));
+        assert_eq!(argmin(u.values().iter().copied()), 2);
 
         let empty_vec: Vec<i16> = vec![];
         let empty = Int16Array::from(empty_vec);
