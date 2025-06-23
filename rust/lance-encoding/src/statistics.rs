@@ -216,8 +216,16 @@ impl VariableWidthBlock {
     // without any adjustment(for example, no null_adjustment for offsets)
     fn cardinality(&mut self) -> Arc<dyn Array> {
         const PRECISION: u8 = 4;
-        let mut hll: HyperLogLogPlus<&[u8], RandomState> =
-            HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+        // The default hasher (currently sip hash 1-3) does not seem to give good results
+        // with HLL.
+        //
+        // In particular, when using randomly generated 12-byte strings, the HLL count was
+        // suggested a cardinality of 500 (out of 1000 unique items and hashes) at least 10%
+        // of the time.
+        //
+        // Using xxhash3 consistently gives better results.
+        let mut hll: HyperLogLogPlus<&[u8], xxhash_rust::xxh3::Xxh3Builder> =
+            HyperLogLogPlus::new(PRECISION, xxhash_rust::xxh3::Xxh3Builder::default()).unwrap();
 
         match self.bits_per_offset {
             32 => {

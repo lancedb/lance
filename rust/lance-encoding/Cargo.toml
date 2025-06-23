@@ -37,6 +37,7 @@ rand.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 zstd.workspace = true
 bytemuck = "1.14"
 arrayref = "0.3.7"

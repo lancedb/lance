@@ -6,12 +6,12 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, OffsetSizeTrait};
 use arrow_buffer::{bit_util, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use bytemuck::{cast_slice, try_cast_slice};
 use byteorder::{ByteOrder, LittleEndian};
 use futures::TryFutureExt;
-use lance_core::utils::bit::pad_bytes;
+use lance_core::utils::bit::pad_bytes_to;
 use snafu::location;
 
 use futures::{future::BoxFuture, FutureExt};
@@ -531,22 +531,116 @@ impl ArrayEncoder for BinaryEncoder {
 #[derive(Debug, Default)]
 pub struct BinaryMiniBlockEncoder {}
 
-const AIM_MINICHUNK_SIZE: u32 = 4 * 1024;
-const BINARY_MINIBLOCK_CHUNK_ALIGNMENT: usize = 4;
+const AIM_MINICHUNK_SIZE: i64 = 4 * 1024;
+
+// Make it to support both u32 and u64
+fn chunk_offsets<N: OffsetSizeTrait>(
+    offsets: &[N],
+    data: &[u8],
+    alignment: usize,
+) -> (Vec<LanceBuffer>, Vec<MiniBlockChunk>) {
+    #[derive(Debug)]
+    struct ChunkInfo {
+        chunk_start_offset_in_orig_idx: usize,
+        chunk_last_offset_in_orig_idx: usize,
+        // the bytes in every chunk starts at `chunk.bytes_start_offset`
+        bytes_start_offset: usize,
+        // every chunk is padded to 8 bytes.
+        // we need to interpret every chunk as &[u32] so we need it to padded at least to 4 bytes,
+        // this field can actually be eliminated and I can use `num_bytes` in `MiniBlockChunk` to compute
+        // the `output_total_bytes`.
+        padded_chunk_size: usize,
+    }
+
+    let byte_width: usize = N::get_byte_width();
+    let mut chunks_info = vec![];
+    let mut chunks = vec![];
+    let mut last_offset_in_orig_idx = 0;
+    loop {
+        let this_last_offset_in_orig_idx = search_next_offset_idx(offsets, last_offset_in_orig_idx);
+
+        let num_values_in_this_chunk = this_last_offset_in_orig_idx - last_offset_in_orig_idx;
+        let chunk_bytes = offsets[this_last_offset_in_orig_idx] - offsets[last_offset_in_orig_idx];
+        let this_chunk_size =
+            (num_values_in_this_chunk + 1) * byte_width + chunk_bytes.to_usize().unwrap();
+
+        let padded_chunk_size = this_chunk_size.next_multiple_of(alignment);
+
+        let this_chunk_bytes_start_offset = (num_values_in_this_chunk + 1) * byte_width;
+        chunks_info.push(ChunkInfo {
+            chunk_start_offset_in_orig_idx: last_offset_in_orig_idx,
+            chunk_last_offset_in_orig_idx: this_last_offset_in_orig_idx,
+            bytes_start_offset: this_chunk_bytes_start_offset,
+            padded_chunk_size,
+        });
+        chunks.push(MiniBlockChunk {
+            log_num_values: if this_last_offset_in_orig_idx == offsets.len() - 1 {
+                0
+            } else {
+                num_values_in_this_chunk.trailing_zeros() as u8
+            },
+            buffer_sizes: vec![padded_chunk_size as u16],
+        });
+        if this_last_offset_in_orig_idx == offsets.len() - 1 {
+            break;
+        }
+        last_offset_in_orig_idx = this_last_offset_in_orig_idx;
+    }
+
+    let output_total_bytes = chunks_info
+        .iter()
+        .map(|chunk_info| chunk_info.padded_chunk_size)
+        .sum::<usize>();
+
+    let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
+
+    for chunk in chunks_info {
+        let this_chunk_offsets: Vec<N> = offsets
+            [chunk.chunk_start_offset_in_orig_idx..=chunk.chunk_last_offset_in_orig_idx]
+            .iter()
+            .map(|offset| {
+                *offset - offsets[chunk.chunk_start_offset_in_orig_idx]
+                    + N::from_usize(chunk.bytes_start_offset).unwrap()
+            })
+            .collect();
+
+        let this_chunk_offsets = LanceBuffer::reinterpret_vec(this_chunk_offsets);
+        output.extend_from_slice(&this_chunk_offsets);
+
+        let start_in_orig = offsets[chunk.chunk_start_offset_in_orig_idx]
+            .to_usize()
+            .unwrap();
+        let end_in_orig = offsets[chunk.chunk_last_offset_in_orig_idx]
+            .to_usize()
+            .unwrap();
+        output.extend_from_slice(&data[start_in_orig..end_in_orig]);
+
+        // pad this chunk to make it align to desired bytes.
+        const PAD_BYTE: u8 = 72;
+        let pad_len = pad_bytes_to(output.len(), alignment);
+
+        // Compare with usize literal to avoid type mismatch with N
+        if pad_len > 0_usize {
+            output.extend(std::iter::repeat_n(PAD_BYTE, pad_len));
+        }
+    }
+    (vec![LanceBuffer::reinterpret_vec(output)], chunks)
+}
 
 // search for the next offset index to cut the values into a chunk.
 // this function incrementally peek the number of values in a chunk,
 // each time multiplies the number of values by 2.
 // It returns the offset_idx in `offsets` that belongs to this chunk.
-fn search_next_offset_idx(offsets: &[u32], last_offset_idx: usize) -> usize {
+fn search_next_offset_idx<N: OffsetSizeTrait>(offsets: &[N], last_offset_idx: usize) -> usize {
     let mut num_values = 1;
     let mut new_num_values = num_values * 2;
     loop {
         if last_offset_idx + new_num_values >= offsets.len() {
-            if (offsets[offsets.len() - 1] - offsets[last_offset_idx])
-                + (offsets.len() - last_offset_idx) as u32 * 4
-                <= AIM_MINICHUNK_SIZE
-            {
+            let existing_bytes = offsets[offsets.len() - 1] - offsets[last_offset_idx];
+            // existing bytes plus the new offset size
+            let new_size = existing_bytes
+                + N::from_usize((offsets.len() - last_offset_idx) * N::get_byte_width()).unwrap();
+            if new_size.to_i64().unwrap() <= AIM_MINICHUNK_SIZE {
                 // case 1: can fit the rest of all data into a miniblock
                 return offsets.len() - 1;
             } else {
@@ -554,17 +648,17 @@ fn search_next_offset_idx(offsets: &[u32], last_offset_idx: usize) -> usize {
                 return last_offset_idx + num_values;
             }
         }
-        if ((offsets[last_offset_idx + new_num_values] - offsets[last_offset_idx])
-            + ((new_num_values + 1) * 4) as u32)
-            <= AIM_MINICHUNK_SIZE
-        {
+        let existing_bytes = offsets[last_offset_idx + new_num_values] - offsets[last_offset_idx];
+        let new_size =
+            existing_bytes + N::from_usize((new_num_values + 1) * N::get_byte_width()).unwrap();
+        if new_size.to_i64().unwrap() <= AIM_MINICHUNK_SIZE {
             num_values = new_num_values;
             new_num_values *= 2;
         } else {
             break;
         }
     }
-    last_offset_idx + num_values
+    last_offset_idx + new_num_values
 }
 
 impl BinaryMiniBlockEncoder {
@@ -575,125 +669,33 @@ impl BinaryMiniBlockEncoder {
         &self,
         mut data: VariableWidthBlock,
     ) -> (MiniBlockCompressed, crate::format::pb::ArrayEncoding) {
-        assert!(data.bits_per_offset == 32);
-
-        let offsets = data.offsets.borrow_to_typed_slice::<u32>();
-        let offsets = offsets.as_ref();
-
-        assert!(offsets.len() > 1);
-
-        #[derive(Debug)]
-        struct ChunkInfo {
-            chunk_start_offset_in_orig_idx: usize,
-            chunk_last_offset_in_orig_idx: usize,
-            // the bytes in every chunk starts at `chunk.bytes_start_offset`
-            bytes_start_offset: usize,
-            // every chunk is padded to 8 bytes.
-            // we need to interpret every chunk as &[u32] so we need it to padded at least to 4 bytes,
-            // this field can actually be eliminated and I can use `num_bytes` in `MiniBlockChunk` to compute
-            // the `output_total_bytes`.
-            padded_chunk_size: usize,
-        }
-
-        let mut chunks_info = vec![];
-        let mut chunks = vec![];
-        let mut last_offset_in_orig_idx = 0;
-        const CHUNK_PAD_BUFFER: [u8; BINARY_MINIBLOCK_CHUNK_ALIGNMENT] =
-            [72; BINARY_MINIBLOCK_CHUNK_ALIGNMENT];
-        loop {
-            let this_last_offset_in_orig_idx =
-                search_next_offset_idx(offsets, last_offset_in_orig_idx);
-
-            // case 1: last chunk
-            if this_last_offset_in_orig_idx == offsets.len() - 1 {
-                let num_values_in_this_chunk =
-                    this_last_offset_in_orig_idx - last_offset_in_orig_idx;
-
-                let this_chunk_size = (num_values_in_this_chunk + 1) * 4
-                    + (offsets[offsets.len() - 1] - offsets[last_offset_in_orig_idx]) as usize;
-
-                let padded_chunk_size = this_chunk_size.next_multiple_of(4);
-
-                // the bytes are put after the offsets
-                let this_chunk_bytes_start_offset = (num_values_in_this_chunk + 1) * 4;
-                chunks_info.push(ChunkInfo {
-                    chunk_start_offset_in_orig_idx: last_offset_in_orig_idx,
-                    chunk_last_offset_in_orig_idx: this_last_offset_in_orig_idx,
-                    bytes_start_offset: this_chunk_bytes_start_offset,
-                    padded_chunk_size,
-                });
-                chunks.push(MiniBlockChunk {
-                    log_num_values: 0,
-                    buffer_sizes: vec![padded_chunk_size as u16],
-                });
-                break;
-            } else {
-                // case 2: not the last chunk
-                let num_values_in_this_chunk =
-                    this_last_offset_in_orig_idx - last_offset_in_orig_idx;
-
-                let this_chunk_size = (num_values_in_this_chunk + 1) * 4
-                    + (offsets[this_last_offset_in_orig_idx] - offsets[last_offset_in_orig_idx])
-                        as usize;
-
-                let padded_chunk_size = this_chunk_size.next_multiple_of(4);
-
-                // the bytes are put after the offsets
-                let this_chunk_bytes_start_offset = (num_values_in_this_chunk + 1) * 4;
-
-                chunks_info.push(ChunkInfo {
-                    chunk_start_offset_in_orig_idx: last_offset_in_orig_idx,
-                    chunk_last_offset_in_orig_idx: this_last_offset_in_orig_idx,
-                    bytes_start_offset: this_chunk_bytes_start_offset,
-                    padded_chunk_size,
-                });
-
-                chunks.push(MiniBlockChunk {
-                    log_num_values: num_values_in_this_chunk.trailing_zeros() as u8,
-                    buffer_sizes: vec![padded_chunk_size as u16],
-                });
-
-                last_offset_in_orig_idx = this_last_offset_in_orig_idx;
+        match data.bits_per_offset {
+            32 => {
+                let offsets = data.offsets.borrow_to_typed_slice::<i32>();
+                let (buffers, chunks) = chunk_offsets(offsets.as_ref(), &data.data, 4);
+                (
+                    MiniBlockCompressed {
+                        data: buffers,
+                        chunks,
+                        num_values: data.num_values,
+                    },
+                    ProtobufUtils::variable(32),
+                )
             }
+            64 => {
+                let offsets = data.offsets.borrow_to_typed_slice::<i64>();
+                let (buffers, chunks) = chunk_offsets(offsets.as_ref(), &data.data, 8);
+                (
+                    MiniBlockCompressed {
+                        data: buffers,
+                        chunks,
+                        num_values: data.num_values,
+                    },
+                    ProtobufUtils::variable(64),
+                )
+            }
+            _ => panic!("Unsupported bits_per_offset"),
         }
-        let output_total_bytes = chunks_info
-            .iter()
-            .map(|chunk_info| chunk_info.padded_chunk_size)
-            .sum::<usize>();
-
-        let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
-        for chunk in chunks_info {
-            // `this_chunk_offsets` are offsets that points to bytes in this chunk,
-            let this_chunk_offsets = offsets
-                [chunk.chunk_start_offset_in_orig_idx..chunk.chunk_last_offset_in_orig_idx + 1]
-                .iter()
-                .map(|offset| {
-                    offset - offsets[chunk.chunk_start_offset_in_orig_idx]
-                        + chunk.bytes_start_offset as u32
-                })
-                .collect::<Vec<_>>();
-
-            output.extend_from_slice(cast_slice(&this_chunk_offsets));
-
-            let start_in_orig = offsets[chunk.chunk_start_offset_in_orig_idx];
-            let end_in_orig = offsets[chunk.chunk_last_offset_in_orig_idx];
-
-            output.extend_from_slice(&data.data[start_in_orig as usize..end_in_orig as usize]);
-
-            // pad this chunk to make it align to 4 bytes.
-            output.extend_from_slice(
-                &CHUNK_PAD_BUFFER[..pad_bytes::<BINARY_MINIBLOCK_CHUNK_ALIGNMENT>(output.len())],
-            );
-        }
-
-        (
-            MiniBlockCompressed {
-                data: vec![LanceBuffer::reinterpret_vec(output)],
-                chunks,
-                num_values: data.num_values,
-            },
-            ProtobufUtils::variable(/*bits_per_value=*/ 32),
-        )
     }
 }
 
@@ -713,8 +715,23 @@ impl MiniBlockCompressor for BinaryMiniBlockEncoder {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct BinaryMiniBlockDecompressor {}
+#[derive(Debug)]
+pub struct BinaryMiniBlockDecompressor {
+    bits_per_offset: u8,
+}
+
+impl BinaryMiniBlockDecompressor {
+    pub fn new(bits_per_offset: u8) -> Self {
+        assert!(bits_per_offset == 32 || bits_per_offset == 64);
+        Self { bits_per_offset }
+    }
+
+    pub fn from_variable(variable: &pb::Variable) -> Self {
+        Self {
+            bits_per_offset: variable.bits_per_offset as u8,
+        }
+    }
+}
 
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // decompress a MiniBlock of binary data, the num_values must be less than or equal
@@ -723,24 +740,49 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
         let data = data.into_iter().next().unwrap();
-        assert!(data.len() >= 8);
-        let offsets: &[u32] = try_cast_slice(&data)
-            .expect("casting buffer failed during BinaryMiniBlock decompression");
 
-        let result_offsets = offsets[0..(num_values + 1) as usize]
-            .iter()
-            .map(|offset| offset - offsets[0])
-            .collect::<Vec<u32>>();
+        if self.bits_per_offset == 64 {
+            // offset and at least one value
+            assert!(data.len() >= 16);
 
-        Ok(DataBlock::VariableWidth(VariableWidthBlock {
-            data: LanceBuffer::Owned(
-                data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
-            ),
-            offsets: LanceBuffer::reinterpret_vec(result_offsets),
-            bits_per_offset: 32,
-            num_values,
-            block_info: BlockInfo::new(),
-        }))
+            let offsets: &[u64] = try_cast_slice(&data)
+                .expect("casting buffer failed during BinaryMiniBlock decompression");
+
+            let result_offsets = offsets[0..(num_values + 1) as usize]
+                .iter()
+                .map(|offset| offset - offsets[0])
+                .collect::<Vec<u64>>();
+            Ok(DataBlock::VariableWidth(VariableWidthBlock {
+                data: LanceBuffer::Owned(
+                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
+                ),
+                offsets: LanceBuffer::reinterpret_vec(result_offsets),
+                bits_per_offset: 64,
+                num_values,
+                block_info: BlockInfo::new(),
+            }))
+        } else {
+            // offset and at least one value
+            assert!(data.len() >= 8);
+
+            let offsets: &[u32] = try_cast_slice(&data)
+                .expect("casting buffer failed during BinaryMiniBlock decompression");
+
+            let result_offsets = offsets[0..(num_values + 1) as usize]
+                .iter()
+                .map(|offset| offset - offsets[0])
+                .collect::<Vec<u32>>();
+
+            Ok(DataBlock::VariableWidth(VariableWidthBlock {
+                data: LanceBuffer::Owned(
+                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
+                ),
+                offsets: LanceBuffer::reinterpret_vec(result_offsets),
+                bits_per_offset: 32,
+                num_values,
+                block_info: BlockInfo::new(),
+            }))
+        }
     }
 }
 
@@ -941,10 +983,13 @@ pub mod tests {
         check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_large_binary() {
+    async fn test_large_binary(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let field = Field::new("", DataType::LargeBinary, true);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_round_trip_encoding_random(field, version).await;
     }
 
     #[test_log::test(tokio::test)]
