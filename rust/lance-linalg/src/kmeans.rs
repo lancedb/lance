@@ -153,6 +153,7 @@ fn split_clusters<T: Float + MulAssign>(
     centroids: &mut [T],
     dim: usize,
 ) {
+    let eps = T::from(1.0 / 1024.0).unwrap();
     let mut rng = SmallRng::from_entropy();
     for i in 0..cnts.len() {
         if cnts[i] == 0 {
@@ -170,11 +171,11 @@ fn split_clusters<T: Float + MulAssign>(
             cnts[j] -= cnts[i];
             for k in 0..dim {
                 if k % 2 == 0 {
-                    centroids[i * dim + k] = centroids[j * dim + k] * (T::one() + T::epsilon());
-                    centroids[j * dim + k] *= T::one() - T::epsilon();
+                    centroids[i * dim + k] = centroids[j * dim + k] * (T::one() + eps);
+                    centroids[j * dim + k] *= T::one() - eps;
                 } else {
-                    centroids[i * dim + k] = centroids[j * dim + k] * (T::one() - T::epsilon());
-                    centroids[j * dim + k] *= T::one() + T::epsilon();
+                    centroids[i * dim + k] = centroids[j * dim + k] * (T::one() - eps);
+                    centroids[j * dim + k] *= T::one() + eps;
                 }
             }
         }
