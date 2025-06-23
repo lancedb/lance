@@ -40,6 +40,7 @@ use super::transaction::Transaction;
 use super::DATA_DIR;
 
 mod commit;
+pub mod delete;
 mod insert;
 pub mod merge_insert;
 pub mod update;
