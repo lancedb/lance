@@ -182,17 +182,19 @@ fn split_clusters<T: Float + MulAssign>(
     }
 }
 
-fn histogram(k: usize, membership: &[u32]) -> Vec<usize> {
+fn histogram(k: usize, membership: &[Option<u32>]) -> Vec<usize> {
     let mut hist: Vec<usize> = vec![0; k];
     membership.iter().for_each(|cd| {
-        hist[*cd as usize] += 1;
+        if let Some(cd) = cd {
+            hist[*cd as usize] += 1;
+        }
     });
 
     hist
 }
 
 /// Std deviation of the histogram / cluster distribution.
-fn hist_stddev(k: usize, membership: &[u32]) -> f32 {
+fn hist_stddev(k: usize, membership: &[Option<u32>]) -> f32 {
     let mean: f32 = membership.len() as f32 * 1.0 / k as f32;
     let len = membership.len();
     (histogram(k, membership)
@@ -215,14 +217,14 @@ pub trait KMeansAlgo<T: Num> {
         data: &[T],
         dimension: usize,
         distance_type: DistanceType,
-    ) -> (Vec<u32>, f64);
+    ) -> (Vec<Option<u32>>, f64);
 
     /// Construct a new KMeans model.
     fn to_kmeans(
         data: &[T],
         dimension: usize,
         k: usize,
-        membership: &[u32],
+        membership: &[Option<u32>],
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans;
@@ -245,7 +247,7 @@ where
         data: &[T::Native],
         dimension: usize,
         distance_type: DistanceType,
-    ) -> (Vec<u32>, f64) {
+    ) -> (Vec<Option<u32>>, f64) {
         let cluster_and_dists = match distance_type {
             DistanceType::L2 => data
                 .par_chunks(dimension)
@@ -263,8 +265,14 @@ where
             }
         };
         (
-            cluster_and_dists.iter().map(|cd| cd.0).collect::<Vec<_>>(),
-            cluster_and_dists.iter().map(|cd| cd.1 as f64).sum(),
+            cluster_and_dists
+                .iter()
+                .map(|cd| cd.map(|(c, _)| c))
+                .collect::<Vec<_>>(),
+            cluster_and_dists
+                .iter()
+                .map(|cd| cd.map(|(_, d)| d as f64).unwrap_or_default())
+                .sum(),
         )
     }
 
@@ -272,7 +280,7 @@ where
         data: &[T::Native],
         dimension: usize,
         k: usize,
-        membership: &[u32],
+        membership: &[Option<u32>],
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans {
@@ -281,11 +289,14 @@ where
         data.chunks_exact(dimension)
             .zip(membership.iter())
             .for_each(|(vector, cluster_id)| {
-                let cluster_id = *cluster_id as usize;
-                let centoid = &mut centroids[cluster_id * dimension..(cluster_id + 1) * dimension];
-                cluster_cnts[cluster_id] += 1;
-                // TODO: simd
-                centoid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                if let Some(cluster_id) = cluster_id {
+                    let cluster_id = *cluster_id as usize;
+                    let centoid =
+                        &mut centroids[cluster_id * dimension..(cluster_id + 1) * dimension];
+                    cluster_cnts[cluster_id] += 1;
+                    // TODO: simd
+                    centoid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                }
             });
 
         let mut empty_clusters = 0;
@@ -332,7 +343,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
         data: &[u8],
         dimension: usize,
         distance_type: DistanceType,
-    ) -> (Vec<u32>, f64) {
+    ) -> (Vec<Option<u32>>, f64) {
         assert_eq!(distance_type, DistanceType::Hamming);
         let cluster_and_dists = data
             .par_chunks(dimension)
@@ -347,8 +358,14 @@ impl KMeansAlgo<u8> for KModeAlgo {
             })
             .collect::<Vec<_>>();
         (
-            cluster_and_dists.iter().map(|cd| cd.0).collect::<Vec<_>>(),
-            cluster_and_dists.iter().map(|cd| cd.1 as f64).sum(),
+            cluster_and_dists
+                .iter()
+                .map(|cd| cd.map(|(c, _)| c))
+                .collect::<Vec<_>>(),
+            cluster_and_dists
+                .iter()
+                .map(|cd| cd.map(|(_, d)| d as f64).unwrap_or_default())
+                .sum(),
         )
     }
 
@@ -356,7 +373,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
         data: &[u8],
         dimension: usize,
         k: usize,
-        membership: &[u32],
+        membership: &[Option<u32>],
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans {
@@ -364,7 +381,9 @@ impl KMeansAlgo<u8> for KModeAlgo {
 
         let mut clusters = HashMap::<u32, Vec<usize>>::new();
         membership.iter().enumerate().for_each(|(i, part_id)| {
-            clusters.entry(*part_id).or_default().push(i);
+            if let Some(part_id) = part_id {
+                clusters.entry(*part_id).or_default().push(i);
+            }
         });
         let centroids = (0..k as u32)
             .into_par_iter()
@@ -503,7 +522,7 @@ impl KMeans {
             };
 
             let mut loss = f64::MAX;
-            let mut last_membership: Option<Vec<u32>> = None;
+            let mut last_membership: Option<Vec<Option<u32>>> = None;
             for i in 1..=params.max_iters {
                 if i % 10 == 0 {
                     info!(
@@ -697,7 +716,7 @@ pub fn compute_partitions_arrow_array(
     centroids: &FixedSizeListArray,
     vectors: &FixedSizeListArray,
     distance_type: DistanceType,
-) -> Result<(Vec<u32>, f64)> {
+) -> Result<(Vec<Option<u32>>, f64)> {
     if centroids.value_length() != vectors.value_length() {
         return Err(ArrowError::InvalidArgumentError(
             "Centroids and vectors have different dimensions".to_string(),
@@ -760,7 +779,7 @@ pub fn compute_partitions<T: ArrowNumericType, K: KMeansAlgo<T::Native>>(
     vectors: &PrimitiveArray<T>,
     dimension: impl AsPrimitive<usize>,
     distance_type: DistanceType,
-) -> (Vec<u32>, f64)
+) -> (Vec<Option<u32>>, f64)
 where
     T::Native: Num,
 {
@@ -778,13 +797,13 @@ pub fn compute_partition<T: Float + L2 + Dot>(
     centroids: &[T],
     vector: &[T],
     distance_type: DistanceType,
-) -> u32 {
+) -> Option<u32> {
     match distance_type {
         DistanceType::L2 => {
-            argmin_value_float(l2_distance_batch(vector, centroids, vector.len())).0
+            argmin_value_float(l2_distance_batch(vector, centroids, vector.len())).map(|(c, _)| c)
         }
         DistanceType::Dot => {
-            argmin_value_float(dot_distance_batch(vector, centroids, vector.len())).0
+            argmin_value_float(dot_distance_batch(vector, centroids, vector.len())).map(|(c, _)| c)
         }
         _ => {
             panic!(
