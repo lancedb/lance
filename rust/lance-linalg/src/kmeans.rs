@@ -870,13 +870,55 @@ mod tests {
         let centroids = generate_random_array(DIM * 18);
         let data = generate_random_array(DIM * 20);
 
-        let (_, loss) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_loss(
+        let (membership, loss) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_loss(
             centroids.as_slice(),
             data.values(),
             DIM,
             DistanceType::L2,
         );
         assert!(loss > 0.0, "loss is not zero: {}", loss);
+        membership.iter().for_each(|cd| {
+            assert!(cd.is_some());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_l2_with_nans() {
+        const DIM: usize = 8;
+        const K: usize = 32;
+        const NUM_CENTROIDS: usize = 16 * 2048;
+        let centroids = generate_random_array(DIM * NUM_CENTROIDS);
+        let values = Float32Array::from_iter_values(repeat_n(f32::NAN, DIM * K));
+
+        compute_partitions::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+            &centroids,
+            &values,
+            DIM,
+            DistanceType::L2,
+        )
+        .0
+        .iter()
+        .for_each(|cd| {
+            assert!(cd.is_none());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_train_l2_kmeans_with_nans() {
+        const DIM: usize = 8;
+        const K: usize = 32;
+        const NUM_CENTROIDS: usize = 16 * 2048;
+        let centroids = generate_random_array(DIM * NUM_CENTROIDS);
+        let values = repeat_n(f32::NAN, DIM * K).collect::<Vec<_>>();
+
+        let (membership, _) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_loss(
+            centroids.as_slice(),
+            &values,
+            DIM,
+            DistanceType::L2,
+        );
+
+        membership.iter().for_each(|cd| assert!(cd.is_none()));
     }
 
     #[tokio::test]
