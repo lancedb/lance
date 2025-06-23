@@ -24,14 +24,16 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{ArrowError, DataType};
 use bitvec::prelude::*;
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use log::{info, warn};
+use num_traits::One;
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
-use rayon::prelude::*;
+use rayon::{current_num_threads, current_thread_index, prelude::*};
 
 use crate::distance::hamming::{hamming, hamming_distance_batch};
 use crate::distance::{dot_distance_batch, DistanceType};
-use crate::kernels::{argmax, argmin_value_float};
+use crate::kernels::argmin_value_float;
 use crate::{
     distance::{
         l2::{l2_distance_batch, L2},
@@ -286,31 +288,61 @@ where
     ) -> KMeans {
         let mut cluster_cnts = vec![0_u64; k];
         let mut centroids = vec![T::Native::zero(); k * dimension];
-        data.chunks_exact(dimension)
-            .zip(membership.iter())
-            .for_each(|(vector, cluster_id)| {
-                if let Some(cluster_id) = cluster_id {
-                    let cluster_id = *cluster_id as usize;
-                    let centoid =
-                        &mut centroids[cluster_id * dimension..(cluster_id + 1) * dimension];
-                    cluster_cnts[cluster_id] += 1;
-                    // TODO: simd
-                    centoid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+
+        let mut num_cpus = get_num_compute_intensive_cpus();
+        if k < num_cpus || k < 16 {
+            num_cpus = 1;
+        }
+
+        (0..num_cpus).into_par_iter().for_each(|_| {
+            let i = current_thread_index().unwrap();
+            let num_threads = current_num_threads();
+            let centroids_ptr = centroids.as_ptr();
+            let cluster_cnts_ptr = cluster_cnts.as_ptr();
+            let start = i * k / num_threads;
+            let end = ((i + 1) * k / num_threads).min(k);
+
+            // SAFETY: Each thread gets a unique, non-overlapping chunk.
+            let local_centroids = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (centroids_ptr as *mut T::Native).add(start * dimension),
+                    (end - start) * dimension,
+                )
+            };
+            let local_counts = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (cluster_cnts_ptr as *mut u64).add(start),
+                    end - start,
+                )
+            };
+
+            data.chunks_exact(dimension)
+                .zip(membership.iter())
+                .filter_map(|(vector, cluster_id)| {
+                    cluster_id.map(|cluster_id| (vector, cluster_id as usize))
+                })
+                .for_each(|(vector, cluster_id)| {
+                    if start <= cluster_id && cluster_id < end {
+                        let local_id = cluster_id - start;
+                        local_counts[local_id] += 1;
+                        let centoid =
+                            &mut local_centroids[local_id * dimension..(local_id + 1) * dimension];
+                        centoid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                    }
+                });
+        });
+
+        centroids
+            .par_chunks_mut(dimension)
+            .zip(cluster_cnts.par_iter())
+            .for_each(|(centroid, &cnt)| {
+                if cnt > 0 {
+                    let norm = T::Native::one() / T::Native::from_u64(cnt).unwrap();
+                    centroid.iter_mut().for_each(|v| *v *= norm);
                 }
             });
 
-        let mut empty_clusters = 0;
-
-        cluster_cnts.iter().enumerate().for_each(|(i, &cnt)| {
-            if cnt == 0 {
-                empty_clusters += 1;
-            } else {
-                centroids[i * dimension..(i + 1) * dimension]
-                    .iter_mut()
-                    .for_each(|v| *v /= T::Native::from_u64(cnt).unwrap());
-            }
-        });
-
+        let empty_clusters = cluster_cnts.iter().filter(|&cnt| *cnt == 0).count();
         if empty_clusters as f32 / k as f32 > 0.1 {
             warn!(
                 "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
