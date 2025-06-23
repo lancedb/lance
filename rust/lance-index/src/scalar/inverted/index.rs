@@ -956,7 +956,7 @@ impl PostingListReader {
             .posting_cache
             .try_get_with(token_id, async move {
                 metrics.record_part_load();
-                info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
+                info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
                self.posting_list_from_batch(&batch, token_id)
             })
@@ -1033,7 +1033,7 @@ impl PostingListReader {
                 .await.map_err(|e| {
                     match e {
                         Error::Schema { .. } => Error::Index {
-                            message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), 
+                            message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
                             location: location!(),
                         },
                         e => e

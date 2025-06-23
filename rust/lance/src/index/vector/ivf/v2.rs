@@ -232,7 +232,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         {
             part_idx
         } else {
-            info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key);
+            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key);
             metrics.record_part_load();
             if partition_id >= self.ivf.num_partitions() {
                 return Err(Error::Index {
