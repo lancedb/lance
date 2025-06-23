@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Packed encoding
+//!
+//! These encodings take struct data and compress it in a way that all fields are collected
+//! together.
+//!
+//! This encoding can be transparent or opaque.  In order to be transparent we must use transparent
+//! compression on all children.  Then we can zip together the compressed children.
+
 use arrow::datatypes::UInt64Type;
 
 use lance_core::{Error, Result};
@@ -8,9 +16,9 @@ use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,
+    compression::MiniBlockDecompressor,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock, StructDataBlock},
-    decoder::MiniBlockDecompressor,
-    encoder::{MiniBlockCompressed, MiniBlockCompressor},
+    encodings::logical::primitive::miniblock::{MiniBlockCompressed, MiniBlockCompressor},
     format::{
         pb::{self},
         ProtobufUtils,

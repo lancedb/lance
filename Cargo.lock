@@ -4294,39 +4294,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lance-encoding-datafusion"
-version = "0.30.1"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-schema",
- "bytes",
- "datafusion",
- "datafusion-common",
- "datafusion-expr",
- "datafusion-functions",
- "datafusion-optimizer",
- "datafusion-physical-expr",
- "futures",
- "lance-core",
- "lance-datafusion",
- "lance-datagen",
- "lance-encoding",
- "lance-file",
- "lance-io",
- "log",
- "pprof",
- "prost 0.13.5",
- "prost-build 0.13.5",
- "prost-types 0.13.5",
- "protobuf-src",
- "rand 0.8.5",
- "snafu",
- "test-log",
- "tokio",
-]
-
-[[package]]
 name = "lance-examples"
 version = "0.30.1"
 dependencies = [
