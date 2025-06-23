@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
-use lance_core::cache::LanceCache;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_file::version::LanceFileVersion;
@@ -81,28 +80,6 @@ pub(crate) async fn read_transaction_file(
     transaction.try_into()
 }
 
-pub(crate) fn transaction_file_cache_key(version: u64) -> String {
-    format!("txn/{version}")
-}
-
-pub(crate) fn manifest_cache_key(location: &ManifestLocation) -> String {
-    if let Some(e_tag) = &location.e_tag {
-        format!("manifest/{}/{}", location.version, e_tag)
-    } else {
-        format!("manifest/{}", location.version)
-    }
-}
-
-pub(crate) fn deletion_file_cache_key(fragment_id: u64, deletion_file: &DeletionFile) -> String {
-    format!(
-        "deletion/{}/{}/{}/{}",
-        fragment_id,
-        deletion_file.read_version,
-        deletion_file.id,
-        deletion_file.file_type.suffix()
-    )
-}
-
 /// Write a transaction to a file and return the relative path.
 async fn write_transaction_file(
     object_store: &ObjectStore,
@@ -128,7 +105,7 @@ async fn do_commit_new_dataset(
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     blob_version: Option<u64>,
-    metadata_cache: &LanceCache,
+    metadata_cache: &crate::session::DSMetadataCache,
 ) -> Result<(Manifest, ManifestLocation)> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
@@ -156,14 +133,16 @@ async fn do_commit_new_dataset(
     // if there is a conflict.
     match result {
         Ok(manifest_location) => {
-            metadata_cache.insert(
-                &transaction_file_cache_key(manifest.version),
-                Arc::new(transaction.clone()),
-            );
-            metadata_cache.insert(
-                &manifest_cache_key(&manifest_location),
-                Arc::new(manifest.clone()),
-            );
+            let tx_key = crate::session::TransactionKey {
+                version: manifest.version,
+            };
+            metadata_cache.insert_with_key(&tx_key, Arc::new(transaction.clone()));
+
+            let manifest_key = crate::session::ManifestKey {
+                version: manifest_location.version,
+                e_tag: manifest_location.e_tag.clone(),
+            };
+            metadata_cache.insert_with_key(&manifest_key, Arc::new(manifest.clone()));
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
@@ -181,7 +160,7 @@ pub(crate) async fn commit_new_dataset(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-    metadata_cache: &LanceCache,
+    metadata_cache: &crate::session::DSMetadataCache,
 ) -> Result<(Manifest, ManifestLocation)> {
     let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blob_path = base_path.child(BLOB_DIR);
@@ -850,14 +829,20 @@ pub(crate) async fn commit_transaction(
         match result {
             Ok(manifest_location) => {
                 // Cache both the transaction file and manifest
-                let cache_key = transaction_file_cache_key(target_version);
+                let tx_key = crate::session::TransactionKey {
+                    version: target_version,
+                };
                 dataset
                     .metadata_cache
-                    .insert(&cache_key, Arc::new(transaction.clone()));
-                dataset.metadata_cache.insert(
-                    &manifest_cache_key(&manifest_location),
-                    Arc::new(manifest.clone()),
-                );
+                    .insert_with_key(&tx_key, Arc::new(transaction.clone()));
+
+                let manifest_key = crate::session::ManifestKey {
+                    version: manifest_location.version,
+                    e_tag: manifest_location.e_tag.clone(),
+                };
+                dataset
+                    .metadata_cache
+                    .insert_with_key(&manifest_key, Arc::new(manifest.clone()));
                 if !indices.is_empty() {
                     dataset.session().index_cache.insert_metadata(
                         dataset.base.as_ref(),
