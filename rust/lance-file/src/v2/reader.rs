@@ -1535,7 +1535,7 @@ pub mod tests {
     use lance_datagen::{array, gen, BatchCount, ByteCount, RowCount};
     use lance_encoding::{
         decoder::{decode_batch, DecodeBatchScheduler, DecoderPlugins, FilterExpression},
-        encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodingOptions},
+        encoder::{encode_batch, EncodedBatch, EncodingOptions, StructuralEncodingStrategy},
         version::LanceFileVersion,
     };
     use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
@@ -1686,7 +1686,7 @@ pub mod tests {
         let encoded_batch = encode_batch(
             &data,
             lance_schema.clone(),
-            &CoreFieldEncodingStrategy::default(),
+            &StructuralEncodingStrategy::default(),
             &encoding_options,
         )
         .await

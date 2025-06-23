@@ -2,9 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod binary;
-pub mod bitpack;
-pub mod block;
-pub mod constant;
-pub mod fsst;
-pub mod packed;
-pub mod value;
+pub mod blob;
+pub mod list;
+pub mod primitive;
+pub mod r#struct;

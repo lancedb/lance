@@ -14,9 +14,12 @@ use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 use log::trace;
 
-use crate::decoder::{
-    DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
-    MessageType, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
+use crate::{
+    decoder::{
+        DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
+        ScheduledScanLine, SchedulerContext,
+    },
+    v2::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
 };
 
 /// Wraps a varbin scheduler and uses a BinaryPageDecoder to cast
