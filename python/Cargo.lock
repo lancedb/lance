@@ -1572,7 +1572,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "object_store 0.12.2",
+ "object_store",
  "parking_lot",
  "parquet",
  "rand 0.8.5",
@@ -1607,7 +1607,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "object_store 0.12.2",
+ "object_store",
  "parking_lot",
  "tokio",
 ]
@@ -1631,7 +1631,7 @@ dependencies = [
  "datafusion-session",
  "futures",
  "log",
- "object_store 0.12.2",
+ "object_store",
  "tokio",
 ]
 
@@ -1650,7 +1650,7 @@ dependencies = [
  "indexmap",
  "libc",
  "log",
- "object_store 0.12.2",
+ "object_store",
  "parquet",
  "paste",
  "recursive",
@@ -1695,7 +1695,7 @@ dependencies = [
  "glob",
  "itertools 0.14.0",
  "log",
- "object_store 0.12.2",
+ "object_store",
  "parquet",
  "rand 0.8.5",
  "tempfile",
@@ -1726,7 +1726,7 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-session",
  "futures",
- "object_store 0.12.2",
+ "object_store",
  "regex",
  "tokio",
 ]
@@ -1751,7 +1751,7 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-session",
  "futures",
- "object_store 0.12.2",
+ "object_store",
  "serde_json",
  "tokio",
 ]
@@ -1780,7 +1780,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "object_store 0.12.2",
+ "object_store",
  "parking_lot",
  "parquet",
  "rand 0.8.5",
@@ -1805,7 +1805,7 @@ dependencies = [
  "datafusion-expr",
  "futures",
  "log",
- "object_store 0.12.2",
+ "object_store",
  "parking_lot",
  "rand 0.8.5",
  "tempfile",
@@ -2120,7 +2120,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-proto-common",
- "object_store 0.12.2",
+ "object_store",
  "prost 0.13.5",
 ]
 
@@ -2154,7 +2154,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "object_store 0.12.2",
+ "object_store",
  "parking_lot",
  "tokio",
 ]
@@ -2187,7 +2187,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "itertools 0.14.0",
- "object_store 0.12.2",
+ "object_store",
  "pbjson-types",
  "prost 0.13.5",
  "substrait",
@@ -3538,7 +3538,7 @@ dependencies = [
  "lazy_static",
  "log",
  "moka",
- "object_store 0.12.2",
+ "object_store",
  "permutation",
  "pin-project",
  "prost 0.12.6",
@@ -3597,7 +3597,7 @@ dependencies = [
  "mock_instant",
  "moka",
  "num_cpus",
- "object_store 0.12.2",
+ "object_store",
  "pin-project",
  "prost 0.13.5",
  "rand 0.8.5",
@@ -3719,7 +3719,7 @@ dependencies = [
  "lance-io",
  "log",
  "num-traits",
- "object_store 0.12.2",
+ "object_store",
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
@@ -3772,7 +3772,7 @@ dependencies = [
  "log",
  "moka",
  "num-traits",
- "object_store 0.12.2",
+ "object_store",
  "prost 0.13.5",
  "prost-build 0.13.5",
  "rand 0.8.5",
@@ -3814,7 +3814,7 @@ dependencies = [
  "lance-core",
  "lazy_static",
  "log",
- "object_store 0.12.2",
+ "object_store",
  "path_abs",
  "pin-project",
  "prost 0.13.5",
@@ -3873,7 +3873,7 @@ dependencies = [
  "lance-io",
  "lazy_static",
  "log",
- "object_store 0.12.2",
+ "object_store",
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
@@ -4453,27 +4453,6 @@ dependencies = [
 
 [[package]]
 name = "object_store"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cfccb68961a56facde1163f9319e0d15743352344e7808a11795fb99698dcaf"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "futures",
- "humantime",
- "itertools 0.13.0",
- "parking_lot",
- "percent-encoding",
- "snafu",
- "tokio",
- "tracing",
- "url",
- "walkdir",
-]
-
-[[package]]
-name = "object_store"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7781f96d79ed0f961a7021424ab01840efbda64ae7a505aaea195efc91eaaec4"
@@ -4618,7 +4597,7 @@ dependencies = [
  "lz4_flex",
  "num",
  "num-bigint",
- "object_store 0.12.2",
+ "object_store",
  "paste",
  "seq-macro",
  "simdutf8",
@@ -5085,7 +5064,7 @@ dependencies = [
  "lance-table",
  "lazy_static",
  "log",
- "object_store 0.11.2",
+ "object_store",
  "once_cell",
  "prost 0.13.5",
  "prost-build 0.11.9",
