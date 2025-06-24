@@ -152,14 +152,17 @@ impl ZstdBufferCompressor {
         input_buf: &[u8],
         output_buf: &mut Vec<u8>,
     ) -> Result<()> {
-        let mut len_buf = [0u8; 8];
-        len_buf.copy_from_slice(&input_buf[..8]);
+        const LENGTH_PREFIX_SIZE: usize = 8;
+        let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
+        len_buf.copy_from_slice(&input_buf[..LENGTH_PREFIX_SIZE]);
+
         let uncompressed_len = u64::from_le_bytes(len_buf) as usize;
 
-        let compressed_data = &input_buf[8..];
-        output_buf.resize(uncompressed_len, 0);
+        let start = output_buf.len();
+        output_buf.resize(start + uncompressed_len, 0);
 
-        decompress_to_buffer(compressed_data, output_buf)?;
+        let compressed_data = &input_buf[LENGTH_PREFIX_SIZE..];
+        decompress_to_buffer(compressed_data, &mut output_buf[start..])?;
         Ok(())
     }
 }
@@ -439,6 +442,53 @@ mod tests {
             .decompress(&compressed_data, &mut decompressed_data)
             .unwrap();
         assert_eq!(input_data, decompressed_data.as_slice());
+    }
+
+    #[test]
+    fn test_zstd_compress_decompress_multiple_times() {
+        let compressor = ZstdBufferCompressor::new(0);
+        let (input_data_1, input_data_2) = (b"Hello ", b"World");
+        let mut compressed_data = Vec::new();
+
+        compressor
+            .compress(input_data_1, &mut compressed_data)
+            .unwrap();
+        let compressed_length_1 = compressed_data.len();
+
+        compressor
+            .compress(input_data_2, &mut compressed_data)
+            .unwrap();
+
+        let mut decompressed_data = Vec::new();
+        compressor
+            .decompress(
+                &compressed_data[..compressed_length_1],
+                &mut decompressed_data,
+            )
+            .unwrap();
+
+        compressor
+            .decompress(
+                &compressed_data[compressed_length_1..],
+                &mut decompressed_data,
+            )
+            .unwrap();
+
+        // the output should contain both input_data_1 and input_data_2
+        assert_eq!(
+            decompressed_data.len(),
+            input_data_1.len() + input_data_2.len()
+        );
+        assert_eq!(
+            &decompressed_data[..input_data_1.len()],
+            input_data_1,
+            "First part of decompressed data should match input_1"
+        );
+        assert_eq!(
+            &decompressed_data[input_data_1.len()..],
+            input_data_2,
+            "Second part of decompressed data should match input_2"
+        );
     }
 
     #[test]
