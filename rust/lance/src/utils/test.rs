@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
+use datafusion_physical_plan::ExecutionPlan;
 use futures::stream::BoxStream;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
@@ -673,6 +674,39 @@ pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
     copy_dir_all(src.as_path(), test_dir.path())?;
 
     Ok(test_dir)
+}
+
+pub async fn assert_plan_node_equals(
+    plan_node: Arc<dyn ExecutionPlan>,
+    expected: &str,
+) -> lance_core::Result<()> {
+    let plan_desc = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
+    );
+
+    let to_match = expected.split("...").collect::<Vec<_>>();
+    let num_pieces = to_match.len();
+    let mut remainder = plan_desc.as_str().trim_end_matches('\n');
+    for (i, piece) in to_match.into_iter().enumerate() {
+        let res = match i {
+            0 => remainder.starts_with(piece),
+            _ if i == num_pieces - 1 => remainder.ends_with(piece),
+            _ => remainder.contains(piece),
+        };
+        if !res {
+            break;
+        }
+        let idx = remainder.find(piece).unwrap();
+        remainder = &remainder[idx + piece.len()..];
+    }
+    if !remainder.is_empty() {
+        panic!(
+            "Expected plan to match:\nExpected: {}\nActual: {}",
+            expected, plan_desc
+        )
+    }
+    Ok(())
 }
 
 #[cfg(test)]
