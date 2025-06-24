@@ -16,11 +16,9 @@ use lance_testing::datagen::generate_random_array;
 
 fn bench_train(c: &mut Criterion) {
     let params = [
-        (64 * 1024, 8),      // training PQ
-        (64 * 1024, 128),    // training IVF with small vectors (1M rows)
-        (64 * 1024, 1024),   // training IVF with large vectors (1M rows)
-        // (1024 * 1024, 128),  // training IVF with small vectors (16M rows)
-        // (1024 * 1024, 1024), // training IVF with large vectors (16M rows)
+        (64 * 1024, 8),    // training PQ
+        (64 * 1024, 128),  // training IVF with small vectors (1M rows)
+        (64 * 1024, 1024), // training IVF with large vectors (1M rows)
     ];
     for (n, dimension) in params {
         let k = n / 256;
