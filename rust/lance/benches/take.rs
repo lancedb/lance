@@ -7,9 +7,16 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
 
+use futures::StreamExt;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::{arrow::FixedSizeListArrayExt, dataset::ProjectionRequest};
+use lance_core::cache::LanceCache;
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::v2::reader::{FileReader, FileReaderOptions};
+use lance_file::v2::LanceEncodingsIo;
 use lance_file::version::LanceFileVersion;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
@@ -30,7 +37,31 @@ fn gen_ranges(num_rows: u64, file_size: u64, n: usize) -> Vec<u64> {
     ranges
 }
 
-fn bench_take_for_version(
+fn bench_random_take_with_dataset(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let num_batches = 1024;
+
+    for file_size in [1024 * 1024, 1024] {
+        dataset_take(
+            c,
+            &rt,
+            file_size,
+            num_batches,
+            LanceFileVersion::V2_0,
+            "V2_0",
+        );
+        dataset_take(
+            c,
+            &rt,
+            file_size,
+            num_batches,
+            LanceFileVersion::V2_1,
+            "V2_1",
+        );
+    }
+}
+
+fn dataset_take(
     c: &mut Criterion,
     rt: &tokio::runtime::Runtime,
     file_size: usize,
@@ -49,10 +80,8 @@ fn bench_take_for_version(
     for num_rows in [1, 10, 100, 1000] {
         c.bench_function(
             &format!(
-                "{} Random Take ({} file size, {} batches, {} rows per take)",
-                version_name, file_size, num_batches, num_rows
-            ),
-            |b| {
+                "{version_name} Random Take Dataset({file_size} file size, {num_batches} batches, {num_rows} rows per take)",
+            ), |b| {
                 b.to_async(rt).iter(|| async {
                     let rows =
                         gen_ranges(num_batches as u64 * BATCH_SIZE, file_size as u64, num_rows);
@@ -67,27 +96,129 @@ fn bench_take_for_version(
     }
 }
 
-fn bench_random_take(c: &mut Criterion) {
+fn bench_random_take_with_file_reader(c: &mut Criterion) {
+    // default tokio runtime
     let rt = tokio::runtime::Runtime::new().unwrap();
     let num_batches = 1024;
+    let file_size = num_batches * BATCH_SIZE as i32 + 1;
 
-    for file_size in [1024 * 1024, 1024] {
-        bench_take_for_version(
-            c,
-            &rt,
-            file_size,
-            num_batches,
-            LanceFileVersion::V2_0,
-            "V2_0",
+    file_reader_take(c, &rt, file_size, num_batches, LanceFileVersion::V2_0, "V2_0");
+    file_reader_take(c, &rt, file_size, num_batches, LanceFileVersion::V2_1, "V2_1");
+}
+
+fn file_reader_take(
+    c: &mut Criterion,
+    rt: &tokio::runtime::Runtime,
+    file_size: i32,
+    num_batches: i32,
+    version: LanceFileVersion,
+    version_name: &str,
+) {
+    let file_reader = rt.block_on(async {
+        // Make sure there is only one fragment.
+        let dataset = create_dataset("memory://test.lance", version, num_batches, file_size).await;
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+        let fragments = dataset.get_fragments();
+        let fragment = fragments.first().unwrap();
+        assert_eq!(fragment.num_data_files(), 1);
+        let file = fragment.metadata().files.get(0).unwrap();
+        let file_path = dataset.data_dir().child(file.path.as_str());
+
+        // Create file reader v2.
+        let scheduler = ScanScheduler::new(
+            dataset.object_store,
+            SchedulerConfig {
+                io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
+            },
         );
-        bench_take_for_version(
-            c,
-            &rt,
-            file_size,
-            num_batches,
-            LanceFileVersion::V2_1,
-            "V2_1",
-        );
+        let file = scheduler
+            .open_file(&file_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_metadata = FileReader::read_all_metadata(&file).await.unwrap();
+
+        FileReader::try_open_with_file_metadata(
+            Arc::new(LanceEncodingsIo(file.clone())),
+            file_path,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            Arc::new(file_metadata),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+            .await
+            .unwrap()
+    });
+
+    // Bench random take.
+    for num_rows in [1, 10, 100, 1000] {
+        c.bench_function(&format!(
+            "{version_name} Random Take FileReader({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
+        ), |b| {
+            b.to_async(rt).iter(|| async {
+                let rows = gen_ranges(num_batches as u64 * BATCH_SIZE, file_size as u64, num_rows);
+                for r in rows {
+                    let stream = file_reader
+                        .read_stream(
+                            lance_io::ReadBatchParams::Range((r as usize)..(r + 1) as usize),
+                            1,
+                            1,
+                            FilterExpression::no_filter(),
+                        )
+                        .unwrap();
+                    stream.fold(Vec::new(), |mut acc, item| async move {
+                        acc.push(item);
+                        acc
+                    }).await;
+                }
+            })
+        });
+    }
+}
+
+fn bench_random_take_with_file_fragment(c: &mut Criterion) {
+    // default tokio runtime
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let num_batches: i32 = 1024;
+    // Make sure there is only one fragment.
+    let file_size = num_batches * BATCH_SIZE as i32 + 1;
+
+    fragment_take(c, &rt, file_size, num_batches, LanceFileVersion::V2_0, "V2_0");
+    fragment_take(c, &rt, file_size, num_batches, LanceFileVersion::V2_1, "V2_1");
+}
+
+fn fragment_take(
+    c: &mut Criterion,
+    rt: &tokio::runtime::Runtime,
+    file_size: i32,
+    num_batches: i32,
+    version: LanceFileVersion,
+    version_name: &str,
+) {
+    let dataset = rt.block_on(create_dataset(
+        "memory://test.lance",
+        version,
+        num_batches,
+        file_size,
+    ));
+
+    assert_eq!(dataset.get_fragments().len(), 1);
+    let fragments = dataset.get_fragments();
+    let fragment = fragments.first().unwrap();
+
+    // Bench random take.
+    for num_rows in [1, 10, 100, 1000] {
+        c.bench_function(&format!(
+            "{version_name} Random Take Fragment({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
+        ), |b| {
+            b.to_async(rt).iter(|| async {
+                let rows = gen_ranges(num_batches as u64 * BATCH_SIZE, file_size as u64, num_rows);
+                for r in rows {
+                    let _ = fragment.take(&[r as u32], dataset.schema()).await;
+                }
+            })
+        });
     }
 }
 
@@ -170,10 +301,10 @@ criterion_group!(
         .sample_size(10000)
         .warm_up_time(Duration::from_secs_f32(3.0))
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_random_take);
+    targets = bench_random_take_with_dataset, bench_random_take_with_file_fragment, bench_random_take_with_file_reader);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_random_take);
+    targets = bench_random_take_with_dataset, bench_random_take_with_file_fragment, bench_random_take_with_file_reader);
 criterion_main!(benches);

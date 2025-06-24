@@ -1069,7 +1069,7 @@ impl Dataset {
         &self.object_store
     }
 
-    pub(crate) fn data_dir(&self) -> Path {
+    pub fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
     }
 
