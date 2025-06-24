@@ -299,6 +299,7 @@ where
             .par_chunks_mut(dimension * chunk_size)
             .zip(cluster_cnts.par_chunks_mut(chunk_size))
             .enumerate()
+            .with_max_len(1)
             .for_each(|(i, (centroids, cnts))| {
                 let start = i * chunk_size;
                 let end = ((i + 1) * chunk_size).min(k);
@@ -311,9 +312,9 @@ where
                         if start <= cluster_id && cluster_id < end {
                             let local_id = cluster_id - start;
                             cnts[local_id] += 1;
-                            let centoid =
+                            let centroid =
                                 &mut centroids[local_id * dimension..(local_id + 1) * dimension];
-                            centoid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
                         }
                     });
             });
