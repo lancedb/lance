@@ -6634,23 +6634,13 @@ mod tests {
         )]));
 
         // Create dataset with 3 fragments (N=3)
-        let data1 = RecordBatch::try_new(
+        let data = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(UInt32Array::from_iter_values(0..10))],
-        )
-        .unwrap();
-        let data2 = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(UInt32Array::from_iter_values(10..20))],
-        )
-        .unwrap();
-        let data3 = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(UInt32Array::from_iter_values(20..30))],
+            vec![Arc::new(UInt32Array::from_iter_values(0..30))],
         )
         .unwrap();
         let batches = RecordBatchIterator::new(
-            vec![data1, data2, data3].into_iter().map(Ok),
+            vec![Ok(data)],
             schema.clone(),
         );
         let write_params = WriteParams {
@@ -6677,18 +6667,12 @@ mod tests {
         assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
 
         // Append more fragments (2 new fragments)
-        let data4 = RecordBatch::try_new(
+        let data = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(UInt32Array::from_iter_values(100..110))],
+            vec![Arc::new(UInt32Array::from_iter_values(100..120))],
         )
         .unwrap();
-        let data5 = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(UInt32Array::from_iter_values(110..120))],
-        )
-        .unwrap();
-        let batches =
-            RecordBatchIterator::new(vec![data4, data5].into_iter().map(Ok), schema.clone());
+        let batches = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
         let write_params = WriteParams {
             mode: WriteMode::Append,
             max_rows_per_file: 10, // Force multiple fragments
