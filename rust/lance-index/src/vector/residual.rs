@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::iter;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
+use std::{iter, ops::MulAssign};
 
 use arrow_array::ArrowNumericType;
 use arrow_array::{
@@ -64,7 +64,8 @@ fn do_compute_residual<T: ArrowNumericType>(
     partitions: Option<&UInt32Array>,
 ) -> Result<FixedSizeListArray>
 where
-    T::Native: Num + Float + L2 + Dot + DivAssign + AddAssign + FromPrimitive,
+    T::Native: Num + Float + L2 + Dot + MulAssign + DivAssign + AddAssign + FromPrimitive,
+    PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     let dimension = centroids.value_length() as usize;
     let centroids = centroids.values().as_primitive::<T>();
