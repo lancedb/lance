@@ -578,26 +578,5 @@ pub fn index_matches_criteria(
             return Ok(false);
         }
     }
-
-    // Do not use indices with empty fragment bitmaps, except for FTS indices
-    // which need to be discoverable even when empty
-    if let Some(fragment_bitmap) = &index.fragment_bitmap {
-        if fragment_bitmap.is_empty() {
-            // Check if this is an FTS index - either by explicit criteria or by detecting the index type
-            let is_fts_requested = criteria.has_type == Some(ScalarIndexType::Inverted);
-            let is_fts_index = if let Ok(Some(index_type)) = best_effort_scalar_index_type(index) {
-                index_type == ScalarIndexType::Inverted
-            } else {
-                false
-            };
-
-            if is_fts_requested || is_fts_index {
-                // FTS index - allow empty bitmap
-            } else {
-                return Ok(false);
-            }
-        }
-    }
-
     Ok(true)
 }

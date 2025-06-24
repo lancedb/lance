@@ -461,7 +461,19 @@ impl DatasetIndexExt for Dataset {
                 let field = self.schema().field_by_id(field_id);
                 if let Some(field) = field {
                     if index_matches_criteria(idx, &criteria, field, has_multiple)? {
-                        return Ok(Some(idx.clone()));
+                        let non_empty = idx.fragment_bitmap.as_ref().map_or(false, |bitmap| {
+                            bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
+                        });
+                        let is_fts_index = if let Some(_details) = &idx.index_details {
+                            use crate::index::scalar::infer_index_type;
+                            matches!(infer_index_type(idx), Some(IndexType::Inverted))
+                        } else {
+                            false
+                        };
+                        if non_empty || is_fts_index {
+                            // If the index is non-empty or an FTS index, return it.
+                            return Ok(Some(idx.clone()));
+                        }
                     }
                 }
             }
@@ -573,7 +585,7 @@ impl DatasetIndexExt for Dataset {
 
         let index_type = indices[0].index_type().to_string();
 
-        let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
+        let indexed_fragments_per_delta = dbg!(self.indexed_fragments(index_name).await?);
 
         let res = indexed_fragments_per_delta
             .iter()
@@ -1034,10 +1046,9 @@ impl DatasetIndexInternalExt for Dataset {
 
             // Only include indices with non-empty fragment bitmaps, except for FTS indices
             // which need to be discoverable even when empty
-            let has_non_empty_bitmap = idx
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(|bitmap| !bitmap.is_empty());
+            let has_non_empty_bitmap = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                !bitmap.is_empty() && !(bitmap & self.fragment_bitmap.as_ref()).is_empty()
+            });
 
             idx.fields.len() == 1 && !is_vector_index && (has_non_empty_bitmap || is_fts_index)
         }) {
@@ -2275,6 +2286,9 @@ mod tests {
         // Verify index is being used before delete
         assert_index_usage(&plan, column_name, true, "before delete");
 
+        let indexes = dataset.load_indices().await.unwrap();
+        let original_index = indexes[0].clone();
+
         // Delete all rows from the table
         dataset.delete("true").await.unwrap();
 
@@ -2295,14 +2309,17 @@ mod tests {
         );
 
         // Critical test: Verify the fragment bitmap is empty after delete
-        let indices = dataset.load_indices().await.unwrap();
-        let index = &indices[0];
+        let index_after_delete = &indices_after_delete[0];
+        let effective_bitmap = index_after_delete
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .unwrap();
         assert!(
-            index
-                .fragment_bitmap
-                .as_ref()
-                .is_none_or(|bitmap| bitmap.is_empty()),
-            "Fragment bitmap should be empty after deleting all data"
+            effective_bitmap.is_empty(),
+            "Effective bitmap should be empty after deleting all data"
+        );
+        assert_eq!(
+            index_after_delete.fragment_bitmap, original_index.fragment_bitmap,
+            "Fragment bitmap should remain the same after delete"
         );
 
         // Verify we can still get index statistics
@@ -2311,6 +2328,18 @@ mod tests {
         assert_eq!(
             stats["num_indexed_rows"], 0,
             "Index should now report zero indexed rows after delete all"
+        );
+        assert_eq!(
+            stats["num_unindexed_rows"], 0,
+            "Index should report zero unindexed rows after delete all"
+        );
+        assert_eq!(
+            stats["num_indexed_fragments"], 0,
+            "Index should report zero indexed fragments after delete all"
+        );
+        assert_eq!(
+            stats["num_unindexed_fragments"], 0,
+            "Index should report zero unindexed fragments after delete all"
         );
 
         // Verify index is NOT being used in queries after delete (empty bitmap)
@@ -2489,15 +2518,15 @@ mod tests {
             "Index should be retained after updating rows"
         );
 
-        // Critical test: Verify the fragment bitmap is empty after update
+        // Critical test: Verify the effective fragment bitmap is empty after update
         let indices = dataset.load_indices().await.unwrap();
         let index = &indices[0];
+        let effective_bitmap = index
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .unwrap();
         assert!(
-            index
-                .fragment_bitmap
-                .as_ref()
-                .is_none_or(|bitmap| bitmap.is_empty()),
-            "Fragment bitmap should be empty after updating all data"
+            effective_bitmap.is_empty(),
+            "Effective fragment bitmap should be empty after updating all data"
         );
 
         // Verify we can still get index statistics
@@ -2540,12 +2569,13 @@ mod tests {
                 .explain_plan(false)
                 .await
                 .unwrap();
-            // Verify index is NOT being used after update (empty bitmap)
+            // With immutable bitmaps, index is still used even with empty effective bitmap
+            // The prefilter will handle non-existent fragments
             assert_index_usage(
                 &_plan_after_update,
                 column_name,
-                false,
-                "after update (empty bitmap)",
+                true,
+                "after update (empty effective bitmap)",
             );
         }
 

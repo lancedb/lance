@@ -1109,10 +1109,6 @@ impl Transaction {
                         }
                     }
                 });
-                Self::prune_deleted_fragments_from_indices(
-                    &mut final_indices,
-                    deleted_fragment_ids,
-                );
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Update {
@@ -1473,17 +1469,6 @@ impl Transaction {
         }
     }
 
-    /// Remove deleted fragments from index bitmaps
-    fn prune_deleted_fragments_from_indices(indices: &mut [Index], deleted_fragment_ids: &[u64]) {
-        for index in indices.iter_mut() {
-            if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                for fragment_id in deleted_fragment_ids.iter().map(|&id| id as u32) {
-                    fragment_bitmap.remove(fragment_id);
-                }
-            }
-        }
-    }
-
     fn is_vector_index(index: &Index) -> bool {
         if let Some(details) = &index.index_details {
             details.type_url.ends_with("VectorIndexDetails")
@@ -1492,7 +1477,7 @@ impl Transaction {
         }
     }
 
-    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, fragments: &[Fragment]) {
+    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, _fragments: &[Fragment]) {
         let field_ids = schema
             .fields_pre_order()
             .map(|f| f.id)
@@ -1507,23 +1492,9 @@ impl Transaction {
                 || existing_index.name == FRAG_REUSE_INDEX_NAME
         });
 
-        let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
-
-        // Update fragment bitmaps to remove non-existent fragments
-        for existing_index in indices.iter_mut() {
-            if let Some(fragment_bitmap) = &mut existing_index.fragment_bitmap {
-                // Remove fragments that no longer exist
-                let mut ids_to_remove = Vec::new();
-                for id in fragment_bitmap.iter() {
-                    if !fragment_ids.contains(&(id as u64)) {
-                        ids_to_remove.push(id);
-                    }
-                }
-                for id in ids_to_remove {
-                    fragment_bitmap.remove(id);
-                }
-            }
-        }
+        // Fragment bitmaps are now immutable and always represent the fragments that
+        // the index contains row IDs for, regardless of whether those fragments still exist.
+        // This ensures consistent prefiltering behavior and clear semantics.
 
         // Apply retention logic for indices with empty bitmaps per index name
         // (except for fragment reuse indices which are always kept)

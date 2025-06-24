@@ -37,6 +37,7 @@ use lance_table::io::commit::{
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use object_store::path::Path;
 use prost::Message;
+use roaring::RoaringBitmap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -130,6 +131,9 @@ pub struct Dataset {
     pub(crate) manifest_location: ManifestLocation,
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
+
+    // Bitmap of fragment ids in this dataset.
+    pub(crate) fragment_bitmap: Arc<RoaringBitmap>,
 
     // These are references to session caches, but with the dataset URI as a prefix.
     pub(crate) metadata_cache: Arc<LanceCache>,
@@ -346,6 +350,13 @@ impl Dataset {
         let (manifest, manifest_location) = self.latest_manifest().await?;
         self.manifest = manifest;
         self.manifest_location = manifest_location;
+        self.fragment_bitmap = Arc::new(
+            self.manifest
+                .fragments
+                .iter()
+                .map(|f| f.id as u32)
+                .collect(),
+        );
         Ok(())
     }
 
@@ -504,6 +515,7 @@ impl Dataset {
             base_path.clone(),
         );
         let metadata_cache = Arc::new(session.metadata_cache.with_key_prefix(&uri));
+        let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
         Ok(Self {
             object_store,
             base: base_path,
@@ -513,6 +525,7 @@ impl Dataset {
             commit_handler,
             session,
             tags,
+            fragment_bitmap,
             metadata_cache,
         })
     }
@@ -866,6 +879,13 @@ impl Dataset {
 
         self.manifest = Arc::new(manifest);
         self.manifest_location = manifest_location;
+        self.fragment_bitmap = Arc::new(
+            self.manifest
+                .fragments
+                .iter()
+                .map(|f| f.id as u32)
+                .collect(),
+        );
 
         Ok(())
     }
