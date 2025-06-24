@@ -446,7 +446,7 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
             index_fragmaps.push(fragment_bitmap.clone());
         } else {
             let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
-            let frags = 0..dataset_at_index.manifest.max_fragment_id;
+            let frags = 0..dataset_at_index.manifest.max_fragment_id.unwrap_or(0);
             index_fragmaps.push(RoaringBitmap::from_sorted_iter(frags).unwrap());
         }
     }
@@ -622,7 +622,7 @@ async fn reserve_fragment_ids(
     .await?;
 
     // Need +1 since max_fragment_id is inclusive in this case and ranges are exclusive
-    let new_max_exclusive = manifest.max_fragment_id + 1;
+    let new_max_exclusive = manifest.max_fragment_id.unwrap_or(0) + 1;
     let reserved_ids = (new_max_exclusive - fragments.len() as u32)..(new_max_exclusive);
 
     for (fragment, new_id) in fragments.zip(reserved_ids) {

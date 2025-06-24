@@ -70,8 +70,9 @@ pub struct Manifest {
     /// The writer flags
     pub writer_feature_flags: u64,
 
-    /// The max fragment id used so far
-    pub max_fragment_id: u32,
+    /// The max fragment id used so far  
+    /// None means never set, Some(0) means max ID used so far is 0
+    pub max_fragment_id: Option<u32>,
 
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
@@ -135,7 +136,7 @@ impl Manifest {
             tag: None,
             reader_feature_flags: 0,
             writer_feature_flags: 0,
-            max_fragment_id: 0,
+            max_fragment_id: None,
             transaction_file: None,
             fragment_offsets,
             next_row_id: 0,
@@ -230,8 +231,18 @@ impl Manifest {
             .try_into()
             .unwrap();
 
-        if max_fragment_id > self.max_fragment_id {
-            self.max_fragment_id = max_fragment_id;
+        match self.max_fragment_id {
+            None => {
+                // First time being set
+                self.max_fragment_id = Some(max_fragment_id);
+            }
+            Some(current_max) => {
+                // Only update if the computed max is greater than current
+                // This preserves the high water mark even when fragments are deleted
+                if max_fragment_id > current_max {
+                    self.max_fragment_id = Some(max_fragment_id);
+                }
+            }
         }
     }
 
@@ -240,12 +251,11 @@ impl Manifest {
     ///
     /// This will return None if there are no fragments.
     pub fn max_fragment_id(&self) -> Option<u64> {
-        if self.max_fragment_id == 0 {
-            // It might not have been updated, so the best we can do is recompute
-            // it from the fragment list.
-            self.fragments.iter().map(|f| f.id).max()
+        if let Some(max_id) = self.max_fragment_id {
+            Some(max_id.into())
         } else {
-            Some(self.max_fragment_id.into())
+            // Not yet set, compute from fragment list
+            self.fragments.iter().map(|f| f.id).max()
         }
     }
 
@@ -518,7 +528,6 @@ impl TryFrom<pb::Manifest> for Manifest {
             local_schema,
             version: p.version,
             writer_version,
-            fragments,
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
             timestamp_nanos: timestamp_nanos.unwrap_or(0),
@@ -526,6 +535,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             reader_feature_flags: p.reader_feature_flags,
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
+            fragments,
             transaction_file: if p.transaction_file.is_empty() {
                 None
             } else {

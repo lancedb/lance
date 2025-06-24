@@ -6553,4 +6553,155 @@ mod tests {
             ManifestNamingScheme::V2
         );
     }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fragment_id_zero_not_reused() {
+        // Test case 1: Fragment id zero isn't re-used
+        // 1. Create a dataset with 1 fragment
+        // 2. Delete all rows
+        // 3. Append another fragment
+        // 4. Assert new fragment has id 1 not 0
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        // Create dataset with 1 fragment
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        // Verify we have 1 fragment with id 0
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_eq!(dataset.get_fragments()[0].id(), 0);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(0));
+
+        // Delete all rows
+        dataset.delete("true").await.unwrap();
+
+        // After deletion, dataset should be empty but max_fragment_id preserved
+        assert_eq!(dataset.get_fragments().len(), 0);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(0));
+
+        // Append another fragment
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(20..30))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Assert new fragment has id 1, not 0
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_eq!(dataset.get_fragments()[0].id(), 1);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fragment_id_never_reset() {
+        // Test case 2: Fragment id is never reset, even if all rows are deleted
+        // 1. Create dataset with N fragments
+        // 2. Delete all rows
+        // 3. Append more fragments
+        // 4. Assert new fragments have ids >= N
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        // Create dataset with 3 fragments (N=3)
+        let data1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+        let data2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(10..20))],
+        )
+        .unwrap();
+        let data3 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(20..30))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(
+            vec![data1, data2, data3].into_iter().map(Ok),
+            schema.clone(),
+        );
+        let write_params = WriteParams {
+            max_rows_per_file: 10, // Force multiple fragments
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Verify we have 3 fragments with ids 0, 1, 2
+        assert_eq!(dataset.get_fragments().len(), 3);
+        assert_eq!(dataset.get_fragments()[0].id(), 0);
+        assert_eq!(dataset.get_fragments()[1].id(), 1);
+        assert_eq!(dataset.get_fragments()[2].id(), 2);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
+
+        // Delete all rows
+        dataset.delete("true").await.unwrap();
+
+        // After deletion, dataset should be empty but max_fragment_id preserved
+        assert_eq!(dataset.get_fragments().len(), 0);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
+
+        // Append more fragments (2 new fragments)
+        let data4 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(100..110))],
+        )
+        .unwrap();
+        let data5 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(110..120))],
+        )
+        .unwrap();
+        let batches =
+            RecordBatchIterator::new(vec![data4, data5].into_iter().map(Ok), schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            max_rows_per_file: 10, // Force multiple fragments
+            ..Default::default()
+        };
+        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Assert new fragments have ids >= N (3, 4)
+        assert_eq!(dataset.get_fragments().len(), 2);
+        assert_eq!(dataset.get_fragments()[0].id(), 3);
+        assert_eq!(dataset.get_fragments()[1].id(), 4);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(4));
+    }
 }

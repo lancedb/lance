@@ -1428,7 +1428,7 @@ impl Transaction {
         }
 
         if let Operation::ReserveFragments { num_fragments } = self.operation {
-            manifest.max_fragment_id += num_fragments;
+            manifest.max_fragment_id = Some(manifest.max_fragment_id.unwrap_or(0) + num_fragments);
         }
 
         manifest.transaction_file = Some(transaction_file_path.to_string());
