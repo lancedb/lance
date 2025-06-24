@@ -393,7 +393,7 @@ impl ObjectStore for IoTrackingStore {
         let result = self.target.get(location).await;
         if let Ok(result) = &result {
             let num_bytes = result.range.end - result.range.start;
-            self.record_read(num_bytes as u64);
+            self.record_read(num_bytes);
         }
         result
     }
@@ -403,12 +403,12 @@ impl ObjectStore for IoTrackingStore {
         let result = self.target.get_opts(location, options).await;
         if let Ok(result) = &result {
             let num_bytes = result.range.end - result.range.start;
-            self.record_read(num_bytes as u64);
+            self.record_read(num_bytes);
         }
         result
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
         let _guard = self.hop_guard();
         let result = self.target.get_range(location, range).await;
         if let Ok(result) = &result {
@@ -417,7 +417,7 @@ impl ObjectStore for IoTrackingStore {
         result
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
         let _guard = self.hop_guard();
         let result = self.target.get_ranges(location, ranges).await;
         if let Ok(result) = &result {
@@ -445,7 +445,7 @@ impl ObjectStore for IoTrackingStore {
         self.target.delete_stream(locations)
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
         let _guard = self.hop_guard();
         self.record_read(0);
         self.target.list(prefix)
@@ -455,7 +455,7 @@ impl ObjectStore for IoTrackingStore {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> BoxStream<'_, OSResult<ObjectMeta>> {
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
         self.record_read(0);
         self.target.list_with_offset(prefix, offset)
     }

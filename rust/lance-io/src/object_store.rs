@@ -556,7 +556,7 @@ impl ObjectStore {
     }
 
     /// Get file size.
-    pub async fn size(&self, path: &Path) -> Result<usize> {
+    pub async fn size(&self, path: &Path) -> Result<u64> {
         Ok(self.inner.head(path).await?.size)
     }
 
