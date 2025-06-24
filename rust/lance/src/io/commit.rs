@@ -444,7 +444,7 @@ pub(crate) async fn migrate_fragments(
                             object_store
                                 .size(&dataset.base.child("data").child(file.path.clone()))
                                 .map_ok(|size| {
-                                    NonZero::new(size as u64).ok_or_else(|| Error::Internal {
+                                    NonZero::new(size).ok_or_else(|| Error::Internal {
                                         message: format!("File {} has size 0", file.path),
                                         location: location!(),
                                     })
