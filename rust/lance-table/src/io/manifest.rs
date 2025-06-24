@@ -40,8 +40,8 @@ pub async fn read_manifest(
     } else {
         object_store.inner.head(path).await?.size
     };
-    const PREFETCH_SIZE: usize = 64 * 1024;
-    let initial_start = std::cmp::max(file_size - PREFETCH_SIZE as u64, 0);
+    const PREFETCH_SIZE: u64 = 64 * 1024;
+    let initial_start = file_size.saturating_sub(PREFETCH_SIZE);
     let range = Range {
         start: initial_start,
         end: file_size,
@@ -81,7 +81,7 @@ pub async fn read_manifest(
                 path,
                 Range {
                     start: manifest_pos as u64,
-                    end: file_size - PREFETCH_SIZE as u64,
+                    end: file_size - PREFETCH_SIZE,
                 },
             )
             .await?

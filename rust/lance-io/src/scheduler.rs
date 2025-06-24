@@ -1190,7 +1190,7 @@ mod tests {
                     GetRange::Bounded(bounded) => bounded.end - bounded.start,
                     _ => panic!(),
                 };
-                bytes_read_copy.fetch_add(num_bytes as u64, Ordering::Release);
+                bytes_read_copy.fetch_add(num_bytes, Ordering::Release);
                 let location = location.clone();
                 let base_store = base_store.clone();
                 async move { base_store.get_opts(&location, options).await }.boxed()
