@@ -293,14 +293,15 @@ where
         if k < num_cpus || k < 16 {
             num_cpus = 1;
         }
+        let chunk_size = k / num_cpus;
 
         centroids
-            .par_chunks_mut(dimension * k / num_cpus)
-            .zip(cluster_cnts.par_chunks_mut(k / num_cpus))
+            .par_chunks_mut(dimension * chunk_size)
+            .zip(cluster_cnts.par_chunks_mut(chunk_size))
             .enumerate()
             .for_each(|(i, (centroids, cnts))| {
-                let start = i * k / num_cpus;
-                let end = ((i + 1) * k / num_cpus).min(k);
+                let start = i * chunk_size;
+                let end = ((i + 1) * chunk_size).min(k);
                 data.chunks(dimension)
                     .zip(membership.iter())
                     .filter_map(|(vector, cluster_id)| {
