@@ -29,7 +29,7 @@ use log::{info, warn};
 use num_traits::One;
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
-use rayon::{current_num_threads, current_thread_index, prelude::*};
+use rayon::prelude::*;
 
 use crate::distance::hamming::{hamming, hamming_distance_batch};
 use crate::distance::{dot_distance_batch, DistanceType};
@@ -294,43 +294,28 @@ where
             num_cpus = 1;
         }
 
-        (0..num_cpus).into_par_iter().for_each(|_| {
-            let i = current_thread_index().unwrap();
-            let num_threads = current_num_threads();
-            let centroids_ptr = centroids.as_ptr();
-            let cluster_cnts_ptr = cluster_cnts.as_ptr();
-            let start = i * k / num_threads;
-            let end = ((i + 1) * k / num_threads).min(k);
-
-            // SAFETY: Each thread gets a unique, non-overlapping chunk.
-            let local_centroids = unsafe {
-                std::slice::from_raw_parts_mut(
-                    (centroids_ptr as *mut T::Native).add(start * dimension),
-                    (end - start) * dimension,
-                )
-            };
-            let local_counts = unsafe {
-                std::slice::from_raw_parts_mut(
-                    (cluster_cnts_ptr as *mut u64).add(start),
-                    end - start,
-                )
-            };
-
-            data.chunks_exact(dimension)
-                .zip(membership.iter())
-                .filter_map(|(vector, cluster_id)| {
-                    cluster_id.map(|cluster_id| (vector, cluster_id as usize))
-                })
-                .for_each(|(vector, cluster_id)| {
-                    if start <= cluster_id && cluster_id < end {
-                        let local_id = cluster_id - start;
-                        local_counts[local_id] += 1;
-                        let centoid =
-                            &mut local_centroids[local_id * dimension..(local_id + 1) * dimension];
-                        centoid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
-                    }
-                });
-        });
+        centroids
+            .par_chunks_mut(dimension * k / num_cpus)
+            .zip(cluster_cnts.par_chunks_mut(k / num_cpus))
+            .enumerate()
+            .for_each(|(i, (centroids, cnts))| {
+                let start = i * k / num_cpus;
+                let end = ((i + 1) * k / num_cpus).min(k);
+                data.chunks(dimension)
+                    .zip(membership.iter())
+                    .filter_map(|(vector, cluster_id)| {
+                        cluster_id.map(|cluster_id| (vector, cluster_id as usize))
+                    })
+                    .for_each(|(vector, cluster_id)| {
+                        if start <= cluster_id && cluster_id < end {
+                            let local_id = cluster_id - start;
+                            cnts[local_id] += 1;
+                            let centoid =
+                                &mut centroids[local_id * dimension..(local_id + 1) * dimension];
+                            centoid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                        }
+                    });
+            });
 
         centroids
             .par_chunks_mut(dimension)
