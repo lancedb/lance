@@ -11,9 +11,9 @@ use futures::prelude::stream::{StreamExt, TryStreamExt};
 use futures::{stream, FutureExt};
 use itertools::Itertools;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
-use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::ROW_ID;
+use lance_core::{cache::LanceCache, datatypes::Schema};
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::FileReaderOptions;
@@ -776,18 +776,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     #[instrument(name = "merge_partitions", level = "debug", skip_all)]
     async fn merge_partitions(&mut self) -> Result<()> {
-        let dataset = self.dataset.as_ref().ok_or(Error::invalid_input(
-            "dataset not set before merge partitions",
-            location!(),
-        ))?;
-        let vector_field =
-            dataset
-                .schema()
-                .field_with_name(self.column.as_str())
-                .ok_or(Error::invalid_input(
-                    "vector field not found in dataset",
-                    location!(),
-                ))?;
         let ivf = self.ivf.as_ref().ok_or(Error::invalid_input(
             "IVF not set before merge partitions",
             location!(),
@@ -804,9 +792,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
         let index_path = self.index_dir.child(INDEX_FILE_NAME);
+
+        let storage_schema: Schema =
+            (&arrow_schema::Schema::new(vec![ROW_ID_FIELD.clone(), quantizer.field()]))
+                .try_into()?;
         let mut storage_writer = FileWriter::try_new(
             self.store.create(&storage_path).await?,
-            Q::Storage::schema(vector_field).try_into()?,
+            storage_schema.clone(),
             Default::default(),
         )?;
         let mut index_writer = FileWriter::try_new(
@@ -848,14 +840,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .try_collect::<Vec<_>>()
                     .await?;
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
-                if storage_writer.is_none() {
-                    storage_writer = Some(FileWriter::try_new(
-                        self.store.create(&storage_path).await?,
-                        batch.schema_ref().as_ref().try_into()?,
-                        Default::default(),
-                    )?);
-                }
-                storage_writer.as_mut().unwrap().write_batch(&batch).await?;
+                storage_writer.write_batch(&batch).await?;
                 storage_ivf.add_partition(batch.num_rows() as u32);
             }
 
@@ -897,7 +882,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         }
 
-        let mut storage_writer = storage_writer.unwrap();
         let storage_ivf_pb = pb::Ivf::try_from(&storage_ivf)?;
         storage_writer.add_schema_metadata(DISTANCE_TYPE_KEY, self.distance_type.to_string());
         let ivf_buffer_pos = storage_writer

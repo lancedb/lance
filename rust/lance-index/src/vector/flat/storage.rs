@@ -16,9 +16,9 @@ use arrow_array::{
     types::{Float32Type, UInt64Type},
     Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array,
 };
-use arrow_schema::{Field, SchemaRef};
+use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
+use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::hamming::hamming;
 use lance_linalg::distance::DistanceType;
@@ -101,17 +101,6 @@ impl QuantizerStorage for FlatFloatStorage {
         _: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
-    }
-
-    fn schema(vector_field: &Field) -> Schema {
-        Schema::new(vec![
-            ROW_ID_FIELD.clone(),
-            Field::new(
-                FLAT_COLUMN,
-                vector_field.clone(),
-                vector_field.is_nullable(),
-            ),
-        ])
     }
 }
 
@@ -270,17 +259,6 @@ impl QuantizerStorage for FlatBinStorage {
         _: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
-    }
-
-    fn schema(vector_field: &Field) -> Schema {
-        Schema::new(vec![
-            ROW_ID_FIELD.clone(),
-            Field::new(
-                FLAT_COLUMN,
-                vector_field.clone(),
-                vector_field.is_nullable(),
-            ),
-        ])
     }
 }
 

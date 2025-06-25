@@ -1172,6 +1172,64 @@ mod tests {
         }
     }
 
+    async fn test_delete_all_rows(params: VectorIndexParams) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        let vector_column = "vector";
+        dataset
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        dataset.delete("id >= 0").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+
+        // optimize after delete all rows
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        let query = vectors.value(0);
+        let results = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<Float32Type>(), 100)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 0);
+
+        // compact after delete all rows
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        let vector_column = "vector";
+        dataset
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        dataset.delete("id >= 0").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<Float32Type>(), 100)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 0);
+    }
+
     #[tokio::test]
     async fn test_flat_knn() {
         test_distance_range(None, 4).await;
@@ -1195,7 +1253,8 @@ mod tests {
         }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params.clone(), nlist).await;
-        test_optimize_strategy(params).await;
+        test_optimize_strategy(params.clone()).await;
+        test_delete_all_rows(params).await;
     }
 
     #[rstest]
@@ -1243,7 +1302,8 @@ mod tests {
         }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params.clone(), nlist).await;
-        test_optimize_strategy(params).await;
+        test_optimize_strategy(params.clone()).await;
+        test_delete_all_rows(params).await;
     }
 
     #[rstest]
@@ -1310,7 +1370,8 @@ mod tests {
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
-        test_optimize_strategy(params).await;
+        test_optimize_strategy(params.clone()).await;
+        test_delete_all_rows(params).await;
     }
 
     #[rstest]
