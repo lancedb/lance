@@ -8,6 +8,7 @@ use std::{collections::HashMap, fmt::Debug};
 
 use arrow::{array::AsArray, compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::Schema;
 use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
@@ -268,6 +269,8 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         metadata: &Self::Metadata,
         fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>;
+
+    fn schema(vector_field: &Field) -> Schema;
 }
 
 /// Loader to load partitioned [VectorStore] from disk.

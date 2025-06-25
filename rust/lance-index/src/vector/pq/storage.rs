@@ -586,6 +586,13 @@ impl QuantizerStorage for ProductQuantizationStorage {
             fri,
         )
     }
+
+    fn schema(vector_field: &Field) -> Schema {
+        Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            PQ_CODE_COLUMN,
+        ])
+    }
 }
 
 impl VectorStore for ProductQuantizationStorage {

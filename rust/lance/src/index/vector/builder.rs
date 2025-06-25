@@ -776,6 +776,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     #[instrument(name = "merge_partitions", level = "debug", skip_all)]
     async fn merge_partitions(&mut self) -> Result<()> {
+        let dataset = self.dataset.as_ref().ok_or(Error::invalid_input(
+            "dataset not set before merge partitions",
+            location!(),
+        ))?;
+        let vector_field =
+            dataset
+                .schema()
+                .field_with_name(self.column.as_str())
+                .ok_or(Error::invalid_input(
+                    "vector field not found in dataset",
+                    location!(),
+                ))?;
         let ivf = self.ivf.as_ref().ok_or(Error::invalid_input(
             "IVF not set before merge partitions",
             location!(),
@@ -792,7 +804,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
         let index_path = self.index_dir.child(INDEX_FILE_NAME);
-        let mut storage_writer = None;
+        let mut storage_writer = FileWriter::try_new(
+            self.store.create(&storage_path).await?,
+            Q::Storage::schema(vector_field).try_into()?,
+            Default::default(),
+        )?;
         let mut index_writer = FileWriter::try_new(
             self.store.create(&index_path).await?,
             S::schema().as_ref().try_into()?,
