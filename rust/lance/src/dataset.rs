@@ -3966,7 +3966,8 @@ mod tests {
         assert_eq!(dataset.manifest.config, desired_config);
         assert_eq!(dataset.config().unwrap(), desired_config);
 
-        let other_value = dataset.config().unwrap().get(&["other-key"]).await.unwrap();
+        let config = dataset.config().unwrap().clone();
+        let other_value = config.get("other-key").unwrap();
         let mut expected = HashMap::new();
         expected.insert("other-key".to_string(), "other-value".to_string());
         assert_eq!(other_value, "other-value");
@@ -3975,7 +3976,7 @@ mod tests {
         dataset.delete_config_keys(&["other-key"]).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
         assert_eq!(dataset.config().unwrap(), desired_config);
-        assert_true!(!dataset.config().unwrap().contains_key(&["other-key"]));
+        assert_true!(!dataset.config().unwrap().contains_key("other-key"));
     }
 
     #[rstest]
