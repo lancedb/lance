@@ -23,6 +23,7 @@ use rand::Rng;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
+use object_store::path::Path;
 
 const BATCH_SIZE: u64 = 1024;
 
@@ -114,7 +115,7 @@ fn file_reader_take(
     version: LanceFileVersion,
     version_name: &str,
 ) {
-    let file_reader = rt.block_on(async {
+    let (dataset, file_path) = rt.block_on(async {
         // Make sure there is only one fragment.
         let dataset = create_dataset("memory://test.lance", version, num_batches, file_size).await;
 
@@ -125,30 +126,7 @@ fn file_reader_take(
         let file = fragment.metadata().files.get(0).unwrap();
         let file_path = dataset.data_dir().child(file.path.as_str());
 
-        // Create file reader v2.
-        let scheduler = ScanScheduler::new(
-            dataset.object_store,
-            SchedulerConfig {
-                io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
-            },
-        );
-        let file = scheduler
-            .open_file(&file_path, &CachedFileSize::unknown())
-            .await
-            .unwrap();
-        let file_metadata = FileReader::read_all_metadata(&file).await.unwrap();
-
-        FileReader::try_open_with_file_metadata(
-            Arc::new(LanceEncodingsIo(file.clone())),
-            file_path,
-            None,
-            Arc::<DecoderPlugins>::default(),
-            Arc::new(file_metadata),
-            &LanceCache::no_cache(),
-            FileReaderOptions::default(),
-        )
-            .await
-            .unwrap()
+        (dataset, file_path)
     });
 
     // Bench random take.
@@ -157,6 +135,8 @@ fn file_reader_take(
             "{version_name} Random Take FileReader({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
         ), |b| {
             b.to_async(rt).iter(|| async {
+                let file_reader = create_file_reader(&dataset, &file_path).await;
+
                 let rows = gen_ranges(num_batches as u64 * BATCH_SIZE, file_size as u64, num_rows);
                 for r in rows {
                     let stream = file_reader
@@ -175,6 +155,33 @@ fn file_reader_take(
             })
         });
     }
+}
+
+async fn create_file_reader(dataset: &Dataset, file_path: &Path) -> FileReader {
+    // Create file reader v2.
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig {
+            io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
+        },
+    );
+    let file = scheduler
+        .open_file(file_path, &CachedFileSize::unknown())
+        .await
+        .unwrap();
+    let file_metadata = FileReader::read_all_metadata(&file).await.unwrap();
+
+    FileReader::try_open_with_file_metadata(
+        Arc::new(LanceEncodingsIo(file.clone())),
+        file_path.clone(),
+        None,
+        Arc::<DecoderPlugins>::default(),
+        Arc::new(file_metadata),
+        &LanceCache::no_cache(),
+        FileReaderOptions::default(),
+    )
+    .await
+    .unwrap()
 }
 
 fn bench_random_take_with_file_fragment(c: &mut Criterion) {
