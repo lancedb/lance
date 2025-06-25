@@ -873,8 +873,8 @@ impl Dataset {
     }
 
     /// Get the table config from manifest
-    pub fn config(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.manifest.config.iter()
+    pub fn config(&self) -> Result<HashMap<String, String>> {
+        Ok(self.manifest.config.clone())
     }
 
     /// Create a Scanner to scan the dataset.
@@ -1765,25 +1765,6 @@ impl Dataset {
         Ok(())
     }
 
-    /// Get config items based on the given keys.
-    pub async fn get_configs(&mut self, keys: Option<&[&str]>) -> Result<HashMap<String, String>> {
-        let mut result;
-
-        match keys {
-            Some(keys) => {
-                result = HashMap::new();
-                for &key in keys {
-                    if let Some(value) = self.manifest.config.get(key) {
-                        result.insert(key.to_string(), value.clone());
-                    }
-                }
-            }
-            None => result = self.manifest.config.clone(),
-        }
-
-        Ok(result)
-    }
-
     /// Update key-value pairs in config.
     pub async fn update_config(
         &mut self,
@@ -1971,6 +1952,7 @@ mod tests {
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
 
+    use all_asserts::assert_true;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -3982,37 +3964,18 @@ mod tests {
 
         dataset.update_config(desired_config.clone()).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
-        assert_eq!(dataset.get_configs(None).await.unwrap(), desired_config);
-        assert_eq!(
-            dataset
-                .config()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<HashMap<_, _>>(),
-            desired_config
-        );
+        assert_eq!(dataset.config().unwrap(), desired_config);
 
-        let configs = dataset.get_configs(Some(&["other-key"])).await.unwrap();
+        let other_value = dataset.config().unwrap().get(&["other-key"]).await.unwrap();
         let mut expected = HashMap::new();
         expected.insert("other-key".to_string(), "other-value".to_string());
-        assert_eq!(configs, expected);
+        assert_eq!(other_value, "other-value");
 
         desired_config.remove("other-key");
         dataset.delete_config_keys(&["other-key"]).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
-        assert_eq!(dataset.get_configs(None).await.unwrap(), desired_config);
-        assert_eq!(
-            dataset
-                .config()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<HashMap<_, _>>(),
-            desired_config
-        );
-
-        expected = HashMap::new();
-        assert_eq!(
-            dataset.get_configs(Some(&["other-key"])).await.unwrap(),
-            expected
-        );
+        assert_eq!(dataset.config().unwrap(), desired_config);
+        assert_true!(!dataset.config().unwrap().contains_key(&["other-key"]));
     }
 
     #[rstest]

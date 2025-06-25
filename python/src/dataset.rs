@@ -1781,24 +1781,19 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (keys))]
-    fn get_configs(&mut self, keys: Option<Vec<String>>) -> PyResult<PyObject> {
-        let key_refs: Option<Vec<&str>> = keys
-            .as_ref()
-            .map(|ks| ks.iter().map(|k| k.as_str()).collect());
-        let key_refs = key_refs.as_deref();
-
+    #[pyo3(signature = ())]
+    fn config(&mut self) -> PyResult<PyObject> {
         let mut new_self = self.ds.as_ref().clone();
 
-        let configs = RT
-            .block_on(None, new_self.get_configs(key_refs))?
+        let config = new_self
+            .config()
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         self.ds = Arc::new(new_self);
 
         Python::with_gil(|py| {
             let dict = PyDict::new(py);
-            for (k, v) in configs {
+            for (k, v) in config {
                 dict.set_item(k, v)?;
             }
             Ok(dict.into())
