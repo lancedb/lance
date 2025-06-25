@@ -1783,7 +1783,7 @@ impl Dataset {
 
     #[pyo3(signature = ())]
     fn config(&mut self) -> PyResult<PyObject> {
-        let mut new_self = self.ds.as_ref().clone();
+        let new_self = self.ds.as_ref().clone();
 
         let config = new_self
             .config()
