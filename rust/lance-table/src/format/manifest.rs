@@ -222,12 +222,17 @@ impl Manifest {
 
     /// Check the current fragment list and update the high water mark
     pub fn update_max_fragment_id(&mut self) {
+        // If there are no fragments, don't update max_fragment_id
+        if self.fragments.is_empty() {
+            return;
+        }
+
         let max_fragment_id = self
             .fragments
             .iter()
             .map(|f| f.id)
             .max()
-            .unwrap_or_default()
+            .unwrap() // Safe because we checked fragments is not empty
             .try_into()
             .unwrap();
 
@@ -249,9 +254,10 @@ impl Manifest {
     /// Return the max fragment id.
     /// Note this does not support recycling of fragment ids.
     ///
-    /// This will return None if there are no fragments.
+    /// This will return None if there are no fragments and max_fragment_id was never set.
     pub fn max_fragment_id(&self) -> Option<u64> {
         if let Some(max_id) = self.max_fragment_id {
+            // Return the stored high water mark
             Some(max_id.into())
         } else {
             // Not yet set, compute from fragment list

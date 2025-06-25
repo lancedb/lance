@@ -6639,10 +6639,7 @@ mod tests {
             vec![Arc::new(UInt32Array::from_iter_values(0..30))],
         )
         .unwrap();
-        let batches = RecordBatchIterator::new(
-            vec![Ok(data)],
-            schema.clone(),
-        );
+        let batches = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
         let write_params = WriteParams {
             max_rows_per_file: 10, // Force multiple fragments
             ..Default::default()
