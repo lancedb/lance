@@ -1067,7 +1067,7 @@ mod tests {
 
         // Create paths relative to the ObjectStore base
         let from_path = base_path.child(source_file_name);
-        
+
         // Use object_store::Path::parse for the destination
         let dest_file = dest_dir.path().join("copied_file.txt");
         let dest_str = dest_file.to_str().unwrap();
@@ -1099,7 +1099,7 @@ mod tests {
 
         // Create paths
         let from_path = base_path.child(source_file_name);
-        
+
         // Create destination with nested directories that don't exist yet
         let dest_file = dest_dir
             .path()
