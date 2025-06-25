@@ -273,7 +273,7 @@ impl<'a> CleanupTask<'a> {
                 let path_to_remove =
                     self.path_if_not_referenced(obj_meta.location, maybe_in_progress, &inspection);
                 if matches!(path_to_remove, Ok(Some(..))) {
-                    removal_stats.lock().unwrap().bytes_removed += obj_meta.size as u64;
+                    removal_stats.lock().unwrap().bytes_removed += obj_meta.size;
                 }
                 future::ready(path_to_remove)
             })
@@ -290,7 +290,7 @@ impl<'a> CleanupTask<'a> {
             .await;
         let manifest_bytes_removed = stream::iter(manifest_bytes_removed)
             .buffer_unordered(self.dataset.object_store.io_parallelism())
-            .try_fold(0, |acc, size| async move { Ok(acc + (size as u64)) })
+            .try_fold(0, |acc, size| async move { Ok(acc + (size)) })
             .await;
 
         let old_manifests_stream = stream::iter(old_manifests)
@@ -808,7 +808,7 @@ mod tests {
                 num_bytes: 0,
             };
             while let Some(path) = file_stream.try_next().await? {
-                file_count.num_bytes += path.size as u64;
+                file_count.num_bytes += path.size;
                 match path.location.extension() {
                     Some("lance") => file_count.num_data_files += 1,
                     Some("manifest") => file_count.num_manifest_files += 1,

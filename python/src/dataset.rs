@@ -1780,6 +1780,25 @@ impl Dataset {
         self.ds = Arc::new(new_self);
         Ok(())
     }
+
+    #[pyo3(signature = ())]
+    fn config(&mut self) -> PyResult<PyObject> {
+        let new_self = self.ds.as_ref().clone();
+
+        let config = new_self
+            .config()
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        self.ds = Arc::new(new_self);
+
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            for (k, v) in config {
+                dict.set_item(k, v)?;
+            }
+            Ok(dict.into())
+        })
+    }
 }
 
 #[derive(FromPyObject)]

@@ -461,18 +461,6 @@ pub async fn detect_scalar_index_type(
     }
 }
 
-/// Grabs the scalar index type from the index details.  If the details are not
-/// present (written by an older version of Lance) then this returns None.
-fn best_effort_scalar_index_type(index: &Index) -> Result<Option<ScalarIndexType>> {
-    if let Some(details) = &index.index_details {
-        let details = get_scalar_index_details(details)?;
-        if let Some(details) = details {
-            return Ok(Some(details.get_type()));
-        }
-    }
-    Ok(None)
-}
-
 /// Infers the index type from the index details, if available.
 /// Returns None if the index details are not present or the type cannot be determined.
 /// This returns IndexType::Vector for all vector index types.
@@ -502,34 +490,56 @@ pub fn index_matches_criteria(
         }
     }
     if let Some(expected_type) = criteria.has_type {
-        let index_type = best_effort_scalar_index_type(index)?;
-        if let Some(index_type) = index_type {
-            if index_type != expected_type {
-                return Ok(false);
-            }
-            // We should not use FTS / NGram indices for exact equality queries
-            // (i.e. merge insert with a join on the indexed column)
-            if criteria.supports_exact_equality {
-                match index_type {
-                    ScalarIndexType::Inverted | ScalarIndexType::NGram => {
+        // there are 3 cases:
+        // - index_type is a scalar index type
+        // - index_type is a vector index type
+        // - index_type is not present, in which case that the index was created with an older version of Lance
+        match infer_index_type(index) {
+            Some(index_type) => {
+                if let Ok(index_type) = ScalarIndexType::try_from(index_type) {
+                    if index_type != expected_type {
                         return Ok(false);
                     }
-                    _ => {}
+                } else {
+                    // it's a vector index type,
+                    // this method is used to determine if the scalar index matches the criteria
+                    // so we should return false
+                    return Ok(false);
                 }
             }
-        } else if has_multiple_indices {
-            return Err(Error::InvalidInput {
-                source: format!(
-                    "An index {} on the field with id {} co-exists with other indices on the same column but was written with an older Lance version, and this is not supported.  Please retrain this index.",
-                    index.name,
-                    index.fields.first().unwrap_or(&0),
-                ).into(),
-                location: location!(),
-            });
+            _ => {
+                // if the index_type is not present, just allow it for backwards compatibility
+            }
         }
-        // Otherwise, if the index is the only index on the column, then we accept it
-        // to allow for backwards compatibility.
-        // else { }
+
+        // We should not use FTS / NGram indices for exact equality queries
+        // (i.e. merge insert with a join on the indexed column)
+        if criteria.supports_exact_equality {
+            match expected_type {
+                ScalarIndexType::Inverted | ScalarIndexType::NGram => {
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
+        // we allow FTS / NGram indices to co-exist with each other,
+        // but we don't allow for the other scalar index types
+        if has_multiple_indices
+            && !matches!(
+                expected_type,
+                ScalarIndexType::Inverted | ScalarIndexType::NGram
+            )
+        {
+            return Err(Error::InvalidInput {
+                            source: format!(
+                                "An index {} on the field with id {} co-exists with other indices on the same column but was written with an older Lance version, and this is not supported.  Please retrain this index.",
+                                index.name,
+                                index.fields.first().unwrap_or(&0),
+                            ).into(),
+                            location: location!(),
+                        });
+        }
     }
     if let Some(for_column) = criteria.for_column {
         if index.fields.len() != 1 {
@@ -540,4 +550,150 @@ pub fn index_matches_criteria(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_table::format::pb::{
+        BTreeIndexDetails, InvertedIndexDetails, NGramIndexDetails, VectorIndexDetails,
+    };
+
+    fn make_index_metadata(
+        name: &str,
+        field_id: i32,
+        index_type: Option<IndexType>,
+    ) -> crate::index::IndexMetadata {
+        let index_details = index_type.map(|index_type| match index_type {
+            IndexType::BTree => prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap(),
+            IndexType::Inverted => {
+                prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
+            }
+            IndexType::NGram => prost_types::Any::from_msg(&NGramIndexDetails::default()).unwrap(),
+            IndexType::Vector => {
+                prost_types::Any::from_msg(&VectorIndexDetails::default()).unwrap()
+            }
+            _ => {
+                unimplemented!("unsupported index type: {}", index_type)
+            }
+        });
+        crate::index::IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            fields: vec![field_id],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details,
+            index_version: 0,
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn test_index_matches_criteria_vector_index() {
+        let index1 = make_index_metadata("vector_index", 1, Some(IndexType::Vector));
+
+        let criteria = ScalarIndexCriteria {
+            has_type: Some(ScalarIndexType::BTree),
+            supports_exact_equality: false,
+            for_column: None,
+            has_name: None,
+        };
+
+        let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
+        let result = index_matches_criteria(&index1, &criteria, &field, true).unwrap();
+        assert!(!result);
+
+        let result = index_matches_criteria(&index1, &criteria, &field, false).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_index_matches_criteria_scalar_index() {
+        let btree_index = make_index_metadata("btree_index", 1, Some(IndexType::BTree));
+        let inverted_index = make_index_metadata("inverted_index", 1, Some(IndexType::Inverted));
+        let ngram_index = make_index_metadata("ngram_index", 1, Some(IndexType::NGram));
+
+        let criteria = ScalarIndexCriteria {
+            has_type: Some(ScalarIndexType::BTree),
+            supports_exact_equality: false,
+            for_column: None,
+            has_name: None,
+        };
+
+        let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
+        let result = index_matches_criteria(&btree_index, &criteria, &field, true);
+        assert!(result.is_err());
+
+        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        assert!(result);
+
+        // test for_column
+        let mut criteria = ScalarIndexCriteria {
+            has_type: None,
+            supports_exact_equality: false,
+            for_column: Some("mycol"),
+            has_name: None,
+        };
+        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        assert!(result);
+
+        criteria.for_column = Some("mycol2");
+        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        assert!(!result);
+
+        // test has_name
+        let mut criteria = ScalarIndexCriteria {
+            has_type: None,
+            supports_exact_equality: false,
+            for_column: None,
+            has_name: Some("btree_index"),
+        };
+        let result = index_matches_criteria(&btree_index, &criteria, &field, true).unwrap();
+        assert!(result);
+        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        assert!(result);
+
+        criteria.has_name = Some("btree_index2");
+        let result = index_matches_criteria(&btree_index, &criteria, &field, true).unwrap();
+        assert!(!result);
+        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        assert!(!result);
+
+        // test supports_exact_equality
+        let mut criteria = ScalarIndexCriteria {
+            has_type: Some(ScalarIndexType::BTree),
+            supports_exact_equality: true,
+            for_column: None,
+            has_name: None,
+        };
+        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        assert!(result);
+
+        criteria.has_type = Some(ScalarIndexType::Inverted);
+        let result = index_matches_criteria(&inverted_index, &criteria, &field, false).unwrap();
+        assert!(!result);
+
+        criteria.has_type = Some(ScalarIndexType::NGram);
+        let result = index_matches_criteria(&ngram_index, &criteria, &field, false).unwrap();
+        assert!(!result);
+
+        // test multiple indices
+        let mut criteria = ScalarIndexCriteria {
+            has_type: Some(ScalarIndexType::BTree),
+            supports_exact_equality: false,
+            for_column: None,
+            has_name: None,
+        };
+        let result = index_matches_criteria(&btree_index, &criteria, &field, true);
+        assert!(result.is_err());
+
+        criteria.has_type = Some(ScalarIndexType::Inverted);
+        let result = index_matches_criteria(&inverted_index, &criteria, &field, true).unwrap();
+        assert!(result);
+
+        criteria.has_type = Some(ScalarIndexType::NGram);
+        let result = index_matches_criteria(&ngram_index, &criteria, &field, true).unwrap();
+        assert!(result);
+    }
 }

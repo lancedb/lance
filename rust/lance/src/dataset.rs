@@ -873,8 +873,8 @@ impl Dataset {
     }
 
     /// Get the table config from manifest
-    pub fn config(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.manifest.config.iter()
+    pub fn config(&self) -> Result<HashMap<String, String>> {
+        Ok(self.manifest.config.clone())
     }
 
     /// Create a Scanner to scan the dataset.
@@ -1952,6 +1952,7 @@ mod tests {
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
 
+    use all_asserts::assert_true;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -3963,10 +3964,19 @@ mod tests {
 
         dataset.update_config(desired_config.clone()).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
+        assert_eq!(dataset.config().unwrap(), desired_config);
+
+        let config = dataset.config().unwrap().clone();
+        let other_value = config.get("other-key").unwrap();
+        let mut expected = HashMap::new();
+        expected.insert("other-key".to_string(), "other-value".to_string());
+        assert_eq!(other_value, "other-value");
 
         desired_config.remove("other-key");
         dataset.delete_config_keys(&["other-key"]).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
+        assert_eq!(dataset.config().unwrap(), desired_config);
+        assert_true!(!dataset.config().unwrap().contains_key("other-key"));
     }
 
     #[rstest]

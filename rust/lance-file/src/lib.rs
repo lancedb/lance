@@ -23,7 +23,7 @@ pub async fn determine_file_version(
     known_size: Option<usize>,
 ) -> Result<LanceFileVersion> {
     let size = match known_size {
-        None => store.size(path).await.unwrap(),
+        None => store.size(path).await.unwrap() as usize,
         Some(size) => size,
     };
     if size < 8 {

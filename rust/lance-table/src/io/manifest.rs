@@ -36,12 +36,12 @@ pub async fn read_manifest(
     known_size: Option<u64>,
 ) -> Result<Manifest> {
     let file_size = if let Some(known_size) = known_size {
-        known_size as usize
+        known_size
     } else {
         object_store.inner.head(path).await?.size
     };
-    const PREFETCH_SIZE: usize = 64 * 1024;
-    let initial_start = std::cmp::max(file_size as i64 - PREFETCH_SIZE as i64, 0) as usize;
+    const PREFETCH_SIZE: u64 = 64 * 1024;
+    let initial_start = file_size.saturating_sub(PREFETCH_SIZE);
     let range = Range {
         start: initial_start,
         end: file_size,
@@ -67,7 +67,7 @@ pub async fn read_manifest(
         ));
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
-    let manifest_len = file_size - manifest_pos;
+    let manifest_len = file_size as usize - manifest_pos;
 
     let buf: Bytes = if manifest_len <= buf.len() {
         // The prefetch captured the entire manifest. We just need to trim the buffer.
@@ -80,7 +80,7 @@ pub async fn read_manifest(
             .get_range(
                 path,
                 Range {
-                    start: manifest_pos,
+                    start: manifest_pos as u64,
                     end: file_size - PREFETCH_SIZE,
                 },
             )
