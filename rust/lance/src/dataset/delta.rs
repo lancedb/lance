@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// The delta dataset between two versions of a dataset.
-pub struct DeltaDataset {
+pub struct DatasetDelta {
     /// The base version number for comparison.
     pub(crate) begin_version: u64,
     /// Manifest of the beginning version.
@@ -26,7 +26,7 @@ pub struct DeltaDataset {
     pub(crate) base_dataset: Dataset,
 }
 
-impl DeltaDataset {
+impl DatasetDelta {
     async fn extract_modified_fragments(
         &self,
         begin_frags: &HashMap<u64, &Fragment>,

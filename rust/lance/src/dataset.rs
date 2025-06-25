@@ -75,7 +75,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
-use crate::dataset::delta::{DeltaData, DeltaDataset, DeltaMetadata};
+use crate::dataset::delta::{DeltaData, DatasetDelta, DeltaMetadata};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{
@@ -598,7 +598,7 @@ impl Dataset {
         Ok(())
     }
 
-    async fn build_delta_dataset(&self, compared_version: u64) -> Result<DeltaDataset> {
+    async fn build_delta_dataset(&self, compared_version: u64) -> Result<DatasetDelta> {
         let current_version = self.version().version;
 
         let (begin_ver, begin_manifest, end_ver, end_manifest) = if current_version
@@ -637,7 +637,7 @@ impl Dataset {
             )
         };
 
-        Ok(DeltaDataset {
+        Ok(DatasetDelta {
             begin_version: begin_ver,
             begin_manifest,
             end_version: end_ver,
