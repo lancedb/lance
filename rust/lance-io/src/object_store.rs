@@ -481,6 +481,10 @@ impl ObjectStore {
     }
 
     pub async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+        if self.is_local() {
+            // Use std::fs::copy for local filesystem to support cross-filesystem copies
+            return super::local::copy_file(from, to);
+        }
         Ok(self.inner.copy(from, to).await?)
     }
 
@@ -1043,5 +1047,75 @@ mod tests {
                 .unwrap();
             assert_eq!(contents, "WINDOWS");
         }
+    }
+
+    #[tokio::test]
+    async fn test_cross_filesystem_copy() {
+        // Create two temporary directories that simulate different filesystems
+        let source_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+
+        // Create a test file in the source directory
+        let source_file_name = "test_file.txt";
+        let source_file = source_dir.path().join(source_file_name);
+        std::fs::write(&source_file, b"test content").unwrap();
+
+        // Create ObjectStore for local filesystem
+        let (store, base_path) = ObjectStore::from_uri(source_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Create paths relative to the ObjectStore base
+        let from_path = base_path.child(source_file_name);
+        
+        // Use object_store::Path::parse for the destination
+        let dest_file = dest_dir.path().join("copied_file.txt");
+        let dest_str = dest_file.to_str().unwrap();
+        let to_path = object_store::path::Path::parse(dest_str).unwrap();
+
+        // Perform the copy operation
+        store.copy(&from_path, &to_path).await.unwrap();
+
+        // Verify the file was copied correctly
+        assert!(dest_file.exists());
+        let copied_content = std::fs::read(&dest_file).unwrap();
+        assert_eq!(copied_content, b"test content");
+    }
+
+    #[tokio::test]
+    async fn test_copy_creates_parent_directories() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+
+        // Create a test file in the source directory
+        let source_file_name = "test_file.txt";
+        let source_file = source_dir.path().join(source_file_name);
+        std::fs::write(&source_file, b"test content").unwrap();
+
+        // Create ObjectStore for local filesystem
+        let (store, base_path) = ObjectStore::from_uri(source_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Create paths
+        let from_path = base_path.child(source_file_name);
+        
+        // Create destination with nested directories that don't exist yet
+        let dest_file = dest_dir
+            .path()
+            .join("nested")
+            .join("dirs")
+            .join("copied_file.txt");
+        let dest_str = dest_file.to_str().unwrap();
+        let to_path = object_store::path::Path::parse(dest_str).unwrap();
+
+        // Perform the copy operation - should create parent directories
+        store.copy(&from_path, &to_path).await.unwrap();
+
+        // Verify the file was copied correctly and directories were created
+        assert!(dest_file.exists());
+        assert!(dest_file.parent().unwrap().exists());
+        let copied_content = std::fs::read(&dest_file).unwrap();
+        assert_eq!(copied_content, b"test content");
     }
 }
