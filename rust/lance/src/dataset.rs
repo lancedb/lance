@@ -6619,7 +6619,12 @@ mod tests {
 
         // verify _rowid and _rowaddr
         let results = ds
-            .sql("SELECT x, y, _rowid, _rowaddr FROM foo where y > 100", "foo", true, true)
+            .sql(
+                "SELECT x, y, _rowid, _rowaddr FROM foo where y > 100",
+                "foo",
+                true,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
