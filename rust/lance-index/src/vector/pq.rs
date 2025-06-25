@@ -492,11 +492,12 @@ impl Quantization for ProductQuantizer {
     }
 
     fn field(&self) -> Field {
+        let num_bytes_per_sub_vector = self.num_sub_vectors * self.num_bits as usize / 8;
         Field::new(
             PQ_CODE_COLUMN,
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::UInt8, true)),
-                self.num_sub_vectors as i32,
+                num_bytes_per_sub_vector as i32,
             ),
             true,
         )

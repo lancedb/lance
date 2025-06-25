@@ -1173,9 +1173,25 @@ mod tests {
     }
 
     async fn test_delete_all_rows(params: VectorIndexParams) {
+        match params.metric_type {
+            DistanceType::Hamming => {
+                test_delete_all_rows_impl::<UInt8Type>(params, 0..4).await;
+            }
+            _ => {
+                test_delete_all_rows_impl::<Float32Type>(params, 0.0..1.0).await;
+            }
+        }
+    }
+
+    async fn test_delete_all_rows_impl<T: ArrowPrimitiveType>(
+        params: VectorIndexParams,
+        range: Range<T::Native>,
+    ) where
+        T::Native: SampleUniform,
+    {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
 
         let vector_column = "vector";
         dataset
@@ -1195,7 +1211,7 @@ mod tests {
         let query = vectors.value(0);
         let results = dataset
             .scan()
-            .nearest(vector_column, query.as_primitive::<Float32Type>(), 100)
+            .nearest(vector_column, query.as_primitive::<T>(), 100)
             .unwrap()
             .try_into_batch()
             .await
@@ -1205,7 +1221,7 @@ mod tests {
         // compact after delete all rows
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
 
         let vector_column = "vector";
         dataset
@@ -1222,7 +1238,7 @@ mod tests {
 
         let results = dataset
             .scan()
-            .nearest(vector_column, query.as_primitive::<Float32Type>(), 100)
+            .nearest(vector_column, query.as_primitive::<T>(), 100)
             .unwrap()
             .try_into_batch()
             .await
