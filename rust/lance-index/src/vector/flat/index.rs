@@ -223,6 +223,17 @@ impl Quantization for FlatQuantizer {
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
         Ok(vectors.slice(0, vectors.len()))
     }
+
+    fn field(&self) -> Field {
+        Field::new(
+            FLAT_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                self.dim as i32,
+            ),
+            true,
+        )
+    }
 }
 
 impl From<FlatQuantizer> for Quantizer {
@@ -300,6 +311,17 @@ impl Quantization for FlatBinQuantizer {
 
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
         Ok(vectors.slice(0, vectors.len()))
+    }
+
+    fn field(&self) -> Field {
+        Field::new(
+            FLAT_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                self.dim as i32,
+            ),
+            true,
+        )
     }
 }
 

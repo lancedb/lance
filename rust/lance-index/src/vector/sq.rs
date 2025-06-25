@@ -7,7 +7,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use builder::SQBuildParams;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
@@ -246,6 +246,17 @@ impl Quantization for ScalarQuantizer {
         Ok(Quantizer::Scalar(Self {
             metadata: metadata.clone(),
         }))
+    }
+
+    fn field(&self) -> Field {
+        Field::new(
+            SQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                self.code_dim() as i32,
+            ),
+            true,
+        )
     }
 }
 

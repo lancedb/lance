@@ -26,9 +26,7 @@ use pb::{
     Variable,
 };
 
-use crate::{
-    encodings::physical::block_compress::CompressionConfig, repdef::DefinitionInterpretation,
-};
+use crate::{encodings::physical::block::CompressionConfig, repdef::DefinitionInterpretation};
 
 use self::pb::Constant;
 

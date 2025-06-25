@@ -221,7 +221,7 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
         Ok(Self {
             version,
             path: meta.location,
-            size: Some(meta.size as u64),
+            size: Some(meta.size),
             naming_scheme: scheme,
             e_tag: meta.e_tag,
         })
@@ -286,7 +286,7 @@ async fn current_manifest_path(
             Ok(ManifestLocation {
                 version,
                 path: meta.location,
-                size: Some(meta.size as u64),
+                size: Some(meta.size),
                 naming_scheme: scheme,
                 e_tag: meta.e_tag,
             })
@@ -318,7 +318,7 @@ async fn current_manifest_path(
             Ok(ManifestLocation {
                 version: current_version,
                 path: current_meta.location,
-                size: Some(current_meta.size as u64),
+                size: Some(current_meta.size),
                 naming_scheme: scheme,
                 e_tag: current_meta.e_tag,
             })
@@ -585,7 +585,7 @@ async fn default_resolve_version(
         Ok(meta) => Ok(ManifestLocation {
             version,
             path,
-            size: Some(meta.size as u64),
+            size: Some(meta.size),
             naming_scheme: scheme,
             e_tag: meta.e_tag,
         }),

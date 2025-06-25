@@ -2716,6 +2716,18 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.delete_config_keys(keys)
 
+    def config(self) -> dict[str, str]:
+        """Get configs of the dataset.
+
+        Parameters
+        ----------
+        Returns
+        -------
+        dict[str, str]
+            A list of configuration items.
+        """
+        return self._ds.config()
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -4066,8 +4078,8 @@ def write_dataset(
     mode: str
         **create** - create a new dataset (raises if uri already exists).
         **overwrite** - create a new snapshot version
-        **append** - create a new version that is the concat of the input the
-        latest version (raises if uri does not exist)
+        **append** - create a new version that is the concat of the input and the
+        latest version, or a new dataset if uri doesn't exist.
     max_rows_per_file: int, default 1024 * 1024
         The max number of rows to write before starting a new file
     max_rows_per_group: int, default 1024

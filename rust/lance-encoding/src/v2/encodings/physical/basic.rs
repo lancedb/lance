@@ -10,8 +10,8 @@ use log::trace;
 use crate::{
     data::{AllNullDataBlock, BlockInfo, DataBlock, NullableDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
+    v2::encoder::{ArrayEncoder, EncodedArray},
     EncodingsIo,
 };
 

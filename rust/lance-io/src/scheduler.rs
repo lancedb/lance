@@ -649,17 +649,17 @@ impl ScanScheduler {
         file_size_bytes: &CachedFileSize,
     ) -> Result<FileScheduler> {
         let file_size_bytes = if let Some(size) = file_size_bytes.get() {
-            u64::from(size) as usize
+            u64::from(size)
         } else {
             let size = self.object_store.size(path).await?;
-            if let Some(size) = NonZero::new(size as u64) {
+            if let Some(size) = NonZero::new(size) {
                 file_size_bytes.set(size);
             }
             size
         };
         let reader = self
             .object_store
-            .open_with_size(path, file_size_bytes)
+            .open_with_size(path, file_size_bytes as usize)
             .await?;
         let block_size = self.object_store.block_size() as u64;
         let max_iop_size = self.object_store.max_iop_size();
@@ -1190,7 +1190,7 @@ mod tests {
                     GetRange::Bounded(bounded) => bounded.end - bounded.start,
                     _ => panic!(),
                 };
-                bytes_read_copy.fetch_add(num_bytes as u64, Ordering::Release);
+                bytes_read_copy.fetch_add(num_bytes, Ordering::Release);
                 let location = location.clone();
                 let base_store = base_store.clone();
                 async move { base_store.get_opts(&location, options).await }.boxed()

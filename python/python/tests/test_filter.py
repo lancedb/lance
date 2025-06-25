@@ -109,7 +109,14 @@ def test_sql_predicates(dataset):
 
 
 def test_illegal_predicates(dataset):
-    predicates_nrows = ["str BETWEEN 10 AND 20", "str > 10"]
+    predicates_nrows = [
+        "str BETWEEN 10 AND 20",
+        "str > 10",
+        "x AN",
+        "🥞",
+        "foo = 7",
+        "int",
+    ]
     for expr in predicates_nrows:
         with pytest.raises(ValueError, match="Invalid user input: *"):
             dataset.to_table(filter=expr)

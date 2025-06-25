@@ -16,6 +16,7 @@
 //! key columns are identical in both the source and the target.  This means that you will need some kind of
 //! meaningful key column to be able to perform a merge insert.
 
+use assign_action::merge_insert_action;
 use futures::FutureExt;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -34,7 +35,7 @@ use datafusion::{
         context::{SessionConfig, SessionContext},
         memory_pool::MemoryConsumer,
     },
-    logical_expr::{self, Expr, JoinType},
+    logical_expr::{self, Expr, Extension, JoinType, LogicalPlan},
     physical_plan::{
         joins::{HashJoinExec, PartitionMode},
         projection::ProjectionExec,
@@ -43,6 +44,7 @@ use datafusion::{
         union::UnionExec,
         ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
     },
+    physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
     prelude::DataFrame,
     scalar::ScalarValue,
 };
@@ -85,7 +87,7 @@ use crate::{
     dataset::{
         fragment::{FileFragment, FragReadConfig},
         transaction::{Operation, Transaction},
-        write::open_writer,
+        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
     },
     index::DatasetIndexInternalExt,
     io::exec::{
@@ -95,6 +97,10 @@ use crate::{
 };
 
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
+
+mod assign_action;
+mod exec;
+mod logical_plan;
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -134,7 +140,7 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
 /// Describes how rows should be handled when there is no matching row in the source table
 ///
 /// These are old rows which do not match any new data
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub enum WhenNotMatchedBySource {
     /// Do not delete rows from the target table
     ///
@@ -173,7 +179,7 @@ impl WhenNotMatchedBySource {
 }
 
 /// Describes how rows should be handled when there is a match between the target table and source table
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub enum WhenMatched {
     /// The row is deleted from the target table and a new row is inserted based on the source table
     ///
@@ -212,6 +218,7 @@ impl WhenMatched {
 /// Describes how rows should be handled when there is no matching row in the target table
 ///
 /// These are new rows which do not match any old data
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WhenNotMatched {
     /// The new row is inserted into the target table
     ///
@@ -221,7 +228,7 @@ pub enum WhenNotMatched {
     DoNothing,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 struct MergeInsertParams {
     // The column(s) to join on
     on: Vec<String>,
@@ -1166,6 +1173,121 @@ impl MergeInsertJob {
         self.execute_uncommitted_impl(stream).await
     }
 
+    async fn create_plan(
+        self,
+        source: SendableRecordBatchStream,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Goal: we shouldn't manually have to specify which columns to scan.
+        //       DataFusion's optimizer should be able to automatically perform
+        //       projection pushdown for us.
+        // Goal: we shouldn't have to add new branches in this code to handle
+        //       indexed vs non-indexed cases. That should be handled by optimizer rules.
+        let session_config = SessionConfig::default();
+        let session_ctx = SessionContext::new_with_config(session_config);
+        let scan = session_ctx.read_lance_unordered(self.dataset.clone(), false, true)?;
+        let on_cols = self
+            .params
+            .on
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>();
+        let source_df = session_ctx.read_one_shot(source)?;
+        let source_df_aliased = source_df.alias("source")?;
+        let scan_aliased = scan.alias("target")?;
+        let df = scan_aliased
+            .join(source_df_aliased, JoinType::Right, &on_cols, &on_cols, None)?
+            .with_column("action", merge_insert_action(&self.params)?)?;
+
+        let (session_state, logical_plan) = df.into_parts();
+
+        let write_node = logical_plan::MergeInsertWriteNode::new(
+            logical_plan,
+            self.dataset.clone(),
+            self.params.clone(),
+        );
+        let logical_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(write_node),
+        });
+
+        let logical_plan = session_state.optimize(&logical_plan)?;
+
+        let planner =
+            DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(MergeInsertPlanner {})]);
+        // This method already does the optimization for us.
+        let physical_plan = planner
+            .create_physical_plan(&logical_plan, &session_state)
+            .await?;
+
+        Ok(physical_plan)
+    }
+
+    async fn execute_uncommitted_v2(
+        self,
+        source: SendableRecordBatchStream,
+    ) -> Result<(Transaction, MergeStats, Option<RowIdTreeMap>)> {
+        let plan = self.create_plan(source).await?;
+
+        // Execute the plan
+        // Assert that we have exactly one partition since we're designed for single-partition execution
+        let partition_count = match plan.properties().output_partitioning() {
+            datafusion_physical_expr::Partitioning::RoundRobinBatch(n) => *n,
+            datafusion_physical_expr::Partitioning::Hash(_, n) => *n,
+            datafusion_physical_expr::Partitioning::UnknownPartitioning(n) => *n,
+        };
+
+        if partition_count != 1 {
+            return Err(Error::invalid_input(
+                format!("Expected exactly 1 partition, got {}", partition_count),
+                location!(),
+            ));
+        }
+
+        // Execute partition 0 (the only partition)
+        let task_context = Arc::new(datafusion::execution::TaskContext::default());
+        let mut stream = plan.execute(0, task_context)?;
+
+        // Assert that the execution produces no output (this is a write operation)
+        if let Some(batch) = stream.next().await {
+            let batch = batch?;
+            if batch.num_rows() > 0 {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Expected no output from write operation, got {} rows",
+                        batch.num_rows()
+                    ),
+                    location!(),
+                ));
+            }
+        }
+
+        // Extract merge stats from the execution plan
+        let merge_insert_exec = plan
+            .as_any()
+            .downcast_ref::<exec::FullSchemaMergeInsertExec>()
+            .ok_or_else(|| Error::Internal {
+                message: "Expected FullSchemaMergeInsertExec".into(),
+                location: location!(),
+            })?;
+
+        let stats = merge_insert_exec
+            .merge_stats()
+            .ok_or_else(|| Error::Internal {
+                message: "Merge stats not available - execution may not have completed".into(),
+                location: location!(),
+            })?;
+
+        let transaction = merge_insert_exec
+            .transaction()
+            .ok_or_else(|| Error::Internal {
+                message: "Transaction not available - execution may not have completed".into(),
+                location: location!(),
+            })?;
+
+        let affected_rows = merge_insert_exec.affected_rows().map(RowIdTreeMap::from);
+
+        Ok((transaction, stats, affected_rows))
+    }
+
     async fn execute_uncommitted_impl(
         self,
         source: SendableRecordBatchStream,
@@ -1180,6 +1302,27 @@ impl MergeInsertJob {
                 ..Default::default()
             },
         );
+
+        // We are migrating a new plan-based code path. For now, only using this
+        // for select supported queries: upsert with full schema, no scalar index, and keeping unmatched rows.
+        let has_scalar_index = self.join_key_as_scalar_index().await?.is_some();
+        let can_use_fast_path = self.params.insert_not_matched
+            && matches!(self.params.when_matched, WhenMatched::UpdateAll)
+            && !has_scalar_index
+            && is_full_schema
+            && matches!(
+                self.params.delete_not_matched_by_source,
+                WhenNotMatchedBySource::Keep
+            );
+
+        if can_use_fast_path {
+            let (transaction, stats, affected_rows) = self.execute_uncommitted_v2(source).await?;
+            return Ok(UncommittedMergeInsert {
+                transaction,
+                affected_rows,
+                stats,
+            });
+        }
 
         let source_schema = source.schema();
         let joined = self.create_joined_stream(source).await?;
@@ -1632,7 +1775,10 @@ mod tests {
     use crate::{
         dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
         session::Session,
-        utils::test::{DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper},
+        utils::test::{
+            assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount,
+            ThrottledStoreWrapper,
+        },
     };
 
     use super::*;
@@ -2802,5 +2948,56 @@ mod tests {
             "All values should be 1 after merge insert. Got: {:?}",
             values
         );
+    }
+
+    #[tokio::test]
+    async fn test_plan_upsert() {
+        let data = lance_datagen::gen()
+            .with_seed(Seed::from(1))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(32));
+        let _schema = data.schema();
+
+        // Create dataset with initial data
+        let ds = Dataset::write(data, "memory://", None).await.unwrap();
+
+        // Create upsert job
+        let merge_insert_job =
+            crate::dataset::MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(crate::dataset::WhenMatched::UpdateAll)
+                .try_build()
+                .unwrap();
+
+        // Create new data for upsert
+        let new_data = lance_datagen::gen()
+            .with_seed(Seed::from(2))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let new_data = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
+        let new_data_stream = reader_to_stream(Box::new(new_data));
+
+        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+
+        // Assert the plan structure using portable plan matching
+        // The optimized plan should have:
+        // 1. FullSchemaMergeInsertExec at the top
+        // 2. ProjectionExec that creates action with key validation (source.key IS NOT NULL)
+        // 3. ProjectionExec that creates the common expression for key validation
+        // 4. HashJoin with projection optimization
+        // 5. LanceScan that only reads the key column (projection pushdown working!)
+        assert_plan_node_equals(
+            plan,
+            "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
+  CoalescePartitionsExec
+    ProjectionExec: expr=[_rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN __common_expr_1@0 AND _rowaddr@1 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as action]
+      ProjectionExec: expr=[key@2 IS NOT NULL as __common_expr_1, _rowaddr@0 as _rowaddr, value@1 as value, key@2 as key]
+        CoalesceBatchesExec...
+          HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
+            LanceScan: uri=data, projection=[key], row_id=false, row_addr=true, ordered=false
+            RepartitionExec...
+              StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        ).await.unwrap();
     }
 }

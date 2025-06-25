@@ -11,8 +11,8 @@ use log::trace;
 use crate::{
     data::{DataBlock, FixedSizeListBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
+    v2::encoder::{ArrayEncoder, EncodedArray},
     EncodingsIo,
 };
 

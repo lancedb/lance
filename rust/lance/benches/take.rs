@@ -30,55 +30,64 @@ fn gen_ranges(num_rows: u64, file_size: u64, n: usize) -> Vec<u64> {
     ranges
 }
 
-fn bench_random_take(c: &mut Criterion) {
-    // default tokio runtime
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let num_batches = 1024;
+fn bench_take_for_version(
+    c: &mut Criterion,
+    rt: &tokio::runtime::Runtime,
+    file_size: usize,
+    num_batches: usize,
+    version: LanceFileVersion,
+    version_name: &str,
+) {
+    let dataset = rt.block_on(create_dataset(
+        "memory://test.lance",
+        version,
+        num_batches as i32,
+        file_size as i32,
+    ));
+    let schema = Arc::new(dataset.schema().clone());
 
-    for file_size in [1024 * 1024, 1024] {
-        let dataset = rt.block_on(create_dataset(
-            "memory://test.lance",
-            LanceFileVersion::Legacy,
-            num_batches,
-            file_size,
-        ));
-        let schema = Arc::new(dataset.schema().clone());
-
-        for num_rows in [1, 10, 100, 1000] {
-            c.bench_function(&format!(
-                "V1 Random Take ({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
-            ), |b| {
-                b.to_async(&rt).iter(|| async {
-                    let rows = gen_ranges(num_batches as u64 * BATCH_SIZE, file_size as u64, num_rows);
+    for num_rows in [1, 10, 100, 1000] {
+        c.bench_function(
+            &format!(
+                "{} Random Take ({} file size, {} batches, {} rows per take)",
+                version_name, file_size, num_batches, num_rows
+            ),
+            |b| {
+                b.to_async(rt).iter(|| async {
+                    let rows =
+                        gen_ranges(num_batches as u64 * BATCH_SIZE, file_size as u64, num_rows);
                     let batch = dataset
                         .take_rows(&rows, ProjectionRequest::Schema(schema.clone()))
                         .await
                         .unwrap_or_else(|_| panic!("rows: {:?}", rows));
                     assert_eq!(batch.num_rows(), num_rows);
                 })
-            });
-        }
+            },
+        );
+    }
+}
 
-        let dataset = rt.block_on(create_dataset(
-            "memory://test.lance",
-            LanceFileVersion::Stable,
-            num_batches,
+fn bench_random_take(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let num_batches = 1024;
+
+    for file_size in [1024 * 1024, 1024] {
+        bench_take_for_version(
+            c,
+            &rt,
             file_size,
-        ));
-        let schema = Arc::new(dataset.schema().clone());
-        for num_rows in [1, 10, 100, 1000] {
-            c.bench_function(&format!(
-                "V2 Random Take ({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
-            ), |b| {
-                b.to_async(&rt).iter(|| async {
-                    let batch = dataset
-                        .take_rows(&gen_ranges(num_batches as u64 * BATCH_SIZE, file_size as u64, num_rows), ProjectionRequest::Schema(schema.clone()))
-                        .await
-                        .unwrap();
-                    assert_eq!(batch.num_rows(), num_rows);
-                })
-            });
-        }
+            num_batches,
+            LanceFileVersion::V2_0,
+            "V2_0",
+        );
+        bench_take_for_version(
+            c,
+            &rt,
+            file_size,
+            num_batches,
+            LanceFileVersion::V2_1,
+            "V2_1",
+        );
     }
 }
 
