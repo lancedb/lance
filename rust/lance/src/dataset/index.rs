@@ -80,16 +80,7 @@ pub trait LanceIndexStoreExt {
 impl LanceIndexStoreExt for LanceIndexStore {
     fn from_dataset(dataset: &Dataset, uuid: &str) -> Self {
         let index_dir = dataset.indices_dir().child(uuid);
-        Self::new(
-            dataset.object_store.clone(),
-            index_dir,
-            Arc::new(
-                dataset
-                    .metadata_cache
-                    .file_metadata_cache("lance_index")
-                    .as_lance_cache()
-                    .clone(),
-            ),
-        )
+        let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
+        Self::new(dataset.object_store.clone(), index_dir, Arc::new(cache))
     }
 }

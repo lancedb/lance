@@ -138,7 +138,7 @@ impl DatasetPreFilter {
         }
 
         let dataset_clone = dataset.clone();
-        let key = crate::session::RowIdMaskKey {
+        let key = crate::session::caches::RowIdMaskKey {
             version: dataset.manifest().version,
         };
         dataset

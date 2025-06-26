@@ -968,11 +968,9 @@ impl<'a> TransactionRebase<'a> {
 
                     // Make sure this is available in the cache for future conflict resolution.
                     let deletion_file = new_deletion_file.as_ref().unwrap();
-                    let key = crate::session::DeletionFileKey {
+                    let key = crate::session::caches::DeletionFileKey {
                         fragment_id: *fragment_id,
-                        read_version: deletion_file.read_version,
-                        id: deletion_file.id,
-                        suffix: deletion_file.file_type.suffix().to_string(),
+                        deletion_file,
                     };
                     dataset.metadata_cache.insert_with_key(&key, Arc::new(dv));
 
@@ -1212,6 +1210,7 @@ mod tests {
 
     use super::*;
     use crate::dataset::transaction::RewriteGroup;
+    use crate::session::caches::DeletionFileKey;
     use crate::{
         dataset::{CommitBuilder, InsertBuilder, WriteParams},
         io,
@@ -1338,11 +1337,9 @@ mod tests {
         .unwrap();
 
         let deletion_file = fragment.deletion_file.as_ref().unwrap();
-        let key = crate::session::DeletionFileKey {
+        let key = DeletionFileKey {
             fragment_id: fragment.id,
-            read_version: deletion_file.read_version,
-            id: deletion_file.id,
-            suffix: deletion_file.file_type.suffix().to_string(),
+            deletion_file,
         };
         dataset
             .metadata_cache

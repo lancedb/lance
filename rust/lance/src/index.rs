@@ -1015,11 +1015,7 @@ impl DatasetIndexInternalExt for Dataset {
                 info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
                 let reader = FileReader::try_new_self_described_from_reader(
                     reader.clone(),
-                    Some(
-                        self.metadata_cache
-                            .file_metadata_cache("vector_index")
-                            .as_lance_cache(),
-                    ),
+                    Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )
                 .await?;
                 vector::open_vector_index_v2(Arc::new(self.clone()), column, uuid, reader, fri)
@@ -1038,9 +1034,7 @@ impl DatasetIndexInternalExt for Dataset {
                     file,
                     None,
                     Default::default(),
-                    self.metadata_cache
-                        .file_metadata_cache("index_file")
-                        .as_lance_cache(),
+                    &self.metadata_cache.file_metadata_cache(&index_file),
                     FileReaderOptions::default(),
                 )
                 .await?;

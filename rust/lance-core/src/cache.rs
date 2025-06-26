@@ -151,8 +151,14 @@ impl LanceCache {
 
     pub fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str, metadata: Arc<T>) {
         let key = self.get_key(key);
-        self.cache
-            .insert((key, TypeId::of::<T>()), SizedRecord::new(metadata));
+        let record = SizedRecord::new(metadata);
+        tracing::trace!(
+            target: "lance_cache::insert",
+            key = key,
+            type_id = std::any::type_name::<T>(),
+            size = (record.size_accessor)(&record.record),
+        );
+        self.cache.insert((key, TypeId::of::<T>()), record);
     }
 
     pub fn insert_unsized<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(

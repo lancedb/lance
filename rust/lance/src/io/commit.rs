@@ -57,6 +57,7 @@ use crate::dataset::{
 };
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
+use crate::session::caches::DSMetadataCache;
 use crate::Dataset;
 
 mod conflict_resolver;
@@ -105,7 +106,7 @@ async fn do_commit_new_dataset(
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     blob_version: Option<u64>,
-    metadata_cache: &crate::session::DSMetadataCache,
+    metadata_cache: &DSMetadataCache,
 ) -> Result<(Manifest, ManifestLocation)> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
@@ -133,14 +134,14 @@ async fn do_commit_new_dataset(
     // if there is a conflict.
     match result {
         Ok(manifest_location) => {
-            let tx_key = crate::session::TransactionKey {
+            let tx_key = crate::session::caches::TransactionKey {
                 version: manifest.version,
             };
             metadata_cache.insert_with_key(&tx_key, Arc::new(transaction.clone()));
 
-            let manifest_key = crate::session::ManifestKey {
+            let manifest_key = crate::session::caches::ManifestKey {
                 version: manifest_location.version,
-                e_tag: manifest_location.e_tag.clone(),
+                e_tag: manifest_location.e_tag.as_deref(),
             };
             metadata_cache.insert_with_key(&manifest_key, Arc::new(manifest.clone()));
             Ok((manifest, manifest_location))
@@ -160,7 +161,7 @@ pub(crate) async fn commit_new_dataset(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-    metadata_cache: &crate::session::DSMetadataCache,
+    metadata_cache: &crate::session::caches::DSMetadataCache,
 ) -> Result<(Manifest, ManifestLocation)> {
     let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blob_path = base_path.child(BLOB_DIR);
@@ -829,16 +830,16 @@ pub(crate) async fn commit_transaction(
         match result {
             Ok(manifest_location) => {
                 // Cache both the transaction file and manifest
-                let tx_key = crate::session::TransactionKey {
+                let tx_key = crate::session::caches::TransactionKey {
                     version: target_version,
                 };
                 dataset
                     .metadata_cache
                     .insert_with_key(&tx_key, Arc::new(transaction.clone()));
 
-                let manifest_key = crate::session::ManifestKey {
+                let manifest_key = crate::session::caches::ManifestKey {
                     version: manifest_location.version,
-                    e_tag: manifest_location.e_tag.clone(),
+                    e_tag: manifest_location.e_tag.as_deref(),
                 };
                 dataset
                     .metadata_cache
