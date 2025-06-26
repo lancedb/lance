@@ -676,9 +676,9 @@ impl KMeans {
                 let fsl =
                     FixedSizeListArray::try_new_from_values(centroids.clone(), dimension as i32)?;
                 let store = FlatFloatStorage::new(fsl, distance_type);
-                SimpleIndex::try_new(store).map(|index| Some(index))
+                SimpleIndex::try_new(store).map(Some)
             }
-            _ => return Ok(None),
+            _ => Ok(None),
         }
     }
 }
