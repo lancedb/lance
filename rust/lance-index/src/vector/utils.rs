@@ -5,7 +5,7 @@ use arrow::{
     array::AsArray,
     datatypes::{Float16Type, Float32Type, Float64Type},
 };
-use arrow_array::{Array, BooleanArray, FixedSizeListArray};
+use arrow_array::{Array, ArrowPrimitiveType, BooleanArray, FixedSizeListArray, PrimitiveArray};
 use arrow_schema::{DataType, Field};
 use lance_core::{Error, Result};
 use lance_io::encodings::plain::bytes_to_array;
@@ -15,6 +15,34 @@ use std::{ops::Range, sync::Arc};
 
 use super::pb;
 use crate::pb::Tensor;
+use crate::vector::flat::storage::FlatFloatStorage;
+use crate::vector::hnsw::builder::HnswBuildParams;
+use crate::vector::hnsw::HNSW;
+use crate::vector::v3::subindex::IvfSubIndex;
+
+pub struct SimpleIndex {
+    store: FlatFloatStorage,
+    index: HNSW,
+}
+
+impl SimpleIndex {
+    pub fn try_new(store: FlatFloatStorage) -> Result<Self> {
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().ef_construction(10).num_edges(12),
+        )?;
+        Ok(Self { store, index: hnsw })
+    }
+
+    pub(crate) fn search<T: ArrowPrimitiveType>(
+        &self,
+        query: PrimitiveArray<T>,
+    ) -> Result<(u32, f32)> {
+        let query = Arc::new(query);
+        let res = self.index.search_basic(query, 1, 10, None, &self.store)?;
+        Ok((res[0].id, res[0].dist.0))
+    }
+}
 
 #[inline]
 #[allow(dead_code)]

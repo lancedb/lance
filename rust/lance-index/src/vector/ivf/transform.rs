@@ -17,8 +17,8 @@ use tracing::instrument;
 use lance_arrow::RecordBatchExt;
 use lance_core::Result;
 use lance_linalg::distance::DistanceType;
-use lance_linalg::kmeans::compute_partitions_arrow_array;
 
+use crate::vector::kmeans::compute_partitions_arrow_array;
 use crate::vector::transform::Transformer;
 use crate::vector::LOSS_METADATA_KEY;
 
