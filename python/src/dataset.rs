@@ -337,7 +337,10 @@ impl Dataset {
             params.metadata_cache_size(metadata_cache_size);
         }
         if let Some(index_cache_size) = index_cache_size {
-            params.index_cache_size(index_cache_size);
+            // Convert from number of entries to bytes (assuming 20 MiB per entry)
+            // This matches the Rust deprecated method's behavior
+            let index_cache_size_bytes = index_cache_size * 20 * 1024 * 1024;
+            params.index_cache_size_bytes(index_cache_size_bytes);
         }
         if let Some(block_size) = block_size {
             params.store_options = Some(ObjectStoreParams {

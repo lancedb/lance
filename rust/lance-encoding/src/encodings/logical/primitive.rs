@@ -20,7 +20,7 @@ use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt, TryStreamExt
 use itertools::Itertools;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
-    cache::{Context, DeepSizeOf},
+    cache::{CacheKey, Context, DeepSizeOf},
     datatypes::{
         DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
         STRUCTURAL_ENCODING_MINIBLOCK,
@@ -2865,14 +2865,30 @@ impl DeepSizeOf for CachedFieldData {
     }
 }
 
+// Cache key for field data
+#[derive(Debug, Clone)]
+pub struct FieldDataCacheKey {
+    pub column_index: u32,
+}
+
+impl CacheKey for FieldDataCacheKey {
+    type ValueType = CachedFieldData;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        self.column_index.to_string().into()
+    }
+}
+
 impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
     fn initialize<'a>(
         &'a mut self,
         _filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
-        let cache_key = self.column_index.to_string();
-        if let Some(cached_data) = context.cache().get::<CachedFieldData>(&cache_key) {
+        let cache_key = FieldDataCacheKey {
+            column_index: self.column_index,
+        };
+        if let Some(cached_data) = context.cache().get_with_key(&cache_key) {
             self.page_schedulers
                 .iter_mut()
                 .zip(cached_data.pages.iter())
@@ -2892,7 +2908,7 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
         async move {
             let page_data = page_data.try_collect::<Vec<_>>().await?;
             let cached_data = Arc::new(CachedFieldData { pages: page_data });
-            cache.insert::<CachedFieldData>(&cache_key, cached_data);
+            cache.insert_with_key(&cache_key, cached_data);
             Ok(())
         }
         .boxed()
