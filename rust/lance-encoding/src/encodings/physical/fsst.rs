@@ -227,11 +227,9 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
         let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i32>();
         let offsets = offsets.as_ref();
 
-        // FSST decompression output buffer, the `MiniBlock` has a size limit of `4 KiB` and
-        // the FSST decompression algorithm output is at most `8 * input_size`
-        // Since `MiniBlock Size` <= 4 KiB and `offsets` are type `i32, it has number of `offsets` <= 1024.
-        let mut decompress_bytes_buf = vec![0u8; 4 * 1024 * 8];
-        let mut decompress_offset_buf = vec![0i32; 1024];
+        // At most we get an 8x expansion and we will have the same # of offsets as the input
+        let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
+        let mut decompress_offset_buf = vec![0i32; offsets.len()];
         fsst::fsst::decompress(
             &self.symbol_table,
             bytes,

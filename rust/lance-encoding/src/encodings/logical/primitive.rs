@@ -79,6 +79,8 @@ pub mod fullzip;
 pub mod miniblock;
 
 const FILL_BYTE: u8 = 0xFE;
+pub const MINIBLOCK_MAX_VALUES: u64 = 4 * 1024;
+pub const MINIBLOCK_MAX_BYTES: u64 = 32 * 1024;
 
 /// A trait for figuring out how to schedule the data within
 /// a single page.

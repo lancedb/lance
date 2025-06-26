@@ -401,7 +401,10 @@ pub mod tests {
     use std::{collections::HashMap, sync::Arc, vec};
 
     use crate::{
-        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        testing::{
+            check_round_trip_encoding_generated, check_round_trip_encoding_of_data,
+            check_round_trip_encoding_random, FnArrayGeneratorProvider, TestCases,
+        },
         version::LanceFileVersion,
     };
 
@@ -464,6 +467,28 @@ pub mod tests {
     async fn test_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
         check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_small_strings(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+        let field = Field::new("", DataType::Utf8, true).with_metadata(field_metadata);
+        check_round_trip_encoding_generated(
+            field,
+            Box::new(FnArrayGeneratorProvider::new(move || {
+                lance_datagen::array::utf8_prefix_plus_counter("user_", /*is_large=*/ false)
+            })),
+            LanceFileVersion::V2_1,
+        )
+        .await;
     }
 
     #[rstest]

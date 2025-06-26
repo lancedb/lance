@@ -4,7 +4,7 @@
 use std::{collections::HashMap, iter, marker::PhantomData, sync::Arc};
 
 use arrow::{
-    array::{ArrayData, AsArray, Float32Builder},
+    array::{ArrayData, AsArray, Float32Builder, GenericStringBuilder},
     buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer},
     datatypes::{
         ArrowPrimitiveType, Float32Type, Int32Type, Int64Type, IntervalDayTime,
@@ -15,8 +15,8 @@ use arrow_array::{
     make_array,
     types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
     Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, LargeListArray,
-    ListArray, NullArray, PrimitiveArray, RecordBatch, RecordBatchOptions, RecordBatchReader,
-    StringArray, StructArray,
+    ListArray, NullArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions,
+    RecordBatchReader, StringArray, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SchemaRef};
 use futures::{stream::BoxStream, StreamExt};
@@ -889,6 +889,79 @@ impl ArrayGenerator for RandomBinaryGenerator {
         Some(ByteCount::from(
             self.bytes_per_element.0 + std::mem::size_of::<i32>() as u64,
         ))
+    }
+}
+
+/// Generate a sequence of strings with a prefix and a counter
+///
+/// For example, if the prefix is "user_" the the strings will be "user_0", "user_1", ...
+#[derive(Debug)]
+pub struct PrefixPlusCounterGenerator {
+    prefix: String,
+    is_large: bool,
+    data_type: DataType,
+    current_counter: u64,
+}
+
+impl PrefixPlusCounterGenerator {
+    pub fn new(prefix: String, is_large: bool) -> Self {
+        Self {
+            prefix,
+            is_large,
+            data_type: if is_large {
+                DataType::LargeUtf8
+            } else {
+                DataType::Utf8
+            },
+            current_counter: 0,
+        }
+    }
+
+    fn generate_values<T: OffsetSizeTrait>(
+        &self,
+        start: u64,
+        num_values: u64,
+    ) -> Result<Arc<dyn Array>, ArrowError> {
+        let max_counter = start + num_values;
+        let max_digits_per_counter = (max_counter as f64).log10().ceil() as u64;
+        let max_bytes_per_str = max_digits_per_counter + self.prefix.len() as u64;
+        let max_bytes = max_bytes_per_str * num_values;
+        let mut builder =
+            GenericStringBuilder::<T>::with_capacity(num_values as usize, max_bytes as usize);
+        let mut word = String::with_capacity(max_bytes_per_str as usize);
+        word.push_str(&self.prefix);
+        for i in 0..num_values {
+            let counter = start + i;
+            word.truncate(self.prefix.len());
+            word.push_str(&counter.to_string());
+            builder.append_value(&word);
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+}
+
+impl ArrayGenerator for PrefixPlusCounterGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        _rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let start = self.current_counter;
+        self.current_counter += length.0;
+        if self.is_large {
+            self.generate_values::<i64>(start, length.0)
+        } else {
+            self.generate_values::<i32>(start, length.0)
+        }
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        // It's not consistent
+        None
     }
 }
 
@@ -2175,6 +2248,16 @@ pub mod array {
         ))
     }
 
+    /// Creates a generator of strings with a prefix and a counter
+    ///
+    /// For example, if the prefix is "user_" the the strings will be "user_0", "user_1", ...
+    pub fn utf8_prefix_plus_counter(
+        prefix: impl Into<String>,
+        is_large: bool,
+    ) -> Box<dyn ArrayGenerator> {
+        Box::new(PrefixPlusCounterGenerator::new(prefix.into(), is_large))
+    }
+
     /// Create a random generator of boolean values
     pub fn rand_boolean() -> Box<dyn ArrayGenerator> {
         Box::<RandomBooleanGenerator>::default()
@@ -2395,6 +2478,16 @@ mod tests {
         assert_eq!(
             *gen.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::StringArray::from_iter_values(["xyz", "xyz", "xyz"])
+        );
+    }
+
+    #[test]
+    fn test_utf8_prefix_plus_counter() {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+        let mut gen = array::utf8_prefix_plus_counter("user_", false);
+        assert_eq!(
+            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
+            arrow_array::StringArray::from_iter_values(["user_0", "user_1", "user_2"])
         );
     }
 

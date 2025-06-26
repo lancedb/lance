@@ -19,7 +19,7 @@ const FSST_SAMPLETARGET: usize = 1 << 14;
 const FSST_SAMPLEMAXSZ: usize = 2 * FSST_SAMPLETARGET;
 
 // if the input size is less than 4MB, we mark the file header and copy the input to the output as is
-pub const FSST_LEAST_INPUT_SIZE: usize = 4 * 1024 * 1024; // 4MB
+pub const FSST_LEAST_INPUT_SIZE: usize = 32 * 1024; // 4MB
 
 // if the max length of the input strings are less than `FSST_LEAST_INPUT_MAX_LENGTH`, we shouldn't use FSST.
 pub const FSST_LEAST_INPUT_MAX_LENGTH: u64 = 5;
@@ -1032,13 +1032,21 @@ impl FsstEncoder {
         if in_buf.len() > out_buf.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "output buffer too small for FSST encoder",
+                format!(
+                    "output buffer ({}) too small for FSST encoder (need at least {})",
+                    out_buf.len(),
+                    in_buf.len()
+                ),
             ));
         }
         if in_offsets_buf.len() > out_offsets_buf.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "output offsets buffer too small for FSST encoder",
+                format!(
+                    "output offsets buffer ({}) too small for FSST encoder (need at least {})",
+                    out_offsets_buf.len(),
+                    in_offsets_buf.len()
+                ),
             ));
         }
 
@@ -1180,7 +1188,11 @@ impl FsstDecoder {
         if in_offsets_buf.len() > out_offsets_buf.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "output offsets buffer too small for FSST decoder",
+                format!(
+                    "output offsets buffer ({}) too small for FSST decoder (need at least {})",
+                    out_offsets_buf.len(),
+                    in_offsets_buf.len()
+                ),
             ));
         }
         let symbol_num = (st_info & 255) as u8;
