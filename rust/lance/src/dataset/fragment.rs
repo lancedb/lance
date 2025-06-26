@@ -724,10 +724,7 @@ impl FileFragment {
                 file_scheduler,
                 None,
                 Arc::<DecoderPlugins>::default(),
-                dataset
-                    .metadata_cache
-                    .file_metadata_cache("data_file")
-                    .as_lance_cache(),
+                &dataset.metadata_cache.file_metadata_cache(&filepath),
                 FileReaderOptions::default(),
             )
             .await?;
@@ -907,12 +904,7 @@ impl FileFragment {
                     self.id() as u32,
                     field_id_offset as i32,
                     *max_field_id,
-                    Some(
-                        self.dataset
-                            .metadata_cache
-                            .file_metadata_cache("fragment_file")
-                            .as_lance_cache(),
-                    ),
+                    Some(&self.dataset.metadata_cache.file_metadata_cache(&path)),
                 )
                 .await?;
                 let initialized_schema = reader.schema().project_by_schema(
@@ -949,6 +941,7 @@ impl FileFragment {
                 .await?;
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let path = file_scheduler.reader().path().clone();
+            let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
             let reader = Arc::new(
                 v2::reader::FileReader::try_open_with_file_metadata(
                     Arc::new(LanceEncodingsIo(file_scheduler.clone())),
@@ -956,10 +949,7 @@ impl FileFragment {
                     None,
                     Arc::<DecoderPlugins>::default(),
                     file_metadata,
-                    self.dataset
-                        .metadata_cache
-                        .file_metadata_cache("data_file")
-                        .as_lance_cache(),
+                    &metadata_cache,
                     FileReaderOptions::default(),
                 )
                 .await?,
@@ -1333,15 +1323,11 @@ impl FileFragment {
         &self,
         file_scheduler: &FileScheduler,
     ) -> Result<Arc<CachedFileMetadata>> {
-        let file_cache = self
-            .dataset
-            .metadata_cache
-            .file_metadata_cache("file_metadata");
         let path = file_scheduler.reader().path();
+        let cache = self.dataset.metadata_cache.file_metadata_cache(path);
 
-        let file_metadata = file_cache
-            .as_lance_cache()
-            .get_or_insert(path.to_string(), |_path| async {
+        let file_metadata = cache
+            .get_or_insert("".into(), |_| async {
                 let file_metadata: CachedFileMetadata =
                     v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
                 Ok(file_metadata)

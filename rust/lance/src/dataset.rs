@@ -11,6 +11,8 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+
+use crate::session::caches::{ManifestKey, TransactionKey};
 use itertools::Itertools;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
@@ -79,7 +81,8 @@ use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
     detect_overlapping_fragments, read_transaction_file,
 };
-use crate::session::{DSMetadataCache, Session};
+use crate::session::caches::DSMetadataCache;
+use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 pub use blob::BlobFile;
@@ -503,7 +506,7 @@ impl Dataset {
             commit_handler.clone(),
             base_path.clone(),
         );
-        let metadata_cache = Arc::new(session.metadata_cache_for_dataset(&uri));
+        let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         Ok(Self {
             object_store,
             base: base_path,
@@ -619,9 +622,9 @@ impl Dataset {
             .await?;
 
         // Check if manifest is in cache before reading from storage
-        let manifest_key = crate::session::ManifestKey {
+        let manifest_key = ManifestKey {
             version: location.version,
-            e_tag: location.e_tag.clone(),
+            e_tag: location.e_tag.as_deref(),
         };
         let cached_manifest = self.metadata_cache.get_with_key(&manifest_key);
         if let Some(cached_manifest) = cached_manifest {
@@ -1513,9 +1516,9 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .map_ok(move |location| {
             let latest_tx = latest_tx.take();
             async move {
-                let manifest_key = crate::session::ManifestKey {
+                let manifest_key = ManifestKey {
                     version: location.version,
-                    e_tag: location.e_tag.clone(),
+                    e_tag: location.e_tag.as_deref(),
                 };
                 let manifest =
                     if let Some(cached) = dataset.metadata_cache.get_with_key(&manifest_key) {
@@ -1548,7 +1551,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     let transactions = manifests
         .map_ok(move |(manifest, location)| async move {
             let manifest_copy = manifest.clone();
-            let tx_key = crate::session::TransactionKey {
+            let tx_key = TransactionKey {
                 version: manifest.version,
             };
             let transaction = if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key) {

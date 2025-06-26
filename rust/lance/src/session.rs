@@ -1,26 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
-use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
-use lance_table::format::Manifest;
-use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use snafu::location;
 
-use crate::dataset::transaction::Transaction;
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::index::cache::IndexCache;
+use crate::session::caches::GlobalMetadataCache;
 
 use self::index_extension::IndexExtension;
 
+pub(crate) mod caches;
 pub mod index_extension;
 
 /// A user session tracks the runtime state.
@@ -34,7 +31,7 @@ pub struct Session {
     /// Sub-caches are created from this cache for each dataset by adding the
     /// URI as a key prefix. See the [`LanceDataset::metadata_cache`] field.
     /// This prevents collisions between different datasets.
-    pub(crate) metadata_cache: GlobalMetadataCache,
+    pub(crate) metadata_cache: caches::GlobalMetadataCache,
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
@@ -169,11 +166,6 @@ impl Session {
     pub fn metadata_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.metadata_cache.0.stats()
     }
-
-    /// Get a dataset-specific metadata cache for the given URI.
-    pub(crate) fn metadata_cache_for_dataset(&self, uri: &str) -> DSMetadataCache {
-        self.metadata_cache.for_dataset(uri)
-    }
 }
 
 impl Default for Session {
@@ -186,156 +178,6 @@ impl Default for Session {
             index_extensions: HashMap::new(),
             store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
-    }
-}
-
-/// A type-safe wrapper around a LanceCache that enforces namespaces for dataset metadata.
-pub(crate) struct GlobalMetadataCache(LanceCache);
-
-impl GlobalMetadataCache {
-    pub fn for_dataset(&self, uri: &str) -> DSMetadataCache {
-        // Create a sub-cache for the dataset by adding the URI as a key prefix.
-        // This prevents collisions between different datasets.
-        DSMetadataCache(self.0.with_key_prefix(uri))
-    }
-
-    /// Create a file-specific metadata cache with the given prefix.
-    /// This is used by file readers and other components that need file-level caching.
-    pub(crate) fn file_metadata_cache(&self, prefix: &str) -> FileMetadataCache {
-        FileMetadataCache(self.0.with_key_prefix(prefix))
-    }
-}
-
-impl Clone for GlobalMetadataCache {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-/// A type-safe wrapper around a LanceCache that enforces namespaces and keys
-/// for dataset metadata.
-pub(crate) struct DSMetadataCache(pub(crate) LanceCache);
-
-impl Deref for DSMetadataCache {
-    type Target = LanceCache;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-// Cache key types for type-safe cache access
-#[derive(Debug)]
-pub(crate) struct ManifestKey {
-    pub version: u64,
-    pub e_tag: Option<String>,
-}
-
-impl CacheKey for ManifestKey {
-    type ValueType = Manifest;
-
-    fn key(&self) -> Cow<'_, str> {
-        if let Some(e_tag) = &self.e_tag {
-            Cow::Owned(format!("manifest/{}/{}", self.version, e_tag))
-        } else {
-            Cow::Owned(format!("manifest/{}", self.version))
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct TransactionKey {
-    pub version: u64,
-}
-
-impl CacheKey for TransactionKey {
-    type ValueType = Transaction;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("txn/{}", self.version))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct DeletionFileKey {
-    pub fragment_id: u64,
-    pub read_version: u64,
-    pub id: u64,
-    pub suffix: String,
-}
-
-impl CacheKey for DeletionFileKey {
-    type ValueType = lance_core::utils::deletion::DeletionVector;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "deletion/{}/{}/{}/{}",
-            self.fragment_id, self.read_version, self.id, self.suffix
-        ))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct RowIdMaskKey {
-    pub version: u64,
-}
-
-impl CacheKey for RowIdMaskKey {
-    type ValueType = lance_core::utils::mask::RowIdMask;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_id_mask/{}", self.version))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct RowIdIndexKey {
-    pub version: u64,
-}
-
-impl CacheKey for RowIdIndexKey {
-    type ValueType = RowIdIndex;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_id_index/{}", self.version))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct RowIdSequenceKey {
-    pub fragment_id: u64,
-}
-
-impl CacheKey for RowIdSequenceKey {
-    type ValueType = RowIdSequence;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_id_sequence/{}", self.fragment_id))
-    }
-}
-
-impl DSMetadataCache {
-    /// Create a file-specific metadata cache with the given prefix.
-    /// This is used by file readers and other components that need file-level caching.
-    pub(crate) fn file_metadata_cache(&self, prefix: &str) -> FileMetadataCache {
-        FileMetadataCache(self.0.with_key_prefix(prefix))
-    }
-}
-
-/// A type-safe wrapper around a LanceCache for file-level metadata caching.
-/// This is used by file readers and other components that need to cache file metadata.
-pub(crate) struct FileMetadataCache(LanceCache);
-
-impl FileMetadataCache {
-    /// Get the underlying LanceCache for compatibility with existing file reader APIs.
-    pub(crate) fn as_lance_cache(&self) -> &LanceCache {
-        &self.0
-    }
-}
-
-impl Clone for FileMetadataCache {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
     }
 }
 

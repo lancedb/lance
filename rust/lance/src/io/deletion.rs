@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::session::DeletionFileKey;
+use crate::session::caches::DeletionFileKey;
 use crate::Dataset;
 use lance_core::utils::deletion::DeletionVector;
 use lance_table::format::DeletionFile;
@@ -15,9 +15,7 @@ pub async fn read_dataset_deletion_file(
 ) -> lance_core::Result<Arc<DeletionVector>> {
     let key = DeletionFileKey {
         fragment_id,
-        read_version: deletion_file.read_version,
-        id: deletion_file.id,
-        suffix: deletion_file.file_type.suffix().to_string(),
+        deletion_file,
     };
 
     if let Some(cached) = dataset.metadata_cache.get_with_key(&key) {
