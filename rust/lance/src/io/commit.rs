@@ -845,11 +845,9 @@ pub(crate) async fn commit_transaction(
                     .metadata_cache
                     .insert_with_key(&manifest_key, Arc::new(manifest.clone()));
                 if !indices.is_empty() {
-                    dataset.session().index_cache.insert_metadata(
-                        dataset.base.as_ref(),
-                        target_version,
-                        Arc::new(indices),
-                    );
+                    dataset
+                        .index_cache
+                        .insert(&target_version.to_string(), Arc::new(indices));
                 }
 
                 match auto_cleanup_hook(&dataset, &manifest).await {

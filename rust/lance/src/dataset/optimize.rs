@@ -1955,9 +1955,10 @@ mod tests {
         let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
-        let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
-            .await
-            .unwrap();
+        let frag_reuse_index =
+            open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
+                .await
+                .unwrap();
 
         // Verify the index has one version with the correct dataset version
         let compaction_version = &frag_reuse_index.details.versions[0];
@@ -2061,9 +2062,10 @@ mod tests {
                 load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
                     .await
                     .unwrap();
-            let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
-                .await
-                .unwrap();
+            let frag_reuse_index =
+                open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
+                    .await
+                    .unwrap();
 
             // Verify the index has one version with the correct dataset version
             assert_eq!(
@@ -2154,9 +2156,10 @@ mod tests {
         let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
-        let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
-            .await
-            .unwrap();
+        let frag_reuse_index =
+            open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
+                .await
+                .unwrap();
 
         assert_eq!(frag_reuse_index.details.versions.len(), plan.tasks().len());
 

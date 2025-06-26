@@ -6,7 +6,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt64Array};
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
+use deepsize::{Context, DeepSizeOf};
 use itertools::Itertools;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
@@ -16,6 +16,7 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::{any::Any, collections::HashMap, sync::Arc};
+use uuid::Uuid;
 
 pub const FRAG_REUSE_INDEX_NAME: &str = "__lance_frag_reuse";
 pub const FRAG_REUSE_DETAILS_FILE_NAME: &str = "details.binpb";
@@ -204,18 +205,27 @@ impl FragReuseIndexDetails {
 /// An index that stores row ID maps.
 /// A row ID map describes the mapping from old row address to new address after compactions.
 /// Each version contains the mapping for one round of compaction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FragReuseIndex {
+    pub uuid: Uuid,
     pub row_id_maps: Vec<HashMap<u64, Option<u64>>>,
     pub details: FragReuseIndexDetails,
 }
 
+impl DeepSizeOf for FragReuseIndex {
+    fn deep_size_of_children(&self, cx: &mut Context) -> usize {
+        self.row_id_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
+    }
+}
+
 impl FragReuseIndex {
     pub fn new(
+        uuid: Uuid,
         row_id_maps: Vec<HashMap<u64, Option<u64>>>,
         details: FragReuseIndexDetails,
     ) -> Self {
         Self {
+            uuid,
             row_id_maps,
             details,
         }

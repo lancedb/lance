@@ -222,6 +222,13 @@ impl LanceCache {
         }
     }
 
+    pub fn clear(&self) {
+        self.cache.invalidate_all();
+        self.cache.run_pending_tasks();
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+    }
+
     // CacheKey-based methods
     pub fn insert_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
     where
@@ -267,6 +274,24 @@ pub struct CacheStats {
     pub hits: u64,
     /// Number of times `get`, `get_unsized`, or `get_or_insert` did not find an item in the cache.
     pub misses: u64,
+}
+
+impl CacheStats {
+    pub fn hit_ratio(&self) -> f32 {
+        if self.hits + self.misses == 0 {
+            0.0
+        } else {
+            self.hits as f32 / (self.hits + self.misses) as f32
+        }
+    }
+
+    pub fn miss_ratio(&self) -> f32 {
+        if self.hits + self.misses == 0 {
+            0.0
+        } else {
+            self.misses as f32 / (self.hits + self.misses) as f32
+        }
+    }
 }
 
 #[cfg(test)]

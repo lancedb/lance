@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_file::version::LanceFileVersion;
@@ -230,9 +230,12 @@ impl<'a> CommitBuilder<'a> {
             });
         }
 
-        let metadata_cache = match &dest {
-            WriteDestination::Dataset(ds) => ds.metadata_cache.clone(),
-            WriteDestination::Uri(uri) => Arc::new(session.metadata_cache.for_dataset(uri)),
+        let (metadata_cache, index_cache) = match &dest {
+            WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
+            WriteDestination::Uri(uri) => (
+                Arc::new(session.metadata_cache.for_dataset(uri)),
+                Arc::new(session.index_cache.for_dataset(uri)),
+            ),
         };
 
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
@@ -345,6 +348,8 @@ impl<'a> CommitBuilder<'a> {
                 session,
                 commit_handler,
                 tags,
+                frag_reuse_index_uuid: OnceLock::new(),
+                index_cache,
                 metadata_cache,
             }),
         }
