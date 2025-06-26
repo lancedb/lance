@@ -3,6 +3,7 @@
 
 use arrow_array::{
     BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
+    UInt32Array,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -17,13 +18,14 @@ use lance_file::v2::LanceEncodingsIo;
 use lance_file::version::LanceFileVersion;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
+use lance_io::ReadBatchParams;
+use object_store::path::Path;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
-use object_store::path::Path;
 
 const BATCH_SIZE: u64 = 1024;
 
@@ -100,30 +102,50 @@ fn dataset_take(
 fn bench_random_take_with_file_reader(c: &mut Criterion) {
     // default tokio runtime
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let num_batches = 1024;
-    let file_size = num_batches * BATCH_SIZE as i32 + 1;
+    let num_batches: u64 = 1024;
+    let file_size: u64 = num_batches * BATCH_SIZE + 1;
 
-    file_reader_take(c, &rt, file_size, num_batches, LanceFileVersion::V2_0, "V2_0");
-    file_reader_take(c, &rt, file_size, num_batches, LanceFileVersion::V2_1, "V2_1");
+    file_reader_take(
+        c,
+        &rt,
+        file_size,
+        num_batches,
+        LanceFileVersion::V2_0,
+        "V2_0",
+    );
+    file_reader_take(
+        c,
+        &rt,
+        file_size,
+        num_batches,
+        LanceFileVersion::V2_1,
+        "V2_1",
+    );
 }
 
 fn file_reader_take(
     c: &mut Criterion,
     rt: &tokio::runtime::Runtime,
-    file_size: i32,
-    num_batches: i32,
+    file_size: u64,
+    num_batches: u64,
     version: LanceFileVersion,
     version_name: &str,
 ) {
     let (dataset, file_path) = rt.block_on(async {
         // Make sure there is only one fragment.
-        let dataset = create_dataset("memory://test.lance", version, num_batches, file_size).await;
+        let dataset = create_dataset(
+            "memory://test.lance",
+            version,
+            num_batches as i32,
+            file_size as i32,
+        )
+        .await;
 
         assert_eq!(dataset.get_fragments().len(), 1);
         let fragments = dataset.get_fragments();
         let fragment = fragments.first().unwrap();
         assert_eq!(fragment.num_data_files(), 1);
-        let file = fragment.metadata().files.get(0).unwrap();
+        let file = fragment.metadata().files.first().unwrap();
         let file_path = dataset.data_dir().child(file.path.as_str());
 
         (dataset, file_path)
@@ -137,21 +159,22 @@ fn file_reader_take(
             b.to_async(rt).iter(|| async {
                 let file_reader = create_file_reader(&dataset, &file_path).await;
 
-                let rows = gen_ranges(num_batches as u64 * BATCH_SIZE, file_size as u64, num_rows);
-                for r in rows {
-                    let stream = file_reader
-                        .read_stream(
-                            lance_io::ReadBatchParams::Range((r as usize)..(r + 1) as usize),
-                            1,
-                            1,
-                            FilterExpression::no_filter(),
-                        )
-                        .unwrap();
-                    stream.fold(Vec::new(), |mut acc, item| async move {
-                        acc.push(item);
-                        acc
-                    }).await;
-                }
+                let mut rows: Vec<u32> = gen_ranges(num_batches * BATCH_SIZE, file_size, num_rows)
+                    .into_iter().map(|x|x as u32).collect();
+                rows.sort();
+                let rows = ReadBatchParams::Indices(UInt32Array::from(rows));
+                let stream = file_reader
+                    .read_stream(
+                        rows,
+                        1024,
+                        16,
+                        FilterExpression::no_filter(),
+                    )
+                    .unwrap();
+                stream.fold(Vec::new(), |mut acc, item| async move {
+                    acc.push(item);
+                    acc
+                }).await;
             })
         });
     }
@@ -187,27 +210,41 @@ async fn create_file_reader(dataset: &Dataset, file_path: &Path) -> FileReader {
 fn bench_random_take_with_file_fragment(c: &mut Criterion) {
     // default tokio runtime
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let num_batches: i32 = 1024;
+    let num_batches: u64 = 1024;
     // Make sure there is only one fragment.
-    let file_size = num_batches * BATCH_SIZE as i32 + 1;
+    let file_size: u64 = num_batches * BATCH_SIZE + 1;
 
-    fragment_take(c, &rt, file_size, num_batches, LanceFileVersion::V2_0, "V2_0");
-    fragment_take(c, &rt, file_size, num_batches, LanceFileVersion::V2_1, "V2_1");
+    fragment_take(
+        c,
+        &rt,
+        file_size,
+        num_batches,
+        LanceFileVersion::V2_0,
+        "V2_0",
+    );
+    fragment_take(
+        c,
+        &rt,
+        file_size,
+        num_batches,
+        LanceFileVersion::V2_1,
+        "V2_1",
+    );
 }
 
 fn fragment_take(
     c: &mut Criterion,
     rt: &tokio::runtime::Runtime,
-    file_size: i32,
-    num_batches: i32,
+    file_size: u64,
+    num_batches: u64,
     version: LanceFileVersion,
     version_name: &str,
 ) {
     let dataset = rt.block_on(create_dataset(
         "memory://test.lance",
         version,
-        num_batches,
-        file_size,
+        num_batches as i32,
+        file_size as i32,
     ));
 
     assert_eq!(dataset.get_fragments().len(), 1);
@@ -220,10 +257,10 @@ fn fragment_take(
             "{version_name} Random Take Fragment({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
         ), |b| {
             b.to_async(rt).iter(|| async {
-                let rows = gen_ranges(num_batches as u64 * BATCH_SIZE, file_size as u64, num_rows);
-                for r in rows {
-                    let _ = fragment.take(&[r as u32], dataset.schema()).await;
-                }
+                let rows = gen_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
+                let mut rows: Vec<u32> = rows.iter().map(|&x| x as u32).collect();
+                rows.sort();
+                let _ = fragment.take(rows.as_slice(), dataset.schema()).await;
             })
         });
     }
