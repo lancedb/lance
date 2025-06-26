@@ -19,7 +19,8 @@ const FSST_SAMPLETARGET: usize = 1 << 14;
 const FSST_SAMPLEMAXSZ: usize = 2 * FSST_SAMPLETARGET;
 
 // if the input size is less than 4MB, we mark the file header and copy the input to the output as is
-pub const FSST_LEAST_INPUT_SIZE: usize = 4 * 1024 * 1024; // 4MB
+//  TODO: FIX ME
+pub const FSST_LEAST_INPUT_SIZE: usize = 32 * 1024; // 4MB
 
 // if the max length of the input strings are less than `FSST_LEAST_INPUT_MAX_LENGTH`, we shouldn't use FSST.
 pub const FSST_LEAST_INPUT_MAX_LENGTH: u64 = 5;
