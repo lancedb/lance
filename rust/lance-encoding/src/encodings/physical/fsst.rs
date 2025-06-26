@@ -311,6 +311,8 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
                 let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i64>();
                 let offsets = offsets.as_ref();
 
+                // The data will expand at most 8 times
+                // The offsets will be the same size because we have the same # of strings
                 let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
                 let mut decompress_offset_buf = vec![0i64; offsets.len()];
                 fsst::fsst::decompress(
@@ -332,6 +334,8 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
                 let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i32>();
                 let offsets = offsets.as_ref();
 
+                // The data will expand at most 8 times
+                // The offsets will be the same size because we have the same # of strings
                 let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
                 let mut decompress_offset_buf = vec![0i32; offsets.len()];
                 fsst::fsst::decompress(
