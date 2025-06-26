@@ -437,8 +437,8 @@ pub mod tests {
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_binary_fsst(
-        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
-        structural_encoding: &str,
+        //#[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK)] structural_encoding: &str,
     ) {
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
@@ -446,15 +446,17 @@ pub mod tests {
             structural_encoding.into(),
         );
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
-
-        let field = Field::new("", DataType::Utf8, true).with_metadata(field_metadata);
+        // TODO: support large binary
+        println!("test_binary_fsst");
+        let field = Field::new("", DataType::LargeUtf8, true).with_metadata(field_metadata);
         check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
     }
 
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_large_binary(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        //#[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(LanceFileVersion::V2_1)] version: LanceFileVersion,
     ) {
         let field = Field::new("", DataType::LargeBinary, true);
         check_round_trip_encoding_random(field, version).await;

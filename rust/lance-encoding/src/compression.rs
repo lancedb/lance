@@ -178,12 +178,15 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 }
             }
             DataBlock::VariableWidth(variable_width_data) => {
-                if variable_width_data.bits_per_offset == 32 {
+                if variable_width_data.bits_per_offset == 32
+                    || variable_width_data.bits_per_offset == 64
+                {
                     let data_size =
                         variable_width_data.expect_single_stat::<UInt64Type>(Stat::DataSize);
                     let max_len =
                         variable_width_data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
 
+                    println!("max_len={}, data_size={}", max_len, data_size);
                     if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
                         && data_size >= FSST_LEAST_INPUT_SIZE as u64
                     {
@@ -191,9 +194,6 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     } else {
                         Ok(Box::new(BinaryMiniBlockEncoder::default()))
                     }
-                } else if variable_width_data.bits_per_offset == 64 {
-                    // TODO: Support FSSTMiniBlockEncoder
-                    Ok(Box::new(BinaryMiniBlockEncoder::default()))
                 } else {
                     todo!(
                         "Implement MiniBlockCompression for VariableWidth DataBlock with {} bit offsets.",
