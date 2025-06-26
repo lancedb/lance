@@ -149,7 +149,7 @@ impl LanceCache {
         self.cache.weighted_size() as usize
     }
 
-    pub fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str, metadata: Arc<T>) {
+    fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str, metadata: Arc<T>) {
         let key = self.get_key(key);
         let record = SizedRecord::new(metadata);
         tracing::trace!(
@@ -170,7 +170,7 @@ impl LanceCache {
         self.insert(key, Arc::new(metadata))
     }
 
-    pub fn get<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
+    fn get<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
         let key = self.get_key(key);
         if let Some(metadata) = self.cache.get(&(key, TypeId::of::<T>())) {
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -194,7 +194,7 @@ impl LanceCache {
     /// If it exists in the cache return that
     ///
     /// If it doesn't then run `loader` to load the item, insert into cache, and return
-    pub async fn get_or_insert<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
+    async fn get_or_insert<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
         &self,
         key: String,
         loader: F,
@@ -220,6 +220,13 @@ impl LanceCache {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn clear(&self) {
+        self.cache.invalidate_all();
+        self.cache.run_pending_tasks();
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
     }
 
     // CacheKey-based methods
@@ -253,6 +260,22 @@ impl LanceCache {
         let key_str = cache_key.key().into_owned();
         self.get_or_insert(key_str, |_| loader()).await
     }
+
+    pub fn insert_unsized_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        self.insert_unsized(&cache_key.key(), metadata)
+    }
+
+    pub fn get_unsized_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        self.get_unsized::<K::ValueType>(&cache_key.key())
+    }
 }
 
 pub trait CacheKey {
@@ -267,6 +290,24 @@ pub struct CacheStats {
     pub hits: u64,
     /// Number of times `get`, `get_unsized`, or `get_or_insert` did not find an item in the cache.
     pub misses: u64,
+}
+
+impl CacheStats {
+    pub fn hit_ratio(&self) -> f32 {
+        if self.hits + self.misses == 0 {
+            0.0
+        } else {
+            self.hits as f32 / (self.hits + self.misses) as f32
+        }
+    }
+
+    pub fn miss_ratio(&self) -> f32 {
+        if self.hits + self.misses == 0 {
+            0.0
+        } else {
+            self.misses as f32 / (self.hits + self.misses) as f32
+        }
+    }
 }
 
 #[cfg(test)]

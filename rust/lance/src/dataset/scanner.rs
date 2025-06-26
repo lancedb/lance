@@ -1820,13 +1820,8 @@ impl Scanner {
                     )
                     .await?;
                 if let Some(index) = index {
-                    let index_type = detect_scalar_index_type(
-                        &self.dataset,
-                        &index,
-                        column,
-                        &self.dataset.session,
-                    )
-                    .await?;
+                    let index_type =
+                        detect_scalar_index_type(&self.dataset, &index, column).await?;
                     if matches!(index_type, ScalarIndexType::Inverted) {
                         indexed_columns.push(column.clone());
                     }

@@ -544,6 +544,10 @@ pub(crate) async fn open_vector_index(
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
 
+    let frag_reuse_uuid = dataset
+        .frag_reuse_index_uuid()
+        .expect("Fragment reuse index UUID should be set");
+
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
             #[allow(unused_variables)]
@@ -564,12 +568,12 @@ pub(crate) async fn open_vector_index(
                 }
                 let ivf = IvfModel::try_from(ivf_pb.to_owned())?;
                 last_stage = Some(Arc::new(IVFIndex::try_new(
-                    dataset.session.clone(),
                     uuid,
                     ivf,
                     reader.clone(),
                     last_stage.unwrap(),
                     metric_type,
+                    dataset.index_cache.for_index(uuid, Some(&frag_reuse_uuid)),
                 )?));
             }
             Some(Stage::Pq(pq_proto)) => {
@@ -621,6 +625,8 @@ pub(crate) async fn open_vector_index_v2(
     let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
+    let frag_reuse_uuid = dataset.frag_reuse_index_uuid();
+
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
             let aux_path = dataset
@@ -641,12 +647,14 @@ pub(crate) async fn open_vector_index_v2(
             let ivf = IvfModel::try_from(pb_ivf)?;
 
             Arc::new(IVFIndex::try_new(
-                dataset.session.clone(),
                 uuid,
                 ivf,
                 reader.object_reader.clone(),
                 Arc::new(hnsw),
                 distance_type,
+                dataset
+                    .index_cache
+                    .for_index(uuid, frag_reuse_uuid.as_ref()),
             )?)
         }
 
@@ -672,12 +680,14 @@ pub(crate) async fn open_vector_index_v2(
             let ivf = IvfModel::try_from(pb_ivf)?;
 
             Arc::new(IVFIndex::try_new(
-                dataset.session.clone(),
                 uuid,
                 ivf,
                 reader.object_reader.clone(),
                 Arc::new(hnsw),
                 distance_type,
+                dataset
+                    .index_cache
+                    .for_index(uuid, frag_reuse_uuid.as_ref()),
             )?)
         }
 

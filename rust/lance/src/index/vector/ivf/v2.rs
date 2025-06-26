@@ -4,22 +4,15 @@
 //! IVF - Inverted File index.
 
 use std::marker::PhantomData;
-use std::{
-    any::Any,
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
 use crate::index::vector::{
     builder::{index_type_string, IvfIndexBuilder},
     IndexFileVersion,
 };
-use crate::{
-    index::{
-        vector::{utils::PartitionLoadLock, VectorIndex},
-        PreFilter,
-    },
-    session::Session,
+use crate::index::{
+    vector::{utils::PartitionLoadLock, VectorIndex},
+    PreFilter,
 };
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
@@ -30,7 +23,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, TryStreamExt};
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::LanceCache;
+use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID};
@@ -85,6 +78,30 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndexCacheEntry
     }
 }
 
+// Cache key for IVF partitions
+#[derive(Debug, Clone)]
+pub struct IVFPartitionKey<S: IvfSubIndex, Q: Quantization> {
+    pub partition_id: usize,
+    _marker: PhantomData<(S, Q)>,
+}
+
+impl<S: IvfSubIndex, Q: Quantization> IVFPartitionKey<S, Q> {
+    pub fn new(partition_id: usize) -> Self {
+        Self {
+            partition_id,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartitionKey<S, Q> {
+    type ValueType = PartitionEntry<S, Q>;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("ivf-{}", self.partition_id).into()
+    }
+}
+
 /// IVF Index.
 #[derive(Debug)]
 pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
@@ -102,17 +119,18 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     distance_type: DistanceType,
 
-    // The session cache holds an Arc to this object so we need to
-    // hold a weak pointer to avoid cycles
-    /// The session cache, used when fetching pages
-    #[allow(dead_code)]
-    session: Weak<Session>,
+    index_cache: LanceCache,
+
     _marker: PhantomData<(S, Q)>,
 }
 
 impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.uuid.deep_size_of_children(context) + self.storage.deep_size_of_children(context)
+        self.uri.deep_size_of_children(context)
+            + self.ivf.deep_size_of_children(context)
+            + self.sub_index_metadata.deep_size_of_children(context)
+            + self.uuid.deep_size_of_children(context)
+            + self.storage.deep_size_of_children(context)
         // Skipping session since it is a weak ref
     }
 }
@@ -123,24 +141,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         object_store: Arc<ObjectStore>,
         index_dir: Path,
         uuid: String,
-        session: Weak<Session>,
         fri: Option<Arc<FragReuseIndex>>,
+        file_metadata_cache: &LanceCache,
+        index_cache: LanceCache,
     ) -> Result<Self> {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
         let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
-        let file_metadata_cache = session
-            .upgrade()
-            .map(|sess| sess.metadata_cache.file_metadata_cache(&uri))
-            .unwrap_or_else(LanceCache::no_cache);
         let index_reader = FileReader::try_open(
             scheduler
                 .open_file(&uri, &CachedFileSize::unknown())
                 .await?,
             None,
             Arc::<DecoderPlugins>::default(),
-            &file_metadata_cache,
+            file_metadata_cache,
             FileReaderOptions::default(),
         )
         .await?;
@@ -194,7 +209,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 .await?,
             None,
             Arc::<DecoderPlugins>::default(),
-            &file_metadata_cache,
+            file_metadata_cache,
             FileReaderOptions::default(),
         )
         .await?;
@@ -210,7 +225,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             partition_locks: PartitionLoadLock::new(num_partitions),
             sub_index_metadata,
             distance_type,
-            session,
+            index_cache,
             _marker: PhantomData,
         })
     }
@@ -222,17 +237,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         write_cache: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndexCacheEntry>> {
-        let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
-        let session = self.session.upgrade().ok_or(Error::Internal {
-            message: "attempt to use index after dataset was destroyed".into(),
-            location: location!(),
-        })?;
-        let part_entry = if let Some(part_idx) =
-            session.index_cache.get_vector_partition(&cache_key)
-        {
+        let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
+        let part_entry = if let Some(part_idx) = self.index_cache.get_with_key(&cache_key) {
             part_idx
         } else {
-            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key);
+            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key.key().as_ref());
             metrics.record_part_load();
             if partition_id >= self.ivf.num_partitions() {
                 return Err(Error::Index {
@@ -250,7 +259,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
             // check the cache again, as the partition may have been loaded by another
             // thread that held the lock on loading the partition
-            if let Some(part_idx) = session.index_cache.get_vector_partition(&cache_key) {
+            if let Some(part_idx) = self.index_cache.get_with_key(&cache_key) {
                 part_idx
             } else {
                 let schema = Arc::new(self.reader.schema().as_ref().into());
@@ -286,9 +295,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     storage,
                 });
                 if write_cache {
-                    session
-                        .index_cache
-                        .insert_vector_partition(&cache_key, partition_entry.clone());
+                    self.index_cache
+                        .insert_with_key(&cache_key, partition_entry.clone());
                 }
 
                 partition_entry
