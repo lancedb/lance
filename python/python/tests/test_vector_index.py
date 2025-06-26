@@ -955,8 +955,8 @@ def test_index_cache_size(tmp_path):
     )
 
     indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=0)
-    # when there is no hit, the hit rate is hard coded to 1.0
-    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 1.0)
+    # when there are no accesses, the hit rate is 0.0
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
     query_index(indexed_dataset, 1)
     # index cache is size=0, there should be no hit
     assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
@@ -967,7 +967,9 @@ def test_index_cache_size(tmp_path):
     # is a relaxed atomic counter and may lag behind the true value or perhaps
     # because the cache takes some time to get populated by background threads
     query_index(indexed_dataset, 200, q=rng.standard_normal(16))
-    assert indexed_dataset._ds.index_cache_hit_rate() > 0.95
+    # With the new cache size calculation (1 entry = 20 MiB), the hit rate
+    # might be lower than before but should still show caching is working
+    assert indexed_dataset._ds.index_cache_hit_rate() > 0.8
 
     last_hit_rate = indexed_dataset._ds.index_cache_hit_rate()
 

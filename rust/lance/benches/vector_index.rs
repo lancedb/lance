@@ -92,7 +92,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
     // reopen with no index caching to test IO overhead
     let dataset = rt.block_on(async {
         DatasetBuilder::from_uri("./vec_data.lance")
-            .with_index_cache_size(0)
+            .with_index_cache_size_bytes(0)
             .load()
             .await
             .unwrap()
