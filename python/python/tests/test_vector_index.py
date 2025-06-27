@@ -550,6 +550,17 @@ def test_ivf_flat_over_binary_vector(tmp_path):
     )
 
 
+def test_create_ivf_sq_index(dataset, tmp_path):
+    assert not dataset.has_index
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_SQ",
+        num_partitions=4,
+    )
+    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")

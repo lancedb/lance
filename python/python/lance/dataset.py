@@ -2073,6 +2073,7 @@ class LanceDataset(pa.dataset.Dataset):
         valid_index_types = [
             "IVF_FLAT",
             "IVF_PQ",
+            "IVF_SQ",
             "IVF_HNSW_FLAT",
             "IVF_HNSW_PQ",
             "IVF_HNSW_SQ",
