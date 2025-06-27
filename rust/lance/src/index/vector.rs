@@ -394,7 +394,7 @@ pub(crate) async fn build_vector_index(
     } else if is_ivf_sq(stages) {
         let StageParams::SQ(sq_params) = &stages[1] else {
             return Err(Error::Index {
-                message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                message: format!("Build Vector Index: invalid stages: {stages:?}"),
                 location: location!(),
             });
         };

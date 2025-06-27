@@ -972,7 +972,7 @@ mod tests {
             vec![
                 Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
                 Arc::new(StringArray::from_iter_values(
-                    (0..10).map(|v| format!("str-{}", v)),
+                    (0..10).map(|v| format!("str-{v}")),
                 )),
                 Arc::new(StructArray::from(vec![
                     (
@@ -1165,7 +1165,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(StringArray::from_iter_values(
-                (0..10).map(|v| format!("str-{}", v)),
+                (0..10).map(|v| format!("str-{v}")),
             ))],
         )
         .unwrap();
@@ -1193,7 +1193,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(StringArray::from_iter_values(
-                (0..10).map(|v| format!("str-{}", v)),
+                (0..10).map(|v| format!("str-{v}")),
             ))],
         )
         .unwrap();
@@ -1221,7 +1221,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(StringArray::from_iter_values(
-                (0..10).map(|v| format!("str-{}", v)),
+                (0..10).map(|v| format!("str-{v}")),
             ))],
         )
         .unwrap();
@@ -1249,7 +1249,7 @@ mod tests {
             schema,
             vec![Arc::new(StringArray::from_iter((0..10).map(|v| {
                 if v % 3 == 0 {
-                    Some(format!("str-{}", v))
+                    Some(format!("str-{v}"))
                 } else {
                     None
                 }
@@ -1604,7 +1604,7 @@ mod tests {
             // Evaluate and assert they have correct results
             let result = physical_expr.evaluate(&batch).unwrap();
             let result = result.into_array(batch.num_rows()).unwrap();
-            assert_eq!(&expected, &result, "unexpected result for {}", expression);
+            assert_eq!(&expected, &result, "unexpected result for {expression}");
         }
     }
 
