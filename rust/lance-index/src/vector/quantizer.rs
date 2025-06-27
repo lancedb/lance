@@ -8,6 +8,7 @@ use std::{collections::HashMap, fmt::Debug};
 
 use arrow::{array::AsArray, compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::Field;
 use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
@@ -36,7 +37,7 @@ pub trait Quantization:
 {
     type BuildParams: QuantizerBuildParams + Send + Sync;
     type Metadata: QuantizerMetadata + Send + Sync;
-    type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore + Debug;
+    type Storage: QuantizerStorage<Metadata = Self::Metadata> + Debug;
 
     fn build(
         data: &dyn Array,
@@ -54,6 +55,7 @@ pub trait Quantization:
     fn quantization_type() -> QuantizationType;
     fn metadata(&self, _: Option<QuantizationMetadata>) -> Self::Metadata;
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer>;
+    fn field(&self) -> Field;
 }
 
 pub enum QuantizationType {

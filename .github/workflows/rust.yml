@@ -88,6 +88,8 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ matrix.toolchain }}
+          # When using the nightly toolchain, do not surface warnings as check annotations
+          matcher: ${{ matrix.toolchain != 'nightly'}}
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
       - name: Install dependencies

@@ -1535,7 +1535,7 @@ pub mod tests {
     use lance_datagen::{array, gen, BatchCount, ByteCount, RowCount};
     use lance_encoding::{
         decoder::{decode_batch, DecodeBatchScheduler, DecoderPlugins, FilterExpression},
-        encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodingOptions},
+        encoder::{default_encoding_strategy, encode_batch, EncodedBatch, EncodingOptions},
         version::LanceFileVersion,
     };
     use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
@@ -1667,8 +1667,12 @@ pub mod tests {
         }
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_encoded_batch_round_trip() {
+    async fn test_encoded_batch_round_trip(
+        // TODO: Add V2_1 (currently fails)
+        #[values(LanceFileVersion::V2_0)] version: LanceFileVersion,
+    ) {
         let data = gen()
             .col("x", array::rand::<Int32Type>())
             .col("y", array::rand_utf8(ByteCount::from(16), false))
@@ -1683,17 +1687,20 @@ pub mod tests {
             keep_original_array: true,
             buffer_alignment: 64,
         };
+
+        let encoding_strategy = default_encoding_strategy(version);
+
         let encoded_batch = encode_batch(
             &data,
             lance_schema.clone(),
-            &CoreFieldEncodingStrategy::default(),
+            encoding_strategy.as_ref(),
             &encoding_options,
         )
         .await
         .unwrap();
 
         // Test self described
-        let bytes = encoded_batch.try_to_self_described_lance().unwrap();
+        let bytes = encoded_batch.try_to_self_described_lance(version).unwrap();
 
         let decoded_batch = EncodedBatch::try_from_self_described_lance(bytes).unwrap();
 
@@ -1711,7 +1718,7 @@ pub mod tests {
         assert_eq!(data, decoded);
 
         // Test mini
-        let bytes = encoded_batch.try_to_mini_lance().unwrap();
+        let bytes = encoded_batch.try_to_mini_lance(version).unwrap();
         let decoded_batch =
             EncodedBatch::try_from_mini_lance(bytes, lance_schema.as_ref(), LanceFileVersion::V2_0)
                 .unwrap();

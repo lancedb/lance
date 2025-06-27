@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
+use datafusion_physical_plan::ExecutionPlan;
 use futures::stream::BoxStream;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
@@ -392,7 +393,7 @@ impl ObjectStore for IoTrackingStore {
         let result = self.target.get(location).await;
         if let Ok(result) = &result {
             let num_bytes = result.range.end - result.range.start;
-            self.record_read(num_bytes as u64);
+            self.record_read(num_bytes);
         }
         result
     }
@@ -402,12 +403,12 @@ impl ObjectStore for IoTrackingStore {
         let result = self.target.get_opts(location, options).await;
         if let Ok(result) = &result {
             let num_bytes = result.range.end - result.range.start;
-            self.record_read(num_bytes as u64);
+            self.record_read(num_bytes);
         }
         result
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
         let _guard = self.hop_guard();
         let result = self.target.get_range(location, range).await;
         if let Ok(result) = &result {
@@ -416,7 +417,7 @@ impl ObjectStore for IoTrackingStore {
         result
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
         let _guard = self.hop_guard();
         let result = self.target.get_ranges(location, ranges).await;
         if let Ok(result) = &result {
@@ -444,7 +445,7 @@ impl ObjectStore for IoTrackingStore {
         self.target.delete_stream(locations)
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
         let _guard = self.hop_guard();
         self.record_read(0);
         self.target.list(prefix)
@@ -454,7 +455,7 @@ impl ObjectStore for IoTrackingStore {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> BoxStream<'_, OSResult<ObjectMeta>> {
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
         self.record_read(0);
         self.target.list_with_offset(prefix, offset)
     }
@@ -673,6 +674,39 @@ pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
     copy_dir_all(src.as_path(), test_dir.path())?;
 
     Ok(test_dir)
+}
+
+pub async fn assert_plan_node_equals(
+    plan_node: Arc<dyn ExecutionPlan>,
+    expected: &str,
+) -> lance_core::Result<()> {
+    let plan_desc = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
+    );
+
+    let to_match = expected.split("...").collect::<Vec<_>>();
+    let num_pieces = to_match.len();
+    let mut remainder = plan_desc.as_str().trim_end_matches('\n');
+    for (i, piece) in to_match.into_iter().enumerate() {
+        let res = match i {
+            0 => remainder.starts_with(piece),
+            _ if i == num_pieces - 1 => remainder.ends_with(piece),
+            _ => remainder.contains(piece),
+        };
+        if !res {
+            break;
+        }
+        let idx = remainder.find(piece).unwrap();
+        remainder = &remainder[idx + piece.len()..];
+    }
+    if !remainder.is_empty() {
+        panic!(
+            "Expected plan to match:\nExpected: {}\nActual: {}",
+            expected, plan_desc
+        )
+    }
+    Ok(())
 }
 
 #[cfg(test)]

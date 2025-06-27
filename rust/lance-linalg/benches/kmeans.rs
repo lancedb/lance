@@ -15,42 +15,31 @@ use lance_linalg::{
 use lance_testing::datagen::generate_random_array;
 
 fn bench_train(c: &mut Criterion) {
-    // default tokio runtime
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let params = [
+        (64 * 1024, 8),    // training PQ
+        (64 * 1024, 128),  // training IVF with small vectors (1M rows)
+        (64 * 1024, 1024), // training IVF with large vectors (1M rows)
+    ];
+    for (n, dimension) in params {
+        let k = n / 256;
 
-    let dimension: i32 = 128;
-    let values = generate_random_array(1024 * 4 * dimension as usize);
-    let array = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
+        let values = generate_random_array(n * dimension as usize);
+        let data = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
 
-    c.bench_function("train_128d_4k", |b| {
-        b.to_async(&rt).iter(|| async {
-            KMeans::new(&array, 25, 50).ok().unwrap();
-        })
-    });
+        let values = generate_random_array(k * dimension as usize);
+        let centroids = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
 
-    let values = generate_random_array(1024 * 64 * dimension as usize);
-    let array = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
-    c.bench_function("train_128d_65535", |b| {
-        b.to_async(&rt).iter(|| async {
-            KMeans::new(&array, 25, 50).ok().unwrap();
-        })
-    });
+        c.bench_function(&format!("train_{}d_{}k", dimension, n / 1024), |b| {
+            b.iter(|| {
+                KMeans::new(&data, k, 50).ok().unwrap();
+            })
+        });
 
-    let values = generate_random_array(1024 * 64 * dimension as usize);
-    let query = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
-    c.bench_function("compute_membership_128d_65535", |b| {
-        b.to_async(&rt)
-            .iter(|| async { compute_partitions_arrow_array(&array, &query, DistanceType::L2) })
-    });
-
-    let dimension = 8;
-    let values = generate_random_array(1024 * 64 * dimension as usize);
-    let array = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
-    c.bench_function("train_8d_65535", |b| {
-        b.to_async(&rt).iter(|| async {
-            KMeans::new(&array, 25, 50).ok().unwrap();
-        })
-    });
+        c.bench_function(
+            &format!("compute_membership_{}d_{}k", dimension, n / 1024),
+            |b| b.iter(|| compute_partitions_arrow_array(&centroids, &data, DistanceType::L2)),
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]

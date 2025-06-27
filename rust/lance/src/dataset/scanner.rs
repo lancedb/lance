@@ -225,7 +225,12 @@ impl LanceFilter {
                 let schema = Arc::new(ArrowSchema::from(full_schema));
                 let planner = Planner::new(schema);
                 let filter = planner.parse_filter(sql)?;
-                planner.optimize_expr(filter)
+                planner.optimize_expr(filter).map_err(|e| {
+                    Error::invalid_input(
+                        format!("Error optimizing sql filter: {sql} ({e})"),
+                        location!(),
+                    )
+                })
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
@@ -236,7 +241,12 @@ impl LanceFilter {
                     .now_or_never()
                     .expect("could not parse the Substrait filter in a synchronous fashion")?;
                 let planner = Planner::new(schema);
-                planner.optimize_expr(expr)
+                planner.optimize_expr(expr.clone()).map_err(|e| {
+                    Error::invalid_input(
+                        format!("Error optimizing substrait filter: {expr:?} ({e})"),
+                        location!(),
+                    )
+                })
             }
             #[cfg(not(feature = "substrait"))]
             Self::Substrait(_) => {
@@ -3165,7 +3175,7 @@ mod test {
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
     use crate::index::vector::{StageParams, VectorIndexParams};
-    use crate::utils::test::{IoStats, IoTrackingStore};
+    use crate::utils::test::{assert_plan_node_equals, IoStats, IoTrackingStore};
 
     #[tokio::test]
     async fn test_batch_size() {
@@ -5135,39 +5145,6 @@ mod test {
             .unwrap();
         let batches = stream.collect::<Vec<_>>().await;
         assert_eq!(batches.len(), 1000_usize.div_ceil(16));
-    }
-
-    async fn assert_plan_node_equals(
-        plan_node: Arc<dyn ExecutionPlan>,
-        expected: &str,
-    ) -> Result<()> {
-        let plan_desc = format!(
-            "{}",
-            datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
-        );
-
-        let to_match = expected.split("...").collect::<Vec<_>>();
-        let num_pieces = to_match.len();
-        let mut remainder = plan_desc.as_str().trim_end_matches('\n');
-        for (i, piece) in to_match.into_iter().enumerate() {
-            let res = match i {
-                0 => remainder.starts_with(piece),
-                _ if i == num_pieces - 1 => remainder.ends_with(piece),
-                _ => remainder.contains(piece),
-            };
-            if !res {
-                break;
-            }
-            let idx = remainder.find(piece).unwrap();
-            remainder = &remainder[idx + piece.len()..];
-        }
-        if !remainder.is_empty() {
-            panic!(
-                "Expected plan to match:\nExpected: {}\nActual: {}",
-                expected, plan_desc
-            )
-        }
-        Ok(())
     }
 
     /// Assert that the plan when formatted matches the expected string.

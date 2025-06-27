@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "0.30.1"
+version = "0.31.0"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 rust-version = "1.65"
@@ -17,7 +17,7 @@ arrow-array = "55.1"
 arrow-data = "55.1"
 arrow-schema = "55.1"
 arrow-select = "55.1"
-object_store = "0.11.2"
+object_store = "0.12.2"
 datafusion = "47.0"
 datafusion-ffi = "47.0"
 datafusion-common = "47.0"

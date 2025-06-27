@@ -9,10 +9,10 @@
 //! and run ``l2`` distance on the unit vectors.
 //!
 
-use std::collections::HashMap;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
 use std::vec;
+use std::{collections::HashMap, ops::MulAssign};
 
 use arrow_array::{
     cast::AsArray,
@@ -24,14 +24,16 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{ArrowError, DataType};
 use bitvec::prelude::*;
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use log::{info, warn};
+use num_traits::One;
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
 use rayon::prelude::*;
 
 use crate::distance::hamming::{hamming, hamming_distance_batch};
 use crate::distance::{dot_distance_batch, DistanceType};
-use crate::kernels::{argmax, argmin_value_float};
+use crate::kernels::argmin_value_float;
 use crate::{
     distance::{
         l2::{l2_distance_batch, L2},
@@ -147,16 +149,36 @@ fn kmeans_random_init<T: ArrowPrimitiveType>(
 
 /// Split one big cluster into two smaller clusters. After split, each
 /// cluster has approximately half of the vectors.
-fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], dimension: usize) {
+fn split_clusters<T: Float + MulAssign>(
+    n: usize,
+    cnts: &mut [u64],
+    centroids: &mut [T],
+    dim: usize,
+) {
+    let eps = T::from(1.0 / 1024.0).unwrap();
+    let mut rng = SmallRng::from_entropy();
     for i in 0..cnts.len() {
         if cnts[i] == 0 {
-            let largest_idx = argmax(cnts.iter().copied()).unwrap() as usize;
-            cnts[i] = cnts[largest_idx] / 2;
-            cnts[largest_idx] /= 2;
-            for j in 0..dimension {
-                centroids[i * dimension + j] =
-                    centroids[largest_idx * dimension + j] * (T::one() + T::epsilon());
-                centroids[largest_idx * dimension + j] /= T::one() + T::epsilon();
+            let mut j = 0;
+            loop {
+                let p = (cnts[j] as f32 - 1.0) / (n - cnts.len()) as f32;
+                if rng.gen::<f32>() < p {
+                    break;
+                }
+                j += 1;
+                j %= cnts.len();
+            }
+
+            cnts[i] = cnts[j] / 2;
+            cnts[j] -= cnts[i];
+            for k in 0..dim {
+                if k % 2 == 0 {
+                    centroids[i * dim + k] = centroids[j * dim + k] * (T::one() + eps);
+                    centroids[j * dim + k] *= T::one() - eps;
+                } else {
+                    centroids[i * dim + k] = centroids[j * dim + k] * (T::one() - eps);
+                    centroids[j * dim + k] *= T::one() + eps;
+                }
             }
         }
     }
@@ -165,8 +187,8 @@ fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], d
 fn histogram(k: usize, membership: &[Option<u32>]) -> Vec<usize> {
     let mut hist: Vec<usize> = vec![0; k];
     membership.iter().for_each(|cd| {
-        if let Some(cluster_id) = cd {
-            hist[*cluster_id as usize] += 1;
+        if let Some(cd) = cd {
+            hist[*cd as usize] += 1;
         }
     });
 
@@ -219,7 +241,8 @@ where
 
 impl<T: ArrowNumericType> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
 where
-    T::Native: Float + Dot + L2 + DivAssign + AddAssign + FromPrimitive + Sync,
+    T::Native: Float + Dot + L2 + MulAssign + DivAssign + AddAssign + FromPrimitive + Sync,
+    PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     fn compute_membership_and_loss(
         centroids: &[T::Native],
@@ -250,7 +273,7 @@ where
                 .collect::<Vec<_>>(),
             cluster_and_dists
                 .iter()
-                .map(|cd| cd.map(|(_, d)| d).unwrap_or_default() as f64)
+                .map(|cd| cd.map(|(_, d)| d as f64).unwrap_or_default())
                 .sum(),
         )
     }
@@ -264,38 +287,49 @@ where
         loss: f64,
     ) -> KMeans {
         let mut cluster_cnts = vec![0_u64; k];
-        let mut new_centroids = vec![T::Native::zero(); k * dimension];
-        data.chunks_exact(dimension)
-            .zip(membership.iter())
-            .for_each(|(vector, cluster_id)| {
-                if let Some(&cluster_id) = cluster_id.as_ref() {
-                    cluster_cnts[cluster_id as usize] += 1;
-                    // TODO: simd
-                    for (old, &new) in new_centroids
-                        [cluster_id as usize * dimension..(1 + cluster_id as usize) * dimension]
-                        .iter_mut()
-                        .zip(vector)
-                    {
-                        *old += new;
-                    }
+        let mut centroids = vec![T::Native::zero(); k * dimension];
+
+        let mut num_cpus = get_num_compute_intensive_cpus();
+        if k < num_cpus || k < 16 {
+            num_cpus = 1;
+        }
+        let chunk_size = k / num_cpus;
+
+        centroids
+            .par_chunks_mut(dimension * chunk_size)
+            .zip(cluster_cnts.par_chunks_mut(chunk_size))
+            .enumerate()
+            .with_max_len(1)
+            .for_each(|(i, (centroids, cnts))| {
+                let start = i * chunk_size;
+                let end = ((i + 1) * chunk_size).min(k);
+                data.chunks(dimension)
+                    .zip(membership.iter())
+                    .filter_map(|(vector, cluster_id)| {
+                        cluster_id.map(|cluster_id| (vector, cluster_id as usize))
+                    })
+                    .for_each(|(vector, cluster_id)| {
+                        if start <= cluster_id && cluster_id < end {
+                            let local_id = cluster_id - start;
+                            cnts[local_id] += 1;
+                            let centroid =
+                                &mut centroids[local_id * dimension..(local_id + 1) * dimension];
+                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                        }
+                    });
+            });
+
+        centroids
+            .par_chunks_mut(dimension)
+            .zip(cluster_cnts.par_iter())
+            .for_each(|(centroid, &cnt)| {
+                if cnt > 0 {
+                    let norm = T::Native::one() / T::Native::from_u64(cnt).unwrap();
+                    centroid.iter_mut().for_each(|v| *v *= norm);
                 }
             });
 
-        let mut empty_clusters = 0;
-
-        cluster_cnts.iter().enumerate().for_each(|(i, &cnt)| {
-            if cnt == 0 {
-                empty_clusters += 1;
-                new_centroids[i * dimension..(i + 1) * dimension]
-                    .iter_mut()
-                    .for_each(|v| *v = T::Native::nan());
-            } else {
-                new_centroids[i * dimension..(i + 1) * dimension]
-                    .iter_mut()
-                    .for_each(|v| *v /= T::Native::from_u64(cnt).unwrap());
-            }
-        });
-
+        let empty_clusters = cluster_cnts.iter().filter(|&cnt| *cnt == 0).count();
         if empty_clusters as f32 / k as f32 > 0.1 {
             warn!(
                 "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
@@ -304,10 +338,15 @@ where
             );
         }
 
-        split_clusters(&mut cluster_cnts, &mut new_centroids, dimension);
+        split_clusters(
+            data.len() / dimension,
+            &mut cluster_cnts,
+            &mut centroids,
+            dimension,
+        );
 
         KMeans {
-            centroids: Arc::new(PrimitiveArray::<T>::from_iter_values(new_centroids)),
+            centroids: Arc::new(PrimitiveArray::<T>::from(centroids)),
             dimension,
             distance_type,
             loss,
@@ -344,7 +383,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
                 .collect::<Vec<_>>(),
             cluster_and_dists
                 .iter()
-                .map(|cd| cd.map(|(_, d)| d).unwrap_or_default() as f64)
+                .map(|cd| cd.map(|(_, d)| d as f64).unwrap_or_default())
                 .sum(),
         )
     }
@@ -360,8 +399,8 @@ impl KMeansAlgo<u8> for KModeAlgo {
         assert_eq!(distance_type, DistanceType::Hamming);
 
         let mut clusters = HashMap::<u32, Vec<usize>>::new();
-        membership.iter().enumerate().for_each(|(i, part_id_opt)| {
-            if let Some(part_id) = part_id_opt {
+        membership.iter().enumerate().for_each(|(i, part_id)| {
+            if let Some(part_id) = part_id {
                 clusters.entry(*part_id).or_default().push(i);
             }
         });
@@ -780,10 +819,10 @@ pub fn compute_partition<T: Float + L2 + Dot>(
 ) -> Option<u32> {
     match distance_type {
         DistanceType::L2 => {
-            argmin_value_float(l2_distance_batch(vector, centroids, vector.len())).map(|c| c.0)
+            argmin_value_float(l2_distance_batch(vector, centroids, vector.len())).map(|(c, _)| c)
         }
         DistanceType::Dot => {
-            argmin_value_float(dot_distance_batch(vector, centroids, vector.len())).map(|c| c.0)
+            argmin_value_float(dot_distance_batch(vector, centroids, vector.len())).map(|(c, _)| c)
         }
         _ => {
             panic!(

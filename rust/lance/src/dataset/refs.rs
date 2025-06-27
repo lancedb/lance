@@ -144,7 +144,7 @@ impl Tags {
         let manifest_size = if let Some(size) = manifest_file.size {
             size as usize
         } else {
-            self.object_store().size(&manifest_file.path).await?
+            self.object_store().size(&manifest_file.path).await? as usize
         };
 
         let tag_contents = TagContents {
@@ -200,7 +200,7 @@ impl Tags {
         let manifest_size = if let Some(size) = manifest_file.size {
             size as usize
         } else {
-            self.object_store().size(&manifest_file.path).await?
+            self.object_store().size(&manifest_file.path).await? as usize
         };
 
         let tag_contents = TagContents {

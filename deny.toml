@@ -105,6 +105,7 @@ allow = [
     "ISC",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",
     "0BSD",
     "OpenSSL",
     "Zlib",

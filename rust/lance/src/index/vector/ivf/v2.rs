@@ -1172,6 +1172,80 @@ mod tests {
         }
     }
 
+    async fn test_delete_all_rows(params: VectorIndexParams) {
+        match params.metric_type {
+            DistanceType::Hamming => {
+                test_delete_all_rows_impl::<UInt8Type>(params, 0..4).await;
+            }
+            _ => {
+                test_delete_all_rows_impl::<Float32Type>(params, 0.0..1.0).await;
+            }
+        }
+    }
+
+    async fn test_delete_all_rows_impl<T: ArrowPrimitiveType>(
+        params: VectorIndexParams,
+        range: Range<T::Native>,
+    ) where
+        T::Native: SampleUniform,
+    {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
+
+        let vector_column = "vector";
+        dataset
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        dataset.delete("id >= 0").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+
+        // optimize after delete all rows
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        let query = vectors.value(0);
+        let results = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), 100)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 0);
+
+        // compact after delete all rows
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
+
+        let vector_column = "vector";
+        dataset
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        dataset.delete("id >= 0").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), 100)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 0);
+    }
+
     #[tokio::test]
     async fn test_flat_knn() {
         test_distance_range(None, 4).await;
@@ -1195,7 +1269,8 @@ mod tests {
         }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params.clone(), nlist).await;
-        test_optimize_strategy(params).await;
+        test_optimize_strategy(params.clone()).await;
+        test_delete_all_rows(params).await;
     }
 
     #[rstest]
@@ -1243,7 +1318,8 @@ mod tests {
         }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params.clone(), nlist).await;
-        test_optimize_strategy(params).await;
+        test_optimize_strategy(params.clone()).await;
+        test_delete_all_rows(params).await;
     }
 
     #[rstest]
@@ -1259,6 +1335,27 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::new(32, 4);
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
+        test_index(params.clone(), nlist, recall_requirement, None).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
+        test_remap(params.clone(), nlist).await;
+        test_optimize_strategy(params).await;
+    }
+
+    #[rstest]
+    #[case(4, DistanceType::L2, 0.85)]
+    #[case(4, DistanceType::Cosine, 0.85)]
+    #[case(4, DistanceType::Dot, 0.75)]
+    #[tokio::test]
+    async fn test_build_ivf_sq(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
+        let ivf_params = IvfBuildParams::new(nlist);
+        let sq_params = SQBuildParams::default();
+        let params = VectorIndexParams::with_ivf_sq_params(distance_type, ivf_params, sq_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
@@ -1310,7 +1407,8 @@ mod tests {
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
-        test_optimize_strategy(params).await;
+        test_optimize_strategy(params.clone()).await;
+        test_delete_all_rows(params).await;
     }
 
     #[rstest]

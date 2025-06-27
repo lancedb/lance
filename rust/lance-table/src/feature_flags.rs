@@ -11,7 +11,7 @@ use lance_core::{Error, Result};
 /// Fragments may contain deletion files, which record the tombstones of
 /// soft-deleted rows.
 pub const FLAG_DELETION_FILES: u64 = 1;
-/// Row ids are table after moves, but not updates. Fragments contain an index
+/// Row ids are stable after moves, but not updates. Fragments contain an index
 /// mapping row ids to row addresses.
 pub const FLAG_MOVE_STABLE_ROW_IDS: u64 = 2;
 /// Files are written with the new v2 format (this flag is no longer used)

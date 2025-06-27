@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arrow::datatypes::{self, ArrowPrimitiveType};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use deepsize::DeepSizeOf;
 use distance::build_distance_table_dot;
 use lance_arrow::*;
@@ -489,6 +489,18 @@ impl Quantization for ProductQuantizer {
             codebook,
             distance_type,
         )))
+    }
+
+    fn field(&self) -> Field {
+        let num_bytes_per_sub_vector = self.num_sub_vectors * self.num_bits as usize / 8;
+        Field::new(
+            PQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                num_bytes_per_sub_vector as i32,
+            ),
+            true,
+        )
     }
 }
 
