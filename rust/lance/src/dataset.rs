@@ -325,6 +325,69 @@ impl From<Schema> for ProjectionRequest {
     }
 }
 
+/// Customize the params of dataset's sql API.
+#[derive(Clone, Debug)]
+pub struct SqlOptions {
+    /// the dataset to run the SQL query
+    dataset: Option<Dataset>,
+
+    /// the SQL query to run
+    sql: String,
+
+    /// the name of the table to register in the datafusion context
+    table_name: String,
+
+    /// if true, the query result will include the internal row id
+    row_id: bool,
+
+    /// if true, the query result will include the internal row address
+    row_addr: bool,
+}
+
+impl SqlOptions {
+    pub fn table_name(mut self, table_name: &str) -> Self {
+        self.table_name = table_name.to_string();
+        self
+    }
+
+    pub fn with_row_id(mut self, row_id: bool) -> Self {
+        self.row_id = row_id;
+        self
+    }
+
+    pub fn with_row_addr(mut self, row_addr: bool) -> Self {
+        self.row_addr = row_addr;
+        self
+    }
+
+    pub async fn execute(self) -> Result<Vec<RecordBatch>> {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            self.table_name,
+            Arc::new(LanceTableProvider::new(
+                Arc::new(self.dataset.unwrap()),
+                self.row_id,
+                self.row_addr,
+            )),
+        )?;
+        let df = ctx.sql(&self.sql).await?;
+        let result = df.collect().await?;
+        Ok(result)
+    }
+}
+
+impl Default for SqlOptions {
+    fn default() -> Self {
+        Self {
+            dataset: None,
+            sql: "".to_string(),
+            table_name: "".to_string(),
+            row_id: false,
+            row_addr: false,
+        }
+    }
+}
+
 impl Dataset {
     /// Open an existing dataset.
     ///
@@ -1453,25 +1516,13 @@ impl Dataset {
     }
 
     /// Run a SQL query against the dataset.
-    pub async fn sql(
-        &self,
-        sql: &str,
-        table: &str,
-        with_row_id: bool,
-        with_row_addr: bool,
-    ) -> Result<Vec<RecordBatch>> {
-        let ctx = SessionContext::new();
-        ctx.register_table(
-            table,
-            Arc::new(LanceTableProvider::new(
-                Arc::new(self.clone()),
-                with_row_id,
-                with_row_addr,
-            )),
-        )?;
-        let df = ctx.sql(sql).await?;
-        let result = df.collect().await?;
-        Ok(result)
+    /// The underlying SQL engine is DataFusion.
+    pub fn sql(&mut self, sql: &str) -> SqlOptions {
+        SqlOptions {
+            dataset: Some(self.clone()),
+            sql: sql.to_string(),
+            ..Default::default()
+        }
     }
 }
 
@@ -6559,7 +6610,7 @@ mod tests {
     async fn test_sql() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let ds = gen()
+        let mut ds = gen()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(
@@ -6571,7 +6622,9 @@ mod tests {
             .unwrap();
 
         let results = ds
-            .sql("SELECT SUM(x) FROM foo WHERE y > 100", "foo", true, true)
+            .sql("SELECT SUM(x) FROM foo WHERE y > 100")
+            .table_name("foo")
+            .execute()
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -6581,14 +6634,12 @@ mod tests {
         // SUM(0..100) - SUM(0..50) = 3675
         assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 3675);
 
-        // verify _rowid and _rowaddr
         let results = ds
-            .sql(
-                "SELECT x, y, _rowid, _rowaddr FROM foo where y > 100",
-                "foo",
-                true,
-                true,
-            )
+            .sql("SELECT x, y, _rowid, _rowaddr FROM foo where y > 100")
+            .table_name("foo")
+            .with_row_id(true)
+            .with_row_addr(true)
+            .execute()
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
