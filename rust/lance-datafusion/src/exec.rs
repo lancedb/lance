@@ -211,7 +211,9 @@ impl DisplayAs for TracedExec {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "TracedExec")
             }
         }
@@ -244,7 +246,7 @@ impl ExecutionPlan for TracedExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(TracedExec {
+        Ok(Arc::new(Self {
             input: children[0].clone(),
             properties: self.properties.clone(),
             span: self.span.clone(),
