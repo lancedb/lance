@@ -159,6 +159,19 @@ impl VectorIndexParams {
         }
     }
 
+    pub fn with_ivf_sq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        sq: SQBuildParams,
+    ) -> Self {
+        let stages = vec![StageParams::Ivf(ivf), StageParams::SQ(sq)];
+        Self {
+            stages,
+            metric_type,
+            version: IndexFileVersion::V3,
+        }
+    }
+
     pub fn ivf_hnsw(
         distance_type: DistanceType,
         ivf: IvfBuildParams,
@@ -243,6 +256,14 @@ fn is_ivf_pq(stages: &[StageParams]) -> bool {
 
     matches!(&stages[len - 1], StageParams::PQ(_))
         && matches!(&stages[len - 2], StageParams::Ivf(_))
+}
+
+fn is_ivf_sq(stages: &[StageParams]) -> bool {
+    if stages.len() < 2 {
+        return false;
+    }
+
+    matches!(&stages[0], StageParams::Ivf(_)) && matches!(&stages[1], StageParams::SQ(_))
 }
 
 fn is_ivf_hnsw(stages: &[StageParams]) -> bool {
@@ -370,6 +391,27 @@ pub(crate) async fn build_vector_index(
                 .await?;
             }
         }
+    } else if is_ivf_sq(stages) {
+        let StageParams::SQ(sq_params) = &stages[1] else {
+            return Err(Error::Index {
+                message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                location: location!(),
+            });
+        };
+
+        IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
+            dataset.clone(),
+            column.to_owned(),
+            dataset.indices_dir().child(uuid),
+            params.metric_type,
+            Box::new(shuffler),
+            Some(ivf_params.clone()),
+            Some(sq_params.clone()),
+            (),
+            fri,
+        )?
+        .build()
+        .await?;
     } else if is_ivf_hnsw(stages) {
         let len = stages.len();
         let StageParams::Hnsw(hnsw_params) = &stages[1] else {

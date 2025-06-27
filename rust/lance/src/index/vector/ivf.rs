@@ -447,6 +447,26 @@ pub(crate) async fn optimize_vector_indices_v2(
             .build()
             .await?;
         }
+        // IVF_SQ
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                (),
+                fri,
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(indices_to_merge)
+            .retrain(options.retrain)
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?;
+        }
         // IVF_HNSW_FLAT
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
             IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
@@ -515,14 +535,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .await?
             .build()
             .await?;
-        }
-        (sub_index_type, quantizer_type) => {
-            return Err(Error::Index {
-                message: format!(
-                    "optimizing vector index: unsupported index type IVF_{sub_index_type}_{quantizer_type}"
-                ),
-                location: location!(),
-            });
         }
     }
 
