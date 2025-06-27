@@ -142,11 +142,11 @@ public class ReadOptions {
 
     /**
      * Metadata cache size for the fragment metadata. If it is zero, metadata cache is disabled.
-     * This method is deprecated. Use {@link #setMetadataCacheSizeBytes(int)} instead.
+     * This method is deprecated. Use {@link #setMetadataCacheSizeBytes(long)} instead.
      *
      * @param metadataCacheSize the metadata cache size (entry count)
      * @return this builder
-     * @deprecated Use {@link #setMetadataCacheSizeBytes(int)} instead
+     * @deprecated Use {@link #setMetadataCacheSizeBytes(long)} instead
      */
     @Deprecated
     public Builder setMetadataCacheSize(int metadataCacheSize) {
