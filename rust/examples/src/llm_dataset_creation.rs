@@ -190,7 +190,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
         let mut parquet_readers = Vec::new();
         for file in &train_files {
-            println!("Downloading file: {}", file);
+            println!("Downloading file: {file}");
             let file_path = repo.get(file)?;
             let data = std::fs::read(file_path)?;
 
@@ -231,11 +231,8 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             total_rows += batch.num_rows();
         }
 
-        println!(
-            "Lance dataset created successfully with {} rows",
-            total_rows
-        );
-        println!("Dataset location: {}", lance_dataset_path);
+        println!("Lance dataset created successfully with {total_rows} rows");
+        println!("Dataset location: {lance_dataset_path}");
 
         Ok(())
     })

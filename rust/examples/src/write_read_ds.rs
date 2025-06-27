@@ -51,7 +51,7 @@ async fn read_dataset(data_path: &str) {
         println!("Batch size: {}, {}", batch.num_rows(), batch.num_columns()); // print size of batch
         println!("Schema: {:?}", batch.schema()); // print schema of recordbatch
 
-        println!("Batch: {:?}", batch); // print the entire recordbatch (schema and data)
+        println!("Batch: {batch:?}"); // print the entire recordbatch (schema and data)
     }
 } // End read dataset
 
