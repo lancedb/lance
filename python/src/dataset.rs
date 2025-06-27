@@ -1512,15 +1512,8 @@ impl Dataset {
                         } else {
                             Err(PyIOError::new_err(e.to_string()))
                         }
-                    } else if is_not_found
-                        && (ignore_not_found.is_none() || !ignore_not_found.unwrap())
-                    {
-                        Err(PyFileNotFoundError::new_err(format!(
-                            "Path not found: {}",
-                            dest
-                        )))
                     } else {
-                        Err(PyIOError::new_err(e.to_string()))
+                        Err(e)
                     }
                 }
             }
