@@ -677,6 +677,11 @@ public class Dataset implements Closeable {
 
   private native List<String> nativeListIndexes();
 
+  /**
+   * Get the table config of the dataset.
+   *
+   * @return the table config
+   */
   public Map<String, String> getConfig() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
