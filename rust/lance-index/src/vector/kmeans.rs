@@ -25,19 +25,15 @@ use arrow_schema::{ArrowError, DataType};
 use bitvec::prelude::*;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
+use lance_linalg::distance::{dot_distance_batch, DistanceType, Normalize};
+use lance_linalg::kernels::argmin_value_float;
 use log::{info, warn};
 use num_traits::One;
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
 use rayon::prelude::*;
 use snafu::location;
-
-use crate::vector::flat::storage::FlatFloatStorage;
-use crate::vector::utils::SimpleIndex;
-use crate::{Error, Result};
-use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
-use lance_linalg::distance::{dot_distance_batch, DistanceType, Normalize};
-use lance_linalg::kernels::argmin_value_float;
 use {
     lance_linalg::distance::{
         l2::{l2_distance_batch, L2},
@@ -45,6 +41,9 @@ use {
     },
     lance_linalg::kernels::argmin_value,
 };
+
+use crate::vector::utils::SimpleIndex;
+use crate::{Error, Result};
 
 /// KMean initialization method.
 #[derive(Debug, PartialEq)]
@@ -243,7 +242,7 @@ where
                 .map(|vec| {
                     let query = PrimitiveArray::<T>::from_iter_values(vec.iter().copied());
                     index
-                        .search(query)
+                        .search(Arc::new(query))
                         .map(|(id, dist)| Some((id, dist)))
                         .unwrap()
                 })
@@ -569,7 +568,7 @@ impl KMeans {
                     );
                 };
 
-                let index = Self::may_train_index(
+                let index = SimpleIndex::may_train_index(
                     kmeans.centroids.clone(),
                     kmeans.dimension,
                     kmeans.distance_type,
@@ -651,34 +650,6 @@ impl KMeans {
                 data.value_type(),
                 params.distance_type
             ))),
-        }
-    }
-
-    // train an HNSW over the centroids to speed up finding the nearest clusters,
-    // only train if all conditions are met:
-    //  - the centroids are float32s or uint8s
-    //  - `num_centroids * dimension >= 1_000_000`
-    //      we benchmarked that it's 2x faster in the case of 1024 centroids and 1024 dimensions,
-    //      so set the threshold to 1_000_000.
-    fn may_train_index(
-        centroids: ArrayRef,
-        dimension: usize,
-        distance_type: DistanceType,
-    ) -> Result<Option<SimpleIndex>> {
-        if centroids.len() < 1_000_000 {
-            // the centroids are stored in a flat array,
-            // the length of the centroids is `num_centroids * dimension`
-            return Ok(None);
-        }
-
-        match centroids.data_type() {
-            DataType::Float32 => {
-                let fsl =
-                    FixedSizeListArray::try_new_from_values(centroids.clone(), dimension as i32)?;
-                let store = FlatFloatStorage::new(fsl, distance_type);
-                SimpleIndex::try_new(store).map(Some)
-            }
-            _ => Ok(None),
         }
     }
 }
