@@ -72,7 +72,7 @@ pub async fn merge_indices<'a>(
         .any(|w| w[0].index_type() != w[1].index_type())
     {
         return Err(Error::Index {
-            message: format!("Append index: invalid index deltas: {:?}", old_indices),
+            message: format!("Append index: invalid index deltas: {old_indices:?}"),
             location: location!(),
         });
     }

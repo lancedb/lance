@@ -506,11 +506,11 @@ fn get_dictionary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
             DataType::UInt32 => collect_statistics(&cast_dictionary_arrays::<UInt32Type>(arrays)),
             DataType::UInt64 => collect_statistics(&cast_dictionary_arrays::<UInt64Type>(arrays)),
             _ => {
-                panic!("Unsupported dictionary key type: {}", key_type);
+                panic!("Unsupported dictionary key type: {key_type}");
             }
         },
         _ => {
-            panic!("Unsupported data type for dictionary: {}", data_type);
+            panic!("Unsupported data type for dictionary: {data_type}");
         }
     }
 }

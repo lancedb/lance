@@ -36,10 +36,7 @@ impl Display for FullReadParams {
 
 async fn create_data(num_bytes: u64) -> (Arc<ObjectStore>, Path) {
     let store_uri = std::env::var("STORE_URI").unwrap_or("/tmp/lance_bench".to_string());
-    println!(
-        "Reading from {}, use the environment variable STORE_URI to change this",
-        store_uri
-    );
+    println!("Reading from {store_uri}, use the environment variable STORE_URI to change this");
     let (obj_store, path) = ObjectStore::from_uri(&store_uri).await.unwrap();
     let tmp_file = path.child("foo.file");
 
@@ -83,9 +80,9 @@ fn bench_full_read(c: &mut Criterion) {
                 b.iter(|| {
                     let obj_store = obj_store.clone();
                     if obj_store.is_local() {
-                        let path_str = format!("/{}", tmp_file);
+                        let path_str = format!("/{tmp_file}");
                         Command::new("dd")
-                            .arg(format!("of={}", path_str))
+                            .arg(format!("of={path_str}"))
                             .arg("oflag=nocache")
                             .arg("conv=notrunc,fdatasync")
                             .arg("count=0")
@@ -174,9 +171,9 @@ fn bench_random_read(c: &mut Criterion) {
                     b.iter(|| {
                         let obj_store = obj_store.clone();
                         if obj_store.is_local() {
-                            let path_str = format!("/{}", tmp_file);
+                            let path_str = format!("/{tmp_file}");
                             Command::new("dd")
-                                .arg(format!("of={}", path_str))
+                                .arg(format!("of={path_str}"))
                                 .arg("oflag=nocache")
                                 .arg("conv=notrunc,fdatasync")
                                 .arg("count=0")

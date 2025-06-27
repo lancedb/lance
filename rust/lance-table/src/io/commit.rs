@@ -209,13 +209,13 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
         })?;
         let scheme =
             ManifestNamingScheme::detect_scheme(filename).ok_or_else(|| Error::Internal {
-                message: format!("Invalid manifest filename: '{}'", filename),
+                message: format!("Invalid manifest filename: '{filename}'"),
                 location: location!(),
             })?;
         let version = scheme
             .parse_version(filename)
             .ok_or_else(|| Error::Internal {
-                message: format!("Invalid manifest filename: '{}'", filename),
+                message: format!("Invalid manifest filename: '{filename}'"),
                 location: location!(),
             })?;
         Ok(Self {
@@ -357,8 +357,7 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "Found multiple manifest naming schemes in the same directory: {:?} and {:?}",
-                        scheme, entry_scheme
+                        "Found multiple manifest naming schemes in the same directory: {scheme:?} and {entry_scheme:?}"
                     ),
                 ));
             }

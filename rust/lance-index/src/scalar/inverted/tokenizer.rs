@@ -96,7 +96,7 @@ impl InvertedIndexParams {
 
     pub fn language(mut self, language: &str) -> Result<Self> {
         // need to convert to valid JSON string
-        let language = serde_json::from_str(format!("\"{}\"", language).as_str())?;
+        let language = serde_json::from_str(format!("\"{language}\"").as_str())?;
         self.language = language;
         Ok(self)
     }
@@ -200,7 +200,7 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
             jieba::JiebaBuilder::load(&home.join(s))?.build()
         }
         _ => Err(Error::invalid_input(
-            format!("unknown base tokenizer {}", name),
+            format!("unknown base tokenizer {name}"),
             location!(),
         )),
     }

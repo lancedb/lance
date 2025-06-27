@@ -77,7 +77,7 @@ impl std::fmt::Debug for u8x16 {
         unsafe {
             self.store_unaligned(arr.as_mut_ptr());
         }
-        write!(f, "u8x16({:?})", arr)
+        write!(f, "u8x16({arr:?})")
     }
 }
 

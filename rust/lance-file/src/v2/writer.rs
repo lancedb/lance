@@ -292,8 +292,7 @@ impl FileWriter {
                 .map(|s| {
                     s.parse::<u64>().unwrap_or_else(|e| {
                         warn!(
-                            "Failed to parse {}: {}, using default",
-                            ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, e
+                            "Failed to parse {ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES}: {e}, using default"
                         );
                         MAX_PAGE_BYTES as u64
                     })
@@ -887,8 +886,7 @@ mod tests {
         for (col_idx, col_metadata) in column_meta.column_metadatas.iter().enumerate() {
             assert!(
                 !col_metadata.pages.is_empty(),
-                "Column {} has no pages",
-                col_idx
+                "Column {col_idx} has no pages"
             );
 
             for (page_idx, page) in col_metadata.pages.iter().enumerate() {
@@ -896,10 +894,7 @@ mod tests {
                 let total_size: u64 = page.buffer_sizes.iter().sum();
                 assert!(
                     total_size <= 1024 * 1024,
-                    "Column {} Page {} size {} exceeds 1MB limit",
-                    col_idx,
-                    page_idx,
-                    total_size
+                    "Column {col_idx} Page {page_idx} size {total_size} exceeds 1MB limit"
                 );
             }
         }
@@ -966,8 +961,7 @@ mod tests {
                 let total_size: u64 = page.buffer_sizes.iter().sum();
                 assert!(
                     total_size <= 2 * 1024 * 1024,
-                    "Page size {} exceeds 2MB limit",
-                    total_size
+                    "Page size {total_size} exceeds 2MB limit"
                 );
             }
         }

@@ -65,7 +65,7 @@ mod tests {
 
         let mut buffer_index = 0;
         let encoded_array_result = encoder.encode(data, &DataType::Int64, &mut buffer_index);
-        assert!(encoded_array_result.is_ok(), "{:?}", encoded_array_result);
+        assert!(encoded_array_result.is_ok(), "{encoded_array_result:?}");
         let encoded_array = encoded_array_result.unwrap();
         assert_eq!(encoded_array.data.num_values(), 8);
         let buffers = encoded_array.data.into_buffers();

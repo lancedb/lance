@@ -285,7 +285,7 @@ pub struct IoStats {
 
 impl Display for IoStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:#?}", self)
+        write!(f, "{self:#?}")
     }
 }
 
@@ -298,7 +298,7 @@ pub struct IoTrackingStore {
 
 impl Display for IoTrackingStore {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:#?}", self)
+        write!(f, "{self:#?}")
     }
 }
 
@@ -701,10 +701,7 @@ pub async fn assert_plan_node_equals(
         remainder = &remainder[idx + piece.len()..];
     }
     if !remainder.is_empty() {
-        panic!(
-            "Expected plan to match:\nExpected: {}\nActual: {}",
-            expected, plan_desc
-        )
+        panic!("Expected plan to match:\nExpected: {expected}\nActual: {plan_desc}")
     }
     Ok(())
 }
@@ -888,7 +885,7 @@ mod tests {
             let generator = TestDatasetGenerator::new(data.clone(), data_storage_version);
             // Sample a few
             for i in 1..20 {
-                let path = tmp_dir.path().join(format!("test_ds_{}_{}", num_cols, i));
+                let path = tmp_dir.path().join(format!("test_ds_{num_cols}_{i}"));
                 let dataset = generator.make_hostile(path.to_str().unwrap()).await;
 
                 let field_structure = get_field_structure(&dataset);

@@ -116,7 +116,7 @@ pub(crate) async fn remap_index(
         .iter()
         .find(|i| i.uuid == *index_id)
         .ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", index_id),
+            message: format!("Index with id {index_id} does not exist"),
             location: location!(),
         })?;
 
@@ -130,8 +130,8 @@ pub(crate) async fn remap_index(
     if row_id_map.values().all(|v| v.is_none()) {
         let deleted_bitmap = RoaringBitmap::from_iter(
             row_id_map
-                .iter()
-                .map(|(row_id, _)| RowAddress::new_from_u64(*row_id))
+                .keys()
+                .map(|row_id| RowAddress::new_from_u64(*row_id))
                 .map(|addr| addr.fragment_id()),
         );
         if Some(deleted_bitmap) == matched.fragment_bitmap {
@@ -432,7 +432,7 @@ impl DatasetIndexExt for Dataset {
         let indices = self.load_indices_by_name(name).await?;
         if indices.is_empty() {
             return Err(Error::IndexNotFound {
-                identity: format!("name={}", name),
+                identity: format!("name={name}"),
                 location: location!(),
             });
         }
@@ -457,7 +457,7 @@ impl DatasetIndexExt for Dataset {
         let indices = self.load_indices_by_name(name).await?;
         if indices.is_empty() {
             return Err(Error::IndexNotFound {
-                identity: format!("name={}", name),
+                identity: format!("name={name}"),
                 location: location!(),
             });
         }
@@ -517,7 +517,7 @@ impl DatasetIndexExt for Dataset {
         if let Some(fri_meta) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
             let uuid = fri_meta.uuid.to_string();
             let fri = if let Some(index) = self.session.index_cache.get_frag_reuse(&uuid) {
-                log::debug!("Found fragment reuse index in cache uuid: {}", uuid);
+                log::debug!("Found fragment reuse index in cache uuid: {uuid}");
                 index
             } else {
                 let index_details = load_frag_reuse_index_details(self, fri_meta).await?;
@@ -697,7 +697,7 @@ impl DatasetIndexExt for Dataset {
         let metadatas = self.load_indices_by_name(index_name).await?;
         if metadatas.is_empty() {
             return Err(Error::IndexNotFound {
-                identity: format!("name={}", index_name),
+                identity: format!("name={index_name}"),
                 location: location!(),
             });
         }
@@ -755,7 +755,7 @@ impl DatasetIndexExt for Dataset {
             ds.delete("false").await.map_err(|err| {
                 Error::Execution {
                     message: format!("Failed to migrate dataset while calculating index statistics. \
-                            To disable migration, set LANCE_AUTO_MIGRATION=false. Original error: {}", err),
+                            To disable migration, set LANCE_AUTO_MIGRATION=false. Original error: {err}"),
                     location: location!(),
                 }
             })?;
@@ -817,7 +817,7 @@ impl DatasetIndexExt for Dataset {
         });
 
         serde_json::to_string(&stats).map_err(|e| Error::Index {
-            message: format!("Failed to serialize index statistics: {}", e),
+            message: format!("Failed to serialize index statistics: {e}"),
             location: location!(),
         })
     }
@@ -831,7 +831,7 @@ impl DatasetIndexExt for Dataset {
         let indices = self.load_indices_by_name(index_name).await?;
         if indices.is_empty() {
             return Err(Error::IndexNotFound {
-                identity: format!("name={}", index_name),
+                identity: format!("name={index_name}"),
                 location: location!(),
             });
         }
@@ -960,7 +960,7 @@ impl DatasetIndexInternalExt for Dataset {
         }
 
         let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", uuid),
+            message: format!("Index with id {uuid} does not exist"),
             location: location!(),
         })?;
 
@@ -981,7 +981,7 @@ impl DatasetIndexInternalExt for Dataset {
     ) -> Result<Arc<dyn VectorIndex>> {
         let cache_key = index_cache_key(self, uuid).await.unwrap();
         if let Some(index) = self.session.index_cache.get_vector(cache_key.as_ref()) {
-            log::debug!("Found vector index in cache uuid: {}", uuid);
+            log::debug!("Found vector index in cache uuid: {uuid}");
             return Ok(index);
         }
 
@@ -1049,7 +1049,7 @@ impl DatasetIndexInternalExt for Dataset {
                 let index_metadata: lance_index::IndexMetadata =
                     serde_json::from_str(index_metadata)?;
                 let field = self.schema().field(column).ok_or_else(|| Error::Index {
-                    message: format!("Column {} does not exist in the schema", column),
+                    message: format!("Column {column} does not exist in the schema"),
                     location: location!(),
                 })?;
 
@@ -1164,12 +1164,12 @@ impl DatasetIndexInternalExt for Dataset {
         if let Some(fri_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
             let uuid = fri_meta.uuid.to_string();
             if let Some(index) = self.session.index_cache.get_frag_reuse(&uuid) {
-                log::debug!("Found vector index in cache uuid: {}", uuid);
+                log::debug!("Found vector index in cache uuid: {uuid}");
                 return Ok(Some(index));
             }
 
             let index_meta = self.load_index(&uuid).await?.ok_or_else(|| Error::Index {
-                message: format!("Index with id {} does not exist", uuid),
+                message: format!("Index with id {uuid} does not exist"),
                 location: location!(),
             })?;
             let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
@@ -1946,8 +1946,8 @@ mod tests {
                 })
                 .collect::<Vec<String>>();
 
-            assert_eq!(texts.len(), 1, "query: {}, texts: {:?}", word, texts);
-            assert_eq!(texts[0], word, "query: {}, texts: {:?}", word, texts);
+            assert_eq!(texts.len(), 1, "query: {word}, texts: {texts:?}");
+            assert_eq!(texts[0], word, "query: {word}, texts: {texts:?}");
         }
 
         dataset
@@ -1980,8 +1980,8 @@ mod tests {
                 })
                 .collect::<Vec<String>>();
 
-            assert_eq!(texts.len(), 1, "query: {}, texts: {:?}", word, texts);
-            assert_eq!(texts[0], word, "query: {}, texts: {:?}", word, texts);
+            assert_eq!(texts.len(), 1, "query: {word}, texts: {texts:?}");
+            assert_eq!(texts[0], word, "query: {word}, texts: {texts:?}");
 
             // we should be able to query the new words after compaction
             compact_files(&mut dataset, CompactionOptions::default(), None)
@@ -2005,8 +2005,8 @@ mod tests {
                         Some(v) => v.to_string(),
                     })
                     .collect::<Vec<String>>();
-                assert_eq!(texts.len(), 1, "query: {}, texts: {:?}", word, texts);
-                assert_eq!(texts[0], word, "query: {}, texts: {:?}", word, texts);
+                assert_eq!(texts.len(), 1, "query: {word}, texts: {texts:?}");
+                assert_eq!(texts[0], word, "query: {word}, texts: {texts:?}");
             }
             assert_indexed_rows(&dataset, num_rows).await;
         }
@@ -2241,7 +2241,7 @@ mod tests {
         let ids = nearest["id"].as_primitive::<Int32Type>();
         let mut seen = HashSet::new();
         for id in ids.values() {
-            assert!(seen.insert(*id), "Duplicate id found: {}", id);
+            assert!(seen.insert(*id), "Duplicate id found: {id}");
         }
 
         dataset
@@ -2262,7 +2262,7 @@ mod tests {
         let ids = nearest_after["id"].as_primitive::<Int32Type>();
         let mut seen = HashSet::new();
         for id in ids.values() {
-            assert!(seen.insert(*id), "Duplicate id found: {}", id);
+            assert!(seen.insert(*id), "Duplicate id found: {id}");
         }
     }
 

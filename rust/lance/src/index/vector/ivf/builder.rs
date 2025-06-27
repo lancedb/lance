@@ -62,7 +62,7 @@ pub(super) async fn build_partitions(
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
         return Err(Error::Schema {
-            message: format!("column {} does not exist in data stream", column),
+            message: format!("column {column} does not exist in data stream"),
             location: location!(),
         });
     }
@@ -204,7 +204,7 @@ pub async fn write_vector_storage(
     writer: ObjectWriter,
     precomputed_partitions_ds_uri: Option<&str>,
 ) -> Result<()> {
-    info!("Transforming {} vectors for storage", num_rows);
+    info!("Transforming {num_rows} vectors for storage");
     let ivf_transformer = Arc::new(lance_index::vector::ivf::IvfTransformer::with_pq(
         centroids,
         distance_type,
@@ -234,7 +234,7 @@ pub async fn write_vector_storage(
         let batch = batch?;
         total_rows_written += batch.num_rows();
         writer.write_batch(&batch).await?;
-        info!("Transform progress: {}/{}", total_rows_written, num_rows);
+        info!("Transform progress: {total_rows_written}/{num_rows}");
     }
     writer.finish().await?;
     Ok(())
@@ -264,7 +264,7 @@ pub(super) async fn build_hnsw_partitions(
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
         return Err(Error::Schema {
-            message: format!("column {} does not exist in data stream", column),
+            message: format!("column {column} does not exist in data stream"),
             location: location!(),
         });
     }

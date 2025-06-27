@@ -20,7 +20,7 @@ use crate::{Error, Result};
 /// Get the vector dimension of the given column in the schema.
 pub fn get_vector_dim(schema: &Schema, column: &str) -> Result<usize> {
     let field = schema.field(column).ok_or(Error::Index {
-        message: format!("Column {} does not exist in schema {}", column, schema),
+        message: format!("Column {column} does not exist in schema {schema}"),
         location: location!(),
     })?;
     infer_vector_dim(&field.data_type())
@@ -36,7 +36,7 @@ fn infer_vector_dim_impl(data_type: &arrow::datatypes::DataType, in_list: bool) 
         (arrow::datatypes::DataType::FixedSizeList(_, dim),_) => Ok(*dim as usize),
         (arrow::datatypes::DataType::List(inner), false) => infer_vector_dim_impl(inner.data_type(),true),
         _ => Err(Error::Index {
-            message: format!("Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}", data_type),
+            message: format!("Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {data_type:?}"),
             location: location!(),
         }),
     }
@@ -50,7 +50,7 @@ pub fn get_vector_type(
     column: &str,
 ) -> Result<(arrow_schema::DataType, arrow_schema::DataType)> {
     let field = schema.field(column).ok_or(Error::Index {
-        message: format!("column {} does not exist in schema {}", column, schema),
+        message: format!("column {column} does not exist in schema {schema}"),
         location: location!(),
     })?;
     Ok((
@@ -95,8 +95,7 @@ fn infer_vector_element_type_impl(
         }
         _ => Err(Error::Index {
             message: format!(
-                "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}",
-                data_type
+                "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {data_type:?}"
             ),
             location: location!(),
         }),
@@ -115,10 +114,7 @@ pub async fn maybe_sample_training_data(
     let num_rows = dataset.count_rows(None).await?;
 
     let vector_field = dataset.schema().field(column).ok_or(Error::Index {
-        message: format!(
-            "Sample training data: column {} does not exist in schema",
-            column
-        ),
+        message: format!("Sample training data: column {column} does not exist in schema"),
         location: location!(),
     })?;
     let is_nullable = vector_field.nullable;
@@ -172,10 +168,7 @@ pub async fn maybe_sample_training_data(
             let batch = batch?;
 
             let array = batch.column_by_name(column).ok_or(Error::Index {
-                message: format!(
-                    "Sample training data: column {} does not exist in return",
-                    column
-                ),
+                message: format!("Sample training data: column {column} does not exist in return"),
                 location: location!(),
             })?;
             let null_count = array.logical_null_count();
@@ -199,7 +192,7 @@ pub async fn maybe_sample_training_data(
         }
 
         let batch = interleave_batches(&collected, &indices).map_err(|err| Error::Index {
-            message: format!("Sample training data: {}", err),
+            message: format!("Sample training data: {err}"),
             location: location!(),
         })?;
         info!(
@@ -229,10 +222,7 @@ pub async fn maybe_sample_training_data(
     };
 
     let array = batch.column_by_name(column).ok_or(Error::Index {
-        message: format!(
-            "Sample training data: column {} does not exist in return",
-            column
-        ),
+        message: format!("Sample training data: column {column} does not exist in return"),
         location: location!(),
     })?;
 
@@ -245,10 +235,7 @@ pub async fn maybe_sample_training_data(
             Ok(vectors.clone())
         }
         _ => Err(Error::Index {
-            message: format!(
-                "Sample training data: column {} is not a FixedSizeListArray",
-                column
-            ),
+            message: format!("Sample training data: column {column} is not a FixedSizeListArray"),
             location: location!(),
         }),
     }

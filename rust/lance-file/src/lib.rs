@@ -28,11 +28,8 @@ pub async fn determine_file_version(
     };
     if size < 8 {
         return Err(Error::InvalidInput {
-            source: format!(
-                "the file {} does not appear to be a lance file (too small)",
-                path
-            )
-            .into(),
+            source: format!("the file {path} does not appear to be a lance file (too small)")
+                .into(),
             location: location!(),
         });
     }
@@ -40,11 +37,8 @@ pub async fn determine_file_version(
     let footer = reader.get_range((size - 8)..size).await?;
     if &footer[4..] != MAGIC {
         return Err(Error::InvalidInput {
-            source: format!(
-                "the file {} does not appear to be a lance file (magic mismatch)",
-                path
-            )
-            .into(),
+            source: format!("the file {path} does not appear to be a lance file (magic mismatch)")
+                .into(),
             location: location!(),
         });
     }

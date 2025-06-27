@@ -30,7 +30,7 @@ fn pq_transform(c: &mut Criterion) {
             *dt,
         );
 
-        c.bench_function(format!("{},{}", dt, TOTAL).as_str(), |b| {
+        c.bench_function(format!("{dt},{TOTAL}").as_str(), |b| {
             b.iter(|| {
                 let _ = pq.quantize(&fsl).unwrap();
             })

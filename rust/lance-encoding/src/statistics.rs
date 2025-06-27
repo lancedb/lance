@@ -42,7 +42,7 @@ impl fmt::Debug for Stat {
 
 impl fmt::Display for Stat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -143,17 +143,14 @@ pub trait GetStat: fmt::Debug {
 
     fn expect_stat(&self, stat: Stat) -> Arc<dyn Array> {
         self.get_stat(stat)
-            .unwrap_or_else(|| panic!("{:?} DataBlock does not have `{}` statistics.", self, stat))
+            .unwrap_or_else(|| panic!("{self:?} DataBlock does not have `{stat}` statistics."))
     }
 
     fn expect_single_stat<T: ArrowPrimitiveType>(&self, stat: Stat) -> T::Native {
         let stat_value = self.expect_stat(stat);
         let stat_value = stat_value.as_primitive::<T>();
         if stat_value.len() != 1 {
-            panic!(
-                "{:?} DataBlock does not have exactly one value for `{} statistics.",
-                self, stat
-            );
+            panic!("{self:?} DataBlock does not have exactly one value for `{stat} statistics.");
         }
         stat_value.value(0)
     }

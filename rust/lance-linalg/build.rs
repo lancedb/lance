@@ -53,8 +53,7 @@ fn main() -> Result<(), String> {
             // It's likely the compiler doesn't support the sapphirerapids architecture
             // Clang 12 and GCC 11 are the first versions with sapphire rapids support
             println!(
-                "cargo:warning=Skipping build of AVX-512 fp16 kernels.  Clang/GCC too old or compiler does not support sapphirerapids architecture.  Error: {}",
-                err
+                "cargo:warning=Skipping build of AVX-512 fp16 kernels.  Clang/GCC too old or compiler does not support sapphirerapids architecture.  Error: {err}"
             );
         } else {
             // We create a special cfg so that we can detect we have in fact
@@ -66,7 +65,7 @@ fn main() -> Result<(), String> {
         // has support for __fp16 going back to at least clang 6.
         // We use haswell since it's the oldest CPUs on AWS.
         if let Err(err) = build_f16_with_flags("avx2", &["-march=haswell"]) {
-            return Err(format!("Unable to build AVX2 f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature.  Received error: {}", err));
+            return Err(format!("Unable to build AVX2 f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature.  Received error: {err}"));
         };
         // There is no SSE instruction set for f16 -> f32 float conversion
     } else if target_arch == "loongarch64" {
@@ -96,11 +95,11 @@ fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
         // Pedantic will complain about _Float16 in some versions of GCC
         // .flag("-Wpedantic")
         // We pass in the suffix to make sure the symbol names are unique
-        .flag(format!("-DSUFFIX=_{}", suffix).as_str());
+        .flag(format!("-DSUFFIX=_{suffix}").as_str());
 
     for flag in flags {
         builder.flag(flag);
     }
 
-    builder.try_compile(&format!("f16_{}", suffix))
+    builder.try_compile(&format!("f16_{suffix}"))
 }

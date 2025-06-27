@@ -77,7 +77,7 @@ impl IndexFileVersion {
             "legacy" => Ok(Self::Legacy),
             "v3" => Ok(Self::V3),
             _ => Err(Error::Index {
-                message: format!("Invalid index file version: {}", version),
+                message: format!("Invalid index file version: {version}"),
                 location: location!(),
             }),
         }
@@ -274,7 +274,7 @@ pub(crate) async fn build_vector_index(
 
     let StageParams::Ivf(ivf_params) = &stages[0] else {
         return Err(Error::Index {
-            message: format!("Build Vector Index: invalid stages: {:?}", stages),
+            message: format!("Build Vector Index: invalid stages: {stages:?}"),
             location: location!(),
         });
     };
@@ -327,7 +327,7 @@ pub(crate) async fn build_vector_index(
             }
             _ => {
                 return Err(Error::Index {
-                    message: format!("Build Vector Index: invalid data type: {:?}", element_type),
+                    message: format!("Build Vector Index: invalid data type: {element_type:?}"),
                     location: location!(),
                 });
             }
@@ -336,7 +336,7 @@ pub(crate) async fn build_vector_index(
         let len = stages.len();
         let StageParams::PQ(pq_params) = &stages[len - 1] else {
             return Err(Error::Index {
-                message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                message: format!("Build Vector Index: invalid stages: {stages:?}"),
                 location: location!(),
             });
         };
@@ -374,7 +374,7 @@ pub(crate) async fn build_vector_index(
         let len = stages.len();
         let StageParams::Hnsw(hnsw_params) = &stages[1] else {
             return Err(Error::Index {
-                message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                message: format!("Build Vector Index: invalid stages: {stages:?}"),
                 location: location!(),
             });
         };
@@ -414,7 +414,7 @@ pub(crate) async fn build_vector_index(
                 }
                 _ => {
                     return Err(Error::Index {
-                        message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                        message: format!("Build Vector Index: invalid stages: {stages:?}"),
                         location: location!(),
                     });
                 }
@@ -437,7 +437,7 @@ pub(crate) async fn build_vector_index(
         }
     } else {
         return Err(Error::Index {
-            message: format!("Build Vector Index: invalid stages: {:?}", stages),
+            message: format!("Build Vector Index: invalid stages: {stages:?}"),
             location: location!(),
         });
     }

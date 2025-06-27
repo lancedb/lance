@@ -816,7 +816,7 @@ pub(crate) mod tests {
         #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
     ) {
         for data_type in PRIMITIVE_TYPES {
-            log::info!("Testing encoding for {:?}", data_type);
+            log::info!("Testing encoding for {data_type:?}");
             let field = Field::new("", data_type.clone(), false);
             check_round_trip_encoding_random(field, version).await;
         }
@@ -835,7 +835,7 @@ pub(crate) mod tests {
         #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
     ) {
         for data_type in LARGE_TYPES.iter() {
-            log::info!("Testing encoding for {:?}", data_type);
+            log::info!("Testing encoding for {data_type:?}");
             let field = Field::new("", data_type.clone(), false);
             check_round_trip_encoding_random(field, version).await;
         }

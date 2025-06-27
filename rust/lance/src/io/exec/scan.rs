@@ -341,8 +341,7 @@ impl LanceStream {
                     }
                 } else {
                     log::warn!(
-                        "Ran out of fragments before we were done scanning for range: {:?}",
-                        offsets
+                        "Ran out of fragments before we were done scanning for range: {offsets:?}"
                     );
                     rows_to_take = 0;
                 }

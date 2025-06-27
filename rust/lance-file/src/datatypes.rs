@@ -230,10 +230,7 @@ async fn load_field_dictionary<'a>(field: &mut Field, reader: &dyn Reader) -> Re
                 }
                 _ => {
                     return Err(Error::Schema {
-                        message: format!(
-                            "Does not support {} as dictionary value type",
-                            value_type
-                        ),
+                        message: format!("Does not support {value_type} as dictionary value type"),
                         location: location!(),
                     });
                 }

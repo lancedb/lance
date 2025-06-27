@@ -806,7 +806,7 @@ mod tests {
                     value_range.clone().map(|n| n as f32).collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from_iter_values(
-                    value_range.clone().map(|n| format!("str-{}", n)),
+                    value_range.clone().map(|n| format!("str-{n}")),
                 )),
                 Arc::new(DictionaryArray::<UInt8Type>::try_new(keys, values_ref.clone()).unwrap()),
             ];
@@ -1427,7 +1427,7 @@ mod tests {
         // Create a large schema
         let mut fields = vec![];
         for i in 0..100 {
-            fields.push(ArrowField::new(format!("f{}", i), DataType::Int32, false));
+            fields.push(ArrowField::new(format!("f{i}"), DataType::Int32, false));
         }
         let arrow_schema = ArrowSchema::new(fields);
         let schema = Schema::try_from(&arrow_schema).unwrap();

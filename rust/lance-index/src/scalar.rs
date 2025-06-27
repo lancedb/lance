@@ -61,7 +61,7 @@ impl TryFrom<IndexType> for ScalarIndexType {
             IndexType::NGram => Ok(Self::NGram),
             IndexType::Inverted => Ok(Self::Inverted),
             _ => Err(Error::InvalidInput {
-                source: format!("Index type {:?} is not a scalar index", value).into(),
+                source: format!("Index type {value:?} is not a scalar index").into(),
                 location: location!(),
             }),
         }
@@ -342,21 +342,21 @@ impl AnyQuery for SargableQuery {
         match self {
             Self::Range(lower, upper) => match (lower, upper) {
                 (Bound::Unbounded, Bound::Unbounded) => "true".to_string(),
-                (Bound::Unbounded, Bound::Included(rhs)) => format!("{} <= {}", col, rhs),
-                (Bound::Unbounded, Bound::Excluded(rhs)) => format!("{} < {}", col, rhs),
-                (Bound::Included(lhs), Bound::Unbounded) => format!("{} >= {}", col, lhs),
+                (Bound::Unbounded, Bound::Included(rhs)) => format!("{col} <= {rhs}"),
+                (Bound::Unbounded, Bound::Excluded(rhs)) => format!("{col} < {rhs}"),
+                (Bound::Included(lhs), Bound::Unbounded) => format!("{col} >= {lhs}"),
                 (Bound::Included(lhs), Bound::Included(rhs)) => {
-                    format!("{} >= {} && {} <= {}", col, lhs, col, rhs)
+                    format!("{col} >= {lhs} && {col} <= {rhs}")
                 }
                 (Bound::Included(lhs), Bound::Excluded(rhs)) => {
-                    format!("{} >= {} && {} < {}", col, lhs, col, rhs)
+                    format!("{col} >= {lhs} && {col} < {rhs}")
                 }
-                (Bound::Excluded(lhs), Bound::Unbounded) => format!("{} > {}", col, lhs),
+                (Bound::Excluded(lhs), Bound::Unbounded) => format!("{col} > {lhs}"),
                 (Bound::Excluded(lhs), Bound::Included(rhs)) => {
-                    format!("{} > {} && {} <= {}", col, lhs, col, rhs)
+                    format!("{col} > {lhs} && {col} <= {rhs}")
                 }
                 (Bound::Excluded(lhs), Bound::Excluded(rhs)) => {
-                    format!("{} > {} && {} < {}", col, lhs, col, rhs)
+                    format!("{col} > {lhs} && {col} < {rhs}")
                 }
             },
             Self::IsIn(values) => {
@@ -374,10 +374,10 @@ impl AnyQuery for SargableQuery {
                 format!("fts({})", query.query)
             }
             Self::IsNull() => {
-                format!("{} IS NULL", col)
+                format!("{col} IS NULL")
             }
             Self::Equals(val) => {
-                format!("{} = {}", col, val)
+                format!("{col} = {val}")
             }
         }
     }

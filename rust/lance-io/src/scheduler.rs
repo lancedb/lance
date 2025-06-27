@@ -110,7 +110,7 @@ impl IopsQuota {
         let initial_capacity = std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT")
             .map(|s| {
                 s.parse::<i32>().unwrap_or_else(|_| {
-                    log::warn!("Ignoring invalid LANCE_PROCESS_IO_THREADS_LIMIT: {}", s);
+                    log::warn!("Ignoring invalid LANCE_PROCESS_IO_THREADS_LIMIT: {s}");
                     DEFAULT_PROCESS_IOPS_LIMIT
                 })
             })

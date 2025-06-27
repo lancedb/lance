@@ -568,10 +568,8 @@ impl MergeInsertJob {
 
         // 6 - Finally, join the input (source table) with the taken data (target table)
         let source_key = Column::new_with_schema(&index_column, shared_input.schema().as_ref())?;
-        let target_key = Column::new_with_schema(
-            &format!("target_{}", index_column),
-            target.schema().as_ref(),
-        )?;
+        let target_key =
+            Column::new_with_schema(&format!("target_{index_column}"), target.schema().as_ref())?;
         let joined = Arc::new(
             HashJoinExec::try_new(
                 shared_input,
@@ -645,7 +643,7 @@ impl MergeInsertJob {
             .params
             .on
             .iter()
-            .map(|c| format!("target_{}", c))
+            .map(|c| format!("target_{c}"))
             .collect::<Vec<_>>();
         let target_cols = target_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
 
@@ -975,8 +973,7 @@ impl MergeInsertJob {
                             .get_fragment(frag_id as usize)
                             .ok_or_else(|| Error::Internal {
                                 message: format!(
-                                    "Got non-existent fragment id from merge result: {}",
-                                    frag_id
+                                    "Got non-existent fragment id from merge result: {frag_id}"
                                 ),
                                 location: location!(),
                             })?;
@@ -1003,7 +1000,7 @@ impl MergeInsertJob {
                 }
                 _ => {
                     return Err(Error::Internal {
-                        message: format!("Got non-fragment id from merge result: {:?}", frag_id),
+                        message: format!("Got non-fragment id from merge result: {frag_id:?}"),
                         location: location!(),
                     });
                 }
@@ -1157,7 +1154,7 @@ impl MergeInsertJob {
             };
         }
         Err(Error::TooMuchWriteContention {
-            message: format!("Attempted {} retries.", max_retries),
+            message: format!("Attempted {max_retries} retries."),
             location: location!(),
         })
     }
@@ -1237,7 +1234,7 @@ impl MergeInsertJob {
 
         if partition_count != 1 {
             return Err(Error::invalid_input(
-                format!("Expected exactly 1 partition, got {}", partition_count),
+                format!("Expected exactly 1 partition, got {partition_count}"),
                 location!(),
             ));
         }
@@ -1521,7 +1518,7 @@ impl Merger {
             let physical_expr = planner.create_physical_expr(&expr)?;
             let data_type = physical_expr.data_type(&schema)?;
             if data_type != DataType::Boolean {
-                return Err(Error::invalid_input(format!("Merge insert conditions must be expressions that return a boolean value, received expression ({}) which has data type {}", expr, data_type), location!()));
+                return Err(Error::invalid_input(format!("Merge insert conditions must be expressions that return a boolean value, received expression ({expr}) which has data type {data_type}"), location!()));
             }
             Some(physical_expr)
         } else {
@@ -1534,7 +1531,7 @@ impl Merger {
             let match_expr = planner.create_physical_expr(&expr)?;
             let data_type = match_expr.data_type(combined_schema.as_ref())?;
             if data_type != DataType::Boolean {
-                return Err(Error::invalid_input(format!("Merge insert conditions must be expressions that return a boolean value, received a 'when matched update if' expression ({}) which has data type {}", expr, data_type), location!()));
+                return Err(Error::invalid_input(format!("Merge insert conditions must be expressions that return a boolean value, received a 'when matched update if' expression ({expr}) which has data type {data_type}"), location!()));
             }
             Some(match_expr)
         } else {
@@ -2287,8 +2284,7 @@ mod tests {
                     &Err(Error::NotSupported { ref source, .. })
                         if source.to_string().contains("Deleting rows from the target table when there is no match in the source table is not supported when the source data has a different schema than the target data"),
                 ),
-                "Expected NotSupported error, got: {:?}",
-                res
+                "Expected NotSupported error, got: {res:?}"
             );
         }
 
@@ -2320,8 +2316,7 @@ mod tests {
                     &Err(Error::SchemaMismatch { ref difference, .. })
                         if difference.to_string().contains("fields did not match")
                 ),
-                "Expected SchemaMismatch error, got: {:?}",
-                res
+                "Expected SchemaMismatch error, got: {res:?}"
             );
         }
 
@@ -2539,8 +2534,7 @@ mod tests {
                     // set to a low value.
                     assert!(
                         matches!(err, Error::TooMuchWriteContention { message, .. } if message.contains("failed on retry_timeout")),
-                        "Expected TooMuchWriteContention error, got: {:?}",
-                        err
+                        "Expected TooMuchWriteContention error, got: {err:?}"
                     );
                 }
             }
@@ -2553,8 +2547,7 @@ mod tests {
             let values = batches["value"].as_primitive::<UInt32Type>();
             assert!(
                 values.values().iter().all(|&v| v == 1),
-                "All values should be 1 after merge insert. Got: {:?}",
-                values
+                "All values should be 1 after merge insert. Got: {values:?}"
             );
         }
     }
@@ -2686,8 +2679,7 @@ mod tests {
         let values = batches["value"].as_primitive::<UInt32Type>();
         assert!(
             values.values().iter().all(|&v| v == 2),
-            "All values should be 1 after merge insert. Got: {:?}",
-            values
+            "All values should be 1 after merge insert. Got: {values:?}"
         );
     }
 
@@ -2945,8 +2937,7 @@ mod tests {
         let values = batches["value"].as_primitive::<UInt32Type>();
         assert!(
             values.values().iter().all(|&v| v == 1),
-            "All values should be 1 after merge insert. Got: {:?}",
-            values
+            "All values should be 1 after merge insert. Got: {values:?}"
         );
     }
 

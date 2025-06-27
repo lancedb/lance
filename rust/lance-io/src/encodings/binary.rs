@@ -100,7 +100,7 @@ impl Encoder for BinaryEncoder<'_> {
             DataType::LargeBinary => self.encode_typed_arr::<LargeBinaryType>(arrs).await,
             _ => {
                 return Err(lance_core::Error::io(
-                    format!("Binary encoder does not support {}", data_type),
+                    format!("Binary encoder does not support {data_type}"),
                     location!(),
                 ));
             }

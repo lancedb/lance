@@ -107,10 +107,7 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
     /// an error.
     fn accept_child(&mut self, _child: DecoderReady) -> Result<()> {
         Err(Error::Internal {
-            message: format!(
-                "The decoder {:?} does not expect children but received a child",
-                self
-            ),
+            message: format!("The decoder {self:?} does not expect children but received a child"),
             location: location!(),
         })
     }

@@ -73,7 +73,7 @@ impl FromStr for QuantizationType {
             "PQ" => Ok(Self::Product),
             "SQ" => Ok(Self::Scalar),
             _ => Err(Error::Index {
-                message: format!("Unknown quantization type: {}", s),
+                message: format!("Unknown quantization type: {s}"),
                 location: location!(),
             }),
         }
@@ -318,14 +318,13 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             .get(INDEX_METADATA_SCHEMA_KEY)
             .ok_or(Error::Index {
                 message: format!(
-                    "Reading quantization storage: index key {} not found",
-                    INDEX_METADATA_SCHEMA_KEY
+                    "Reading quantization storage: index key {INDEX_METADATA_SCHEMA_KEY} not found"
                 ),
                 location: location!(),
             })?;
         let index_metadata: IndexMetadata =
             serde_json::from_str(metadata_str).map_err(|_| Error::Index {
-                message: format!("Failed to parse index metadata: {}", metadata_str),
+                message: format!("Failed to parse index metadata: {metadata_str}"),
                 location: location!(),
             })?;
         let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;

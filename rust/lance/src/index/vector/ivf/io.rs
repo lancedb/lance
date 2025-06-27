@@ -72,10 +72,7 @@ async fn merge_streams(
         let batch = match stream.next().await {
             Some(Ok(batch)) => batch,
             Some(Err(e)) => {
-                return Err(Error::io(
-                    format!("failed to read batch: {}", e),
-                    location!(),
-                ));
+                return Err(Error::io(format!("failed to read batch: {e}"), location!()));
             }
             None => {
                 return Err(Error::io(
@@ -99,7 +96,7 @@ async fn merge_streams(
                 batch
                     .column_by_name(column)
                     .ok_or_else(|| Error::Index {
-                        message: format!("code column {} not found", column),
+                        message: format!("code column {column} not found"),
                         location: location!(),
                     })?
                     .as_fixed_size_list()
@@ -120,7 +117,7 @@ async fn merge_streams(
             }
             Some(Err(e)) => {
                 return Err(Error::io(
-                    format!("IVF Shuffler::failed to read batch: {}", e),
+                    format!("IVF Shuffler::failed to read batch: {e}"),
                     location!(),
                 ));
             }
@@ -168,10 +165,7 @@ pub(super) async fn write_pq_partitions(
                     new_streams.push(stream);
                 }
                 Some(Err(e)) => {
-                    return Err(Error::io(
-                        format!("failed to read batch: {}", e),
-                        location!(),
-                    ));
+                    return Err(Error::io(format!("failed to read batch: {e}"), location!()));
                 }
                 None => {
                     return Err(Error::io(
@@ -281,10 +275,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                     new_streams.push(stream);
                 }
                 Some(Err(e)) => {
-                    return Err(Error::io(
-                        format!("failed to read batch: {}", e),
-                        location!(),
-                    ));
+                    return Err(Error::io(format!("failed to read batch: {e}"), location!()));
                 }
                 None => {
                     return Err(Error::io(
@@ -303,8 +294,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     let mut tasks = Vec::with_capacity(ivf.num_partitions());
     let sem = Arc::new(Semaphore::new(*HNSW_PARTITIONS_BUILD_PARALLEL));
     for part_id in 0..ivf.num_partitions() {
-        part_files.push(tmp_part_dir.child(format!("hnsw_part_{}", part_id)));
-        aux_part_files.push(tmp_part_dir.child(format!("hnsw_part_aux_{}", part_id)));
+        part_files.push(tmp_part_dir.child(format!("hnsw_part_{part_id}")));
+        aux_part_files.push(tmp_part_dir.child(format!("hnsw_part_aux_{part_id}")));
 
         let mut code_array: Vec<Arc<dyn Array>> = vec![];
         let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
@@ -373,7 +364,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore error");
 
-            log::debug!("Building HNSW partition {}", part_id);
+            log::debug!("Building HNSW partition {part_id}");
             let result = build_hnsw_quantization_partition(
                 dataset,
                 &column,
@@ -386,7 +377,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                 code_array,
             )
             .await;
-            log::debug!("Finished building HNSW partition {}", part_id);
+            log::debug!("Finished building HNSW partition {part_id}");
             result
         }));
     }
@@ -511,9 +502,7 @@ async fn build_hnsw_quantization_partition(
     let index_rows = futures::join!(build_hnsw, build_store).0?;
     assert!(
         index_rows >= num_rows,
-        "index rows {} must be greater than or equal to num rows {}",
-        index_rows,
-        num_rows
+        "index rows {index_rows} must be greater than or equal to num rows {num_rows}"
     );
     Ok(num_rows)
 }

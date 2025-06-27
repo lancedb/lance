@@ -185,8 +185,7 @@ impl Shuffler for IvfShuffler {
                     .expect("there should be at least one batch");
                 writers = stream::iter(0..self.num_partitions)
                     .map(|partition_id| {
-                        let part_path =
-                            self.output_dir.child(format!("ivf_{}.lance", partition_id));
+                        let part_path = self.output_dir.child(format!("ivf_{partition_id}.lance"));
                         let object_store = self.object_store.clone();
                         let schema = schema.clone();
                         async move {
@@ -207,7 +206,7 @@ impl Shuffler for IvfShuffler {
 
             // do flush
             if counter % self.buffer_size == 0 {
-                log::info!("shuffle {} batches, flushing", counter);
+                log::info!("shuffle {counter} batches, flushing");
                 let mut futs = vec![];
                 for (part_id, writer) in writers.iter_mut().enumerate() {
                     let batches = &partition_buffers[part_id];
@@ -274,7 +273,7 @@ impl ShuffleReader for IvfShufflerReader {
         &self,
         partition_id: usize,
     ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
-        let partition_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
+        let partition_path = self.output_dir.child(format!("ivf_{partition_id}.lance"));
 
         let reader = FileReader::try_open(
             self.scheduler

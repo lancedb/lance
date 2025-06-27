@@ -245,8 +245,7 @@ impl Schema {
             if !seen_names.insert(column_path.clone()) {
                 return Err(Error::Schema {
                     message: format!(
-                        "Duplicate field name \"{}\" in schema:\n {:#?}",
-                        column_path, self
+                        "Duplicate field name \"{column_path}\" in schema:\n {self:#?}"
                     ),
                     location: location!(),
                 });
@@ -609,7 +608,7 @@ impl TryFrom<&ArrowSchema> for Schema {
         for pk_col in pk.into_iter() {
             if !pk_col.is_leaf() {
                 return Err(Error::Schema {
-                    message: format!("Primary key column must be a leaf: {}", pk_col),
+                    message: format!("Primary key column must be a leaf: {pk_col}"),
                     location: location!(),
                 });
             }
@@ -619,8 +618,7 @@ impl TryFrom<&ArrowSchema> for Schema {
                     if ancestor.nullable {
                         return Err(Error::Schema {
                             message: format!(
-                                "Primary key column and all its ancestors must not be nullable: {}",
-                                ancestor
+                                "Primary key column and all its ancestors must not be nullable: {ancestor}"
                             ),
                             location: location!(),
                         });
@@ -629,8 +627,7 @@ impl TryFrom<&ArrowSchema> for Schema {
                     if ancestor.logical_type.is_list() || ancestor.logical_type.is_large_list() {
                         return Err(Error::Schema {
                             message: format!(
-                                "Primary key column must not be in a list type: {}",
-                                ancestor
+                                "Primary key column must not be in a list type: {ancestor}"
                             ),
                             location: location!(),
                         });
@@ -728,7 +725,7 @@ pub fn explain_fields_difference(
 
     let prepend_path = |f: &str| {
         if let Some(path) = path {
-            format!("{}.{}", path, f)
+            format!("{path}.{f}")
         } else {
             f.to_string()
         }
@@ -810,8 +807,7 @@ fn explain_metadata_difference(
 ) -> Option<String> {
     if metadata != expected {
         Some(format!(
-            "metadata did not match, expected: {:?}, actual: {:?}",
-            expected, metadata
+            "metadata did not match, expected: {expected:?}, actual: {metadata:?}"
         ))
     } else {
         None
@@ -899,7 +895,7 @@ impl Projection {
             self.field_ids.extend(fields.iter().map(|f| f.id));
         } else if matches!(on_missing, OnMissing::Error) {
             return Err(Error::InvalidInput {
-                source: format!("Column {} does not exist", column).into(),
+                source: format!("Column {column} does not exist").into(),
                 location: location!(),
             });
         }
@@ -1651,7 +1647,7 @@ mod tests {
         };
         assert!(subschema.compare_with_options(&expected, &options));
         let res = subschema.explain_difference(&expected, &options);
-        assert!(res.is_none(), "Expected None, got {:?}", res);
+        assert!(res.is_none(), "Expected None, got {res:?}");
 
         // Omitting non-nullable fields should fail
         let subschema = ArrowSchema::new(vec![ArrowField::new(
@@ -1704,7 +1700,7 @@ mod tests {
         };
         assert!(out_of_order.compare_with_options(&expected, &options));
         let res = out_of_order.explain_difference(&expected, &options);
-        assert!(res.is_none(), "Expected None, got {:?}", res);
+        assert!(res.is_none(), "Expected None, got {res:?}");
     }
 
     #[test]

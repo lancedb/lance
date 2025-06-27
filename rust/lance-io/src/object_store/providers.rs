@@ -183,10 +183,10 @@ impl ObjectStoreRegistry {
 
         let scheme = base_path.scheme();
         let Some(provider) = self.get_provider(scheme) else {
-            let mut message = format!("No object store provider found for scheme: '{}'", scheme);
+            let mut message = format!("No object store provider found for scheme: '{scheme}'");
             if let Ok(providers) = self.providers.read() {
                 let valid_schemes = providers.keys().cloned().collect::<Vec<_>>().join(", ");
-                message.push_str(&format!("\nValid schemes: {}", valid_schemes));
+                message.push_str(&format!("\nValid schemes: {valid_schemes}"));
             }
 
             return Err(Error::invalid_input(message, location!()));

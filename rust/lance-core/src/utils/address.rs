@@ -52,7 +52,7 @@ impl From<u64> for RowAddress {
 
 impl std::fmt::Debug for RowAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self) // use Display
+        write!(f, "{self}") // use Display
     }
 }
 

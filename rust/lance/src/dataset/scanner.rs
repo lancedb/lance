@@ -363,7 +363,7 @@ pub struct Scanner {
 
 fn escape_column_name(name: &str) -> String {
     name.split('.')
-        .map(|s| format!("`{}`", s))
+        .map(|s| format!("`{s}`"))
         .collect::<Vec<_>>()
         .join(".")
 }
@@ -555,7 +555,7 @@ impl Scanner {
             for field in fields.iter() {
                 if self.dataset.schema().field(field).is_none() {
                     return Err(Error::invalid_input(
-                        format!("Column {} not found", field),
+                        format!("Column {field} not found"),
                         location!(),
                     ));
                 }
@@ -734,8 +734,7 @@ impl Scanner {
                 if !matches!(vector_type, DataType::List(_)) {
                     return Err(Error::invalid_input(
                         format!(
-                            "Query is multivector but column {}({})is not multivector",
-                            column, vector_type,
+                            "Query is multivector but column {column}({vector_type})is not multivector",
                         ),
                         location!(),
                     ));
@@ -1673,7 +1672,7 @@ impl Scanner {
             )
             .await?
             .ok_or(Error::invalid_input(
-                format!("Column {} has no inverted index", column),
+                format!("Column {column} has no inverted index"),
                 location!(),
             ))?;
         if let Some(fragmap) = &index.fragment_bitmap {
@@ -3045,7 +3044,7 @@ pub mod test_dataset {
                         vec![
                             Arc::new(Int32Array::from_iter_values(i * 80..(i + 1) * 80)),
                             Arc::new(StringArray::from_iter_values(
-                                (i * 80..(i + 1) * 80).map(|v| format!("s-{}", v)),
+                                (i * 80..(i + 1) * 80).map(|v| format!("s-{v}")),
                             )),
                             Arc::new(vectors),
                         ],
@@ -3119,7 +3118,7 @@ pub mod test_dataset {
             let new_data: Vec<ArrayRef> = vec![
                 Arc::new(Int32Array::from_iter_values(400..410)), // 5 * 80
                 Arc::new(StringArray::from_iter_values(
-                    (400..410).map(|v| format!("s-{}", v)),
+                    (400..410).map(|v| format!("s-{v}")),
                 )),
                 Arc::new(new_vectors),
             ];
@@ -3191,7 +3190,7 @@ mod test {
                     vec![
                         Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
                         Arc::new(StringArray::from_iter_values(
-                            (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                            (i * 20..(i + 1) * 20).map(|v| format!("s-{v}")),
                         )),
                     ],
                 )
@@ -3245,7 +3244,7 @@ mod test {
                     vec![
                         Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
                         Arc::new(StringArray::from_iter_values(
-                            (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                            (i * 20..(i + 1) * 20).map(|v| format!("s-{v}")),
                         )),
                     ],
                 )
@@ -3265,7 +3264,7 @@ mod test {
             .await
             .unwrap();
 
-        let dataset = Dataset::open(&format!("file-object-store://{}", test_uri))
+        let dataset = Dataset::open(&format!("file-object-store://{test_uri}"))
             .await
             .unwrap();
         let mut builder = dataset.scan();
@@ -3305,7 +3304,7 @@ mod test {
                 // Projected just "s"
                 Arc::new(test_ds.schema.project(&[1])?),
                 vec![Arc::new(StringArray::from_iter_values(
-                    (51..400).map(|v| format!("s-{}", v)),
+                    (51..400).map(|v| format!("s-{v}")),
                 ))],
             )?;
             assert_eq!(batch, expected_batch);
@@ -3455,9 +3454,7 @@ mod test {
                 let expected_rows = case.limit.unwrap_or(k as i64) as usize;
                 assert!(
                     result_rows <= expected_rows,
-                    "Expected less than {} rows, got {}",
-                    expected_rows,
-                    result_rows
+                    "Expected less than {expected_rows} rows, got {result_rows}"
                 );
             } else {
                 // Exactly equal count
@@ -4126,7 +4123,7 @@ mod test {
         let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(LargeStringArray::from_iter_values(
-                (0..10).map(|v| format!("s-{}", v)),
+                (0..10).map(|v| format!("s-{v}")),
             ))],
         )
         .unwrap()];
@@ -4156,7 +4153,7 @@ mod test {
         let expected = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(LargeStringArray::from_iter_values(
-                (8..9).map(|v| format!("s-{}", v)),
+                (8..9).map(|v| format!("s-{v}")),
             ))],
         )
         .unwrap();
@@ -4182,7 +4179,7 @@ mod test {
         let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(StringArray::from_iter_values(
-                (0..20).map(|v| format!("s-{}", v)),
+                (0..20).map(|v| format!("s-{v}")),
             ))],
         )
         .unwrap()];
@@ -4207,7 +4204,7 @@ mod test {
         let expected = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(StringArray::from_iter_values(
-                (10..=19).map(|v| format!("s-{}", v)),
+                (10..=19).map(|v| format!("s-{v}")),
             ))],
         )
         .unwrap();
@@ -4233,7 +4230,7 @@ mod test {
                 let struct_i_arr: Arc<Int32Array> =
                     Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20));
                 let struct_o_arr: Arc<StringArray> = Arc::new(StringArray::from_iter_values(
-                    (i * 20..(i + 1) * 20).map(|v| format!("o-{:02}", v)),
+                    (i * 20..(i + 1) * 20).map(|v| format!("o-{v:02}")),
                 ));
                 RecordBatch::try_new(
                     schema.clone(),
@@ -4243,7 +4240,7 @@ mod test {
                             (Arc::new(struct_o_field.clone()), struct_o_arr as ArrayRef),
                         ])),
                         Arc::new(StringArray::from_iter_values(
-                            (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                            (i * 20..(i + 1) * 20).map(|v| format!("s-{v}")),
                         )),
                     ],
                 )
@@ -5421,7 +5418,7 @@ mod test {
                 let struct_i_arr: Arc<Int32Array> =
                     Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20));
                 let struct_o_arr: Arc<StringArray> = Arc::new(StringArray::from_iter_values(
-                    (i * 20..(i + 1) * 20).map(|v| format!("o-{:02}", v)),
+                    (i * 20..(i + 1) * 20).map(|v| format!("o-{v:02}")),
                 ));
                 RecordBatch::try_new(
                     schema.clone(),
@@ -5431,7 +5428,7 @@ mod test {
                             (Arc::new(struct_o_field.clone()), struct_o_arr as ArrayRef),
                         ])),
                         Arc::new(StringArray::from_iter_values(
-                            (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                            (i * 20..(i + 1) * 20).map(|v| format!("s-{v}")),
                         )),
                     ],
                 )

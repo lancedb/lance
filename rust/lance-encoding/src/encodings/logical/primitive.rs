@@ -3901,9 +3901,7 @@ impl PrimitiveStructuralEncoder {
             if num_values == num_nulls {
                 return if repdefs.iter().all(|rd| rd.is_simple_validity()) {
                     log::debug!(
-                        "Encoding column {} with {} items using simple-null layout",
-                        column_idx,
-                        num_values
+                        "Encoding column {column_idx} with {num_values} items using simple-null layout"
                     );
                     // Simple case, no rep/def and all nulls, we don't need to encode any data
                     Self::encode_simple_all_null(column_idx, num_values, row_number)
@@ -3932,9 +3930,7 @@ impl PrimitiveStructuralEncoder {
 
             if Self::should_dictionary_encode(&data_block) {
                 log::debug!(
-                    "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
-                    column_idx,
-                    num_values
+                    "Encoding column {column_idx} with {num_values} items using dictionary encoding (mini-block layout)"
                 );
                 let (indices_data_block, dictionary_data_block) =
                     Self::dictionary_encode(data_block);
@@ -3950,9 +3946,7 @@ impl PrimitiveStructuralEncoder {
                 )
             } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
                 log::debug!(
-                    "Encoding column {} with {} items using mini-block layout",
-                    column_idx,
-                    num_values
+                    "Encoding column {column_idx} with {num_values} items using mini-block layout"
                 );
                 Self::encode_miniblock(
                     column_idx,
@@ -3966,9 +3960,7 @@ impl PrimitiveStructuralEncoder {
                 )
             } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
                 log::debug!(
-                    "Encoding column {} with {} items using full-zip layout",
-                    column_idx,
-                    num_values
+                    "Encoding column {column_idx} with {num_values} items using full-zip layout"
                 );
                 Self::encode_full_zip(
                     column_idx,

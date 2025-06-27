@@ -288,7 +288,7 @@ fn local_path_to_url(str_path: &str) -> Result<Url> {
     let expanded_path = expand_path(str_path)?;
 
     Url::from_directory_path(expanded_path).map_err(|_| Error::InvalidInput {
-        source: format!("Invalid table location: '{}'", str_path).into(),
+        source: format!("Invalid table location: '{str_path}'").into(),
         location: location!(),
     })
 }
@@ -594,7 +594,7 @@ impl FromStr for LanceConfigKey {
         match s.to_ascii_lowercase().as_str() {
             "download_retry_count" => Ok(Self::DownloadRetryCount),
             _ => Err(Error::InvalidInput {
-                source: format!("Invalid LanceConfigKey: {}", s).into(),
+                source: format!("Invalid LanceConfigKey: {s}").into(),
                 location: location!(),
             }),
         }

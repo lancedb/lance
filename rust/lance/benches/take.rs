@@ -49,8 +49,7 @@ fn bench_take_for_version(
     for num_rows in [1, 10, 100, 1000] {
         c.bench_function(
             &format!(
-                "{} Random Take ({} file size, {} batches, {} rows per take)",
-                version_name, file_size, num_batches, num_rows
+                "{version_name} Random Take ({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
             ),
             |b| {
                 b.to_async(rt).iter(|| async {
@@ -59,7 +58,7 @@ fn bench_take_for_version(
                     let batch = dataset
                         .take_rows(&rows, ProjectionRequest::Schema(schema.clone()))
                         .await
-                        .unwrap_or_else(|_| panic!("rows: {:?}", rows));
+                        .unwrap_or_else(|_| panic!("rows: {rows:?}"));
                     assert_eq!(batch.num_rows(), num_rows);
                 })
             },
@@ -127,7 +126,7 @@ async fn create_dataset(
                     )),
                     Arc::new(BinaryArray::from_iter_values(
                         (i * batch_size..(i + 1) * batch_size)
-                            .map(|x| format!("blob-{}", x).into_bytes()),
+                            .map(|x| format!("blob-{x}").into_bytes()),
                     )),
                     Arc::new(
                         FixedSizeListArray::try_new_from_values(
@@ -141,7 +140,7 @@ async fn create_dataset(
                     ),
                     Arc::new(BinaryArray::from_iter_values(
                         (i * batch_size..(i + 1) * batch_size)
-                            .map(|x| format!("blob-{}", x).into_bytes()),
+                            .map(|x| format!("blob-{x}").into_bytes()),
                     )),
                 ],
             )

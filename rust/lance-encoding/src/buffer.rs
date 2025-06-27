@@ -309,7 +309,7 @@ impl LanceBuffer {
             if bits_per_value % 8 == 0 {
                 Ok(bits_per_value / 8)
             } else {
-                Err(Error::InvalidInput { source: format!("LanceBuffer::zip_into_one only supports full-byte buffers currently and received a buffer with {} bits per value", bits_per_value).into(), location: location!() })
+                Err(Error::InvalidInput { source: format!("LanceBuffer::zip_into_one only supports full-byte buffers currently and received a buffer with {bits_per_value} bits per value").into(), location: location!() })
             }
         }).collect::<Result<Vec<_>>>()?;
         let total_bytes_per_value = bytes_per_value.iter().sum::<u64>();

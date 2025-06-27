@@ -121,7 +121,7 @@ impl Index for BitmapIndex {
             num_bitmaps: self.index_map.len(),
         };
         serde_json::to_value(stats).map_err(|e| Error::Internal {
-            message: format!("failed to serialize bitmap index statistics: {}", e),
+            message: format!("failed to serialize bitmap index statistics: {e}"),
             location: location!(),
         })
     }
@@ -568,7 +568,7 @@ pub mod tests {
             let bitmap = loaded_index
                 .index_map
                 .get(&key)
-                .unwrap_or_else(|| panic!("Key {} should exist", key_val));
+                .unwrap_or_else(|| panic!("Key {key_val} should exist"));
 
             // Convert RowIdTreeMap to a vector for easier assertion
             let row_ids: Vec<u64> = bitmap.row_ids().unwrap().map(u64::from).collect();
@@ -577,26 +577,21 @@ pub mod tests {
             assert_eq!(
                 row_ids.len(),
                 per_bitmap_size as usize,
-                "Bitmap for key {} has wrong size",
-                key_val
+                "Bitmap for key {key_val} has wrong size"
             );
 
             // Verify first few and last few elements
             for i in 0..5.min(per_bitmap_size) {
                 assert!(
                     row_ids.contains(&i),
-                    "Bitmap for key {} should contain row_id {}",
-                    key_val,
-                    i
+                    "Bitmap for key {key_val} should contain row_id {i}"
                 );
             }
 
             for i in (per_bitmap_size - 5)..per_bitmap_size {
                 assert!(
                     row_ids.contains(&i),
-                    "Bitmap for key {} should contain row_id {}",
-                    key_val,
-                    i
+                    "Bitmap for key {key_val} should contain row_id {i}"
                 );
             }
 
@@ -604,8 +599,7 @@ pub mod tests {
             let expected_range: Vec<u64> = (0..per_bitmap_size).collect();
             assert_eq!(
                 row_ids, expected_range,
-                "Bitmap for key {} doesn't contain expected values",
-                key_val
+                "Bitmap for key {key_val} doesn't contain expected values"
             );
 
             tracing::info!(

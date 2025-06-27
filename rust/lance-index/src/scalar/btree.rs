@@ -1098,12 +1098,12 @@ fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
         });
     }
     let min = ScalarValue::try_from_array(&values, 0).map_err(|e| Error::Internal {
-        message: format!("failed to get min value from batch: {}", e),
+        message: format!("failed to get min value from batch: {e}"),
         location: location!(),
     })?;
     let max =
         ScalarValue::try_from_array(&values, values.len() - 1).map_err(|e| Error::Internal {
-            message: format!("failed to get max value from batch: {}", e),
+            message: format!("failed to get max value from batch: {e}"),
             location: location!(),
         })?;
 

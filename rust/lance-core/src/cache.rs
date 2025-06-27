@@ -249,7 +249,7 @@ mod tests {
 
         // Test eviction based on size
         for i in 0..20 {
-            cache.insert(&format!("key_{}", i), Arc::new(vec![i, i, i]));
+            cache.insert(&format!("key_{i}"), Arc::new(vec![i, i, i]));
         }
         assert_eq!(cache.size_bytes(), capacity);
         assert_eq!(cache.size(), 10);
