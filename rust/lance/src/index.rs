@@ -1150,8 +1150,9 @@ impl DatasetIndexInternalExt for Dataset {
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
-                            Arc::downgrade(&self.session),
                             fri,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
