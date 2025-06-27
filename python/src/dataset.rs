@@ -22,7 +22,7 @@ use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
 use pyo3::{
-    exceptions::{PyFileNotFoundError, PyIOError, PyKeyError, PyValueError},
+    exceptions::{PyIOError, PyKeyError, PyValueError},
     pybacked::PyBackedStr,
     pyclass,
     types::{IntoPyDict, PyDict},
@@ -1513,7 +1513,7 @@ impl Dataset {
                             Err(PyIOError::new_err(e.to_string()))
                         }
                     } else {
-                        Err(e)
+                        Err(PyIOError::new_err(e.to_string()))
                     }
                 }
             }
