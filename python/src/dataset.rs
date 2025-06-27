@@ -1344,7 +1344,7 @@ impl Dataset {
             "NGRAM" => IndexType::NGram,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
-            "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
+            "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
                 IndexType::Vector
             }
             _ => {
@@ -2179,6 +2179,10 @@ fn prepare_vector_index_params(
 
         "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(
             m_type, ivf_params, pq_params,
+        ))),
+
+        "IVF_SQ" => Ok(Box::new(VectorIndexParams::with_ivf_sq_params(
+            m_type, ivf_params, sq_params,
         ))),
 
         "IVF_HNSW_FLAT" => Ok(Box::new(VectorIndexParams::ivf_hnsw(
