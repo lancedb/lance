@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Caches for Lance datasets. They are organized in a hierarchical manner to
-//! avoid collisions.d
+//! avoid collisions.
 //!
 //!  GlobalMetadataCache
 //!     │
