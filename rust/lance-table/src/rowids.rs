@@ -321,9 +321,7 @@ impl RowIdSequence {
             }
             last_index = index;
 
-            if cur_seg.is_none() {
-                return None;
-            }
+            cur_seg?;
 
             while (index - rows_passed) >= cur_seg_len {
                 rows_passed += cur_seg_len;

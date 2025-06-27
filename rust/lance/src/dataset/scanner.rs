@@ -1608,7 +1608,7 @@ impl Scanner {
             && self.batch_size.is_none()
             && self.use_stats
         {
-            self.pushdown_scan(false, filter_plan.refine_expr.clone().take().unwrap())
+            self.pushdown_scan(false, filter_plan.refine_expr.clone().unwrap())
         } else {
             let ordered = if self.ordering.is_some() || self.nearest.is_some() {
                 // If we are sorting the results there is no need to scan in order
@@ -1657,7 +1657,7 @@ impl Scanner {
         }
 
         if let Some(fragment_readahead) = self.fragment_readahead {
-            read_options = read_options.with_fragment_readahead(fragment_readahead as usize);
+            read_options = read_options.with_fragment_readahead(fragment_readahead);
         }
 
         if make_deletions_null {
@@ -1681,7 +1681,7 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if self.dataset.is_legacy_storage() {
             self.legacy_filtered_read(
-                &filter_plan,
+                filter_plan,
                 projection,
                 make_deletions_null,
                 fragments,
@@ -1691,7 +1691,7 @@ impl Scanner {
             .await
         } else {
             self.new_filtered_read(
-                &filter_plan,
+                filter_plan,
                 projection,
                 make_deletions_null,
                 fragments,
@@ -1710,7 +1710,7 @@ impl Scanner {
             // If the filter plan has two steps (a scalar indexed portion and a refine portion) then
             // it makes sense to grab cheap columns during the first step to avoid taking them for
             // the second step.
-            self.calc_eager_projection(&filter_plan, self.projection_plan.physical_schema.as_ref())?
+            self.calc_eager_projection(filter_plan, self.projection_plan.physical_schema.as_ref())?
                 .with_row_id()
         } else {
             // If the filter plan only has one step then we just do a filtered read of all the
@@ -1725,7 +1725,7 @@ impl Scanner {
 
         let scan_range = if filter_plan.is_empty() {
             log::trace!("pushing scan_range into filtered_read");
-            self.get_scan_range(&filter_plan).await?
+            self.get_scan_range(filter_plan).await?
         } else {
             None
         };
@@ -1734,7 +1734,7 @@ impl Scanner {
         let filter_pushed_down = !self.dataset.is_legacy_storage();
         let plan = self
             .filtered_read(
-                &filter_plan,
+                filter_plan,
                 projection,
                 self.include_deleted_rows,
                 self.fragments.clone().map(Arc::new),
@@ -1765,7 +1765,7 @@ impl Scanner {
         // The source is an FTS search
         if self.prefilter {
             // If we are prefiltering then the fts node will take care of the filter
-            let source = self.fts(&filter_plan, query).await?;
+            let source = self.fts(filter_plan, query).await?;
             *filter_plan = FilterPlan::default();
             Ok(source)
         } else {
@@ -1790,7 +1790,7 @@ impl Scanner {
         if self.prefilter {
             log::trace!("source is a vector search (prefilter)");
             // If we are prefiltering then the ann / knn node will take care of the filter
-            let source = self.vector_search(&filter_plan).await?;
+            let source = self.vector_search(filter_plan).await?;
             *filter_plan = FilterPlan::default();
             Ok(source)
         } else {
@@ -2358,7 +2358,7 @@ impl Scanner {
 
             let mut plan = self
                 .filtered_read(
-                    &filter_plan,
+                    filter_plan,
                     vector_scan_projection,
                     /*include_deleted_rows=*/ true,
                     None,
