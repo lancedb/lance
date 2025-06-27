@@ -284,7 +284,7 @@ impl<F: Fn() -> Box<dyn ArrayGenerator> + Clone + 'static> ArrayGeneratorProvide
     }
 
     fn copy(&self) -> Box<dyn ArrayGeneratorProvider> {
-        Box::new(FnArrayGeneratorProvider {
+        Box::new(Self {
             provider_fn: self.provider_fn.clone(),
         })
     }
