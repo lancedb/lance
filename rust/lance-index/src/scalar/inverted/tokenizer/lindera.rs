@@ -59,7 +59,7 @@ impl LinderaTokenizerBuilder for LinderaBuilder {
             );
             LinderaTokenizer::new().map_err(|e| {
                 Error::io(
-                    format!("Failed to initialize default tokenizer: {}", e),
+                    format!("Failed to initialize default tokenizer: {e}"),
                     location!(),
                 )
             })?

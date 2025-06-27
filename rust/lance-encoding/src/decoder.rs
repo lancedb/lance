@@ -264,7 +264,7 @@ const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 #[derive(Debug)]
 pub enum PageEncoding {
     Legacy(pb::ArrayEncoding),
-    Structural(pb::PageLayout),
+    Structural(Box<pb::PageLayout>),
 }
 
 impl PageEncoding {
@@ -277,7 +277,7 @@ impl PageEncoding {
 
     pub fn as_structural(&self) -> &pb::PageLayout {
         match self {
-            Self::Structural(enc) => enc,
+            Self::Structural(enc) => enc.as_ref(),
             Self::Legacy(_) => panic!("Expected a structural encoding"),
         }
     }

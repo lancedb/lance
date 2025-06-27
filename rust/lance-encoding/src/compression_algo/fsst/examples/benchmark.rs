@@ -113,12 +113,9 @@ fn benchmark(file_path: &str) {
     // Print tsv headers
     #[allow(clippy::print_stdout)]
     {
-        println!("for file: {}", file_path);
+        println!("for file: {file_path}");
         println!("Compression ratio\tCompression speed\tDecompression speed");
-        println!(
-            "{:.3}\t\t\t\t{:.2}MB/s\t\t\t{:.2}MB/s",
-            compression_ratio, com_speed, d_speed
-        );
+        println!("{compression_ratio:.3}\t\t\t\t{com_speed:.2}MB/s\t\t\t{d_speed:.2}MB/s");
     }
     for i in 0..TEST_NUM {
         assert_eq!(inputs[i].value_data(), decompression_out_bufs[i]);

@@ -732,9 +732,7 @@ pub async fn commit_handler_from_url(
             let dynamo_endpoint = get_dynamodb_endpoint(&storage_options);
             let storage_options = storage_options.as_s3_options();
 
-            let region = storage_options
-                .get(&AmazonS3ConfigKey::Region)
-                .map(|s| s.to_string());
+            let region = storage_options.get(&AmazonS3ConfigKey::Region).cloned();
 
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
@@ -762,7 +760,7 @@ pub async fn commit_handler_from_url(
 #[cfg(feature = "dynamodb")]
 fn get_dynamodb_endpoint(storage_options: &StorageOptions) -> Option<String> {
     if let Some(endpoint) = storage_options.0.get("dynamodb_endpoint") {
-        Some(endpoint.to_string())
+        Some(endpoint.clone())
     } else {
         std::env::var("DYNAMODB_ENDPOINT").ok()
     }

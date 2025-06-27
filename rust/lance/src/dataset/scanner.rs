@@ -205,7 +205,7 @@ pub enum LanceFilter {
     /// The filter is a Substrait expression
     Substrait(Vec<u8>),
     /// The filter is a Datafusion expression
-    Datafusion(Expr),
+    Datafusion(Box<Expr>),
 }
 
 impl LanceFilter {
@@ -252,7 +252,7 @@ impl LanceFilter {
             Self::Substrait(_) => {
                 panic!("Substrait filter is not supported in this build");
             }
-            Self::Datafusion(expr) => Ok(expr.clone()),
+            Self::Datafusion(expr) => Ok(expr.as_ref().clone()),
         }
     }
 }
@@ -576,7 +576,7 @@ impl Scanner {
     }
 
     pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
-        self.filter = Some(LanceFilter::Datafusion(filter));
+        self.filter = Some(LanceFilter::Datafusion(Box::new(filter)));
         self
     }
 

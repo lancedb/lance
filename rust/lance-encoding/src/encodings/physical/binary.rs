@@ -641,7 +641,7 @@ pub mod tests {
                 if with_nulls && i % 7 == 0 {
                     None
                 } else {
-                    Some(s.to_string())
+                    Some(s.clone())
                 }
             })
             .collect();

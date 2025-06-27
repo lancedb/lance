@@ -113,7 +113,7 @@ impl DisplayAs for OneShotExec {
             .schema
             .field_names()
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| s.as_str())
             .collect::<Vec<_>>();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
@@ -224,7 +224,7 @@ impl LanceExecutionOptions {
                 .map(|s| match s.parse::<u64>() {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!("Failed to parse LANCE_MEM_POOL_SIZE: {}, using default", e);
+                        warn!("Failed to parse LANCE_MEM_POOL_SIZE: {e}, using default");
                         DEFAULT_LANCE_MEM_POOL_SIZE
                     }
                 })
@@ -404,7 +404,7 @@ pub async fn analyze_plan(
         .execute(0, get_task_context(&session_ctx, &options))
         .map_err(|err| {
             Error::io(
-                format!("Failed to execute analyze plan: {}", err),
+                format!("Failed to execute analyze plan: {err}"),
                 location!(),
             )
         })?;

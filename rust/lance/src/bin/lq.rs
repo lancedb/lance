@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
     match &args.command {
         Commands::Inspect { uri } => {
             let dataset = Dataset::open(uri).await.unwrap();
-            println!("Dataset URI: {}", uri);
+            println!("Dataset URI: {uri}");
             println!(
                 "Latest version: {}, Total versions: {}",
                 dataset.version().version,

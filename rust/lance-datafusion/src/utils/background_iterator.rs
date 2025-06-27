@@ -69,7 +69,7 @@ where
                     // Resume the panic on the main task
                     panic::resume_unwind(err.into_panic());
                 } else {
-                    panic!("Background task failed: {:?}", err);
+                    panic!("Background task failed: {err:?}");
                 }
             }
         }

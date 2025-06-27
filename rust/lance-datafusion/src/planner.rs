@@ -187,8 +187,7 @@ impl ContextProvider for LanceContextProvider {
         name: datafusion::sql::TableReference,
     ) -> DFResult<Arc<dyn datafusion::logical_expr::TableSource>> {
         Err(datafusion::error::DataFusionError::NotImplemented(format!(
-            "Attempt to reference inner table {} not supported",
-            name
+            "Attempt to reference inner table {name} not supported"
         )))
     }
 
@@ -323,7 +322,7 @@ impl Planner {
 
             _ => {
                 return Err(Error::invalid_input(
-                    format!("Unary operator '{:?}' is not supported", op),
+                    format!("Unary operator '{op:?}' is not supported"),
                     location!(),
                 ));
             }
@@ -334,7 +333,7 @@ impl Planner {
     fn number(&self, value: &str, negative: bool) -> Result<Expr> {
         use datafusion::logical_expr::lit;
         let value: Cow<str> = if negative {
-            Cow::Owned(format!("-{}", value))
+            Cow::Owned(format!("-{value}"))
         } else {
             Cow::Borrowed(value)
         };
@@ -368,7 +367,7 @@ impl Planner {
         match func_args {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self.parse_sql_expr(expr),
             _ => Err(Error::invalid_input(
-                format!("Unsupported function args: {:?}", func_args),
+                format!("Unsupported function args: {func_args:?}"),
                 location!(),
             )),
         }
@@ -479,7 +478,7 @@ impl Planner {
                     Some(9) => TimeUnit::Nanosecond,
                     _ => {
                         return Err(Error::invalid_input(
-                            format!("Unsupported datetime resolution: {:?}", resolution),
+                            format!("Unsupported datetime resolution: {resolution:?}"),
                             location!(),
                         ));
                     }
@@ -495,7 +494,7 @@ impl Planner {
                     Some(9) => TimeUnit::Nanosecond,
                     _ => {
                         return Err(Error::invalid_input(
-                            format!("Unsupported datetime resolution: {:?}", resolution),
+                            format!("Unsupported datetime resolution: {resolution:?}"),
                             location!(),
                         ));
                     }
@@ -507,17 +506,13 @@ impl Planner {
                     Ok(ArrowDataType::Decimal128(*precision as u8, *scale as i8))
                 }
                 _ => Err(Error::invalid_input(
-                    format!(
-                        "Must provide precision and scale for decimal: {:?}",
-                        number_info
-                    ),
+                    format!("Must provide precision and scale for decimal: {number_info:?}"),
                     location!(),
                 )),
             },
             _ => Err(Error::invalid_input(
                 format!(
-                    "Unsupported data type: {:?}. Supported types: {:?}",
-                    data_type, SUPPORTED_TYPES
+                    "Unsupported data type: {data_type:?}. Supported types: {SUPPORTED_TYPES:?}"
                 ),
                 location!(),
             )),
@@ -564,10 +559,7 @@ impl Planner {
 
                 let array_literal_error = |pos: usize, value: &_| {
                     Err(Error::invalid_input(
-                        format!(
-                            "Expected a literal value in array, instead got {} at position {}",
-                            value, pos
-                        ),
+                        format!("Expected a literal value in array, instead got {value} at position {pos}"),
                         location!(),
                     ))
                 };

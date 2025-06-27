@@ -182,7 +182,7 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
         s if s.starts_with("lindera/") => {
             let Some(home) = language_model_home() else {
                 return Err(Error::invalid_input(
-                    format!("unknown base tokenizer {}", name),
+                    format!("unknown base tokenizer {name}"),
                     location!(),
                 ));
             };
@@ -193,7 +193,7 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
             let s = if s == "jieba" { "jieba/default" } else { s };
             let Some(home) = language_model_home() else {
                 return Err(Error::invalid_input(
-                    format!("unknown base tokenizer {}", name),
+                    format!("unknown base tokenizer {name}"),
                     location!(),
                 ));
             };

@@ -14,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 
 async fn get_store() -> Arc<ObjectStore> {
     let bucket_name = std::env::var("OBJECT_STORE_BUCKET").unwrap_or_else(|_| "test-bucket".into());
-    ObjectStore::from_uri(&format!("gs://{}/object", bucket_name))
+    ObjectStore::from_uri(&format!("gs://{bucket_name}/object"))
         .await
         .unwrap()
         .0

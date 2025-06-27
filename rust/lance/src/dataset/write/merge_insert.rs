@@ -151,7 +151,7 @@ pub enum WhenNotMatchedBySource {
     /// Delete rows from the target table if there is no match AND the expression evaluates to true
     ///
     /// This can be used to replace a region of data with new data
-    DeleteIf(Expr),
+    DeleteIf(Box<Expr>),
 }
 
 impl WhenNotMatchedBySource {
@@ -174,7 +174,7 @@ impl WhenNotMatchedBySource {
             .context(InvalidInputSnafu {
                 location: location!(),
             })?;
-        Ok(Self::DeleteIf(expr))
+        Ok(Self::DeleteIf(Box::new(expr)))
     }
 }
 
@@ -191,7 +191,7 @@ pub enum WhenMatched {
     DoNothing,
     /// The row is updated (similar to UpdateAll) only for rows where the expression evaluates to
     /// true
-    UpdateIf(Expr),
+    UpdateIf(Box<Expr>),
 }
 
 impl WhenMatched {
@@ -211,7 +211,7 @@ impl WhenMatched {
             .context(InvalidInputSnafu {
                 location: location!(),
             })?;
-        Ok(Self::UpdateIf(expr))
+        Ok(Self::UpdateIf(Box::new(expr)))
     }
 }
 
@@ -1514,7 +1514,7 @@ impl Merger {
             &params.delete_not_matched_by_source
         {
             let planner = Planner::new(schema.clone());
-            let expr = planner.optimize_expr(expr.clone())?;
+            let expr = planner.optimize_expr(expr.as_ref().clone())?;
             let physical_expr = planner.create_physical_expr(&expr)?;
             let data_type = physical_expr.data_type(&schema)?;
             if data_type != DataType::Boolean {
@@ -1527,7 +1527,7 @@ impl Merger {
         let match_filter_expr = if let WhenMatched::UpdateIf(expr) = &params.when_matched {
             let combined_schema = Arc::new(combined_schema(&schema));
             let planner = Planner::new(combined_schema.clone());
-            let expr = planner.optimize_expr(expr.clone())?;
+            let expr = planner.optimize_expr(expr.as_ref().clone())?;
             let match_expr = planner.create_physical_expr(&expr)?;
             let data_type = match_expr.data_type(combined_schema.as_ref())?;
             if data_type != DataType::Boolean {
@@ -2021,7 +2021,9 @@ mod tests {
         // find-or-create, with delete some
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
             .unwrap()
-            .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
+            .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(Box::new(
+                condition.clone(),
+            )))
             .try_build()
             .unwrap();
         check(
@@ -2037,7 +2039,9 @@ mod tests {
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
             .unwrap()
             .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
+            .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(Box::new(
+                condition.clone(),
+            )))
             .try_build()
             .unwrap();
         check(
@@ -2054,7 +2058,9 @@ mod tests {
             .unwrap()
             .when_matched(WhenMatched::UpdateAll)
             .when_not_matched(WhenNotMatched::DoNothing)
-            .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
+            .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(Box::new(
+                condition.clone(),
+            )))
             .try_build()
             .unwrap();
         check(new_batch.clone(), job, &[1], &[4, 5, 6], &[0, 3, 2]).await;
@@ -2063,7 +2069,9 @@ mod tests {
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
             .unwrap()
             .when_not_matched(WhenNotMatched::DoNothing)
-            .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
+            .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(Box::new(
+                condition.clone(),
+            )))
             .try_build()
             .unwrap();
         check(new_batch.clone(), job, &[1, 4, 5, 6], &[], &[0, 0, 2]).await;
@@ -2314,7 +2322,7 @@ mod tests {
                 matches!(
                     &res,
                     &Err(Error::SchemaMismatch { ref difference, .. })
-                        if difference.to_string().contains("fields did not match")
+                        if difference.clone().contains("fields did not match")
                 ),
                 "Expected SchemaMismatch error, got: {res:?}"
             );

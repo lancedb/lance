@@ -662,11 +662,11 @@ impl FileReader {
                                     page.encoding.as_ref().unwrap(),
                                 ))
                             }
-                            _ => {
-                                PageEncoding::Structural(Self::fetch_encoding::<pbenc::PageLayout>(
-                                    page.encoding.as_ref().unwrap(),
-                                ))
-                            }
+                            _ => PageEncoding::Structural(Box::new(Self::fetch_encoding::<
+                                pbenc::PageLayout,
+                            >(
+                                page.encoding.as_ref().unwrap(),
+                            ))),
                         };
                         let buffer_offsets_and_sizes = Arc::from(
                             page.buffer_offsets

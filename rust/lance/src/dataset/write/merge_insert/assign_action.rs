@@ -93,7 +93,7 @@ pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
         }
         WhenMatched::UpdateIf(condition) => {
             cases.push((
-                matched.and(condition.clone()),
+                matched.and(condition.as_ref().clone()),
                 Action::UpdateAll.as_literal_expr(),
             ));
         }
@@ -106,7 +106,7 @@ pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
         }
         WhenNotMatchedBySource::DeleteIf(condition) => {
             cases.push((
-                not_matched_in_source.and(condition.clone()),
+                not_matched_in_source.and(condition.as_ref().clone()),
                 Action::Delete.as_literal_expr(),
             ));
         }
