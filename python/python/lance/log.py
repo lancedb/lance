@@ -47,7 +47,7 @@ def set_logger(
     LOGGER.setLevel(level)
     lh = log_handler
     if lh is None:
-        lh = logging.FileHandler(file_path)
+        lh = logging.FileHandler(file_path)  # type: ignore
     lh.setLevel(level)
     formatter = logging.Formatter(format_string)
     lh.setFormatter(formatter)

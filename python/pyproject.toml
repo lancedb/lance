@@ -74,13 +74,7 @@ lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 pythonVersion = "3.12"
 # TODO: expand this list as we fix more files.
 include = [
-    "python/lance/util.py",
-    "python/lance/debug.py",
-    "python/lance/tracing.py",
-    "python/lance/dependencies.py",
-    "python/lance/schema.py",
-    "python/lance/file.py",
-    "python/lance/util.py",
+    "python/lance",
 ]
 # Dependencies like pyarrow make this difficult to enforce strictly.
 reportMissingTypeStubs = "warning"

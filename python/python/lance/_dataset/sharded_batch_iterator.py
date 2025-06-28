@@ -78,7 +78,7 @@ class ShardedBatchIterator:
         self._batch_readahead = batch_readahead
 
         self._ds: LanceDataset = (
-            data if isinstance(data, LanceDataset) else lance.dataset(data)
+            data if isinstance(data, LanceDataset) else lance.dataset(data)  # type: ignore
         )
 
     @staticmethod
@@ -140,7 +140,7 @@ class ShardedBatchIterator:
 
         return self._ds._ds.take_scan(
             _gen_ranges(),
-            columns=self._columns,
+            columns=self._columns,  # type: ignore
         )
 
     def __iter__(self):

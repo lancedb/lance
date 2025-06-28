@@ -22,7 +22,7 @@ def preferred_device(device: Optional[str] = None):
     """
     if device is not None:
         if isinstance(device, str):
-            device = torch.device(device)
+            device = torch.device(device)  # type: ignore
         return device
     if torch.cuda.is_available():
         return torch.device("cuda")

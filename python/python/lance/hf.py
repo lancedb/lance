@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import pyarrow as pa
 
 if TYPE_CHECKING:
-    import PIL.Image
-    import torch
+    import PIL.Image  # type: ignore
+    import torch  # type: ignore
 
 
 class HuggingFaceConverter:
@@ -21,7 +21,7 @@ class HuggingFaceConverter:
         self.ds_info = ds_info
 
     def _to_pil_image(self, scalar: pa.StructScalar) -> "PIL.Image.Image":
-        import PIL.Image
+        import PIL.Image  # type: ignore
 
         row = scalar.as_py()
         if row.get("bytes") is None:

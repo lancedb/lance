@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from datetime import timedelta
 from pathlib import Path
 from typing import (
     Any,
@@ -33,6 +34,7 @@ from .._arrow.bf16 import BFloat16Array
 from ..commit import CommitLock
 from ..dataset import (
     AlterColumn,
+    DataStatistics,
     ExecuteResult,
     Index,
     LanceOperation,
@@ -209,10 +211,12 @@ class _Dataset:
         use_stats: Optional[bool] = None,
         substrait_filter: Optional[bytes] = None,
         fast_search: Optional[bool] = None,
-        full_text_query: Optional[dict] = None,
+        full_text_query: Optional[dict | PyFullTextQuery] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
+        scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
+        strict_batch_size: Optional[bool] = None,
     ) -> _Scanner: ...
     def count_rows(self, filter: Optional[str] = None) -> int: ...
     def take(
@@ -325,6 +329,30 @@ class _Dataset:
         batch_size: Optional[int] = None,
     ): ...
     def add_columns_with_schema(self, schema: pa.Schema): ...
+    def read_index_partition(
+        self,
+        index_name: str,
+        partition_id: int,
+        with_vector: bool,
+    ) -> pa.RecordBatchReader: ...
+    @property
+    def max_field_id(self) -> int: ...
+    def take_blobs_by_indices(
+        self,
+        indices: List[int],
+        blob_column: str,
+    ) -> List[LanceBlobFile]: ...
+    @staticmethod
+    def commit_transaction(
+        dest: str | _Dataset,
+        transaction: Transaction,
+        commit_lock: Optional[CommitLock] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+        enable_v2_manifest_paths: Optional[bool] = None,
+        detached: Optional[bool] = None,
+        max_retries: Optional[int] = None,
+    ) -> _Dataset: ...
+    def data_stats(self) -> DataStatistics: ...
 
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...
@@ -332,6 +360,11 @@ class _MergeInsertBuilder:
     def when_not_matched_insert_all(self) -> Self: ...
     def when_not_matched_by_source_delete(self, expr: Optional[str] = None) -> Self: ...
     def execute(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
+    def execute_uncommitted(
+        self, new_data: pa.RecordBatchReader
+    ) -> Tuple[Transaction, Dict[str, Any]]: ...
+    def conflict_retries(self, max_retries: int) -> Self: ...
+    def retry_timeout(self, timeout: timedelta) -> Self: ...
 
 class _Scanner:
     @property
@@ -394,6 +427,9 @@ class _Fragment:
     def physical_rows(self) -> int: ...
     @property
     def num_deletions(self) -> int: ...
+    def merge(
+        self, reader: ReaderLike, left_on: str, right_on: str, max_field_id: int
+    ) -> Tuple[FragmentMetadata, LanceSchema]: ...
 
 def iops_counter() -> int: ...
 def bytes_read_counter() -> int: ...
@@ -475,11 +511,13 @@ class PyFullTextQuery:
         fuzziness: Optional[int] = 0,
         max_expansions: int = 50,
         operator: str = "OR",
+        prefix_length: int = 0,
     ) -> PyFullTextQuery: ...
     @staticmethod
     def phrase_query(
         query: str,
         column: str,
+        slop: int = 0,
     ) -> PyFullTextQuery: ...
     @staticmethod
     def boost_query(
@@ -494,6 +532,10 @@ class PyFullTextQuery:
         boosts: Optional[List[float]] = None,
         operator: str = "OR",
     ) -> PyFullTextQuery: ...
+    @staticmethod
+    def boolean_query(
+        queries: List[Tuple[str, PyFullTextQuery]],
+    ) -> PyFullTextQuery: ...
 
 class ScanStatistics:
     iops: int
@@ -503,3 +545,8 @@ class ScanStatistics:
 
 __version__: str
 language_model_home: Callable[[], str]
+
+class FFILanceTableProvider:
+    def __init__(
+        self, dataset: _Dataset, *, with_row_id=False, with_row_addr=False
+    ) -> None: ...

@@ -19,6 +19,9 @@ class BlobIterator:
             return None
         return io.BytesIO(value.as_py())
 
+    def __iter__(self) -> Iterator[Optional[IO[bytes]]]:
+        return self
+
 
 class BlobColumn:
     """
@@ -45,7 +48,7 @@ class BlobColumn:
 
         self.blob_column = blob_column
 
-    def __iter__(self) -> Iterator[IO[bytes]]:
+    def __iter__(self) -> Iterator[Optional[IO[bytes]]]:
         return BlobIterator(iter(self.blob_column))
 
 
@@ -98,7 +101,7 @@ class BlobFile(io.RawIOBase):
     def readall(self) -> bytes:
         return self.inner.readall()
 
-    def readinto(self, b: bytearray) -> int:
+    def readinto(self, b: bytearray) -> int:  # type: ignore
         return self.inner.read_into(b)
 
     def __repr__(self) -> str:

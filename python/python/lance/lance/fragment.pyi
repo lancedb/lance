@@ -70,7 +70,7 @@ class DeletionFile:
         ...
 
     @classmethod
-    def from_json(json: str) -> DeletionFile:
+    def from_json(cls, json: str) -> DeletionFile:
         """
         Load a deletion file from a JSON representation.
 
@@ -88,6 +88,9 @@ class DeletionFile:
     def __reduce__(self) -> tuple: ...
 
 class RowIdMeta:
+    def asdict(self) -> dict:
+        """Get a dictionary representation of the deletion file."""
+        ...
     def json(self) -> str:
         """Get a JSON representation of the row id metadata.
 
@@ -102,7 +105,7 @@ class RowIdMeta:
         ...
 
     @classmethod
-    def from_json(json: str) -> RowIdMeta:
+    def from_json(cls, json: str) -> RowIdMeta:
         """
         Load row id metadata from a JSON representation.
 

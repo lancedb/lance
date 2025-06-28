@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from typing import Any, Callable, Dict, List, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import pyarrow as pa
 from ray.data import from_items
@@ -27,7 +27,7 @@ RecordBatchTransformer = Callable[[pa.RecordBatch], pa.RecordBatch]
 def execute_fragment_operation(
     task_dispatcher: "DispatchFragmentTasks",
     value_function: Union[Dict[str, str], RecordBatchTransformer],
-    operation_parameters: Dict[str, Any] = None,
+    operation_parameters: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Execute distributed fragment operations and commit results.
@@ -40,7 +40,7 @@ def execute_fragment_operation(
     operation_parameters = operation_parameters or {}
 
     # Generate and execute distributed tasks
-    processing_tasks = task_dispatcher.get_tasks(value_function, operation_parameters)
+    processing_tasks = task_dispatcher.get_tasks(value_function, operation_parameters)  # type: ignore
     task_dataset = from_items(processing_tasks).map(lambda task: task[ITEM_KEY]())
 
     # Collect and commit results
@@ -49,7 +49,7 @@ def execute_fragment_operation(
 
 
 def add_columns(
-    dataset: lance.LanceDataset,
+    dataset: lance.LanceDataset,  # type: ignore
     column_generator: RecordBatchTransformer,
     source_columns: List[str],
 ) -> None:
