@@ -381,5 +381,23 @@ pub fn lance_supports_nulls(datatype: &DataType) -> bool {
             | DataType::List(_)
             | DataType::FixedSizeBinary(_)
             | DataType::FixedSizeList(_, _)
+            | DataType::Timestamp(_, _)
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Boolean
+            | DataType::LargeBinary
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Duration(_)
     )
 }
