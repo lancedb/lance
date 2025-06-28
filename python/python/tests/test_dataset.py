@@ -3583,3 +3583,359 @@ def test_metadata_cache_size(tmp_path):
     # With zero cache size, session should be smaller than default
     # (it won't be exactly 0 due to struct overhead)
     assert zero_cache_size < default_size
+
+
+@pytest.mark.parametrize("mode", ["create", "append", "overwrite"])
+@pytest.mark.parametrize("commit_msg", [None, "", "Test commit message"])
+def test_write_dataset_commit_messages(tmp_path, mode, commit_msg):
+    """Test commit messages for create/append/overwrite"""
+    # Common test data
+    schema = pa.schema([pa.field("a", pa.int64())])
+    data = pa.table({"a": range(10)})
+    base_path = tmp_path / f"{mode}_dataset"
+
+    # Special handling for create mode
+    if mode == "create":
+        # Test normal creation
+        dataset = lance.write_dataset(
+            data, base_path, schema=schema, commit_message=commit_msg
+        )
+        assert dataset.version == 1
+
+        # Verify commit message
+        commit_messages = dataset.list_commit_messages()
+        assert len(commit_messages) == 1
+        assert commit_messages[0] == (1, commit_msg)
+
+        # Test duplicate create attempt
+        with pytest.raises(IOError):
+            lance.write_dataset(
+                data,
+                base_path,
+                schema=schema,
+                mode="create",
+                commit_message="Should fail",
+            )
+
+    else:  # Handle append/overwrite modes
+        # Setup initial dataset
+        lance.write_dataset(
+            data, base_path, schema=schema, commit_message="Initial commit"
+        )
+        initial_version = lance.dataset(base_path).version
+
+        # Perform append/overwrite operation
+        dataset = lance.write_dataset(
+            data, base_path, schema=schema, mode=mode, commit_message=commit_msg
+        )
+
+        # Verify version increment
+        assert dataset.version == initial_version + 1
+
+        # Verify commit messages
+        commit_messages = dataset.list_commit_messages()
+        sorted_msgs = sorted(commit_messages, key=lambda x: x[0])
+
+        # Check both initial and new commit messages
+        assert sorted_msgs[0] == (1, "Initial commit")
+        assert sorted_msgs[1] == (initial_version + 1, commit_msg)
+
+
+@pytest.mark.parametrize("schema,data", input_data, ids=type)
+def test_list_commit_messages_multiple_versions(tmp_path, schema, data):
+    """
+    Test LanceDataset.list_commit_messages()
+    for a dataset with multiple versions.
+    """
+    dataset_path = tmp_path / "list_messages_test"
+
+    msg1 = "Commit for version 1"
+    lance.write_dataset(data, dataset_path, schema, commit_message=msg1)
+
+    msg2 = "Commit for version 2 (append)"
+    lance.write_dataset(data, dataset_path, schema, mode="append", commit_message=msg2)
+
+    msg3 = "Commit for version 3 (overwrite)"
+    dataset = lance.write_dataset(
+        data, dataset_path, schema, mode="overwrite", commit_message=msg3
+    )
+
+    assert dataset.version == 3
+    commit_messages = dataset.list_commit_messages()
+
+    # Assuming messages are returned in (version, message) tuples, ordered by version
+    # or need sorting. The API doc from report: List[Tuple[int, Optional[str]]]
+    # Let's sort to be sure for assertion
+    sorted_messages = sorted(commit_messages, key=lambda x: x[0])
+
+    assert len(sorted_messages) == 3
+    assert sorted_messages[0] == (1, msg1)
+    assert sorted_messages[1] == (2, msg2)
+    assert sorted_messages[2] == (3, msg3)
+
+    # Test with some versions having no messages
+    dataset_path_mixed = tmp_path / "list_messages_mixed"
+    lance.write_dataset(data, dataset_path_mixed, schema, commit_message="V1")
+    lance.write_dataset(
+        data, dataset_path_mixed, schema, mode="append"
+    )  # V2 no message
+    ds_mixed = lance.write_dataset(
+        data, dataset_path_mixed, schema, mode="append", commit_message="V3"
+    )
+
+    mixed_messages = ds_mixed.list_commit_messages()
+    sorted_mixed_messages = sorted(mixed_messages, key=lambda x: x[0])
+
+    assert len(sorted_mixed_messages) == 3
+    assert sorted_mixed_messages[0] == (1, "V1")
+    assert sorted_mixed_messages[1] == (2, None)
+    assert sorted_mixed_messages[2] == (3, "V3")
+
+
+@pytest.mark.parametrize("schema,data", input_data, ids=type)
+def test_dataset_commit_message_set_and_update(tmp_path, schema, data):
+    """
+    Test LanceDataset.commit_message().
+    """
+    dataset_path = tmp_path / "set_update_message_test"
+
+    # Initial write, no commit message
+    dataset = lance.write_dataset(data, dataset_path, schema)
+    assert dataset.version == 1
+    assert dataset.list_commit_messages()[0] == (1, None)
+
+    # Set commit message for version 1
+    msg_v1_set = "Message set for version 1"
+    dataset.commit_message(msg_v1_set, 1)
+    assert dataset.list_commit_messages()[0] == (1, msg_v1_set)
+
+    # Append data to create version 2
+    lance.write_dataset(
+        data, dataset_path, schema, mode="append", commit_message="Original V2 msg"
+    )
+    dataset = lance.dataset(dataset_path)  # Re-open to get latest state
+    assert dataset.version == 2
+
+    # Update commit message for version 1
+    msg_v1_updated = "Message for version 1 updated"
+    dataset.commit_message(msg_v1_updated, 1)
+
+    # Update commit message for version 2
+    msg_v2_updated = "Message for version 2 updated"
+    dataset.commit_message(msg_v2_updated, 2)
+
+    commit_messages = sorted(dataset.list_commit_messages(), key=lambda x: x[0])
+    assert len(commit_messages) == 2
+    assert commit_messages[0] == (1, msg_v1_updated)
+    assert commit_messages[1] == (2, msg_v2_updated)
+
+    # Test setting message for a non-existent version (e.g., version 99)
+    # Behavior depends on Rust implementation (error or silent fail).
+    # Assuming it should raise an error for a non-existent version.
+    with pytest.raises(Exception):  # Replace with specific LanceDB/Arrow error if known
+        dataset.commit_message("Message for non-existent version", 99)
+
+
+@pytest.mark.parametrize("schema,data", input_data, ids=type)
+def test_dataset_delete_message(tmp_path, schema, data):
+    """
+    Test LanceDataset.delete_message()
+    for deleting commit messages.
+    """
+    dataset_path = tmp_path / "delete_message_test"
+
+    msg1 = "Message for V1"
+    msg2 = "Message for V2"
+
+    lance.write_dataset(data, dataset_path, schema, commit_message=msg1)
+    dataset = lance.write_dataset(
+        data, dataset_path, schema, mode="append", commit_message=msg2
+    )
+
+    assert dataset.version == 2
+    messages_before_delete = sorted(dataset.list_commit_messages(), key=lambda x: x[0])
+    assert messages_before_delete[0] == (1, msg1)
+    assert messages_before_delete[1] == (2, msg2)
+
+    # Delete message for version 1
+    dataset.delete_message(1)
+    messages_after_delete_v1 = sorted(
+        dataset.list_commit_messages(), key=lambda x: x[0]
+    )
+    assert len(messages_after_delete_v1) == 2  # Version still exists
+    assert messages_after_delete_v1[0] == (1, None)  # Message is None
+    assert messages_after_delete_v1[1] == (2, msg2)
+
+    # Delete message for version 2
+    dataset.delete_message(2)
+    messages_after_delete_v2 = sorted(
+        dataset.list_commit_messages(), key=lambda x: x[0]
+    )
+    assert messages_after_delete_v2[0] == (1, None)
+    assert messages_after_delete_v2[1] == (2, None)
+
+    # Attempt to delete message for a version that now has no message
+    # This should not error, just do nothing.
+    try:
+        dataset.delete_message(1)
+    except Exception as e:
+        pytest.fail(f"Deleting an already None message raised an error: {e}")
+
+    messages_after_re_delete = sorted(
+        dataset.list_commit_messages(), key=lambda x: x[0]
+    )
+    assert messages_after_re_delete[0] == (1, None)
+    assert messages_after_re_delete[1] == (2, None)
+
+    # Attempt to delete message for a non-existent version
+    # Assuming this should raise an error.
+    with pytest.raises(Exception):  # Replace with specific LanceDB/Arrow error if known
+        dataset.delete_message(99)
+
+    #  delete (non-existent) message
+    dataset = lance.write_dataset(
+        data, dataset_path, schema, mode="append"
+    )  # Version 3, no message
+    assert dataset.version == 3
+    messages_before_delete_v3 = sorted(
+        dataset.list_commit_messages(), key=lambda x: x[0]
+    )
+    assert messages_before_delete_v3[2] == (3, None)
+
+    try:
+        dataset.delete_message(3)  # Delete message for V3 (which is None)
+    except Exception as e:
+        pytest.fail(f"Deleting a message that was initially None raised an error: {e}")
+
+    messages_after_delete_v3_none = sorted(
+        dataset.list_commit_messages(), key=lambda x: x[0]
+    )
+    assert messages_after_delete_v3_none[2] == (3, None)
+
+
+@pytest.mark.parametrize("schema,data", input_data, ids=type)
+def test_commit_and_delete_message_latest_version(tmp_path, schema, data):
+    """
+    Test LanceDataset.commit_message()
+    for setting and updating messages for specific versions.
+    """
+    dataset_path = tmp_path / "set_update_message_test"
+
+    # Initial write, no commit message
+    dataset = lance.write_dataset(data, dataset_path, schema)
+    assert dataset.version == 1
+    assert dataset.list_commit_messages()[0] == (1, None)
+
+    # Set commit message for version 1
+    msg_v1_set = "Message set for version 1"
+    dataset.commit_message(msg_v1_set)
+    assert dataset.list_commit_messages()[0] == (1, msg_v1_set)
+
+    # Test commit_message without version on the new latest version
+    msg_v1_update = "override commit message for latest"
+    dataset.commit_message(msg_v1_update)
+    versions = dataset.versions()
+    assert len(versions) == 1
+    assert dataset.list_commit_messages()[0] == (1, msg_v1_update)
+
+    # Test delete_message without version (should apply to latest)
+    dataset.delete_message()
+    versions = dataset.versions()
+    assert len(versions) == 1
+    assert dataset.list_commit_messages()[0] == (1, None)
+
+
+def test_add_columns_then_set_commit_message(tmp_path: Path):
+    """Test commit messages after adding columns."""
+    # Initial dataset
+    table = pa.table({"a": range(10)})
+    dataset = lance.write_dataset(table, tmp_path, commit_message="Initial commit")
+    assert dataset.version == 1
+    assert dataset.list_commit_messages()[0] == (1, "Initial commit")
+
+    # Add columns without commit message parameter
+    dataset.add_columns({"b": "a + 1"})
+    assert dataset.version == 2
+
+    # Set commit message after operation
+    dataset.commit_message("Added column b", version=2)
+
+    # Verify message
+    commit_messages = dataset.list_commit_messages()
+    sorted_messages = sorted(commit_messages, key=lambda x: x[0])
+    assert sorted_messages[1] == (2, "Added column b")
+
+    # Add another column without message
+    dataset.add_columns({"c": "a + 2"})
+    assert dataset.version == 3
+
+    # Verify no message set for this version
+    commit_messages = dataset.list_commit_messages()
+    sorted_messages = sorted(commit_messages, key=lambda x: x[0])
+    assert sorted_messages[2] == (3, None)
+
+
+def test_merge_insert_then_set_commit_message(tmp_path: Path):
+    """Test commit messages after merge_insert."""
+    # Initial dataset
+    nrows = 100
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64()),
+            pa.field("b", pa.int64()),
+            pa.field("c", pa.int64()),
+        ],
+        metadata={"foo": "bar"},
+    )
+
+    table = pa.Table.from_pydict(
+        {
+            "a": range(nrows),
+            "b": [1 for _ in range(nrows)],
+            "c": [x % 2 for x in range(nrows)],
+        },
+        schema=schema,
+    )
+
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "dataset",
+        mode="create",
+        max_rows_per_file=100,
+        commit_message="Initial dataset",
+    )
+
+    # Merge-insert without commit message parameter
+    new_table = pa.Table.from_pydict(
+        {
+            "a": range(300, 300 + nrows),
+            "b": [2 for _ in range(nrows)],
+            "c": [0 for _ in range(nrows)],
+        },
+        schema=schema,
+    )
+
+    (dataset.merge_insert("a").when_not_matched_insert_all().execute(new_table))
+
+    dataset = lance.dataset(tmp_path / "dataset")
+    assert dataset.version == 2
+
+    # Set commit message after operation
+    dataset.commit_message("First merge_insert", version=2)
+
+    # Verify message
+    commit_messages = dataset.list_commit_messages()
+    sorted_messages = sorted(commit_messages, key=lambda x: x[0])
+    assert sorted_messages[0] == (1, "Initial dataset")
+    assert sorted_messages[1] == (2, "First merge_insert")
+
+    # Another merge_insert without message
+    (dataset.merge_insert("a").when_matched_update_all().execute(new_table))
+
+    dataset = lance.dataset(tmp_path / "dataset")
+    assert dataset.version == 3
+
+    # Verify no message set for this version
+    commit_messages = dataset.list_commit_messages()
+    sorted_messages = sorted(commit_messages, key=lambda x: x[0])
+    assert sorted_messages[2] == (3, None)

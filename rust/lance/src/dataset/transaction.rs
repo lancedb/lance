@@ -74,6 +74,7 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
 
+pub const COMMIT_MESSAGE_KEY: &str = "commit_message";
 /// A change to a dataset that can be retried
 ///
 /// This contains enough information to be able to build the next manifest,
@@ -1360,6 +1361,9 @@ impl Transaction {
                 Arc::new(final_fragments),
                 new_blob_version,
             );
+
+            // commit message does not inherit from previous version, so reset commit_message to None first
+            prev_manifest.delete_config_keys(&[COMMIT_MESSAGE_KEY]);
             if user_requested_version.is_some()
                 && matches!(self.operation, Operation::Overwrite { .. })
             {
@@ -1380,6 +1384,10 @@ impl Transaction {
                 new_blob_version,
             )
         };
+
+        if let Some(commit_msg) = &config.commit_message {
+            manifest.update_config(vec![(COMMIT_MESSAGE_KEY.to_string(), commit_msg.clone())]);
+        }
 
         manifest.tag.clone_from(&self.tag);
 

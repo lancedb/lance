@@ -42,6 +42,7 @@ pub struct CommitBuilder<'a> {
     detached: bool,
     commit_config: CommitConfig,
     affected_rows: Option<RowIdTreeMap>,
+    commit_message: Option<String>,
 }
 
 impl<'a> CommitBuilder<'a> {
@@ -58,6 +59,7 @@ impl<'a> CommitBuilder<'a> {
             detached: false,
             commit_config: Default::default(),
             affected_rows: None,
+            commit_message: Default::default(),
         }
     }
 
@@ -155,6 +157,12 @@ impl<'a> CommitBuilder<'a> {
     /// used to perform fast conflict resolution.
     pub fn with_affected_rows(mut self, affected_rows: RowIdTreeMap) -> Self {
         self.affected_rows = Some(affected_rows);
+        self
+    }
+
+    /// Set the commit message if provided when in write_dataset
+    pub fn with_commit_message(mut self, commit_message: Option<String>) -> Self {
+        self.commit_message = commit_message;
         self
     }
 
@@ -271,6 +279,7 @@ impl<'a> CommitBuilder<'a> {
         let manifest_config = ManifestWriteConfig {
             use_move_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
+            commit_message: self.commit_message.clone(),
             ..Default::default()
         };
 

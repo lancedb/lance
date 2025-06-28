@@ -338,6 +338,51 @@ class LanceDataset(pa.dataset.Dataset):
     def list_indices(self) -> List[Index]:
         return self._ds.load_indices()
 
+    def list_commit_messages(self) -> List[Tuple[int, Optional[str]]]:
+        """List all commit messages associated with dataset versions.
+        Returns a list of tuples, each containing a version number and its
+        associated commit message (if any). If a version doesn't have a
+        commit message, the message will be None.
+
+        Returns
+        -------
+        List[Tuple[int, Optional[str]]]
+            A list of tuples where each tuple contains:
+            - Version number (int)
+            - Commit message (str or None)
+        """
+        return self._ds.list_commit_messages()
+
+    def commit_message(self, message: str, version: Optional[int] = None):
+        """Set a commit message for a given dataset version.
+
+        If the version does not exist or if no version is provided,
+        the commit message will be set for the latest version of the dataset.
+
+        Parameters
+        ----------
+        message : str
+            The commit message.
+        version : Optional[int], default None
+            The dataset version to set the commit message for.
+            If None, the message is set for the latest version.
+        """
+        target_version = version if version is not None else self.latest_version
+        self._ds.commit_message(message, target_version)
+
+    def delete_message(self, version: Optional[int] = None):
+        """delete version message, if the version does not exist,
+        the commit message will be set for the latest version of the dataset.
+
+        Parameters
+        ----------
+        version : Optional[int], default None
+            The dataset version to set the commit message for.
+            If None, the message is set for the latest version.
+        """
+        target_version = version if version is not None else self.latest_version
+        self._ds.delete_message(target_version)
+
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
             "LanceDataset.index_statistics() is deprecated, "
@@ -4063,6 +4108,7 @@ def write_dataset(
     enable_v2_manifest_paths: bool = False,
     enable_move_stable_row_ids: bool = False,
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
+    commit_message: Optional[str] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -4132,6 +4178,9 @@ def write_dataset(
         then no autocleaning will be performed.
         Note: this option only takes effect when creating a new dataset,
         it has no effect on existing datasets.
+    commit_message: str, optional
+        A message to associate with this commit. This message will be stored in the
+        dataset's metadata and can be retrieved using list_commit_messages().
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -4167,6 +4216,7 @@ def write_dataset(
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
         "enable_move_stable_row_ids": enable_move_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
+        "commit_message": commit_message,
     }
 
     if commit_lock:
