@@ -3116,7 +3116,7 @@ mod tests {
         .unwrap();
 
         let stream = RecordBatchIterator::new(vec![Ok(to_merge)], schema.clone());
-        dataset.merge(stream, "i", "i").await.unwrap();
+        dataset.merge(stream, "i", "i", None, None).await.unwrap();
         dataset.validate().await.unwrap();
 
         // Validate the resulting data

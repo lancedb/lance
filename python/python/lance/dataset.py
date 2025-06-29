@@ -1108,6 +1108,8 @@ class LanceDataset(pa.dataset.Dataset):
         left_on: str,
         right_on: Optional[str] = None,
         schema=None,
+        fragment_ids: Optional[List[int]] = None,
+        commit: Optional[bool] = True,
     ):
         """
         Merge another dataset into this one.
@@ -1128,6 +1130,12 @@ class LanceDataset(pa.dataset.Dataset):
         right_on: str or None
             The name of the column in data_obj to join on. If None, defaults to
             left_on.
+        left_fragment_ids: List[int] or None
+            The fragment IDs to read from data_obj. If None, defaults to all
+            fragments. It is mainly used in distributed scenarios to specify
+            which fragments to read.
+        commit: bool
+            Whether to directly commit the dataset after merging
 
         Examples
         --------
@@ -1142,7 +1150,7 @@ class LanceDataset(pa.dataset.Dataset):
         1  2  b
         2  3  c
         >>> new_df = pa.table({'x': [1, 2, 3], 'z': ['d', 'e', 'f']})
-        >>> dataset.merge(new_df, 'x')
+        >>> _ = dataset.merge(new_df, 'x')
         >>> dataset.to_table().to_pandas()
            x  y  z
         0  1  a  d
@@ -1159,7 +1167,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         reader = _coerce_reader(data_obj, schema)
 
-        self._ds.merge(reader, left_on, right_on)
+        return self._ds.merge(reader, left_on, right_on, fragment_ids, commit)
 
     def add_columns(
         self,

@@ -1450,7 +1450,7 @@ mod tests {
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
 
-        dataset.merge(reader, "a", "a").await.unwrap();
+        dataset.merge(reader, "a", "a", None, None).await.unwrap();
 
         let expected_remap = expect_remap(
             &[vec![
