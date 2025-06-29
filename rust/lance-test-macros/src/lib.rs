@@ -29,7 +29,7 @@ fn expand_tracing_init() -> Tokens {
             _ => panic!("Unexpected trace level {}", trace_level),
           };
 
-          let (chrome_layer, _guard) = tracing_chrome::ChromeLayerBuilder::new().trace_style(tracing_chrome::TraceStyle::Async).build();
+          let (chrome_layer, _guard) = tracing_chrome::ChromeLayerBuilder::new().trace_style(tracing_chrome::TraceStyle::Async).include_args(true).build();
           let subscriber = ::tracing_subscriber::registry::Registry::default();
           let chrome_layer = ::tracing_subscriber::Layer::with_filter(chrome_layer, level_filter);
           let subscriber = tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt::with(
