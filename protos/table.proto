@@ -106,7 +106,7 @@ message Manifest {
   // have been used in previous versions.
   // 
   // For a single file, will be zero.
-  uint32 max_fragment_id = 11;
+  optional uint32 max_fragment_id = 11;
 
   // Path to the transaction file, relative to `{root}/_transactions`
   //
