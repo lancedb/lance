@@ -17,9 +17,10 @@ use tracing::instrument;
 use lance_arrow::RecordBatchExt;
 use lance_core::Result;
 use lance_linalg::distance::DistanceType;
-use lance_linalg::kmeans::compute_partitions_arrow_array;
 
+use crate::vector::kmeans::compute_partitions_arrow_array;
 use crate::vector::transform::Transformer;
+use crate::vector::utils::SimpleIndex;
 use crate::vector::LOSS_METADATA_KEY;
 
 use super::PART_ID_COLUMN;
@@ -39,6 +40,7 @@ pub struct PartitionTransformer {
     distance_type: DistanceType,
     input_column: String,
     output_column: String,
+    index: Option<SimpleIndex>,
 }
 
 impl PartitionTransformer {
@@ -47,11 +49,19 @@ impl PartitionTransformer {
         distance_type: DistanceType,
         input_column: impl AsRef<str>,
     ) -> Self {
+        let index = SimpleIndex::may_train_index(
+            centroids.values().clone(),
+            centroids.value_length() as usize,
+            distance_type,
+        )
+        .unwrap();
+
         Self {
             centroids,
             distance_type,
             input_column: input_column.as_ref().to_owned(),
             output_column: PART_ID_COLUMN.to_owned(),
+            index,
         }
     }
 }
@@ -85,8 +95,24 @@ impl Transformer for PartitionTransformer {
                 location: location!(),
             })?;
 
-        let (part_ids, loss) =
-            compute_partitions_arrow_array(&self.centroids, fsl, self.distance_type)?;
+        let (part_ids, loss) = match &self.index {
+            Some(index) => {
+                let parts_and_dists = fsl.iter().map(|vec| vec.map(|v| index.search(v).unwrap()));
+
+                let mut part_ids = Vec::with_capacity(fsl.len());
+                let mut loss = 0.0;
+                parts_and_dists.for_each(|pair| {
+                    if let Some((part_id, dist)) = pair {
+                        part_ids.push(Some(part_id));
+                        loss += dist as f64;
+                    } else {
+                        part_ids.push(None);
+                    }
+                });
+                (part_ids, loss)
+            }
+            None => compute_partitions_arrow_array(&self.centroids, fsl, self.distance_type)?,
+        };
         let part_ids = UInt32Array::from(part_ids);
         let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true);
         Ok(batch
