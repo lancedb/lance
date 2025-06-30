@@ -1621,10 +1621,13 @@ impl Dataset {
 
     async fn merge_impl(
         &mut self,
+        fragment_ids: Vec<usize>,
         stream: Box<dyn RecordBatchReader + Send>,
         left_on: &str,
         right_on: &str,
-    ) -> Result<()> {
+        commit: Option<bool>,
+    ) -> Result<(Vec<Fragment>, Schema)> {
+        let commit = commit.unwrap_or(true);
         // Sanity check.
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
             return Err(Error::invalid_input(
@@ -1668,19 +1671,28 @@ impl Dataset {
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
-        let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
-            .then(|f| {
-                let joiner = joiner.clone();
-                async move { f.merge(left_on, &joiner).await.map(|f| f.metadata) }
-            })
-            .try_collect::<Vec<_>>()
+        // Process all fragments using default parallel strategy
+        let updated_fragments = self
+            .process_fragments(fragment_ids, left_on, joiner)
             .await?;
+        if commit {
+            self.commit_merge_operation(&updated_fragments, &new_schema)
+                .await?;
+        }
+        Ok((updated_fragments, new_schema))
+    }
 
+    /// Merge this dataset with another arrow-based dataset.
+    pub async fn commit_merge_operation(
+        &mut self,
+        updated_fragments: &[Fragment],
+        new_schema: &Schema,
+    ) -> Result<()> {
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::Merge {
-                fragments: updated_fragments,
-                schema: new_schema,
+                fragments: updated_fragments.to_vec(),
+                schema: new_schema.clone(),
             },
             // It is not possible to add blob columns using merge
             /*blobs_op=*/
@@ -1694,6 +1706,32 @@ impl Dataset {
         Ok(())
     }
 
+    /// Fragment-level processing interface for distributed execution
+    /// Enables external frameworks like Ray to parallelize fragment processing
+    async fn process_fragments(
+        &self,
+        fragment_ids: Vec<usize>,
+        left_on: &str,
+        joiner: Arc<HashJoiner>,
+    ) -> Result<Vec<Fragment>> {
+        let fragments = stream::iter(fragment_ids)
+            .map(|fragment_id| async move {
+                self.get_fragment(fragment_id).ok_or_else(|| {
+                    Error::invalid_input(format!("Fragment {} not found", fragment_id), location!())
+                })
+            })
+            .buffered(2)
+            .and_then(|fragment| {
+                let joiner = joiner.clone();
+                let left_on = left_on.to_string();
+                async move { fragment.merge(&left_on, &joiner).await.map(|f| f.metadata) }
+            })
+            .try_collect()
+            .await?;
+
+        Ok(fragments)
+    }
+
     /// Merge this dataset with another arrow Table / Dataset, and returns a new version of dataset.
     ///
     /// Parameters:
@@ -1701,6 +1739,9 @@ impl Dataset {
     /// - `stream`: the stream of [`RecordBatch`] to merge.
     /// - `left_on`: the column name to join on the left side (self).
     /// - `right_on`: the column name to join on the right side (stream).
+    /// - `fragment_ids`: Optional specific fragment IDs to merge.
+    ///   If empty, all fragments will be merged.
+    /// - `commit`: Optional flag to commit the merge operation.
     ///
     /// Returns: a new version of dataset.
     ///
@@ -1710,9 +1751,26 @@ impl Dataset {
         stream: impl RecordBatchReader + Send + 'static,
         left_on: &str,
         right_on: &str,
-    ) -> Result<()> {
+        fragment_ids: Option<Vec<usize>>,
+        commit: Option<bool>,
+    ) -> Result<(Vec<Fragment>, Schema)> {
+        let had_custom_ids = fragment_ids.is_some();
+
+        let effective_ids =
+            fragment_ids.unwrap_or_else(|| self.get_fragments().iter().map(|f| f.id()).collect());
+
+        if effective_ids.is_empty() {
+            let msg = if had_custom_ids {
+                "Specified fragment_ids is empty"
+            } else {
+                "No fragments found in dataset"
+            };
+            return Err(Error::invalid_input(msg, location!()));
+        }
+
         let stream = Box::new(stream);
-        self.merge_impl(stream, left_on, right_on).await
+        self.merge_impl(effective_ids, stream, left_on, right_on, commit)
+            .await
     }
 
     async fn update_op(&mut self, op: Operation) -> Result<()> {
@@ -3431,7 +3489,7 @@ mod tests {
         let batches =
             RecordBatchIterator::new(vec![right_batch1].into_iter().map(Ok), right_schema.clone());
         let mut dataset = Dataset::open(test_uri).await.unwrap();
-        dataset.merge(batches, "i", "i2").await.unwrap();
+        dataset.merge(batches, "i", "i2", None, None).await.unwrap();
         dataset.validate().await.unwrap();
 
         assert_eq!(dataset.version().version, 3);
@@ -3526,7 +3584,10 @@ mod tests {
             .col("new_value", array::fill_utf8("new_value".to_string()))
             .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
 
-        dataset.merge(new_data, "key", "key2").await.unwrap();
+        dataset
+            .merge(new_data, "key", "key2", None, None)
+            .await
+            .unwrap();
         dataset.validate().await.unwrap();
     }
 
@@ -3578,7 +3639,10 @@ mod tests {
         let indices = arrow_array::UInt32Array::from_iter_values(indices);
         let new_batch = arrow::compute::take_record_batch(&new_batch, &indices).unwrap();
         let new_data = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema.clone());
-        dataset.merge(new_data, ROW_ID, "rowid").await.unwrap();
+        dataset
+            .merge(new_data, ROW_ID, "rowid", None, None)
+            .await
+            .unwrap();
         dataset.validate().await.unwrap();
         assert_eq!(dataset.schema().fields.len(), 3);
         assert!(dataset.schema().field("key").is_some());
@@ -3647,7 +3711,10 @@ mod tests {
         let indices = arrow_array::UInt32Array::from_iter_values(indices);
         let new_batch = arrow::compute::take_record_batch(&new_batch, &indices).unwrap();
         let new_data = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema.clone());
-        dataset.merge(new_data, ROW_ADDR, "rowaddr").await.unwrap();
+        dataset
+            .merge(new_data, ROW_ADDR, "rowaddr", None, None)
+            .await
+            .unwrap();
         dataset.validate().await.unwrap();
         assert_eq!(dataset.schema().fields.len(), 3);
         assert!(dataset.schema().field("key").is_some());

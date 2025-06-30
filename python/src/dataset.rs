@@ -1061,23 +1061,38 @@ impl Dataset {
         Ok(())
     }
 
+    #[pyo3(signature = (reader, left_on, right_on, fragment_ids = None, commit = None))]
     fn merge(
         &mut self,
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
-    ) -> PyResult<()> {
-        let mut new_self = self.ds.as_ref().clone();
-        let new_self = RT
+        fragment_ids: Option<Vec<usize>>,
+        commit: Option<bool>,
+    ) -> PyResult<(Vec<PyLance<Fragment>>, LanceSchema)> {
+        let mut temp_ds = self.ds.as_ref().clone();
+        let raw_fragment_ids = fragment_ids.clone();
+
+        let (updated_fragments, schema, modified_ds) = RT
             .spawn(None, async move {
-                new_self
-                    .merge(reader.0, &left_on, &right_on)
+                let result = temp_ds
+                    .merge(reader.0, &left_on, &right_on, fragment_ids, commit)
                     .await
-                    .map(|_| new_self)
+                    .map_err(|e| {
+                        let msg = format!(
+                            "Merge failed on fragments {:?}. Details: {}",
+                            raw_fragment_ids, e
+                        );
+                        PyIOError::new_err(msg)
+                    })?;
+                Ok::<_, PyErr>((result.0, result.1, temp_ds))
             })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        self.ds = Arc::new(new_self);
-        Ok(())
+        self.ds = Arc::new(modified_ds);
+
+        let py_fragments = updated_fragments.into_iter().map(PyLance).collect();
+
+        Ok((py_fragments, LanceSchema(schema)))
     }
 
     fn delete(&mut self, predicate: String) -> PyResult<()> {
