@@ -2514,9 +2514,9 @@ mod tests {
         assert_eq!(
             *gen.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::BinaryArray::from_iter_values([
-                vec![56, 122, 157, 34],
-                vec![58, 51],
-                vec![41, 184, 125]
+                vec![211, 239],
+                vec![126, 73, 74, 131],
+                vec![145, 222]
             ])
         );
     }
