@@ -13,18 +13,21 @@ use futures::{
     Stream,
 };
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::datatypes::Schema;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::ROW_ID;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::v2::writer::FileWriter;
+use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
 };
+use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::utils::is_finite;
-use lance_index::vector::v3::shuffler::IvfShufflerReader;
+use lance_index::vector::v3::shuffler::{EmptyReader, IvfShufflerReader};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{ivf::storage::IvfModel, PART_ID_FIELD};
 use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN};
@@ -93,6 +96,8 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
 
     // fields for merging indices / remapping
     existing_indices: Vec<Arc<dyn VectorIndex>>,
+
+    fri: Option<Arc<FragReuseIndex>>,
 }
 
 type BuildStream<S, Q> =
@@ -109,6 +114,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         ivf_params: Option<IvfBuildParams>,
         quantizer_params: Option<Q::BuildParams>,
         sub_index_params: S::BuildParams,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let temp_dir = tempdir()?;
         let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
@@ -130,6 +136,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             quantizer: None,
             shuffle_reader: None,
             existing_indices: Vec::new(),
+            fri,
         })
     }
 
@@ -140,6 +147,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         distance_type: DistanceType,
         shuffler: Box<dyn Shuffler>,
         sub_index_params: S::BuildParams,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         Self::new(
             dataset,
@@ -150,6 +158,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             None,
             None,
             sub_index_params,
+            fri,
         )
     }
 
@@ -187,6 +196,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             quantizer: Some(ivf_index.quantizer().try_into()?),
             shuffle_reader: None,
             existing_indices: vec![index],
+            fri: None,
         })
     }
 
@@ -442,6 +452,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         data: Option<impl RecordBatchStream + Unpin + 'static>,
     ) -> Result<&mut Self> {
         if data.is_none() {
+            // If we don't specify the shuffle reader, it's going to re-read the
+            // dataset and duplicate the data.
+            self.shuffle_reader = Some(Arc::new(EmptyReader));
+
             return Ok(self);
         }
         let data = data.unwrap();
@@ -572,6 +586,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let existing_indices = Arc::new(self.existing_indices.clone());
         let distance_type = self.distance_type;
         let column = self.column.clone();
+        let fri = self.fri.clone();
         let build_iter = (0..ivf.num_partitions()).map(move |partition| {
             let reader = reader.clone();
             let existing_indices = existing_indices.clone();
@@ -579,6 +594,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let quantizer = quantizer.clone();
             let sub_index_params = sub_index_params.clone();
             let column = column.clone();
+            let fri = fri.clone();
             async move {
                 let (batches, loss) = Self::take_partition_batches(
                     partition,
@@ -592,8 +608,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     return Ok(None);
                 }
 
-                let (storage, sub_index) =
-                    Self::build_index(distance_type, quantizer, sub_index_params, batches, column)?;
+                let (storage, sub_index) = Self::build_index(
+                    distance_type,
+                    quantizer,
+                    sub_index_params,
+                    batches,
+                    column,
+                    fri,
+                )?;
                 Ok(Some((storage, sub_index, loss)))
             }
         });
@@ -610,8 +632,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         sub_index_params: S::BuildParams,
         batches: Vec<RecordBatch>,
         column: String,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<(Q::Storage, S)> {
-        let storage = StorageBuilder::new(column, distance_type, quantizer)?.build(batches)?;
+        let storage = StorageBuilder::new(column, distance_type, quantizer, fri)?.build(batches)?;
         let sub_index = S::index_vectors(&storage, sub_index_params)?;
 
         Ok((storage, sub_index))
@@ -690,7 +713,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
         let index_path = self.index_dir.child(INDEX_FILE_NAME);
-        let mut storage_writer = None;
+
+        let storage_schema: Schema =
+            (&arrow_schema::Schema::new(vec![ROW_ID_FIELD.clone(), quantizer.field()]))
+                .try_into()?;
+        let mut storage_writer = FileWriter::try_new(
+            self.store.create(&storage_path).await?,
+            storage_schema.clone(),
+            Default::default(),
+        )?;
         let mut index_writer = FileWriter::try_new(
             self.store.create(&index_path).await?,
             S::schema().as_ref().try_into()?,
@@ -719,14 +750,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             } else {
                 let batches = storage.to_batches()?.collect::<Vec<_>>();
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
-                if storage_writer.is_none() {
-                    storage_writer = Some(FileWriter::try_new(
-                        self.store.create(&storage_path).await?,
-                        batch.schema_ref().as_ref().try_into()?,
-                        Default::default(),
-                    )?);
-                }
-                storage_writer.as_mut().unwrap().write_batch(&batch).await?;
+                storage_writer.write_batch(&batch).await?;
                 storage_ivf.add_partition(batch.num_rows() as u32);
             }
 
@@ -761,7 +785,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         }
 
-        let mut storage_writer = storage_writer.unwrap();
         let storage_ivf_pb = pb::Ivf::try_from(&storage_ivf)?;
         storage_writer.add_schema_metadata(DISTANCE_TYPE_KEY, self.distance_type.to_string());
         let ivf_buffer_pos = storage_writer
@@ -770,13 +793,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
         // For now, each partition's metadata is just the quantizer,
         // it's all the same for now, so we just take the first one
-        let storage_partition_metadata = vec![quantizer
-            .metadata(Some(QuantizationMetadata {
-                codebook_position: Some(0),
-                codebook: None,
-                transposed: true,
-            }))?
-            .to_string()];
+        let mut metadata = quantizer.metadata(Some(QuantizationMetadata {
+            codebook_position: Some(0),
+            codebook: None,
+            transposed: true,
+        }));
+        if let Some(extra_metadata) = metadata.extra_metadata()? {
+            let idx = storage_writer.add_global_buffer(extra_metadata).await?;
+            metadata.set_buffer_index(idx);
+        }
+        let metadata = serde_json::to_string(&metadata)?;
+        let storage_partition_metadata = vec![metadata];
         storage_writer.add_schema_metadata(
             STORAGE_METADATA_KEY,
             serde_json::to_string(&storage_partition_metadata)?,

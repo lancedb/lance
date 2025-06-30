@@ -6,6 +6,12 @@
 
 use std::sync::Arc;
 
+use crate::index::DatasetIndexInternalExt;
+use crate::session::Session;
+use crate::{
+    dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
+    Dataset,
+};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -14,30 +20,31 @@ use futures::TryStreamExt;
 use lance_core::datatypes::Field;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
-use lance_index::scalar::ngram::{train_ngram_index, NGramIndex};
-use lance_index::scalar::{
-    bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
-    btree::{train_btree_index, BTreeIndex, TrainingSource},
-    flat::FlatIndexMetadata,
-    inverted::{train_inverted_index, InvertedIndex, INVERT_LIST_FILE},
-    label_list::{train_label_list_index, LabelListIndex},
-    lance_format::LanceIndexStore,
-    ScalarIndex, ScalarIndexParams, ScalarIndexType,
-};
+use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::{
     btree::DEFAULT_BTREE_BATCH_SIZE, inverted::tokenizer::InvertedIndexParams,
 };
+use lance_index::scalar::{
+    inverted::METADATA_FILE,
+    ngram::{train_ngram_index, NGramIndex},
+};
 use lance_index::ScalarIndexCriteria;
+use lance_index::{
+    scalar::{
+        bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
+        btree::{train_btree_index, BTreeIndex, TrainingSource},
+        flat::FlatIndexMetadata,
+        inverted::{train_inverted_index, InvertedIndex, INVERT_LIST_FILE},
+        label_list::{train_label_list_index, LabelListIndex},
+        lance_format::LanceIndexStore,
+        ScalarIndex, ScalarIndexParams, ScalarIndexType,
+    },
+    IndexType,
+};
 use lance_table::format::Index;
 use log::info;
 use snafu::location;
 use tracing::instrument;
-
-use crate::session::Session;
-use crate::{
-    dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
-    Dataset,
-};
 
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
 const TRAINING_UPDATE_FREQ: usize = 1000000;
@@ -232,6 +239,18 @@ fn get_scalar_index_details(
     }
 }
 
+fn get_vector_index_details(
+    details: &prost_types::Any,
+) -> Result<Option<lance_table::format::pb::VectorIndexDetails>> {
+    if details.type_url.ends_with("VectorIndexDetails") {
+        Ok(Some(
+            details.to_msg::<lance_table::format::pb::VectorIndexDetails>()?,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Build a Scalar Index (returns details to store in the manifest)
 #[instrument(level = "debug", skip_all)]
 pub(super) async fn build_scalar_index(
@@ -340,29 +359,31 @@ pub async fn open_scalar_index(
     dataset: &Dataset,
     column: &str,
     index: &Index,
+    metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let uuid_str = index.uuid.to_string();
     let index_store = Arc::new(LanceIndexStore::from_dataset(dataset, &uuid_str));
     let index_type = detect_scalar_index_type(dataset, index, column, &dataset.session).await?;
+    let fri = dataset.open_frag_reuse_index(metrics).await?;
     match index_type {
         ScalarIndexType::Bitmap => {
-            let bitmap_index = BitmapIndex::load(index_store).await?;
+            let bitmap_index = BitmapIndex::load(index_store, fri).await?;
             Ok(bitmap_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::LabelList => {
-            let tag_index = LabelListIndex::load(index_store).await?;
+            let tag_index = LabelListIndex::load(index_store, fri).await?;
             Ok(tag_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::Inverted => {
-            let inverted_index = InvertedIndex::load(index_store).await?;
+            let inverted_index = InvertedIndex::load(index_store, fri).await?;
             Ok(inverted_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::NGram => {
-            let ngram_index = NGramIndex::load(index_store).await?;
+            let ngram_index = NGramIndex::load(index_store, fri).await?;
             Ok(ngram_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::BTree => {
-            let btree_index = BTreeIndex::load(index_store).await?;
+            let btree_index = BTreeIndex::load(index_store, fri).await?;
             Ok(btree_index as Arc<dyn ScalarIndex>)
         }
     }
@@ -383,12 +404,18 @@ async fn infer_scalar_index_type(
     })?;
 
     let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
-    let inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
+    let inverted_list_lookup = index_dir.child(METADATA_FILE);
+    let legacy_inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
     let index_type = if let DataType::List(_) = col.data_type() {
         ScalarIndexType::LabelList
     } else if dataset.object_store.exists(&bitmap_page_lookup).await? {
         ScalarIndexType::Bitmap
-    } else if dataset.object_store.exists(&inverted_list_lookup).await? {
+    } else if dataset.object_store.exists(&inverted_list_lookup).await?
+        || dataset
+            .object_store
+            .exists(&legacy_inverted_list_lookup)
+            .await?
+    {
         ScalarIndexType::Inverted
     } else {
         ScalarIndexType::BTree
@@ -434,16 +461,21 @@ pub async fn detect_scalar_index_type(
     }
 }
 
-/// Grabs the scalar index type from the index details.  If the details are not
-/// present (written by an older version of Lance) then this returns None.
-fn best_effort_scalar_index_type(index: &Index) -> Result<Option<ScalarIndexType>> {
+/// Infers the index type from the index details, if available.
+/// Returns None if the index details are not present or the type cannot be determined.
+/// This returns IndexType::Vector for all vector index types.
+pub fn infer_index_type(index: &Index) -> Option<IndexType> {
     if let Some(details) = &index.index_details {
-        let details = get_scalar_index_details(details)?;
-        if let Some(details) = details {
-            return Ok(Some(details.get_type()));
+        if let Ok(Some(details)) = get_scalar_index_details(details) {
+            return Some(details.get_type().into());
+        } else if let Ok(Some(_)) = get_vector_index_details(details) {
+            return Some(IndexType::Vector);
+        } else {
+            // If the details are not recognized, we return None
+            return None;
         }
     }
-    Ok(None)
+    None
 }
 
 pub fn index_matches_criteria(
@@ -458,34 +490,56 @@ pub fn index_matches_criteria(
         }
     }
     if let Some(expected_type) = criteria.has_type {
-        let index_type = best_effort_scalar_index_type(index)?;
-        if let Some(index_type) = index_type {
-            if index_type != expected_type {
-                return Ok(false);
-            }
-            // We should not use FTS / NGram indices for exact equality queries
-            // (i.e. merge insert with a join on the indexed column)
-            if criteria.supports_exact_equality {
-                match index_type {
-                    ScalarIndexType::Inverted | ScalarIndexType::NGram => {
+        // there are 3 cases:
+        // - index_type is a scalar index type
+        // - index_type is a vector index type
+        // - index_type is not present, in which case that the index was created with an older version of Lance
+        match infer_index_type(index) {
+            Some(index_type) => {
+                if let Ok(index_type) = ScalarIndexType::try_from(index_type) {
+                    if index_type != expected_type {
                         return Ok(false);
                     }
-                    _ => {}
+                } else {
+                    // it's a vector index type,
+                    // this method is used to determine if the scalar index matches the criteria
+                    // so we should return false
+                    return Ok(false);
                 }
             }
-        } else if has_multiple_indices {
-            return Err(Error::InvalidInput {
-                source: format!(
-                    "An index {} on the field with id {} co-exists with other indices on the same column but was written with an older Lance version, and this is not supported.  Please retrain this index.",
-                    index.name,
-                    index.fields.first().unwrap_or(&0),
-                ).into(),
-                location: location!(),
-            });
+            _ => {
+                // if the index_type is not present, just allow it for backwards compatibility
+            }
         }
-        // Otherwise, if the index is the only index on the column, then we accept it
-        // to allow for backwards compatibility.
-        // else { }
+
+        // We should not use FTS / NGram indices for exact equality queries
+        // (i.e. merge insert with a join on the indexed column)
+        if criteria.supports_exact_equality {
+            match expected_type {
+                ScalarIndexType::Inverted | ScalarIndexType::NGram => {
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
+        // we allow FTS / NGram indices to co-exist with each other,
+        // but we don't allow for the other scalar index types
+        if has_multiple_indices
+            && !matches!(
+                expected_type,
+                ScalarIndexType::Inverted | ScalarIndexType::NGram
+            )
+        {
+            return Err(Error::InvalidInput {
+                            source: format!(
+                                "An index {} on the field with id {} co-exists with other indices on the same column but was written with an older Lance version, and this is not supported.  Please retrain this index.",
+                                index.name,
+                                index.fields.first().unwrap_or(&0),
+                            ).into(),
+                            location: location!(),
+                        });
+        }
     }
     if let Some(for_column) = criteria.for_column {
         if index.fields.len() != 1 {
@@ -496,4 +550,150 @@ pub fn index_matches_criteria(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_table::format::pb::{
+        BTreeIndexDetails, InvertedIndexDetails, NGramIndexDetails, VectorIndexDetails,
+    };
+
+    fn make_index_metadata(
+        name: &str,
+        field_id: i32,
+        index_type: Option<IndexType>,
+    ) -> crate::index::IndexMetadata {
+        let index_details = index_type.map(|index_type| match index_type {
+            IndexType::BTree => prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap(),
+            IndexType::Inverted => {
+                prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
+            }
+            IndexType::NGram => prost_types::Any::from_msg(&NGramIndexDetails::default()).unwrap(),
+            IndexType::Vector => {
+                prost_types::Any::from_msg(&VectorIndexDetails::default()).unwrap()
+            }
+            _ => {
+                unimplemented!("unsupported index type: {}", index_type)
+            }
+        });
+        crate::index::IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            fields: vec![field_id],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details,
+            index_version: 0,
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn test_index_matches_criteria_vector_index() {
+        let index1 = make_index_metadata("vector_index", 1, Some(IndexType::Vector));
+
+        let criteria = ScalarIndexCriteria {
+            has_type: Some(ScalarIndexType::BTree),
+            supports_exact_equality: false,
+            for_column: None,
+            has_name: None,
+        };
+
+        let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
+        let result = index_matches_criteria(&index1, &criteria, &field, true).unwrap();
+        assert!(!result);
+
+        let result = index_matches_criteria(&index1, &criteria, &field, false).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_index_matches_criteria_scalar_index() {
+        let btree_index = make_index_metadata("btree_index", 1, Some(IndexType::BTree));
+        let inverted_index = make_index_metadata("inverted_index", 1, Some(IndexType::Inverted));
+        let ngram_index = make_index_metadata("ngram_index", 1, Some(IndexType::NGram));
+
+        let criteria = ScalarIndexCriteria {
+            has_type: Some(ScalarIndexType::BTree),
+            supports_exact_equality: false,
+            for_column: None,
+            has_name: None,
+        };
+
+        let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
+        let result = index_matches_criteria(&btree_index, &criteria, &field, true);
+        assert!(result.is_err());
+
+        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        assert!(result);
+
+        // test for_column
+        let mut criteria = ScalarIndexCriteria {
+            has_type: None,
+            supports_exact_equality: false,
+            for_column: Some("mycol"),
+            has_name: None,
+        };
+        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        assert!(result);
+
+        criteria.for_column = Some("mycol2");
+        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        assert!(!result);
+
+        // test has_name
+        let mut criteria = ScalarIndexCriteria {
+            has_type: None,
+            supports_exact_equality: false,
+            for_column: None,
+            has_name: Some("btree_index"),
+        };
+        let result = index_matches_criteria(&btree_index, &criteria, &field, true).unwrap();
+        assert!(result);
+        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        assert!(result);
+
+        criteria.has_name = Some("btree_index2");
+        let result = index_matches_criteria(&btree_index, &criteria, &field, true).unwrap();
+        assert!(!result);
+        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        assert!(!result);
+
+        // test supports_exact_equality
+        let mut criteria = ScalarIndexCriteria {
+            has_type: Some(ScalarIndexType::BTree),
+            supports_exact_equality: true,
+            for_column: None,
+            has_name: None,
+        };
+        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        assert!(result);
+
+        criteria.has_type = Some(ScalarIndexType::Inverted);
+        let result = index_matches_criteria(&inverted_index, &criteria, &field, false).unwrap();
+        assert!(!result);
+
+        criteria.has_type = Some(ScalarIndexType::NGram);
+        let result = index_matches_criteria(&ngram_index, &criteria, &field, false).unwrap();
+        assert!(!result);
+
+        // test multiple indices
+        let mut criteria = ScalarIndexCriteria {
+            has_type: Some(ScalarIndexType::BTree),
+            supports_exact_equality: false,
+            for_column: None,
+            has_name: None,
+        };
+        let result = index_matches_criteria(&btree_index, &criteria, &field, true);
+        assert!(result.is_err());
+
+        criteria.has_type = Some(ScalarIndexType::Inverted);
+        let result = index_matches_criteria(&inverted_index, &criteria, &field, true).unwrap();
+        assert!(result);
+
+        criteria.has_type = Some(ScalarIndexType::NGram);
+        let result = index_matches_criteria(&ngram_index, &criteria, &field, true).unwrap();
+        assert!(result);
+    }
 }

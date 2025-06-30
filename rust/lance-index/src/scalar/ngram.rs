@@ -7,6 +7,17 @@ use std::iter::once;
 use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
 
+use super::btree::TrainingSource;
+use super::lance_format::LanceIndexStore;
+use super::{
+    AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector, ScalarIndex, SearchResult,
+    TextQuery,
+};
+use crate::frag_reuse::FragReuseIndex;
+use crate::metrics::NoOpMetricsCollector;
+use crate::scalar::inverted::CACHE_SIZE;
+use crate::vector::VectorIndex;
+use crate::{Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
 use arrow::datatypes::{UInt32Type, UInt64Type};
 use arrow_array::{BinaryArray, RecordBatch, UInt32Array};
@@ -16,7 +27,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::iter_str_array;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -33,18 +44,6 @@ use snafu::location;
 use tantivy::tokenizer::TextAnalyzer;
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
-
-use crate::metrics::NoOpMetricsCollector;
-use crate::scalar::inverted::CACHE_SIZE;
-use crate::vector::VectorIndex;
-use crate::{Index, IndexType};
-
-use super::btree::TrainingSource;
-use super::lance_format::LanceIndexStore;
-use super::{
-    AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector, ScalarIndex, SearchResult,
-    TextQuery,
-};
 
 const TOKENS_COL: &str = "tokens";
 const POSTING_LIST_COL: &str = "posting_list";
@@ -146,13 +145,16 @@ impl DeepSizeOf for NGramPostingList {
 }
 
 impl NGramPostingList {
-    fn try_from_batch(batch: RecordBatch) -> Result<Self> {
+    fn try_from_batch(batch: RecordBatch, fri: Option<Arc<FragReuseIndex>>) -> Result<Self> {
         let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
-        let bitmap =
+        let mut bitmap =
             RoaringTreemap::deserialize_from(bitmap_bytes).map_err(|e| Error::Internal {
                 message: format!("Error deserializing ngram list: {}", e),
                 location: location!(),
             })?;
+        if let Some(fri_ref) = fri.as_ref() {
+            bitmap = fri_ref.remap_row_ids_roaring_tree_map(&bitmap);
+        }
         Ok(Self { bitmap })
     }
 
@@ -174,6 +176,7 @@ struct NGramPostingListReader {
     reader: Arc<dyn IndexReader>,
     /// The cache key is the row_offset
     cache: Cache<u32, Arc<NGramPostingList>>,
+    fri: Option<Arc<FragReuseIndex>>,
 }
 
 impl DeepSizeOf for NGramPostingListReader {
@@ -200,7 +203,7 @@ impl NGramPostingListReader {
         self.cache
             .try_get_with(row_offset, async move {
                 metrics.record_part_load();
-                tracing::info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="ngram", part_id=row_offset);
+                tracing::info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="ngram", part_id=row_offset);
                 let batch = self
                     .reader
                     .read_range(
@@ -208,7 +211,7 @@ impl NGramPostingListReader {
                         Some(&[POSTING_LIST_COL]),
                     )
                     .await?;
-                Result::Ok(Arc::new(NGramPostingList::try_from_batch(batch)?))
+                Result::Ok(Arc::new(NGramPostingList::try_from_batch(batch, self.fri.clone())?))
             })
             .await
             .map_err(|e| Error::io(e.to_string(), location!()))
@@ -260,7 +263,10 @@ impl DeepSizeOf for NGramIndex {
 }
 
 impl NGramIndex {
-    async fn from_store(store: Arc<dyn IndexStore>) -> Result<Self> {
+    async fn from_store(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         let tokens = store.open_index_file(POSTINGS_FILENAME).await?;
         let tokens = tokens
             .read_range(0..tokens.num_rows(), Some(&[TOKENS_COL]))
@@ -283,6 +289,7 @@ impl NGramIndex {
                 .max_capacity(*CACHE_SIZE as u64)
                 .weigher(|_, posting: &Arc<NGramPostingList>| posting.deep_size_of() as u32)
                 .build(),
+            fri,
         });
 
         Ok(Self {
@@ -444,11 +451,11 @@ impl ScalarIndex for NGramIndex {
         false
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
+    async fn load(store: Arc<dyn IndexStore>, fri: Option<Arc<FragReuseIndex>>) -> Result<Arc<Self>>
     where
         Self: Sized,
     {
-        Ok(Arc::new(Self::from_store(store).await?))
+        Ok(Arc::new(Self::from_store(store, fri).await?))
     }
 
     async fn remap(
@@ -646,7 +653,7 @@ impl NGramIndexBuilder {
         let spill_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(tmpdir.path())?,
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
 
         Ok(Self {
@@ -1184,7 +1191,7 @@ mod tests {
     use datafusion_common::DataFusionError;
     use futures::{stream, TryStreamExt};
     use itertools::Itertools;
-    use lance_core::{cache::FileMetadataCache, utils::mask::RowIdTreeMap};
+    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
@@ -1254,7 +1261,7 @@ mod tests {
         let test_store = LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         );
 
         builder
@@ -1263,7 +1270,9 @@ mod tests {
             .unwrap();
 
         (
-            NGramIndex::from_store(Arc::new(test_store)).await.unwrap(),
+            NGramIndex::from_store(Arc::new(test_store), None)
+                .await
+                .unwrap(),
             tmpdir,
         )
     }
@@ -1458,12 +1467,12 @@ mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
 
         index.update(data, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let index = NGramIndex::from_store(test_store, None).await.unwrap();
         assert_eq!(index.tokens.len(), 3);
     }
 
@@ -1493,13 +1502,13 @@ mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
 
         let remapping = HashMap::from([(2, Some(100)), (3, None), (4, Some(101))]);
         index.remap(&remapping, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let index = NGramIndex::from_store(test_store, None).await.unwrap();
         let row_ids = row_ids_in_index(&index).await;
         assert_eq!(row_ids, vec![0, 1, 100, 101]);
 
@@ -1533,12 +1542,12 @@ mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
 
         index.update(data, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let index = NGramIndex::from_store(test_store, None).await.unwrap();
         let row_ids = row_ids_in_index(&index).await;
         assert_eq!(row_ids, vec![0, 1, 2, 3, 4, 100, 101, 102]);
 

@@ -31,7 +31,6 @@ use pyo3::{
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
-use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
@@ -54,6 +53,7 @@ use lance::dataset::{
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
+use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
@@ -92,9 +92,7 @@ pub mod commit;
 pub mod optimize;
 pub mod stats;
 
-const DEFAULT_NPROBS: usize = 1;
-const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
-const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
+const DEFAULT_NPROBS: usize = 20;
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
@@ -316,7 +314,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None))]
     fn new(
         py: Python,
         uri: String,
@@ -327,17 +325,24 @@ impl Dataset {
         commit_handler: Option<PyObject>,
         storage_options: Option<HashMap<String, String>>,
         manifest: Option<&[u8]>,
+        metadata_cache_size_bytes: Option<usize>,
     ) -> PyResult<Self> {
-        let mut params = ReadParams {
-            index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
-            metadata_cache_size: metadata_cache_size.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
-            store_options: Some(ObjectStoreParams {
-                block_size,
+        let mut params = ReadParams::default();
+        if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
+            params.metadata_cache_size_bytes(metadata_cache_size_bytes);
+        } else if let Some(metadata_cache_size) = metadata_cache_size {
+            #[allow(deprecated)]
+            params.metadata_cache_size(metadata_cache_size);
+        }
+        if let Some(index_cache_size) = index_cache_size {
+            params.index_cache_size(index_cache_size);
+        }
+        if let Some(block_size) = block_size {
+            params.store_options = Some(ObjectStoreParams {
+                block_size: Some(block_size),
                 ..Default::default()
-            }),
-            ..Default::default()
+            });
         };
-
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);
             params.set_commit_lock(Arc::new(py_commit_lock));
@@ -746,15 +751,41 @@ impl Dataset {
                 10
             };
 
-            let nprobes: usize = if let Some(nprobes) = nearest.get_item("nprobes")? {
-                if nprobes.is_none() {
-                    DEFAULT_NPROBS
-                } else {
-                    nprobes.extract()?
+            let mut minimum_nprobes = DEFAULT_NPROBS;
+            let mut maximum_nprobes = None;
+
+            if let Some(nprobes) = nearest.get_item("nprobes")? {
+                if !nprobes.is_none() {
+                    minimum_nprobes = nprobes.extract()?;
+                    maximum_nprobes = Some(minimum_nprobes);
                 }
-            } else {
-                DEFAULT_NPROBS
-            };
+            }
+
+            if let Some(min_nprobes) = nearest.get_item("minimum_nprobes")? {
+                if !min_nprobes.is_none() {
+                    minimum_nprobes = min_nprobes.extract()?;
+                }
+            }
+
+            if let Some(max_nprobes) = nearest.get_item("maximum_nprobes")? {
+                if !max_nprobes.is_none() {
+                    maximum_nprobes = Some(max_nprobes.extract()?);
+                }
+            }
+
+            if minimum_nprobes > maximum_nprobes.unwrap_or(usize::MAX) {
+                return Err(PyValueError::new_err(
+                    "minimum_nprobes must be <= maximum_nprobes",
+                ));
+            }
+
+            if minimum_nprobes < 1 {
+                return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
+            }
+
+            if maximum_nprobes.unwrap_or(usize::MAX) < 1 {
+                return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
+            }
 
             let metric_type: Option<MetricType> =
                 if let Some(metric) = nearest.get_item("metric")? {
@@ -813,7 +844,10 @@ impl Dataset {
             };
             scanner
                 .map(|s| {
-                    let mut s = s.nprobs(nprobes);
+                    let mut s = s.minimum_nprobes(minimum_nprobes);
+                    if let Some(maximum_nprobes) = maximum_nprobes {
+                        s = s.maximum_nprobes(maximum_nprobes);
+                    }
                     if let Some(factor) = refine_factor {
                         s = s.refine(factor);
                     }
@@ -1178,10 +1212,31 @@ impl Dataset {
         })
     }
 
+    fn tags_ordered(self_: PyRef<'_, Self>, order: Option<String>) -> PyResult<PyObject> {
+        let tags = self_
+            .list_tags_ordered(order.as_deref())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Python::with_gil(|py| {
+            let pylist = PyList::empty(py);
+
+            for (tag_name, tag_content) in tags {
+                let dict = PyDict::new(py);
+                dict.set_item("version", tag_content.version)?;
+                dict.set_item("manifest_size", tag_content.manifest_size)?;
+
+                pylist.append((tag_name.as_str(), dict))?;
+            }
+
+            Ok(PyObject::from(pylist))
+        })
+    }
+
     fn tags(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let tags = self_
             .list_tags()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
         Python::with_gil(|py| {
             let pytags = PyDict::new(py);
             for (k, v) in tags.iter() {
@@ -1191,6 +1246,20 @@ impl Dataset {
                 pytags.set_item(k, dict.into_py_any(py)?).unwrap();
             }
             pytags.into_py_any(py)
+        })
+    }
+
+    fn get_version(self_: PyRef<'_, Self>, tag: String) -> PyResult<u64> {
+        let inner_result = RT.block_on(None, self_.ds.tags.get_version(&tag))?;
+
+        inner_result.map_err(|err: lance::Error| match err {
+            lance::Error::NotFound { .. } => {
+                PyValueError::new_err(format!("Tag not found: {}", err))
+            }
+            lance::Error::RefNotFound { .. } => {
+                PyValueError::new_err(format!("Ref not found: {}", err))
+            }
+            _ => PyIOError::new_err(format!("Storage error: {}", err)),
         })
     }
 
@@ -1275,7 +1344,9 @@ impl Dataset {
             "NGRAM" => IndexType::NGram,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
-            "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
+            "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
+                IndexType::Vector
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -1419,15 +1490,33 @@ impl Dataset {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (dest, storage_options = None))]
-    fn drop(dest: String, storage_options: Option<HashMap<String, String>>) -> PyResult<()> {
+    #[pyo3(signature = (dest, storage_options = None, ignore_not_found = None))]
+    fn drop(
+        dest: String,
+        storage_options: Option<HashMap<String, String>>,
+        ignore_not_found: Option<bool>,
+    ) -> PyResult<()> {
         RT.spawn(None, async move {
             let (object_store, path) =
                 object_store_from_uri_or_path(&dest, storage_options).await?;
-            object_store
-                .remove_dir_all(path)
-                .await
-                .map_err(|e| PyIOError::new_err(e.to_string()))
+            let result = object_store.remove_dir_all(path).await;
+
+            match result {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let is_not_found = matches!(&e, lance_core::Error::NotFound { .. });
+
+                    if let Some(true) = ignore_not_found {
+                        if is_not_found {
+                            Ok(())
+                        } else {
+                            Err(PyIOError::new_err(e.to_string()))
+                        }
+                    } else {
+                        Err(PyIOError::new_err(e.to_string()))
+                    }
+                }
+            }
         })?
     }
 
@@ -1685,6 +1774,49 @@ impl Dataset {
         )));
         Ok(PyArrowType(reader))
     }
+
+    #[pyo3(signature = (upsert_values))]
+    fn update_config(&mut self, upsert_values: &Bound<'_, PyDict>) -> PyResult<()> {
+        let upsert: HashMap<String, String> = upsert_values
+            .iter()
+            .map(|(k, v)| Ok((k.extract::<String>()?, v.extract::<String>()?)))
+            .collect::<PyResult<_>>()?;
+
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.update_config(upsert))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    #[pyo3(signature = (keys))]
+    fn delete_config_keys(&mut self, keys: Vec<String>) -> PyResult<()> {
+        let key_refs: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.delete_config_keys(&key_refs))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    #[pyo3(signature = ())]
+    fn config(&mut self) -> PyResult<PyObject> {
+        let new_self = self.ds.as_ref().clone();
+
+        let config = new_self
+            .config()
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        self.ds = Arc::new(new_self);
+
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            for (k, v) in config {
+                dict.set_item(k, v)?;
+            }
+            Ok(dict.into())
+        })
+    }
 }
 
 #[derive(FromPyObject)]
@@ -1723,6 +1855,32 @@ impl Dataset {
 
     fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
         RT.runtime.block_on(self.ds.tags.list())
+    }
+
+    fn list_tags_ordered(
+        &self,
+        order: Option<&str>,
+    ) -> ::lance::error::Result<Vec<(String, TagContents)>> {
+        let ordering = match order {
+            Some("asc") => Some(std::cmp::Ordering::Less),
+            Some("desc") => Some(std::cmp::Ordering::Greater),
+            Some(invalid_order) => {
+                let error_msg = format!(
+                    "Invalid sort order '{}'. Valid values are: asc, desc",
+                    invalid_order
+                );
+                return Err(::lance::error::Error::InvalidInput {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        error_msg,
+                    )),
+                    location: location!(),
+                });
+            }
+            None => None,
+        };
+        RT.runtime
+            .block_on(async { self.ds.tags.list_tags_ordered(ordering).await })
     }
 
     fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {
@@ -1906,6 +2064,7 @@ fn prepare_vector_index_params(
     let mut hnsw_params = HnswBuildParams::default();
     let mut pq_params = PQBuildParams::default();
     let mut sq_params = SQBuildParams::default();
+    let mut index_file_version = IndexFileVersion::V3;
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -2022,9 +2181,15 @@ fn prepare_vector_index_params(
             let codebook = as_fixed_size_list_array(batch.column(0));
             pq_params.codebook = Some(codebook.values().clone())
         };
+
+        if let Some(version) = kwargs.get_item("index_file_version")? {
+            let version: String = version.extract()?;
+            index_file_version = IndexFileVersion::try_from(&version)
+                .map_err(|e| PyValueError::new_err(format!("Invalid index_file_version: {e}")))?;
+        }
     }
 
-    match index_type {
+    let mut params = match index_type {
         "IVF_FLAT" => Ok(Box::new(VectorIndexParams::ivf_flat(
             ivf_params.num_partitions,
             m_type,
@@ -2032,6 +2197,16 @@ fn prepare_vector_index_params(
 
         "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(
             m_type, ivf_params, pq_params,
+        ))),
+
+        "IVF_SQ" => Ok(Box::new(VectorIndexParams::with_ivf_sq_params(
+            m_type, ivf_params, sq_params,
+        ))),
+
+        "IVF_HNSW_FLAT" => Ok(Box::new(VectorIndexParams::ivf_hnsw(
+            m_type,
+            ivf_params,
+            hnsw_params,
         ))),
 
         "IVF_HNSW_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
@@ -2051,7 +2226,9 @@ fn prepare_vector_index_params(
         _ => Err(PyValueError::new_err(format!(
             "Index type '{index_type}' is not supported."
         ))),
-    }
+    }?;
+    params.version(index_file_version);
+    Ok(params)
 }
 
 #[pyclass(name = "_FragmentWriteProgress", module = "_lib")]
@@ -2220,7 +2397,7 @@ pub struct PyFullTextQuery {
 #[pymethods]
 impl PyFullTextQuery {
     #[staticmethod]
-    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR"))]
+    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR", prefix_length=0))]
     fn match_query(
         query: String,
         column: String,
@@ -2228,6 +2405,7 @@ impl PyFullTextQuery {
         fuzziness: Option<u32>,
         max_expansions: usize,
         operator: &str,
+        prefix_length: u32,
     ) -> PyResult<Self> {
         Ok(Self {
             inner: MatchQuery::new(query)
@@ -2239,6 +2417,7 @@ impl PyFullTextQuery {
                     Operator::try_from(operator)
                         .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?,
                 )
+                .with_prefix_length(prefix_length)
                 .into(),
         })
     }

@@ -630,18 +630,22 @@ impl FileWriter {
 /// lance file format
 pub trait EncodedBatchWriteExt {
     /// Serializes into a lance file, including the schema
-    fn try_to_self_described_lance(&self) -> Result<Bytes>;
+    fn try_to_self_described_lance(&self, version: LanceFileVersion) -> Result<Bytes>;
     /// Serializes into a lance file, without the schema.
     ///
     /// The schema must be provided to deserialize the buffer
-    fn try_to_mini_lance(&self) -> Result<Bytes>;
+    fn try_to_mini_lance(&self, version: LanceFileVersion) -> Result<Bytes>;
 }
 
 // Creates a lance footer and appends it to the encoded data
 //
 // The logic here is very similar to logic in the FileWriter except we
 // are using BufMut (put_xyz) instead of AsyncWrite (write_xyz).
-fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes> {
+fn concat_lance_footer(
+    batch: &EncodedBatch,
+    write_schema: bool,
+    version: LanceFileVersion,
+) -> Result<Bytes> {
     // Estimating 1MiB for file footer
     let mut data = BytesMut::with_capacity(batch.data.len() + 1024 * 1024);
     data.put(batch.data.clone());
@@ -726,7 +730,7 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
         data.put_u64_le(gbo_len);
     }
 
-    let (major, minor) = LanceFileVersion::default().to_numbers();
+    let (major, minor) = version.to_numbers();
 
     // write the footer
     data.put_u64_le(col_metadata_start);
@@ -742,12 +746,12 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
 }
 
 impl EncodedBatchWriteExt for EncodedBatch {
-    fn try_to_self_described_lance(&self) -> Result<Bytes> {
-        concat_lance_footer(self, true)
+    fn try_to_self_described_lance(&self, version: LanceFileVersion) -> Result<Bytes> {
+        concat_lance_footer(self, true, version)
     }
 
-    fn try_to_mini_lance(&self) -> Result<Bytes> {
-        concat_lance_footer(self, false)
+    fn try_to_mini_lance(&self, version: LanceFileVersion) -> Result<Bytes> {
+        concat_lance_footer(self, false, version)
     }
 }
 
@@ -761,7 +765,7 @@ mod tests {
     use arrow_array::{types::Float64Type, RecordBatchReader};
     use arrow_array::{RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use lance_core::cache::FileMetadataCache;
+    use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_encoding::decoder::DecoderPlugins;
@@ -871,7 +875,7 @@ mod tests {
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
-            &FileMetadataCache::no_cache(),
+            &LanceCache::no_cache(),
             FileReaderOptions::default(),
         )
         .await
@@ -951,7 +955,7 @@ mod tests {
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
-            &FileMetadataCache::no_cache(),
+            &LanceCache::no_cache(),
             FileReaderOptions::default(),
         )
         .await

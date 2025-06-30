@@ -1,6 +1,7 @@
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+use crate::utils::to_rust_map;
 use crate::{
     error::{Error, Result},
     traits::IntoJava,
@@ -8,16 +9,18 @@ use crate::{
 };
 use arrow::{array::RecordBatchReader, ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
+use jni::objects::JMap;
 use jni::{
     objects::{JObject, JString},
     sys::{jint, jlong},
     JNIEnv,
 };
 use lance::io::ObjectStore;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::{FileReader, FileReaderOptions, ReaderProjection};
+use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
@@ -86,15 +89,30 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_openNative<'l
     mut env: JNIEnv<'local>,
     _reader_class: JObject,
     file_uri: JString,
+    storage_options_obj: JObject,
 ) -> JObject<'local> {
-    ok_or_throw!(env, inner_open(&mut env, file_uri,))
+    ok_or_throw!(env, inner_open(&mut env, file_uri, storage_options_obj))
 }
 
-fn inner_open<'local>(env: &mut JNIEnv<'local>, file_uri: JString) -> Result<JObject<'local>> {
+fn inner_open<'local>(
+    env: &mut JNIEnv<'local>,
+    file_uri: JString,
+    storage_options_obj: JObject,
+) -> Result<JObject<'local>> {
     let file_uri_str: String = env.get_string(&file_uri)?.into();
-
+    let jmap = JMap::from_env(env, &storage_options_obj)?;
+    let storage_options = to_rust_map(env, &jmap)?;
     let reader = RT.block_on(async move {
-        let (obj_store, path) = ObjectStore::from_uri(&file_uri_str).await?;
+        let object_params = ObjectStoreParams {
+            storage_options: Some(storage_options),
+            ..Default::default()
+        };
+        let (obj_store, path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            &file_uri_str,
+            &object_params,
+        )
+        .await?;
         let config = SchedulerConfig::max_bandwidth(&obj_store);
         let scan_scheduler = ScanScheduler::new(obj_store, config);
 
@@ -105,7 +123,7 @@ fn inner_open<'local>(env: &mut JNIEnv<'local>, file_uri: JString) -> Result<JOb
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
-            &FileMetadataCache::no_cache(),
+            &LanceCache::no_cache(),
             FileReaderOptions::default(),
         )
         .await
@@ -210,11 +228,14 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
             (*ptr).lock().unwrap()
         };
 
+        let file_version = reader.inner.metadata().version();
+
         if !projected_names.is_null() {
             let schema = Schema::try_from(reader.schema()?.as_ref())?;
             let column_names: Vec<String> = env.get_strings(&projected_names)?;
             let names: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
             reader_projection = Some(ReaderProjection::from_column_names(
+                file_version,
                 &schema,
                 names.as_slice(),
             )?);

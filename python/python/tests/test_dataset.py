@@ -485,6 +485,41 @@ def test_tag(tmp_path: Path):
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 1
 
+    version = ds.tags.get_version("tag1")
+    assert version == 1
+
+
+def test_tag_order(tmp_path: Path):
+    table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
+    base_dir = tmp_path / "test"
+
+    for i in range(3):
+        mode = "append" if i > 0 else "create"
+        ds = lance.write_dataset(table, base_dir, mode=mode)
+
+    expected_tags = {"tag3": 3, "tag2": 2, "tag1": 1}
+    for name, version in expected_tags.items():
+        ds.tags.create(name, version)
+
+    tags_asc = ds.tags.list_ordered(order="asc")
+    assert len(tags_asc) == 3
+    tag_names_asc = [t[0] for t in tags_asc]
+    assert tag_names_asc == sorted(expected_tags.keys()), (
+        f"Unexpected ascending order: {tag_names_asc}"
+    )
+
+    # Test descending order (default)
+    tags_desc = ds.tags.list_ordered(order="desc")
+    assert len(tags_desc) == 3
+    tag_names_desc = [t[0] for t in tags_desc]
+    assert tag_names_desc == list(expected_tags.keys()), (
+        f"Unexpected descending order: {tag_names_desc}"
+    )
+
+    # Test without parameter (should default to descending)
+    tags_default = ds.tags.list_ordered()
+    assert tags_default == tags_desc, "Default order should match descending order"
+
 
 def test_sample(tmp_path: Path):
     table1 = pa.Table.from_pydict({"x": [0, 10, 20, 30, 40, 50], "y": range(6)})
@@ -1088,6 +1123,38 @@ def test_auto_cleanup(tmp_path):
     assert len(dataset.versions()) == 2
 
 
+def test_config_update_auto_cleanup(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir, mode="create")
+    ds.update_config(
+        {"lance.auto_cleanup.interval": "1", "lance.auto_cleanup.older_than": "1ms"}
+    )
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+
+    time.sleep(5)
+
+    # trigger cleanup
+    lance.write_dataset(table, base_dir, mode="append")
+    dataset = lance.dataset(base_dir)
+    assert len(dataset.versions()) == 2
+
+
+def test_access_config(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir, mode="create")
+    ds.update_config({"test_key": "test_value"})
+    config_value = ds.config()["test_key"]
+    assert config_value == "test_value"
+    assert 1 == len(ds.config())
+
+    ds.delete_config_keys(["test_key"])
+    assert 0 == len(ds.config())
+
+
 def test_auto_cleanup_invalid(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1110,6 +1177,41 @@ def test_auto_cleanup_invalid(tmp_path):
     )
     dataset = lance.dataset(base_dir)
     assert len(dataset.versions()) == 4
+
+
+def test_enable_disable_auto_cleanup(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir, mode="create")
+    auto_cleanup_options = AutoCleanupConfig(
+        interval=1,
+        older_than_seconds=1,
+    )
+    # enable auto cleanup
+    ds.optimize.enable_auto_cleanup(auto_cleanup_options)
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+
+    time.sleep(5)
+
+    # trigger cleanup
+    lance.write_dataset(table, base_dir, mode="append")
+    assert len(ds.versions()) == 2
+
+    # this is a transactional commit, so will increase a version
+    ds.optimize.disable_auto_cleanup()
+
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+    lance.write_dataset(table, base_dir, mode="append")
+
+    time.sleep(5)
+
+    # wait to see if cleanup would be trigger
+    lance.write_dataset(table, base_dir, mode="append")
+
+    assert len(ds.versions()) == 7
 
 
 def test_create_from_commit(tmp_path: Path):
@@ -2205,6 +2307,80 @@ def test_scan_with_batch_size(tmp_path: Path):
         assert batch.num_rows != 12
 
 
+def test_dictionaries(tmp_path: Path):
+    data = pa.table(
+        {
+            "id": pa.array([1, 2, 3]),
+            "dict": pa.array(
+                ["foo", "bar", "baz"], pa.dictionary(pa.int32(), pa.string())
+            ),
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    assert ds.schema == pa.schema(
+        {"id": pa.int64(), "dict": pa.dictionary(pa.int32(), pa.string())}
+    )
+    assert ds.to_table() == data
+
+    # Can insert data with new values
+    new_data = pa.table(
+        {
+            "id": [4, 5, 6],
+            "dict": pa.array(
+                ["qux", "quux", "corge"], pa.dictionary(pa.int32(), pa.string())
+            ),
+        }
+    )
+    ds.insert(new_data)
+    table = ds.to_table().combine_chunks()
+    assert table == pa.table(
+        {
+            "id": [1, 2, 3, 4, 5, 6],
+            "dict": pa.array(
+                ["foo", "bar", "baz", "qux", "quux", "corge"],
+                pa.dictionary(pa.int32(), pa.string()),
+            ),
+        }
+    )
+
+    dict_arr = table.column("dict").chunk(0)
+    assert dict_arr.type == pa.dictionary(pa.int32(), pa.string())
+    assert dict_arr.to_pylist() == ["foo", "bar", "baz", "qux", "quux", "corge"]
+
+    assert dict_arr.dictionary.to_pylist() == [
+        "foo",
+        "bar",
+        "baz",
+        "qux",
+        "quux",
+        "corge",
+    ]
+
+    # Can merge insert data that has even more values
+    new_data = pa.table(
+        {
+            "id": [1, 7],
+            "dict": pa.array(
+                ["grault", "garply"], pa.dictionary(pa.int32(), pa.string())
+            ),
+        }
+    )
+    ds.merge_insert(
+        "id"
+    ).when_matched_update_all().when_not_matched_insert_all().execute(new_data)
+    table = ds.to_table().combine_chunks().sort_by("id")
+    assert table.column("id").to_pylist() == [1, 2, 3, 4, 5, 6, 7]
+    assert table.column("dict").to_pylist() == [
+        "grault",
+        "bar",
+        "baz",
+        "qux",
+        "quux",
+        "corge",
+        "garply",
+    ]
+
+
 @pytest.mark.slow
 def test_io_buffer_size(tmp_path: Path):
     # These cases regress deadlock issues that happen when the
@@ -3253,6 +3429,11 @@ def test_dataset_drop(tmp_path: Path):
     assert Path(tmp_path).exists()
     lance.LanceDataset.drop(tmp_path)
     assert not Path(tmp_path).exists()
+    lance.LanceDataset.drop(tmp_path, ignore_not_found=True)
+    with pytest.raises(OSError):
+        lance.LanceDataset.drop(tmp_path, ignore_not_found=False)
+    with pytest.raises(OSError):
+        lance.LanceDataset.drop(tmp_path)
 
 
 def test_dataset_schema(tmp_path: Path):
@@ -3385,3 +3566,20 @@ def test_create_table_from_pydict(tmp_path):
     }
     ds = lance.write_dataset(dat, tmp_path)
     assert ds.to_table() == pa.Table.from_pydict(dat)
+
+
+def test_metadata_cache_size(tmp_path):
+    lance.write_dataset(pa.table({"id": [1, 2, 3]}), tmp_path / "test")
+
+    ds = lance.dataset(tmp_path / "test")
+    ds.to_table()  # Populate cache
+    default_size = ds.session().size_bytes()
+    assert default_size > 0
+
+    ds = lance.dataset(tmp_path / "test", metadata_cache_size_bytes=0)
+    ds.to_table()  # Attempt to populate cache (should be limited by 0 size)
+    zero_cache_size = ds.session().size_bytes()
+
+    # With zero cache size, session should be smaller than default
+    # (it won't be exactly 0 due to struct overhead)
+    assert zero_cache_size < default_size

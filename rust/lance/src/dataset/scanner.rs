@@ -12,10 +12,10 @@ use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
-use datafusion::common::SchemaExt;
+use datafusion::common::{DFSchema, SchemaExt};
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{col, lit, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::expressions;
@@ -25,16 +25,15 @@ use datafusion::physical_plan::{
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
     expressions::Literal,
-    filter::FilterExec,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
     union::UnionExec,
     ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
-use datafusion_expr::Operator;
+use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{aggregate::AggregateExprBuilder, expressions::Column};
-use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
@@ -69,7 +68,7 @@ use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-use crate::io::exec::{get_physical_optimizer, LanceScanConfig};
+use crate::io::exec::{get_physical_optimizer, LanceFilterExec, LanceScanConfig};
 use crate::io::exec::{
     knn::new_knn_exec, project, AddRowAddrExec, FilterPlan, KNNVectorDistanceExec,
     LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
@@ -226,7 +225,12 @@ impl LanceFilter {
                 let schema = Arc::new(ArrowSchema::from(full_schema));
                 let planner = Planner::new(schema);
                 let filter = planner.parse_filter(sql)?;
-                planner.optimize_expr(filter)
+                planner.optimize_expr(filter).map_err(|e| {
+                    Error::invalid_input(
+                        format!("Error optimizing sql filter: {sql} ({e})"),
+                        location!(),
+                    )
+                })
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
@@ -237,7 +241,12 @@ impl LanceFilter {
                     .now_or_never()
                     .expect("could not parse the Substrait filter in a synchronous fashion")?;
                 let planner = Planner::new(schema);
-                planner.optimize_expr(expr)
+                planner.optimize_expr(expr.clone()).map_err(|e| {
+                    Error::invalid_input(
+                        format!("Error optimizing substrait filter: {expr:?} ({e})"),
+                        location!(),
+                    )
+                })
             }
             #[cfg(not(feature = "substrait"))]
             Self::Substrait(_) => {
@@ -805,7 +814,8 @@ impl Scanner {
             k,
             lower_bound: None,
             upper_bound: None,
-            nprobes: 1,
+            minimum_nprobes: 20,
+            maximum_nprobes: None,
             ef: None,
             refine_factor: None,
             metric_type: MetricType::L2,
@@ -827,9 +837,50 @@ impl Scanner {
         self
     }
 
+    /// Configures how many partititions will be searched in the vector index.
+    ///
+    /// This method is a convenience method that sets both [Self::minimum_nprobes] and
+    /// [Self::maximum_nprobes] to the same value.
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.nprobes = n;
+            q.minimum_nprobes = n;
+            q.maximum_nprobes = Some(n);
+        } else {
+            log::warn!("nprobes is not set because nearest has not been called yet");
+        }
+        self
+    }
+
+    /// Configures the minimum number of partitions to search in the vector index.
+    ///
+    /// If we have found k matching results after searching this many partitions then
+    /// the search will stop.  Increasing this number can increase recall but will increase
+    /// latency on all queries.
+    pub fn minimum_nprobes(&mut self, n: usize) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.minimum_nprobes = n;
+        } else {
+            log::warn!("minimum_nprobes is not set because nearest has not been called yet");
+        }
+        self
+    }
+
+    /// Configures the maximum number of partitions to search in the vector index.
+    ///
+    /// These partitions will only be searched if we have not found `k` results after
+    /// searching the minimum number of partitions.  Setting this to None (the default)
+    /// will search all partitions if needed.
+    ///
+    /// This setting only takes effect when a prefilter is in place.  In that case we
+    /// can spend more effort to try and find results when the filter is highly selective.
+    ///
+    /// If there is no prefilter, or the results are not highly selective, this value will
+    /// have no effect.
+    pub fn maximum_nprobes(&mut self, n: usize) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.maximum_nprobes = Some(n);
+        } else {
+            log::warn!("maximum_nprobes is not set because nearest has not been called yet");
         }
         self
     }
@@ -1549,10 +1600,7 @@ impl Scanner {
         if let Some(refine_expr) = filter_plan.refine_expr {
             // We create a new planner specific to the node's schema, since
             // physical expressions reference column by index rather than by name.
-            let planner = Planner::new(plan.schema());
-            let physical_refine_expr = planner.create_physical_expr(&refine_expr)?;
-
-            plan = Arc::new(FilterExec::try_new(physical_refine_expr, plan)?);
+            plan = Arc::new(LanceFilterExec::try_new(refine_expr, plan)?);
         }
 
         // Stage 3: sort
@@ -1954,11 +2002,44 @@ impl Scanner {
                         must = Some(plan);
                     }
                 }
+
+                // For must_not queries, union the results of each subquery
+                let mut must_not = Vec::with_capacity(query.must_not.len());
+                for query in &query.must_not {
+                    let plan = Box::pin(self.plan_fts(
+                        query,
+                        &unlimited_params,
+                        filter_plan,
+                        prefilter_source,
+                    ))
+                    .await?;
+                    must_not.push(plan);
+                }
+                let must_not = if must_not.is_empty() {
+                    Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
+                } else if must_not.len() == 1 {
+                    must_not.pop().unwrap()
+                } else {
+                    let unioned = Arc::new(UnionExec::new(must_not));
+                    Arc::new(RepartitionExec::try_new(
+                        unioned,
+                        Partitioning::RoundRobinBatch(1),
+                    )?)
+                };
+
+                if query.should.is_empty() && must.is_none() {
+                    return Err(Error::invalid_input(
+                        "boolean query must have at least one should/must query".to_string(),
+                        location!(),
+                    ));
+                }
+
                 Arc::new(BooleanQueryExec::new(
                     query.clone(),
                     params.clone(),
                     should,
                     must,
+                    must_not,
                 ))
             }
         };
@@ -2015,7 +2096,7 @@ impl Scanner {
             let mut scan_node = self.scan_fragments(
                 true,
                 false,
-                true,
+                false,
                 flat_fts_scan_schema,
                 Arc::new(unindexed_fragments),
                 None,
@@ -2024,9 +2105,7 @@ impl Scanner {
 
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 // If there is a prefilter we need to manually apply it to the new data
-                let planner = Planner::new(scan_node.schema());
-                let physical_refine_expr = planner.create_physical_expr(expr)?;
-                scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
+                scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
             }
 
             let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
@@ -2144,10 +2223,7 @@ impl Scanner {
                 )
             };
             if let Some(refine_expr) = &filter_plan.refine_expr {
-                let planner = Planner::new(plan.schema());
-                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
-
-                plan = Arc::new(FilterExec::try_new(physical_refine_expr, plan)?);
+                plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
             }
             Ok(self.flat_knn(plan, q)?)
         }
@@ -2200,7 +2276,7 @@ impl Scanner {
             let mut scan_node = self.scan_fragments(
                 true,
                 false,
-                true,
+                false,
                 vector_scan_projection,
                 Arc::new(unindexed_fragments),
                 // Can't pushdown limit/offset in an ANN search
@@ -2212,9 +2288,7 @@ impl Scanner {
 
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 // If there is a prefilter we need to manually apply it to the new data
-                let planner = Planner::new(scan_node.schema());
-                let physical_refine_expr = planner.create_physical_expr(expr)?;
-                scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
+                scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
             }
             // first we do flat search on just the new data
             let topk_appended = self.flat_knn(scan_node, &q)?;
@@ -2387,9 +2461,7 @@ impl Scanner {
         if let Some(post_take_filter) = post_take_filter {
             let planner = Planner::new(plan.schema());
             let optimized_filter = planner.optimize_expr(post_take_filter)?;
-            let physical_refine_expr = planner.create_physical_expr(&optimized_filter)?;
-
-            plan = Arc::new(FilterExec::try_new(physical_refine_expr, plan)?);
+            plan = Arc::new(LanceFilterExec::try_new(optimized_filter, plan)?);
         }
 
         if self.with_row_address {
@@ -2417,7 +2489,6 @@ impl Scanner {
             let scan_arrow_schema = Arc::new(scan_schema.as_ref().into());
             let planner = Planner::new(scan_arrow_schema);
             let optimized_filter = planner.optimize_expr(filter.clone())?;
-            let physical_refine_expr = planner.create_physical_expr(&optimized_filter)?;
 
             let new_data_scan = self.scan_fragments(
                 true,
@@ -2429,7 +2500,7 @@ impl Scanner {
                 None,
                 false,
             );
-            let filtered = Arc::new(FilterExec::try_new(physical_refine_expr, new_data_scan)?);
+            let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, new_data_scan)?);
             Some(Arc::new(project(filtered, plan.schema().as_ref())?))
         } else {
             None
@@ -2557,45 +2628,43 @@ impl Scanner {
             q.metric_type,
         )?);
 
-        // filter out elements out of distance range
-        let lower_bound_expr = q
+        let lower: Option<(Expr, Arc<dyn PhysicalExpr>)> = q
             .lower_bound
-            .map(|v| {
-                let lower_bound = expressions::lit(v);
-                expressions::binary(
-                    expressions::col(DIST_COL, flat_dist.schema().as_ref())?,
-                    Operator::GtEq,
-                    lower_bound,
-                    flat_dist.schema().as_ref(),
-                )
+            .map(|v| -> Result<(Expr, Arc<dyn PhysicalExpr>)> {
+                let logical = col(DIST_COL).gt_eq(lit(v));
+                let schema = flat_dist.schema();
+                let df_schema = DFSchema::try_from(schema)?;
+                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                Ok::<(Expr, Arc<dyn PhysicalExpr>), _>((logical, physical))
             })
             .transpose()?;
-        let upper_bound_expr = q
+
+        let upper = q
             .upper_bound
-            .map(|v| {
-                let upper_bound = expressions::lit(v);
-                expressions::binary(
-                    expressions::col(DIST_COL, flat_dist.schema().as_ref())?,
-                    Operator::Lt,
-                    upper_bound,
-                    flat_dist.schema().as_ref(),
-                )
+            .map(|v| -> Result<(Expr, Arc<dyn PhysicalExpr>)> {
+                let logical = col(DIST_COL).lt(lit(v));
+                let schema = flat_dist.schema();
+                let df_schema = DFSchema::try_from(schema)?;
+                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                Ok::<(Expr, Arc<dyn PhysicalExpr>), _>((logical, physical))
             })
             .transpose()?;
-        let filter_expr = match (lower_bound_expr, upper_bound_expr) {
-            (Some(lower), Some(upper)) => Some(expressions::binary(
-                lower,
-                Operator::And,
-                upper,
-                flat_dist.schema().as_ref(),
-            )?),
-            (Some(lower), None) => Some(lower),
-            (None, Some(upper)) => Some(upper),
+
+        let filter_expr = match (lower, upper) {
+            (Some((llog, _)), Some((ulog, _))) => {
+                let logical = llog.and(ulog);
+                let schema = flat_dist.schema();
+                let df_schema = DFSchema::try_from(schema)?;
+                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                Some((logical, physical))
+            }
+            (Some((llog, lphys)), None) => Some((llog, lphys)),
+            (None, Some((ulog, uphys))) => Some((ulog, uphys)),
             (None, None) => None,
         };
 
         let knn_plan: Arc<dyn ExecutionPlan> = if let Some(filter_expr) = filter_expr {
-            Arc::new(FilterExec::try_new(filter_expr, flat_dist)?)
+            Arc::new(LanceFilterExec::try_new(filter_expr.0, flat_dist)?)
         } else {
             flat_dist
         };
@@ -2613,12 +2682,10 @@ impl Scanner {
         )
         .with_fetch(Some(q.k));
 
-        let not_nulls = FilterExec::try_new(
-            expressions::is_not_null(expressions::col(DIST_COL, sort.schema().as_ref())?)?,
-            Arc::new(sort),
-        )?;
+        let logical_not_null = col(DIST_COL).is_not_null();
+        let not_nulls = Arc::new(LanceFilterExec::try_new(logical_not_null, Arc::new(sort))?);
 
-        Ok(Arc::new(not_nulls))
+        Ok(not_nulls)
     }
 
     fn get_fragments_as_bitmap(&self) -> RoaringBitmap {
@@ -2784,10 +2851,8 @@ impl Scanner {
                 let columns_in_filter = Planner::column_names_in_expr(refine_expr);
                 let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
                 let filter_input = self.scan(true, false, true, None, filter_schema);
-                let planner = Planner::new(filter_input.schema());
-                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
                 let filtered_row_ids =
-                    Arc::new(FilterExec::try_new(physical_refine_expr, filter_input)?);
+                    Arc::new(LanceFilterExec::try_new(refine_expr.clone(), filter_input)?);
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             }
             // No prefilter
@@ -3110,7 +3175,7 @@ mod test {
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
     use crate::index::vector::{StageParams, VectorIndexParams};
-    use crate::utils::test::{IoStats, IoTrackingStore};
+    use crate::utils::test::{assert_plan_node_equals, IoStats, IoTrackingStore};
 
     #[tokio::test]
     async fn test_batch_size() {
@@ -4015,7 +4080,7 @@ mod test {
         let mut scan = dataset.scan();
         scan.filter("filterable > 5").unwrap();
         scan.nearest("vector", query_key.as_ref(), 1).unwrap();
-        scan.nprobs(100);
+        scan.minimum_nprobes(100);
         scan.with_row_id();
 
         let batches = scan
@@ -4316,7 +4381,7 @@ mod test {
             let key: Float32Array = (0..32).map(|_v| 1.0_f32).collect();
             scan.nearest("vec", &key, 5).unwrap();
             scan.refine(100);
-            scan.nprobs(100);
+            scan.minimum_nprobes(100);
 
             assert_eq!(
                 dataset.index_cache_entry_count(),
@@ -4352,7 +4417,7 @@ mod test {
             let mut scan = dataset.scan();
             scan.nearest("vec", &key, 5).unwrap();
             scan.refine(100);
-            scan.nprobs(100);
+            scan.minimum_nprobes(100);
 
             let results = scan
                 .try_into_stream()
@@ -4414,7 +4479,7 @@ mod test {
             let mut scan = dataset.scan();
             scan.nearest("vec", &key, 5).unwrap();
             scan.refine(100);
-            scan.nprobs(100);
+            scan.minimum_nprobes(100);
 
             let results = scan
                 .try_into_stream()
@@ -5082,39 +5147,6 @@ mod test {
         assert_eq!(batches.len(), 1000_usize.div_ceil(16));
     }
 
-    async fn assert_plan_node_equals(
-        plan_node: Arc<dyn ExecutionPlan>,
-        expected: &str,
-    ) -> Result<()> {
-        let plan_desc = format!(
-            "{}",
-            datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
-        );
-
-        let to_match = expected.split("...").collect::<Vec<_>>();
-        let num_pieces = to_match.len();
-        let mut remainder = plan_desc.as_str().trim_end_matches('\n');
-        for (i, piece) in to_match.into_iter().enumerate() {
-            let res = match i {
-                0 => remainder.starts_with(piece),
-                _ if i == num_pieces - 1 => remainder.ends_with(piece),
-                _ => remainder.contains(piece),
-            };
-            if !res {
-                break;
-            }
-            let idx = remainder.find(piece).unwrap();
-            remainder = &remainder[idx + piece.len()..];
-        }
-        if !remainder.is_empty() {
-            panic!(
-                "Expected plan to match:\nExpected: {}\nActual: {}",
-                expected, plan_desc
-            )
-        }
-        Ok(())
-    }
-
     /// Assert that the plan when formatted matches the expected string.
     ///
     /// Within expected, you can use `...` to match any number of characters.
@@ -5588,7 +5620,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=42), expr=...
         ANNSubIndex: name=..., k=42, deltas=1
-          ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5605,7 +5637,7 @@ mod test {
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=40), expr=...
                   ANNSubIndex: name=..., k=40, deltas=1
-                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+                    ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5641,7 +5673,7 @@ mod test {
           CoalesceBatchesExec: target_batch_size=8192
             SortExec: TopK(fetch=17), expr=...
               ANNSubIndex: name=..., k=17, deltas=1
-                ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+                ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5659,7 +5691,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=17), expr=...
         ANNSubIndex: name=..., k=17, deltas=1
-          ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
           FilterExec: i@0 > 10
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
@@ -5688,7 +5720,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=6), expr=...
                       ANNSubIndex: name=..., k=6, deltas=1
-                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5716,7 +5748,7 @@ mod test {
                         CoalesceBatchesExec: target_batch_size=8192
                           SortExec: TopK(fetch=15), expr=...
                             ANNSubIndex: name=..., k=15, deltas=1
-                              ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+                              ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await?;
 
@@ -5749,7 +5781,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
                       ANNSubIndex: name=..., k=5, deltas=1
-                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
                         FilterExec: i@0 > 10
                           LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
@@ -5774,7 +5806,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
-          ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
           ScalarIndexQuery: query=[i > 10]@i_idx",
         )
         .await?;
@@ -5793,7 +5825,7 @@ mod test {
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
-          ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
           FilterExec: i@0 > 10
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
@@ -5827,7 +5859,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=8), expr=...
                       ANNSubIndex: name=..., k=8, deltas=1
-                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
                         ScalarIndexQuery: query=[i > 10]@i_idx",
         )
         .await?;
@@ -5860,7 +5892,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=11), expr=...
                       ANNSubIndex: name=..., k=11, deltas=1
-                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
                         ScalarIndexQuery: query=[i > 10]@i_idx",
         )
         .await?;
@@ -6138,7 +6170,7 @@ mod test {
             "ProjectionExec: expr=[_rowid@1 as _rowid, _distance@0 as _distance]
   SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
-      ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+      ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await
         .unwrap();
@@ -6154,7 +6186,7 @@ mod test {
             "ProjectionExec: expr=[_rowid@1 as _rowid, _distance@0 as _distance]
   SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
-      ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+      ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await
         .unwrap();
@@ -6182,7 +6214,7 @@ mod test {
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]...
                   ANNSubIndex: name=idx, k=34, deltas=1
-                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+                    ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
         .await
         .unwrap();

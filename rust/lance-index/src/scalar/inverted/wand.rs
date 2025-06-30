@@ -407,7 +407,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             if self.check_block_max(pivot) {
-                if self.postings[0].doc().unwrap().doc_id() == doc_id {
+                if !self.postings[0].empty() && self.postings[0].doc().unwrap().doc_id() == doc_id {
                     // all the posting iterators preceding pivot have reached this doc id,
                     // so that means the sum of upper bound of all terms is not less than the threshold,
                     // this document is a candidate
@@ -478,10 +478,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn move_term(&mut self, least_id: u64) {
         let picked = self.pick_term(least_id);
         self.postings[picked].next(least_id);
-        if self.postings[picked].empty() {
-            self.postings.remove(picked);
-        }
         self.postings.sort_unstable();
+        while let Some(posting) = self.postings.last() {
+            if posting.empty() {
+                self.postings.pop();
+            } else {
+                break;
+            }
+        }
     }
 
     fn move_preceding(&mut self, pivot: usize, least_id: u64) {
@@ -503,9 +507,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut least_length = usize::MAX;
         let mut pick_index = 0;
         for (i, posting) in self.postings.iter().enumerate() {
-            let doc = posting.doc().unwrap();
-            if doc.doc_id() >= least_id {
-                continue;
+            if let Some(doc) = posting.doc() {
+                if doc.doc_id() >= least_id {
+                    continue;
+                }
             }
             // a shorter posting list means this term is rare and more likely to skip more documents,
             // so we prefer the term with a shorter posting list.
@@ -618,5 +623,95 @@ impl PositionIterator {
                 .partition_point(|&pos| (pos as i32) < least_pos),
             _ => unreachable!("position iterator only supports Int32 and UInt32"),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::buffer::ScalarBuffer;
+    use rstest::rstest;
+
+    use crate::{
+        metrics::NoOpMetricsCollector,
+        scalar::inverted::{
+            encoding::compress_posting_list, scorer::BM25Scorer, CompressedPostingList,
+            PlainPostingList,
+        },
+    };
+
+    use super::*;
+
+    fn generate_posting_list(
+        doc_ids: Vec<u32>,
+        max_score: f32,
+        is_compressed: bool,
+    ) -> PostingList {
+        let freqs = vec![1; doc_ids.len()];
+        let max_scores = vec![max_score; doc_ids.len()];
+        if is_compressed {
+            let blocks = compress_posting_list(
+                doc_ids.len(),
+                doc_ids.iter(),
+                freqs.iter(),
+                max_scores.into_iter(),
+            )
+            .unwrap();
+            PostingList::Compressed(CompressedPostingList::new(
+                blocks,
+                max_score,
+                doc_ids.len() as u32,
+                None,
+            ))
+        } else {
+            PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from_iter(doc_ids.iter().map(|id| *id as u64)),
+                ScalarBuffer::from_iter(freqs.iter().map(|freq| *freq as f32)),
+                Some(max_score),
+                None,
+            ))
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_wand(#[values(false, true)] is_compressed: bool) {
+        let mut docs = DocSet::default();
+        for i in 0..2 * BLOCK_SIZE {
+            docs.append(i as u64, 1);
+        }
+
+        // when the pivot is greater than 0, and the first posting list is exhausted after shallow_next
+        let postings = vec![
+            PostingIterator::new(
+                String::from("test"),
+                0,
+                0,
+                generate_posting_list(
+                    Vec::from_iter(0..=BLOCK_SIZE as u32 + 1),
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("full"),
+                1,
+                1,
+                generate_posting_list(vec![BLOCK_SIZE as u32 + 2], 1.0, is_compressed),
+                docs.len(),
+            ),
+        ];
+
+        let bm25 = BM25Scorer::new(std::iter::empty());
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        // This should trigger the bug when the second posting list becomes empty
+        let result = wand
+            .search(
+                &FtsSearchParams::default(),
+                Arc::new(RowIdMask::default()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(result.len(), 0); // Should not panic
     }
 }

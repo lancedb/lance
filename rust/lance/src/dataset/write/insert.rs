@@ -307,7 +307,12 @@ impl<'a> InsertBuilder<'a> {
                 }
                 let m = dataset.manifest.as_ref();
                 let mut schema_cmp_opts = SchemaCompareOptions {
-                    compare_dictionary: true,
+                    // In the legacy format we stored the dictionary in the manifest and
+                    // all files must have identical dictionaries.
+                    //
+                    // In 2.0+ the dictionary is stored in the files and dictionaries may
+                    // fluctuate between files.
+                    compare_dictionary: m.should_use_legacy_format(),
                     // array nullability is checked later, using actual data instead
                     // of the schema
                     compare_nullability: NullabilityComparison::Ignore,

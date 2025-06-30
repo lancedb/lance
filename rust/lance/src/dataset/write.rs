@@ -40,6 +40,7 @@ use super::transaction::Transaction;
 use super::DATA_DIR;
 
 mod commit;
+pub mod delete;
 mod insert;
 pub mod merge_insert;
 pub mod update;
@@ -307,7 +308,7 @@ pub async fn do_write_fragments(
             || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
         {
             let (num_rows, data_file) = writer.take().unwrap().finish().await?;
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_DATA, path = &data_file.path);
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
             debug_assert_eq!(num_rows, num_rows_in_current_file);
             params.progress.complete(fragments.last().unwrap()).await?;
             let last_fragment = fragments.last_mut().unwrap();
@@ -320,7 +321,7 @@ pub async fn do_write_fragments(
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
         let (num_rows, data_file) = writer.finish().await?;
-        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_DATA, path = &data_file.path);
+        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
         let last_fragment = fragments.last_mut().unwrap();
         last_fragment.physical_rows = Some(num_rows as usize);
         last_fragment.files.push(data_file);
@@ -369,7 +370,7 @@ pub async fn write_fragments_internal(
                         compare_nullability: NullabilityComparison::Ignore,
                         allow_missing_if_nullable: true,
                         ignore_field_order: true,
-                        compare_dictionary: true,
+                        compare_dictionary: dataset.is_legacy_storage(),
                         ..Default::default()
                     },
                 )?;

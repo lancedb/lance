@@ -12,7 +12,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Operator};
@@ -38,7 +38,7 @@ fn bench_inverted(c: &mut Criterion) {
         Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             index_dir,
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ))
     });
 
@@ -82,7 +82,7 @@ fn bench_inverted(c: &mut Criterion) {
             });
         })
     });
-    let invert_index = rt.block_on(InvertedIndex::load(store)).unwrap();
+    let invert_index = rt.block_on(InvertedIndex::load(store, None)).unwrap();
 
     let params = FtsSearchParams::new().with_limit(Some(10));
     let no_filter = Arc::new(NoFilter);

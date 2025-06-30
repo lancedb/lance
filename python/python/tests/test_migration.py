@@ -78,3 +78,12 @@ def test_old_btree_bitmap_indices(tmp_path: Path):
     assert ds.to_table(filter="btree > 2") == pa.table(
         {"bitmap": [3, 4], "btree": [3, 4]}
     )
+
+
+def test_index_no_details(tmp_path: Path):
+    """
+    In versions below 0.19.3 we did not write index details to the index metadata.
+    This test ensures that we can still read the old indices.
+    """
+    ds = prep_dataset(tmp_path, "v0.18.2", "index_no_details.lance")
+    assert ds.to_table(filter="id > 2").num_rows == 97

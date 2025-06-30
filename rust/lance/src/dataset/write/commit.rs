@@ -230,6 +230,11 @@ impl<'a> CommitBuilder<'a> {
             });
         }
 
+        let metadata_cache = match &dest {
+            WriteDestination::Dataset(ds) => ds.metadata_cache.clone(),
+            WriteDestination::Uri(uri) => Arc::new(session.metadata_cache.with_key_prefix(uri)),
+        };
+
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
             ds.manifest_location.naming_scheme
         } else if self.enable_v2_manifest_paths {
@@ -313,7 +318,7 @@ impl<'a> CommitBuilder<'a> {
                 &transaction,
                 &manifest_config,
                 manifest_naming_scheme,
-                &session,
+                metadata_cache.as_ref(),
             )
             .await?
         };
@@ -340,6 +345,7 @@ impl<'a> CommitBuilder<'a> {
                 session,
                 commit_handler,
                 tags,
+                metadata_cache,
             }),
         }
     }
@@ -684,7 +690,10 @@ mod tests {
         } else {
             // We need to read the other manifests and transactions.
             assert_eq!(io_stats.read_iops, 1 + num_other_txns * 2);
-            assert_eq!(io_stats.num_hops, 5);
+            // It's possible to read the txns for some versions before we
+            // finish reading later versions and so the entire "read versions
+            // and txs" may appear as 1 hop instead of 2.
+            assert!(io_stats.num_hops <= 5);
         }
         assert_eq!(io_stats.write_iops, 2); // txn + manifest
     }

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import pyarrow as pa
 
@@ -57,7 +57,12 @@ class LanceFileReader:
     """
 
     # TODO: make schema optional
-    def __init__(self, path: str, storage_options: Optional[Dict[str, str]] = None):
+    def __init__(
+        self,
+        path: str,
+        storage_options: Optional[Dict[str, str]] = None,
+        columns: Optional[List[str]] = None,
+    ):
         """
         Creates a new file reader to read the given file
 
@@ -70,10 +75,15 @@ class LanceFileReader:
         storage_options : optional, dict
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        columns: list of str, default None
+            List of column names to be fetched.
+            All columns are fetched if None or unspecified.
         """
         if isinstance(path, Path):
             path = str(path)
-        self._reader = _LanceFileReader(path, storage_options=storage_options)
+        self._reader = _LanceFileReader(
+            path, storage_options=storage_options, columns=columns
+        )
 
     def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
         """
@@ -168,6 +178,10 @@ class LanceFileReader:
             The contents of the global buffer
         """
         return self._reader.read_global_buffer(index)
+
+    def num_rows(self) -> int:
+        """Return the number of rows belonging to the data file."""
+        return self._reader.num_rows()
 
 
 class LanceFileWriter:

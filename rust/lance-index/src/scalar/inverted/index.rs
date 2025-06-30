@@ -32,7 +32,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
-use fst::{IntoStreamer, Streamer};
+use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
@@ -67,11 +67,12 @@ use super::{
     iter::{PostingListIterator, TokenIterator, TokenSource},
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
-use crate::prefilter::PreFilter;
+use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::{
     AnyQuery, IndexReader, IndexStore, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
 };
 use crate::Index;
+use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
@@ -212,7 +213,11 @@ impl InvertedIndex {
             .unzip())
     }
 
-    async fn load_legacy_index(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
+    async fn load_legacy_index(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<Self>> {
+        log::warn!("loading legacy FTS index");
         let tokens_fut = tokio::spawn({
             let store = store.clone();
             async move {
@@ -240,7 +245,7 @@ impl InvertedIndex {
             let store = store.clone();
             async move {
                 let docs_reader = store.open_index_file(DOCS_FILE).await?;
-                let docs = DocSet::load(docs_reader, true).await?;
+                let docs = DocSet::load(docs_reader, true, fri).await?;
                 Result::Ok(docs)
             }
         });
@@ -341,7 +346,7 @@ impl ScalarIndex for InvertedIndex {
         true
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
+    async fn load(store: Arc<dyn IndexStore>, fri: Option<Arc<FragReuseIndex>>) -> Result<Arc<Self>>
     where
         Self: Sized,
     {
@@ -369,7 +374,12 @@ impl ScalarIndex for InvertedIndex {
 
                 let partitions = partitions.into_iter().map(|id| {
                     let store = store.clone();
-                    async move { Result::Ok(Arc::new(InvertedPartition::load(store, id).await?)) }
+                    let fri_clone = fri.clone();
+                    async move {
+                        Result::Ok(Arc::new(
+                            InvertedPartition::load(store, id, fri_clone).await?,
+                        ))
+                    }
                 });
                 let partitions = stream::iter(partitions)
                     .buffer_unordered(store.io_parallelism())
@@ -385,7 +395,7 @@ impl ScalarIndex for InvertedIndex {
             }
             Err(_) => {
                 // old index format
-                Self::load_legacy_index(store).await
+                Self::load_legacy_index(store, fri).await
             }
         }
     }
@@ -432,13 +442,17 @@ impl InvertedPartition {
         self.inverted_list.lengths.is_none()
     }
 
-    pub async fn load(store: Arc<dyn IndexStore>, id: u64) -> Result<Self> {
+    pub async fn load(
+        store: Arc<dyn IndexStore>,
+        id: u64,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
         let inverted_list = PostingListReader::try_new(invert_list_file).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
-        let docs = DocSet::load(docs_file, false).await?;
+        let docs = DocSet::load(docs_file, false, fri).await?;
 
         Ok(Self {
             id,
@@ -453,15 +467,10 @@ impl InvertedPartition {
         self.tokens.get(token)
     }
 
-    pub fn expand_fuzzy(
-        &self,
-        tokens: &[String],
-        fuzziness: Option<u32>,
-        max_expansions: usize,
-    ) -> Result<Vec<String>> {
-        let mut new_tokens = Vec::with_capacity(min(tokens.len(), max_expansions));
+    pub fn expand_fuzzy(&self, tokens: &[String], params: &FtsSearchParams) -> Result<Vec<String>> {
+        let mut new_tokens = Vec::with_capacity(min(tokens.len(), params.max_expansions));
         for token in tokens {
-            let fuzziness = match fuzziness {
+            let fuzziness = match params.fuzziness {
                 Some(fuzziness) => fuzziness,
                 None => MatchQuery::auto_fuzziness(token),
             };
@@ -470,12 +479,18 @@ impl InvertedPartition {
                     message: format!("failed to construct the fuzzy query: {}", e),
                     location: location!(),
                 })?;
+
             if let TokenMap::Fst(ref map) = self.tokens.tokens {
-                let mut stream = map.search(lev).into_stream();
-                while let Some((token, _)) = stream.next() {
-                    new_tokens.push(String::from_utf8_lossy(token).into_owned());
-                    if new_tokens.len() >= max_expansions {
-                        break;
+                match params.prefix_length {
+                    0 => take_fst_keys(map.search(lev), &mut new_tokens, params.max_expansions),
+                    prefix_length => {
+                        let prefix = &token[..min(prefix_length as usize, token.len())];
+                        let prefix = fst::automaton::Str::new(prefix).starts_with();
+                        take_fst_keys(
+                            map.search(lev.intersection(prefix)),
+                            &mut new_tokens,
+                            params.max_expansions,
+                        )
                     }
                 }
             } else {
@@ -503,7 +518,7 @@ impl InvertedPartition {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let is_phrase_query = params.phrase_slop.is_some();
         let tokens = match is_fuzzy {
-            true => self.expand_fuzzy(tokens, params.fuzziness, params.max_expansions)?,
+            true => self.expand_fuzzy(tokens, params)?,
             false => tokens.to_vec(),
         };
         let mut token_ids = Vec::with_capacity(tokens.len());
@@ -558,7 +573,11 @@ impl InvertedPartition {
         builder
             .posting_lists
             .reserve_exact(self.inverted_list.len());
-        for posting_list in self.inverted_list.read_all(true).await? {
+        for posting_list in self
+            .inverted_list
+            .read_all(self.inverted_list.has_positions())
+            .await?
+        {
             let posting_list = posting_list?;
             builder
                 .posting_lists
@@ -937,7 +956,7 @@ impl PostingListReader {
             .posting_cache
             .try_get_with(token_id, async move {
                 metrics.record_part_load();
-                info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
+                info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
                self.posting_list_from_batch(&batch, token_id)
             })
@@ -1014,7 +1033,7 @@ impl PostingListReader {
                 .await.map_err(|e| {
                     match e {
                         Error::Schema { .. } => Error::Index {
-                            message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), 
+                            message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
                             location: location!(),
                         },
                         e => e
@@ -1291,6 +1310,20 @@ impl DeepSizeOf for CompressedPostingList {
 }
 
 impl CompressedPostingList {
+    pub fn new(
+        blocks: LargeBinaryArray,
+        max_score: f32,
+        length: u32,
+        positions: Option<ListArray>,
+    ) -> Self {
+        Self {
+            max_score,
+            length,
+            blocks,
+            positions,
+        }
+    }
+
     pub fn from_batch(batch: &RecordBatch, max_score: f32, length: u32) -> Self {
         debug_assert_eq!(batch.num_rows(), 1);
         let blocks = batch[POSTING_COL]
@@ -1406,8 +1439,8 @@ impl PostingListBuilder {
         }
         let compressed = compress_posting_list(
             self.doc_ids.len(),
-            self.doc_ids.block_iter(),
-            self.frequencies.block_iter(),
+            self.doc_ids.iter(),
+            self.frequencies.iter(),
             block_max_scores.into_iter(),
         )?;
         let schema = inverted_list_schema(self.has_positions());
@@ -1708,7 +1741,11 @@ impl DocSet {
         Ok(batch)
     }
 
-    pub async fn load(reader: Arc<dyn IndexReader>, is_legacy: bool) -> Result<Self> {
+    pub async fn load(
+        reader: Arc<dyn IndexReader>,
+        is_legacy: bool,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
@@ -1720,11 +1757,28 @@ impl DocSet {
             true => row_id_col
                 .values()
                 .iter()
+                .filter_map(|id| {
+                    if let Some(fri_ref) = fri.as_ref() {
+                        fri_ref.remap_row_id(*id)
+                    } else {
+                        Some(*id)
+                    }
+                })
                 .zip(num_tokens_col.values().iter())
                 .sorted_unstable_by_key(|x| x.0)
                 .unzip(),
             false => {
-                let row_ids = row_id_col.values().to_vec();
+                let row_ids = row_id_col
+                    .values()
+                    .iter()
+                    .filter_map(|id| {
+                        if let Some(fri_ref) = fri.as_ref() {
+                            fri_ref.remap_row_id(*id)
+                        } else {
+                            Some(*id)
+                        }
+                    })
+                    .collect();
                 let num_tokens = num_tokens_col.values().to_vec();
                 (row_ids, num_tokens)
             }
@@ -1926,6 +1980,7 @@ pub fn flat_bm25_search_stream(
             .collect::<Vec<_>>();
         let mask = BooleanArray::from(mask);
         let batch = arrow::compute::filter_record_batch(&batch, &mask)?;
+        debug_assert!(batch[ROW_ID].null_count() == 0, "flat FTS produces nulls");
         Ok(batch)
     });
 
@@ -1934,4 +1989,49 @@ pub fn flat_bm25_search_stream(
 
 pub fn is_phrase_query(query: &str) -> bool {
     query.starts_with('\"') && query.ends_with('\"')
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::scalar::inverted::encoding::decompress_posting_list;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_posting_builder_remap() {
+        let mut builder = PostingListBuilder::new(false);
+        let n = BLOCK_SIZE + 3;
+        for i in 0..n {
+            builder.add(i as u32, PositionRecorder::Count(1));
+        }
+        let removed = vec![5, 7];
+        builder.remap(&removed);
+
+        let mut expected = PostingListBuilder::new(false);
+        for i in 0..n - removed.len() {
+            expected.add(i as u32, PositionRecorder::Count(1));
+        }
+        assert_eq!(builder.doc_ids, expected.doc_ids);
+        assert_eq!(builder.frequencies, expected.frequencies);
+
+        // BLOCK_SIZE + 3 elements should be reduced to BLOCK_SIZE + 1,
+        // there are still 2 blocks.
+        let batch = builder.to_batch(vec![1.0, 2.0]).unwrap();
+        let (doc_ids, freqs) = decompress_posting_list(
+            (n - removed.len()) as u32,
+            batch[POSTING_COL]
+                .as_list::<i32>()
+                .value(0)
+                .as_binary::<i64>(),
+        )
+        .unwrap();
+        assert!(doc_ids
+            .iter()
+            .zip(expected.doc_ids.iter())
+            .all(|(a, b)| a == b));
+        assert!(freqs
+            .iter()
+            .zip(expected.frequencies.iter())
+            .all(|(a, b)| a == b));
+    }
 }

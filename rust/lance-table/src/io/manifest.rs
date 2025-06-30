@@ -36,12 +36,12 @@ pub async fn read_manifest(
     known_size: Option<u64>,
 ) -> Result<Manifest> {
     let file_size = if let Some(known_size) = known_size {
-        known_size as usize
+        known_size
     } else {
         object_store.inner.head(path).await?.size
     };
-    const PREFETCH_SIZE: usize = 64 * 1024;
-    let initial_start = std::cmp::max(file_size as i64 - PREFETCH_SIZE as i64, 0) as usize;
+    const PREFETCH_SIZE: u64 = 64 * 1024;
+    let initial_start = file_size.saturating_sub(PREFETCH_SIZE);
     let range = Range {
         start: initial_start,
         end: file_size,
@@ -67,7 +67,7 @@ pub async fn read_manifest(
         ));
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
-    let manifest_len = file_size - manifest_pos;
+    let manifest_len = file_size as usize - manifest_pos;
 
     let buf: Bytes = if manifest_len <= buf.len() {
         // The prefetch captured the entire manifest. We just need to trim the buffer.
@@ -80,7 +80,7 @@ pub async fn read_manifest(
             .get_range(
                 path,
                 Range {
-                    start: manifest_pos,
+                    start: manifest_pos as u64,
                     end: file_size - PREFETCH_SIZE,
                 },
             )
@@ -126,11 +126,12 @@ pub async fn read_manifest_indexes(
         };
         let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
 
-        Ok(section
+        let indices = section
             .indices
             .into_iter()
             .map(Index::try_from)
-            .collect::<Result<Vec<_>>>()?)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(indices)
     } else {
         Ok(vec![])
     }
@@ -161,9 +162,10 @@ pub async fn write_manifest(
 ) -> Result<usize> {
     // Write dictionary values.
     let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);
+    let is_legacy_storage = manifest.should_use_legacy_format();
     for field_id in 0..max_field_id + 1 {
         if let Some(field) = manifest.schema.mut_field_by_id(field_id) {
-            if field.data_type().is_dictionary() {
+            if field.data_type().is_dictionary() && is_legacy_storage {
                 let dict_info = field.dictionary.as_mut().ok_or_else(|| {
                     Error::io(
                         format!("Lance field {} misses dictionary info", field.name),

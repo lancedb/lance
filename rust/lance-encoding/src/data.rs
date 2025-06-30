@@ -20,10 +20,11 @@ use std::{
 };
 
 use arrow::array::{ArrayData, ArrayDataBuilder, AsArray};
-use arrow_array::{new_empty_array, new_null_array, Array, ArrayRef, UInt64Array};
-use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
+use arrow_array::{new_empty_array, new_null_array, Array, ArrayRef, OffsetSizeTrait, UInt64Array};
+use arrow_buffer::{
+    ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer,
+};
 use arrow_schema::DataType;
-use bytemuck::try_cast_slice;
 use lance_arrow::DataTypeExt;
 use snafu::location;
 
@@ -252,34 +253,33 @@ impl FixedWidthDataBlock {
 }
 
 #[derive(Debug)]
-pub struct VariableWidthDataBlockBuilder {
-    offsets: Vec<u32>,
+pub struct VariableWidthDataBlockBuilder<T: OffsetSizeTrait> {
+    offsets: Vec<T>,
     bytes: Vec<u8>,
 }
 
-impl VariableWidthDataBlockBuilder {
+impl<T: OffsetSizeTrait> VariableWidthDataBlockBuilder<T> {
     fn new(estimated_size_bytes: u64) -> Self {
         Self {
-            offsets: vec![0u32],
+            offsets: vec![T::from_usize(0).unwrap()],
             bytes: Vec::with_capacity(estimated_size_bytes as usize),
         }
     }
 }
 
-impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
+impl<T: OffsetSizeTrait> DataBlockBuilderImpl for VariableWidthDataBlockBuilder<T> {
     fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
         let block = data_block.as_variable_width_ref().unwrap();
-        assert!(block.bits_per_offset == 32);
+        assert!(block.bits_per_offset == T::get_byte_width() as u8 * 8);
 
-        let offsets: &[u32] = try_cast_slice(&block.offsets)
-            .expect("cast from a bits_per_offset=32 `VariableWidthDataBlock's offsets field field to &[32] should be fine.");
+        let offsets: ScalarBuffer<T> = block.offsets.try_clone().unwrap().borrow_to_typed_slice();
 
         let start_offset = offsets[selection.start as usize];
         let end_offset = offsets[selection.end as usize];
         let mut previous_len = self.bytes.len();
 
         self.bytes
-            .extend_from_slice(&block.data[start_offset as usize..end_offset as usize]);
+            .extend_from_slice(&block.data[start_offset.as_usize()..end_offset.as_usize()]);
 
         self.offsets.extend(
             offsets[selection.start as usize..selection.end as usize]
@@ -287,8 +287,8 @@ impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
                 .zip(&offsets[selection.start as usize + 1..=selection.end as usize])
                 .map(|(&current, &next)| {
                     let this_value_len = next - current;
-                    previous_len += this_value_len as usize;
-                    previous_len as u32
+                    previous_len += this_value_len.as_usize();
+                    T::from_usize(previous_len).unwrap()
                 }),
         );
     }
@@ -298,7 +298,7 @@ impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
         DataBlock::VariableWidth(VariableWidthBlock {
             data: LanceBuffer::Owned(self.bytes),
             offsets: LanceBuffer::reinterpret_vec(self.offsets),
-            bits_per_offset: 32,
+            bits_per_offset: T::get_byte_width() as u8 * 8,
             num_values,
             block_info: BlockInfo::new(),
         })
@@ -1085,7 +1085,13 @@ impl DataBlock {
             }
             Self::VariableWidth(inner) => {
                 if inner.bits_per_offset == 32 {
-                    Box::new(VariableWidthDataBlockBuilder::new(estimated_size_bytes))
+                    Box::new(VariableWidthDataBlockBuilder::<i32>::new(
+                        estimated_size_bytes,
+                    ))
+                } else if inner.bits_per_offset == 64 {
+                    Box::new(VariableWidthDataBlockBuilder::<i64>::new(
+                        estimated_size_bytes,
+                    ))
                 } else {
                     todo!()
                 }

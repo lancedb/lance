@@ -18,7 +18,7 @@ use deepsize::DeepSizeOf;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::iter_str_array;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{cache::FileMetadataCache, utils::tokio::spawn_cpu};
+use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use lazy_static::lazy_static;
@@ -93,7 +93,7 @@ impl InvertedIndexBuilder {
         let local_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
         let src_store = store.unwrap_or_else(|| local_store.clone());
         Self {
@@ -159,12 +159,20 @@ impl InvertedIndexBuilder {
             index_tasks.push(task);
         }
 
-        let mut stream = flatten_stream.map(|batch| {
-            let batch = batch?;
-            let num_rows = batch.num_rows();
-            sender.send_blocking(batch).expect("failed to send batch");
-            Result::Ok(num_rows)
-        });
+        let sender = Arc::new(sender);
+
+        let mut stream = Box::pin(flatten_stream.then({
+            |batch_result| {
+                let sender = sender.clone();
+                async move {
+                    let sender = sender.clone();
+                    let batch = batch_result?;
+                    let num_rows = batch.num_rows();
+                    sender.send(batch).await.expect("failed to send batch");
+                    Result::Ok(num_rows)
+                }
+            }
+        }));
         log::info!("indexing FTS with {} workers", num_workers);
 
         let mut last_num_rows = 0;
@@ -204,7 +212,7 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         for part in self.partitions.iter() {
-            let part = InvertedPartition::load(src_store.clone(), *part).await?;
+            let part = InvertedPartition::load(src_store.clone(), *part, None).await?;
             let mut builder = part.into_builder().await?;
             builder.remap(mapping).await?;
             builder.write(dest_store).await?;
@@ -226,17 +234,16 @@ impl InvertedIndexBuilder {
     }
 
     async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
-        let partitions = futures::future::try_join_all(
-            self.partitions
-                .iter()
-                .map(|part| InvertedPartition::load(self.src_store.clone(), *part))
-                .chain(
-                    self.new_partitions
-                        .iter()
-                        .map(|part| InvertedPartition::load(self.local_store.clone(), *part)),
-                ),
-        )
-        .await?;
+        let partitions =
+            futures::future::try_join_all(
+                self.partitions
+                    .iter()
+                    .map(|part| InvertedPartition::load(self.src_store.clone(), *part, None))
+                    .chain(self.new_partitions.iter().map(|part| {
+                        InvertedPartition::load(self.local_store.clone(), *part, None)
+                    })),
+            )
+            .await?;
         let mut merger = SizeBasedMerger::new(dest_store, partitions, *LANCE_FTS_TARGET_SIZE << 20);
         let partitions = merger.merge().await?;
         self.write_metadata(dest_store, &partitions).await?;

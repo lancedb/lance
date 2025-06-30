@@ -7,7 +7,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use builder::SQBuildParams;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
@@ -31,15 +31,7 @@ pub mod transform;
 // TODO: move this to be pub(crate) once we have a better way to test it.
 #[derive(Debug, Clone)]
 pub struct ScalarQuantizer {
-    /// Number of bits for the centroids.
-    ///
-    /// Only support 8, as one of `u8` byte now.
-    pub num_bits: u16,
-
-    /// Original dimension of the vectors.
-    pub dim: usize,
-
-    pub bounds: Range<f64>,
+    metadata: ScalarQuantizationMetadata,
 }
 
 impl DeepSizeOf for ScalarQuantizer {
@@ -51,23 +43,25 @@ impl DeepSizeOf for ScalarQuantizer {
 impl ScalarQuantizer {
     pub fn new(num_bits: u16, dim: usize) -> Self {
         Self {
-            num_bits,
-            dim,
-            bounds: Range::<f64> {
-                start: f64::MAX,
-                end: f64::MIN,
+            metadata: ScalarQuantizationMetadata {
+                num_bits,
+                dim,
+                bounds: Range::<f64> {
+                    start: f64::MAX,
+                    end: f64::MIN,
+                },
             },
         }
     }
 
     pub fn with_bounds(num_bits: u16, dim: usize, bounds: Range<f64>) -> Self {
         let mut sq = Self::new(num_bits, dim);
-        sq.bounds = bounds;
+        sq.metadata.bounds = bounds;
         sq
     }
 
     pub fn num_bits(&self) -> u16 {
-        self.num_bits
+        self.metadata.num_bits
     }
 
     pub fn update_bounds<T: ArrowFloatType>(
@@ -87,11 +81,11 @@ impl ScalarQuantizer {
             })?
             .as_slice();
 
-        self.bounds = data.iter().fold(self.bounds.clone(), |f, v| {
+        self.metadata.bounds = data.iter().fold(self.metadata.bounds.clone(), |f, v| {
             f.start.min(v.as_())..f.end.max(v.as_())
         });
 
-        Ok(self.bounds.clone())
+        Ok(self.metadata.bounds.clone())
     }
 
     pub fn transform<T: ArrowFloatType>(&self, data: &dyn Array) -> Result<ArrayRef> {
@@ -119,7 +113,7 @@ impl ScalarQuantizer {
             .as_slice();
 
         // TODO: support SQ4
-        let builder: Vec<u8> = scale_to_u8::<T>(data, &self.bounds);
+        let builder: Vec<u8> = scale_to_u8::<T>(data, &self.metadata.bounds);
 
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
             UInt8Array::from(builder),
@@ -128,7 +122,7 @@ impl ScalarQuantizer {
     }
 
     pub fn bounds(&self) -> Range<f64> {
-        self.bounds.clone()
+        self.metadata.bounds.clone()
     }
 
     /// Whether to use residual as input or not.
@@ -217,7 +211,7 @@ impl Quantization for ScalarQuantizer {
     }
 
     fn code_dim(&self) -> usize {
-        self.dim
+        self.metadata.dim
     }
 
     fn column(&self) -> &'static str {
@@ -244,20 +238,25 @@ impl Quantization for ScalarQuantizer {
         QuantizationType::Scalar
     }
 
-    fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
-        Ok(serde_json::to_value(ScalarQuantizationMetadata {
-            dim: self.dim,
-            num_bits: self.num_bits(),
-            bounds: self.bounds(),
-        })?)
+    fn metadata(&self, _: Option<QuantizationMetadata>) -> Self::Metadata {
+        self.metadata.clone()
     }
 
     fn from_metadata(metadata: &Self::Metadata, _: DistanceType) -> Result<Quantizer> {
-        Ok(Quantizer::Scalar(Self::with_bounds(
-            metadata.num_bits,
-            metadata.dim,
-            metadata.bounds.clone(),
-        )))
+        Ok(Quantizer::Scalar(Self {
+            metadata: metadata.clone(),
+        }))
+    }
+
+    fn field(&self) -> Field {
+        Field::new(
+            SQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                self.code_dim() as i32,
+            ),
+            true,
+        )
     }
 }
 
@@ -304,9 +303,9 @@ mod tests {
         let mut sq = ScalarQuantizer::new(8, float_values.len());
 
         sq.update_bounds::<Float16Type>(&vectors).unwrap();
-        assert_eq!(sq.bounds.start, float_values[0].to_f64());
+        assert_eq!(sq.bounds().start, float_values[0].to_f64());
         assert_eq!(
-            sq.bounds.end,
+            sq.bounds().end,
             float_values.last().cloned().unwrap().to_f64()
         );
 
@@ -333,9 +332,9 @@ mod tests {
         let mut sq = ScalarQuantizer::new(8, float_values.len());
 
         sq.update_bounds::<Float32Type>(&vectors).unwrap();
-        assert_eq!(sq.bounds.start, float_values[0].to_f64().unwrap());
+        assert_eq!(sq.bounds().start, float_values[0].to_f64().unwrap());
         assert_eq!(
-            sq.bounds.end,
+            sq.bounds().end,
             float_values.last().cloned().unwrap().to_f64().unwrap()
         );
 
@@ -362,8 +361,8 @@ mod tests {
         let mut sq = ScalarQuantizer::new(8, float_values.len());
 
         sq.update_bounds::<Float64Type>(&vectors).unwrap();
-        assert_eq!(sq.bounds.start, float_values[0]);
-        assert_eq!(sq.bounds.end, float_values.last().cloned().unwrap());
+        assert_eq!(sq.bounds().start, float_values[0]);
+        assert_eq!(sq.bounds().end, float_values.last().cloned().unwrap());
 
         let sq_code = sq.transform::<Float64Type>(&vectors).unwrap();
         let sq_values = sq_code

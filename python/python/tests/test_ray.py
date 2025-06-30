@@ -189,7 +189,7 @@ def test_lance_parallel_merge_columns(tmp_path: Path):
         .write_lance(tmp_path, schema=schema)
     )
     lance_ds = lance.dataset(tmp_path)
-    add_columns(lance_ds, generate_label, ["height"])
+    add_columns(lance_ds, generate_label, source_columns=["height"])
     ds = lance.dataset(tmp_path)
     tbl = ds.to_table()
     size_labels = sorted(tbl.column("size_labels").to_pylist())

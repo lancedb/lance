@@ -136,7 +136,7 @@ impl Reader for CloudObjectReader {
                 let meta = self
                     .do_with_retry(|| self.object_store.head(&self.path))
                     .await?;
-                Ok(meta.size)
+                Ok(meta.size as usize)
             })
             .await
             .cloned()
@@ -147,7 +147,13 @@ impl Reader for CloudObjectReader {
         self.do_get_with_outer_retry(
             || {
                 let options = GetOptions {
-                    range: Some(range.clone().into()),
+                    range: Some(
+                        Range {
+                            start: range.start as u64,
+                            end: range.end as u64,
+                        }
+                        .into(),
+                    ),
                     ..Default::default()
                 };
                 self.object_store.get_opts(&self.path, options)

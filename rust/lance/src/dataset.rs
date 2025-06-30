@@ -12,10 +12,10 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 use itertools::Itertools;
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
@@ -77,8 +77,8 @@ use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments, manifest_cache_path, read_transaction_file,
-    transaction_file_cache_path,
+    detect_overlapping_fragments, manifest_cache_key, read_transaction_file,
+    transaction_file_cache_key,
 };
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
@@ -107,7 +107,10 @@ const INDICES_DIR: &str = "_indices";
 pub const DATA_DIR: &str = "data";
 pub const BLOB_DIR: &str = "_blobs";
 pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
-pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
+// Default to 1 GiB for the metadata cache. Column metadata can be like 40MB,
+// so this should be enough for a few hundred columns. Other metadata is much
+// smaller.
+pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Lance Dataset
 #[derive(Clone)]
@@ -126,6 +129,9 @@ pub struct Dataset {
     pub(crate) manifest_location: ManifestLocation,
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
+
+    // These are references to session caches, but with the dataset URI as a prefix.
+    pub(crate) metadata_cache: Arc<LanceCache>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -170,9 +176,9 @@ pub struct ReadParams {
     ///
     pub index_cache_size: usize,
 
-    /// Metadata cache size for the fragment metadata. If it is zero, metadata
-    /// cache is disabled.
-    pub metadata_cache_size: usize,
+    /// Size of the metadata cache in bytes. This cache stores metadata in memory
+    /// for faster open table and scans. The default is 1 GiB.
+    pub metadata_cache_size_bytes: usize,
 
     /// If present, dataset will use this shared [`Session`] instead creating a new one.
     ///
@@ -208,8 +214,19 @@ impl ReadParams {
     }
 
     /// Set the cache size for the file metadata. Set to zero to disable this cache.
+    #[deprecated(
+        since = "0.30.0",
+        note = "Use `metadata_cache_size_bytes` instead, which accepts a size in bytes."
+    )]
     pub fn metadata_cache_size(&mut self, cache_size: usize) -> &mut Self {
-        self.metadata_cache_size = cache_size;
+        let assumed_entry_size = 10 * 1024 * 1024; // 10 MiB per entry
+        self.metadata_cache_size_bytes = cache_size * assumed_entry_size;
+        self
+    }
+
+    /// Set the cache size for the file metadata in bytes.
+    pub fn metadata_cache_size_bytes(&mut self, cache_size: usize) -> &mut Self {
+        self.metadata_cache_size_bytes = cache_size;
         self
     }
 
@@ -229,7 +246,7 @@ impl Default for ReadParams {
     fn default() -> Self {
         Self {
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
-            metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
+            metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             session: None,
             store_options: None,
             commit_handler: None,
@@ -465,7 +482,9 @@ impl Dataset {
             }
         }
 
-        populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
+        if manifest.should_use_legacy_format() {
+            populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
+        }
 
         Ok(manifest)
     }
@@ -485,6 +504,7 @@ impl Dataset {
             commit_handler.clone(),
             base_path.clone(),
         );
+        let metadata_cache = Arc::new(session.metadata_cache.with_key_prefix(&uri));
         Ok(Self {
             object_store,
             base: base_path,
@@ -494,6 +514,7 @@ impl Dataset {
             commit_handler,
             session,
             tags,
+            metadata_cache,
         })
     }
 
@@ -599,8 +620,8 @@ impl Dataset {
             .await?;
 
         // Check if manifest is in cache before reading from storage
-        let cache_path = manifest_cache_path(&location);
-        let cached_manifest = self.session.file_metadata_cache.get(&cache_path);
+        let cache_key = manifest_cache_key(&location);
+        let cached_manifest = self.metadata_cache.get(&cache_key);
         if let Some(cached_manifest) = cached_manifest {
             return Ok((cached_manifest, location));
         }
@@ -609,7 +630,7 @@ impl Dataset {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
-        if manifest.schema.has_dictionary_types() {
+        if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
             let reader = if let Some(size) = location.size {
                 self.object_store
                     .open_with_size(&location.path, size as usize)
@@ -850,6 +871,11 @@ impl Dataset {
         Ok(())
     }
 
+    /// Get the table config from manifest
+    pub fn config(&self) -> Result<HashMap<String, String>> {
+        Ok(self.manifest.config.clone())
+    }
+
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(Arc::new(self.clone()))
@@ -988,46 +1014,7 @@ impl Dataset {
 
     /// Delete rows based on a predicate.
     pub async fn delete(&mut self, predicate: &str) -> Result<()> {
-        let mut updated_fragments: Vec<Fragment> = Vec::new();
-        let mut deleted_fragment_ids: Vec<u64> = Vec::new();
-        stream::iter(self.get_fragments())
-            .map(|f| async move {
-                let old_fragment = f.metadata.clone();
-                let new_fragment = f.delete(predicate).await?.map(|f| f.metadata);
-                Ok((old_fragment, new_fragment))
-            })
-            .buffer_unordered(get_num_compute_intensive_cpus())
-            // Drop the fragments that were deleted.
-            .try_for_each(|(old_fragment, new_fragment)| {
-                if let Some(new_fragment) = new_fragment {
-                    if new_fragment != old_fragment {
-                        updated_fragments.push(new_fragment);
-                    }
-                } else {
-                    deleted_fragment_ids.push(old_fragment.id);
-                }
-                futures::future::ready(Ok::<_, crate::Error>(()))
-            })
-            .await?;
-
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::Delete {
-                updated_fragments,
-                deleted_fragment_ids,
-                predicate: predicate.to_string(),
-            },
-            // No change is needed to the blobs dataset.  The blobs are implicitly deleted since the
-            // rows that reference them are deleted.
-            /*blobs_op=*/
-            None,
-            None,
-        );
-
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-
-        Ok(())
+        write::delete::delete(self, predicate).await
     }
 
     pub async fn count_deleted_rows(&self) -> Result<usize> {
@@ -1042,7 +1029,7 @@ impl Dataset {
         &self.object_store
     }
 
-    pub(crate) fn data_dir(&self) -> Path {
+    pub fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
     }
 
@@ -1485,11 +1472,10 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .map_ok(move |location| {
             let latest_tx = latest_tx.take();
             async move {
-                let cache_path = manifest_cache_path(&location);
+                let cache_key = manifest_cache_key(&location);
                 let manifest = dataset
-                    .session
-                    .file_metadata_cache
-                    .get_or_insert(&cache_path, |_| {
+                    .metadata_cache
+                    .get_or_insert(cache_key, |_| {
                         Dataset::load_manifest(
                             dataset.object_store(),
                             &location,
@@ -1510,12 +1496,11 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .try_buffer_unordered(io_parallelism / 2);
     let transactions = manifests
         .map_ok(move |(manifest, location)| async move {
-            let cache_path = transaction_file_cache_path(&dataset.base, manifest.version);
+            let cache_key = transaction_file_cache_key(manifest.version);
             let manifest_copy = manifest.clone();
             let transaction = dataset
-                .session
-                .file_metadata_cache
-                .get_or_insert(&cache_path, |_| async move {
+                .metadata_cache
+                .get_or_insert(cache_key, |_| async move {
                     let dataset_version = Dataset::checkout_manifest(
                         dataset.object_store.clone(),
                         dataset.base.clone(),
@@ -1870,7 +1855,7 @@ fn write_manifest_file_to_path<'a>(
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
         let res = object_writer.shutdown().await?;
-        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_MANIFEST, path = path.to_string());
+        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
         Ok(res)
     })
 }
@@ -1891,7 +1876,7 @@ mod tests {
     use crate::dataset::transaction::DataReplacementGroup;
     use crate::dataset::WriteMode::Overwrite;
     use crate::index::vector::VectorIndexParams;
-    use crate::utils::test::TestDatasetGenerator;
+    use crate::utils::test::copy_test_data_to_tmp;
 
     use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
@@ -1927,10 +1912,12 @@ mod tests {
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
 
+    use all_asserts::assert_true;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
     use rstest::rstest;
+    use std::cmp::Ordering;
     use tempfile::{tempdir, TempDir};
 
     // Used to validate that futures returned are Send.
@@ -2627,8 +2614,12 @@ mod tests {
         assert!(matches!(result, Err(Error::SchemaMismatch { .. })))
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn append_dictionary() {
+    async fn append_dictionary(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         // We store the dictionary as part of the schema, so we check that the
         // dictionary is consistent between appends.
 
@@ -2652,6 +2643,7 @@ mod tests {
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2687,10 +2679,14 @@ mod tests {
         )
         .unwrap()];
 
-        // Try write to dataset (fail)
+        // Try write to dataset (fails with legacy format)
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let result = Dataset::write(batches, test_uri, Some(write_params)).await;
-        assert!(result.is_err());
+        if data_storage_version == LanceFileVersion::Legacy {
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok());
+        }
     }
 
     #[rstest]
@@ -3667,176 +3663,6 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_delete(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-        data_storage_version: LanceFileVersion,
-        #[values(false, true)] with_scalar_index: bool,
-    ) {
-        use std::collections::HashSet;
-
-        fn sequence_data(range: Range<u32>) -> RecordBatch {
-            let schema = Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("i", DataType::UInt32, false),
-                ArrowField::new("x", DataType::UInt32, false),
-            ]));
-            RecordBatch::try_new(
-                schema,
-                vec![
-                    Arc::new(UInt32Array::from_iter_values(range.clone())),
-                    Arc::new(UInt32Array::from_iter_values(range.map(|v| v * 2))),
-                ],
-            )
-            .unwrap()
-        }
-        // Write a dataset
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::UInt32, false),
-            ArrowField::new("x", DataType::UInt32, false),
-        ]));
-        let data = sequence_data(0..100);
-        // Split over two files.
-        let batches = vec![data.slice(0, 50), data.slice(50, 50)];
-        let mut dataset = TestDatasetGenerator::new(batches, data_storage_version)
-            .make_hostile(test_uri)
-            .await;
-
-        if with_scalar_index {
-            dataset
-                .create_index(
-                    &["i"],
-                    IndexType::Scalar,
-                    Some("scalar_index".to_string()),
-                    &ScalarIndexParams::default(),
-                    false,
-                )
-                .await
-                .unwrap();
-        }
-
-        // Delete nothing
-        dataset.delete("i < 0").await.unwrap();
-        dataset.validate().await.unwrap();
-
-        // We should not have any deletion file still
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 2);
-        assert_eq!(dataset.count_fragments(), 2);
-        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 0);
-        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
-        assert!(fragments[0].metadata.deletion_file.is_none());
-        assert!(fragments[1].metadata.deletion_file.is_none());
-
-        // Delete rows
-        dataset.delete("i < 10 OR i >= 90").await.unwrap();
-        dataset.validate().await.unwrap();
-
-        // Verify result:
-        // There should be a deletion file in the metadata
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 2);
-        assert_eq!(dataset.count_fragments(), 2);
-        assert!(fragments[0].metadata.deletion_file.is_some());
-        assert!(fragments[1].metadata.deletion_file.is_some());
-        assert_eq!(
-            fragments[0]
-                .metadata
-                .deletion_file
-                .as_ref()
-                .unwrap()
-                .num_deleted_rows,
-            Some(10)
-        );
-        assert_eq!(
-            fragments[1]
-                .metadata
-                .deletion_file
-                .as_ref()
-                .unwrap()
-                .num_deleted_rows,
-            Some(10)
-        );
-
-        // The deletion file should contain 20 rows
-        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);
-        // First fragment has 0..10 deleted
-        let deletion_vector = fragments[0].get_deletion_vector().await.unwrap().unwrap();
-        assert_eq!(deletion_vector.len(), 10);
-        assert_eq!(
-            deletion_vector.iter().collect::<HashSet<_>>(),
-            (0..10).collect::<HashSet<_>>()
-        );
-        // Second fragment has 90..100 deleted
-        let deletion_vector = fragments[1].get_deletion_vector().await.unwrap().unwrap();
-        assert_eq!(deletion_vector.len(), 10);
-        // The second fragment starts at 50, so 90..100 becomes 40..50 in local row ids.
-        assert_eq!(
-            deletion_vector.iter().collect::<HashSet<_>>(),
-            (40..50).collect::<HashSet<_>>()
-        );
-        let second_deletion_file = fragments[1].metadata.deletion_file.clone().unwrap();
-
-        // Delete more rows
-        dataset.delete("i < 20").await.unwrap();
-        dataset.validate().await.unwrap();
-
-        // Verify result
-        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 30);
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 2);
-        assert!(fragments[0].metadata.deletion_file.is_some());
-        let deletion_vector = fragments[0].get_deletion_vector().await.unwrap().unwrap();
-        assert_eq!(deletion_vector.len(), 20);
-        assert_eq!(
-            deletion_vector.iter().collect::<HashSet<_>>(),
-            (0..20).collect::<HashSet<_>>()
-        );
-        // Second deletion vector was not rewritten
-        assert_eq!(
-            fragments[1].metadata.deletion_file.as_ref().unwrap(),
-            &second_deletion_file
-        );
-
-        // Delete full fragment
-        dataset.delete("i >= 50").await.unwrap();
-        dataset.validate().await.unwrap();
-
-        // Verify second fragment is fully gone
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 1);
-        assert_eq!(dataset.count_fragments(), 1);
-        assert_eq!(fragments[0].id(), 0);
-
-        // Verify the count_deleted_rows only contains the rows from the first fragment
-        // i.e. - deleted_rows from the fragment that has been deleted are not counted
-        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);
-
-        // Append after delete
-        let data = sequence_data(0..100);
-        let batches = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
-        let write_params = WriteParams {
-            mode: WriteMode::Append,
-            ..Default::default()
-        };
-        let dataset = Dataset::write(batches, test_uri, Some(write_params))
-            .await
-            .unwrap();
-
-        dataset.validate().await.unwrap();
-
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 2);
-        assert_eq!(dataset.count_fragments(), 2);
-        // Fragment id picks up where we left off
-        assert_eq!(fragments[0].id(), 0);
-        assert_eq!(fragments[1].id(), 2);
-        assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
-    }
-
-    #[rstest]
-    #[tokio::test]
     async fn test_restore(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
@@ -3928,10 +3754,19 @@ mod tests {
 
         dataset.update_config(desired_config.clone()).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
+        assert_eq!(dataset.config().unwrap(), desired_config);
+
+        let config = dataset.config().unwrap().clone();
+        let other_value = config.get("other-key").unwrap();
+        let mut expected = HashMap::new();
+        expected.insert("other-key".to_string(), "other-value".to_string());
+        assert_eq!(other_value, "other-value");
 
         desired_config.remove("other-key");
         dataset.delete_config_keys(&["other-key"]).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
+        assert_eq!(dataset.config().unwrap(), desired_config);
+        assert_true!(!dataset.config().unwrap().contains_key("other-key"));
     }
 
     #[rstest]
@@ -4063,7 +3898,39 @@ mod tests {
 
         dataset.tags.create("tag1", 1).await.unwrap();
         dataset.tags.create("tag2", 1).await.unwrap();
-        dataset.tags.create("v1.0.0-rc1", 1).await.unwrap();
+        dataset.tags.create("v1.0.0-rc1", 2).await.unwrap();
+
+        let default_order = dataset.tags.list_tags_ordered(None).await.unwrap();
+        let default_names: Vec<_> = default_order.iter().map(|t| &t.0).collect();
+        assert_eq!(
+            default_names,
+            ["v1.0.0-rc1", "tag1", "tag2"],
+            "Default ordering mismatch"
+        );
+
+        let asc_order = dataset
+            .tags
+            .list_tags_ordered(Some(Ordering::Less))
+            .await
+            .unwrap();
+        let asc_names: Vec<_> = asc_order.iter().map(|t| &t.0).collect();
+        assert_eq!(
+            asc_names,
+            ["tag1", "tag2", "v1.0.0-rc1"],
+            "Ascending ordering mismatch"
+        );
+
+        let desc_order = dataset
+            .tags
+            .list_tags_ordered(Some(Ordering::Greater))
+            .await
+            .unwrap();
+        let desc_names: Vec<_> = desc_order.iter().map(|t| &t.0).collect();
+        assert_eq!(
+            desc_names,
+            ["v1.0.0-rc1", "tag1", "tag2"],
+            "Descending ordering mismatch"
+        );
 
         assert_eq!(dataset.tags.list().await.unwrap().len(), 3);
 
@@ -4387,43 +4254,6 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await?;
         Ok(results)
-    }
-
-    fn copy_dir_all(
-        src: impl AsRef<std::path::Path>,
-        dst: impl AsRef<std::path::Path>,
-    ) -> std::io::Result<()> {
-        use std::fs;
-        fs::create_dir_all(&dst)?;
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            if ty.is_dir() {
-                copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
-            } else {
-                fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Copies a test dataset into a temporary directory, returning the tmpdir.
-    ///
-    /// The `table_path` should be relative to `test_data/` at the root of the
-    /// repo.
-    fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
-        use std::path::PathBuf;
-
-        let mut src = PathBuf::new();
-        src.push(env!("CARGO_MANIFEST_DIR"));
-        src.push("../../test_data");
-        src.push(table_path);
-
-        let test_dir = tempdir().unwrap();
-
-        copy_dir_all(src.as_path(), test_dir.path())?;
-
-        Ok(test_dir)
     }
 
     #[rstest]
@@ -5264,7 +5094,14 @@ mod tests {
             list_col.values().append_value("mots");
             list_col.values().append_value("accentués");
             list_col.append(true);
+            list_col
+                .values()
+                .append_value("lance database full text search");
+            list_col.append(true);
+
+            // for testing null
             list_col.append(false);
+
             Arc::new(list_col.finish())
         } else {
             Arc::new(GenericStringArray::<Offset>::from(vec![
@@ -5275,6 +5112,7 @@ mod tests {
                 "unrelated doc",
                 "unrelated",
                 "mots accentués",
+                "lance database full text search",
             ]))
         };
         let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
@@ -5351,16 +5189,17 @@ mod tests {
                         .with_operator(Operator::And)
                         .into(),
                 )
-                .limit(Some(3)),
+                .limit(Some(5)),
             )
             .unwrap()
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 2, "{:?}", result);
+        assert_eq!(result.num_rows(), 3, "{:?}", result);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
         assert!(ids.contains(&0), "{:?}", result);
         assert!(ids.contains(&1), "{:?}", result);
+        assert!(ids.contains(&7), "{:?}", result);
 
         let result = ds
             .scan()
@@ -5407,12 +5246,13 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 4);
+        assert_eq!(result.num_rows(), 5);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(ids.contains(&2));
         assert!(ids.contains(&3));
+        assert!(ids.contains(&7));
 
         let result = ds
             .scan()
@@ -5429,9 +5269,10 @@ mod tests {
             .await
             .unwrap();
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert_eq!(result.num_rows(), 2, "{:?}", ids);
+        assert_eq!(result.num_rows(), 3, "{:?}", ids);
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
+        assert!(ids.contains(&7));
 
         let result = ds
             .scan()
@@ -5546,6 +5387,45 @@ mod tests {
                             MatchQuery::new("lance database".to_owned())
                                 .with_operator(Operator::And)
                                 .into(),
+                        ),
+                    ])
+                    .into(),
+                )
+                .limit(Some(3)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 3, "{:?}", result);
+        let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert!(ids.contains(&0), "{:?}", result);
+        assert!(ids.contains(&1), "{:?}", result);
+        assert!(ids.contains(&7), "{:?}", result);
+
+        let result = ds
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                // must contain "lance" and "database", and may contain "search"
+                FullTextSearchQuery::new_query(
+                    BooleanQuery::new([
+                        (
+                            Occur::Should,
+                            MatchQuery::new("search".to_owned())
+                                .with_operator(Operator::And)
+                                .into(),
+                        ),
+                        (
+                            Occur::Must,
+                            MatchQuery::new("lance database".to_owned())
+                                .with_operator(Operator::And)
+                                .into(),
+                        ),
+                        (
+                            Occur::MustNot,
+                            MatchQuery::new("full text".to_owned()).into(),
                         ),
                     ])
                     .into(),

@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "0.29.0"
+version = "0.31.0"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 rust-version = "1.65"
@@ -12,17 +12,17 @@ name = "lance"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow = { version = "54.1", features = ["pyarrow"] }
-arrow-array = "54.1"
-arrow-data = "54.1"
-arrow-schema = "54.1"
-arrow-select = "54.1"
-object_store = "0.11.2"
-datafusion = "46.0"
-datafusion-ffi = "46.0"
-datafusion-common = "46.0"
+arrow = { version = "55.1", features = ["pyarrow"] }
+arrow-array = "55.1"
+arrow-data = "55.1"
+arrow-schema = "55.1"
+arrow-select = "55.1"
+object_store = "0.12.2"
+datafusion = "47.0"
+datafusion-ffi = "47.0"
+datafusion-common = "47.0"
 async-trait = "0.1"
-chrono = "0.4.31"
+chrono = "0.4.41"
 env_logger = "0.11.7"
 futures = "0.3"
 half = { version = "2.5", default-features = false, features = [
@@ -50,10 +50,11 @@ lance-datafusion = { path = "../rust/lance-datafusion" }
 lazy_static = "1"
 log = "0.4"
 prost = "0.13.2"
-pyo3 = { version = "0.23", features = [
+pyo3 = { version = "0.24.1", features = [
     "extension-module",
     "abi3-py39",
     "py-clone",
+    "chrono",
 ] }
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
 uuid = "1.3.0"
