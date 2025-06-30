@@ -188,8 +188,7 @@ impl ExecutionPlan for MatchQueryExec {
                 )
                 .await?
                 .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
+                    "No Inverted index found for column {column}",
                 )))?;
             let uuid = index_meta.uuid.to_string();
             let index = ds
@@ -209,8 +208,7 @@ impl ExecutionPlan for MatchQueryExec {
                 .downcast_ref::<InvertedIndex>()
                 .ok_or_else(|| {
                     DataFusionError::Execution(format!(
-                        "Index for column {} is not an inverted index",
-                        column,
+                        "Index for column {column} is not an inverted index",
                     ))
                 })?;
 
@@ -378,8 +376,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 )
                 .await?
                 .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
+                    "No Inverted index found for column {column}",
                 )))?;
             let uuid = index_meta.uuid.to_string();
             let index = ds
@@ -390,8 +387,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 .downcast_ref::<InvertedIndex>()
                 .ok_or_else(|| {
                     DataFusionError::Execution(format!(
-                        "Index for column {} is not an inverted index",
-                        column,
+                        "Index for column {column} is not an inverted index",
                     ))
                 })?;
             Ok::<_, DataFusionError>(flat_bm25_search_stream(
@@ -567,8 +563,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 )
                 .await?
                 .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
+                    "No Inverted index found for column {column}",
                 )))?;
             let uuid = index_meta.uuid.to_string();
             let index = ds
@@ -588,8 +583,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 .downcast_ref::<InvertedIndex>()
                 .ok_or_else(|| {
                     DataFusionError::Execution(format!(
-                        "Index for column {} is not an inverted index",
-                        column,
+                        "Index for column {column} is not an inverted index",
                     ))
                 })?;
 

@@ -475,8 +475,8 @@ mod test {
             }
 
             for (i, value) in values.iter().enumerate() {
-                assert_eq!(segment.get(i), Some(*value), "i = {}", i);
-                assert_eq!(segment.position(*value), Some(i), "i = {}", i);
+                assert_eq!(segment.get(i), Some(*value), "i = {i}");
+                assert_eq!(segment.position(*value), Some(i), "i = {i}");
             }
 
             check_segment_iter(&segment);

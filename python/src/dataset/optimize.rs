@@ -53,8 +53,7 @@ fn parse_compaction_options(options: &Bound<'_, PyDict>) -> PyResult<CompactionO
             }
             _ => {
                 return Err(PyValueError::new_err(format!(
-                    "Invalid compaction option: {}",
-                    key
+                    "Invalid compaction option: {key}"
                 )));
             }
         }
@@ -70,7 +69,7 @@ fn unwrap_dataset(dataset: PyObject) -> PyResult<Py<Dataset>> {
 fn wrap_fragment<'py>(py: Python<'py>, fragment: &Fragment) -> PyResult<Bound<'py, PyAny>> {
     let fragment_metadata = PyModule::import(py, "lance.fragment")?.getattr("FragmentMetadata")?;
     let fragment_json = serde_json::to_string(&fragment).map_err(|x| {
-        PyValueError::new_err(format!("failed to serialize fragment metadata: {}", x))
+        PyValueError::new_err(format!("failed to serialize fragment metadata: {x}"))
     })?;
 
     fragment_metadata.call_method1("from_json", (fragment_json,))
@@ -158,10 +157,7 @@ impl PyCompactionPlan {
     /// The JSON representation is not guaranteed to be stable across versions.
     pub fn json(&self) -> PyResult<String> {
         serde_json::to_string(&self.0).map_err(|err| {
-            PyValueError::new_err(format!(
-                "Could not dump CompactionPlan due to error: {}",
-                err
-            ))
+            PyValueError::new_err(format!("Could not dump CompactionPlan due to error: {err}"))
         })
     }
 
@@ -178,10 +174,7 @@ impl PyCompactionPlan {
     #[staticmethod]
     pub fn from_json(json: String) -> PyResult<Self> {
         let task = serde_json::from_str(&json).map_err(|err| {
-            PyValueError::new_err(format!(
-                "Could not load CompactionPlan due to error: {}",
-                err
-            ))
+            PyValueError::new_err(format!("Could not load CompactionPlan due to error: {err}"))
         })?;
         Ok(Self(task))
     }
@@ -270,10 +263,7 @@ impl PyCompactionTask {
     /// The JSON representation is not guaranteed to be stable across versions.
     pub fn json(&self) -> PyResult<String> {
         serde_json::to_string(&self.0).map_err(|err| {
-            PyValueError::new_err(format!(
-                "Could not dump CompactionTask due to error: {}",
-                err
-            ))
+            PyValueError::new_err(format!("Could not dump CompactionTask due to error: {err}"))
         })
     }
 
@@ -290,10 +280,7 @@ impl PyCompactionTask {
     #[staticmethod]
     pub fn from_json(json: String) -> PyResult<Self> {
         let task = serde_json::from_str(&json).map_err(|err| {
-            PyValueError::new_err(format!(
-                "Could not load CompactionTask due to error: {}",
-                err
-            ))
+            PyValueError::new_err(format!("Could not load CompactionTask due to error: {err}"))
         })?;
         Ok(Self(task))
     }
@@ -388,10 +375,7 @@ impl PyRewriteResult {
     /// The JSON representation is not guaranteed to be stable across versions.
     pub fn json(&self) -> PyResult<String> {
         serde_json::to_string(&self.0).map_err(|err| {
-            PyValueError::new_err(format!(
-                "Could not dump RewriteResult due to error: {}",
-                err
-            ))
+            PyValueError::new_err(format!("Could not dump RewriteResult due to error: {err}"))
         })
     }
 
@@ -399,10 +383,7 @@ impl PyRewriteResult {
     #[staticmethod]
     pub fn from_json(json: String) -> PyResult<Self> {
         let result = serde_json::from_str(&json).map_err(|err| {
-            PyValueError::new_err(format!(
-                "Could not load RewriteResult due to error: {}",
-                err
-            ))
+            PyValueError::new_err(format!("Could not load RewriteResult due to error: {err}"))
         })?;
         Ok(Self(result))
     }

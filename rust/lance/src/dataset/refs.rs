@@ -110,7 +110,7 @@ impl Tags {
 
         if !self.object_store().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
+                message: format!("tag {tag} does not exist"),
             });
         }
 
@@ -126,7 +126,7 @@ impl Tags {
 
         if self.object_store().exists(&tag_file).await? {
             return Err(Error::RefConflict {
-                message: format!("tag {} already exists", tag),
+                message: format!("tag {tag} already exists"),
             });
         }
 
@@ -137,7 +137,7 @@ impl Tags {
 
         if !self.object_store().exists(&manifest_file.path).await? {
             return Err(Error::VersionNotFound {
-                message: format!("version {} does not exist", version),
+                message: format!("version {version} does not exist"),
             });
         }
 
@@ -168,7 +168,7 @@ impl Tags {
 
         if !self.object_store().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
+                message: format!("tag {tag} does not exist"),
             });
         }
 
@@ -182,7 +182,7 @@ impl Tags {
 
         if !self.object_store().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
+                message: format!("tag {tag} does not exist"),
             });
         }
 
@@ -193,7 +193,7 @@ impl Tags {
 
         if !self.object_store().exists(&manifest_file.path).await? {
             return Err(Error::VersionNotFound {
-                message: format!("version {} does not exist", version),
+                message: format!("version {version} does not exist"),
             });
         }
 
@@ -234,7 +234,7 @@ pub fn base_tags_path(base_path: &Path) -> Path {
 }
 
 pub fn tag_path(base_path: &Path, tag: &str) -> Path {
-    base_tags_path(base_path).child(format!("{}.json", tag))
+    base_tags_path(base_path).child(format!("{tag}.json"))
 }
 
 impl TagContents {

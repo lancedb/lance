@@ -67,7 +67,7 @@ impl PrimitiveFieldScheduler {
             .enumerate()
             // Buggy versions of Lance could sometimes create empty pages
             .filter(|(page_index, page)| {
-                log::trace!("Skipping empty page with index {}", page_index);
+                log::trace!("Skipping empty page with index {page_index}");
                 page.num_rows > 0
             })
             .map(|(page_index, page)| {

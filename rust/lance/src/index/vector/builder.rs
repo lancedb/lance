@@ -260,7 +260,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         self.partition_sizes = vec![(0, 0); model.num_partitions()];
         let local_store = ObjectStore::local();
         for (part_id, (store, index)) in mapped.into_iter().enumerate() {
-            let path = self.temp_dir.child(format!("storage_part{}", part_id));
+            let path = self.temp_dir.child(format!("storage_part{part_id}"));
             let batches = store.to_batches()?;
             let schema = store.schema().as_ref().try_into()?;
             let store_len = FileWriter::create_file_with_batches(
@@ -272,7 +272,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             )
             .await?;
 
-            let path = self.temp_dir.child(format!("index_part{}", part_id));
+            let path = self.temp_dir.child(format!("index_part{part_id}"));
             let batch = index.to_batch()?;
             let schema = batch.schema().as_ref().try_into()?;
             let index_len = FileWriter::create_file_with_batches(
@@ -365,10 +365,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         let start = std::time::Instant::now();
-        info!(
-            "loading training data for quantizer. sample size: {}",
-            sample_size_hint
-        );
+        info!("loading training data for quantizer. sample size: {sample_size_hint}");
         let training_data =
             utils::maybe_sample_training_data(dataset, &self.column, sample_size_hint).await?;
         info!(
@@ -441,7 +438,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 // the uri points to data directory,
                 // so need to trim the "data" suffix for reading the dataset
                 let uri = uri.trim_end_matches("data");
-                log::info!("shuffle with precomputed shuffle buffers from {}", uri);
+                log::info!("shuffle with precomputed shuffle buffers from {uri}");
                 let ds = Dataset::open(uri).await?;
                 ds.scan().try_into_stream().await?
             }
@@ -559,7 +556,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let batch = transformed_stream.as_mut().peek().await;
         let schema = match batch {
             Some(Ok(b)) => b.schema(),
-            Some(Err(e)) => panic!("do this better: error reading first batch: {:?}", e),
+            Some(Err(e)) => panic!("do this better: error reading first batch: {e:?}"),
             None => {
                 log::info!("no data to shuffle");
                 self.shuffle_reader = Some(Arc::new(IvfShufflerReader::new(
@@ -689,7 +686,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // build quantized vector storage
         let storage = StorageBuilder::new(column, distance_type, quantizer, fri)?.build(batches)?;
 
-        let path = temp_dir.child(format!("storage_part{}", part_id));
+        let path = temp_dir.child(format!("storage_part{part_id}"));
         let batches = storage.to_batches()?;
         let write_storage_fut = FileWriter::create_file_with_batches(
             &local_store,
@@ -701,7 +698,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         // build the sub index, with in-memory storage
         let sub_index = S::index_vectors(&storage, sub_index_params)?;
-        let path = temp_dir.child(format!("index_part{}", part_id));
+        let path = temp_dir.child(format!("index_part{part_id}"));
         let index_batch = sub_index.to_batch()?;
         let schema = index_batch.schema().as_ref().try_into()?;
         let write_index_fut = FileWriter::create_file_with_batches(
@@ -757,7 +754,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut loss = 0.0;
         if reader.partition_size(part_id)? > 0 {
             let mut partition_data = reader.read_partition(part_id).await?.ok_or(Error::io(
-                format!("partition {} is empty", part_id).as_str(),
+                format!("partition {part_id} is empty").as_str(),
                 location!(),
             ))?;
             while let Some(batch) = partition_data.try_next().await? {
@@ -819,7 +816,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             if storage_size == 0 {
                 storage_ivf.add_partition(0);
             } else {
-                let storage_part_path = self.temp_dir.child(format!("storage_part{}", part_id));
+                let storage_part_path = self.temp_dir.child(format!("storage_part{part_id}"));
                 let reader = FileReader::try_open(
                     scheduler
                         .open_file(&storage_part_path, &CachedFileSize::unknown())
@@ -848,7 +845,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 index_ivf.add_partition(0);
                 partition_index_metadata.push(String::new());
             } else {
-                let index_part_path = self.temp_dir.child(format!("index_part{}", part_id));
+                let index_part_path = self.temp_dir.child(format!("index_part{part_id}"));
                 let reader = FileReader::try_open(
                     scheduler
                         .open_file(&index_part_path, &CachedFileSize::unknown())
@@ -962,14 +959,14 @@ pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: Quantization
         // ignore FLAT sub index,
         // IVF_FLAT_FLAT => IVF_FLAT
         // IVF_FLAT_PQ => IVF_PQ
-        (SubIndexType::Flat, quantization_type) => format!("IVF_{}", quantization_type),
+        (SubIndexType::Flat, quantization_type) => format!("IVF_{quantization_type}"),
         (sub_index_type, quantization_type) => {
             if sub_index_type.to_string() == quantization_type.to_string() {
                 // ignore redundant quantization type
                 // e.g. IVF_PQ_PQ should be IVF_PQ
-                format!("IVF_{}", sub_index_type)
+                format!("IVF_{sub_index_type}")
             } else {
-                format!("IVF_{}_{}", sub_index_type, quantization_type)
+                format!("IVF_{sub_index_type}_{quantization_type}")
             }
         }
     }

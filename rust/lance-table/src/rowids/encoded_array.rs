@@ -370,8 +370,7 @@ mod test {
                     ..
                 } if base == expected_base
             ),
-            "{:?}",
-            encoded
+            "{encoded:?}"
         );
         let roundtripped = encoded.into_iter().collect::<Vec<_>>();
         assert_eq!(range.collect::<Vec<_>>(), roundtripped);

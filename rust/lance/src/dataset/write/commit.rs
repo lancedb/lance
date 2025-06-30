@@ -529,11 +529,11 @@ mod tests {
             // to check for the latest version to see if we need to do conflict
             // resolution.
             let (reads, writes) = get_new_iops();
-            assert_eq!(reads, 1, "i = {}", i);
+            assert_eq!(reads, 1, "i = {i}");
             // Should see 2 IOPs:
             // 1. Write the transaction files
             // 2. Write (conditional put) the manifest
-            assert_eq!(writes, 2, "i = {}", i);
+            assert_eq!(writes, 2, "i = {i}");
         }
 
         // Commit transaction with URI and session

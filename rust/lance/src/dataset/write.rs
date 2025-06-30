@@ -110,7 +110,7 @@ impl TryFrom<&str> for WriteMode {
             "append" => Ok(Self::Append),
             "overwrite" => Ok(Self::Overwrite),
             _ => Err(Error::invalid_input(
-                format!("Invalid write mode: {}", value),
+                format!("Invalid write mode: {value}"),
                 location!(),
             )),
         }
@@ -711,7 +711,7 @@ impl SpillStreamIter {
     ) -> Result<Self> {
         let tmp_dir = tokio::task::spawn_blocking(|| {
             tempfile::tempdir().map_err(|e| Error::InvalidInput {
-                source: format!("Failed to create temp dir: {}", e).into(),
+                source: format!("Failed to create temp dir: {e}").into(),
                 location: location!(),
             })
         })
@@ -968,13 +968,11 @@ mod tests {
             assert_eq!(fragment.physical_rows, Some(1024));
             assert_eq!(
                 fragment.files[0].file_major_version, major,
-                "version: {}",
-                version
+                "version: {version}"
             );
             assert_eq!(
                 fragment.files[0].file_minor_version, minor,
-                "version: {}",
-                version
+                "version: {version}"
             );
         }
     }

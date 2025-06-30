@@ -94,7 +94,7 @@ impl TryFrom<&DataType> for pb::tensor::DataType {
             DataType::Float32 => Ok(Self::Float32),
             DataType::Float64 => Ok(Self::Float64),
             _ => Err(Error::Index {
-                message: format!("pb tensor type not supported: {:?}", dt),
+                message: format!("pb tensor type not supported: {dt:?}"),
                 location: location!(),
             }),
         }

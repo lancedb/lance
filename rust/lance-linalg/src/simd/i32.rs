@@ -36,7 +36,7 @@ impl std::fmt::Debug for i32x8 {
         unsafe {
             self.store_unaligned(arr.as_mut_ptr());
         }
-        write!(f, "i32x8({:?})", arr)
+        write!(f, "i32x8({arr:?})")
     }
 }
 

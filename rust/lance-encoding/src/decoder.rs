@@ -264,7 +264,7 @@ const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 #[derive(Debug)]
 pub enum PageEncoding {
     Legacy(pb::ArrayEncoding),
-    Structural(pb::PageLayout),
+    Structural(Box<pb::PageLayout>),
 }
 
 impl PageEncoding {
@@ -277,7 +277,7 @@ impl PageEncoding {
 
     pub fn as_structural(&self) -> &pb::PageLayout {
         match self {
-            Self::Structural(enc) => enc,
+            Self::Structural(enc) => enc.as_ref(),
             Self::Legacy(_) => panic!("Expected a structural encoding"),
         }
     }
@@ -554,7 +554,7 @@ impl CoreFieldDecoderStrategy {
         let encoding = &column_info.page_infos[0].encoding;
         match encoding.as_legacy().array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Struct(_) => Ok(()),
-            _ => Err(Error::InvalidInput { source: format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {:?}", encoding).into(), location: location!() }),
+            _ => Err(Error::InvalidInput { source: format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {encoding:?}").into(), location: location!() }),
         }
     }
 
@@ -801,8 +801,7 @@ impl CoreFieldDecoderStrategy {
                 } else {
                     Err(Error::NotSupported {
                         source: format!(
-                            "No way to decode into a dictionary field of type {}",
-                            value_type
+                            "No way to decode into a dictionary field of type {value_type}"
                         )
                         .into(),
                         location: location!(),
@@ -1056,7 +1055,7 @@ impl DecodeBatchScheduler {
             rows_requested,
             priority
                 .as_ref()
-                .map(|p| format!(" (priority={:?})", p))
+                .map(|p| format!(" (priority={p:?})"))
                 .unwrap_or_default()
         );
 
@@ -1070,7 +1069,7 @@ impl DecodeBatchScheduler {
         let mut num_rows_scheduled = 0;
         let mut rows_to_schedule = root_job.num_rows();
         let mut priority = priority.unwrap_or(Box::new(SimplePriorityRange::new(0)));
-        trace!("Scheduled ranges refined to {} rows", rows_to_schedule);
+        trace!("Scheduled ranges refined to {rows_to_schedule} rows");
         while rows_to_schedule > 0 {
             let maybe_next_scan_line = root_job.schedule_next(&mut context, priority.as_ref());
             if let Err(schedule_next_err) = maybe_next_scan_line {
@@ -1338,10 +1337,7 @@ impl BatchDecodeStream {
         trace!("scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}", scheduled_need, self.rows_drained, to_take, self.rows_scheduled);
         if scheduled_need > 0 {
             let desired_scheduled = scheduled_need + self.rows_scheduled;
-            trace!(
-                "Draining from scheduler (desire at least {} scheduled rows)",
-                desired_scheduled
-            );
+            trace!("Draining from scheduler (desire at least {desired_scheduled} scheduled rows)");
             let actually_scheduled = self.wait_for_scheduled(desired_scheduled).await?;
             if actually_scheduled < desired_scheduled {
                 let under_scheduled = desired_scheduled - actually_scheduled;
@@ -1355,10 +1351,7 @@ impl BatchDecodeStream {
 
         // wait_for_loaded waits for *>* loaded_need (not >=) so we do a -1 here
         let loaded_need = self.rows_drained + to_take - 1;
-        trace!(
-            "Waiting for I/O (desire at least {} fully loaded rows)",
-            loaded_need
-        );
+        trace!("Waiting for I/O (desire at least {loaded_need} fully loaded rows)");
         self.root_decoder.wait_for_loaded(loaded_need).await?;
 
         let next_task = self.root_decoder.drain(to_take)?;
@@ -1544,10 +1537,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
         trace!("scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}", scheduled_need, self.rows_drained, to_take, self.rows_scheduled);
         if scheduled_need > 0 {
             let desired_scheduled = scheduled_need + self.rows_scheduled;
-            trace!(
-                "Draining from scheduler (desire at least {} scheduled rows)",
-                desired_scheduled
-            );
+            trace!("Draining from scheduler (desire at least {desired_scheduled} scheduled rows)");
             let actually_scheduled = self.wait_for_io(desired_scheduled)?;
             if actually_scheduled < desired_scheduled {
                 let under_scheduled = desired_scheduled - actually_scheduled;
@@ -1673,10 +1663,7 @@ impl StructuralBatchDecodeStream {
         trace!("scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}", scheduled_need, self.rows_drained, to_take, self.rows_scheduled);
         if scheduled_need > 0 {
             let desired_scheduled = scheduled_need + self.rows_scheduled;
-            trace!(
-                "Draining from scheduler (desire at least {} scheduled rows)",
-                desired_scheduled
-            );
+            trace!("Draining from scheduler (desire at least {desired_scheduled} scheduled rows)");
             let actually_scheduled = self.wait_for_scheduled(desired_scheduled).await?;
             if actually_scheduled < desired_scheduled {
                 let under_scheduled = desired_scheduled - actually_scheduled;
@@ -2240,7 +2227,7 @@ impl SchedulerContext {
         if self.recv.is_some() {
             format!("TEMP({}){}", self.name, path)
         } else {
-            format!("ROOT{}", path)
+            format!("ROOT{path}")
         }
     }
 
@@ -2361,14 +2348,14 @@ impl NextDecodeTask {
                 if size_bytes > BATCH_SIZE_BYTES_WARNING {
                     emitted_batch_size_warning.call_once(|| {
                         let size_mb = size_bytes / 1024 / 1024;
-                        debug!("Lance read in a single batch that contained more than {}MiB of data.  You may want to consider reducing the batch size.", size_mb);
+                        debug!("Lance read in a single batch that contained more than {size_mb}MiB of data.  You may want to consider reducing the batch size.");
                     });
                 }
                 Ok(batch)
             }
             Err(e) => {
                 let e = Error::Internal {
-                    message: format!("Error decoding batch: {}", e),
+                    message: format!("Error decoding batch: {e}"),
                     location: location!(),
                 };
                 Err(e)

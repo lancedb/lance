@@ -30,11 +30,11 @@ pub fn rand_batches(
             lance_datagen::RoundingBehavior::RoundUp,
         )
         .map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Failed to generate batches: {}", e))
+            pyo3::exceptions::PyValueError::new_err(format!("Failed to generate batches: {e}"))
         })?
         .map(|item| {
             item.map(PyArrowType::from).map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!("Failed to generate batch: {}", e))
+                pyo3::exceptions::PyValueError::new_err(format!("Failed to generate batch: {e}"))
             })
         })
         .collect::<PyResult<Vec<PyArrowType<RecordBatch>>>>()

@@ -75,7 +75,7 @@ impl std::fmt::Display for CompressionScheme {
             Self::None => "none",
             Self::Lz4 => "lz4",
         };
-        write!(f, "{}", scheme_str)
+        write!(f, "{scheme_str}")
     }
 }
 
@@ -87,7 +87,7 @@ impl FromStr for CompressionScheme {
             "none" => Ok(Self::None),
             "zstd" => Ok(Self::Zstd),
             _ => Err(Error::invalid_input(
-                format!("Unknown compression scheme: {}", s),
+                format!("Unknown compression scheme: {s}"),
                 location!(),
             )),
         }
@@ -139,7 +139,7 @@ impl BufferCompressor for Lz4BufferCompressor {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
         lz4::block::compress_to_buffer(input_buf, None, true, output_buf)
             .map_err(|err| Error::Internal {
-                message: format!("LZ4 compression error: {}", err),
+                message: format!("LZ4 compression error: {err}"),
                 location: location!(),
             })
             .map(|_| ())
@@ -148,7 +148,7 @@ impl BufferCompressor for Lz4BufferCompressor {
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
         lz4::block::decompress_to_buffer(input_buf, None, output_buf)
             .map_err(|err| Error::Internal {
-                message: format!("LZ4 decompression error: {}", err),
+                message: format!("LZ4 decompression error: {err}"),
                 location: location!(),
             })
             .map(|_| ())
@@ -273,10 +273,7 @@ impl PerValueCompressor for CompressedBufferEncoder {
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
         let data_type = data.name();
         let mut data = data.as_variable_width().ok_or(Error::Internal {
-            message: format!(
-                "Attempt to use CompressedBufferEncoder on data of type {}",
-                data_type
-            ),
+            message: format!("Attempt to use CompressedBufferEncoder on data of type {data_type}"),
             location: location!(),
         })?;
 

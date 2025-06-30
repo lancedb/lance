@@ -95,7 +95,7 @@ impl HashJoiner {
                     match task_result {
                         Ok(Ok(_)) => Ok(()),
                         Ok(Err(err)) => Err(err),
-                        Err(err) => Err(Error::io(format!("HashJoiner: {}", err), location!())),
+                        Err(err) => Err(Error::io(format!("HashJoiner: {err}"), location!())),
                     }
                 }
             })
@@ -176,7 +176,7 @@ impl HashJoiner {
                         let array_refs = arrays.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
                         interleave(array_refs.as_ref(), indices.as_ref())
                             .map_err(|err| Error::io(
-                                format!("HashJoiner: {}", err),
+                                format!("HashJoiner: {err}"),
                                 location!(),
                             ))
                     })
@@ -194,7 +194,7 @@ impl HashJoiner {
                         },
                         Ok(Err(err)) => Err(err),
                         Err(err) => Err(Error::io(
-                            format!("HashJoiner: {}", err),
+                            format!("HashJoiner: {err}"),
                             location!(),
                         )),
                     }
@@ -231,7 +231,7 @@ mod tests {
                     vec![
                         Arc::new(Int32Array::from_iter(values.iter().copied())),
                         Arc::new(StringArray::from_iter_values(
-                            values.iter().map(|v| format!("str_{}", v)),
+                            values.iter().map(|v| format!("str_{v}")),
                         )),
                     ],
                 )

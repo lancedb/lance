@@ -45,7 +45,7 @@ impl LanceFileVersion {
             (2, 0) => Ok(Self::V2_0),
             (2, 1) => Ok(Self::V2_1),
             _ => Err(Error::InvalidInput {
-                source: format!("Unknown Lance storage version: {}.{}", major, minor).into(),
+                source: format!("Unknown Lance storage version: {major}.{minor}").into(),
                 location: location!(),
             }),
         }
@@ -92,7 +92,7 @@ impl FromStr for LanceFileVersion {
             // Version 0.3 is an alias of 2.0
             "0.3" => Ok(Self::V2_0),
             _ => Err(Error::InvalidInput {
-                source: format!("Unknown Lance storage version: {}", value).into(),
+                source: format!("Unknown Lance storage version: {value}").into(),
                 location: location!(),
             }),
         }

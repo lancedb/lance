@@ -337,7 +337,7 @@ impl ScalarIndex for InvertedIndex {
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         return Err(Error::invalid_input(
-            format!("unsupported query {:?} for inverted index", query),
+            format!("unsupported query {query:?} for inverted index"),
             location!(),
         ));
     }
@@ -476,7 +476,7 @@ impl InvertedPartition {
             };
             let lev =
                 fst::automaton::Levenshtein::new(token, fuzziness).map_err(|e| Error::Index {
-                    message: format!("failed to construct the fuzzy query: {}", e),
+                    message: format!("failed to construct the fuzzy query: {e}"),
                     location: location!(),
                 })?;
 
@@ -726,7 +726,7 @@ impl TokenSet {
             tokens
                 .insert(token, token_id as u64)
                 .map_err(|e| Error::Index {
-                    message: format!("failed to insert token {}: {}", token, e),
+                    message: format!("failed to insert token {token}: {e}"),
                     location: location!(),
                 })?;
         }
@@ -1861,7 +1861,7 @@ pub fn flat_full_text_search(
         DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query, tokenizer),
         DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query, tokenizer),
         data_type => Err(Error::invalid_input(
-            format!("unsupported data type {} for inverted index", data_type),
+            format!("unsupported data type {data_type} for inverted index"),
             location!(),
         )),
     }

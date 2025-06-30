@@ -129,15 +129,12 @@ impl TrainingRequest {
             "Starting index training job with id {} on column {}",
             training_uuid, self.column
         );
-        info!("Training index (job_id={}): 0/{}", training_uuid, num_rows);
+        info!("Training index (job_id={training_uuid}): 0/{num_rows}");
         let batches = batches.map_ok(move |batch| {
             rows_processed += batch.num_rows();
             if rows_processed >= next_update {
                 next_update += TRAINING_UPDATE_FREQ;
-                info!(
-                    "Training index (job_id={}): {}/{}",
-                    training_uuid, rows_processed, num_rows
-                );
+                info!("Training index (job_id={training_uuid}): {rows_processed}/{num_rows}");
             }
             batch
         });
@@ -264,7 +261,7 @@ pub(super) async fn build_scalar_index(
         column: column.to_string(),
     });
     let field = dataset.schema().field(column).ok_or(Error::InvalidInput {
-        source: format!("No column with name {}", column).into(),
+        source: format!("No column with name {column}").into(),
         location: location!(),
     })?;
 
@@ -396,10 +393,7 @@ async fn infer_scalar_index_type(
 ) -> Result<ScalarIndexType> {
     let index_dir = dataset.indices_dir().child(index_uuid.to_string());
     let col = dataset.schema().field(column).ok_or(Error::Internal {
-        message: format!(
-            "Index refers to column {} which does not exist in dataset schema",
-            column
-        ),
+        message: format!("Index refers to column {column} which does not exist in dataset schema"),
         location: location!(),
     })?;
 

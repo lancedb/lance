@@ -150,7 +150,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 .metadata
                 .get(INDEX_METADATA_SCHEMA_KEY)
                 .ok_or(Error::Index {
-                    message: format!("{} not found", DISTANCE_TYPE_KEY),
+                    message: format!("{DISTANCE_TYPE_KEY} not found"),
                     location: location!(),
                 })?
                 .as_str(),
@@ -162,12 +162,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .metadata
             .get(IVF_METADATA_KEY)
             .ok_or(Error::Index {
-                message: format!("{} not found", IVF_METADATA_KEY),
+                message: format!("{IVF_METADATA_KEY} not found"),
                 location: location!(),
             })?
             .parse()
             .map_err(|e| Error::Index {
-                message: format!("Failed to decode IVF position: {}", e),
+                message: format!("Failed to decode IVF position: {e}"),
                 location: location!(),
             })?;
         let ivf_pb_bytes = index_reader.read_global_buffer(ivf_pos).await?;
@@ -312,7 +312,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 self.ivf
                     .centroid(partition_id)
                     .ok_or_else(|| Error::Index {
-                        message: format!("partition centroid {} does not exist", partition_id),
+                        message: format!("partition centroid {partition_id} does not exist"),
                         location: location!(),
                     })?;
             let residual_key = sub(&query.key, &partition_centroids)?;
@@ -965,15 +965,12 @@ mod tests {
         let query = vectors.value(0);
         // delete half rows to trigger compact
         let half_rows = NUM_ROWS / 2;
-        dataset
-            .delete(&format!("id < {}", half_rows))
-            .await
-            .unwrap();
+        dataset.delete(&format!("id < {half_rows}")).await.unwrap();
         // update the other half rows
         let update_result = UpdateBuilder::new(Arc::new(dataset))
             .update_where(&format!("id >= {} and id<{}", half_rows, half_rows + 50))
             .unwrap()
-            .set("id", &format!("{}+id", NUM_ROWS))
+            .set("id", &format!("{NUM_ROWS}+id"))
             .unwrap()
             .build()
             .unwrap()
@@ -1131,10 +1128,7 @@ mod tests {
                 if count <= 1 {
                     // the first append is with the same data distribution, so the loss should be
                     // very close to the original loss, then it shouldn't hit the retrain threshold
-                    panic!(
-                        "retrain threshold {} should not be hit",
-                        AVG_LOSS_RETRAIN_THRESHOLD
-                    );
+                    panic!("retrain threshold {AVG_LOSS_RETRAIN_THRESHOLD} should not be hit");
                 }
 
                 break;
@@ -1539,10 +1533,7 @@ mod tests {
         let recall = row_ids.intersection(&gt_set).count() as f32 / 100.0;
         assert!(
             recall >= recall_requirement,
-            "recall: {}\n results: {:?}\n\ngt: {:?}",
-            recall,
-            results,
-            gt
+            "recall: {recall}\n results: {results:?}\n\ngt: {gt:?}"
         );
     }
 
@@ -1786,7 +1777,7 @@ mod tests {
                 if i < part_idx {
                     assert_eq!(left_row_ids[i], *id);
                 } else {
-                    assert_eq!(right_row_ids[i - part_idx], *id, "{:?}", right_row_ids);
+                    assert_eq!(right_row_ids[i - part_idx], *id, "{right_row_ids:?}");
                 }
             });
         }
@@ -1909,17 +1900,14 @@ mod tests {
         let recall = row_ids.intersection(&gt).count() as f32 / k as f32;
         assert!(
             recall >= recall_requirement,
-            "recall: {}\n results: {:?}\n\ngt: {:?}",
-            recall,
-            results,
-            gt,
+            "recall: {recall}\n results: {results:?}\n\ngt: {gt:?}",
         );
     }
 
     async fn rewrite_pq_storage(dir: Path) -> Result<()> {
         let obj_store = Arc::new(ObjectStore::local());
         let store_path = dir.child(INDEX_AUXILIARY_FILE_NAME);
-        let copied_path = dir.child(format!("{}.original", INDEX_AUXILIARY_FILE_NAME));
+        let copied_path = dir.child(format!("{INDEX_AUXILIARY_FILE_NAME}.original"));
         obj_store.copy(&store_path, &copied_path).await?;
         obj_store.delete(&store_path).await?;
         let scheduler =

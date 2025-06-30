@@ -185,8 +185,7 @@ pub fn bytes_to_array(
     if layout.buffers.len() != 1 {
         return Err(Error::Internal {
             message: format!(
-                "Can only convert datatypes that require one buffer, found {:?}",
-                data_type
+                "Can only convert datatypes that require one buffer, found {data_type:?}"
             ),
             location: location!(),
         });
@@ -647,11 +646,10 @@ mod tests {
         // Underlying data is padded to the nearest multiple of two bytes (for u16).
         let data = arr.to_data();
         let buf = &data.buffers()[0];
-        let repr = format!("{:?}", buf);
+        let repr = format!("{buf:?}");
         assert!(
             repr.contains("[1, 0, 2, 0, 3, 0]"),
-            "Underlying buffer contains unexpected data: {}",
-            repr
+            "Underlying buffer contains unexpected data: {repr}"
         );
     }
 
@@ -912,7 +910,7 @@ mod tests {
             (u32_overflow / byte_width) as u32 + 100,
         ];
         let chunks = make_chunked_requests(&indices, byte_width, prefetch_size);
-        assert_eq!(chunks.len(), 6, "got chunks: {:?}", chunks);
+        assert_eq!(chunks.len(), 6, "got chunks: {chunks:?}");
         assert_eq!(chunks, vec![(0..2), (2..3), (3..4), (4..5), (5..6), (6..7)])
     }
 }

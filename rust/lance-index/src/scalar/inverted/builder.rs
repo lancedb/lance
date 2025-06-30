@@ -173,7 +173,7 @@ impl InvertedIndexBuilder {
                 }
             }
         }));
-        log::info!("indexing FTS with {} workers", num_workers);
+        log::info!("indexing FTS with {num_workers} workers");
 
         let mut last_num_rows = 0;
         let mut total_num_rows = 0;
@@ -351,10 +351,7 @@ impl InnerBuilder {
 
             if num_posting_lists % 500_000 == 0 {
                 log::info!(
-                    "wrote {} posting lists of partition {}, writing elapsed: {:?}",
-                    num_posting_lists,
-                    id,
-                    write_duration,
+                    "wrote {num_posting_lists} posting lists of partition {id}, writing elapsed: {write_duration:?}",
                 );
             }
         }
@@ -676,13 +673,13 @@ fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
 }
 
 pub(crate) fn token_file_path(partition_id: u64) -> String {
-    format!("part_{}_{}", partition_id, TOKENS_FILE)
+    format!("part_{partition_id}_{TOKENS_FILE}")
 }
 
 pub(crate) fn posting_file_path(partition_id: u64) -> String {
-    format!("part_{}_{}", partition_id, INVERT_LIST_FILE)
+    format!("part_{partition_id}_{INVERT_LIST_FILE}")
 }
 
 pub(crate) fn doc_file_path(partition_id: u64) -> String {
-    format!("part_{}_{}", partition_id, DOCS_FILE)
+    format!("part_{partition_id}_{DOCS_FILE}")
 }

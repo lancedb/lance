@@ -21,10 +21,7 @@ where
     let dim = fsl.value_length() as usize;
     if dim % m != 0 {
         return Err(Error::invalid_input(
-            format!(
-                "num_sub_vectors must divide vector dimension {}, but got {}",
-                dim, m
-            ),
+            format!("num_sub_vectors must divide vector dimension {dim}, but got {m}"),
             location!(),
         ));
     };
@@ -64,9 +61,7 @@ pub fn get_sub_vector_centroids<const NUM_BITS: u32, T>(
 ) -> &[T] {
     debug_assert!(
         sub_vector_idx < num_sub_vectors,
-        "sub_vector idx: {}, num_sub_vectors: {}",
-        sub_vector_idx,
-        num_sub_vectors
+        "sub_vector idx: {sub_vector_idx}, num_sub_vectors: {num_sub_vectors}"
     );
 
     let num_centroids: usize = 2_usize.pow(NUM_BITS);

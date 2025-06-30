@@ -273,7 +273,7 @@ mod test {
             .map(|r| r.unwrap_err())
             .collect::<Vec<_>>();
 
-        assert!(errors.is_empty(), "{:?}", errors);
+        assert!(errors.is_empty(), "{errors:?}");
 
         // load the data and check the content
         let ds = DatasetBuilder::from_uri(ds_uri)

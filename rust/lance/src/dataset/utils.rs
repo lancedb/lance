@@ -37,8 +37,7 @@ fn extract_row_ids(
         .copied();
     row_ids.append(row_ids_itr).map_err(|err| {
         datafusion::error::DataFusionError::Execution(format!(
-            "Row ids did not arrive in sorted order: {}",
-            err
+            "Row ids did not arrive in sorted order: {err}"
         ))
     })?;
     let non_row_ids_cols = (0..batch.num_columns())

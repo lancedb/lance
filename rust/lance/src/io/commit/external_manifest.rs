@@ -85,10 +85,7 @@ mod test {
             let mut store = self.store.lock().await;
             match store.get(&(uri.to_string(), version)) {
                 Some(_) => Err(Error::io(
-                    format!(
-                        "manifest already exists for uri: {}, version: {}",
-                        uri, version
-                    ),
+                    format!("manifest already exists for uri: {uri}, version: {version}"),
                     location!(),
                 )),
                 None => {
@@ -116,10 +113,7 @@ mod test {
                     Ok(())
                 }
                 None => Err(Error::io(
-                    format!(
-                        "manifest already exists for uri: {}, version: {}",
-                        uri, version
-                    ),
+                    format!("manifest already exists for uri: {uri}, version: {version}"),
                     location!(),
                 )),
             }
@@ -244,7 +238,7 @@ mod test {
                 .map(|r| r.unwrap_err())
                 .collect::<Vec<_>>();
 
-            assert!(errors.is_empty(), "{:?}", errors);
+            assert!(errors.is_empty(), "{errors:?}");
 
             // load the data and check the content
             let ds = DatasetBuilder::from_uri(ds_uri)
@@ -278,7 +272,7 @@ mod test {
                         .contains(".manifest#")
                 })
                 .collect::<Vec<_>>();
-            assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
+            assert!(unexpected_entries.is_empty(), "{unexpected_entries:?}");
         }
     }
 
@@ -382,6 +376,6 @@ mod test {
                     .ends_with(".manifest")
             })
             .collect::<Vec<_>>();
-        assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
+        assert!(unexpected_entries.is_empty(), "{unexpected_entries:?}");
     }
 }

@@ -141,7 +141,7 @@ async fn resolve_s3_region(
         // can be resolved from the bucket.
         let bucket = url.host_str().ok_or_else(|| {
             Error::invalid_input(
-                format!("Could not parse bucket from url: {}", url),
+                format!("Could not parse bucket from url: {url}"),
                 location!(),
             )
         })?;
@@ -211,15 +211,9 @@ pub async fn build_aws_credential(
 fn extract_static_s3_credentials(
     options: &HashMap<AmazonS3ConfigKey, String>,
 ) -> Option<StaticCredentialProvider<ObjectStoreAwsCredential>> {
-    let key_id = options
-        .get(&AmazonS3ConfigKey::AccessKeyId)
-        .map(|s| s.to_string());
-    let secret_key = options
-        .get(&AmazonS3ConfigKey::SecretAccessKey)
-        .map(|s| s.to_string());
-    let token = options
-        .get(&AmazonS3ConfigKey::Token)
-        .map(|s| s.to_string());
+    let key_id = options.get(&AmazonS3ConfigKey::AccessKeyId).cloned();
+    let secret_key = options.get(&AmazonS3ConfigKey::SecretAccessKey).cloned();
+    let token = options.get(&AmazonS3ConfigKey::Token).cloned();
     match (key_id, secret_key, token) {
         (Some(key_id), Some(secret_key), token) => {
             Some(StaticCredentialProvider::new(ObjectStoreAwsCredential {
@@ -295,7 +289,7 @@ impl CredentialProvider for AwsCredentialAdapter {
         } else {
             let refreshed_creds = Arc::new(self.inner.provide_credentials().await.map_err(
                 |e| Error::Internal {
-                    message: format!("Failed to get AWS credentials: {}", e),
+                    message: format!("Failed to get AWS credentials: {e}"),
                     location: location!(),
                 },
             )?);

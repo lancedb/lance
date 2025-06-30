@@ -42,8 +42,7 @@ impl DataFrameExt for DataFrame {
         for col in partition_columns {
             if self.schema().field_with_name(None, col).is_err() {
                 return Err(datafusion::error::DataFusionError::Execution(format!(
-                    "Partition column '{}' not found",
-                    col
+                    "Partition column '{col}' not found"
                 )));
             }
         }
@@ -212,8 +211,7 @@ impl Stream for BatchStreamGrouper {
             }
             debug_assert!(
                 self.unprocessed.is_none(),
-                "Something went wrong with state: {:?}",
-                self
+                "Something went wrong with state: {self:?}"
             );
 
             match self.input.poll_next_unpin(cx) {

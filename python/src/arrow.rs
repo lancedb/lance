@@ -83,7 +83,7 @@ pub fn bfloat16_array(values: Vec<Option<f32>>, py: Python<'_>) -> PyResult<PyOb
     );
     let schema = Schema::new(vec![field]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])
-        .map_err(|err| PyValueError::new_err(format!("Failed to build array: {}", err)))?;
+        .map_err(|err| PyValueError::new_err(format!("Failed to build array: {err}")))?;
 
     let pyarrow_batch = batch.to_pyarrow(py)?;
     pyarrow_batch.call_method1(py, "__getitem__", ("bfloat16",))

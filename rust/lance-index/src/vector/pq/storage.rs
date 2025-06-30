@@ -119,14 +119,11 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
             .metadata
             .get(PQ_METADATA_KEY)
             .ok_or(Error::Index {
-                message: format!(
-                    "Reading PQ storage: metadata key {} not found",
-                    PQ_METADATA_KEY
-                ),
+                message: format!("Reading PQ storage: metadata key {PQ_METADATA_KEY} not found"),
                 location: location!(),
             })?;
         let mut metadata: Self = serde_json::from_str(metadata).map_err(|_| Error::Index {
-            message: format!("Failed to parse PQ metadata: {}", metadata),
+            message: format!("Failed to parse PQ metadata: {metadata}"),
             location: location!(),
         })?;
 
@@ -374,14 +371,13 @@ impl ProductQuantizationStorage {
             .get(INDEX_METADATA_SCHEMA_KEY)
             .ok_or(Error::Index {
                 message: format!(
-                    "Reading PQ storage: index key {} not found",
-                    INDEX_METADATA_SCHEMA_KEY
+                    "Reading PQ storage: index key {INDEX_METADATA_SCHEMA_KEY} not found"
                 ),
                 location: location!(),
             })?;
         let index_metadata: IndexMetadata =
             serde_json::from_str(metadata_str).map_err(|_| Error::Index {
-                message: format!("Failed to parse index metadata: {}", metadata_str),
+                message: format!("Failed to parse index metadata: {metadata_str}"),
                 location: location!(),
             })?;
         let distance_type: DistanceType =

@@ -149,7 +149,7 @@ impl NGramPostingList {
         let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
         let mut bitmap =
             RoaringTreemap::deserialize_from(bitmap_bytes).map_err(|e| Error::Internal {
-                message: format!("Error deserializing ngram list: {}", e),
+                message: format!("Error deserializing ngram list: {e}"),
                 location: location!(),
             })?;
         if let Some(fri_ref) = fri.as_ref() {
@@ -364,7 +364,7 @@ impl Index for NGramIndex {
             num_ngrams: self.tokens.len(),
         };
         serde_json::to_value(ngram_stats).map_err(|e| Error::Internal {
-            message: format!("Error serializing statistics: {}", e),
+            message: format!("Error serializing statistics: {e}"),
             location: location!(),
         })
     }
@@ -550,7 +550,7 @@ impl NGramIndexSpillState {
             .into_iter()
             .map(|bytes| {
                 RoaringTreemap::deserialize_from(bytes.expect_ok()?).map_err(|e| Error::Internal {
-                    message: format!("Error deserializing ngram list: {}", e),
+                    message: format!("Error deserializing ngram list: {e}"),
                     location: location!(),
                 })
             })
@@ -715,11 +715,11 @@ impl NGramIndexBuilder {
     }
 
     fn spill_filename(id: usize) -> String {
-        format!("spill-{}.lance", id)
+        format!("spill-{id}.lance")
     }
 
     fn tmp_spill_filename(id: usize) -> String {
-        format!("spill-{}.lance.tmp", id)
+        format!("spill-{id}.lance.tmp")
     }
 
     async fn flush(&mut self, state: NGramIndexBuildState) -> Result<bool> {
@@ -1027,10 +1027,7 @@ impl NGramIndexBuilder {
         output_index: usize,
     ) -> Result<()> {
         // We fully load the small file into memory and then stream the large file
-        info!(
-            "Merge spill files {} and {} into {}",
-            index_of_left, index_of_right, output_index
-        );
+        info!("Merge spill files {index_of_left} and {index_of_right} into {output_index}");
 
         let mut writer = spill_store
             .new_index_file(&Self::spill_filename(output_index), POSTINGS_SCHEMA.clone())

@@ -70,10 +70,10 @@ impl FileFragment {
             .map(|f| format!("'{}'", f.path))
             .collect::<Vec<_>>()
             .join(", ");
-        write!(s, "{}]", file_path).unwrap();
+        write!(s, "{file_path}]").unwrap();
         if let Some(deletion) = &self.fragment.metadata().deletion_file {
             let path = deletion_file_path(&Default::default(), self.id() as u64, deletion);
-            write!(s, ", deletion_file='{}'", path).unwrap();
+            write!(s, ", deletion_file='{path}'").unwrap();
         }
         write!(s, ")").unwrap();
         Ok(s)
@@ -432,8 +432,7 @@ impl PyDeletionFile {
             "bitmap" => DeletionFileType::Bitmap,
             _ => {
                 return Err(PyValueError::new_err(format!(
-                    "file_type must be either 'array' or 'bitmap', got '{}'",
-                    file_type
+                    "file_type must be either 'array' or 'bitmap', got '{file_type}'"
                 )))
             }
         };
@@ -463,7 +462,7 @@ impl PyDeletionFile {
         let mut repr = "DeletionFile(".to_string();
         write!(repr, "type='{}'", self.file_type()).unwrap();
         if let Some(num_deleted_rows) = self.0.num_deleted_rows {
-            write!(repr, ", num_deleted_rows={}", num_deleted_rows).unwrap();
+            write!(repr, ", num_deleted_rows={num_deleted_rows}").unwrap();
         }
         write!(repr, ")").unwrap();
         repr
@@ -495,9 +494,8 @@ impl PyDeletionFile {
     #[pyo3(signature = (fragment_id, base_uri=None))]
     fn path(&self, fragment_id: u64, base_uri: Option<&str>) -> PyResult<String> {
         let base_path = if let Some(base_uri) = base_uri {
-            Path::from_url_path(base_uri).map_err(|e| {
-                PyValueError::new_err(format!("Invalid base URI: {}: {}", base_uri, e))
-            })?
+            Path::from_url_path(base_uri)
+                .map_err(|e| PyValueError::new_err(format!("Invalid base URI: {base_uri}: {e}")))?
         } else {
             Path::default()
         };
@@ -506,17 +504,14 @@ impl PyDeletionFile {
 
     pub fn json(&self) -> PyResult<String> {
         serde_json::to_string(&self.0).map_err(|err| {
-            PyValueError::new_err(format!(
-                "Could not dump CompactionPlan due to error: {}",
-                err
-            ))
+            PyValueError::new_err(format!("Could not dump CompactionPlan due to error: {err}"))
         })
     }
 
     #[staticmethod]
     pub fn from_json(json: String) -> PyResult<Self> {
         let deletion_file = serde_json::from_str(&json).map_err(|err| {
-            PyValueError::new_err(format!("Could not load DeletionFile due to error: {}", err))
+            PyValueError::new_err(format!("Could not load DeletionFile due to error: {err}"))
         })?;
         Ok(Self(deletion_file))
     }
@@ -555,17 +550,14 @@ impl PyRowIdMeta {
 
     pub fn json(&self) -> PyResult<String> {
         serde_json::to_string(&self.0).map_err(|err| {
-            PyValueError::new_err(format!(
-                "Could not dump CompactionPlan due to error: {}",
-                err
-            ))
+            PyValueError::new_err(format!("Could not dump CompactionPlan due to error: {err}"))
         })
     }
 
     #[staticmethod]
     pub fn from_json(json: String) -> PyResult<Self> {
         let row_id_meta = serde_json::from_str(&json).map_err(|err| {
-            PyValueError::new_err(format!("Could not load RowIdMeta due to error: {}", err))
+            PyValueError::new_err(format!("Could not load RowIdMeta due to error: {err}"))
         })?;
         Ok(Self(row_id_meta))
     }

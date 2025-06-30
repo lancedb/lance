@@ -57,19 +57,16 @@ fn run_bench<T: ArrowFloatType>(
     );
 
     if let Some(simd_impl) = simd_impl {
-        c.bench_function(
-            format!("NormL2({type_name}, SIMD)", type_name = type_name).as_str(),
-            |b| {
-                b.iter(|| {
-                    black_box(
-                        target
-                            .chunks_exact(DIMENSION)
-                            .map(simd_impl)
-                            .collect::<Vec<_>>(),
-                    );
-                });
-            },
-        );
+        c.bench_function(format!("NormL2({type_name}, SIMD)").as_str(), |b| {
+            b.iter(|| {
+                black_box(
+                    target
+                        .chunks_exact(DIMENSION)
+                        .map(simd_impl)
+                        .collect::<Vec<_>>(),
+                );
+            });
+        });
     }
 }
 

@@ -266,14 +266,12 @@ pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_readAllNative
 
                 if start_val < 0 || end_val < 0 {
                     return Err(Error::input_error(format!(
-                        "Invalid range values (negative): start={}, end={}",
-                        start_val, end_val
+                        "Invalid range values (negative): start={start_val}, end={end_val}"
                     )));
                 }
                 if start_val > end_val {
                     return Err(Error::input_error(format!(
-                        "Invalid range (start > end): start={}, end={}",
-                        start_val, end_val
+                        "Invalid range (start > end): start={start_val}, end={end_val}"
                     )));
                 }
 

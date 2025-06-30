@@ -700,12 +700,7 @@ async fn rewrite_files(
     let schema = reader.schema();
     let reader = reader.inspect_ok(move |batch| {
         rows_read += batch.num_rows();
-        log::info!(
-            "Compaction task {}: Read progress {}/{}",
-            task_id,
-            rows_read,
-            num_rows,
-        );
+        log::info!("Compaction task {task_id}: Read progress {rows_read}/{num_rows}",);
     });
     let reader = Box::pin(RecordBatchStreamAdapter::new(schema, reader));
 
@@ -737,7 +732,7 @@ async fn rewrite_files(
     assert!(new_fragments.blob.is_none());
     let mut new_fragments = new_fragments.default.0;
 
-    log::info!("Compaction task {}: file written", task_id);
+    log::info!("Compaction task {task_id}: file written");
 
     let (row_id_map, changed_row_addrs) = if let Some(row_ids) = row_ids {
         let row_ids = Arc::try_unwrap(row_ids)
@@ -745,10 +740,7 @@ async fn rewrite_files(
             .into_inner()
             .expect("Row ids mutex still locked");
 
-        log::info!(
-            "Compaction task {}: reserving fragment ids and transposing row ids",
-            task_id
-        );
+        log::info!("Compaction task {task_id}: reserving fragment ids and transposing row ids");
         reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
 
         if options.defer_index_remap {
@@ -760,7 +752,7 @@ async fn rewrite_files(
             (Some(row_id_map), None)
         }
     } else {
-        log::info!("Compaction task {}: rechunking stable row ids", task_id);
+        log::info!("Compaction task {task_id}: rechunking stable row ids");
         rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
 
         if options.defer_index_remap {
@@ -785,7 +777,7 @@ async fn rewrite_files(
         .map(|f| f.files.len() + f.deletion_file.is_some() as usize)
         .sum();
 
-    log::info!("Compaction task {}: completed", task_id);
+    log::info!("Compaction task {task_id}: completed");
 
     Ok(RewriteResult {
         metrics,
@@ -836,8 +828,7 @@ async fn rechunk_stable_row_ids(
                 .map(|frag| frag.physical_rows.unwrap() as u64)
                 .sum::<u64>()
         },
-        "{:?}",
-        old_sequences
+        "{old_sequences:?}"
     );
 
     let new_sequences = lance_table::rowids::rechunk_sequences(
@@ -1897,9 +1888,7 @@ mod tests {
                 assert_eq!(
                     immediate_map.get(old_row_id),
                     Some(new_row_id),
-                    "Row ID mapping should be identical: {} -> {:?}",
-                    old_row_id,
-                    new_row_id
+                    "Row ID mapping should be identical: {old_row_id} -> {new_row_id:?}"
                 );
             }
 
@@ -2784,13 +2773,11 @@ mod tests {
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
             plan.contains("MaterializeIndex"),
-            "Expected bitmap index scan in plan: {}",
-            plan
+            "Expected bitmap index scan in plan: {plan}"
         );
         assert!(
             !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
-            plan
+            "Expected no fragment scan in plan: {plan}"
         );
     }
 
@@ -2883,13 +2870,11 @@ mod tests {
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
             plan.contains("MaterializeIndex"),
-            "Expected btree index scan in plan: {}",
-            plan
+            "Expected btree index scan in plan: {plan}"
         );
         assert!(
             !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
-            plan
+            "Expected no fragment scan in plan: {plan}"
         );
     }
 
@@ -2991,13 +2976,11 @@ mod tests {
         let plan = scanner.explain_plan(true).await.unwrap();
         assert!(
             plan.contains("MatchQuery"),
-            "Expected inverted index scan in plan: {}",
-            plan
+            "Expected inverted index scan in plan: {plan}"
         );
         assert!(
             !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
-            plan
+            "Expected no fragment scan in plan: {plan}"
         );
 
         // Reindex to the latest
@@ -3087,15 +3070,15 @@ mod tests {
 
         // Initial scan
         let count1 = dataset
-            .count_rows(Some(format!("contains(doc, '{}')", test_word1)))
+            .count_rows(Some(format!("contains(doc, '{test_word1}')")))
             .await
             .unwrap();
         let count2 = dataset
-            .count_rows(Some(format!("contains(doc, '{}')", test_word2)))
+            .count_rows(Some(format!("contains(doc, '{test_word2}')")))
             .await
             .unwrap();
         let count3 = dataset
-            .count_rows(Some(format!("contains(doc, '{}')", test_word3)))
+            .count_rows(Some(format!("contains(doc, '{test_word3}')")))
             .await
             .unwrap();
 
@@ -3119,21 +3102,21 @@ mod tests {
         // Verify that scans still work correctly and return the same counts
         assert_eq!(
             dataset
-                .count_rows(Some(format!("contains(doc, '{}')", test_word1)))
+                .count_rows(Some(format!("contains(doc, '{test_word1}')")))
                 .await
                 .unwrap(),
             count1
         );
         assert_eq!(
             dataset
-                .count_rows(Some(format!("contains(doc, '{}')", test_word2)))
+                .count_rows(Some(format!("contains(doc, '{test_word2}')")))
                 .await
                 .unwrap(),
             count2
         );
         assert_eq!(
             dataset
-                .count_rows(Some(format!("contains(doc, '{}')", test_word3)))
+                .count_rows(Some(format!("contains(doc, '{test_word3}')")))
                 .await
                 .unwrap(),
             count3
@@ -3142,19 +3125,17 @@ mod tests {
         // Verify that after index creation and compaction, scan uses inverted index scan
         let mut scanner = dataset.scan();
         scanner
-            .filter(&format!("contains(doc, '{}')", test_word1))
+            .filter(&format!("contains(doc, '{test_word1}')"))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
             plan.contains("MaterializeIndex"),
-            "Expected inverted index scan in plan: {}",
-            plan
+            "Expected inverted index scan in plan: {plan}"
         );
         assert!(
             !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
-            plan
+            "Expected no fragment scan in plan: {plan}"
         );
     }
 
@@ -3251,13 +3232,11 @@ mod tests {
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
             plan.contains("MaterializeIndex"),
-            "Expected label list index scan in plan: {}",
-            plan
+            "Expected label list index scan in plan: {plan}"
         );
         assert!(
             !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
-            plan
+            "Expected no fragment scan in plan: {plan}"
         );
     }
 
@@ -3410,13 +3389,11 @@ mod tests {
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
             plan.contains("ANNSubIndex"),
-            "Expected vector index scan in plan: {}",
-            plan
+            "Expected vector index scan in plan: {plan}"
         );
         assert!(
             !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
-            plan
+            "Expected no fragment scan in plan: {plan}"
         );
     }
 }

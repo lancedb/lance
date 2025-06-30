@@ -76,7 +76,7 @@ async fn main() {
     let dataset = Dataset::open(dataset_dir.as_ref()).await.unwrap();
     let query_string = tokens[0];
     let query = FullTextSearchQuery::new(query_string.to_owned()).limit(Some(10));
-    println!("query: {:?}", query);
+    println!("query: {query:?}");
     let batch = dataset
         .scan()
         .full_text_search(query.clone())

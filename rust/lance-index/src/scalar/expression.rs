@@ -661,9 +661,9 @@ impl PartialEq for ScalarIndexExpr {
 impl std::fmt::Display for ScalarIndexExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Not(inner) => write!(f, "NOT({})", inner),
-            Self::And(lhs, rhs) => write!(f, "AND({},{})", lhs, rhs),
-            Self::Or(lhs, rhs) => write!(f, "OR({},{})", lhs, rhs),
+            Self::Not(inner) => write!(f, "NOT({inner})"),
+            Self::And(lhs, rhs) => write!(f, "AND({lhs},{rhs})"),
+            Self::Or(lhs, rhs) => write!(f, "OR({lhs},{rhs})"),
             Self::Query(search) => write!(
                 f,
                 "[{}]@{}",
@@ -1339,7 +1339,7 @@ mod tests {
             expr,
             Some(IndexedExpression::index_query(
                 col.to_string(),
-                format!("{}_idx", col),
+                format!("{col}_idx"),
                 Arc::new(query),
             )),
         )
@@ -1357,7 +1357,7 @@ mod tests {
             Some(
                 IndexedExpression::index_query(
                     col.to_string(),
-                    format!("{}_idx", col),
+                    format!("{col}_idx"),
                     Arc::new(query),
                 )
                 .maybe_not()

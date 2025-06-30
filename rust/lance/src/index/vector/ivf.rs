@@ -139,7 +139,7 @@ impl IVFIndex {
     ) -> Result<Self> {
         if !sub_index.is_loadable() {
             return Err(Error::Index {
-                message: format!("IVF sub index must be loadable, got: {:?}", sub_index),
+                message: format!("IVF sub index must be loadable, got: {sub_index:?}"),
                 location: location!(),
             });
         }
@@ -598,7 +598,7 @@ async fn optimize_ivf_pq_indices(
         .collect::<Result<Vec<_>>>()?;
     write_pq_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&indices_to_merge)).await?;
     let metadata = IvfPQIndexMetadata {
-        name: format!("_{}_idx", vector_column),
+        name: format!("_{vector_column}_idx"),
         column: vector_column.to_string(),
         dimension: dim as u32,
         dataset_version,
@@ -1213,10 +1213,7 @@ pub async fn build_ivf_model(
     let sample_size_hint = params.num_partitions * params.sample_rate;
 
     let start = std::time::Instant::now();
-    info!(
-        "Loading training data for IVF. Sample size: {}",
-        sample_size_hint
-    );
+    info!("Loading training data for IVF. Sample size: {sample_size_hint}");
     let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
     info!(
         "Finished loading training data in {:02} seconds",
@@ -1292,7 +1289,7 @@ pub async fn load_precomputed_partitions_if_available(
 ) -> Result<Option<HashMap<u64, u32>>> {
     match &ivf_params.precomputed_partitions_file {
         Some(file) => {
-            info!("Loading precomputed partitions from file: {}", file);
+            info!("Loading precomputed partitions from file: {file}");
             let mut builder = DatasetBuilder::from_uri(file);
             if let Some(storage_options) = &ivf_params.storage_options {
                 builder = builder.with_storage_options(storage_options.clone());
@@ -1960,8 +1957,7 @@ mod tests {
                 attempts_remaining -= 1;
             }
             panic!(
-                "Unable to generate centroids with sufficient distance after {} attempts",
-                MAX_ATTEMPTS
+                "Unable to generate centroids with sufficient distance after {MAX_ATTEMPTS} attempts"
             );
         }
 
@@ -2603,8 +2599,7 @@ mod tests {
                 .for_each(|v| {
                     assert!(
                         (0.0..2.0).contains(v),
-                        "Expect cosine value in range [0.0, 2.0], got: {}",
-                        v
+                        "Expect cosine value in range [0.0, 2.0], got: {v}"
                     )
                 });
         }
@@ -2664,8 +2659,7 @@ mod tests {
             .for_each(|v| {
                 assert!(
                     (-1.0..1.0).contains(v),
-                    "Expect cosine value in range [-1.0, 1.0], got: {}",
-                    v
+                    "Expect cosine value in range [-1.0, 1.0], got: {v}"
                 );
             });
     }
@@ -2714,8 +2708,7 @@ mod tests {
                 .for_each(|v| {
                     assert!(
                         (-2.0 * DIM as f32..0.0).contains(v),
-                        "Expect dot product value in range [-2.0 * DIM, 0.0], got: {}",
-                        v
+                        "Expect dot product value in range [-2.0 * DIM, 0.0], got: {v}"
                     )
                 });
         }
@@ -2888,11 +2881,10 @@ mod tests {
                     source
                         .to_string()
                         .contains("num_sub_vectors must divide vector dimension"),
-                    "{:?}",
-                    res
+                    "{res:?}"
                 );
             }
-            _ => panic!("Expected InvalidInput error: {:?}", res),
+            _ => panic!("Expected InvalidInput error: {res:?}"),
         }
     }
 
@@ -2987,10 +2979,7 @@ mod tests {
         let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
             recall >= 0.9,
-            "recall: {}\n results: {:?}\n\ngt: {:?}",
-            recall,
-            results,
-            gt,
+            "recall: {recall}\n results: {results:?}\n\ngt: {gt:?}",
         );
     }
 
@@ -3069,10 +3058,7 @@ mod tests {
         let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
             recall >= 0.9,
-            "recall: {}\n results: {:?}\n\ngt: {:?}",
-            recall,
-            results,
-            gt,
+            "recall: {recall}\n results: {results:?}\n\ngt: {gt:?}",
         );
     }
 
@@ -3132,7 +3118,7 @@ mod tests {
             .as_primitive::<Float32Type>()
             .values()
             .iter()
-            .for_each(|v| assert!((-1.0..=1.0).contains(v), "Got {}", v));
+            .for_each(|v| assert!((-1.0..=1.0).contains(v), "Got {v}"));
 
         let dataset = Dataset::open(test_uri).await.unwrap();
 
@@ -3158,6 +3144,6 @@ mod tests {
             }
         }
 
-        assert!(correct_times >= 9, "correct: {}", correct_times);
+        assert!(correct_times >= 9, "correct: {correct_times}");
     }
 }

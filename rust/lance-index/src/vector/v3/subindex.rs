@@ -82,7 +82,7 @@ impl TryFrom<&str> for SubIndexType {
             "FLAT" => Ok(Self::Flat),
             "HNSW" => Ok(Self::Hnsw),
             _ => Err(Error::Index {
-                message: format!("unknown sub index type {}", value),
+                message: format!("unknown sub index type {value}"),
                 location: location!(),
             }),
         }

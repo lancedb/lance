@@ -486,7 +486,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     metrics.partitions_ranked.add(index.total_partitions());
 
                     let partitions = index.find_partitions(&query).map_err(|e| {
-                        DataFusionError::Execution(format!("Failed to find partitions: {}", e))
+                        DataFusionError::Execution(format!("Failed to find partitions: {e}"))
                     })?;
 
                     let mut list_builder = ListBuilder::new(UInt32Builder::new())
@@ -573,8 +573,7 @@ impl ANNIvfSubIndexExec {
         if input.schema().field_with_name(PART_ID_COLUMN).is_err() {
             return Err(Error::Index {
                 message: format!(
-                    "ANNSubIndexExec node: input schema does not have \"{}\" column",
-                    PART_ID_COLUMN
+                    "ANNSubIndexExec node: input schema does not have \"{PART_ID_COLUMN}\" column"
                 ),
                 location: location!(),
             });
@@ -775,10 +774,7 @@ impl ANNIvfSubIndexExec {
                                 &metrics.index_metrics,
                             )
                             .map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "Failed to calculate KNN: {}",
-                                    e
-                                ))
+                                DataFusionError::Execution(format!("Failed to calculate KNN: {e}"))
                             })
                             .await?;
                         metrics.baseline_metrics.record_output(batch.num_rows());
@@ -833,7 +829,7 @@ impl ANNIvfSubIndexExec {
                             &metrics.index_metrics,
                         )
                         .map_err(|e| {
-                            DataFusionError::Execution(format!("Failed to calculate KNN: {}", e))
+                            DataFusionError::Execution(format!("Failed to calculate KNN: {e}"))
                         })
                         .await?;
                     metrics.baseline_metrics.record_output(batch.num_rows());
@@ -1281,7 +1277,7 @@ mod tests {
                             .unwrap(),
                         ),
                         Arc::new(StringArray::from_iter_values(
-                            (i * 20..(i + 1) * 20).map(|i| format!("s3://bucket/file-{}", i)),
+                            (i * 20..(i + 1) * 20).map(|i| format!("s3://bucket/file-{i}")),
                         )),
                     ],
                 )

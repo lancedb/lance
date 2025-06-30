@@ -60,7 +60,7 @@ impl S3Bucket {
             .map_err(|err| err.into_service_error());
         match res {
             Err(e) if e.is_no_such_bucket() => return,
-            Err(e) => panic!("Failed to list objects in bucket: {}", e),
+            Err(e) => panic!("Failed to list objects in bucket: {e}"),
             _ => {}
         }
         let objects = res.unwrap().contents.unwrap_or_default();
@@ -157,7 +157,7 @@ impl DynamoDBCommitTable {
         {
             Ok(_) => {}
             Err(e) if e.is_resource_not_found_exception() => {}
-            Err(e) => panic!("Failed to delete table: {}", e),
+            Err(e) => panic!("Failed to delete table: {e}"),
         };
     }
 }

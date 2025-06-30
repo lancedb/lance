@@ -18,7 +18,7 @@ pub fn format_schema(dataset: &Bound<'_, PyAny>) -> PyResult<String> {
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
     let dataset_ref = &dataset.bind(py).borrow().ds;
     let schema = dataset_ref.schema();
-    Ok(format!("{:#?}", schema))
+    Ok(format!("{schema:#?}"))
 }
 
 /// Print the full Lance manifest of the dataset.
@@ -28,7 +28,7 @@ pub fn format_manifest(dataset: &Bound<'_, PyAny>) -> PyResult<String> {
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
     let dataset_ref = &dataset.bind(py).borrow().ds;
     let manifest = dataset_ref.manifest();
-    Ok(format!("{:#?}", manifest))
+    Ok(format!("{manifest:#?}"))
 }
 
 // These are dead code because they just exist for the debug impl.
@@ -93,7 +93,7 @@ pub fn format_fragment(
     let schema = dataset_ref.schema();
 
     let pp_meta = PrettyPrintableFragment::new(&fragment, schema);
-    Ok(format!("{:#?}", pp_meta))
+    Ok(format!("{pp_meta:#?}"))
 }
 
 /// Return a string representation of each transaction in the dataset, in
@@ -116,10 +116,10 @@ pub fn list_transactions(
 
         loop {
             let transaction = dataset.read_transaction().await.map_err(|err| {
-                PyIOError::new_err(format!("Failed to read transaction file: {:?}", err))
+                PyIOError::new_err(format!("Failed to read transaction file: {err:?}"))
             })?;
             if let Some(transaction) = transaction {
-                transactions.push(Some(format!("{:#?}", transaction)));
+                transactions.push(Some(format!("{transaction:#?}")));
             } else {
                 transactions.push(None);
             }
@@ -135,8 +135,7 @@ pub fn list_transactions(
                     Err(Error::DatasetNotFound { .. }) => break,
                     Err(err) => {
                         return Err(PyIOError::new_err(format!(
-                            "Failed to checkout version: {:?}",
-                            err
+                            "Failed to checkout version: {err:?}"
                         )))
                     }
                 }

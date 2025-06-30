@@ -260,10 +260,7 @@ where
                 .map(|vec| argmin_value_float(dot_distance_batch(vec, centroids, dimension)))
                 .collect::<Vec<_>>(),
             _ => {
-                panic!(
-                    "KMeans::find_partitions: {} is not supported",
-                    distance_type
-                );
+                panic!("KMeans::find_partitions: {distance_type} is not supported");
             }
         };
         (
@@ -332,9 +329,8 @@ where
         let empty_clusters = cluster_cnts.iter().filter(|&cnt| *cnt == 0).count();
         if empty_clusters as f32 / k as f32 > 0.1 {
             warn!(
-                "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
-                is too small to have a meaningful index (less than 5000 vectors) or has many duplicate vectors.",
-                empty_clusters, k
+                "KMeans: more than 10% of clusters are empty: {empty_clusters} of {k}.\nHelp: this could mean your dataset \
+                is too small to have a meaningful index (less than 5000 vectors) or has many duplicate vectors."
             );
         }
 
@@ -600,8 +596,7 @@ impl KMeans {
         if n < k {
             return Err(ArrowError::InvalidArgumentError(
                 format!(
-                    "KMeans: training does not have sufficient data points: n({}) is smaller than k({})",
-                    n, k
+                    "KMeans: training does not have sufficient data points: n({n}) is smaller than k({k})"
                 )
             ));
         }
@@ -697,10 +692,7 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
         DistanceType::L2 => l2_distance_batch(query, centroids, query.len()).collect(),
         DistanceType::Dot => dot_distance_batch(query, centroids, query.len()).collect(),
         _ => {
-            panic!(
-                "KMeans::find_partitions: {} is not supported",
-                distance_type
-            );
+            panic!("KMeans::find_partitions: {distance_type} is not supported");
         }
     };
 
@@ -718,10 +710,7 @@ pub fn kmeans_find_partitions_binary(
     let dists: Vec<f32> = match distance_type {
         DistanceType::Hamming => hamming_distance_batch(query, centroids, query.len()).collect(),
         _ => {
-            panic!(
-                "KMeans::find_partitions: {} is not supported",
-                distance_type
-            );
+            panic!("KMeans::find_partitions: {distance_type} is not supported");
         }
     };
 
@@ -825,10 +814,7 @@ pub fn compute_partition<T: Float + L2 + Dot>(
             argmin_value_float(dot_distance_batch(vector, centroids, vector.len())).map(|(c, _)| c)
         }
         _ => {
-            panic!(
-                "KMeans::compute_partition: distance type {} is not supported",
-                distance_type
-            );
+            panic!("KMeans::compute_partition: distance type {distance_type} is not supported");
         }
     }
 }
@@ -895,7 +881,7 @@ mod tests {
             DIM,
             DistanceType::L2,
         );
-        assert!(loss > 0.0, "loss is not zero: {}", loss);
+        assert!(loss > 0.0, "loss is not zero: {loss}");
         membership.iter().for_each(|cd| {
             assert!(cd.is_some());
         });

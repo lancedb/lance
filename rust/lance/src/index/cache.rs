@@ -216,7 +216,7 @@ impl IndexCache {
 
     /// Construct a key for index metadata arrays.
     fn metadata_key(dataset_uuid: &str, version: u64) -> String {
-        format!("{}:{}", dataset_uuid, version)
+        format!("{dataset_uuid}:{version}")
     }
 
     /// Get all index metadata for a particular dataset version.

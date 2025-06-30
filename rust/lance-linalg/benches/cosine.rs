@@ -43,14 +43,14 @@ where
     let key = generate_random_array_with_seed::<T>(DIMENSION, [0; 32]);
     let target = generate_random_array_with_seed::<T>(TOTAL * DIMENSION, [42; 32]);
 
-    c.bench_function(format!("Cosine({}, scalar)", type_name).as_str(), |b| {
+    c.bench_function(format!("Cosine({type_name}, scalar)").as_str(), |b| {
         b.iter(|| {
             black_box(cosine_scalar(key.as_slice(), target.as_slice(), DIMENSION));
         })
     });
 
     c.bench_function(
-        format!("Cosine({}, auto-vectorized)", type_name).as_str(),
+        format!("Cosine({type_name}, auto-vectorized)").as_str(),
         |b| {
             b.iter(|| {
                 black_box(

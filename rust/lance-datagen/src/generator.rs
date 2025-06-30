@@ -1447,7 +1447,7 @@ impl FixedSizeBatchGenerator {
         let mut fields = Vec::with_capacity(generators.len());
         for (field_index, field_gen) in generators.iter().enumerate() {
             let (name, gen) = field_gen;
-            let default_name = format!("field_{}", field_index);
+            let default_name = format!("field_{field_index}");
             let name = name.clone().unwrap_or(default_name);
             let mut field = Field::new(name, gen.data_type().clone(), true);
             if let Some(metadata) = gen.metadata() {

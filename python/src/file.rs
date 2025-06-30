@@ -326,8 +326,7 @@ fn path_to_parent(path: &Path) -> PyResult<(Path, String)> {
     let mut parts = path.parts().collect::<Vec<_>>();
     if parts.is_empty() {
         return Err(PyValueError::new_err(format!(
-            "Path {} is not a valid path to a file",
-            path,
+            "Path {path} is not a valid path to a file",
         )));
     }
     let filename = parts.pop().unwrap().as_ref().to_owned();
@@ -408,7 +407,7 @@ impl LanceFileReader {
             .infer_error()?;
         let file_metadata = FileReader::read_all_metadata(&file)
             .await
-            .map_err(|e| PyIOError::new_err(format!("Error reading file metadata: {}", e)))?;
+            .map_err(|e| PyIOError::new_err(format!("Error reading file metadata: {e}")))?;
 
         let mut base_projection = None;
         if let Some(columns) = columns {
@@ -418,7 +417,7 @@ impl LanceFileReader {
                     &file_metadata.file_schema,
                     &columns.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
                 )
-                .map_err(|e| PyIOError::new_err(format!("Error creating projection: {}", e)))?,
+                .map_err(|e| PyIOError::new_err(format!("Error creating projection: {e}")))?,
             );
         }
 

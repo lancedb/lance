@@ -971,7 +971,7 @@ impl Transaction {
             if let Some(user_requested) = user_requested {
                 if user_requested != file_version {
                     return Err(Error::invalid_input(
-                        format!("User requested data storage version ({}) does not match version in data files ({})", user_requested, file_version),
+                        format!("User requested data storage version ({user_requested}) does not match version in data files ({file_version})"),
                         location!(),
                     ));
                 }
@@ -1258,7 +1258,7 @@ impl Transaction {
                         .enumerate()
                         .map(|(id, f)| (id, f.fields.clone()))
                         .fold("".to_string(), |acc, (id, fields)| {
-                            format!("{}File {}: {:?}\n", acc, id, fields)
+                            format!("{acc}File {id}: {fields:?}\n")
                         });
 
                     return Err(Error::invalid_input(
@@ -2081,7 +2081,7 @@ impl From<&Transaction> for pb::Transaction {
                         .unwrap_or(Default::default()),
                 })
             }
-            _ => panic!("Invalid blob operation: {:?}", value),
+            _ => panic!("Invalid blob operation: {value:?}"),
         });
 
         Self {

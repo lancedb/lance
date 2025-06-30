@@ -77,13 +77,13 @@ impl std::fmt::Display for RowIdSequence {
 
         write!(f, "[")?;
         for row_id in first_10 {
-            write!(f, "{}", row_id)?;
+            write!(f, "{row_id}")?;
         }
         if theres_more {
             write!(f, ", ...")?;
         }
         for row_id in last_10 {
-            write!(f, ", {}", row_id)?;
+            write!(f, ", {row_id}")?;
         }
         write!(f, "]")
     }

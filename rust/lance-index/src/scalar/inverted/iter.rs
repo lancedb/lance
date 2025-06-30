@@ -44,7 +44,7 @@ impl Iterator for TokenIterator<'_> {
 
 pub enum PostingListIterator<'a> {
     Plain(PlainPostingListIterator<'a>),
-    Compressed(CompressedPostingListIterator),
+    Compressed(Box<CompressedPostingListIterator>),
 }
 
 impl<'a> PostingListIterator<'a> {
@@ -52,11 +52,11 @@ impl<'a> PostingListIterator<'a> {
         match posting {
             PostingList::Plain(posting) => Self::Plain(posting.iter()),
             PostingList::Compressed(posting) => {
-                Self::Compressed(CompressedPostingListIterator::new(
+                Self::Compressed(Box::new(CompressedPostingListIterator::new(
                     posting.length as usize,
                     posting.blocks.clone(),
                     posting.positions.clone(),
-                ))
+                )))
             }
         }
     }
@@ -71,6 +71,7 @@ impl<'a> Iterator for PostingListIterator<'a> {
                 .next()
                 .map(|(doc_id, freq, pos)| (doc_id, freq as u32, pos)),
             PostingListIterator::Compressed(iter) => iter
+                .as_mut()
                 .next()
                 .map(|(doc_id, freq, pos)| (doc_id as u64, freq, pos)),
         }

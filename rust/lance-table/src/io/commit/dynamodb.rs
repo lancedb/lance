@@ -52,9 +52,9 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let request_id = self.0.request_id().unwrap_or("unknown");
         let service_err = &self.0.raw_response();
-        write!(f, "WrappedSdkError: request_id: {}", request_id)?;
+        write!(f, "WrappedSdkError: request_id: {request_id}")?;
         if let Some(err) = service_err {
-            write!(f, ", service_error: {:?}", err)
+            write!(f, ", service_error: {err:?}")
         } else {
             write!(f, ", no service error")
         }
@@ -259,10 +259,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             .wrap_err()?;
 
         let item = get_item_result.item.context(NotFoundSnafu {
-            uri: format!(
-                "dynamodb not found: base_uri: {}; version: {}",
-                base_uri, version
-            ),
+            uri: format!("dynamodb not found: base_uri: {base_uri}; version: {version}"),
             location: location!(),
         })?;
 
@@ -293,10 +290,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             .wrap_err()?;
 
         let item = get_item_result.item.context(NotFoundSnafu {
-            uri: format!(
-                "dynamodb not found: base_uri: {}; version: {}",
-                base_uri, version
-            ),
+            uri: format!("dynamodb not found: base_uri: {base_uri}; version: {version}"),
             location: location!(),
         })?;
 
@@ -393,7 +387,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                 match (version_attribute, path_attribute) {
                     (AttributeValue::N(version), AttributeValue::S(path)) => {
                         let version = version.parse().map_err(|e| Error::io(
-                            format!("dynamodb error: could not parse the version number returned {}, error: {}", version, e),
+                            format!("dynamodb error: could not parse the version number returned {version}, error: {e}"),
                             location!(),
                         ))?;
                         let path = Path::from(path.as_str());

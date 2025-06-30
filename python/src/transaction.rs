@@ -337,9 +337,9 @@ impl FromPyObject<'_> for PyLance<RewrittenIndex> {
         let old_id: String = ob.getattr("old_id")?.extract()?;
         let new_id: String = ob.getattr("new_id")?.extract()?;
         let old_id = Uuid::parse_str(&old_id)
-            .map_err(|e| PyValueError::new_err(format!("Failed to parse UUID: {}", e)))?;
+            .map_err(|e| PyValueError::new_err(format!("Failed to parse UUID: {e}")))?;
         let new_id = Uuid::parse_str(&new_id)
-            .map_err(|e| PyValueError::new_err(format!("Failed to parse UUID: {}", e)))?;
+            .map_err(|e| PyValueError::new_err(format!("Failed to parse UUID: {e}")))?;
         Ok(Self(RewrittenIndex { old_id, new_id }))
     }
 }
@@ -376,8 +376,7 @@ fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
     // Note: the field ids here are wrong.
     Schema::try_from(arrow_schema).map_err(|e| {
         PyValueError::new_err(format!(
-            "Failed to convert Arrow schema to Lance schema: {}",
-            e
+            "Failed to convert Arrow schema to Lance schema: {e}"
         ))
     })
 }

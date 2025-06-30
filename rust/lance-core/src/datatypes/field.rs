@@ -109,7 +109,7 @@ impl FromStr for StorageClass {
             "default" | "" => Ok(Self::Default),
             "blob" => Ok(Self::Blob),
             _ => Err(Error::Schema {
-                message: format!("Unknown storage class: {}", s),
+                message: format!("Unknown storage class: {s}"),
                 location: location!(),
             }),
         }
@@ -303,8 +303,7 @@ impl Field {
                 })
                 .unwrap_or_else(|| expected.name.clone());
             differences.push(format!(
-                "expected name '{}' but name was '{}'",
-                expected_path, self_name
+                "expected name '{expected_path}' but name was '{self_name}'"
             ));
         }
         if options.compare_field_ids && self.id != expected.id {
@@ -327,14 +326,12 @@ impl Field {
         }
         if options.compare_dictionary && self.dictionary != expected.dictionary {
             differences.push(format!(
-                "dictionary for `{}` did not match expected dictionary",
-                self_name
+                "dictionary for `{self_name}` did not match expected dictionary"
             ));
         }
         if options.compare_metadata && self.metadata != expected.metadata {
             differences.push(format!(
-                "metadata for `{}` did not match expected metadata",
-                self_name
+                "metadata for `{self_name}` did not match expected metadata"
             ));
         }
         let children_differences = explain_fields_difference(
@@ -442,7 +439,7 @@ impl Field {
                     self.set_dictionary_values(arr.as_dictionary::<UInt64Type>().values())
                 }
                 _ => {
-                    panic!("Unsupported dictionary key type: {}", key_type);
+                    panic!("Unsupported dictionary key type: {key_type}");
                 }
             },
             DataType::Struct(subfields) => {
@@ -605,8 +602,7 @@ impl Field {
                 if dt != other_dt {
                     return Err(Error::Schema {
                         message: format!(
-                            "Attempt to project field by different types: {} and {}",
-                            dt, other_dt,
+                            "Attempt to project field by different types: {dt} and {other_dt}",
                         ),
                         location: location!(),
                     });
@@ -656,10 +652,7 @@ impl Field {
             }
             _ => match on_type_mismatch {
                 OnTypeMismatch::Error => Err(Error::Schema {
-                    message: format!(
-                        "Attempt to project incompatible fields: {} and {}",
-                        self, other
-                    ),
+                    message: format!("Attempt to project incompatible fields: {self} and {other}"),
                     location: location!(),
                 }),
                 OnTypeMismatch::TakeSelf => Ok(self.clone()),
@@ -824,8 +817,7 @@ impl Field {
                 if self.data_type() != other.data_type() {
                     return Err(Error::Schema {
                         message: format!(
-                            "Attempt to merge incompatible fields: {} and {}",
-                            self, other
+                            "Attempt to merge incompatible fields: {self} and {other}"
                         ),
                         location: location!(),
                     });
@@ -927,13 +919,13 @@ impl fmt::Display for Field {
         )?;
 
         if let Some(dictionary) = &self.dictionary {
-            write!(f, ", dictionary={:?}", dictionary)?;
+            write!(f, ", dictionary={dictionary:?}")?;
         }
 
         if !self.children.is_empty() {
             write!(f, ", children=[")?;
             for child in self.children.iter() {
-                write!(f, "{}, ", child)?;
+                write!(f, "{child}, ")?;
             }
             write!(f, "]")?;
         }

@@ -167,7 +167,7 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
             _ => {
                 return Err(Error::Schema {
-                    message: format!("Unsupported data type: {:?}", dt),
+                    message: format!("Unsupported data type: {dt:?}"),
                     location: location!(),
                 })
             }
@@ -219,7 +219,7 @@ impl TryFrom<&LogicalType> for DataType {
                 "fixed_size_list" => {
                     if splits.len() < 3 {
                         return Err(Error::Schema {
-                            message: format!("Unsupported logical type: {}", lt),
+                            message: format!("Unsupported logical type: {lt}"),
                             location: location!(),
                         });
                     }
@@ -261,7 +261,7 @@ impl TryFrom<&LogicalType> for DataType {
                 "fixed_size_binary" => {
                     if splits.len() != 2 {
                         Err(Error::Schema {
-                            message: format!("Unsupported logical type: {}", lt),
+                            message: format!("Unsupported logical type: {lt}"),
                             location: location!(),
                         })
                     } else {
@@ -275,7 +275,7 @@ impl TryFrom<&LogicalType> for DataType {
                 "dict" => {
                     if splits.len() != 4 {
                         Err(Error::Schema {
-                            message: format!("Unsupported dictionary type: {}", lt),
+                            message: format!("Unsupported dictionary type: {lt}"),
                             location: location!(),
                         })
                     } else {
@@ -287,7 +287,7 @@ impl TryFrom<&LogicalType> for DataType {
                 "decimal" => {
                     if splits.len() != 4 {
                         Err(Error::Schema {
-                            message: format!("Unsupported decimal type: {}", lt),
+                            message: format!("Unsupported decimal type: {lt}"),
                             location: location!(),
                         })
                     } else {
@@ -322,7 +322,7 @@ impl TryFrom<&LogicalType> for DataType {
                 "timestamp" => {
                     if splits.len() != 3 {
                         Err(Error::Schema {
-                            message: format!("Unsupported timestamp type: {}", lt),
+                            message: format!("Unsupported timestamp type: {lt}"),
                             location: location!(),
                         })
                     } else {
@@ -336,7 +336,7 @@ impl TryFrom<&LogicalType> for DataType {
                     }
                 }
                 _ => Err(Error::Schema {
-                    message: format!("Unsupported logical type: {}", lt),
+                    message: format!("Unsupported logical type: {lt}"),
                     location: location!(),
                 }),
             }

@@ -646,8 +646,7 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
             if !field.is_default_storage() {
                 return Err(Error::NotSupported {
                     source: format!(
-                        "Column \"{}\" is not a default storage column and cannot yet be dropped",
-                        col
+                        "Column \"{col}\" is not a default storage column and cannot yet be dropped"
                     )
                     .into(),
                     location: location!(),
@@ -655,7 +654,7 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
             }
         } else {
             return Err(Error::invalid_input(
-                format!("Column {} does not exist in the dataset", col),
+                format!("Column {col} does not exist in the dataset"),
                 location!(),
             ));
         }

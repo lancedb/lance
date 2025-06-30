@@ -58,14 +58,11 @@ impl QuantizerMetadata for ScalarQuantizationMetadata {
             .metadata
             .get(SQ_METADATA_KEY)
             .ok_or(Error::Index {
-                message: format!(
-                    "Reading SQ metadata: metadata key {} not found",
-                    SQ_METADATA_KEY
-                ),
+                message: format!("Reading SQ metadata: metadata key {SQ_METADATA_KEY} not found"),
                 location: location!(),
             })?;
         serde_json::from_str(metadata_str).map_err(|_| Error::Index {
-            message: format!("Failed to parse index metadata: {}", metadata_str),
+            message: format!("Failed to parse index metadata: {metadata_str}"),
             location: location!(),
         })
     }
@@ -230,14 +227,13 @@ impl ScalarQuantizationStorage {
             .get(INDEX_METADATA_SCHEMA_KEY)
             .ok_or(Error::Index {
                 message: format!(
-                    "Reading SQ storage: index key {} not found",
-                    INDEX_METADATA_SCHEMA_KEY
+                    "Reading SQ storage: index key {INDEX_METADATA_SCHEMA_KEY} not found"
                 ),
                 location: location!(),
             })?;
         let index_metadata: IndexMetadata =
             serde_json::from_str(metadata_str).map_err(|_| Error::Index {
-                message: format!("Failed to parse index metadata: {}", metadata_str),
+                message: format!("Failed to parse index metadata: {metadata_str}"),
                 location: location!(),
             })?;
         let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;

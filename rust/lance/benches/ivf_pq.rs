@@ -67,8 +67,8 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     const DIM: usize = 768;
-    let uri = format!("./ivf_pq_{}d.lance", DIM);
-    std::fs::remove_dir_all(&uri).map_or_else(|_| println!("{} not exists", uri), |_| {});
+    let uri = format!("./ivf_pq_{DIM}d.lance");
+    std::fs::remove_dir_all(&uri).map_or_else(|_| println!("{uri} not exists"), |_| {});
 
     rt.block_on(async { create_dataset(std::path::Path::new(&uri), DIM, WriteMode::Create).await });
 
@@ -78,11 +78,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
     let pq = 96;
 
     c.bench_function(
-        format!(
-            "CreateIVF{},PQ{}(d={},metric=cosine)",
-            ivf_partition, pq, DIM
-        )
-        .as_str(),
+        format!("CreateIVF{ivf_partition},PQ{pq}(d={DIM},metric=cosine)").as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
                 let params =
@@ -104,7 +100,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
     );
 
     c.bench_function(
-        format!("CreateIVF{},PQ{}(d={},metric=l2)", ivf_partition, pq, DIM).as_str(),
+        format!("CreateIVF{ivf_partition},PQ{pq}(d={DIM},metric=l2)").as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
                 let params = VectorIndexParams::ivf_pq(ivf_partition, 8, pq, MetricType::L2, 50);

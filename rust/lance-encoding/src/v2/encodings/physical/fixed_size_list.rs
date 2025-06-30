@@ -109,7 +109,7 @@ impl ArrayEncoder for FslEncoder {
     ) -> Result<EncodedArray> {
         let inner_type = match data_type {
             DataType::FixedSizeList(inner_field, _) => inner_field.data_type().clone(),
-            _ => panic!("Expected fixed size list data type and got {}", data_type),
+            _ => panic!("Expected fixed size list data type and got {data_type}"),
         };
         let data = data.as_fixed_size_list().unwrap();
         let child = *data.child;

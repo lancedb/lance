@@ -201,7 +201,7 @@ fn bytes_read_counter() -> PyResult<u64> {
 #[pyfunction(name = "_schema_to_json")]
 fn schema_to_json(schema: PyArrowType<ArrowSchema>) -> PyResult<String> {
     schema.0.to_json().map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("Failed to convert schema to json: {}", e))
+        pyo3::exceptions::PyValueError::new_err(format!("Failed to convert schema to json: {e}"))
     })
 }
 
@@ -209,8 +209,7 @@ fn schema_to_json(schema: PyArrowType<ArrowSchema>) -> PyResult<String> {
 fn json_to_schema(json: &str) -> PyResult<PyArrowType<ArrowSchema>> {
     let schema = ArrowSchema::from_json(json).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!(
-            "Failed to convert json to schema: {}, json={}",
-            e, json
+            "Failed to convert json to schema: {e}, json={json}"
         ))
     })?;
     Ok(schema.into())
@@ -338,7 +337,7 @@ fn read_tfrecord(
 
     // Verify initialization happened successfully
     init_receiver.recv().unwrap().map_err(|err| {
-        PyIOError::new_err(format!("Failed to initialize tfrecord reader: {}", err))
+        PyIOError::new_err(format!("Failed to initialize tfrecord reader: {err}"))
     })?;
 
     let batch_reader = RecordBatchIterator::new(batch_receiver, schema);
@@ -346,7 +345,7 @@ fn read_tfrecord(
     // TODO: this should be handled by upstream
     let stream = FFI_ArrowArrayStream::new(Box::new(batch_reader));
     let stream_reader = ArrowArrayStreamReader::try_new(stream).map_err(|err| {
-        PyValueError::new_err(format!("Failed to export record batch reader: {}", err))
+        PyValueError::new_err(format!("Failed to export record batch reader: {err}"))
     })?;
 
     Ok(PyArrowType(stream_reader))
@@ -360,10 +359,10 @@ fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     let dataset_ref = &dataset.bind(py).borrow().ds;
     let indices = RT
         .block_on(Some(py), dataset_ref.load_indices())?
-        .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
+        .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {err}")))?;
     let (manifest, _) = RT
         .block_on(Some(py), dataset_ref.latest_manifest())?
-        .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
+        .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {err}")))?;
     Ok(::lance::io::commit::manifest_needs_migration(
         &manifest, &indices,
     ))

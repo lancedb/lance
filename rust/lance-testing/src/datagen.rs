@@ -156,7 +156,7 @@ impl BatchGenerator {
         let mut arrays = Vec::with_capacity(self.generators.len());
         for (field_index, gen) in self.generators.iter_mut().enumerate() {
             let arr = gen.generate(num_rows as usize);
-            let default_name = format!("field_{}", field_index);
+            let default_name = format!("field_{field_index}");
             let name = gen.name().unwrap_or(&default_name);
             fields.push(Field::new(name, arr.data_type().clone(), true));
             arrays.push(arr);

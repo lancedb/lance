@@ -361,7 +361,7 @@ impl Index for FragReuseIndex {
             num_versions: self.details.versions.len(),
         };
         serde_json::to_value(stats).map_err(|e| Error::Internal {
-            message: format!("failed to serialize fragment reuse index statistics: {}", e),
+            message: format!("failed to serialize fragment reuse index statistics: {e}"),
             location: location!(),
         })
     }

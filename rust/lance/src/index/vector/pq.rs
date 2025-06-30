@@ -532,10 +532,7 @@ pub async fn build_pq_model(
     );
     let expected_sample_size =
         lance_index::vector::pq::num_centroids(params.num_bits as u32) * params.sample_rate;
-    info!(
-        "Loading training data for PQ. Sample size: {}",
-        expected_sample_size
-    );
+    info!("Loading training data for PQ. Sample size: {expected_sample_size}");
     let start = std::time::Instant::now();
     let mut training_data =
         maybe_sample_training_data(dataset, column, expected_sample_size).await?;
@@ -582,7 +579,7 @@ pub async fn build_pq_model(
         });
     }
 
-    info!("Start train PQ: params={:#?}", params);
+    info!("Start train PQ: params={params:#?}");
     let pq = ProductQuantizer::build(&training_data, DistanceType::L2, params)?;
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
     Ok(pq)
@@ -749,8 +746,7 @@ mod tests {
             .unwrap();
         assert!(
             distances.values().iter().all(|&d| d <= 0.001),
-            "distances: {:?}",
-            distances
+            "distances: {distances:?}"
         );
     }
 

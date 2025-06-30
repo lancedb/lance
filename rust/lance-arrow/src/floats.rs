@@ -57,8 +57,7 @@ impl TryFrom<&DataType> for FloatType {
             DataType::Float32 => Ok(Self::Float32),
             DataType::Float64 => Ok(Self::Float64),
             _ => Err(crate::ArrowError::InvalidArgumentError(format!(
-                "{:?} is not a floating type",
-                value
+                "{value:?} is not a floating type"
             ))),
         }
     }

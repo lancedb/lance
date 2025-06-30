@@ -112,11 +112,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
 
         write!(
             f,
-            "MergeInsertWrite: on=[{}], when_matched={}, when_not_matched={}, when_not_matched_by_source={}",
-            on_keys,
-            when_matched,
-            when_not_matched,
-            when_not_matched_by_source
+            "MergeInsertWrite: on=[{on_keys}], when_matched={when_matched}, when_not_matched={when_not_matched}, when_not_matched_by_source={when_not_matched_by_source}"
         )
     }
 

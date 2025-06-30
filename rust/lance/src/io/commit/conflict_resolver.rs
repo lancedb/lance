@@ -1188,7 +1188,7 @@ async fn initial_fragments_for_rebase(
 
 fn wrong_operation_err(op: &Operation) -> Error {
     Error::Internal {
-        message: format!("function called against a wrong operation: {}", op),
+        message: format!("function called against a wrong operation: {op}"),
         location: location!(),
     }
 }
@@ -2043,33 +2043,21 @@ mod tests {
                         let result = rebase.check_txn(other, 1);
                         assert!(
                             result.is_ok(),
-                            "Transaction {:?} should {:?} with {:?}, but was {:?}",
-                            operation,
-                            expected_conflict,
-                            other,
-                            result
+                            "Transaction {operation:?} should {expected_conflict:?} with {other:?}, but was {result:?}"
                         )
                     }
                     NotCompatible => {
                         let result = rebase.check_txn(other, 1);
                         assert!(
                             matches!(result, Err(Error::CommitConflict { .. })),
-                            "Transaction {:?} should be {:?} with {:?}, but was: {:?}",
-                            operation,
-                            expected_conflict,
-                            other,
-                            result
+                            "Transaction {operation:?} should be {expected_conflict:?} with {other:?}, but was: {result:?}"
                         )
                     }
                     Retryable => {
                         let result = rebase.check_txn(other, 1);
                         assert!(
                             matches!(result, Err(Error::RetryableCommitConflict { .. })),
-                            "Transaction {:?} should be {:?} with {:?}, but was {:?}",
-                            operation,
-                            expected_conflict,
-                            other,
-                            result
+                            "Transaction {operation:?} should be {expected_conflict:?} with {other:?}, but was {result:?}"
                         )
                     }
                 }

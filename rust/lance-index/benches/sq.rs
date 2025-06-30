@@ -81,7 +81,7 @@ pub fn bench_storage(c: &mut Criterion) {
         )
         .unwrap();
         c.bench_function(
-            format!("ScalarQuantizationStorage,chunks={}x10K", num_chunks).as_str(),
+            format!("ScalarQuantizationStorage,chunks={num_chunks}x10K").as_str(),
             |b| {
                 let total = storage.len();
                 b.iter(|| {

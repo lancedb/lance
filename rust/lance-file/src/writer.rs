@@ -858,13 +858,13 @@ mod tests {
 
         let list_offsets = (0..202).step_by(2).collect();
         let list_values =
-            StringArray::from((0..200).map(|n| format!("str-{}", n)).collect::<Vec<_>>());
+            StringArray::from((0..200).map(|n| format!("str-{n}")).collect::<Vec<_>>());
         let list_arr: arrow_array::GenericListArray<i32> =
             try_new_generic_list_array(list_values, &list_offsets).unwrap();
 
         let large_list_offsets: Int64Array = (0..202).step_by(2).collect();
         let large_list_values =
-            StringArray::from((0..200).map(|n| format!("str-{}", n)).collect::<Vec<_>>());
+            StringArray::from((0..200).map(|n| format!("str-{n}")).collect::<Vec<_>>());
         let large_list_arr: arrow_array::GenericListArray<i64> =
             try_new_generic_list_array(large_list_values, &large_list_offsets).unwrap();
 
@@ -1165,7 +1165,7 @@ mod tests {
             .into_iter()
             .map(|(field_id, data_type)| {
                 Arc::new(ArrowField::new(
-                    format!("{}", field_id),
+                    format!("{field_id}"),
                     DataType::Struct(
                         vec![
                             Arc::new(ArrowField::new("null_count", DataType::Int64, false)),

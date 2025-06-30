@@ -318,7 +318,7 @@ pub async fn remap_column_index(
     let index = match indices.iter().find(|i| i.name == index_name) {
         None => {
             return Err(Error::Index {
-                message: format!("Index with name {} not found", index_name),
+                message: format!("Index with name {index_name} not found"),
                 location: location!(),
             });
         }
@@ -326,8 +326,7 @@ pub async fn remap_column_index(
             if index.fields != [field.id] {
                 Err(Error::Index {
                     message: format!(
-                        "Index name {} already exists with different fields",
-                        index_name
+                        "Index name {index_name} already exists with different fields"
                     ),
                     location: location!(),
                 })

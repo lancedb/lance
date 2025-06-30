@@ -194,7 +194,7 @@ pub(super) async fn take_blobs(
     {
         return Err(Error::InvalidInput {
             location: location!(),
-            source: format!("the column '{}' is not a blob column", column).into(),
+            source: format!("the column '{column}' is not a blob column").into(),
         });
     }
     let description_and_addr = dataset

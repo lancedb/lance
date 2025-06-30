@@ -202,7 +202,7 @@ impl Quantization for ScalarQuantizer {
             }
             value_type => {
                 return Err(Error::invalid_input(
-                    format!("unsupported data type {} for scalar quantizer", value_type),
+                    format!("unsupported data type {value_type} for scalar quantizer"),
                     location!(),
                 ))
             }
@@ -224,7 +224,7 @@ impl Quantization for ScalarQuantizer {
             DataType::Float32 => self.transform::<Float32Type>(vectors),
             DataType::Float64 => self.transform::<Float64Type>(vectors),
             value_type => Err(Error::invalid_input(
-                format!("unsupported data type {} for scalar quantizer", value_type),
+                format!("unsupported data type {value_type} for scalar quantizer"),
                 location!(),
             )),
         }

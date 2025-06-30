@@ -571,15 +571,12 @@ impl IvfSubIndex for HNSW {
                 .metadata()
                 .get(HNSW_METADATA_KEY)
                 .ok_or(Error::Index {
-                    message: format!("{} not found", HNSW_METADATA_KEY),
+                    message: format!("{HNSW_METADATA_KEY} not found"),
                     location: location!(),
                 })?;
         let hnsw_metadata: HnswMetadata =
             serde_json::from_str(hnsw_metadata).map_err(|e| Error::Index {
-                message: format!(
-                    "Failed to decode HNSW metadata: {}, json: {}",
-                    e, hnsw_metadata
-                ),
+                message: format!("Failed to decode HNSW metadata: {e}, json: {hnsw_metadata}"),
                 location: location!(),
             })?;
 

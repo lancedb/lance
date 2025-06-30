@@ -41,7 +41,7 @@ impl std::fmt::Debug for f32x8 {
         unsafe {
             self.store_unaligned(arr.as_mut_ptr());
         }
-        write!(f, "f32x8({:?})", arr)
+        write!(f, "f32x8({arr:?})")
     }
 }
 
@@ -467,7 +467,7 @@ impl std::fmt::Debug for f32x16 {
         unsafe {
             self.store_unaligned(arr.as_mut_ptr());
         }
-        write!(f, "f32x16({:?})", arr)
+        write!(f, "f32x16({arr:?})")
     }
 }
 
@@ -973,7 +973,7 @@ mod tests {
 
         assert_eq!(
             "f32x8([100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0])",
-            format!("{:?}", simd_power)
+            format!("{simd_power:?}")
         );
     }
 

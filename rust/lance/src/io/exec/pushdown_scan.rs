@@ -114,7 +114,7 @@ impl LancePushdownScanExec {
             .collect();
         let dataset_schema = dataset.schema();
         let predicate_projection = Arc::new(dataset_schema.project(&columns)
-            .map_err(|err| Error::invalid_input(format!("Filter predicate '{:?}' references columns {:?}, but some of them were not found in the dataset schema: {}\nInner error: {:?}", predicate, columns, dataset_schema, err), location!()))?);
+            .map_err(|err| Error::invalid_input(format!("Filter predicate '{predicate:?}' references columns {columns:?}, but some of them were not found in the dataset schema: {dataset_schema}\nInner error: {err:?}"), location!()))?);
 
         if config.make_deletions_null && !config.with_row_id {
             return Err(DataFusionError::Configuration(
@@ -465,8 +465,7 @@ impl FragmentScanner {
                     }
                     _ => {
                         return Err(DataFusionError::Internal(format!(
-                            "Unexpected result from predicate evaluation: {:?}",
-                            result
+                            "Unexpected result from predicate evaluation: {result:?}"
                         )))
                     }
                 };
@@ -685,7 +684,7 @@ impl FragmentScanner {
                     Err(err) => {
                         // TODO: this logs on each iteration, but maybe should should
                         // only log once per call of this func?
-                        log::debug!("Failed to simplify predicate: {}", err);
+                        log::debug!("Failed to simplify predicate: {err}");
                         self.predicate.clone()
                     }
                 };

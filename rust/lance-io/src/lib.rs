@@ -57,7 +57,7 @@ impl std::fmt::Display for ReadBatchParams {
                 if !ranges_str.is_empty() {
                     ranges_str.pop();
                 }
-                write!(f, "Ranges({})", ranges_str)
+                write!(f, "Ranges({ranges_str})")
             }
             Self::RangeFull => write!(f, "RangeFull"),
             Self::RangeTo(r) => write!(f, "RangeTo({})", r.end),
@@ -71,7 +71,7 @@ impl std::fmt::Display for ReadBatchParams {
                 if !indices_str.is_empty() {
                     indices_str.pop();
                 }
-                write!(f, "Indices({})", indices_str)
+                write!(f, "Indices({indices_str})")
             }
         }
     }
@@ -162,8 +162,7 @@ impl ReadBatchParams {
         let out_of_bounds = |size: usize| {
             Err(Error::InvalidInput {
                 source: format!(
-                    "Cannot slice from {} with length {} given a selection of size {}",
-                    start, length, size
+                    "Cannot slice from {start} with length {length} given a selection of size {size}"
                 )
                 .into(),
                 location: location!(),

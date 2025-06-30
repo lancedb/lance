@@ -61,8 +61,7 @@ impl PageTable {
         if max_field_id < min_field_id {
             return Err(Error::Internal {
                 message: format!(
-                    "max_field_id {} is less than min_field_id {}",
-                    max_field_id, min_field_id
+                    "max_field_id {max_field_id} is less than min_field_id {min_field_id}"
                 ),
                 location: location!(),
             });
@@ -116,8 +115,7 @@ impl PageTable {
         if min_field_id > *self.pages.keys().min().unwrap() {
             return Err(Error::invalid_input(
                 format!(
-                    "field_id_offset {} is greater than the minimum field_id {}",
-                    min_field_id, observed_min
+                    "field_id_offset {min_field_id} is greater than the minimum field_id {observed_min}"
                 ),
                 location!(),
             ));

@@ -58,7 +58,7 @@ fn bench_decode(c: &mut Criterion) {
     const NUM_BYTES: u64 = 1024 * 1024 * 128;
     group.throughput(criterion::Throughput::Bytes(NUM_BYTES));
     for data_type in PRIMITIVE_TYPES {
-        let func_name = format!("{:?}", data_type).to_lowercase();
+        let func_name = format!("{data_type:?}").to_lowercase();
         let num_rows = NUM_BYTES / data_type.primitive_width().unwrap() as u64;
         group.bench_function(func_name, |b| {
             let data = lance_datagen::gen()
@@ -107,11 +107,8 @@ fn bench_decode_fsl(c: &mut Criterion) {
                     &[false, true]
                 };
                 for nullable in nullable_choices {
-                    let func_name = format!(
-                        "{:?}_{}_v{}_null{}",
-                        data_type, dimension, version, nullable
-                    )
-                    .to_lowercase();
+                    let func_name = format!("{data_type:?}_{dimension}_v{version}_null{nullable}")
+                        .to_lowercase();
                     group.throughput(criterion::Throughput::Bytes(NUM_BYTES));
                     group.bench_function(func_name, |b| {
                         let num_rows =
@@ -177,7 +174,7 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
         NUM_ROWS * std::mem::size_of::<u32>() as u64 + string_data.get_array_memory_size() as u64,
     ));
 
-    let func_name = format!("{:?}", data_type).to_lowercase();
+    let func_name = format!("{data_type:?}").to_lowercase();
     group.bench_function(func_name, |b| {
         let string_array = string_data.column(0);
 

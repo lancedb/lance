@@ -39,7 +39,7 @@ pub async fn compute_distance(
     let vectors = batch
         .column_by_name(column)
         .ok_or_else(|| Error::Schema {
-            message: format!("column {} does not exist in dataset", column),
+            message: format!("column {column} does not exist in dataset"),
             location: location!(),
         })?
         .clone();
@@ -78,7 +78,7 @@ pub async fn compute_distance(
         batch
             .try_with_column(distance_field(), distances)
             .map_err(|e| Error::Execution {
-                message: format!("Failed to adding distance column: {}", e),
+                message: format!("Failed to adding distance column: {e}"),
                 location: location!(),
             })
     })

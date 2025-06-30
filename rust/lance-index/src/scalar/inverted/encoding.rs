@@ -294,9 +294,7 @@ mod tests {
         let original_size = 2 * num_rows * 4;
         assert!(
             compressed_size < original_size,
-            "compressed size {} should be less than original size {}",
-            compressed_size,
-            original_size
+            "compressed size {compressed_size} should be less than original size {original_size}"
         );
 
         let (decompressed_doc_ids, decompressed_frequencies) =
@@ -320,9 +318,7 @@ mod tests {
         let original_size = 2 * num_positions * 4;
         assert!(
             compressed_size < original_size,
-            "compressed size {} should be less than original size {}",
-            compressed_size,
-            original_size
+            "compressed size {compressed_size} should be less than original size {original_size}"
         );
 
         let decompressed_positions = decompress_positions(&compressed);

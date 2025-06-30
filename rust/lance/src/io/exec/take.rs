@@ -105,7 +105,7 @@ impl TakeStream {
         .dataset
         .get_fragment(fragment_id as usize)
         .ok_or_else(|| {
-            DataFusionError::Execution(format!("The input to a take operation specified fragment id {} but this fragment does not exist in the dataset", fragment_id))
+            DataFusionError::Execution(format!("The input to a take operation specified fragment id {fragment_id} but this fragment does not exist in the dataset"))
         })?;
 
         let reader = Arc::new(
@@ -316,19 +316,19 @@ impl DisplayAs for TakeExec {
             .map(|f| {
                 let name = f.name();
                 if extra_fields.contains(name) {
-                    format!("({})", name)
+                    format!("({name})")
                 } else {
-                    name.to_string()
+                    name.clone()
                 }
             })
             .collect::<Vec<_>>()
             .join(", ");
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "Take: columns={:?}", columns)
+                write!(f, "Take: columns={columns:?}")
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "Take\ncolumns={:?}", columns)
+                write!(f, "Take\ncolumns={columns:?}")
             }
         }
     }
@@ -359,16 +359,14 @@ impl TakeExec {
             && input.schema().column_with_name(ROW_ID).is_none()
         {
             return Err(DataFusionError::Plan(format!(
-                "TakeExec requires the input plan to have a column named '{}' or '{}'",
-                ROW_ADDR, ROW_ID
+                "TakeExec requires the input plan to have a column named '{ROW_ADDR}' or '{ROW_ID}'"
             )));
         }
 
         // Can't use take if we don't want any fields and we can't use take to add row_id or row_addr
         assert!(
             !projection.with_row_id && !projection.with_row_addr,
-            "Take should not be used to insert row_id / row_addr: {:#?}",
-            projection
+            "Take should not be used to insert row_id / row_addr: {projection:#?}"
         );
 
         let output_schema = Arc::new(Self::calculate_output_schema(

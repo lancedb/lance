@@ -1018,8 +1018,7 @@ impl FsstEncoder {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "the symbol table buffer for FSST encoder must have size {}",
-                    FSST_SYMBOL_TABLE_SIZE
+                    "the symbol table buffer for FSST encoder must have size {FSST_SYMBOL_TABLE_SIZE}"
                 ),
             ));
         }
@@ -1154,8 +1153,7 @@ impl FsstDecoder {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "the symbol table buffer for FSST decoder must have size {}",
-                    FSST_SYMBOL_TABLE_SIZE
+                    "the symbol table buffer for FSST decoder must have size {FSST_SYMBOL_TABLE_SIZE}"
                 ),
             ));
         }

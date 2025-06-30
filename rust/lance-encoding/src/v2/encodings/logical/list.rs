@@ -97,7 +97,7 @@ impl ListRequestsIter {
 
             // Skip any offsets pages that are before the range
             while offsets_offset + (cur_page_info.offsets_in_page) <= range.start {
-                trace!("Skipping null offset adjustment chunk {:?}", offsets_offset);
+                trace!("Skipping null offset adjustment chunk {offsets_offset:?}");
                 offsets_offset += cur_page_info.offsets_in_page;
                 items_offset += cur_page_info.num_items_referenced_by_page;
                 cur_page_info = page_infos_iter.next().unwrap();
@@ -286,18 +286,14 @@ fn decode_offsets(
                         let start = w[0] % null_offset_adjustment;
                         let end = w[1] % null_offset_adjustment;
                         if end < start {
-                            panic!("End is less than start in window {:?} with null_offset_adjustment={} we get start={} and end={}", w, null_offset_adjustment, start, end);
+                            panic!("End is less than start in window {w:?} with null_offset_adjustment={null_offset_adjustment} we get start={start} and end={end}");
                         }
                         let length = end - start;
                         last_normalized_offset += length;
                         last_normalized_offset
                     }),
             );
-        trace!(
-            "List offsets range of {} lists maps to item range {:?}",
-            num_lists,
-            items_range
-        );
+        trace!("List offsets range of {num_lists} lists maps to item range {items_range:?}");
         offsets_offset += num_offsets_to_norm as u32;
         if !items_range.is_empty() {
             let items_range =
@@ -432,11 +428,7 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
         let next_offsets = self.offsets.schedule_next(context, priority)?;
         let offsets_scheduled = next_offsets.rows_scheduled;
         let list_reqs = self.list_requests_iter.next(offsets_scheduled);
-        trace!(
-            "Scheduled {} offsets which maps to list requests: {:?}",
-            offsets_scheduled,
-            list_reqs
-        );
+        trace!("Scheduled {offsets_scheduled} offsets which maps to list requests: {list_reqs:?}");
         let null_offset_adjustment = list_reqs[0].null_offset_adjustment;
         // It shouldn't be possible for `list_reqs` to span more than one offsets page and so it shouldn't
         // be possible for the null_offset_adjustment to change
@@ -543,7 +535,7 @@ impl ListFieldScheduler {
         let list_type = match &offset_type {
             DataType::Int32 => DataType::List(items_field.clone()),
             DataType::Int64 => DataType::LargeList(items_field.clone()),
-            _ => panic!("Unexpected offset type {}", offset_type),
+            _ => panic!("Unexpected offset type {offset_type}"),
         };
         Self {
             offsets_scheduler,
@@ -697,7 +689,7 @@ impl LogicalPageDecoder for ListPageDecoder {
                 if indirectly_loaded.is_err() {
                     match indirectly_loaded.unwrap_err().try_into_panic() {
                         Ok(err) => std::panic::resume_unwind(err),
-                        Err(err) => panic!("{:?}", err),
+                        Err(err) => panic!("{err:?}"),
                     };
                 }
                 let indirectly_loaded = indirectly_loaded.unwrap()?;
@@ -761,7 +753,7 @@ impl LogicalPageDecoder for ListPageDecoder {
             // shrink the read batch size if we detect the batches are going to be huge (maybe
             // even achieve this with a read_batch_bytes parameter, though some estimation may
             // still be required)
-            return Err(Error::NotSupported { source: format!("loading a batch of {} lists would require creating an array with over i32::MAX items and we don't yet support returning smaller than requested batches", num_rows).into(), location: location!() });
+            return Err(Error::NotSupported { source: format!("loading a batch of {num_rows} lists would require creating an array with over i32::MAX items and we don't yet support returning smaller than requested batches").into(), location: location!() });
         }
         let offsets = self.offsets
             [self.rows_drained as usize..(self.rows_drained + actual_num_rows + 1) as usize]

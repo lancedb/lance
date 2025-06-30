@@ -416,10 +416,7 @@ impl FileReader {
         let len = footer_bytes.len();
         if len < FOOTER_LEN {
             return Err(Error::io(
-                format!(
-                    "does not have sufficient data, len: {}, bytes: {:?}",
-                    len, footer_bytes
-                ),
+                format!("does not have sufficient data, len: {len}, bytes: {footer_bytes:?}"),
                 location!(),
             ));
         }
@@ -445,10 +442,7 @@ impl FileReader {
         let magic_bytes = footer_bytes.slice(len - 4..);
         if magic_bytes.as_ref() != MAGIC {
             return Err(Error::io(
-                format!(
-                    "file does not appear to be a Lance file (invalid magic: {:?})",
-                    MAGIC
-                ),
+                format!("file does not appear to be a Lance file (invalid magic: {MAGIC:?})"),
                 location!(),
             ));
         }
@@ -668,11 +662,11 @@ impl FileReader {
                                     page.encoding.as_ref().unwrap(),
                                 ))
                             }
-                            _ => {
-                                PageEncoding::Structural(Self::fetch_encoding::<pbenc::PageLayout>(
-                                    page.encoding.as_ref().unwrap(),
-                                ))
-                            }
+                            _ => PageEncoding::Structural(Box::new(Self::fetch_encoding::<
+                                pbenc::PageLayout,
+                            >(
+                                page.encoding.as_ref().unwrap(),
+                            ))),
                         };
                         let buffer_offsets_and_sizes = Arc::from(
                             page.buffer_offsets
@@ -730,8 +724,7 @@ impl FileReader {
             if !column_indices_seen.insert(*column_index) {
                 return Err(Error::invalid_input(
                     format!(
-                        "The projection specified the column index {} more than once",
-                        column_index
+                        "The projection specified the column index {column_index} more than once"
                     ),
                     location!(),
                 ));
@@ -1386,20 +1379,20 @@ pub fn describe_encoding(page: &pbfile::column_metadata::Page) -> String {
                         let encoding = encoding_any.to_msg::<pbenc::ArrayEncoding>();
                         match encoding {
                             Ok(encoding) => {
-                                format!("{:#?}", encoding)
+                                format!("{encoding:#?}")
                             }
                             Err(err) => {
-                                format!("Unsupported(decode_err={})", err)
+                                format!("Unsupported(decode_err={err})")
                             }
                         }
                     } else if encoding_any.type_url == "/lance.encodings.PageLayout" {
                         let encoding = encoding_any.to_msg::<pbenc::PageLayout>();
                         match encoding {
                             Ok(encoding) => {
-                                format!("{:#?}", encoding)
+                                format!("{encoding:#?}")
                             }
                             Err(err) => {
-                                format!("Unsupported(decode_err={})", err)
+                                format!("Unsupported(decode_err={err})")
                             }
                         }
                     } else {
@@ -1771,7 +1764,7 @@ pub mod tests {
             vec!["location", "categories"],
             vec!["score.y", "location", "categories"],
         ] {
-            debug!("Testing round trip with projection {:?}", columns);
+            debug!("Testing round trip with projection {columns:?}");
             for use_field_ids in [true, false] {
                 // We can specify the projection as part of the read operation via read_stream_projected
                 let file_reader = FileReader::try_open(

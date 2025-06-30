@@ -35,7 +35,7 @@ impl TryFrom<u8> for Action {
             2 => Ok(Self::Insert),
             3 => Ok(Self::Delete),
             _ => Err(crate::Error::InvalidInput {
-                source: format!("Invalid action code: {}", value).into(),
+                source: format!("Invalid action code: {value}").into(),
                 location: location!(),
             }),
         }
@@ -63,7 +63,7 @@ pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
         let key_conditions: Vec<Expr> = params
             .on
             .iter()
-            .map(|key| col(format!("source.{}", key)).is_not_null())
+            .map(|key| col(format!("source.{key}")).is_not_null())
             .collect();
 
         // Use AND to combine all key column checks (all must be non-null)
@@ -93,7 +93,7 @@ pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
         }
         WhenMatched::UpdateIf(condition) => {
             cases.push((
-                matched.and(condition.clone()),
+                matched.and(condition.as_ref().clone()),
                 Action::UpdateAll.as_literal_expr(),
             ));
         }
@@ -106,7 +106,7 @@ pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
         }
         WhenNotMatchedBySource::DeleteIf(condition) => {
             cases.push((
-                not_matched_in_source.and(condition.clone()),
+                not_matched_in_source.and(condition.as_ref().clone()),
                 Action::Delete.as_literal_expr(),
             ));
         }
