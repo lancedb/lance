@@ -236,6 +236,24 @@ impl BlockingDataset {
         Ok(())
     }
 
+    pub fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
+        RT.block_on(self.inner.replace_schema_metadata(metadata))?;
+        Ok(())
+    }
+
+    pub fn replace_field_metadata(&mut self, metadata_map: HashMap<String, HashMap<String, String>>) -> Result<()> {
+        let schema = self.inner.schema();
+        let mut new_field_meta: HashMap<u32, HashMap<String, String>> = HashMap::new();
+        for (field_name, metadata) in metadata_map {
+            let field = schema.field(field_name.as_str())
+                .ok_or_else(|| Error::runtime_error(format!("Field \"{}\" not found", field_name)))?;
+            new_field_meta.insert(field.id as u32, metadata);
+        }
+        println!("new_field_meta: {:?}", new_field_meta);
+        RT.block_on(self.inner.replace_field_metadata(new_field_meta))?;
+        Ok(())
+    }
+
     pub fn close(&self) {}
 }
 
@@ -1564,4 +1582,62 @@ fn inner_get_version_by_tag(
     let dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
     dataset_guard.get_version(tag.as_str())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceSchemaMetadata(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jschema_metadata: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_replace_schema_metadata(&mut env, java_dataset, jschema_metadata))
+}
+
+fn inner_replace_schema_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jschema_metadata: JObject,
+) -> Result<()> {
+    let jmap = JMap::from_env(env, &jschema_metadata)?;
+    let schema_metadata = to_rust_map(env, &jmap)?;
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.replace_schema_metadata(schema_metadata)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceFieldMetadata<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    jfield_metadata_map: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_replace_field_metadata(&mut env, java_dataset, jfield_metadata_map))
+}
+
+fn inner_replace_field_metadata<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    jfield_metadata_map: JObject,
+) -> Result<()> {
+    let jmap = JMap::from_env(env, &jfield_metadata_map)?;
+    let mut field_metadata_map = HashMap::new();
+    let mut iter = jmap.iter(env)?;
+    env.with_local_frame(16, |env| {
+        while let Some((key, value)) = iter.next(env)? {
+            let key_jstring = JString::from(key);
+            let key_string: String = env.get_string(&key_jstring)?.into();
+            let inner_map = JMap::from_env(env, &value)?;
+            let value_map = to_rust_map(env, &inner_map)?;
+            field_metadata_map.insert(key_string, value_map);
+        }
+        Ok::<(), Error>(())
+    })?;
+    println!("{:?}", field_metadata_map);
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.replace_field_metadata(field_metadata_map)
 }
