@@ -4781,6 +4781,30 @@ mod tests {
         assert_eq!(get_bitmap(&indices[1]), vec![1]);
     }
 
+    #[tokio::test]
+    async fn test_max_fragment_id_migration() {
+        // v0.5.9 and earlier did not store the max fragment id in the manifest.
+        // This test ensures that we can read such datasets and migrate them to
+        // the latest version, which requires the max fragment id to be present.
+        {
+            let test_dir = copy_test_data_to_tmp("v0.5.9/no_fragments").unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+            let dataset = Dataset::open(test_uri).await.unwrap();
+
+            assert_eq!(dataset.manifest.max_fragment_id, None);
+            assert_eq!(dataset.manifest.max_fragment_id(), None);
+        }
+
+        {
+            let test_dir = copy_test_data_to_tmp("v0.5.9/dataset_with_fragments").unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+            let dataset = Dataset::open(test_uri).await.unwrap();
+
+            assert_eq!(dataset.manifest.max_fragment_id, None);
+            assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
+        }
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_bfloat16_roundtrip(
