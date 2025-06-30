@@ -1401,6 +1401,15 @@ impl Dataset {
                     if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
                         params = params.ascii_folding(ascii_folding.extract()?);
                     }
+                    if let Some(min_ngram_length) = kwargs.get_item("min_ngram_length")? {
+                        params = params.ngram_min_length(min_ngram_length.extract()?);
+                    }
+                    if let Some(max_ngram_length) = kwargs.get_item("max_ngram_length")? {
+                        params = params.ngram_max_length(max_ngram_length.extract()?);
+                    }
+                    if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
+                        params = params.ngram_prefix_only(prefix_only.extract()?);
+                    }
                 }
                 Box::new(params)
             }

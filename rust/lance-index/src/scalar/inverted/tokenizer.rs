@@ -63,10 +63,30 @@ pub struct InvertedIndexParams {
     /// ascii folding
     #[serde(default = "bool_true")]
     pub(crate) ascii_folding: bool,
+
+    /// min ngram length
+    #[serde(default = "default_min_ngram_length")]
+    pub(crate) min_ngram_length: u32,
+
+    /// max ngram length
+    #[serde(default = "default_max_ngram_length")]
+    pub(crate) max_ngram_length: u32,
+
+    /// whether prefix only
+    #[serde(default)]
+    pub(crate) prefix_only: bool,
 }
 
 fn bool_true() -> bool {
     true
+}
+
+fn default_min_ngram_length() -> u32 {
+    3
+}
+
+fn default_max_ngram_length() -> u32 {
+    3
 }
 
 impl Default for InvertedIndexParams {
@@ -76,6 +96,19 @@ impl Default for InvertedIndexParams {
 }
 
 impl InvertedIndexParams {
+    /// Create a new `InvertedIndexParams` with the given base tokenizer and language.
+    ///
+    /// The `base_tokenizer` can be one of the following:
+    /// - `simple`: splits tokens on whitespace and punctuation, default
+    /// - `whitespace`: splits tokens on whitespace
+    /// - `raw`: no tokenization
+    /// - `ngram`: N-Gram tokenizer
+    /// - `lindera/*`: Lindera tokenizer
+    /// - `jieba/*`: Jieba tokenizer
+    ///
+    /// The `language` is used for stemming and removing stop words,
+    /// this is not used for `lindera/*` and `jieba/*` tokenizers.
+    /// Default to `English`.
     pub fn new(base_tokenizer: String, language: tantivy::tokenizer::Language) -> Self {
         Self {
             base_tokenizer,
@@ -86,6 +119,9 @@ impl InvertedIndexParams {
             stem: true,
             remove_stop_words: true,
             ascii_folding: true,
+            min_ngram_length: default_min_ngram_length(),
+            max_ngram_length: default_max_ngram_length(),
+            prefix_only: false,
         }
     }
 
@@ -101,6 +137,11 @@ impl InvertedIndexParams {
         Ok(self)
     }
 
+    /// Set whether to store the position of the term in the document.
+    /// This can significantly increase the size of the index.
+    /// If false, only store the frequency of the term in the document.
+    /// This doesn't work with `ngram` tokenizer.
+    /// Default to `false`.
     pub fn with_position(mut self, with_position: bool) -> Self {
         self.with_position = with_position;
         self
@@ -131,8 +172,31 @@ impl InvertedIndexParams {
         self
     }
 
+    /// Set the minimum N-Gram length, only works when `base_tokenizer` is `ngram`.
+    /// Must be greater than 0 and not greater than `max_ngram_length`.
+    /// Default to 3.
+    pub fn ngram_min_length(mut self, min_length: u32) -> Self {
+        self.min_ngram_length = min_length;
+        self
+    }
+
+    /// Set the maximum N-Gram length, only works when `base_tokenizer` is `ngram`.
+    /// Must be greater than 0 and not less than `min_ngram_length`.
+    /// Default to 3.
+    pub fn ngram_max_length(mut self, max_length: u32) -> Self {
+        self.max_ngram_length = max_length;
+        self
+    }
+
+    /// Set whether only prefix N-Gram is generated, only works when `base_tokenizer` is `ngram`.
+    /// Default to `false`.
+    pub fn ngram_prefix_only(mut self, prefix_only: bool) -> Self {
+        self.prefix_only = prefix_only;
+        self
+    }
+
     pub fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzer> {
-        let mut builder = build_base_tokenizer_builder(&self.base_tokenizer)?;
+        let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
             builder = builder.filter_dynamic(tantivy::tokenizer::RemoveLongFilter::limit(
                 max_token_length,
@@ -162,47 +226,56 @@ impl InvertedIndexParams {
         }
         Ok(builder.build())
     }
-}
 
-fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
-    match name {
-        "simple" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
-            tantivy::tokenizer::SimpleTokenizer::default(),
-        )
-        .dynamic()),
-        "whitespace" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
-            tantivy::tokenizer::WhitespaceTokenizer::default(),
-        )
-        .dynamic()),
-        "raw" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
-            tantivy::tokenizer::RawTokenizer::default(),
-        )
-        .dynamic()),
-        #[cfg(feature = "tokenizer-lindera")]
-        s if s.starts_with("lindera/") => {
-            let Some(home) = language_model_home() else {
-                return Err(Error::invalid_input(
-                    format!("unknown base tokenizer {}", name),
-                    location!(),
-                ));
-            };
-            lindera::LinderaBuilder::load(&home.join(s))?.build()
+    fn build_base_tokenizer(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
+        match self.base_tokenizer.as_str() {
+            "simple" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
+                tantivy::tokenizer::SimpleTokenizer::default(),
+            )
+            .dynamic()),
+            "whitespace" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
+                tantivy::tokenizer::WhitespaceTokenizer::default(),
+            )
+            .dynamic()),
+            "raw" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
+                tantivy::tokenizer::RawTokenizer::default(),
+            )
+            .dynamic()),
+            "ngram" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
+                tantivy::tokenizer::NgramTokenizer::new(
+                    self.min_ngram_length as usize,
+                    self.max_ngram_length as usize,
+                    self.prefix_only,
+                )
+                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
+            )
+            .dynamic()),
+            #[cfg(feature = "tokenizer-lindera")]
+            s if s.starts_with("lindera/") => {
+                let Some(home) = language_model_home() else {
+                    return Err(Error::invalid_input(
+                        format!("unknown base tokenizer {}", self.base_tokenizer),
+                        location!(),
+                    ));
+                };
+                lindera::LinderaBuilder::load(&home.join(s))?.build()
+            }
+            #[cfg(feature = "tokenizer-jieba")]
+            s if s.starts_with("jieba/") || s == "jieba" => {
+                let s = if s == "jieba" { "jieba/default" } else { s };
+                let Some(home) = language_model_home() else {
+                    return Err(Error::invalid_input(
+                        format!("unknown base tokenizer {}", self.base_tokenizer),
+                        location!(),
+                    ));
+                };
+                jieba::JiebaBuilder::load(&home.join(s))?.build()
+            }
+            _ => Err(Error::invalid_input(
+                format!("unknown base tokenizer {}", self.base_tokenizer),
+                location!(),
+            )),
         }
-        #[cfg(feature = "tokenizer-jieba")]
-        s if s.starts_with("jieba/") || s == "jieba" => {
-            let s = if s == "jieba" { "jieba/default" } else { s };
-            let Some(home) = language_model_home() else {
-                return Err(Error::invalid_input(
-                    format!("unknown base tokenizer {}", name),
-                    location!(),
-                ));
-            };
-            jieba::JiebaBuilder::load(&home.join(s))?.build()
-        }
-        _ => Err(Error::invalid_input(
-            format!("unknown base tokenizer {}", name),
-            location!(),
-        )),
     }
 }
 
