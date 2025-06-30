@@ -122,6 +122,15 @@ try:
     MAP_DATASET_CLASS = torchdata.datapipes.map.MapDataPipe
     ITER_DATASET_CLASS = torchdata.datapipes.iter.IterDataPipe
 
+    if "LANCE_TORCH_DATAPIPES" not in os.environ:
+        logger.warning(
+            "The torchdata version is old enough to utilize the DataPipe "
+            "API but LANCE_TORCH_DATAPIPES is not set. We recommend "
+            "either upgrading torchdata or setting the LANCE_TORCH_DATAPIPES "
+            "environment variable in order to utilize torchdata"
+        )
+        raise ImportError("avoid deprecated data pipes API unless requested")
+        
     logger.warning(
         "TorchData integration is still in BETA phase. "
         "APIs may change without backward compatibility."
