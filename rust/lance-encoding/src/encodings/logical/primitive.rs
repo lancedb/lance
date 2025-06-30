@@ -1793,11 +1793,19 @@ impl FullZipScheduler {
         match &details.value_decompressor {
             PerValueDecompressor::Fixed(decompressor) => {
                 let bits_per_value = decompressor.bits_per_value();
-                assert!(bits_per_value > 0);
+                if bits_per_value == 0 {
+                    return Err(lance_core::Error::Internal {
+                        message: "Invalid encoding: bits_per_value must be greater than 0".into(),
+                        location: location!(),
+                    });
+                }
                 if bits_per_value % 8 != 0 {
                     // Unlikely we will ever want this since full-zip values are so large the few bits we shave off don't
                     // make much difference.
-                    unimplemented!("Bit-packed full-zip");
+                    return Err(lance_core::Error::NotSupported {
+                        source: "Bit-packed full-zip encoding (non-byte-aligned values) is not yet implemented".into(),
+                        location: location!(),
+                    });
                 }
                 let bytes_per_value = bits_per_value / 8;
                 let total_bytes_per_value =
@@ -1877,9 +1885,17 @@ impl FullZipScheduler {
             match &details.value_decompressor {
                 PerValueDecompressor::Fixed(decompressor) => {
                     let bits_per_value = decompressor.bits_per_value();
-                    assert!(bits_per_value > 0);
+                    if bits_per_value == 0 {
+                        return Err(lance_core::Error::Internal {
+                            message: "Invalid encoding: bits_per_value must be greater than 0".into(),
+                            location: location!(),
+                        });
+                    }
                     if bits_per_value % 8 != 0 {
-                        unimplemented!("Bit-packed full-zip");
+                        return Err(lance_core::Error::NotSupported {
+                            source: "Bit-packed full-zip encoding (non-byte-aligned values) is not yet implemented".into(),
+                            location: location!(),
+                        });
                     }
                     let bytes_per_value = bits_per_value / 8;
                     let total_bytes_per_value =
