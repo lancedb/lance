@@ -29,7 +29,7 @@ enum SimpleIndexStatus {
     Disabled,
 }
 
-const USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(|| {
+static USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(|| {
     if let Ok(v) = std::env::var("LANCE_USE_HNSW_SPEEDUP_INDEXING") {
         if v == "enabled" {
             SimpleIndexStatus::Enabled
