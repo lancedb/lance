@@ -196,6 +196,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
             Callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
         ] = _to_tensor,
         sampler: Optional[Sampler] = None,
+        auto_detect_rank: bool = True,
         **kwargs,
     ):
         """Use PyTorch Dataset API to read Lance dataset.
@@ -235,6 +236,8 @@ class LanceDataset(torch.utils.data.IterableDataset):
             A function that samples the dataset.
         to_tensor_fn : callable, optional
             A function that converts a pyarrow RecordBatch to torch.Tensor.
+        auto_detect_rank: bool = True, optional
+            If set true, the rank and world_size will be detected automatically.
         """
         super().__init__()
         if isinstance(dataset, (str, Path)):
@@ -274,6 +277,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
 
         self.cache = cache
         self.cached_ds: Optional[CachedDataset] = None
+        self._auto_detect_rank = auto_detect_rank
 
     def __repr__(self) -> str:
         return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})"
@@ -287,12 +291,19 @@ class LanceDataset(torch.utils.data.IterableDataset):
 
     def __iter__(self):
         if self.sampler is None:
-            if self.rank is not None and self.world_size is not None:
+            if self.rank is not None:
                 rank = self.rank
-                world_size = self.world_size
-            else:
+            elif self._auto_detect_rank:
                 rank = get_global_rank()
+            else:
+                rank = None
+
+            if self.world_size is not None:
+                world_size = self.world_size
+            elif self._auto_detect_rank:
                 world_size = get_global_world_size()
+            else:
+                world_size = None
             if self.shard_granularity is None:
                 if rank is not None and world_size is not None:
                     sampler = ShardedFragmentSampler(rank=rank, world_size=world_size)
