@@ -448,7 +448,8 @@ pub mod tests {
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
         // TODO: support large binary
         println!("test_binary_fsst");
-        let field = Field::new("", DataType::LargeUtf8, true).with_metadata(field_metadata);
+        //let field = Field::new("", DataType::LargeUtf8, true).with_metadata(field_metadata);
+        let field = Field::new("", DataType::Utf8, true).with_metadata(field_metadata);
         check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
     }
 

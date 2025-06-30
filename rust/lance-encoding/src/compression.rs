@@ -186,7 +186,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     let max_len =
                         variable_width_data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
 
-                    println!("max_len={}, data_size={}", max_len, data_size);
+                    //println!("max_len={}, data_size={}", max_len, data_size);
                     if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
                         && data_size >= FSST_LEAST_INPUT_SIZE as u64
                     {

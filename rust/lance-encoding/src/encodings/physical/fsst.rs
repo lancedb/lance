@@ -41,7 +41,7 @@ struct FsstCompressed {
 
 impl FsstCompressed {
     fn fsst_compress(data: DataBlock) -> Result<Self> {
-        println!("Calling fsst_compress");
+        //println!("Calling fsst_compress");
         match data {
             DataBlock::VariableWidth(mut variable_width) => {
                 // TODO: support 64
