@@ -592,6 +592,44 @@ def test_indexed_filter_with_fts_index(tmp_path):
     assert results["_rowid"].to_pylist() == [2, 3]
 
 
+def test_fts_ngram_tokenizer(tmp_path):
+    data = pa.table({"text": ["hello world", "lance database", "lance is cool"]})
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", index_type="INVERTED", base_tokenizer="ngram")
+
+    results = ds.to_table(full_text_query="lan")
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {"lance database", "lance is cool"}
+
+    results = ds.to_table(full_text_query="nce")  # spellchecker:disable-line
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {"lance database", "lance is cool"}
+
+    # the default min_ngram_length is 3, so "la" should not match
+    results = ds.to_table(full_text_query="la")
+    assert results.num_rows == 0
+
+    # test setting min_ngram_length and prefix_only
+    ds.create_scalar_index(
+        "text",
+        index_type="INVERTED",
+        base_tokenizer="ngram",
+        min_ngram_length=2,
+        prefix_only=True,
+    )
+
+    results = ds.to_table(full_text_query="lan")
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {"lance database", "lance is cool"}
+
+    results = ds.to_table(full_text_query="nce")  # spellchecker:disable-line
+    assert results.num_rows == 0
+
+    results = ds.to_table(full_text_query="la")
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {"lance database", "lance is cool"}
+
+
 def test_fts_stats(dataset):
     dataset.create_scalar_index(
         "doc", index_type="INVERTED", with_position=False, remove_stop_words=True
