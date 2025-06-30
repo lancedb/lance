@@ -69,6 +69,11 @@ pub enum Error {
     Schema { message: String, location: Location },
     #[snafu(display("Not found: {uri}, {location}"))]
     NotFound { uri: String, location: Location },
+    #[snafu(display("Field not found: {field_desc}, {location}"))]
+    FieldNotFound {
+        field_desc: String,
+        location: Location,
+    },
     #[snafu(display("LanceError(IO): {source}, {location}"))]
     IO {
         source: BoxedError,
