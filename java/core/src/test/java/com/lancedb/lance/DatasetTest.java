@@ -765,7 +765,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testConfig() {
+  void testUpdateConfig() {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -774,36 +774,66 @@ public class DatasetTest {
       dataset = testDataset.createEmptyDataset();
       assertEquals(1, dataset.version());
       Map<String, String> originalConfig = dataset.getConfig();
-      Map<String, String> config = dataset.getConfig();
-      config.put("key1", "value1");
-      config.put("key2", "value2");
-      config.putAll(originalConfig);
-      dataset.updateConfig(config);
+      Map<String, String> updateConfig = new HashMap<>();
+      updateConfig.put("key1", "value1");
+      updateConfig.put("key2", "value2");
+      dataset.updateConfig(updateConfig);
+      originalConfig.putAll(updateConfig);
       assertEquals(2, dataset.version());
       Map<String, String> currentConfig = dataset.getConfig();
       for (String configKey : currentConfig.keySet()) {
-        assertEquals(currentConfig.get(configKey), config.get(configKey));
+        assertEquals(currentConfig.get(configKey), originalConfig.get(configKey));
       }
-      assertEquals(originalConfig.size() + 2, currentConfig.size());
+      assertEquals(originalConfig.size(), currentConfig.size());
 
-      Map<String, String> config2 = new HashMap<>();
-      config2.put("key1", "value3");
-      dataset.updateConfig(config2);
-      assertEquals(3, dataset.version());
+      Map<String, String> updateConfig2 = new HashMap<>();
+      updateConfig2.put("key1", "value3");
+      dataset.updateConfig(updateConfig2);
       currentConfig = dataset.getConfig();
-      config.putAll(config2);
+      originalConfig.putAll(updateConfig2);
+      assertEquals(3, dataset.version());
       for (String configKey : currentConfig.keySet()) {
-        assertEquals(config.get(configKey), currentConfig.get(configKey));
+        assertEquals(currentConfig.get(configKey), originalConfig.get(configKey));
       }
+      assertEquals(originalConfig.size(), currentConfig.size());
+    }
+  }
+
+  @Test
+  void testDeleteConfigKeys() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      assertEquals(1, dataset.version());
+      Map<String, String> originalConfig = dataset.getConfig();
+      Map<String, String> config = new HashMap<>();
+      config.put("key1", "value1");
+      config.put("key2", "value2");
+      dataset.updateConfig(config);
+      assertEquals(2, dataset.version());
+      Map<String, String> currentConfig = dataset.getConfig();
+      assertTrue(currentConfig.keySet().containsAll(config.keySet()));
       assertEquals(originalConfig.size() + 2, currentConfig.size());
 
-      dataset.deleteConfigKeys(config2.keySet());
+      Set<String> deleteKeys = new HashSet<>();
+      deleteKeys.add("key1");
+      dataset.deleteConfigKeys(deleteKeys);
+      assertEquals(3, dataset.version());
+      originalConfig = currentConfig;
+      currentConfig = dataset.getConfig();
+      assertEquals(originalConfig.size() - 1, currentConfig.size());
+      assertTrue(currentConfig.containsKey("key2"));
+      assertFalse(currentConfig.containsKey("key1"));
+      deleteKeys.add("key2");
+      dataset.deleteConfigKeys(deleteKeys);
       assertEquals(4, dataset.version());
       currentConfig = dataset.getConfig();
-      for (String configKey : currentConfig.keySet()) {
-        assertEquals(currentConfig.get(configKey), config.get(configKey));
-      }
-      assertEquals(originalConfig.size() + 1, currentConfig.size());
+      assertEquals(originalConfig.size() - 2, currentConfig.size());
+      assertFalse(currentConfig.containsKey("key2"));
+      assertFalse(currentConfig.containsKey("key1"));
     }
   }
 }
