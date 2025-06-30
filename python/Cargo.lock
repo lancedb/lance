@@ -1110,13 +1110,34 @@ dependencies = [
 
 [[package]]
 name = "brotli"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d640d25bc63c50fb1f0b545ffd80207d2e10a4c965530809b40ba3386825c391"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
+ "brotli-decompressor 2.5.1",
+]
+
+[[package]]
+name = "brotli"
 version = "8.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9991eea70ea4f293524138648e41ee89b0b2b12ddef3b255effa43c8056e0e0d"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
- "brotli-decompressor",
+ "brotli-decompressor 5.0.0",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "2.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e2e4afe60d7dd600fdd3de8d0f08c2b7ec039712e3b6137ff98b7004e82de4f"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
 ]
 
 [[package]]
@@ -3654,6 +3675,7 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "rand_xoshiro",
+ "random_word",
 ]
 
 [[package]]
@@ -4587,7 +4609,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "base64 0.22.1",
- "brotli",
+ "brotli 8.0.1",
  "bytes",
  "chrono",
  "flate2",
@@ -5298,6 +5320,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
 dependencies = [
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "random_word"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcd87d2e3f99cc11e6c7fc518f09e63e194f7243b4cf30c979b0c524d04fbd90"
+dependencies = [
+ "ahash",
+ "brotli 3.5.0",
+ "once_cell",
+ "paste",
+ "rand 0.8.5",
+ "unicase",
 ]
 
 [[package]]
@@ -6772,6 +6808,12 @@ dependencies = [
  "syn 2.0.101",
  "typify-impl",
 ]
+
+[[package]]
+name = "unicase"
+version = "2.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75b844d17643ee918803943289730bec8aac480150456169e647ed0b576ba539"
 
 [[package]]
 name = "unicode-blocks"

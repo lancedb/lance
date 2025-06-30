@@ -2491,7 +2491,7 @@ mod tests {
         for i in 0..10 {
             let sentence = words_array.value(i);
             let word_count = sentence.split_whitespace().count();
-            assert!(word_count >= 1 && word_count <= 5);
+            assert!((1..=5).contains(&word_count));
         }
 
         let mut gen = array::rand_date32();
