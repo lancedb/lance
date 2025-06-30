@@ -19,6 +19,7 @@ futures = { workspace = true }
 hex = "0.4.3"
 rand = { workspace = true }
 rand_xoshiro = "0.6.0"
+random_word = { version = "0.5", features = ["en"] }
 
 [dev-dependencies]
 criterion = { workspace = true }
