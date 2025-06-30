@@ -3,7 +3,7 @@
 
 import contextlib
 from multiprocessing import Process, Queue, Value
-from typing import Callable, Iterable
+from typing import Callable, Generator
 
 from torch.utils.data import IterableDataset
 
@@ -13,7 +13,7 @@ from lance.log import LOGGER
 def _worker_ep(
     dataset_creator: Callable[[], IterableDataset],
     queue: Queue,
-    shutdown: Value,
+    shutdown: Value,  # type: ignore
 ) -> None:
     dataset = dataset_creator()
     while not shutdown.value:
@@ -82,9 +82,11 @@ def async_dataset(
     dataset_creator: Callable[[], IterableDataset],
     *,
     queue_size: int = 4,
-) -> Iterable[AsyncDataset]:
+) -> Generator[AsyncDataset, None, None]:
+    ds = None
     try:
         ds = AsyncDataset(dataset_creator, queue_size=queue_size)
         yield ds
     finally:
-        ds.close()
+        if ds is not None:
+            ds.close()

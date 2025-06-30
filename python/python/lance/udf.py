@@ -198,7 +198,7 @@ def normalize_transform(
             )
             if isinstance(sample_batch, pd.DataFrame):
                 sample_batch = pa.RecordBatch.from_pandas(sample_batch)
-            udf_like = BatchUDF(udf_like, output_schema=sample_batch.schema)
+            udf_like = BatchUDF(udf_like, output_schema=sample_batch.schema)  # type: ignore
 
             return udf_like
         except Exception as inner_err:

@@ -56,12 +56,12 @@ class CachedDataset:
             writer: Optional[pa.ipc.RecordBatchFileWriter] = None
             for batch in self.stream:
                 if writer is None:
-                    self.cache_file = Path(self.cache_dir.name) / "cache.arrow"
+                    self.cache_file = Path(self.cache_dir.name) / "cache.arrow"  # type: ignore
                     writer = pa.ipc.new_stream(str(self.cache_file), batch.schema)
                 writer.write(batch)
                 yield batch
                 del batch
-            writer.close()
+            writer.close()  # type: ignore
             self.finished_origin_stream = True
         else:
             # Follow up iteration

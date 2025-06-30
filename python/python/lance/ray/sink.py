@@ -15,12 +15,17 @@ from typing import (
     Optional,
     Tuple,
     Union,
+    no_type_check,
 )
 
 import pyarrow as pa
 
-import lance
-from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, FragmentMetadata, write_fragments
+import lance  # type: ignore
+from lance.fragment import (
+    DEFAULT_MAX_BYTES_PER_FILE,  # type: ignore
+    FragmentMetadata,  # type: ignore
+    write_fragments,  # type: ignore
+)
 
 from ..dependencies import ray
 
@@ -47,7 +52,7 @@ def _pd_to_arrow(
         return tbl
     elif isinstance(df, pa.Table):
         if schema is not None:
-            return df.cast(schema)
+            return df.cast(schema)  # type: ignore
     return df
 
 
@@ -66,7 +71,7 @@ def _write_fragment(
     from ..dependencies import pandas as pd
 
     if schema is None:
-        first = next(stream)
+        first = next(stream)  # type: ignore
         if _PANDAS_AVAILABLE and isinstance(first, pd.DataFrame):
             schema = pa.Schema.from_pandas(first).remove_metadata()
         elif isinstance(first, Dict):
@@ -126,27 +131,27 @@ class _BaseLanceDatasink(ray.data.Datasink):
 
     def on_write_start(self):
         if self.mode == "append":
-            ds = lance.LanceDataset(self.uri, storage_options=self.storage_options)
+            ds = lance.LanceDataset(self.uri, storage_options=self.storage_options)  # type: ignore
             self.read_version = ds.version
             if self.schema is None:
                 self.schema = ds.schema
 
+    @no_type_check
     def on_write_complete(
         self,
-        write_results: List[List[Tuple[str, str]]],
+        write_result,
     ):
         import warnings
 
-        if not write_results:
+        if not write_result:
             warnings.warn(
                 "write_results is empty.",
                 DeprecationWarning,
             )
             return
         if (
-            not isinstance(write_results, list)
-            or not isinstance(write_results[0], list)
-        ) and not hasattr(write_results, "write_returns"):
+            not isinstance(write_result, list) or not isinstance(write_result[0], list)
+        ) and not hasattr(write_result, "write_returns"):
             warnings.warn(
                 "write_results type is wrong. please check version, "
                 "upgrade or downgrade your ray version. ray versions >= 2.38 "
@@ -156,10 +161,10 @@ class _BaseLanceDatasink(ray.data.Datasink):
                 DeprecationWarning,
             )
             return
-        if hasattr(write_results, "write_returns"):
-            write_results = write_results.write_returns
+        if hasattr(write_result, "write_returns"):
+            write_result = getattr(write_result, "write_returns")
 
-        if len(write_results) == 0:
+        if len(write_result) == 0:
             warnings.warn(
                 "write results is empty. please check ray version or internal error",
                 DeprecationWarning,
@@ -168,22 +173,22 @@ class _BaseLanceDatasink(ray.data.Datasink):
 
         fragments = []
         schema = None
-        for batch in write_results:
+        for batch in write_result:
             for fragment_str, schema_str in batch:
-                fragment = pickle.loads(fragment_str)
+                fragment = pickle.loads(fragment_str)  # type: ignore
                 fragments.append(fragment)
-                schema = pickle.loads(schema_str)
+                schema = pickle.loads(schema_str)  # type: ignore
         # Check weather writer has fragments or not.
         # Skip commit when there are no fragments.
         if not schema:
             return
         if self.mode in set(["create", "overwrite"]):
-            op = lance.LanceOperation.Overwrite(schema, fragments)
+            op = lance.LanceOperation.Overwrite(schema, fragments)  # type: ignore
         elif self.mode == "append":
-            op = lance.LanceOperation.Append(fragments)
-        lance.LanceDataset.commit(
+            op = lance.LanceOperation.Append(fragments)  # type: ignore
+        lance.LanceDataset.commit(  # type: ignore
             self.uri,
-            op,
+            op,  # type: ignore
             read_version=self.read_version,
             storage_options=self.storage_options,
         )
@@ -276,7 +281,7 @@ class LanceDatasink(_BaseLanceDatasink):
     def write(
         self,
         blocks: Iterable[Union[pa.Table, "pd.DataFrame"]],
-        _ctx,
+        ctx,
     ):
         fragments_and_schema = _write_fragment(
             blocks,
@@ -374,7 +379,7 @@ class LanceFragmentWriter:
             self.uri,
             schema=self.schema,
             max_rows_per_file=self.max_rows_per_file,
-            max_rows_per_group=self.max_rows_per_group,
+            max_rows_per_group=self.max_rows_per_group,  # type: ignore
             data_storage_version=self.data_storage_version,
             storage_options=self.storage_options,
         )
@@ -403,7 +408,7 @@ class LanceCommitter(_BaseLanceDatasink):
     def write(
         self,
         blocks: Iterable[Union[pa.Table, "pd.DataFrame"]],
-        _ctx,
+        ctx,
     ):
         """Passthrough the fragments to commit phase"""
         v = []
@@ -495,4 +500,4 @@ def _register_hooks():
         .write_lance("~/data.lance")
     ```
     """
-    ray.data.Dataset.write_lance = write_lance
+    ray.data.Dataset.write_lance = write_lance  # type: ignore

@@ -14,9 +14,9 @@
 
 from typing import List
 
-from lance import LanceDataset
-from lance.fragment import FragmentMetadata
-from lance.optimize import CompactionOptions
+from lance import LanceDataset  # type: ignore
+from lance.fragment import FragmentMetadata  # type: ignore
+from lance.optimize import CompactionOptions  # type: ignore
 
 class CompactionMetrics:
     fragments_removed: int
@@ -45,10 +45,14 @@ class CompactionPlan:
 class Compaction:
     @staticmethod
     def execute(
-        dataset: "LanceDataset", options: CompactionOptions
+        dataset: "LanceDataset",
+        options: CompactionOptions,  # type: ignore
     ) -> CompactionMetrics: ...
     @staticmethod
-    def plan(dataset: "LanceDataset", options: CompactionOptions) -> CompactionPlan: ...
+    def plan(
+        dataset: "LanceDataset",
+        options: CompactionOptions,  # type: ignore
+    ) -> CompactionPlan: ...
     @staticmethod
     def commit(
         dataset: "LanceDataset", rewrites: List[RewriteResult]

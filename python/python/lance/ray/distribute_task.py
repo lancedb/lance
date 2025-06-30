@@ -48,7 +48,7 @@ class FragmentTask:
         self.task_input = task_input
 
     def __call__(self) -> Dict[str, Any]:
-        output = self._fn()
+        output = self.task_input.fn()
         return {
             TASK_ID_KEY: self.task_input.task_id,
             PARTITION_KEY: {FRAGMENT_KEY: self.task_input.fragment, "output": output},
@@ -82,7 +82,7 @@ class AddColumnTask(FragmentTask):
 class DispatchFragmentTasks:
     """Orchestrates distributed execution of fragment operations."""
 
-    def __init__(self, dataset: lance.LanceDataset):
+    def __init__(self, dataset: lance.LanceDataset):  # type: ignore
         self.dataset = dataset
 
     def get_tasks(
@@ -119,7 +119,7 @@ class DispatchFragmentTasks:
         fragments = [part[FRAGMENT_KEY] for part in partitions]
         unified_schema = partitions[0][SCHEMA_KEY]
 
-        operation = lance.LanceOperation.Merge(fragments, unified_schema)
+        operation = lance.LanceOperation.Merge(fragments, unified_schema)  # type: ignore
         self.dataset.commit(
             base_uri=self.dataset.uri,
             operation=operation,

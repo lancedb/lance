@@ -4,6 +4,7 @@
 import os
 import uuid
 from pathlib import Path
+from typing import Any
 
 import lance
 import numpy as np
@@ -75,7 +76,7 @@ def check_add_columns(
 def check_add_columns_fails(
     dataset: LanceDataset,
     use_fragments: bool,
-    expected_exception: any,
+    expected_exception: Any,
     match: str,
     *args,
     **kwargs,
