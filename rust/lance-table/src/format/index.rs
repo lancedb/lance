@@ -101,7 +101,7 @@ impl From<&Index> for pb::IndexMetadata {
             if let Err(e) = bitmap.serialize_into(&mut fragment_bitmap) {
                 // In theory, this should never error. But if we do, just
                 // recover gracefully.
-                log::error!("Failed to serialize fragment bitmap: {}", e);
+                log::error!("Failed to serialize fragment bitmap: {e}");
                 fragment_bitmap.clear();
             }
         }

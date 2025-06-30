@@ -82,8 +82,7 @@ impl KMeans {
             let kmeans =
                 LanceKMeans::new_with_params(&fixed_size_arr, k, &params).map_err(|e| {
                     PyRuntimeError::new_err(format!(
-                        "Error initialing KMeans from existing centroids: {}",
-                        e
+                        "Error initialing KMeans from existing centroids: {e}"
                     ))
                 })?;
             Some(kmeans)
@@ -111,7 +110,7 @@ impl KMeans {
             ..Default::default()
         };
         let kmeans = LanceKMeans::new_with_params(&fixed_size_arr, self.k, &params)
-            .map_err(|e| PyRuntimeError::new_err(format!("Error training KMeans: {}", e)))?;
+            .map_err(|e| PyRuntimeError::new_err(format!("Error training KMeans: {e}")))?;
         self.trained_kmeans = Some(kmeans);
         Ok(())
     }
@@ -156,8 +155,7 @@ impl KMeans {
                 FixedSizeListArray::try_new_from_values(centroids, kmeans.dimension as i32)
                     .map_err(|e| {
                         PyRuntimeError::new_err(format!(
-                            "Error converting centroids to FixedSizeListArray: {}",
-                            e
+                            "Error converting centroids to FixedSizeListArray: {e}"
                         ))
                     })?;
             fixed_size_arr.into_data().to_pyarrow(py)

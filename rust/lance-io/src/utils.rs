@@ -49,7 +49,7 @@ pub async fn read_binary_array(
         )),
         _ => {
             return Err(Error::io(
-                format!("Unsupported binary type: {}", data_type),
+                format!("Unsupported binary type: {data_type}"),
                 location!(),
             ));
         }
@@ -127,10 +127,7 @@ pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
     let len = bytes.len();
     if len < 16 {
         return Err(Error::io(
-            format!(
-                "does not have sufficient data, len: {}, bytes: {:?}",
-                len, bytes
-            ),
+            format!("does not have sufficient data, len: {len}, bytes: {bytes:?}"),
             location!(),
         ));
     }
@@ -143,10 +140,7 @@ pub fn read_version(bytes: &Bytes) -> Result<(u16, u16)> {
     let len = bytes.len();
     if len < 8 {
         return Err(Error::io(
-            format!(
-                "does not have sufficient data, len: {}, bytes: {:?}",
-                len, bytes
-            ),
+            format!("does not have sufficient data, len: {len}, bytes: {bytes:?}"),
             location!(),
         ));
     }

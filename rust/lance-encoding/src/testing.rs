@@ -55,10 +55,10 @@ impl EncodingsIo for SimulatedScheduler {
             .map(|range| self.data.slice(range.start as usize..range.end as usize))
             .collect();
 
-        log::trace!("Scheduled request with priority {}", priority);
+        log::trace!("Scheduled request with priority {priority}");
         std::future::ready(data)
             .map(move |data| {
-                log::trace!("Decoded request with priority {}", priority);
+                log::trace!("Decoded request with priority {priority}");
                 Ok(data)
             })
             .boxed()
@@ -273,7 +273,7 @@ pub async fn check_round_trip_encoding_generated(
 ) {
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
-        debug!("Testing random data with a page size of {}", page_size);
+        debug!("Testing random data with a page size of {page_size}");
         let encoding_strategy = default_encoding_strategy(version);
         let encoder_factory = || {
             let mut column_index_seq = ColumnIndexSequence::default();
@@ -459,14 +459,14 @@ impl SimulatedWriter {
     }
 
     fn write_page(&mut self, encoded_page: EncodedPage) {
-        trace!("Encoded page {:?}", encoded_page);
+        trace!("Encoded page {encoded_page:?}");
         let page_buffers = encoded_page.data;
         let page_encoding = encoded_page.description;
         let buffer_offsets_and_sizes = page_buffers
             .into_iter()
             .map(|b| {
                 let (offset, size) = self.write_buffer(b);
-                trace!("Encoded buffer offset={} size={}", offset, size);
+                trace!("Encoded buffer offset={offset} size={size}");
                 (offset, size)
             })
             .collect::<Vec<_>>();
@@ -598,7 +598,7 @@ async fn check_round_trip_encoding_inner(
 
     // Test range scheduling
     for range in &test_cases.ranges {
-        debug!("Testing decode of range {:?}", range);
+        debug!("Testing decode of range {range:?}");
         let num_rows = range.end - range.start;
         let expected = concat_data
             .as_ref()
@@ -773,12 +773,7 @@ async fn check_round_trip_field_encoding_random(
                 }
 
                 debug!(
-                    "Testing with {} rows divided across {} batches for {} rows per batch with null_rate={:?} and use_slicing={}",
-                    NUM_RANDOM_ROWS,
-                    num_ingest_batches,
-                    rows_per_batch,
-                    null_rate,
-                    use_slicing
+                    "Testing with {NUM_RANDOM_ROWS} rows divided across {num_ingest_batches} batches for {rows_per_batch} rows per batch with null_rate={null_rate:?} and use_slicing={use_slicing}"
                 );
                 check_round_trip_encoding_inner(encoder_factory(), &field, data, &test_cases).await
             }

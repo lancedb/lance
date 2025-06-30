@@ -84,7 +84,7 @@ fn compute_distances(c: &mut Criterion) {
         );
 
         c.bench_function(
-            format!("compute_distances: {},{},PQ={},DIM={}", TOTAL, dt, PQ, DIM).as_str(),
+            format!("compute_distances: {TOTAL},{dt},PQ={PQ},DIM={DIM}").as_str(),
             |b| {
                 b.iter(|| {
                     black_box(pq.compute_distances(&query, &code).unwrap());

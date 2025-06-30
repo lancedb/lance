@@ -256,7 +256,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                         // but would be a significant amount of work
                         //
                         // An easier fallback implementation would be to decode-on-write and encode-on-read
-                        Err(Error::NotSupported { source: format!("cannot encode a dictionary column whose value type is a logical type ({})", value_type).into(), location: location!() })
+                        Err(Error::NotSupported { source: format!("cannot encode a dictionary column whose value type is a logical type ({value_type})").into(), location: location!() })
                     }
                 }
                 _ => todo!("Implement encoding for field {}", field),
@@ -762,7 +762,7 @@ pub mod tests {
         let encoder_result = encoding_strategy.create_array_encoder(&[array], &lance_field);
         assert!(encoder_result.is_ok());
         let encoder = encoder_result.unwrap();
-        assert_eq!(format!("{:?}", encoder).as_str(), expected_encoder);
+        assert_eq!(format!("{encoder:?}").as_str(), expected_encoder);
     }
 
     #[test]

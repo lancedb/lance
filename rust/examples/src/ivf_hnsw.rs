@@ -84,7 +84,7 @@ async fn main() {
     let pq_params = SQBuildParams::default();
     let params =
         VectorIndexParams::with_ivf_hnsw_sq_params(metric_type, ivf_params, hnsw_params, pq_params);
-    println!("{:?}", params);
+    println!("{params:?}");
 
     if args.create_index {
         let now = std::time::Instant::now();

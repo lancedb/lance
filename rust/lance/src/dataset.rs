@@ -1395,8 +1395,7 @@ impl Dataset {
             let mut message = "Overlapping fragments detected in dataset.".to_string();
             for (index_name, overlapping_frags) in err.bad_indices {
                 message.push_str(&format!(
-                    "\nIndex {:?} has overlapping fragments: {:?}",
-                    index_name, overlapping_frags
+                    "\nIndex {index_name:?} has overlapping fragments: {overlapping_frags:?}"
                 ));
             }
             return Err(Error::corrupt_file(
@@ -1628,17 +1627,14 @@ impl Dataset {
         // Sanity check.
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
             return Err(Error::invalid_input(
-                format!("Column {} does not exist in the left side dataset", left_on),
+                format!("Column {left_on} does not exist in the left side dataset"),
                 location!(),
             ));
         };
         let right_schema = stream.schema();
         if right_schema.field_with_name(right_on).is_err() {
             return Err(Error::invalid_input(
-                format!(
-                    "Column {} does not exist in the right side dataset",
-                    right_on
-                ),
+                format!("Column {right_on} does not exist in the right side dataset"),
                 location!(),
             ));
         };
@@ -3241,8 +3237,7 @@ mod tests {
             entries_names
                 .iter()
                 .all(|name| ManifestNamingScheme::detect_scheme(name) == Some(scheme)),
-            "Entries: {:?}",
-            entries_names
+            "Entries: {entries_names:?}"
         );
     }
 
@@ -5160,9 +5155,9 @@ mod tests {
             .unwrap();
         assert_eq!(result.num_rows(), 3, "{:?}", result);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert!(ids.contains(&0), "{:?}", result);
-        assert!(ids.contains(&1), "{:?}", result);
-        assert!(ids.contains(&2), "{:?}", result);
+        assert!(ids.contains(&0), "{result:?}");
+        assert!(ids.contains(&1), "{result:?}");
+        assert!(ids.contains(&2), "{result:?}");
 
         let result = ds
             .scan()
@@ -5175,9 +5170,9 @@ mod tests {
             .unwrap();
         assert_eq!(result.num_rows(), 3);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert!(ids.contains(&0), "{:?}", result);
-        assert!(ids.contains(&1), "{:?}", result);
-        assert!(ids.contains(&3), "{:?}", result);
+        assert!(ids.contains(&0), "{result:?}");
+        assert!(ids.contains(&1), "{result:?}");
+        assert!(ids.contains(&3), "{result:?}");
 
         let result = ds
             .scan()
@@ -5197,9 +5192,9 @@ mod tests {
             .unwrap();
         assert_eq!(result.num_rows(), 3, "{:?}", result);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert!(ids.contains(&0), "{:?}", result);
-        assert!(ids.contains(&1), "{:?}", result);
-        assert!(ids.contains(&7), "{:?}", result);
+        assert!(ids.contains(&0), "{result:?}");
+        assert!(ids.contains(&1), "{result:?}");
+        assert!(ids.contains(&7), "{result:?}");
 
         let result = ds
             .scan()
@@ -5399,9 +5394,9 @@ mod tests {
             .unwrap();
         assert_eq!(result.num_rows(), 3, "{:?}", result);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert!(ids.contains(&0), "{:?}", result);
-        assert!(ids.contains(&1), "{:?}", result);
-        assert!(ids.contains(&7), "{:?}", result);
+        assert!(ids.contains(&0), "{result:?}");
+        assert!(ids.contains(&1), "{result:?}");
+        assert!(ids.contains(&7), "{result:?}");
 
         let result = ds
             .scan()
@@ -5438,8 +5433,8 @@ mod tests {
             .unwrap();
         assert_eq!(result.num_rows(), 2, "{:?}", result);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert!(ids.contains(&0), "{:?}", result);
-        assert!(ids.contains(&1), "{:?}", result);
+        assert!(ids.contains(&0), "{result:?}");
+        assert!(ids.contains(&1), "{result:?}");
     }
 
     #[tokio::test]
@@ -5536,14 +5531,12 @@ mod tests {
             if res1.is_err() {
                 assert!(
                     matches!(res1, Err(Error::DatasetAlreadyExists { .. })),
-                    "{:?}",
-                    res1
+                    "{res1:?}"
                 );
             } else if res2.is_err() {
                 assert!(
                     matches!(res2, Err(Error::DatasetAlreadyExists { .. })),
-                    "{:?}",
-                    res2
+                    "{res2:?}"
                 );
             } else {
                 assert!(res1.is_ok() && res2.is_ok());
@@ -5572,8 +5565,7 @@ mod tests {
         let res = dataset.append(reader, None).await;
         assert!(
             matches!(res, Err(Error::SchemaMismatch { .. })),
-            "Expected Error::SchemaMismatch, got {:?}",
-            res
+            "Expected Error::SchemaMismatch, got {res:?}"
         );
 
         // If missing columns that are nullable, the write succeeds.
@@ -5744,8 +5736,7 @@ mod tests {
         let res = Dataset::write(reader, test_uri, Some(append_options)).await;
         assert!(
             matches!(res, Err(Error::SchemaMismatch { .. })),
-            "Expected Error::SchemaMismatch, got {:?}",
-            res
+            "Expected Error::SchemaMismatch, got {res:?}"
         );
 
         // Can scan and get all data
@@ -6223,8 +6214,7 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("Expected to modify the fragment but no changes were made"),
-            "Expected Error::DataFileReplacementError, got {:?}",
-            err
+            "Expected Error::DataFileReplacementError, got {err:?}"
         );
     }
 

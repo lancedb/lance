@@ -28,21 +28,18 @@ fn bench_partitions(c: &mut Criterion) {
 
         for k in &[1, 10, 50] {
             let ivf = IvfTransformer::new(fsl.clone(), DistanceType::L2, vec![]);
-            c.bench_function(format!("IVF{},k={},L2", num_centroids, k).as_str(), |b| {
+            c.bench_function(format!("IVF{num_centroids},k={k},L2").as_str(), |b| {
                 b.iter(|| {
                     let _ = ivf.find_partitions(&query, *k);
                 })
             });
 
             let ivf = IvfTransformer::new(fsl.clone(), DistanceType::Cosine, vec![]);
-            c.bench_function(
-                format!("IVF{},k={},Cosine", num_centroids, k).as_str(),
-                |b| {
-                    b.iter(|| {
-                        let _ = ivf.find_partitions(&query, *k);
-                    })
-                },
-            );
+            c.bench_function(format!("IVF{num_centroids},k={k},Cosine").as_str(), |b| {
+                b.iter(|| {
+                    let _ = ivf.find_partitions(&query, *k);
+                })
+            });
         }
 
         let ivf = IvfTransformer::new(fsl.clone(), DistanceType::L2, vec![]);

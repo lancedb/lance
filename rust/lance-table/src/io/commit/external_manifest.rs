@@ -289,7 +289,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 let path = default_resolve_version(base_path, version, object_store)
                     .await
                     .map_err(|_| Error::NotFound {
-                        uri: format!("{}@{}", base_path, version),
+                        uri: format!("{base_path}@{version}"),
                         location: location!(),
                     })?
                     .path;
@@ -307,8 +307,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                             .await;
                         if let Err(e) = res {
                             warn!(
-                                "could not update external manifest store during load, with error: {}",
-                                e
+                                "could not update external manifest store during load, with error: {e}"
                             );
                         }
                         let naming_scheme =

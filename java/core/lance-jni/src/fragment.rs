@@ -267,12 +267,10 @@ impl IntoJava for &DeletionFileType {
         env.get_static_field(
             DELETE_FILE_TYPE_CLASS,
             name,
-            format!("L{};", DELETE_FILE_TYPE_CLASS),
+            format!("L{DELETE_FILE_TYPE_CLASS};"),
         )?
         .l()
-        .map_err(|e| {
-            Error::runtime_error(format!("failed to get {}: {}", DELETE_FILE_TYPE_CLASS, e))
-        })
+        .map_err(|e| Error::runtime_error(format!("failed to get {DELETE_FILE_TYPE_CLASS}: {e}")))
     }
 }
 
@@ -333,9 +331,7 @@ impl IntoJava for &Fragment {
                 JValueGen::Object(&row_id_meta),
             ],
         )
-        .map_err(|e| {
-            Error::runtime_error(format!("failed to get {}: {}", FRAGMENT_METADATA_CLASS, e))
-        })
+        .map_err(|e| Error::runtime_error(format!("failed to get {FRAGMENT_METADATA_CLASS}: {e}")))
     }
 }
 
@@ -366,7 +362,7 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             .call_method(
                 self,
                 "getDeletionFile",
-                format!("()L{};", DELETE_FILE_CLASS),
+                format!("()L{DELETE_FILE_CLASS};"),
                 &[],
             )?
             .l()?;
@@ -380,7 +376,7 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             .call_method(
                 self,
                 "getRowIdMeta",
-                format!("()L{};", ROW_ID_META_CLASS),
+                format!("()L{ROW_ID_META_CLASS};"),
                 &[],
             )?
             .l()?;
@@ -412,7 +408,7 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
             .call_method(
                 self,
                 "getFileType",
-                format!("()L{};", DELETE_FILE_TYPE_CLASS),
+                format!("()L{DELETE_FILE_TYPE_CLASS};"),
                 &[],
             )?
             .l()?

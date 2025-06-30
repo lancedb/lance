@@ -393,7 +393,7 @@ pub(crate) fn add_blanks(batch: RecordBatch, batch_offsets: &[u32]) -> Result<Re
         .map(|array| {
             arrow::compute::take(array.as_ref(), &selection_vector, None).map_err(|e| {
                 Error::Arrow {
-                    message: format!("Failed to add blanks: {}", e),
+                    message: format!("Failed to add blanks: {e}"),
                     location: location!(),
                 }
             })

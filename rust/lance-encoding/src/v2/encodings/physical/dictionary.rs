@@ -363,8 +363,7 @@ impl ArrayEncoder for DictionaryEncoder {
         if !matches!(data_type, DataType::Utf8) {
             return Err(Error::InvalidInput {
                 source: format!(
-                    "DictionaryEncoder only supports string arrays but got {}",
-                    data_type
+                    "DictionaryEncoder only supports string arrays but got {data_type}"
                 )
                 .into(),
                 location: location!(),

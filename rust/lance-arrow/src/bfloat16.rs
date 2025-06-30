@@ -49,7 +49,7 @@ impl std::fmt::Debug for BFloat16Array {
                 let binary_values = array.value(i);
                 let value =
                     bf16::from_bits(u16::from_le_bytes([binary_values[0], binary_values[1]]));
-                write!(f, "{:?}", value)
+                write!(f, "{value:?}")
             }
         })?;
         write!(f, "]")
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(array.len(), 3);
 
         let expected_fmt = "BFloat16Array\n[\n  1.0,\n  2.0,\n  3.0,\n]";
-        assert_eq!(expected_fmt, format!("{:?}", array));
+        assert_eq!(expected_fmt, format!("{array:?}"));
 
         for (expected, value) in values.iter().zip(array.iter()) {
             assert_eq!(Some(*expected), value);
@@ -328,7 +328,7 @@ mod tests {
         assert_eq!(array.null_count(), 1);
 
         let expected_fmt = "BFloat16Array\n[\n  1.0,\n  null,\n  3.0,\n]";
-        assert_eq!(expected_fmt, format!("{:?}", array));
+        assert_eq!(expected_fmt, format!("{array:?}"));
 
         for (expected, value) in values.iter().zip(array.iter()) {
             assert_eq!(*expected, value);

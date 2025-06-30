@@ -249,16 +249,14 @@ impl FullSchemaMergeInsertExec {
 
             let mut merge_state = merge_state.lock().map_err(|e| {
                 datafusion::error::DataFusionError::Internal(format!(
-                    "Failed to lock merge state: {}",
-                    e
+                    "Failed to lock merge state: {e}"
                 ))
             })?;
             for row_idx in 0..batch.num_rows() {
                 let action_code = action_array.value(row_idx);
                 let action = Action::try_from(action_code).map_err(|e| {
                     datafusion::error::DataFusionError::Internal(format!(
-                        "Invalid action code {}: {}",
-                        action_code, e
+                        "Invalid action code {action_code}: {e}"
                     ))
                 })?;
 
@@ -381,11 +379,7 @@ impl DisplayAs for FullSchemaMergeInsertExec {
 
                 write!(
                     f,
-                    "MergeInsert: on=[{}], when_matched={}, when_not_matched={}, when_not_matched_by_source={}",
-                    on_keys,
-                    when_matched,
-                    when_not_matched,
-                    when_not_matched_by_source
+                    "MergeInsert: on=[{on_keys}], when_matched={when_matched}, when_not_matched={when_not_matched}, when_not_matched_by_source={when_not_matched_by_source}"
                 )
             }
             datafusion::physical_plan::DisplayFormatType::TreeRender => {

@@ -204,7 +204,7 @@ impl TryFrom<&Field> for JsonField {
         };
 
         Ok(Self {
-            name: field.name().to_string(),
+            name: field.name().clone(),
             nullable: field.is_nullable(),
             type_: data_type,
             metadata,

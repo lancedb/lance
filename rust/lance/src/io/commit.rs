@@ -270,16 +270,13 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
         if let Some(actual_file_version) =
             Fragment::try_infer_version(&manifest.fragments).map_err(|e| Error::Internal {
                 message: format!(
-                    "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
-                    e
+                    "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {e}"
                 ),
                 location: location!(),
             })? {
                 if actual_file_version > data_storage_version {
                     log::warn!(
-                        "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
-                        data_storage_version,
-                        actual_file_version
+                        "Data storage version {data_storage_version} is less than the actual file version {actual_file_version}.  This has been automatically updated."
                     );
                     manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
                 }
@@ -291,9 +288,7 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
             if actual_file_version != data_storage_version {
                 return Err(Error::Internal {
                     message: format!(
-                        "The operation added files with version {}.  However, the data storage version is {}.",
-                        actual_file_version,
-                        data_storage_version
+                        "The operation added files with version {actual_file_version}.  However, the data storage version is {data_storage_version}."
                     ),
                     location: location!(),
                 });
@@ -867,8 +862,8 @@ pub(crate) async fn commit_transaction(
                 }
 
                 match auto_cleanup_hook(&dataset, &manifest).await {
-                    Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
-                    Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
+                    Ok(Some(stats)) => log::info!("Auto cleanup triggered: {stats:?}"),
+                    Err(e) => log::error!("Error encountered during auto_cleanup_hook: {e}"),
                     _ => {}
                 };
                 return Ok((manifest, manifest_location));
@@ -982,8 +977,7 @@ mod tests {
             assert_eq!(
                 num_successes,
                 distinct_results.len(),
-                "Expected no two tasks to succeed for the same version. Got {:?}",
-                task_results
+                "Expected no two tasks to succeed for the same version. Got {task_results:?}"
             );
         } else {
             // All we can promise here is at least one tasks succeeds, but multiple
@@ -1146,7 +1140,7 @@ mod tests {
 
         let results = join_all(futures).await;
         for result in results {
-            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
+            assert!(matches!(result, Ok(Ok(_))), "{result:?}");
         }
 
         // Validate that each version has the anticipated number of indexes
@@ -1230,7 +1224,7 @@ mod tests {
 
             // Assert all succeeded
             for result in results {
-                assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
+                assert!(matches!(result, Ok(Ok(_))), "{result:?}");
             }
 
             // Assert final fragments and versions expected
@@ -1291,7 +1285,7 @@ mod tests {
 
         // Assert all succeeded
         for result in results {
-            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
+            assert!(matches!(result, Ok(Ok(_))), "{result:?}");
         }
 
         let dataset = dataset.checkout_version(6).await.unwrap();
@@ -1312,7 +1306,7 @@ mod tests {
 
         // Assert all succeeded
         for result in results {
-            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
+            assert!(matches!(result, Ok(Ok(_))), "{result:?}");
         }
 
         let dataset = dataset.checkout_version(11).await.unwrap();
@@ -1353,22 +1347,20 @@ mod tests {
                         first_operation_failed = true;
                         assert!(
                             matches!(&result, &Err(Error::CommitConflict { .. })),
-                            "{:?}",
-                            result,
+                            "{result:?}",
                         );
                     }
                 }
                 1 => match first_operation_failed {
-                    true => assert!(result.is_ok(), "{:?}", result),
+                    true => assert!(result.is_ok(), "{result:?}"),
                     false => {
                         assert!(
                             matches!(&result, &Err(Error::CommitConflict { .. })),
-                            "{:?}",
-                            result,
+                            "{result:?}",
                         );
                     }
                 },
-                _ => assert!(result.is_ok(), "{:?}", result),
+                _ => assert!(result.is_ok(), "{result:?}"),
             }
         }
     }

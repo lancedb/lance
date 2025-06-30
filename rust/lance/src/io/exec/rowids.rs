@@ -131,8 +131,7 @@ impl AddRowAddrExec {
                             builder.append_value(row_addr.into());
                         } else {
                             return Err(DataFusionError::Internal(format!(
-                                "AddRowAddrExec: rowid not found in index: {}",
-                                rowid
+                                "AddRowAddrExec: rowid not found in index: {rowid}"
                             )));
                         }
                     } else {
@@ -148,8 +147,7 @@ impl AddRowAddrExec {
                         rowaddrs.push(row_addr.into());
                     } else {
                         return Err(DataFusionError::Internal(format!(
-                            "AddRowAddrExec: rowid not found in index: {}",
-                            rowid
+                            "AddRowAddrExec: rowid not found in index: {rowid}"
                         )));
                     }
                 }

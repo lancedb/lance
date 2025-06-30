@@ -91,7 +91,7 @@ fn dataset_take(
                     let batch = dataset
                         .take_rows(&rows, ProjectionRequest::Schema(schema.clone()))
                         .await
-                        .unwrap_or_else(|_| panic!("rows: {:?}", rows));
+                        .unwrap_or_else(|_| panic!("rows: {rows:?}"));
                     assert_eq!(batch.num_rows(), num_rows);
                 })
             },
@@ -389,7 +389,7 @@ async fn create_dataset(
                     )),
                     Arc::new(BinaryArray::from_iter_values(
                         (i * batch_size..(i + 1) * batch_size)
-                            .map(|x| format!("blob-{}", x).into_bytes()),
+                            .map(|x| format!("blob-{x}").into_bytes()),
                     )),
                     Arc::new(
                         FixedSizeListArray::try_new_from_values(
@@ -403,7 +403,7 @@ async fn create_dataset(
                     ),
                     Arc::new(BinaryArray::from_iter_values(
                         (i * batch_size..(i + 1) * batch_size)
-                            .map(|x| format!("blob-{}", x).into_bytes()),
+                            .map(|x| format!("blob-{x}").into_bytes()),
                     )),
                 ],
             )

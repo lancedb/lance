@@ -61,7 +61,7 @@ impl ScalarIndexLoader for Dataset {
             .load_scalar_index(ScalarIndexCriteria::default().with_name(index_name))
             .await?
             .ok_or_else(|| Error::Internal {
-                message: format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column),
+                message: format!("Scanner created plan for index query on index {index_name} for column {column} but no usable index exists with that name"),
                 location: location!()
             })?;
         self.open_scalar_index(column, &idx.uuid.to_string(), metrics)

@@ -63,7 +63,7 @@ pub async fn create_test_vector_dataset(output: &str, num_rows: usize, dim: i32)
         batches.push(batch);
     }
     let batch_reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-    println!("Writing dataset to {}", output);
+    println!("Writing dataset to {output}");
     Dataset::write(batch_reader, output, None).await.unwrap();
 }
 

@@ -365,8 +365,7 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Res
                         } else {
                             // This should not be possible
                             Err(DataFusionError::Substrait(format!(
-                                "Unexpected reference to table {} found when parsing filter",
-                                table
+                                "Unexpected reference to table {table} found when parsing filter"
                             )))
                         }
                     }

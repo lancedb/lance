@@ -469,8 +469,8 @@ impl IvfShuffler {
             location!(),
         ))?;
 
-        info!("Writing unsorted data to disk at {}", path);
-        info!("with schema: {:?}", schema);
+        info!("Writing unsorted data to disk at {path}");
+        info!("with schema: {schema:?}");
 
         let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
             writer,
@@ -481,7 +481,7 @@ impl IvfShuffler {
         let mut batches_processed = 0;
         while let Some(batch) = data.next().await {
             if batches_processed % 1000 == 0 {
-                info!("Partition assignment progress {}/?", batches_processed);
+                info!("Partition assignment progress {batches_processed}/?");
             }
             batches_processed += 1;
             file_writer.write(&[batch?]).await?;
@@ -666,7 +666,7 @@ impl IvfShuffler {
 
             while let Some(batch) = stream.next().await {
                 if num_processed % 100 == 0 {
-                    info!("Shuffle Progress {}/{}", num_processed, num_batches_to_sort);
+                    info!("Shuffle Progress {num_processed}/{num_batches_to_sort}");
                 }
                 num_processed += 1;
 
@@ -706,8 +706,7 @@ impl IvfShuffler {
         let num_batches = self.total_batches().await?;
         let total_batches = num_batches.iter().sum();
         info!(
-            "Sorting unsorted data into sorted chunks (batches_per_chunk={} concurrent_jobs={})",
-            batches_per_partition, concurrent_jobs
+            "Sorting unsorted data into sorted chunks (batches_per_chunk={batches_per_partition} concurrent_jobs={concurrent_jobs})"
         );
         stream::iter((0..total_batches).step_by(batches_per_partition))
             .zip(stream::repeat(num_batches))
@@ -762,10 +761,7 @@ impl IvfShuffler {
                     let path = this.output_dir.child(output_file.clone());
                     let writer = object_store.create(&path).await?;
 
-                    info!(
-                        "Chunk loaded into memory and sorted, writing to disk at {}",
-                        path
-                    );
+                    info!("Chunk loaded into memory and sorted, writing to disk at {path}");
 
                     let sorted_file_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
                         "partitions",

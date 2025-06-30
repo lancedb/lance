@@ -158,7 +158,7 @@ impl Reader for CloudObjectReader {
                 };
                 self.object_store.get_opts(&self.path, options)
             },
-            || format!("range {:?}", range),
+            || format!("range {range:?}"),
         )
         .await
     }

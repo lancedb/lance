@@ -471,10 +471,7 @@ impl FixedSizeListBlock {
                 inner.num_values /= self.dimension;
                 Some(inner)
             }
-            _ => panic!(
-                "Expected FixedSizeList or FixedWidth data block but found {:?}",
-                self
-            ),
+            _ => panic!("Expected FixedSizeList or FixedWidth data block but found {self:?}"),
         }
     }
 
@@ -516,7 +513,7 @@ impl FixedSizeListBlock {
                     .len(num_values as usize)
                     .null_count(0)
             }
-            _ => panic!("Expected FixedSizeList data type and got {:?}", data_type),
+            _ => panic!("Expected FixedSizeList data type and got {data_type:?}"),
         };
         if validate {
             Ok(builder.build()?)
@@ -737,7 +734,7 @@ impl StructDataBlock {
             }
         } else {
             Err(Error::Internal {
-                message: format!("Expected Struct, got {:?}", data_type),
+                message: format!("Expected Struct, got {data_type:?}"),
                 location: location!(),
             })
         }
@@ -807,7 +804,7 @@ impl DictionaryDataBlock {
             (key_type.as_ref().clone(), value_type.as_ref().clone())
         } else {
             return Err(Error::Internal {
-                message: format!("Expected Dictionary, got {:?}", data_type),
+                message: format!("Expected Dictionary, got {data_type:?}"),
                 location: location!(),
             });
         };
@@ -1609,10 +1606,7 @@ impl DataBlock {
             | DataType::Map(_, _)
             | DataType::RunEndEncoded(_, _)
             | DataType::Union(_, _) => {
-                panic!(
-                    "Field with data type {} cannot be converted to data block",
-                    data_type
-                )
+                panic!("Field with data type {data_type} cannot be converted to data block")
             }
         };
 

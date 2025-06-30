@@ -175,7 +175,7 @@ mod tests {
         bitmap.set(9);
         assert_eq!(bitmap.count_ones(), 5);
         assert_eq!(
-            format!("{:?}", bitmap),
+            format!("{bitmap:?}"),
             "Bitmap { data: 1100110001, len: 10 }"
         );
 
@@ -183,7 +183,7 @@ mod tests {
         bitmap.clear(4);
         assert_eq!(bitmap.count_ones(), 3);
         assert_eq!(
-            format!("{:?}", bitmap),
+            format!("{bitmap:?}"),
             "Bitmap { data: 1000010001, len: 10 }"
         );
 

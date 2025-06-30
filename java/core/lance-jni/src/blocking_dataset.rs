@@ -1001,7 +1001,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeTake(
     match inner_take(&mut env, java_dataset, indices_obj, columns_obj) {
         Ok(byte_array) => byte_array,
         Err(e) => {
-            let _ = env.throw_new("java/lang/RuntimeException", format!("{:?}", e));
+            let _ = env.throw_new("java/lang/RuntimeException", format!("{e:?}"));
             std::ptr::null_mut()
         }
     }

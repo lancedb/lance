@@ -147,7 +147,7 @@ impl DataTypeExt for DataType {
 
     fn byte_width(&self) -> usize {
         self.byte_width_opt()
-            .unwrap_or_else(|| panic!("Expecting fixed stride data type, found {:?}", self))
+            .unwrap_or_else(|| panic!("Expecting fixed stride data type, found {self:?}"))
     }
 }
 
@@ -381,13 +381,11 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                     self.nulls().cloned(),
                 )),
                 data_type => Err(ArrowError::ParseError(format!(
-                    "Expect either floating type or integer got {:?}",
-                    data_type
+                    "Expect either floating type or integer got {data_type:?}"
                 ))),
             },
             data_type => Err(ArrowError::ParseError(format!(
-                "Expect either FixedSizeList got {:?}",
-                data_type
+                "Expect either FixedSizeList got {data_type:?}"
             ))),
         }
     }
@@ -660,7 +658,7 @@ impl RecordBatchExt for RecordBatch {
             .fields()
             .iter()
             .position(|f| f.name() == name)
-            .ok_or_else(|| ArrowError::SchemaError(format!("Field {} does not exist", name)))?;
+            .ok_or_else(|| ArrowError::SchemaError(format!("Field {name} does not exist")))?;
         columns[field_i] = column;
         Self::try_new(self.schema(), columns)
     }
@@ -691,7 +689,7 @@ impl RecordBatchExt for RecordBatch {
             .fields()
             .iter()
             .position(|f| f.name() == name)
-            .ok_or_else(|| ArrowError::SchemaError(format!("Field {} does not exist", name)))?;
+            .ok_or_else(|| ArrowError::SchemaError(format!("Field {name} does not exist")))?;
         columns[field_i] = column;
         Self::try_new(Arc::new(schema), columns)
     }
@@ -1403,7 +1401,7 @@ mod tests {
             vec![
                 Arc::new(Int32Array::from_iter_values(0..20)),
                 Arc::new(StringArray::from_iter_values(
-                    (0..20).map(|i| format!("str-{}", i)),
+                    (0..20).map(|i| format!("str-{i}")),
                 )),
             ],
         )
@@ -1437,7 +1435,7 @@ mod tests {
             vec![
                 Arc::new(Int32Array::from_iter_values(0..20)),
                 Arc::new(StringArray::from_iter_values(
-                    (0..20).map(|i| format!("str-{}", i)),
+                    (0..20).map(|i| format!("str-{i}")),
                 )),
             ],
         )
@@ -1467,7 +1465,7 @@ mod tests {
                 expected_schema,
                 vec![
                     Arc::new(StringArray::from_iter_values(
-                        (0..20).map(|i| format!("str-{}", i)),
+                        (0..20).map(|i| format!("str-{i}")),
                     )),
                     Arc::new(Int32Array::from_iter_values(0..20)),
                 ],

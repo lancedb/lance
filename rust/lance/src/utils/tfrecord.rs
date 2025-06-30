@@ -72,7 +72,7 @@ pub async fn infer_tfrecord_schema(
         .get(&path)
         .await?
         .into_stream()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+        .map_err(std::io::Error::other)
         .into_async_read();
     let mut records = RecordStream::<Example, _>::from_reader(data, Default::default());
     let mut i = 0;
@@ -134,7 +134,7 @@ pub async fn read_tfrecord(
         .get(&path)
         .await?
         .into_stream()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+        .map_err(std::io::Error::other)
         .into_async_read();
     let schema_ref = schema.clone();
     let batch_stream = RecordStream::<Example, _>::from_reader(data, Default::default())
@@ -227,7 +227,7 @@ impl FeatureMeta {
         };
         if self.feature_type != feature_type {
             return Err(Error::io(
-                format!("inconsistent feature type for field {:?}", feature_type),
+                format!("inconsistent feature type for field {feature_type:?}"),
                 location!(),
             ));
         }
@@ -267,7 +267,7 @@ fn tensor_dtype_to_arrow(tensor_dtype: &TensorDataType) -> Result<DataType> {
         TensorDataType::DtDouble => DataType::Float64,
         _ => {
             return Err(Error::io(
-                format!("unsupported tensor data type {:?}", tensor_dtype),
+                format!("unsupported tensor data type {tensor_dtype:?}"),
                 location!(),
             ));
         }

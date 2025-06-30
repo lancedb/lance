@@ -93,7 +93,7 @@ impl LanceSchema {
     #[staticmethod]
     pub fn from_pyarrow(schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
         let schema = Schema::try_from(&schema.0)
-            .map_err(|err| PyValueError::new_err(format!("Failed to convert schema: {}", err)))?;
+            .map_err(|err| PyValueError::new_err(format!("Failed to convert schema: {err}")))?;
         Ok(Self(schema))
     }
 
@@ -105,7 +105,7 @@ impl LanceSchema {
 
         let mut states = Vec::new();
         let metadata_str = serde_json::to_string(&fields_with_meta.metadata)
-            .map_err(|e| PyErr::new::<PyValueError, _>(format!("{}", e)))?
+            .map_err(|e| PyErr::new::<PyValueError, _>(format!("{e}")))?
             .into_py_any(py)?;
         states.push(metadata_str);
 
@@ -125,13 +125,12 @@ impl LanceSchema {
     #[pyo3(signature = (metadata_json, *field_protos))]
     pub fn _from_protos(metadata_json: String, field_protos: Vec<Vec<u8>>) -> PyResult<Self> {
         let metadata = serde_json::from_str(&metadata_json)
-            .map_err(|err| PyValueError::new_err(format!("Failed to parse metadata: {}", err)))?;
+            .map_err(|err| PyValueError::new_err(format!("Failed to parse metadata: {err}")))?;
 
         let mut fields = Vec::new();
         for proto in field_protos {
-            let field = pb::Field::decode(proto.as_slice()).map_err(|e| {
-                PyValueError::new_err(format!("Failed to parse field proto: {}", e))
-            })?;
+            let field = pb::Field::decode(proto.as_slice())
+                .map_err(|e| PyValueError::new_err(format!("Failed to parse field proto: {e}")))?;
             fields.push(field);
         }
         let fields_with_meta = FieldsWithMeta {

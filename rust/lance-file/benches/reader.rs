@@ -25,7 +25,7 @@ use rand::seq::SliceRandom;
 
 fn bench_reader(c: &mut Criterion) {
     for version in [LanceFileVersion::V2_0, LanceFileVersion::V2_1] {
-        let mut group = c.benchmark_group(format!("reader_{}", version));
+        let mut group = c.benchmark_group(format!("reader_{version}"));
         let data = lance_datagen::gen()
             .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
             .into_batch_rows(lance_datagen::RowCount::from(2 * 1024 * 1024))
@@ -124,7 +124,7 @@ fn bench_reader(c: &mut Criterion) {
 fn bench_random_access(c: &mut Criterion) {
     const TAKE_SIZE: usize = 100;
     for version in [LanceFileVersion::V2_0, LanceFileVersion::V2_1] {
-        let mut group = c.benchmark_group(format!("reader_{}", version));
+        let mut group = c.benchmark_group(format!("reader_{version}"));
         let data = lance_datagen::gen()
             .anon_col(lance_datagen::array::rand_type(&DataType::Int32).with_random_nulls(0.1))
             .into_batch_rows(lance_datagen::RowCount::from(2 * 1024 * 1024))

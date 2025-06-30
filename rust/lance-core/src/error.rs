@@ -304,10 +304,7 @@ impl From<serde_json::Error> for Error {
 
 #[track_caller]
 fn arrow_io_error_from_msg(message: String) -> ArrowError {
-    ArrowError::IoError(
-        message.clone(),
-        std::io::Error::new(std::io::ErrorKind::Other, message),
-    )
+    ArrowError::IoError(message.clone(), std::io::Error::other(message))
 }
 
 impl From<Error> for ArrowError {
@@ -451,7 +448,7 @@ mod test {
         match f().unwrap_err() {
             Error::IO { location, .. } => {
                 // +4 is the beginning of object_store::Error::Generic...
-                assert_eq!(location.line, current_fn.line() + 4, "{}", location)
+                assert_eq!(location.line, current_fn.line() + 4, "{location}")
             }
             #[allow(unreachable_patterns)]
             _ => panic!("expected ObjectStore error"),

@@ -89,7 +89,7 @@ impl TryFrom<&str> for Operator {
             "AND" => Ok(Self::And),
             "OR" => Ok(Self::Or),
             _ => Err(Error::invalid_input(
-                format!("Invalid operator: {}", value),
+                format!("Invalid operator: {value}"),
                 location!(),
             )),
         }
@@ -125,14 +125,14 @@ pub enum FtsQuery {
 impl std::fmt::Display for FtsQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Self::Match(query) => write!(f, "Match({:?})", query),
-            Self::Phrase(query) => write!(f, "Phrase({:?})", query),
+            Self::Match(query) => write!(f, "Match({query:?})"),
+            Self::Phrase(query) => write!(f, "Phrase({query:?})"),
             Self::Boost(query) => write!(
                 f,
                 "Boosting(positive={}, negative={}, negative_boost={})",
                 query.positive, query.negative, query.negative_boost
             ),
-            Self::MultiMatch(query) => write!(f, "MultiMatch({:?})", query),
+            Self::MultiMatch(query) => write!(f, "MultiMatch({query:?})"),
             Self::Boolean(query) => {
                 write!(
                     f,
@@ -575,7 +575,7 @@ impl TryFrom<&str> for Occur {
             "MUST" => Ok(Self::Must),
             "MUST_NOT" => Ok(Self::MustNot),
             _ => Err(Error::invalid_input(
-                format!("Invalid occur value: {}", value),
+                format!("Invalid occur value: {value}"),
                 location!(),
             )),
         }

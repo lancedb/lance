@@ -487,8 +487,7 @@ pub async fn auto_cleanup_hook(
                 Err(e) => {
                     return Err(Error::Cleanup {
                         message: format!(
-                        "Error encountered while parsing lance.auto_cleanup.older_than as std::time::Duration: {}",
-                        e
+                        "Error encountered while parsing lance.auto_cleanup.older_than as std::time::Duration: {e}"
                     ),
                     })
                 }
@@ -499,8 +498,7 @@ pub async fn auto_cleanup_hook(
                 Err(e) => {
                     return Err(Error::Cleanup {
                         message: format!(
-                        "Error encountered while parsing lance.auto_cleanup.interval as u64: {}",
-                        e
+                        "Error encountered while parsing lance.auto_cleanup.interval as u64: {e}"
                     ),
                     })
                 }
@@ -642,7 +640,7 @@ mod tests {
             let tmpdir_path = tmpdir.path().as_os_str().to_str().unwrap().to_owned();
             Ok(Self {
                 _tmpdir: tmpdir,
-                dataset_path: format!("{}/my_db", tmpdir_path),
+                dataset_path: format!("{tmpdir_path}/my_db"),
                 mock_store: Arc::new(MockObjectStore::new()),
                 clock: MockClock::new(),
             })

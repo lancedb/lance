@@ -61,7 +61,7 @@ mod tests {
         for (uri, expected_path) in cases {
             let url = uri_to_url(uri).unwrap();
             let path = provider.extract_path(&url);
-            assert_eq!(path.as_ref(), expected_path, "uri: '{}'", uri);
+            assert_eq!(path.as_ref(), expected_path, "uri: '{uri}'");
         }
     }
 

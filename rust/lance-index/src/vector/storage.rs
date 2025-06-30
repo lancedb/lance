@@ -199,7 +199,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 .metadata
                 .get(DISTANCE_TYPE_KEY)
                 .ok_or(Error::Index {
-                    message: format!("{} not found", DISTANCE_TYPE_KEY),
+                    message: format!("{DISTANCE_TYPE_KEY} not found"),
                     location: location!(),
                 })?
                 .as_str(),
@@ -209,12 +209,12 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             .metadata
             .get(IVF_METADATA_KEY)
             .ok_or(Error::Index {
-                message: format!("{} not found", IVF_METADATA_KEY),
+                message: format!("{IVF_METADATA_KEY} not found"),
                 location: location!(),
             })?
             .parse()
             .map_err(|e| Error::Index {
-                message: format!("Failed to decode IVF metadata: {}", e),
+                message: format!("Failed to decode IVF metadata: {e}"),
                 location: location!(),
             })?;
         let ivf_bytes = reader.read_global_buffer(ivf_pos).await?;
@@ -225,7 +225,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 .metadata
                 .get(STORAGE_METADATA_KEY)
                 .ok_or(Error::Index {
-                    message: format!("{} not found", STORAGE_METADATA_KEY),
+                    message: format!("{STORAGE_METADATA_KEY} not found"),
                     location: location!(),
                 })?
                 .as_str(),

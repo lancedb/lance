@@ -427,7 +427,7 @@ impl Dataset {
         let field = new_self
             .schema()
             .field(field_name)
-            .ok_or_else(|| PyKeyError::new_err(format!("Field \"{}\" not found", field_name)))?;
+            .ok_or_else(|| PyKeyError::new_err(format!("Field \"{field_name}\" not found")))?;
         let new_field_meta: HashMap<u32, HashMap<String, String>> =
             HashMap::from_iter(vec![(field.id as u32, metadata)]);
         RT.block_on(None, new_self.replace_field_metadata(new_field_meta))?
@@ -447,11 +447,10 @@ impl Dataset {
             .block_on(self.ds.index_statistics(&index_name))
             .map_err(|err| match err {
                 lance::Error::IndexNotFound { .. } => {
-                    PyKeyError::new_err(format!("Index \"{}\" not found", index_name))
+                    PyKeyError::new_err(format!("Index \"{index_name}\" not found"))
                 }
                 _ => PyIOError::new_err(format!(
-                    "Failed to get index statistics for index {}: {}",
-                    index_name, err
+                    "Failed to get index statistics for index {index_name}: {err}"
                 )),
             })
     }
@@ -619,8 +618,7 @@ impl Dataset {
                 if let Some(cols) = columns {
                     query = query.with_columns(&cols).map_err(|e| {
                         PyValueError::new_err(format!(
-                            "Failed to set full text search columns: {}",
-                            e
+                            "Failed to set full text search columns: {e}"
                         ))
                     })?;
                 }
@@ -835,7 +833,7 @@ impl Dataset {
             let scanner = match element_type {
                 DataType::UInt8 => {
                     let q = arrow::compute::cast(&q, &DataType::UInt8).map_err(|e| {
-                        PyValueError::new_err(format!("Failed to cast q to binary vector: {}", e))
+                        PyValueError::new_err(format!("Failed to cast q to binary vector: {e}"))
                     })?;
                     let q = q.as_primitive::<UInt8Type>();
                     scanner.nearest(&column, q, k)
@@ -1025,8 +1023,7 @@ impl Dataset {
                     let k = key?;
                     if k != "path" && k != "name" && k != "nullable" && k != "data_type" {
                         return Err(PyValueError::new_err(format!(
-                            "Unknown key: {}. Valid keys are name, nullable, and data_type.",
-                            k
+                            "Unknown key: {k}. Valid keys are name, nullable, and data_type."
                         )));
                     }
                 }
@@ -1253,13 +1250,11 @@ impl Dataset {
         let inner_result = RT.block_on(None, self_.ds.tags.get_version(&tag))?;
 
         inner_result.map_err(|err: lance::Error| match err {
-            lance::Error::NotFound { .. } => {
-                PyValueError::new_err(format!("Tag not found: {}", err))
-            }
+            lance::Error::NotFound { .. } => PyValueError::new_err(format!("Tag not found: {err}")),
             lance::Error::RefNotFound { .. } => {
-                PyValueError::new_err(format!("Ref not found: {}", err))
+                PyValueError::new_err(format!("Ref not found: {err}"))
             }
-            _ => PyIOError::new_err(format!("Storage error: {}", err)),
+            _ => PyIOError::new_err(format!("Storage error: {err}")),
         })
     }
 
@@ -1354,7 +1349,7 @@ impl Dataset {
             }
         };
 
-        log::info!("Creating index: type={}", index_type);
+        log::info!("Creating index: type={index_type}");
         let params: Box<dyn IndexParams> = match index_type.as_str() {
             "BTREE" => Box::<ScalarIndexParams>::default(),
             "BITMAP" => Box::new(ScalarIndexParams {
@@ -1381,8 +1376,7 @@ impl Dataset {
                             language.downcast::<PyString>()?.clone().try_into()?;
                         params = params.language(&language).map_err(|e| {
                             PyValueError::new_err(format!(
-                                "can't set tokenizer language to {}: {:?}",
-                                language, e
+                                "can't set tokenizer language to {language}: {e:?}"
                             ))
                         })?;
                     }
@@ -1865,10 +1859,8 @@ impl Dataset {
             Some("asc") => Some(std::cmp::Ordering::Less),
             Some("desc") => Some(std::cmp::Ordering::Greater),
             Some(invalid_order) => {
-                let error_msg = format!(
-                    "Invalid sort order '{}'. Valid values are: asc, desc",
-                    invalid_order
-                );
+                let error_msg =
+                    format!("Invalid sort order '{invalid_order}'. Valid values are: asc, desc");
                 return Err(::lance::error::Error::InvalidInput {
                     source: Box::new(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -1897,7 +1889,7 @@ impl Dataset {
                     Ok(_) => (),
                     Err(e) => {
                         // Don't fail scan if callback fails
-                        error!("Error in scan stats callback: {}", e);
+                        error!("Error in scan stats callback: {e}");
                     }
                 }
             });
@@ -2108,7 +2100,7 @@ fn prepare_vector_index_params(
                     &Default::default(),
                 )
                 .map_err(|e| {
-                    PyValueError::new_err(format!("Failed to cast centroids to column type: {}", e))
+                    PyValueError::new_err(format!("Failed to cast centroids to column type: {e}"))
                 })?;
             }
             let centroids = as_fixed_size_list_array(centroids.as_ref());
@@ -2131,8 +2123,7 @@ fn prepare_vector_index_params(
                 (Some(l), Some(p)) => {
                     let path = Path::parse(p.to_string()).map_err(|e| {
                         PyValueError::new_err(format!(
-                            "Failed to parse precomputed_shuffle_buffers_path: {}",
-                            e
+                            "Failed to parse precomputed_shuffle_buffers_path: {e}"
                         ))
                     })?;
                     let list = l.downcast::<PyList>()?
@@ -2256,7 +2247,7 @@ impl WriteFragmentProgress for PyWriteProgress {
         })
         .map_err(|e| {
             lance::Error::io(
-                format!("Failed to call begin() on WriteFragmentProgress: {}", e),
+                format!("Failed to call begin() on WriteFragmentProgress: {e}"),
                 location!(),
             )
         })?;
@@ -2273,7 +2264,7 @@ impl WriteFragmentProgress for PyWriteProgress {
         })
         .map_err(|e| {
             lance::Error::io(
-                format!("Failed to call complete() on WriteFragmentProgress: {}", e),
+                format!("Failed to call complete() on WriteFragmentProgress: {e}"),
                 location!(),
             )
         })?;
@@ -2317,7 +2308,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
         })
         .map_err(|err: PyErr| {
             lance_core::Error::io(
-                format!("Failed to call get_batch() on UDFCheckpointer: {}", err),
+                format!("Failed to call get_batch() on UDFCheckpointer: {err}"),
                 location!(),
             )
         })
@@ -2333,7 +2324,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
         })
         .map_err(|err: PyErr| {
             lance_core::Error::io(
-                format!("Failed to call get_fragment() on UDFCheckpointer: {}", err),
+                format!("Failed to call get_fragment() on UDFCheckpointer: {err}"),
                 location!(),
             )
         })?;
@@ -2341,7 +2332,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             .map(|data| {
                 serde_json::from_str(&data).map_err(|err| {
                     lance::Error::io(
-                        format!("Failed to deserialize fragment data: {}", err),
+                        format!("Failed to deserialize fragment data: {err}"),
                         location!(),
                     )
                 })
@@ -2358,7 +2349,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
         })
         .map_err(|err: PyErr| {
             lance_core::Error::io(
-                format!("Failed to call insert_batch() on UDFCheckpointer: {}", err),
+                format!("Failed to call insert_batch() on UDFCheckpointer: {err}"),
                 location!(),
             )
         })
@@ -2367,7 +2358,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
     fn insert_fragment(&self, fragment: Fragment) -> lance_core::Result<()> {
         let data = serde_json::to_string(&fragment).map_err(|err| {
             lance_core::Error::io(
-                format!("Failed to serialize fragment data: {}", err),
+                format!("Failed to serialize fragment data: {err}"),
                 location!(),
             )
         })?;
@@ -2378,10 +2369,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
         })
         .map_err(|err: PyErr| {
             lance_core::Error::io(
-                format!(
-                    "Failed to call insert_fragment() on UDFCheckpointer: {}",
-                    err
-                ),
+                format!("Failed to call insert_fragment() on UDFCheckpointer: {err}"),
                 location!(),
             )
         })
@@ -2415,7 +2403,7 @@ impl PyFullTextQuery {
                 .with_max_expansions(max_expansions)
                 .with_operator(
                     Operator::try_from(operator)
-                        .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?,
+                        .map_err(|e| PyValueError::new_err(format!("Invalid operator: {e}")))?,
                 )
                 .with_prefix_length(prefix_length)
                 .into(),
@@ -2450,16 +2438,16 @@ impl PyFullTextQuery {
         operator: &str,
     ) -> PyResult<Self> {
         let q = MultiMatchQuery::try_new(query, columns)
-            .map_err(|e| PyValueError::new_err(format!("Invalid query: {}", e)))?;
+            .map_err(|e| PyValueError::new_err(format!("Invalid query: {e}")))?;
         let q = if let Some(boosts) = boosts {
             q.try_with_boosts(boosts)
-                .map_err(|e| PyValueError::new_err(format!("Invalid boosts: {}", e)))?
+                .map_err(|e| PyValueError::new_err(format!("Invalid boosts: {e}")))?
         } else {
             q
         };
 
         let op = Operator::try_from(operator)
-            .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?;
+            .map_err(|e| PyValueError::new_err(format!("Invalid operator: {e}")))?;
 
         Ok(Self {
             inner: q.with_operator(op).into(),

@@ -241,7 +241,7 @@ impl UpdateJob {
         let expected_schema = self.dataset.schema().into();
         if schema.as_ref() != &expected_schema {
             return Err(Error::Internal {
-                message: format!("Expected schema {:?} but got {:?}", expected_schema, schema),
+                message: format!("Expected schema {expected_schema:?} but got {schema:?}"),
                 location: location!(),
             });
         }
@@ -529,7 +529,7 @@ mod tests {
             vec![
                 Arc::new(Int64Array::from_iter_values(0..30)),
                 Arc::new(StringArray::from_iter_values(
-                    (0..30).map(|i| format!("bar{}", i)),
+                    (0..30).map(|i| format!("bar{i}")),
                 )),
             ],
         )
@@ -578,7 +578,7 @@ mod tests {
                 Arc::new(StringArray::from_iter_values(
                     (0..15)
                         .map(|_| "foo".to_string())
-                        .chain((15..30).map(|i| format!("bar{}", i))),
+                        .chain((15..30).map(|i| format!("bar{i}"))),
                 )),
             ],
         )
@@ -671,7 +671,7 @@ mod tests {
                     .unwrap();
 
                 let job = UpdateBuilder::new(Arc::new(dataset))
-                    .update_where(&format!("id = {}", i))
+                    .update_where(&format!("id = {i}"))
                     .unwrap()
                     .set("value", "1")
                     .unwrap()

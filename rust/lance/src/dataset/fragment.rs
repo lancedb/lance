@@ -1116,8 +1116,7 @@ impl FileFragment {
                             .data_dir()
                             .child(self.metadata.files[0].path.as_str()),
                         format!(
-                            "Field id {} is not in increasing order in fragment {:#?}",
-                            field_id, self
+                            "Field id {field_id} is not in increasing order in fragment {self:#?}"
                         ),
                         location!(),
                     ));
@@ -1128,10 +1127,7 @@ impl FileFragment {
                         self.dataset
                             .data_dir()
                             .child(self.metadata.files[0].path.as_str()),
-                        format!(
-                            "Field id {} is duplicated in fragment {:#?}",
-                            field_id, self
-                        ),
+                        format!("Field id {field_id} is duplicated in fragment {self:#?}"),
                         location!(),
                     ));
                 }
@@ -1181,8 +1177,7 @@ impl FileFragment {
                 return Err(Error::corrupt_file(
                     path,
                     format!(
-                        "data file has incorrect length. Expected: {} Got: {}",
-                        expected_length, length
+                        "data file has incorrect length. Expected: {expected_length} Got: {length}"
                     ),
                     location!(),
                 ));
@@ -1195,8 +1190,7 @@ impl FileFragment {
                         .data_dir()
                         .child(self.metadata.files[0].path.as_str()),
                     format!(
-                        "Fragment metadata has incorrect physical_rows. Actual: {} Metadata: {}",
-                        expected_length, physical_rows
+                        "Fragment metadata has incorrect physical_rows. Actual: {expected_length} Metadata: {physical_rows}"
                     ),
                     location!(),
                 ));
@@ -1236,7 +1230,7 @@ impl FileFragment {
                             self.metadata.id,
                             deletion_file_meta,
                         ),
-                        format!("deletion vector contains an offset that is out of range. Offset: {} Fragment length: {}", offset, expected_length),
+                        format!("deletion vector contains an offset that is out of range. Offset: {offset} Fragment length: {expected_length}"),
                         location!(),
                     ));
                 }
@@ -1464,20 +1458,14 @@ impl FileFragment {
         let stream = Box::new(stream);
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
             return Err(Error::invalid_input(
-                format!(
-                    "Column {} does not exist in the left side fragment",
-                    left_on
-                ),
+                format!("Column {left_on} does not exist in the left side fragment"),
                 location!(),
             ));
         };
         let right_schema = stream.schema();
         if right_schema.field_with_name(right_on).is_err() {
             return Err(Error::invalid_input(
-                format!(
-                    "Column {} does not exist in the right side fragment",
-                    right_on
-                ),
+                format!("Column {right_on} does not exist in the right side fragment"),
                 location!(),
             ));
         };
@@ -1650,9 +1638,8 @@ impl FileFragment {
             return Err(Error::Internal {
                 message: format!(
                     "Deletion vector includes rows that aren't in the fragment. \
-                Num physical rows {}; Deletion vector length: {}; \
-                Examples: {:?}",
-                    physical_rows, dv_len, examples
+                Num physical rows {physical_rows}; Deletion vector length: {dv_len}; \
+                Examples: {examples:?}"
                 ),
                 location: location!(),
             });
@@ -2028,8 +2015,7 @@ impl FragmentReader {
         if !params.valid_given_len(total_num_rows as usize) {
             return Err(Error::invalid_input(
                 format!(
-                    "Invalid read params {} for fragment with {} addressable rows",
-                    params, total_num_rows
+                    "Invalid read params {params} for fragment with {total_num_rows} addressable rows"
                 ),
                 location!(),
             ));
@@ -2358,7 +2344,7 @@ mod tests {
                     vec![
                         Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
                         Arc::new(StringArray::from_iter_values(
-                            (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                            (i * 20..(i + 1) * 20).map(|v| format!("s-{v}")),
                         )),
                     ],
                 )
@@ -3237,7 +3223,7 @@ mod tests {
                 true,
             )])),
             vec![Arc::new(StringArray::from_iter_values(
-                (0..20).map(|v| format!("s-{}", v)),
+                (0..20).map(|v| format!("s-{v}")),
             ))],
         )?;
 
@@ -3427,7 +3413,7 @@ mod tests {
         // Create a file that has 10 columns.
         let schema = Arc::new(ArrowSchema::new(
             (0..10)
-                .map(|i| ArrowField::new(format!("col_{}", i), DataType::Int32, true))
+                .map(|i| ArrowField::new(format!("col_{i}"), DataType::Int32, true))
                 .collect::<Vec<_>>(),
         ));
 

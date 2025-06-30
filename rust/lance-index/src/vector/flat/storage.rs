@@ -64,7 +64,7 @@ impl QuantizerStorage for FlatFloatStorage {
             batch
                 .column_by_name(ROW_ID)
                 .ok_or(Error::Schema {
-                    message: format!("column {} not found", ROW_ID),
+                    message: format!("column {ROW_ID} not found"),
                     location: location!(),
                 })?
                 .as_primitive::<UInt64Type>()
@@ -222,7 +222,7 @@ impl QuantizerStorage for FlatBinStorage {
             batch
                 .column_by_name(ROW_ID)
                 .ok_or(Error::Schema {
-                    message: format!("column {} not found", ROW_ID),
+                    message: format!("column {ROW_ID} not found"),
                     location: location!(),
                 })?
                 .as_primitive::<UInt64Type>()

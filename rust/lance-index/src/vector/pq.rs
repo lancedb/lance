@@ -132,8 +132,7 @@ impl ProductQuantizer {
         if NUM_BITS == 4 && num_sub_vectors % 2 != 0 {
             return Err(Error::Index {
                 message: format!(
-                    "PQ: num_sub_vectors must be divisible by 2 for num_bits=4, but got {}",
-                    num_sub_vectors,
+                    "PQ: num_sub_vectors must be divisible by 2 for num_bits=4, but got {num_sub_vectors}",
                 ),
                 location: location!(),
             });

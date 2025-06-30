@@ -409,7 +409,7 @@ impl ChildState {
     }
 
     fn drain(&mut self, num_rows: u64) -> Result<CompositeDecodeTask> {
-        trace!("Struct draining {} rows", num_rows);
+        trace!("Struct draining {num_rows} rows");
 
         trace!(
             "Draining {} rows from struct page with {} rows already drained",
@@ -531,7 +531,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
                 .push_back(child.decoder);
         } else {
             // This decoder is intended for one of our children
-            let intended = self.children[child_idx as usize].scheduled.back_mut().ok_or_else(|| Error::Internal { message: format!("Decoder scheduled for child at index {} but we don't have any child at that index yet", child_idx), location: location!() })?;
+            let intended = self.children[child_idx as usize].scheduled.back_mut().ok_or_else(|| Error::Internal { message: format!("Decoder scheduled for child at index {child_idx} but we don't have any child at that index yet"), location: location!() })?;
             intended.accept_child(child)?;
         }
         Ok(())

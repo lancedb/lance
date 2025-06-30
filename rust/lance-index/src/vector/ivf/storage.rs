@@ -141,12 +141,12 @@ impl IvfModel {
     pub async fn load(reader: &FileReader) -> Result<Self> {
         let schema = reader.schema();
         let meta_str = schema.metadata.get(IVF_METADATA_KEY).ok_or(Error::Index {
-            message: format!("{} not found during search", IVF_METADATA_KEY),
+            message: format!("{IVF_METADATA_KEY} not found during search"),
             location: location!(),
         })?;
         let ivf_metadata: IvfMetadata =
             serde_json::from_str(meta_str).map_err(|e| Error::Index {
-                message: format!("Failed to parse IVF metadata: {}", e),
+                message: format!("Failed to parse IVF metadata: {e}"),
                 location: location!(),
             })?;
 
