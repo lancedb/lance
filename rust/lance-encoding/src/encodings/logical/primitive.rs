@@ -2034,55 +2034,15 @@ impl CachedPageData for FullZipCacheableState {
 }
 
 impl StructuralPageScheduler for FullZipScheduler {
-    /// Initializes the scheduler by loading and caching the repetition index from storage.
-    /// This method is called once per page to prepare the cached data that will be used
-    /// for all subsequent range queries on this page.
+    /// Initializes the scheduler. Currently returns NoCachedPageData as caching is disabled by default.
+    /// In future PRs, this will support opt-in caching of the repetition index.
     fn initialize<'a>(
         &'a mut self,
-        io: &Arc<dyn EncodingsIo>,
+        _io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        // Only load and cache if we have a repetition index
-        if let Some(rep_index_details) = self.rep_index.as_ref() {
-            let buf_position = rep_index_details.buf_position;
-            let bytes_per_value = rep_index_details.bytes_per_value;
-            let rows_in_page = self.rows_in_page;
-            let io = io.clone();
-
-            async move {
-                // Calculate the size of the repetition index buffer
-                // For variable-width data, we store one offset per row plus one final offset
-                let rep_index_size = (rows_in_page + 1) * bytes_per_value;
-
-                // Load the repetition index from storage
-                let rep_index_data = io
-                    .submit_request(vec![buf_position..buf_position + rep_index_size], 0)
-                    .await?[0]
-                    .clone();
-                let rep_index_data = LanceBuffer::from_bytes(rep_index_data, 1);
-
-                // Decode the repetition index using ByteUnpacker
-                use crate::utils::bytepack::ByteUnpacker;
-                let unpacker = ByteUnpacker::new(
-                    rep_index_data.as_ref().iter().copied(),
-                    bytes_per_value as usize,
-                );
-                let offsets: Vec<u64> = unpacker.collect();
-                let rep_index = vec![offsets];
-
-                let decoded_rep_index = RepetitionIndex::decode(&rep_index);
-
-                let cached_state = Arc::new(FullZipCacheableState {
-                    rep_index: Some(decoded_rep_index),
-                    rep_index_buffer: Some(rep_index_data),
-                });
-
-                Ok(cached_state as Arc<dyn CachedPageData>)
-            }
-            .boxed()
-        } else {
-            // No repetition index, nothing to cache
-            std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
-        }
+        // TODO: Add opt-in caching of repetition index
+        // Currently disabled by default, will be enabled via configuration in follow-up PRs
+        std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
     }
 
     /// Loads previously cached repetition index data from the cache system.
@@ -4874,6 +4834,8 @@ mod tests {
         assert_eq!(skip_in_chunk, 0);
     }
 
+    // TODO: Re-enable this test when caching configuration is implemented in follow-up PRs
+    #[ignore]
     #[tokio::test]
     async fn test_fullzip_repetition_index_caching() {
         use crate::testing::SimulatedScheduler;
