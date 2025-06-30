@@ -590,7 +590,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let build_iter = (0..ivf.num_partitions()).map(move |partition| {
             let reader = reader.clone();
             let existing_indices = existing_indices.clone();
-            let distance_type = distance_type.clone();
+            let distance_type = distance_type;
             let quantizer = quantizer.clone();
             let sub_index_params = sub_index_params.clone();
             let column = column.clone();
