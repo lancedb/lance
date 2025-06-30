@@ -592,6 +592,16 @@ def test_indexed_filter_with_fts_index(tmp_path):
     assert results["_rowid"].to_pylist() == [2, 3]
 
 
+def test_fts_ngram_tokenizer(tmp_path):
+    data = pa.table({"text": ["hello world", "hello lance", "lance is cool"]})
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", index_type="INVERTED", base_tokenizer="ngram")
+
+    results = ds.to_table(full_text_query="lan")
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {"hello lance", "lance is cool"}
+
+
 def test_fts_stats(dataset):
     dataset.create_scalar_index(
         "doc", index_type="INVERTED", with_position=False, remove_stop_words=True
