@@ -62,7 +62,7 @@ impl DatasetPreFilter {
     ) -> Self {
         let mut fragments = RoaringBitmap::new();
         if indices.iter().any(|idx| idx.fragment_bitmap.is_none()) {
-            fragments.insert_range(0..dataset.manifest.max_fragment_id);
+            fragments.insert_range(0..dataset.manifest.max_fragment_id.unwrap_or(0));
         } else {
             indices.iter().for_each(|idx| {
                 fragments |= idx.fragment_bitmap.as_ref().unwrap();
