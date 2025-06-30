@@ -741,6 +741,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
             let Some((storage, index, loss)) = part else {
                 log::warn!("partition {} is empty, skipping", part_id);
+
+                storage_ivf.add_partition(0);
+                index_ivf.add_partition(0);
+                partition_index_metadata.push(String::new());
+
                 continue;
             };
             total_loss += loss;
