@@ -119,8 +119,11 @@ try:
 
     import torchdata
 
-    MAP_DATASET_CLASS = torchdata.datapipes.map.MapDataPipe
-    ITER_DATASET_CLASS = torchdata.datapipes.iter.IterDataPipe
+    try:
+        MAP_DATASET_CLASS = torchdata.datapipes.map.MapDataPipe
+        ITER_DATASET_CLASS = torchdata.datapipes.iter.IterDataPipe
+    except AttributeError:
+        raise ImportError("torchdata too new to support DataPipes API")
 
     if "LANCE_TORCH_DATAPIPES" not in os.environ:
         logger.warning(
@@ -130,7 +133,7 @@ try:
             "environment variable in order to utilize torchdata"
         )
         raise ImportError("avoid deprecated data pipes API unless requested")
-        
+
     logger.warning(
         "TorchData integration is still in BETA phase. "
         "APIs may change without backward compatibility."
