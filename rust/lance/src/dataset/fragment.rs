@@ -1584,10 +1584,16 @@ impl FileFragment {
         // We do this on the expression level after expression optimization has
         // occurred so we also catch expressions that are equivalent to `true`
         if let Some(predicate) = &scanner.get_filter()? {
-            if matches!(predicate, Expr::Literal(ScalarValue::Boolean(Some(false)))) {
+            if matches!(
+                predicate,
+                Expr::Literal(ScalarValue::Boolean(Some(false)), _)
+            ) {
                 return Ok(Some(self));
             }
-            if matches!(predicate, Expr::Literal(ScalarValue::Boolean(Some(true)))) {
+            if matches!(
+                predicate,
+                Expr::Literal(ScalarValue::Boolean(Some(true)), _)
+            ) {
                 return Ok(None);
             }
         }

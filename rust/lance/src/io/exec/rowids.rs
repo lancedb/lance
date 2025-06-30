@@ -272,8 +272,11 @@ impl ExecutionPlan for AddRowAddrExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn statistics(&self) -> Result<datafusion::physical_plan::Statistics> {
-        let mut stats = self.input.statistics()?;
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<datafusion::physical_plan::Statistics> {
+        let mut stats = self.input.partition_statistics(partition)?;
 
         let row_id_col_stats = stats.column_statistics.get(self.rowid_pos).ok_or_else(|| {
             DataFusionError::Internal("RowAddrExec: rowid column stats not found".into())
@@ -457,7 +460,7 @@ mod test {
         let memory_exec =
             MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], schema, None).unwrap();
         let exec = AddRowAddrExec::try_new(memory_exec, dataset.clone(), 0).unwrap();
-        let stats = exec.statistics().unwrap();
+        let stats = exec.partition_statistics(None).unwrap();
         let result = apply_to_batch(batch, dataset).await.unwrap();
 
         assert_eq!(stats.num_rows, Precision::Exact(3));

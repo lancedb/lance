@@ -2019,7 +2019,7 @@ mod tests {
         // For the "delete some" tests we use key > 1
         let condition = Expr::gt(
             Expr::Column(Column::new_unqualified("key")),
-            Expr::Literal(ScalarValue::UInt32(Some(1))),
+            Expr::Literal(ScalarValue::UInt32(Some(1)), None),
         );
         // find-or-create, with delete some
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -2994,10 +2994,15 @@ mod tests {
     ProjectionExec: expr=[_rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN __common_expr_1@0 AND _rowaddr@1 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as action]
       ProjectionExec: expr=[key@2 IS NOT NULL as __common_expr_1, _rowaddr@0 as _rowaddr, value@1 as value, key@2 as key]
         CoalesceBatchesExec...
-          HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
-            LanceScan: uri=data, projection=[key], row_id=false, row_addr=true, ordered=false
-            RepartitionExec...
-              StreamingTableExec: partition_sizes=1, projection=[value, key]"
+          HashJoinExec: mode=Partitioned, join_type=Right, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
+            CoalesceBatchesExec...
+              RepartitionExec...
+                RepartitionExec...
+                  LanceScan: uri=data, projection=[key], row_id=false, row_addr=true, ordered=false
+            CoalesceBatchesExec...
+              RepartitionExec...
+                RepartitionExec...
+                  StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
 }
