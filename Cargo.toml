@@ -150,9 +150,9 @@ serde = { version = "^1" }
 serde_json = { version = "1" }
 shellexpand = "3.0"
 snafu = "0.8"
-tantivy = { version = "0.24.1", features = ["stopwords"] }
-lindera = { version = "0.44.0" }
-lindera-tantivy = { version = "0.44.0" }
+tantivy = { version = "0.22.0", features = ["stopwords"] }
+lindera = { version = "0.40.2" }
+lindera-tantivy = { version = "0.40.2" }
 tempfile = "3"
 test-log = { version = "0.2.15" }
 tokio = { version = "1.23", features = [
