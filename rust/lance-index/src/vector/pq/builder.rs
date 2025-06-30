@@ -16,7 +16,6 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::{Dot, Normalize, L2};
-use rayon::prelude::*;
 use snafu::location;
 
 use super::utils::divide_to_subvectors;
@@ -108,7 +107,7 @@ impl PQBuildParams {
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
         let d = sub_vectors
-            .into_par_iter()
+            .into_iter()
             .enumerate()
             .map(|(sub_vec_idx, sub_vec)| {
                 train_kmeans::<T>(

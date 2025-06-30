@@ -13,6 +13,7 @@ use lance_io::encodings::plain::bytes_to_array;
 use lance_linalg::distance::DistanceType;
 use prost::bytes;
 use snafu::location;
+use std::sync::LazyLock;
 use std::{ops::Range, sync::Arc};
 
 use super::pb;
@@ -21,6 +22,26 @@ use crate::vector::flat::storage::FlatFloatStorage;
 use crate::vector::hnsw::builder::HnswBuildParams;
 use crate::vector::hnsw::HNSW;
 use crate::vector::v3::subindex::IvfSubIndex;
+
+enum SimpleIndexStatus {
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+const USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(|| {
+    if let Ok(v) = std::env::var("LANCE_USE_HNSW_SPEEDUP_INDEXING") {
+        if v == "enabled" {
+            SimpleIndexStatus::Enabled
+        } else if v == "disabled" {
+            SimpleIndexStatus::Disabled
+        } else {
+            SimpleIndexStatus::Auto
+        }
+    } else {
+        SimpleIndexStatus::Auto
+    }
+});
 
 #[derive(Debug)]
 pub struct SimpleIndex {
@@ -32,7 +53,7 @@ impl SimpleIndex {
     pub fn try_new(store: FlatFloatStorage) -> Result<Self> {
         let hnsw = HNSW::index_vectors(
             &store,
-            HnswBuildParams::default().ef_construction(10).num_edges(12),
+            HnswBuildParams::default().ef_construction(15).num_edges(12),
         )?;
         Ok(Self { store, index: hnsw })
     }
@@ -48,10 +69,14 @@ impl SimpleIndex {
         dimension: usize,
         distance_type: DistanceType,
     ) -> Result<Option<Self>> {
-        if centroids.len() < 1_000_000 {
-            // the centroids are stored in a flat array,
-            // the length of the centroids is `num_centroids * dimension`
-            return Ok(None);
+        match *USE_HNSW_SPEEDUP_INDEXING {
+            SimpleIndexStatus::Auto => {
+                if centroids.len() < 1_000_000 {
+                    return Ok(None);
+                }
+            }
+            SimpleIndexStatus::Disabled => return Ok(None),
+            _ => {}
         }
 
         match centroids.data_type() {
@@ -66,7 +91,7 @@ impl SimpleIndex {
     }
 
     pub(crate) fn search(&self, query: ArrayRef) -> Result<(u32, f32)> {
-        let res = self.index.search_basic(query, 1, 10, None, &self.store)?;
+        let res = self.index.search_basic(query, 1, 15, None, &self.store)?;
         Ok((res[0].id, res[0].dist.0))
     }
 }
