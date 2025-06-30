@@ -735,10 +735,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let mut part_id = 0;
         let mut total_loss = 0.0;
+        log::info!("merging partitions");
         while let Some(part) = build_stream.try_next().await? {
             part_id += 1;
-            log::info!("merging partition {}/{}", part_id, ivf.num_partitions());
-
             let Some((storage, index, loss)) = part else {
                 log::warn!("partition {} is empty, skipping", part_id);
 
@@ -834,6 +833,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         storage_writer.finish().await?;
         index_writer.finish().await?;
+
+        log::info!("merging partitions done");
 
         Ok(())
     }
