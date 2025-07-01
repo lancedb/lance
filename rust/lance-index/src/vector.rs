@@ -18,9 +18,9 @@ use lance_core::{Result, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
-use std::sync::LazyLock;
 use object_store::path::Path;
 use quantizer::{QuantizationType, Quantizer};
+use std::sync::LazyLock;
 use v3::subindex::SubIndexType;
 
 pub mod bq;

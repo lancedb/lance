@@ -3671,7 +3671,6 @@ dependencies = [
  "lance-arrow",
  "lance-core",
  "lance-datagen",
- "lazy_static",
  "log",
  "pin-project",
  "prost 0.13.5",

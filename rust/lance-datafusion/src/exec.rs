@@ -261,9 +261,8 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     SessionContext::new_with_config_rt(session_config, runtime_env)
 }
 
-static DEFAULT_SESSION_CONTEXT: LazyLock<SessionContext> = LazyLock::new(|| {
-    new_session_context(&LanceExecutionOptions::default())
-});
+static DEFAULT_SESSION_CONTEXT: LazyLock<SessionContext> =
+    LazyLock::new(|| new_session_context(&LanceExecutionOptions::default()));
 
 static DEFAULT_SESSION_CONTEXT_WITH_SPILLING: LazyLock<SessionContext> = LazyLock::new(|| {
     new_session_context(&LanceExecutionOptions {

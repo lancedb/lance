@@ -33,7 +33,10 @@ pub fn get_num_compute_intensive_cpus() -> usize {
 }
 
 pub static IO_CORE_RESERVATION: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("LANCE_IO_CORE_RESERVATION").unwrap_or("2".to_string()).parse().unwrap()
+    std::env::var("LANCE_IO_CORE_RESERVATION")
+        .unwrap_or("2".to_string())
+        .parse()
+        .unwrap()
 });
 
 pub static CPU_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {

@@ -138,7 +138,8 @@ impl DynamoDBExternalManifestStore {
         table_name: &str,
         committer_name: &str,
     ) -> Result<Arc<dyn ExternalManifestStore>> {
-        static SANITY_CHECK_CACHE: LazyLock<RwLock<HashSet<String>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
+        static SANITY_CHECK_CACHE: LazyLock<RwLock<HashSet<String>>> =
+            LazyLock::new(|| RwLock::new(HashSet::new()));
 
         let store = Arc::new(Self {
             client: client.clone(),
