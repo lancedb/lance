@@ -50,7 +50,7 @@ use crate::Result;
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
 static HNSW_PARTITIONS_BUILD_PARALLEL: LazyLock<usize> =
-    LazyLock::new(|| get_num_compute_intensive_cpus());
+    LazyLock::new(get_num_compute_intensive_cpus);
 
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
 async fn merge_streams(
