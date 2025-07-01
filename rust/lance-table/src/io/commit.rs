@@ -441,45 +441,72 @@ fn list_manifests<'a>(
         .boxed()
 }
 
-// Async wrapper around std::fs::read_dir that returns a stream
-fn async_read_dir(path: std::path::PathBuf) -> impl Stream<Item = Result<std::fs::DirEntry>> {
-    use futures::stream::{self, StreamExt};
+// Struct that streams directory entries without blocking the async runtime
+struct AsyncDirStream {
+    receiver: tokio::sync::mpsc::Receiver<Result<std::fs::DirEntry>>,
+    task_handle: tokio::task::JoinHandle<()>,
+}
 
-    // Create a future that does the blocking work
-    let entries_future = tokio::task::spawn_blocking(move || {
-        let read_result = std::fs::read_dir(&path);
-        match read_result {
-            Ok(entries) => {
-                let entries_vec: std::io::Result<Vec<_>> = entries.collect();
-                match entries_vec {
-                    Ok(entries) => Ok(entries),
-                    Err(e) => Err(Error::IO {
+impl AsyncDirStream {
+    fn new(path: std::path::PathBuf) -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel(32); // Buffer limit of 32
+
+        let task_handle = tokio::task::spawn_blocking(move || {
+            let read_result = std::fs::read_dir(&path);
+            match read_result {
+                Ok(entries) => {
+                    for entry_result in entries {
+                        let send_result = match entry_result {
+                            Ok(entry) => sender.blocking_send(Ok(entry)),
+                            Err(e) => sender.blocking_send(Err(Error::IO {
+                                source: Box::new(e),
+                                location: location!(),
+                            })),
+                        };
+                        // If receiver is dropped, stop sending
+                        if send_result.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Send the error and exit
+                    let _ = sender.blocking_send(Err(Error::IO {
                         source: Box::new(e),
                         location: location!(),
-                    }),
+                    }));
                 }
             }
-            Err(e) => Err(Error::IO {
-                source: Box::new(e),
-                location: location!(),
-            }),
-        }
-    });
+        });
 
-    // Convert the future to a stream that yields individual entries
-    stream::once(entries_future)
-        .map(|join_result| match join_result {
-            Ok(entries_result) => entries_result,
-            Err(e) => Err(Error::IO {
-                source: Box::new(e),
-                location: location!(),
-            }),
-        })
-        .map(|entries_result| match entries_result {
-            Ok(entries) => stream::iter(entries.into_iter().map(Ok)).left_stream(),
-            Err(e) => stream::once(future::ready(Err(e))).right_stream(),
-        })
-        .flatten()
+        Self {
+            receiver,
+            task_handle,
+        }
+    }
+}
+
+impl Drop for AsyncDirStream {
+    fn drop(&mut self) {
+        // Abort the task when the stream is dropped
+        self.task_handle.abort();
+    }
+}
+
+impl Stream for AsyncDirStream {
+    type Item = Result<std::fs::DirEntry>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
+// Async wrapper around std::fs::read_dir that returns a stream
+fn async_read_dir(path: std::path::PathBuf) -> impl Stream<Item = Result<std::fs::DirEntry>> {
+    AsyncDirStream::new(path)
 }
 
 // Optimized listing for local filesystems that avoids unnecessary stat calls
@@ -487,31 +514,34 @@ fn list_manifests_local(base_path: Path) -> impl Stream<Item = Result<ManifestLo
     let versions_path = lance_io::local::to_local_path(&base_path.child(VERSIONS_DIR));
 
     async_read_dir(versions_path.into())
-        .filter_map(move |entry_result| {
-            let base_path = base_path.clone();
-            async move {
-                let entry = match entry_result {
-                    Ok(entry) => entry,
-                    Err(e) => return Some(Err(e)),
-                };
+        .map(move |entry_result| {
+            let entry = entry_result?;
 
-                let filename_raw = entry.file_name();
-                let filename = filename_raw.to_string_lossy();
+            let filename_raw = entry.file_name();
+            let filename = filename_raw.to_string_lossy();
 
-                // Check if it's a valid manifest file
-                let scheme = ManifestNamingScheme::detect_scheme(&filename)?;
-                let version = scheme.parse_version(&filename)?;
+            // Check if it's a valid manifest file
+            let scheme =
+                ManifestNamingScheme::detect_scheme(&filename).ok_or_else(|| Error::Internal {
+                    message: format!("Invalid manifest filename: {}", filename),
+                    location: location!(),
+                })?;
+            let version = scheme
+                .parse_version(&filename)
+                .ok_or_else(|| Error::Internal {
+                    message: format!("Invalid manifest version: {}", filename),
+                    location: location!(),
+                })?;
 
-                let path = base_path.child(VERSIONS_DIR).child(filename.as_ref());
+            let path = base_path.child(VERSIONS_DIR).child(filename.as_ref());
 
-                Some(Ok(ManifestLocation {
-                    version,
-                    path,
-                    size: None, // Will be filled later if needed
-                    naming_scheme: scheme,
-                    e_tag: None, // Will be filled later if needed
-                }))
-            }
+            Ok(ManifestLocation {
+                version,
+                path,
+                size: None, // Will be filled later if needed
+                naming_scheme: scheme,
+                e_tag: None, // Will be filled later if needed
+            })
         })
         .boxed()
 }
