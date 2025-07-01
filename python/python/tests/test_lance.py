@@ -248,3 +248,22 @@ def test_io_counters(tmp_path):
     dataset.to_table()
     assert lance.iops_counter() > starting_iops
     assert lance.bytes_read_counter() > starting_bytes
+
+
+def test_with_row_id(tmp_path):
+    path = tmp_path / "test_with_row_id.lance"
+    data = pa.table(
+        {
+            "data_item_id": pa.array([1001, 1002, 1003]),
+            "a": pa.array([1, 2, 3]),
+        }
+    )
+
+    lance.write_dataset(data, path)
+
+    lance_ds = lance.dataset(path)
+    table = lance_ds.scanner(
+        with_row_id=True, columns=["data_item_id", "_rowid"]
+    ).to_table()
+
+    assert table.column("_rowid").type == pa.uint64()
