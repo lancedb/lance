@@ -1191,6 +1191,13 @@ impl FilterPlan {
         self.refine_expr.is_none() && self.index_query.is_none()
     }
 
+    pub fn all_columns(&self) -> Vec<String> {
+        self.full_expr
+            .as_ref()
+            .map(Planner::column_names_in_expr)
+            .unwrap_or_default()
+    }
+
     pub fn refine_columns(&self) -> Vec<String> {
         self.refine_expr
             .as_ref()

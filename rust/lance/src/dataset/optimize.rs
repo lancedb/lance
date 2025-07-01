@@ -2794,13 +2794,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("MaterializeIndex"),
-            "Expected bitmap index scan in plan: {}",
-            plan
-        );
-        assert!(
-            !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
+            plan.contains("indexed_filter=[category = 1]@category_idx, refine_filter=--"),
+            "Expected indexed filter in read: {}",
             plan
         );
     }
@@ -2893,13 +2888,10 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("MaterializeIndex"),
-            "Expected btree index scan in plan: {}",
-            plan
-        );
-        assert!(
-            !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
+            plan.contains(
+                "indexed_filter=AND([id >= 2000]@id_idx,[id < 3000]@id_idx), refine_filter=--"
+            ),
+            "Expected index filter in read: {}",
             plan
         );
     }
@@ -3162,13 +3154,10 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("MaterializeIndex"),
-            "Expected inverted index scan in plan: {}",
-            plan
-        );
-        assert!(
-            !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
+            plan.contains(
+                "indexed_filter=[contains(doc, Utf8(\"absolutize\"))]@doc_idx, refine_filter=--"
+            ),
+            "Expected indexed filter in read: {}",
             plan
         );
     }
@@ -3265,13 +3254,10 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("MaterializeIndex"),
-            "Expected label list index scan in plan: {}",
-            plan
-        );
-        assert!(
-            !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
+            plan.contains(
+                "indexed_filter=[array_has_any(labels, List([1]))]@labels_idx, refine_filter=--"
+            ),
+            "Expected indexed filter in read: {}",
             plan
         );
     }
