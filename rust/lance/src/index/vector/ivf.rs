@@ -3,11 +3,7 @@
 
 //! IVF - Inverted File index.
 
-use std::{
-    any::Any,
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
 use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
@@ -20,7 +16,6 @@ use crate::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use crate::{
     dataset::Dataset,
     index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
-    session::Session,
 };
 use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
@@ -40,6 +35,7 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::{
+    cache::LanceCache,
     traits::DatasetTakeRows,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
     Error, Result, ROW_ID_FIELD,
@@ -112,10 +108,7 @@ pub struct IVFIndex {
 
     pub metric_type: MetricType,
 
-    // The session cache holds an Arc to this object so we need to
-    // hold a weak pointer to avoid cycles
-    /// The session cache, used when fetching pages
-    session: Weak<Session>,
+    index_cache: LanceCache,
 }
 
 impl DeepSizeOf for IVFIndex {
@@ -123,19 +116,18 @@ impl DeepSizeOf for IVFIndex {
         self.uuid.deep_size_of_children(context)
             + self.reader.deep_size_of_children(context)
             + self.sub_index.deep_size_of_children(context)
-        // Skipping session since it is a weak ref
     }
 }
 
 impl IVFIndex {
     /// Create a new IVF index.
     pub(crate) fn try_new(
-        session: Arc<Session>,
         uuid: &str,
         ivf: IvfModel,
         reader: Arc<dyn Reader>,
         sub_index: Arc<dyn VectorIndex>,
         metric_type: MetricType,
+        index_cache: LanceCache,
     ) -> Result<Self> {
         if !sub_index.is_loadable() {
             return Err(Error::Index {
@@ -147,12 +139,12 @@ impl IVFIndex {
         let num_partitions = ivf.num_partitions();
         Ok(Self {
             uuid: uuid.to_owned(),
-            session: Arc::downgrade(&session),
             ivf,
             reader,
             sub_index,
             metric_type,
             partition_locks: PartitionLoadLock::new(num_partitions),
+            index_cache,
         })
     }
 
@@ -170,12 +162,10 @@ impl IVFIndex {
         write_cache: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
-        let session = self.session.upgrade().ok_or(Error::Internal {
-            message: "attempt to use index after dataset was destroyed".into(),
-            location: location!(),
-        })?;
-        let part_index = if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
+        let cache_key = format!("ivf-{}", partition_id);
+        let part_index = if let Some(part_idx) =
+            self.index_cache.get_unsized::<dyn VectorIndex>(&cache_key)
+        {
             part_idx
         } else {
             metrics.record_part_load();
@@ -185,7 +175,7 @@ impl IVFIndex {
             let _guard = mtx.lock().await;
             // check the cache again, as the partition may have been loaded by another
             // thread that held the lock on loading the partition
-            if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
+            if let Some(part_idx) = self.index_cache.get_unsized::<dyn VectorIndex>(&cache_key) {
                 part_idx
             } else {
                 if partition_id >= self.ivf.num_partitions() {
@@ -211,7 +201,7 @@ impl IVFIndex {
                     .await?;
                 let idx: Arc<dyn VectorIndex> = idx.into();
                 if write_cache {
-                    session.index_cache.insert_vector(&cache_key, idx.clone());
+                    self.index_cache.insert_unsized(&cache_key, idx.clone());
                 }
                 idx
             }

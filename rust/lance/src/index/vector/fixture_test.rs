@@ -20,6 +20,7 @@ mod test {
     use datafusion::execution::SendableRecordBatchStream;
     use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::cache::LanceCache;
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{metrics::MetricsCollector, vector::ivf::storage::IvfModel};
     use lance_index::{
@@ -38,7 +39,6 @@ mod test {
             prefilter::{DatasetPreFilter, PreFilter},
             vector::ivf::IVFIndex,
         },
-        session::Session,
         Result,
     };
 
@@ -53,8 +53,8 @@ mod test {
     }
 
     impl DeepSizeOf for ResidualCheckMockIndex {
-        fn deep_size_of_children(&self, _: &mut Context) -> usize {
-            todo!()
+        fn deep_size_of_children(&self, cx: &mut Context) -> usize {
+            self.assert_query_value.deep_size_of_children(cx) + self.ret_val.get_array_memory_size()
         }
     }
 
@@ -187,8 +187,6 @@ mod test {
         for _ in 0..4 {
             ivf.add_partition(0);
         }
-        // hold on to this pointer, because the index only holds a weak reference
-        let session = Arc::new(Session::default());
 
         let make_idx = move |assert_query: Vec<f32>, metric: MetricType| async move {
             let f = tempfile::NamedTempFile::new().unwrap();
@@ -208,12 +206,12 @@ mod test {
                 ]))),
             });
             IVFIndex::try_new(
-                session.clone(),
                 &Uuid::new_v4().to_string(),
                 ivf,
                 reader.into(),
                 mock_sub_index,
                 metric,
+                LanceCache::no_cache(),
             )
             .unwrap()
         };
