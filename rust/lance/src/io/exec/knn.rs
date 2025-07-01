@@ -243,8 +243,8 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         )) as SendableRecordBatchStream)
     }
 
-    fn statistics(&self) -> DataFusionResult<Statistics> {
-        let inner_stats = self.input.statistics()?;
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+        let inner_stats = self.input.partition_statistics(partition)?;
         let schema = self.input.schema();
         let dist_stats = inner_stats
             .column_statistics
@@ -1014,12 +1014,20 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         )))
     }
 
-    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> DataFusionResult<datafusion::physical_plan::Statistics> {
         Ok(Statistics {
             num_rows: Precision::Exact(
                 self.query.k
                     * self.query.refine_factor.unwrap_or(1) as usize
-                    * self.input.statistics()?.num_rows.get_value().unwrap_or(&1),
+                    * self
+                        .input
+                        .partition_statistics(partition)?
+                        .num_rows
+                        .get_value()
+                        .unwrap_or(&1),
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
         })
