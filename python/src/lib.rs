@@ -107,7 +107,7 @@ fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 // TODO: make this runtime configurable (e.g. num threads)
-static RT: LazyLock<BackgroundExecutor> = LazyLock::new(|| BackgroundExecutor::new());
+static RT: LazyLock<BackgroundExecutor> = LazyLock::new(BackgroundExecutor::new);
 
 pub fn init_logging(mut log_builder: Builder) {
     let logger = log_builder.build();
