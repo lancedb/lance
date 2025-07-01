@@ -676,14 +676,34 @@ pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
     Ok(test_dir)
 }
 
+/// Trims whitespace from the start and end of each line in the string.
+fn trim_whitespace(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for line in s.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    if !result.is_empty() {
+        // Remove the last newline
+        result.pop();
+    }
+    result
+}
+
 pub async fn assert_plan_node_equals(
     plan_node: Arc<dyn ExecutionPlan>,
-    expected: &str,
+    raw_expected: &str,
 ) -> lance_core::Result<()> {
-    let plan_desc = format!(
+    let raw_plan_desc = format!(
         "{}",
         datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
     );
+    let plan_desc = trim_whitespace(&raw_plan_desc);
+
+    let expected = trim_whitespace(raw_expected);
 
     let to_match = expected.split("...").collect::<Vec<_>>();
     let num_pieces = to_match.len();
@@ -703,7 +723,7 @@ pub async fn assert_plan_node_equals(
     if !remainder.is_empty() {
         panic!(
             "Expected plan to match:\nExpected: {}\nActual: {}",
-            expected, plan_desc
+            raw_expected, raw_plan_desc
         )
     }
     Ok(())

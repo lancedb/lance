@@ -7,6 +7,7 @@ use std::{ops::Range, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use async_recursion::async_recursion;
+use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -17,7 +18,9 @@ use datafusion::physical_plan::{
 };
 use datafusion_expr::Expr;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
+use datafusion_physical_plan::Statistics;
 use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
@@ -645,7 +648,7 @@ impl FilteredReadStream {
         let mut trimmed = Vec::with_capacity(physical_ranges.len());
         for range in physical_ranges {
             let range_len = range.end - range.start;
-            if to_skip > range_len {
+            if to_skip >= range_len {
                 to_skip -= range_len;
                 continue;
             }
@@ -829,7 +832,8 @@ impl FilteredReadStream {
         let physical_filter = fragment_read_task
             .filter
             .map(|filter| {
-                let planner = Planner::new(Arc::new((&read_schema).into()));
+                let planner =
+                    Planner::new(Arc::new(fragment_read_task.projection.to_arrow_schema()?));
                 planner.create_physical_expr(&filter)
             })
             .transpose()?;
@@ -950,9 +954,15 @@ impl FilteredReadOptions {
     /// This function only materializes deleted rows that are masked by a deletion
     /// vector.  If the deleted row has been materialized via compaction, or if an
     /// entire fragment was deleted, it will not be read by this function.
-    pub fn with_deleted_rows(mut self) -> Self {
+    pub fn with_deleted_rows(mut self) -> Result<Self> {
+        if self.scan_range_before_filter.is_some() || self.scan_range_after_filter.is_some() {
+            return Err(Error::InvalidInput {
+                source: "with_deleted_rows is not supported when there is a scan range".into(),
+                location: location!(),
+            });
+        }
         self.with_deleted_rows = true;
-        self
+        Ok(self)
     }
 
     /// Specify the range of rows to read before applying the filter.
@@ -963,9 +973,15 @@ impl FilteredReadOptions {
     /// a subset of the data (and apply the filter on this subset).  For example, if the
     /// data as a column `count` that steps from 0 to 1000 and the filter is `count > 200`
     /// and the range is 100..300, then scan will read rows 100..300 and return rows 200..300
-    pub fn with_scan_range_before_filter(mut self, scan_range: Range<u64>) -> Self {
+    pub fn with_scan_range_before_filter(mut self, scan_range: Range<u64>) -> Result<Self> {
+        if self.with_deleted_rows {
+            return Err(Error::InvalidInput {
+                source: "with_deleted_rows is not supported when there is a scan range".into(),
+                location: location!(),
+            });
+        }
         self.scan_range_before_filter = Some(scan_range);
-        self
+        Ok(self)
     }
 
     /// The range of rows to read after applying the filter.
@@ -976,9 +992,15 @@ impl FilteredReadOptions {
     /// match, then we can use this to skip reading the data entirely.
     ///
     /// We currently do not support setting this when there is more than one partition.
-    pub fn with_scan_range_after_filter(mut self, scan_range: Range<u64>) -> Self {
+    pub fn with_scan_range_after_filter(mut self, scan_range: Range<u64>) -> Result<Self> {
+        if self.with_deleted_rows {
+            return Err(Error::InvalidInput {
+                source: "with_deleted_rows is not supported when there is a scan range".into(),
+                location: location!(),
+            });
+        }
         self.scan_range_after_filter = Some(scan_range);
-        self
+        Ok(self)
     }
 
     /// Specify the fragments to read.
@@ -1207,6 +1229,86 @@ impl ExecutionPlan for FilteredReadExec {
         Some(self.metrics.clone_inner())
     }
 
+    fn statistics(&self) -> datafusion::error::Result<Statistics> {
+        let fragments = self
+            .options
+            .fragments
+            .clone()
+            .unwrap_or_else(|| self.dataset.fragments().clone());
+
+        if fragments.iter().any(|f| f.num_rows().is_none()) {
+            return Err(DataFusionError::Internal(
+                "Fragments are missing row count stats".to_string(),
+            ));
+        }
+
+        let total_rows: u64 = fragments.iter().map(|f| f.num_rows().unwrap() as u64).sum();
+
+        if self.options.filter_plan.is_empty() {
+            // If there is no filter, we just return the total number of rows (sans any before/after-filter range)
+            let total_rows =
+                if let Some(scan_range_after_filter) = &self.options.scan_range_after_filter {
+                    total_rows.min(scan_range_after_filter.end - scan_range_after_filter.start)
+                } else {
+                    total_rows
+                };
+            let total_rows =
+                if let Some(scan_range_before_filter) = &self.options.scan_range_before_filter {
+                    total_rows.min(scan_range_before_filter.end - scan_range_before_filter.start)
+                } else {
+                    total_rows
+                };
+            Ok(Statistics {
+                num_rows: Precision::Exact(total_rows as usize),
+                ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
+            })
+        } else {
+            // We could evaluate the indexed filter here but this is still during the planning
+            // phase so we want to avoid that.
+            //
+            // Instead, we create a mock input which is the filtered read (without the filter)
+            // and then use DF's FilterExec logic to calculate the statistics (which uses column
+            // stats and basic filter shape)
+            let filter = self.options.filter_plan.full_expr.as_ref().unwrap();
+
+            let read_projection = self
+                .dataset
+                .empty_projection()
+                .union_columns(self.options.filter_plan.all_columns(), OnMissing::Error)?
+                .with_row_id()
+                .with_row_addr();
+
+            let planner = Arc::new(Planner::new(Arc::new(read_projection.to_arrow_schema()?)));
+            let physical_filter = planner.create_physical_expr(filter)?;
+
+            let mock_input = Arc::new(Self::try_new(
+                self.dataset.clone(),
+                FilteredReadOptions {
+                    scan_range_after_filter: None,
+                    filter_plan: FilterPlan::empty(),
+                    projection: read_projection,
+                    ..self.options.clone()
+                },
+            )?);
+            let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
+            let mut df_stats = df_filter_exec.statistics()?;
+
+            // If we have an after-filter range, we should apply it to the stats (the before-filter range
+            // is applied in the mock input)
+            let total_rows = if let Some(scan_range_after_filter) =
+                &self.options.scan_range_after_filter
+            {
+                df_stats.num_rows.min(&Precision::Exact(
+                    scan_range_after_filter.end as usize - scan_range_after_filter.start as usize,
+                ))
+            } else {
+                df_stats.num_rows
+            };
+            df_stats.num_rows = total_rows;
+            Ok(df_stats)
+        }
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1245,12 +1347,12 @@ impl ExecutionPlan for FilteredReadExec {
 mod tests {
     use arrow::{
         compute::concat_batches,
-        datatypes::{UInt32Type, UInt64Type},
+        datatypes::{Float32Type, UInt32Type, UInt64Type},
     };
-    use arrow_array::{Array, UInt32Array};
+    use arrow_array::{cast::AsArray, Array, UInt32Array};
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
-    use lance_datagen::{array, r#gen, BatchCount, RowCount};
+    use lance_datagen::{array, r#gen, BatchCount, Dimension, RowCount};
     use lance_index::{
         optimize::OptimizeOptions,
         scalar::{expression::PlannerIndexExt, ScalarIndexParams},
@@ -1288,6 +1390,11 @@ mod tests {
                 .col("fully_indexed", array::step::<UInt32Type>())
                 .col("partly_indexed", array::step::<UInt64Type>())
                 .col("not_indexed", array::step::<UInt32Type>())
+                .col(
+                    "recheck_idx",
+                    array::cycle_utf8_literals(&["cat", "caterpillar", "dog"]),
+                )
+                .col("vector", array::rand_vec::<Float32Type>(Dimension::from(4)))
                 .into_dataset(
                     tmp_path.path().to_str().unwrap(),
                     FragmentCount::from(2),
@@ -1310,6 +1417,16 @@ mod tests {
                 .create_index(
                     &["partly_indexed"],
                     IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            dataset
+                .create_index(
+                    &["recheck_idx"],
+                    IndexType::NGram,
                     None,
                     &ScalarIndexParams::default(),
                     false,
@@ -1339,7 +1456,10 @@ mod tests {
             dataset
                 .optimize_indices(&OptimizeOptions {
                     num_indices_to_merge: 1,
-                    index_names: Some(vec!["fully_indexed_idx".to_string()]),
+                    index_names: Some(vec![
+                        "fully_indexed_idx".to_string(),
+                        "recheck_idx_idx".to_string(),
+                    ]),
                     retrain: false,
                 })
                 .await
@@ -1441,7 +1561,10 @@ mod tests {
             .await;
 
         // Basic range scan (whole dataset, no filter)
-        let options = base_options.clone().with_scan_range_before_filter(25..125);
+        let options = base_options
+            .clone()
+            .with_scan_range_before_filter(25..125)
+            .unwrap();
         fixture
             .test_plan(options, &u32s(vec![25..100, 250..275]))
             .await;
@@ -1450,18 +1573,25 @@ mod tests {
         let options = base_options
             .clone()
             .with_fragments(fixture.frags(&[3, 2]))
-            .with_scan_range_before_filter(25..125);
+            .with_scan_range_before_filter(25..125)
+            .unwrap();
         fixture
             .test_plan(options, &u32s(vec![325..400, 250..275]))
             .await;
 
         // Range scan that goes past the end of the dataset (100 rows
         // requested, only 50 can be returned)
-        let options = base_options.clone().with_scan_range_before_filter(200..300);
+        let options = base_options
+            .clone()
+            .with_scan_range_before_filter(200..300)
+            .unwrap();
         fixture.test_plan(options, &u32s(vec![350..400])).await;
 
         // Range scan that completely misses the dataset
-        let options = base_options.clone().with_scan_range_before_filter(300..400);
+        let options = base_options
+            .clone()
+            .with_scan_range_before_filter(300..400)
+            .unwrap();
         fixture.test_plan(options, &u32s(vec![])).await;
     }
 
@@ -1497,6 +1627,29 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn test_recheck() {
+        let fixture = TestFixture::new().await;
+
+        // First, test with the default batch size, which is bigger than any fragment in our
+        // test dataset (we have tests for larger batch sizes in python, let's avoid duplicating
+        // them here)
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+
+        let filter_plan = fixture
+            .filter_plan("contains(recheck_idx, 'cat')", true)
+            .await;
+
+        let options = base_options.clone().with_filter_plan(filter_plan);
+
+        let plan = FilteredReadExec::try_new(fixture.dataset.clone(), options).unwrap();
+
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch_sizes = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
+        assert_eq!(batch_sizes, vec![67]);
+    }
+
+    #[test_log::test(tokio::test)]
     async fn test_projection() {
         let fixture = Arc::new(TestFixture::new().await);
 
@@ -1525,7 +1678,17 @@ mod tests {
                 }
             };
 
-        check_projection(None, vec!["fully_indexed", "partly_indexed", "not_indexed"]).await;
+        check_projection(
+            None,
+            vec![
+                "fully_indexed",
+                "partly_indexed",
+                "not_indexed",
+                "recheck_idx",
+                "vector",
+            ],
+        )
+        .await;
         let projection = fixture
             .dataset
             .empty_projection()
@@ -1547,6 +1710,8 @@ mod tests {
                 "fully_indexed",
                 "partly_indexed",
                 "not_indexed",
+                "recheck_idx",
+                "vector",
                 "_rowid",
                 "_rowaddr",
             ],
@@ -1588,6 +1753,7 @@ mod tests {
         let options = base_options
             .clone()
             .with_scan_range_before_filter(25..125)
+            .unwrap()
             .with_filter_plan(filter_plan);
         fixture
             .test_plan(options, &u32s(vec![75..100, 250..275]))
@@ -1598,6 +1764,7 @@ mod tests {
         let options = base_options
             .clone()
             .with_scan_range_before_filter(25..50)
+            .unwrap()
             .with_filter_plan(filter_plan);
         fixture.test_plan(options, &u32s(vec![])).await;
 
@@ -1630,6 +1797,7 @@ mod tests {
             let options = base_options
                 .clone()
                 .with_scan_range_before_filter(25..125)
+                .unwrap()
                 .with_filter_plan(filter_plan);
             fixture
                 .test_plan(options, &u32s(vec![25..100, 250..270]))
@@ -1661,7 +1829,7 @@ mod tests {
         // Basic full scan
         fixture
             .test_plan(
-                base_options.clone().with_deleted_rows(),
+                base_options.clone().with_deleted_rows().unwrap(),
                 &u32s(vec![0..100, 200..400]),
             )
             .await;
@@ -1672,7 +1840,9 @@ mod tests {
                 base_options
                     .clone()
                     .with_deleted_rows()
-                    .with_scan_range_before_filter(25..125),
+                    .unwrap()
+                    .with_scan_range_before_filter(25..125)
+                    .unwrap(),
                 &u32s(vec![25..100, 200..225]),
             )
             .await;
@@ -1681,6 +1851,7 @@ mod tests {
         let options = base_options
             .clone()
             .with_deleted_rows()
+            .unwrap()
             .with_projection(fixture.dataset.empty_projection().with_row_id());
         let plan = FilteredReadExec::try_new(fixture.dataset.clone(), options).unwrap();
         let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
@@ -1697,5 +1868,109 @@ mod tests {
         let dv = Arc::new(DeletionVector::from_iter(vec![1]));
         let ranges = DvToValidRanges::new(dv.iter().map(|i| i as u64), 2).collect::<Vec<_>>();
         assert_eq!(ranges, vec![0..1]);
+    }
+
+    #[tokio::test]
+    async fn test_statistics() {
+        let fixture = Arc::new(TestFixture::new().await);
+
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+
+        let plan =
+            FilteredReadExec::try_new(fixture.dataset.clone(), base_options.clone()).unwrap();
+
+        let stats = plan.statistics().unwrap();
+        // With no filter and no range we have an exact count
+        assert_eq!(stats.num_rows, Precision::Exact(250));
+
+        // No filter with range (before or after) is still exact
+        let options = base_options
+            .clone()
+            .with_scan_range_before_filter(25..125)
+            .unwrap();
+        let plan = FilteredReadExec::try_new(fixture.dataset.clone(), options).unwrap();
+        let stats = plan.statistics().unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(100));
+
+        // With a filter, we don't know the exact count but DF can make some guesses
+
+        // In this case DF recognizes the expression as simple and without column stats it errs on
+        // the side of nothing getting filtered out.
+        let options = base_options
+            .clone()
+            .with_filter_plan(fixture.filter_plan("not_indexed >= 200", false).await);
+        let plan = FilteredReadExec::try_new(fixture.dataset.clone(), options).unwrap();
+        let stats = plan.statistics().unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(250));
+
+        // In this case DF doesn't recognize the expression as simple and so it assumes a default
+        // selectivity of 0.2
+        let options = base_options
+            .clone()
+            .with_filter_plan(fixture.filter_plan("random() < 0.5", false).await);
+        let plan = FilteredReadExec::try_new(fixture.dataset.clone(), options).unwrap();
+        let stats = plan.statistics().unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(50));
+
+        // Filter columns not part of projection, make sure statistics using correct input schema
+        let options = base_options
+            .clone()
+            .with_filter_plan(fixture.filter_plan("not_indexed >= 200", false).await)
+            .with_projection(
+                fixture
+                    .dataset
+                    .empty_projection()
+                    // Loading a vector here regresses a bug found during development where the input schema
+                    // to the filter exec in statistics was incorrect.
+                    .union_column("vector", OnMissing::Error)
+                    .unwrap(),
+            );
+        let plan = FilteredReadExec::try_new(fixture.dataset.clone(), options).unwrap();
+        let stats = plan.statistics().unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(250));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_limit_offset_with_deleted_rows() {
+        // This test reproduces the issue from the Python test_limit_offset[stable] failure
+        // Create a simple dataset with 10 rows (0-9)
+        let tmp_path = tempfile::tempdir().unwrap();
+        let mut dataset = gen()
+            .col("a", array::step::<UInt32Type>())
+            .into_dataset(
+                tmp_path.path().to_str().unwrap(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+
+        // Delete rows where a > 2 AND a < 7 (should delete a=3,4,5,6)
+        // This leaves: a=0,1,2,7,8,9
+        dataset.delete("a > 2 AND a < 7").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Test offset=3, limit=1 which should return a=7 (the 4th remaining row)
+        let base_options = FilteredReadOptions::basic_full_read(&dataset);
+        let options = base_options.with_scan_range_before_filter(3..4).unwrap();
+
+        let plan = FilteredReadExec::try_new(dataset.clone(), options).unwrap();
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+
+        // This should return 1 row with a=7
+        assert_eq!(
+            batch.num_rows(),
+            1,
+            "Expected 1 row but got {}",
+            batch.num_rows()
+        );
+
+        if batch.num_rows() > 0 {
+            let col = batch.column(0).as_primitive::<UInt32Type>();
+            assert_eq!(col.value(0), 7, "Expected a=7 but got a={}", col.value(0));
+        }
     }
 }

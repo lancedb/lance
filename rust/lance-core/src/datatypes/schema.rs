@@ -1070,6 +1070,22 @@ impl Projection {
     }
 
     /// Convert the projection to a schema
+    ///
+    /// Includes the _rowid and _rowaddr columns if requested
+    pub fn to_full_schema(&self) -> Schema {
+        let mut schema = self.to_schema();
+        let mut extra_fields = Vec::new();
+        if self.with_row_id {
+            extra_fields.push(ROW_ID_FIELD.clone());
+        }
+        if self.with_row_addr {
+            extra_fields.push(ROW_ADDR_FIELD.clone());
+        }
+        schema.extend(&extra_fields).unwrap();
+        schema
+    }
+
+    /// Convert the projection to a schema
     pub fn into_schema(self) -> Schema {
         self.to_schema()
     }
