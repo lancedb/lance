@@ -79,39 +79,39 @@ impl FsstCompressed {
                             symbol_table,
                         })
                     }
-                    // 64 => {
-                    //     let offsets = variable_width.offsets.borrow_to_typed_slice::<i64>();
-                    //     let offsets_slice = offsets.as_ref();
-                    //     let bytes_data = variable_width.data.into_buffer();
+                    64 => {
+                        let offsets = variable_width.offsets.borrow_to_typed_slice::<i64>();
+                        let offsets_slice = offsets.as_ref();
+                        let bytes_data = variable_width.data.into_buffer();
 
-                    //     // prepare compression output buffer
-                    //     let mut dest_offsets = vec![0_i64; offsets_slice.len() * 2];
-                    //     let mut dest_values = vec![0_u8; bytes_data.len() * 2];
-                    //     let mut symbol_table = vec![0_u8; fsst::fsst::FSST_SYMBOL_TABLE_SIZE];
+                        // prepare compression output buffer
+                        let mut dest_offsets = vec![0_i64; offsets_slice.len() * 2];
+                        let mut dest_values = vec![0_u8; bytes_data.len() * 2];
+                        let mut symbol_table = vec![0_u8; fsst::fsst::FSST_SYMBOL_TABLE_SIZE];
 
-                    //     // fsst compression
-                    //     fsst::fsst::compress(
-                    //         &mut symbol_table,
-                    //         bytes_data.as_slice(),
-                    //         offsets_slice,
-                    //         &mut dest_values,
-                    //         &mut dest_offsets,
-                    //     )?;
+                        // fsst compression
+                        fsst::fsst::compress(
+                            &mut symbol_table,
+                            bytes_data.as_slice(),
+                            offsets_slice,
+                            &mut dest_values,
+                            &mut dest_offsets,
+                        )?;
 
-                    //     // construct `DataBlock` for BinaryMiniBlockEncoder, we may want some `DataBlock` construct methods later
-                    //     let compressed = VariableWidthBlock {
-                    //         data: LanceBuffer::reinterpret_vec(dest_values),
-                    //         bits_per_offset: 32,
-                    //         offsets: LanceBuffer::reinterpret_vec(dest_offsets),
-                    //         num_values: variable_width.num_values,
-                    //         block_info: BlockInfo::new(),
-                    //     };
+                        // construct `DataBlock` for BinaryMiniBlockEncoder, we may want some `DataBlock` construct methods later
+                        let compressed = VariableWidthBlock {
+                            data: LanceBuffer::reinterpret_vec(dest_values),
+                            bits_per_offset: 64,
+                            offsets: LanceBuffer::reinterpret_vec(dest_offsets),
+                            num_values: variable_width.num_values,
+                            block_info: BlockInfo::new(),
+                        };
 
-                    //     Ok(Self {
-                    //         data: compressed,
-                    //         symbol_table,
-                    //     })
-                    // }
+                        Ok(Self {
+                            data: compressed,
+                            symbol_table,
+                        })
+                    }
                     _ => panic!(
                         "Unsupported offsets type {}",
                         variable_width.bits_per_offset
@@ -256,13 +256,14 @@ impl FsstMiniBlockDecompressor {
 impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         // Step 1. decompress data use `BinaryMiniBlockDecompressor`
-        // TODO: Support 64 bits for FSST compressor
+        // TODO: detect 64 bits for FSST compressor before calling decompress function
         let binary_decompressor =
-            Box::new(BinaryMiniBlockDecompressor::new(32)) as Box<dyn MiniBlockDecompressor>;
+            Box::new(BinaryMiniBlockDecompressor::new(64)) as Box<dyn MiniBlockDecompressor>;
         let compressed_data_block = binary_decompressor.decompress(data, num_values)?;
         let DataBlock::VariableWidth(mut compressed_data_block) = compressed_data_block else {
             panic!("BinaryMiniBlockDecompressor should output VariableWidth DataBlock")
         };
+        println!("bits_per_offset={}", compressed_data_block.bits_per_offset);
 
         // Step 2. FSST decompress
         let bytes = compressed_data_block.data.borrow_to_typed_slice::<u8>();
