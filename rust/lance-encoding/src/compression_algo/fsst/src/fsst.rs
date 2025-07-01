@@ -46,6 +46,7 @@ const MAX_SYMBOL_LENGTH: usize = 8;
 
 pub const FSST_SYMBOL_TABLE_SIZE: usize = 8 + 256 * 8 + 256; // 8 bytes for the header, 256 symbols(8 bytes each), 256 bytes for lens
 
+use arrow_array::LargeStringArray;
 use arrow_array::OffsetSizeTrait;
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -954,6 +955,13 @@ fn decompress_bulk<T: OffsetSizeTrait>(
 
         // handle the remaining bytes
         if in_curr + 2 <= in_end {
+            if *out_curr >= out.len() {
+                println!(
+                    "out_curr({}) is no less than out.len({})",
+                    *out_curr,
+                    out.len()
+                );
+            }
             out[*out_curr] = compressed_strs[in_curr + 1];
             if compressed_strs[in_curr] != FSST_ESC {
                 let code = compressed_strs[in_curr] as usize;
@@ -1539,6 +1547,78 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
         .unwrap();
         let mut decompress_output: Vec<u8> = vec![0; compress_output_buf.len() * 8];
         let mut decompress_offsets: Vec<i32> = vec![0; compress_offset_buf.len()];
+        decompress(
+            &symbol_table,
+            &compress_output_buf,
+            &compress_offset_buf,
+            &mut decompress_output,
+            &mut decompress_offsets,
+        )
+        .unwrap();
+        for i in 1..decompress_offsets.len() {
+            let s = &decompress_output
+                [decompress_offsets[i - 1] as usize..decompress_offsets[i] as usize];
+            let original = &string_array.value_data()[string_array.value_offsets().to_vec()[i - 1]
+                as usize
+                ..string_array.value_offsets().to_vec()[i] as usize];
+            assert!(
+                s == original,
+                "s: {:?}\n\n, original: {:?}",
+                std::str::from_utf8(s),
+                std::str::from_utf8(original)
+            );
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_fsst_64_bit_offsets() {
+        let test_input_size = 1024 * 1024;
+        let repeat_num = test_input_size / TEST_PARAGRAPH.len();
+        let test_input = TEST_PARAGRAPH.repeat(repeat_num);
+        helper_64_bit(&test_input);
+
+        let test_input_size = 2 * 1024 * 1024;
+        let repeat_num = test_input_size / TEST_PARAGRAPH.len();
+        let test_input = TEST_PARAGRAPH.repeat(repeat_num);
+        helper_64_bit(&test_input);
+
+        let test_input_size = 1024 * 1024;
+        let repeat_num = test_input_size / TEST_PARAGRAPH2.len();
+        let test_input = TEST_PARAGRAPH2.repeat(repeat_num);
+        helper_64_bit(&test_input);
+
+        let test_input_size = 2 * 1024 * 1024;
+        let repeat_num = test_input_size / TEST_PARAGRAPH2.len();
+        let test_input = TEST_PARAGRAPH2.repeat(repeat_num);
+        helper_64_bit(&test_input);
+
+        let test_input_size = 1024 * 1024;
+        let repeat_num = test_input_size / TEST_PARAGRAPH3.len();
+        let test_input = TEST_PARAGRAPH3.repeat(repeat_num);
+        helper_64_bit(&test_input);
+
+        let test_input_size = 2 * 1024 * 1024;
+        let repeat_num = test_input_size / TEST_PARAGRAPH3.len();
+        let test_input = TEST_PARAGRAPH3.repeat(repeat_num);
+        helper_64_bit(&test_input);
+    }
+
+    fn helper_64_bit(test_input: &str) {
+        let lines_vec = test_input.lines().collect::<Vec<&str>>();
+        let string_array = LargeStringArray::from(lines_vec);
+        let mut compress_output_buf: Vec<u8> = vec![0; string_array.value_data().len()];
+        let mut compress_offset_buf: Vec<i64> = vec![0; string_array.value_offsets().len()];
+        let mut symbol_table = [0; FSST_SYMBOL_TABLE_SIZE];
+        compress(
+            symbol_table.as_mut(),
+            string_array.value_data(),
+            string_array.value_offsets(),
+            &mut compress_output_buf,
+            &mut compress_offset_buf,
+        )
+        .unwrap();
+        let mut decompress_output: Vec<u8> = vec![0; compress_output_buf.len() * 8];
+        let mut decompress_offsets: Vec<i64> = vec![0; compress_offset_buf.len()];
         decompress(
             &symbol_table,
             &compress_output_buf,
