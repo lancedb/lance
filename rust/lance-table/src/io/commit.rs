@@ -483,40 +483,35 @@ fn async_read_dir(path: std::path::PathBuf) -> impl Stream<Item = Result<std::fs
 }
 
 // Optimized listing for local filesystems that avoids unnecessary stat calls
-fn list_manifests_local(base_path: &Path) -> impl Stream<Item = Result<ManifestLocation>> {
+fn list_manifests_local(base_path: Path) -> impl Stream<Item = Result<ManifestLocation>> {
     let versions_path = lance_io::local::to_local_path(&base_path.child(VERSIONS_DIR));
 
     async_read_dir(versions_path.into())
-        .filter_map(|entry_result| async move {
-            let entry = match entry_result {
-                Ok(entry) => entry,
-                Err(e) => return Some(Err(e)),
-            };
+        .filter_map(move |entry_result| {
+            let base_path = base_path.clone();
+            async move {
+                let entry = match entry_result {
+                    Ok(entry) => entry,
+                    Err(e) => return Some(Err(e)),
+                };
 
-            let filename_raw = entry.file_name();
-            let filename = filename_raw.to_string_lossy();
+                let filename_raw = entry.file_name();
+                let filename = filename_raw.to_string_lossy();
 
-            // Check if it's a valid manifest file
-            let scheme = ManifestNamingScheme::detect_scheme(&filename)?;
-            let version = scheme.parse_version(&filename)?;
+                // Check if it's a valid manifest file
+                let scheme = ManifestNamingScheme::detect_scheme(&filename)?;
+                let version = scheme.parse_version(&filename)?;
 
-            let path = match Path::from_filesystem_path(entry.path()) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Some(Err(Error::IO {
-                        source: Box::new(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
-                        location: location!(),
-                    }))
-                }
-            };
+                let path = base_path.child(VERSIONS_DIR).child(filename.as_ref());
 
-            Some(Ok(ManifestLocation {
-                version,
-                path,
-                size: None, // Will be filled later if needed
-                naming_scheme: scheme,
-                e_tag: None, // Will be filled later if needed
-            }))
+                Some(Ok(ManifestLocation {
+                    version,
+                    path,
+                    size: None, // Will be filled later if needed
+                    naming_scheme: scheme,
+                    e_tag: None, // Will be filled later if needed
+                }))
+            }
         })
         .boxed()
 }
@@ -588,14 +583,14 @@ pub trait CommitHandler: Debug + Send + Sync {
     /// in arbitrary order.
     fn list_manifest_locations<'a>(
         &self,
-        base_path: &Path,
+        base_path: &'a Path,
         object_store: &'a ObjectStore,
         sorted_descending: bool,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
         // Use optimized local listing for local filesystems
         let underlying_stream: BoxStream<'a, Result<ManifestLocation>> = if object_store.is_local()
         {
-            list_manifests_local(base_path).boxed()
+            list_manifests_local(base_path.clone()).boxed()
         } else {
             list_manifests(base_path, &object_store.inner).boxed()
         };
