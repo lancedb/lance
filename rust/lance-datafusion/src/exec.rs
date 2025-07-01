@@ -15,7 +15,7 @@ use datafusion::{
     dataframe::DataFrame,
     execution::{
         context::{SessionConfig, SessionContext},
-        disk_manager::DiskManagerConfig,
+        disk_manager::DiskManagerBuilder,
         memory_pool::FairSpillPool,
         runtime_env::RuntimeEnvBuilder,
         TaskContext,
@@ -253,7 +253,7 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     }
     if options.use_spilling() {
         runtime_env_builder = runtime_env_builder
-            .with_disk_manager(DiskManagerConfig::new())
+            .with_disk_manager_builder(DiskManagerBuilder::default())
             .with_memory_pool(Arc::new(FairSpillPool::new(
                 options.mem_pool_size() as usize
             )));

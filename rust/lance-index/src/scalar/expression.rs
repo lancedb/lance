@@ -4,13 +4,13 @@
 use std::{ops::Bound, sync::Arc};
 
 use arrow_array::Array;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
     expr::{InList, ScalarFunction},
-    Between, BinaryExpr, Expr, Operator, ReturnTypeArgs, ScalarUDF,
+    Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
 };
 
 use futures::join;
@@ -853,7 +853,7 @@ fn maybe_indexed_column<'a, 'b>(
 // Extract a literal scalar value from an expression, if it is a literal, or None
 fn maybe_scalar(expr: &Expr, expected_type: &DataType) -> Option<ScalarValue> {
     match expr {
-        Expr::Literal(value) => safe_coerce_scalar(value, expected_type),
+        Expr::Literal(value, _) => safe_coerce_scalar(value, expected_type),
         // Some literals can't be expressed in datafusion's SQL and can only be expressed with
         // a cast.  For example, there is no way to express a fixed-size-binary literal (which is
         // commonly used for UUID).  As a result the expression could look like...
@@ -862,7 +862,7 @@ fn maybe_scalar(expr: &Expr, expected_type: &DataType) -> Option<ScalarValue> {
         //
         // In this case we need to extract the value, apply the cast, and then test the casted value
         Expr::Cast(cast) => match cast.expr.as_ref() {
-            Expr::Literal(value) => {
+            Expr::Literal(value, _) => {
                 let casted = value.cast_to(&cast.data_type).ok()?;
                 safe_coerce_scalar(&casted, expected_type)
             }
@@ -874,16 +874,18 @@ fn maybe_scalar(expr: &Expr, expected_type: &DataType) -> Option<ScalarValue> {
                     return None;
                 }
                 match (&scalar_function.args[0], &scalar_function.args[1]) {
-                    (Expr::Literal(value), Expr::Literal(cast_type)) => {
+                    (Expr::Literal(value, _), Expr::Literal(cast_type, _)) => {
                         let target_type = scalar_function
                             .func
-                            .return_type_from_args(ReturnTypeArgs {
-                                arg_types: &[value.data_type(), cast_type.data_type()],
+                            .return_field_from_args(ReturnFieldArgs {
+                                arg_fields: &[
+                                    Arc::new(Field::new("expression", value.data_type(), false)),
+                                    Arc::new(Field::new("datatype", cast_type.data_type(), false)),
+                                ],
                                 scalar_arguments: &[Some(value), Some(cast_type)],
-                                nullables: &[false, false],
                             })
                             .ok()?;
-                        let casted = value.cast_to(target_type.return_type()).ok()?;
+                        let casted = value.cast_to(target_type.data_type()).ok()?;
                         safe_coerce_scalar(&casted, expected_type)
                     }
                     _ => None,
