@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
 use arrow::array::AsArray;
@@ -91,21 +91,27 @@ pub fn get_default_batch_size() -> Option<usize> {
 }
 
 pub const LEGACY_DEFAULT_FRAGMENT_READAHEAD: usize = 4;
-lazy_static::lazy_static! {
-    pub static ref DEFAULT_FRAGMENT_READAHEAD: Option<usize> = std::env::var("LANCE_DEFAULT_FRAGMENT_READAHEAD")
-        .map(|val| Some(val.parse().unwrap())).unwrap_or(None);
 
-    pub static ref DEFAULT_XTR_OVERFETCH: u32 = std::env::var("LANCE_XTR_OVERFETCH")
-        .map(|val| val.parse().unwrap()).unwrap_or(10);
-}
+pub static DEFAULT_FRAGMENT_READAHEAD: LazyLock<Option<usize>> = LazyLock::new(|| {
+    std::env::var("LANCE_DEFAULT_FRAGMENT_READAHEAD")
+        .map(|val| Some(val.parse().unwrap()))
+        .unwrap_or(None)
+});
+
+pub static DEFAULT_XTR_OVERFETCH: LazyLock<u32> = LazyLock::new(|| {
+    std::env::var("LANCE_XTR_OVERFETCH")
+        .map(|val| val.parse().unwrap())
+        .unwrap_or(10)
+});
 
 // We want to support ~256 concurrent reads to maximize throughput on cloud storage systems
 // Our typical page size is 8MiB (though not all reads are this large yet due to offset buffers, validity buffers, etc.)
 // So we want to support 256 * 8MiB ~= 2GiB of queued reads
-lazy_static::lazy_static! {
-    pub static ref DEFAULT_IO_BUFFER_SIZE: u64 = std::env::var("LANCE_DEFAULT_IO_BUFFER_SIZE")
-        .map(|val| val.parse().unwrap()).unwrap_or(2 * 1024 * 1024 * 1024);
-}
+pub static DEFAULT_IO_BUFFER_SIZE: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("LANCE_DEFAULT_IO_BUFFER_SIZE")
+        .map(|val| val.parse().unwrap())
+        .unwrap_or(2 * 1024 * 1024 * 1024)
+});
 
 /// Defines an ordering for a single column
 ///

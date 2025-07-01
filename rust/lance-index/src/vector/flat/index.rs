@@ -37,12 +37,15 @@ use super::storage::{FlatBinStorage, FlatFloatStorage, FLAT_COLUMN};
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct FlatIndex {}
 
-lazy_static::lazy_static! {
-    static ref ANN_SEARCH_SCHEMA: SchemaRef = Schema::new(vec![
+use std::sync::LazyLock;
+
+static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Schema::new(vec![
         Field::new(DIST_COL, DataType::Float32, true),
         ROW_ID_FIELD.clone(),
-    ]).into();
-}
+    ])
+    .into()
+});
 
 #[derive(Default)]
 pub struct FlatQueryParams {

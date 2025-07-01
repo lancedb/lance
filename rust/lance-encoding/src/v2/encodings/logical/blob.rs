@@ -387,7 +387,10 @@ impl FieldEncoder for BlobFieldEncoder {
 
 #[cfg(test)]
 pub mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, LazyLock},
+    };
 
     use arrow_array::LargeBinaryArray;
     use arrow_schema::{DataType, Field};
@@ -399,13 +402,12 @@ pub mod tests {
         version::LanceFileVersion,
     };
 
-    lazy_static::lazy_static! {
-    static ref BLOB_META: HashMap<String, String> =
+    static BLOB_META: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
         [(BLOB_META_KEY.to_string(), "true".to_string())]
             .iter()
             .cloned()
-            .collect::<HashMap<_, _>>();
-    }
+            .collect::<HashMap<_, _>>()
+    });
 
     #[test_log::test(tokio::test)]
     async fn test_blob() {

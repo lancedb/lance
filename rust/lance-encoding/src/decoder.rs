@@ -213,7 +213,7 @@
 //!    relation to the way the data is stored.
 
 use std::collections::VecDeque;
-use std::sync::Once;
+use std::sync::{LazyLock, Once};
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
@@ -1918,11 +1918,11 @@ pub fn schedule_and_decode(
     }
 }
 
-lazy_static::lazy_static! {
-    pub static ref WAITER_RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+pub static WAITER_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_current_thread()
         .build()
-        .unwrap();
-}
+        .unwrap()
+});
 
 /// Schedules and decodes the requested data in a blocking fashion
 ///
