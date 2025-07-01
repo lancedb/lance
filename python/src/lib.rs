@@ -59,7 +59,6 @@ use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
 use session::Session;
 
-
 pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
