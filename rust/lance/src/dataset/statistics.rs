@@ -6,7 +6,6 @@
 use std::{collections::HashMap, future::Future, sync::Arc};
 
 use lance_core::Result;
-use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
 use super::{fragment::FileFragment, Dataset};
 
@@ -47,14 +46,10 @@ impl DatasetStatisticsExt for Dataset {
                 )
             }));
         if !self.is_legacy_storage() {
-            let scan_scheduler = ScanScheduler::new(
-                self.object_store.clone(),
-                SchedulerConfig::max_bandwidth(self.object_store.as_ref()),
-            );
             for fragment in self.fragments().as_ref() {
                 let file_fragment = FileFragment::new(self.clone(), fragment.clone());
                 file_fragment
-                    .update_storage_stats(&mut field_stats, self.schema(), scan_scheduler.clone())
+                    .update_storage_stats(&mut field_stats, self.schema())
                     .await?;
             }
         }
