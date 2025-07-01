@@ -515,34 +515,29 @@ fn list_manifests_local(base_path: Path) -> impl Stream<Item = Result<ManifestLo
 
     async_read_dir(versions_path.into())
         .map(move |entry_result| {
-            let entry = entry_result?;
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(e) => return Some(Err(e)),
+            };
 
             let filename_raw = entry.file_name();
             let filename = filename_raw.to_string_lossy();
 
             // Check if it's a valid manifest file
-            let scheme =
-                ManifestNamingScheme::detect_scheme(&filename).ok_or_else(|| Error::Internal {
-                    message: format!("Invalid manifest filename: {}", filename),
-                    location: location!(),
-                })?;
-            let version = scheme
-                .parse_version(&filename)
-                .ok_or_else(|| Error::Internal {
-                    message: format!("Invalid manifest version: {}", filename),
-                    location: location!(),
-                })?;
+            let scheme = ManifestNamingScheme::detect_scheme(&filename)?;
+            let version = scheme.parse_version(&filename)?;
 
             let path = base_path.child(VERSIONS_DIR).child(filename.as_ref());
 
-            Ok(ManifestLocation {
+            Some(Ok(ManifestLocation {
                 version,
                 path,
                 size: None, // Will be filled later if needed
                 naming_scheme: scheme,
                 e_tag: None, // Will be filled later if needed
-            })
+            }))
         })
+        .filter_map(futures::future::ready)
         .boxed()
 }
 
