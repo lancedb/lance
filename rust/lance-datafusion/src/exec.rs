@@ -23,7 +23,7 @@ use datafusion::{
     physical_plan::{
         analyze::AnalyzeExec,
         display::DisplayableExecutionPlan,
-        execution_plan::{Boundedness, EmissionType},
+        execution_plan::{Boundedness, CardinalityEffect, EmissionType},
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -45,9 +45,12 @@ use log::{debug, info, warn};
 use snafu::location;
 use tracing::Span;
 
-use crate::utils::{
-    MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
-    PARTS_LOADED_METRIC, REQUESTS_METRIC,
+use crate::{
+    chunker::StrictBatchSizeStream,
+    utils::{
+        MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
+        IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+    },
 };
 
 /// An source execution node created from an existing stream
@@ -554,5 +557,82 @@ impl SessionContextExt for SessionContext {
         let part_stream = Arc::new(OneShotPartitionStream::new(data));
         let provider = StreamingTable::try_new(schema, vec![part_stream])?;
         self.read_table(Arc::new(provider))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StrictBatchSizeExec {
+    input: Arc<dyn ExecutionPlan>,
+    batch_size: usize,
+}
+
+impl StrictBatchSizeExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, batch_size: usize) -> Self {
+        Self { input, batch_size }
+    }
+}
+
+impl DisplayAs for StrictBatchSizeExec {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "StrictBatchSizeExec")
+    }
+}
+
+impl ExecutionPlan for StrictBatchSizeExec {
+    fn name(&self) -> &str {
+        "StrictBatchSizeExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            input: children[0].clone(),
+            batch_size: self.batch_size,
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let stream = self.input.execute(partition, context)?;
+        let schema = stream.schema();
+        let stream = StrictBatchSizeStream::new(stream, self.batch_size);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn statistics(&self) -> datafusion_common::Result<Statistics> {
+        self.input.statistics()
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
     }
 }
