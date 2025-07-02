@@ -254,10 +254,22 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
                 .iter()
                 .map(|offset| offset - offsets[0])
                 .collect::<Vec<u64>>();
+
+            // Bounds checking to prevent crashes
+            let start_offset = offsets[0] as usize;
+            let end_offset = offsets[num_values as usize] as usize;
+            if start_offset > data.len() || end_offset > data.len() || start_offset > end_offset {
+                return Err(lance_core::Error::InvalidInput {
+                    source: format!(
+                        "Invalid offset range: start={}, end={}, data_len={}, offsets[0]={}, offsets[{}]={}",
+                        start_offset, end_offset, data.len(), offsets[0], num_values, offsets[num_values as usize]
+                    ).into(),
+                    location: location!(),
+                });
+            }
+
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::Owned(
-                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
-                ),
+                data: LanceBuffer::Owned(data[start_offset..end_offset].to_vec()),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 64,
                 num_values,
@@ -275,10 +287,21 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
                 .map(|offset| offset - offsets[0])
                 .collect::<Vec<u32>>();
 
+            // Bounds checking to prevent crashes
+            let start_offset = offsets[0] as usize;
+            let end_offset = offsets[num_values as usize] as usize;
+            if start_offset > data.len() || end_offset > data.len() || start_offset > end_offset {
+                return Err(lance_core::Error::InvalidInput {
+                    source: format!(
+                        "Invalid offset range: start={}, end={}, data_len={}, offsets[0]={}, offsets[{}]={}",
+                        start_offset, end_offset, data.len(), offsets[0], num_values, offsets[num_values as usize]
+                    ).into(),
+                    location: location!(),
+                });
+            }
+
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::Owned(
-                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
-                ),
+                data: LanceBuffer::Owned(data[start_offset..end_offset].to_vec()),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 32,
                 num_values,
@@ -293,40 +316,72 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
 pub struct VariableEncoder {}
 
 impl BlockCompressor for VariableEncoder {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let num_values: u32 = data
-            .num_values()
+    fn compress(&self, mut data: DataBlock) -> Result<LanceBuffer> {
+        match data {
+            DataBlock::VariableWidth(ref mut variable_width_data) => {
+                let num_values = variable_width_data.num_values;
+                match variable_width_data.bits_per_offset {
+                    32 => {
+                        let num_values: u32 = num_values
             .try_into()
             .expect("The Maximum number of values BinaryBlockEncoder can work with is u32::MAX");
 
-        match data {
-            DataBlock::VariableWidth(mut variable_width_data) => {
-                if variable_width_data.bits_per_offset != 32 {
-                    panic!("BinaryBlockEncoder only works with 32 bits per offset VariableWidth DataBlock.");
+                        let offsets = variable_width_data.offsets.borrow_to_typed_slice::<u32>();
+                        let offsets = offsets.as_ref();
+                        // the first 4 bytes store the number of values, then 4 bytes for bytes_start_offset,
+                        // then offsets data, then bytes data.
+                        let bytes_start_offset = 4 + 4 + std::mem::size_of_val(offsets) as u32;
+
+                        let output_total_bytes =
+                            bytes_start_offset as usize + variable_width_data.data.len();
+                        let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
+
+                        // store `num_values` in the first 4 bytes of output buffer
+                        output.extend_from_slice(&(num_values).to_le_bytes());
+
+                        // store `bytes_start_offset` in the next 4 bytes of output buffer
+                        output.extend_from_slice(&(bytes_start_offset).to_le_bytes());
+
+                        // store offsets
+                        output.extend_from_slice(cast_slice(offsets));
+
+                        // store bytes
+                        output.extend_from_slice(&variable_width_data.data);
+                        Ok(LanceBuffer::Owned(output))
+                    }
+                    64 => {
+                        let num_values: u64 = num_values
+            .try_into()
+            .expect("The Maximum number of values BinaryBlockEncoder can work with is u32::MAX");
+                        let offsets = variable_width_data.offsets.borrow_to_typed_slice::<u64>();
+                        let offsets = offsets.as_ref();
+                        // the first 8 bytes store the number of values, then 8 bytes for bytes_start_offset,
+                        // then offsets data, then bytes data.
+                        // QUESTION: 8 or 4?
+                        let bytes_start_offset = 8 + 8 + std::mem::size_of_val(offsets) as u64;
+
+                        let output_total_bytes =
+                            bytes_start_offset as usize + variable_width_data.data.len();
+                        let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
+
+                        // store `num_values` in the first 4 bytes of output buffer
+                        output.extend_from_slice(&(num_values).to_le_bytes());
+
+                        // store `bytes_start_offset` in the next 4 bytes of output buffer
+                        output.extend_from_slice(&(bytes_start_offset).to_le_bytes());
+
+                        // store offsets
+                        output.extend_from_slice(cast_slice(offsets));
+
+                        // store bytes
+                        output.extend_from_slice(&variable_width_data.data);
+                        Ok(LanceBuffer::Owned(output))
+                    }
+                    _ => {
+                        panic!("BinaryBlockEncoder does not work with {} bits per offset VariableWidth DataBlock.",
+                variable_width_data.bits_per_offset);
+                    }
                 }
-                let offsets = variable_width_data.offsets.borrow_to_typed_slice::<u32>();
-                let offsets = offsets.as_ref();
-                // the first 4 bytes store the number of values, then 4 bytes for bytes_start_offset,
-                // then offsets data, then bytes data.
-                let bytes_start_offset = 4 + 4 + std::mem::size_of_val(offsets) as u32;
-
-                let output_total_bytes =
-                    bytes_start_offset as usize + variable_width_data.data.len();
-                let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
-
-                // store `num_values` in the first 4 bytes of output buffer
-                output.extend_from_slice(&(num_values).to_le_bytes());
-
-                // store `bytes_start_offset` in the next 4 bytes of output buffer
-                output.extend_from_slice(&(bytes_start_offset).to_le_bytes());
-
-                // store offsets
-                output.extend_from_slice(cast_slice(offsets));
-
-                // store bytes
-                output.extend_from_slice(&variable_width_data.data);
-
-                Ok(LanceBuffer::Owned(output))
             }
             _ => {
                 panic!("BinaryBlockEncoder can only work with Variable Width DataBlock.");

@@ -46,8 +46,7 @@ const MAX_SYMBOL_LENGTH: usize = 8;
 
 pub const FSST_SYMBOL_TABLE_SIZE: usize = 8 + 256 * 8 + 256; // 8 bytes for the header, 256 symbols(8 bytes each), 256 bytes for lens
 
-use arrow_array::LargeStringArray;
-use arrow_array::OffsetSizeTrait;
+use arrow_array::{LargeStringArray, OffsetSizeTrait};
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
@@ -817,6 +816,7 @@ fn decompress_bulk<T: OffsetSizeTrait>(
     let symbols = decoder.symbols;
     let lens = decoder.lens;
     let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
+        // Do SIMD operation here by 4 bytes
         while in_curr + 4 <= in_end {
             let next_block;
             let mut code;
@@ -828,6 +828,12 @@ fn decompress_bulk<T: OffsetSizeTrait>(
             let escape_mask = (next_block & 0x80808080u32)
                 & ((((!next_block) & 0x7F7F7F7Fu32) + 0x7F7F7F7Fu32) ^ 0x80808080u32);
             if escape_mask == 0 {
+                // Ensure we have enough space for all 4 bytes (worst case: 4 * MAX_SYMBOL_LENGTH)
+                let required_space = *out_curr + 4 * MAX_SYMBOL_LENGTH;
+                if required_space > out.len() {
+                    out.resize(required_space.max(out.len() * 2), 0);
+                }
+
                 // 0th byte
                 code = compressed_strs[in_curr] as usize;
                 len = lens[code] as usize;
@@ -868,6 +874,12 @@ fn decompress_bulk<T: OffsetSizeTrait>(
                 in_curr += 1;
                 *out_curr += len;
             } else {
+                // Ensure space needed for escape cases (worst case: 3 * MAX_SYMBOL_LENGTH + 1 escape byte)
+                let required_space = *out_curr + 3 * MAX_SYMBOL_LENGTH + 1;
+                if required_space > out.len() {
+                    out.resize(required_space.max(out.len() * 2), 0);
+                }
+
                 let first_escape_pos = escape_mask.trailing_zeros() >> 3;
                 if first_escape_pos == 3 {
                     // 0th byte
@@ -955,13 +967,12 @@ fn decompress_bulk<T: OffsetSizeTrait>(
 
         // handle the remaining bytes
         if in_curr + 2 <= in_end {
-            if *out_curr >= out.len() {
-                println!(
-                    "out_curr({}) is no less than out.len({})",
-                    *out_curr,
-                    out.len()
-                );
+            // Ensure we have enough space for the next operations
+            let required_space = *out_curr + MAX_SYMBOL_LENGTH + 1; // +1 for escape byte
+            if required_space > out.len() {
+                out.resize(required_space.max(out.len() * 2), 0); // Double the size to avoid frequent resizing
             }
+
             out[*out_curr] = compressed_strs[in_curr + 1];
             if compressed_strs[in_curr] != FSST_ESC {
                 let code = compressed_strs[in_curr] as usize;
@@ -973,6 +984,10 @@ fn decompress_bulk<T: OffsetSizeTrait>(
                 *out_curr += lens[code] as usize;
                 if compressed_strs[in_curr] != FSST_ESC {
                     let code = compressed_strs[in_curr] as usize;
+                    let required_space = *out_curr + lens[code] as usize;
+                    if required_space > out.len() {
+                        out.resize(required_space.max(out.len() * 2), 0);
+                    }
                     unsafe {
                         let src = symbols[code];
                         ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
@@ -993,6 +1008,10 @@ fn decompress_bulk<T: OffsetSizeTrait>(
         if in_curr < in_end {
             // last code cannot be an escape code
             let code = compressed_strs[in_curr] as usize;
+            let required_space = *out_curr + lens[code] as usize;
+            if required_space > out.len() {
+                out.resize(required_space.max(out.len() * 2), 0);
+            }
             unsafe {
                 let src = symbols[code];
                 ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
@@ -1002,7 +1021,7 @@ fn decompress_bulk<T: OffsetSizeTrait>(
     };
 
     let mut out_curr = *out_pos;
-    out_offsets[0] = T::from_usize(0).unwrap();
+    out_offsets[0] = T::from_usize(*out_pos).unwrap();
     for i in 1..offsets.len() {
         let in_curr = offsets[i - 1].as_usize();
         let in_end = offsets[i].as_usize();
