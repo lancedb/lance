@@ -3,9 +3,9 @@
 
 use std::ops::{Range, RangeInclusive};
 
-use deepsize::DeepSizeOf;
-
 use super::{bitmap::Bitmap, encoded_array::EncodedU64Array};
+use deepsize::DeepSizeOf;
+use snafu::location;
 
 /// Different ways to represent a sequence of distinct u64s.
 ///
@@ -248,6 +248,10 @@ impl U64Segment {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Get the min and max value of the segment, excluding tombstones.
     pub fn range(&self) -> Option<RangeInclusive<u64>> {
         match self {
@@ -367,6 +371,152 @@ impl U64Segment {
             Self::SortedArray(array) => array.get(i),
             Self::Array(array) => array.get(i),
         }
+    }
+
+    /// Check if a value is contained in the segment
+    pub fn contains(&self, val: u64) -> bool {
+        match self {
+            Self::Range(range) => range.contains(&val),
+            Self::RangeWithHoles { range, holes } => {
+                if !range.contains(&val) {
+                    return false;
+                }
+                // Check if the value is not in the holes
+                !holes.iter().any(|hole| hole == val)
+            }
+            Self::RangeWithBitmap { range, bitmap } => {
+                if !range.contains(&val) {
+                    return false;
+                }
+                // Check if the bitmap has the value set (not cleared)
+                let idx = (val - range.start) as usize;
+                bitmap.get(idx)
+            }
+            Self::SortedArray(array) => {
+                // Use binary search for sorted arrays
+                array.iter().any(|v| v == val)
+            }
+            Self::Array(array) => {
+                // Linear search for unsorted arrays
+                array.iter().any(|v| v == val)
+            }
+        }
+    }
+
+    /// Produce a new segment that has [`val`] as the new highest value in the segment
+    pub fn with_new_high(self, val: u64) -> lance_core::Result<Self> {
+        // Check that the new value is higher than the current maximum
+        if let Some(range) = self.range() {
+            if val <= *range.end() {
+                return Err(lance_core::Error::invalid_input(
+                    format!(
+                        "New value {} must be higher than current maximum {}",
+                        val,
+                        range.end()
+                    ),
+                    location!(),
+                ));
+            }
+        }
+
+        Ok(match self {
+            Self::Range(range) => {
+                // Special case for empty range: create a range containing only the new value
+                if range.start == range.end {
+                    Self::Range(Range {
+                        start: val,
+                        end: val + 1,
+                    })
+                } else if val == range.end {
+                    Self::Range(Range {
+                        start: range.start,
+                        end: val + 1,
+                    })
+                } else {
+                    Self::RangeWithHoles {
+                        range: Range {
+                            start: range.start,
+                            end: val + 1,
+                        },
+                        holes: EncodedU64Array::U64((range.end..val).collect()),
+                    }
+                }
+            }
+            Self::RangeWithHoles { range, holes } => {
+                if val == range.end {
+                    Self::RangeWithHoles {
+                        range: Range {
+                            start: range.start,
+                            end: val + 1,
+                        },
+                        holes,
+                    }
+                } else {
+                    let mut new_holes: Vec<u64> = holes.iter().collect();
+                    new_holes.extend(range.end..val);
+                    Self::RangeWithHoles {
+                        range: Range {
+                            start: range.start,
+                            end: val + 1,
+                        },
+                        holes: EncodedU64Array::U64(new_holes),
+                    }
+                }
+            }
+            Self::RangeWithBitmap { range, bitmap } => {
+                if val == range.end {
+                    let new_range = Range {
+                        start: range.start,
+                        end: val + 1,
+                    };
+                    let mut new_bitmap =
+                        Bitmap::new_full((new_range.end - new_range.start) as usize);
+
+                    for (idx, is_set) in bitmap.iter().enumerate() {
+                        if !is_set {
+                            new_bitmap.clear(idx);
+                        }
+                    }
+
+                    Self::RangeWithBitmap {
+                        range: new_range,
+                        bitmap: new_bitmap,
+                    }
+                } else {
+                    let new_range = Range {
+                        start: range.start,
+                        end: val + 1,
+                    };
+                    let mut new_bitmap =
+                        Bitmap::new_full((new_range.end - new_range.start) as usize);
+
+                    for (idx, is_set) in bitmap.iter().enumerate() {
+                        if !is_set {
+                            new_bitmap.clear(idx);
+                        }
+                    }
+
+                    for idx in range.end..val {
+                        new_bitmap.clear((idx - range.start) as usize);
+                    }
+
+                    Self::RangeWithBitmap {
+                        range: new_range,
+                        bitmap: new_bitmap,
+                    }
+                }
+            }
+            Self::SortedArray(array) => {
+                let mut new_array = array.iter().collect::<Vec<u64>>();
+                new_array.push(val);
+                Self::SortedArray(EncodedU64Array::U64(new_array))
+            }
+            Self::Array(array) => {
+                let mut new_array = array.iter().collect::<Vec<u64>>();
+                new_array.push(val);
+                Self::Array(EncodedU64Array::U64(new_array))
+            }
+        })
     }
 
     /// Delete a set of row ids from the segment.
@@ -549,6 +699,238 @@ mod test {
         check_segment(
             &[7000, 1, 24000],
             &U64Segment::Array(vec![7000, 1, 24000].into()),
+        );
+    }
+
+    #[test]
+    fn test_with_new_high() {
+        // Test Range: contiguous sequence
+        let segment = U64Segment::Range(10..20);
+
+        // Test adding value that extends the range
+        let result = segment.clone().with_new_high(20).unwrap();
+        assert_eq!(result, U64Segment::Range(10..21));
+
+        // Test adding value that creates holes
+        let result = segment.with_new_high(25).unwrap();
+        assert_eq!(
+            result,
+            U64Segment::RangeWithHoles {
+                range: 10..26,
+                holes: EncodedU64Array::U64(vec![20, 21, 22, 23, 24]),
+            }
+        );
+
+        // Test RangeWithHoles: sequence with existing holes
+        let segment = U64Segment::RangeWithHoles {
+            range: 10..20,
+            holes: EncodedU64Array::U64(vec![15, 17]),
+        };
+
+        // Test adding value that extends the range without new holes
+        let result = segment.clone().with_new_high(20).unwrap();
+        assert_eq!(
+            result,
+            U64Segment::RangeWithHoles {
+                range: 10..21,
+                holes: EncodedU64Array::U64(vec![15, 17]),
+            }
+        );
+
+        // Test adding value that creates additional holes
+        let result = segment.with_new_high(25).unwrap();
+        assert_eq!(
+            result,
+            U64Segment::RangeWithHoles {
+                range: 10..26,
+                holes: EncodedU64Array::U64(vec![15, 17, 20, 21, 22, 23, 24]),
+            }
+        );
+
+        // Test RangeWithBitmap: sequence with bitmap representation
+        let mut bitmap = Bitmap::new_full(10);
+        bitmap.clear(3); // Clear position 3 (value 13)
+        bitmap.clear(7); // Clear position 7 (value 17)
+        let segment = U64Segment::RangeWithBitmap {
+            range: 10..20,
+            bitmap,
+        };
+
+        // Test adding value that extends the range without new holes
+        let result = segment.clone().with_new_high(20).unwrap();
+        let expected_bitmap = {
+            let mut b = Bitmap::new_full(11);
+            b.clear(3); // Clear position 3 (value 13)
+            b.clear(7); // Clear position 7 (value 17)
+            b
+        };
+        assert_eq!(
+            result,
+            U64Segment::RangeWithBitmap {
+                range: 10..21,
+                bitmap: expected_bitmap,
+            }
+        );
+
+        // Test adding value that creates additional holes
+        let result = segment.with_new_high(25).unwrap();
+        let expected_bitmap = {
+            let mut b = Bitmap::new_full(16);
+            b.clear(3); // Clear position 3 (value 13)
+            b.clear(7); // Clear position 7 (value 17)
+                        // Clear positions 10-14 (values 20-24)
+            for i in 10..15 {
+                b.clear(i);
+            }
+            b
+        };
+        assert_eq!(
+            result,
+            U64Segment::RangeWithBitmap {
+                range: 10..26,
+                bitmap: expected_bitmap,
+            }
+        );
+
+        // Test SortedArray: sparse sorted sequence
+        let segment = U64Segment::SortedArray(EncodedU64Array::U64(vec![1, 5, 10]));
+
+        let result = segment.with_new_high(15).unwrap();
+        assert_eq!(
+            result,
+            U64Segment::SortedArray(EncodedU64Array::U64(vec![1, 5, 10, 15]))
+        );
+
+        // Test Array: unsorted sequence
+        let segment = U64Segment::Array(EncodedU64Array::U64(vec![10, 5, 1]));
+
+        let result = segment.with_new_high(15).unwrap();
+        assert_eq!(
+            result,
+            U64Segment::Array(EncodedU64Array::U64(vec![10, 5, 1, 15]))
+        );
+
+        // Test edge cases
+        // Empty segment
+        let segment = U64Segment::Range(0..0);
+        let result = segment.with_new_high(5).unwrap();
+        assert_eq!(result, U64Segment::Range(5..6));
+
+        // Single value segment
+        let segment = U64Segment::Range(42..43);
+        let result = segment.with_new_high(50).unwrap();
+        assert_eq!(
+            result,
+            U64Segment::RangeWithHoles {
+                range: 42..51,
+                holes: EncodedU64Array::U64(vec![43, 44, 45, 46, 47, 48, 49]),
+            }
+        );
+    }
+
+    #[test]
+    fn test_with_new_high_assertion() {
+        let segment = U64Segment::Range(10..20);
+        // This should return an error because 15 is not higher than the current maximum 19
+        let result = segment.with_new_high(15);
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("New value 15 must be higher than current maximum 19"));
+    }
+
+    #[test]
+    fn test_with_new_high_assertion_equal() {
+        let segment = U64Segment::Range(1..6);
+        // This should return an error because 5 is not higher than the current maximum 5
+        let result = segment.with_new_high(5);
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("New value 5 must be higher than current maximum 5"));
+    }
+
+    #[test]
+    fn test_contains() {
+        // Test Range: contiguous sequence
+        let segment = U64Segment::Range(10..20);
+        assert!(segment.contains(10), "Should contain 10");
+        assert!(segment.contains(15), "Should contain 15");
+        assert!(segment.contains(19), "Should contain 19");
+        assert!(!segment.contains(9), "Should not contain 9");
+        assert!(!segment.contains(20), "Should not contain 20");
+        assert!(!segment.contains(25), "Should not contain 25");
+
+        // Test RangeWithHoles: sequence with holes
+        let segment = U64Segment::RangeWithHoles {
+            range: 10..20,
+            holes: EncodedU64Array::U64(vec![15, 17]),
+        };
+        assert!(segment.contains(10), "Should contain 10");
+        assert!(segment.contains(14), "Should contain 14");
+        assert!(!segment.contains(15), "Should not contain 15 (hole)");
+        assert!(segment.contains(16), "Should contain 16");
+        assert!(!segment.contains(17), "Should not contain 17 (hole)");
+        assert!(segment.contains(18), "Should contain 18");
+        assert!(
+            !segment.contains(20),
+            "Should not contain 20 (out of range)"
+        );
+
+        // Test RangeWithBitmap: sequence with bitmap
+        let mut bitmap = Bitmap::new_full(10);
+        bitmap.clear(3); // Clear position 3 (value 13)
+        bitmap.clear(7); // Clear position 7 (value 17)
+        let segment = U64Segment::RangeWithBitmap {
+            range: 10..20,
+            bitmap,
+        };
+        assert!(segment.contains(10), "Should contain 10");
+        assert!(segment.contains(12), "Should contain 12");
+        assert!(
+            !segment.contains(13),
+            "Should not contain 13 (cleared in bitmap)"
+        );
+        assert!(segment.contains(16), "Should contain 16");
+        assert!(
+            !segment.contains(17),
+            "Should not contain 17 (cleared in bitmap)"
+        );
+        assert!(segment.contains(19), "Should contain 19");
+        assert!(
+            !segment.contains(20),
+            "Should not contain 20 (out of range)"
+        );
+
+        // Test SortedArray: sparse sorted sequence
+        let segment = U64Segment::SortedArray(EncodedU64Array::U64(vec![1, 5, 10]));
+        assert!(segment.contains(1), "Should contain 1");
+        assert!(segment.contains(5), "Should contain 5");
+        assert!(segment.contains(10), "Should contain 10");
+        assert!(!segment.contains(0), "Should not contain 0");
+        assert!(!segment.contains(3), "Should not contain 3");
+        assert!(!segment.contains(15), "Should not contain 15");
+
+        // Test Array: unsorted sequence
+        let segment = U64Segment::Array(EncodedU64Array::U64(vec![10, 5, 1]));
+        assert!(segment.contains(1), "Should contain 1");
+        assert!(segment.contains(5), "Should contain 5");
+        assert!(segment.contains(10), "Should contain 10");
+        assert!(!segment.contains(0), "Should not contain 0");
+        assert!(!segment.contains(3), "Should not contain 3");
+        assert!(!segment.contains(15), "Should not contain 15");
+
+        // Test empty segment
+        let segment = U64Segment::Range(0..0);
+        assert!(
+            !segment.contains(0),
+            "Empty segment should not contain anything"
+        );
+        assert!(
+            !segment.contains(5),
+            "Empty segment should not contain anything"
         );
     }
 }
