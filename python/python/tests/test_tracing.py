@@ -52,3 +52,40 @@ def test_tracing():
 
     assert os.path.exists(trace_name)
     os.remove(trace_name)
+
+
+def test_tracing_callback(tmp_path):
+    script = tmp_path / "script.py"
+    script.write_text(
+        """import lance
+import pyarrow as pa
+
+from lance.tracing import capture_trace_events
+
+events = []
+def callback(evt):
+    events.append(evt)
+
+capture_trace_events(callback)
+
+lance.write_dataset(pa.table({"x": range(100)}), "memory://test")
+assert len(events) == 2
+
+print(events[0].args["mode"])
+assert events[0].target == "lance::file_audit"
+assert events[0].args["mode"] == "create"
+assert events[0].args["type"] == "data"
+
+print(events[1])
+assert events[1].target == "lance::file_audit"
+assert events[1].args["mode"] == "create"
+assert events[1].args["type"] == "manifest"
+"""
+    )
+    subprocess.run(
+        [sys.executable, script],
+        check=True,
+        env={
+            "LANCE_LOG": "debug",
+        },
+    )
