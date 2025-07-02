@@ -243,12 +243,32 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
 #[derive(Debug)]
 pub struct FsstMiniBlockDecompressor {
     symbol_table: LanceBuffer,
+    binary_encoding: pb::ArrayEncoding,
 }
 
 impl FsstMiniBlockDecompressor {
     pub fn new(description: &pb::Fsst) -> Self {
         Self {
             symbol_table: LanceBuffer::from_bytes(description.symbol_table.clone(), 1),
+            binary_encoding: description
+                .binary
+                .as_ref()
+                .expect("FSST encoding must have binary field")
+                .as_ref()
+                .clone(),
+        }
+    }
+
+    fn get_bits_per_offset(&self) -> Result<u8> {
+        use crate::format::pb::array_encoding::ArrayEncoding as ArrayEncodingEnum;
+
+        match &self.binary_encoding.array_encoding {
+            // WHY IT'S NOT Fsst?
+            Some(ArrayEncodingEnum::Variable(variable)) => Ok(variable.bits_per_offset as u8),
+            _ => Err(lance_core::Error::InvalidInput {
+                source: "FSST binary encoding must be Variable type".into(),
+                location: location!(),
+            }),
         }
     }
 }
@@ -256,9 +276,11 @@ impl FsstMiniBlockDecompressor {
 impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         // Step 1. decompress data use `BinaryMiniBlockDecompressor`
-        // TODO: detect 64 bits for FSST compressor before calling decompress function
-        let binary_decompressor =
-            Box::new(BinaryMiniBlockDecompressor::new(64)) as Box<dyn MiniBlockDecompressor>;
+        // Extract the bits_per_offset from the binary encoding
+        let bits_per_offset = self.get_bits_per_offset()?;
+        //println!("bits_per_offset =  {}", bits_per_offset);
+        let binary_decompressor = Box::new(BinaryMiniBlockDecompressor::new(bits_per_offset))
+            as Box<dyn MiniBlockDecompressor>;
         let compressed_data_block = binary_decompressor.decompress(data, num_values)?;
         let DataBlock::VariableWidth(mut compressed_data_block) = compressed_data_block else {
             panic!("BinaryMiniBlockDecompressor should output VariableWidth DataBlock")
