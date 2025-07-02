@@ -231,6 +231,9 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
             &mut decompress_offset_buf,
         )?;
 
+        // Ensure the offsets array is trimmed to exactly num_values + 1 elements
+        decompress_offset_buf.truncate((num_values + 1) as usize);
+
         Ok(DataBlock::VariableWidth(VariableWidthBlock {
             data: LanceBuffer::Owned(decompress_bytes_buf),
             offsets: LanceBuffer::reinterpret_vec(decompress_offset_buf),
@@ -276,6 +279,9 @@ impl FsstMiniBlockDecompressor {
 
 impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        // Debug: Track values from beginning
+        println!("FSST decompress: Input num_values={}", num_values);
+
         // Step 1. decompress data use `BinaryMiniBlockDecompressor`
         // Extract the bits_per_offset from the binary encoding
         let bits_per_offset = self.get_bits_per_offset()?;
@@ -287,6 +293,14 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
             panic!("BinaryMiniBlockDecompressor should output VariableWidth DataBlock")
         };
 
+        // Debug: Check what BinaryMiniBlockDecompressor returned
+        println!(
+            "FSST decompress: After BinaryMiniBlockDecompressor - num_values={}, offsets.len()={}",
+            compressed_data_block.num_values,
+            compressed_data_block.offsets.len()
+                / (compressed_data_block.bits_per_offset as usize / 8)
+        );
+
         // Step 2. FSST decompress
         let bytes = compressed_data_block.data.borrow_to_typed_slice::<u8>();
         let bytes = bytes.as_ref();
@@ -297,6 +311,11 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
                 let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i64>();
                 let offsets = offsets.as_ref();
 
+                println!(
+                    "FSST decompress: Using 64-bit offsets, input offsets.len()={}",
+                    offsets.len()
+                );
+
                 let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
                 let mut decompress_offset_buf = vec![0i64; offsets.len()];
                 fsst::fsst::decompress(
@@ -306,6 +325,21 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
                     &mut decompress_bytes_buf,
                     &mut decompress_offset_buf,
                 )?;
+
+                println!(
+                    "FSST decompress: After FSST decompress, output offsets.len()={}",
+                    decompress_offset_buf.len()
+                );
+
+                // Ensure the offsets array is trimmed to exactly num_values + 1 elements
+                decompress_offset_buf.truncate((num_values + 1) as usize);
+
+                println!(
+                    "FSST decompress: After truncate to {}, final offsets.len()={}",
+                    num_values + 1,
+                    decompress_offset_buf.len()
+                );
+
                 (
                     decompress_bytes_buf,
                     LanceBuffer::reinterpret_vec(decompress_offset_buf),
@@ -314,6 +348,11 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
             } else {
                 let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i32>();
                 let offsets = offsets.as_ref();
+
+                println!(
+                    "FSST decompress: Using 32-bit offsets, input offsets.len()={}",
+                    offsets.len()
+                );
 
                 let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
                 let mut decompress_offset_buf = vec![0i32; offsets.len()];
@@ -324,12 +363,32 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
                     &mut decompress_bytes_buf,
                     &mut decompress_offset_buf,
                 )?;
+
+                println!(
+                    "FSST decompress: After FSST decompress, output offsets.len()={}",
+                    decompress_offset_buf.len()
+                );
+
+                // Ensure the offsets array is trimmed to exactly num_values + 1 elements
+                decompress_offset_buf.truncate((num_values + 1) as usize);
+
+                println!(
+                    "FSST decompress: After truncate to {}, final offsets.len()={}",
+                    num_values + 1,
+                    decompress_offset_buf.len()
+                );
+
                 (
                     decompress_bytes_buf,
                     LanceBuffer::reinterpret_vec(decompress_offset_buf),
                     32,
                 )
             };
+
+        println!(
+            "FSST decompress: Returning DataBlock with num_values={}",
+            num_values
+        );
 
         Ok(DataBlock::VariableWidth(VariableWidthBlock {
             data: LanceBuffer::Owned(decompress_bytes_buf),
