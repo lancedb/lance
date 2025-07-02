@@ -46,7 +46,7 @@ const MAX_SYMBOL_LENGTH: usize = 8;
 
 pub const FSST_SYMBOL_TABLE_SIZE: usize = 8 + 256 * 8 + 256; // 8 bytes for the header, 256 symbols(8 bytes each), 256 bytes for lens
 
-use arrow_array::{LargeStringArray, OffsetSizeTrait};
+use arrow_array::OffsetSizeTrait;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
@@ -596,7 +596,7 @@ fn build_symbol_table<T: OffsetSizeTrait>(
             let symbol_len = st.symbols[prev_code as usize].symbol_len() as usize;
             let escape_cost = if is_escape_code(prev_code) { 1 } else { 0 };
             let gain_contribution = symbol_len.saturating_sub(1 + escape_cost);
-            gain = gain + T::from_usize(gain_contribution).unwrap();
+            gain += T::from_usize(gain_contribution).unwrap();
 
             while curr < word.len() {
                 counters.count1_inc(prev_code);
@@ -635,7 +635,7 @@ fn build_symbol_table<T: OffsetSizeTrait>(
                 let symbol_len_usize = symbol_len as usize;
                 let escape_cost = if is_escape_code(curr_code) { 1 } else { 0 };
                 let gain_contribution = symbol_len_usize.saturating_sub(1 + escape_cost);
-                gain = gain + T::from_usize(gain_contribution).unwrap();
+                gain += T::from_usize(gain_contribution).unwrap();
 
                 // no need to count pairs in final round
                 if sample_frac < 128 {
@@ -1623,6 +1623,7 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
     }
 
     fn helper_64_bit(test_input: &str) {
+        use arrow_array::LargeStringArray;
         let lines_vec = test_input.lines().collect::<Vec<&str>>();
         let string_array = LargeStringArray::from(lines_vec);
         let mut compress_output_buf: Vec<u8> = vec![0; string_array.value_data().len()];

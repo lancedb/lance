@@ -350,9 +350,6 @@ impl BlockCompressor for VariableEncoder {
                         Ok(LanceBuffer::Owned(output))
                     }
                     64 => {
-                        let num_values: u64 = num_values
-            .try_into()
-            .expect("The Maximum number of values BinaryBlockEncoder can work with is u32::MAX");
                         let offsets = variable_width_data.offsets.borrow_to_typed_slice::<u64>();
                         let offsets = offsets.as_ref();
                         // the first 8 bytes store the number of values, then 8 bytes for bytes_start_offset,
@@ -415,14 +412,36 @@ pub struct BinaryBlockDecompressor {}
 
 impl BlockDecompressor for BinaryBlockDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        // // the first 4 bytes in the BinaryBlock compressed buffer stores the num_values this block has.
+        // debug_assert_eq!(num_values, LittleEndian::read_u32(&data[..4]) as u64);
+
+        // // the next 4 bytes in the BinaryBlock compressed buffer stores the bytes_start_offset.
+        // let bytes_start_offset = LittleEndian::read_u32(&data[4..8]);
+
+        // // the next `bytes_start_offset - 8` stores the offsets.
+        // let offsets = data.slice_with_length(8, bytes_start_offset as usize - 8);
+
+        // // the rest are the binary bytes.
+        // let data = data.slice_with_length(
+        //     bytes_start_offset as usize,
+        //     data.len() - bytes_start_offset as usize,
+        // );
+
+        // Ok(DataBlock::VariableWidth(VariableWidthBlock {
+        //     data,
+        //     offsets,
+        //     bits_per_offset: 32,
+        //     num_values,
+        //     block_info: BlockInfo::new(),
+        // }))
         // the first 4 bytes in the BinaryBlock compressed buffer stores the num_values this block has.
-        debug_assert_eq!(num_values, LittleEndian::read_u32(&data[..4]) as u64);
+        debug_assert_eq!(num_values, LittleEndian::read_u64(&data[..8]));
 
         // the next 4 bytes in the BinaryBlock compressed buffer stores the bytes_start_offset.
-        let bytes_start_offset = LittleEndian::read_u32(&data[4..8]);
+        let bytes_start_offset = LittleEndian::read_u64(&data[8..16]);
 
-        // the next `bytes_start_offset - 8` stores the offsets.
-        let offsets = data.slice_with_length(8, bytes_start_offset as usize - 8);
+        // the next `bytes_start_offset - 16` stores the offsets.
+        let offsets = data.slice_with_length(16, bytes_start_offset as usize - 16);
 
         // the rest are the binary bytes.
         let data = data.slice_with_length(
@@ -433,7 +452,7 @@ impl BlockDecompressor for BinaryBlockDecompressor {
         Ok(DataBlock::VariableWidth(VariableWidthBlock {
             data,
             offsets,
-            bits_per_offset: 32,
+            bits_per_offset: 64,
             num_values,
             block_info: BlockInfo::new(),
         }))
@@ -502,7 +521,7 @@ pub mod tests {
         );
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
         // TODO: support large binary
-        println!("test_binary_fsst");
+        //println!("test_binary_fsst");
         let field = Field::new("", DataType::LargeUtf8, true).with_metadata(field_metadata);
         //let field = Field::new("", DataType::Utf8, true).with_metadata(field_metadata);
         check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
