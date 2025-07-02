@@ -630,8 +630,11 @@ impl ExecutionPlan for StrictBatchSizeExec {
         vec![false]
     }
 
-    fn statistics(&self) -> datafusion_common::Result<Statistics> {
-        self.input.statistics()
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion_common::Result<Statistics> {
+        self.input.partition_statistics(partition)
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
