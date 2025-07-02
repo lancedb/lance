@@ -1399,6 +1399,93 @@ def test_merge_with_schema_holes(tmp_path: Path):
     assert tbl == expected
 
 
+def test_merge_columns_rowid(tmp_path: Path):
+    base_ds = lance.write_dataset(
+        pa.table({"a": range(10), "b": range(10)}), tmp_path / "base"
+    )
+
+    merged_frags = []
+    schema = None
+    for frag in base_ds.get_fragments():
+
+        def copy_row_id(batch: pa.RecordBatch) -> pa.RecordBatch:
+            return pa.record_batch(
+                {
+                    "row_id_copy": batch["_rowid"],
+                }
+            )
+
+        merged, new_schema = frag.merge_columns(copy_row_id, columns=["_rowid"])
+        merged_frags.append(merged)
+        schema = new_schema
+
+    merged_ds = lance.LanceDataset.commit(
+        base_ds.uri,
+        lance.LanceOperation.Merge(merged_frags, schema),
+        read_version=base_ds.version,
+    )
+
+    assert merged_ds.to_table() == pa.table(
+        {
+            "a": range(10),
+            "b": range(10),
+            "row_id_copy": pa.array(range(10), pa.uint64()),
+        }
+    )
+
+
+def test_merge_separate_dataset(tmp_path: Path):
+    base_ds = lance.write_dataset(
+        pa.table({"a": range(10), "b": range(10)}), tmp_path / "base"
+    )
+
+    def create_view():
+        for batch in base_ds.to_batches(columns=["a"], with_row_id=True):
+            new_batch = pa.record_batch(
+                {
+                    "original_row_id": batch["_rowid"],
+                    "double_a": pc.multiply(batch["a"], 2),
+                }
+            )
+            yield new_batch
+
+    schema = list(create_view())[0].schema
+
+    view_ds = lance.write_dataset(create_view(), tmp_path / "view", schema=schema)
+    view_ds.create_scalar_index("original_row_id", "BTREE")
+
+    merged_frags = []
+    schema = None
+    for frag in base_ds.get_fragments():
+        # TODO: It would be nice to use frag.merge_columns with a UDF, but if the UDF
+        # reads from another dataset, we will get a deadlock.
+        table = frag.to_table(with_row_id=True)
+        min_id = table["_rowid"][0]
+        max_id = table["_rowid"][-1]
+        view_table = view_ds.to_table(
+            columns=["double_a"],
+            filter=f"original_row_id >= {min_id} and original_row_id <= {max_id}",
+        )
+        if view_table.num_rows != table.num_rows:
+            raise ValueError(
+                f"Expected {table.num_rows} rows, got {view_table.num_rows}"
+            )
+
+        merged, new_schema = frag.merge_columns(view_table)
+        merged_frags.append(merged)
+        schema = new_schema
+
+    merged_ds = lance.LanceDataset.commit(
+        base_ds.uri,
+        lance.LanceOperation.Merge(merged_frags, schema),
+        read_version=base_ds.version,
+    )
+
+    assert merged_ds.to_table() == pa.table(
+        {"a": range(10), "b": range(10), "double_a": range(0, 20, 2)}
+    )
+
+
 def test_merge_search(tmp_path: Path):
     left_table = pa.Table.from_pydict({"id": [1, 2, 3], "left": ["a", "b", "c"]})
     right_table = pa.Table.from_pydict({"id": [1, 2, 3], "right": ["A", "B", "C"]})
