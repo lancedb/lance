@@ -236,9 +236,6 @@ impl BinaryMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
-    // decompress a MiniBlock of binary data, the num_values must be less than or equal
-    // to the number of values this MiniBlock has, BinaryMiniBlock doesn't store `the number of values`
-    // it has so assertion can not be done here and the caller of `decompress` must ensure `num_values` <= number of values in the chunk.
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
         let data = data.into_iter().next().unwrap();
@@ -412,32 +409,11 @@ pub struct BinaryBlockDecompressor {}
 
 impl BlockDecompressor for BinaryBlockDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        // // the first 4 bytes in the BinaryBlock compressed buffer stores the num_values this block has.
-        // debug_assert_eq!(num_values, LittleEndian::read_u32(&data[..4]) as u64);
+        // the first 8 bytes in the BinaryBlock compressed buffer stores the num_values this block has.
+        let stored_num_values = LittleEndian::read_u64(&data[..8]);
+        debug_assert_eq!(num_values, stored_num_values);
 
-        // // the next 4 bytes in the BinaryBlock compressed buffer stores the bytes_start_offset.
-        // let bytes_start_offset = LittleEndian::read_u32(&data[4..8]);
-
-        // // the next `bytes_start_offset - 8` stores the offsets.
-        // let offsets = data.slice_with_length(8, bytes_start_offset as usize - 8);
-
-        // // the rest are the binary bytes.
-        // let data = data.slice_with_length(
-        //     bytes_start_offset as usize,
-        //     data.len() - bytes_start_offset as usize,
-        // );
-
-        // Ok(DataBlock::VariableWidth(VariableWidthBlock {
-        //     data,
-        //     offsets,
-        //     bits_per_offset: 32,
-        //     num_values,
-        //     block_info: BlockInfo::new(),
-        // }))
-        // the first 4 bytes in the BinaryBlock compressed buffer stores the num_values this block has.
-        debug_assert_eq!(num_values, LittleEndian::read_u64(&data[..8]));
-
-        // the next 4 bytes in the BinaryBlock compressed buffer stores the bytes_start_offset.
+        // the next 8 bytes in the BinaryBlock compressed buffer stores the bytes_start_offset.
         let bytes_start_offset = LittleEndian::read_u64(&data[8..16]);
 
         // the next `bytes_start_offset - 16` stores the offsets.
