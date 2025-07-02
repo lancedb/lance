@@ -731,6 +731,7 @@ mod tests {
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
                 fields_modified: vec![],
+                mem_wal_to_flush: None,
             },
             read_version: 1,
             blobs_op: None,

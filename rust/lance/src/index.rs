@@ -17,12 +17,14 @@ use itertools::Itertools;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tracing::{
-    IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS,
+    IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR,
+    TRACE_IO_EVENTS,
 };
 use lance_file::reader::FileReader;
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_index::frag_reuse::{FragReuseIndex, FRAG_REUSE_INDEX_NAME};
+use lance_index::mem_wal::{MemWalIndex, MEM_WAL_INDEX_NAME};
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
     FtsQueryParser, IndexInformationProvider, LabelListQueryParser, MultiQueryParser,
@@ -71,6 +73,7 @@ use vector::utils::get_vector_type;
 pub(crate) mod append;
 pub(crate) mod cache;
 pub mod frag_reuse;
+pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
 pub mod vector;
@@ -83,6 +86,7 @@ use self::scalar::build_scalar_index;
 use self::vector::{build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX};
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+use crate::index::mem_wal::open_mem_wal_index;
 use crate::index::vector::remap_vector_index;
 use crate::{dataset::Dataset, Error, Result};
 
@@ -900,6 +904,12 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<Arc<FragReuseIndex>>>;
 
+    /// Opens the MemWAL index
+    async fn open_mem_wal_index(
+        &self,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<Arc<MemWalIndex>>>;
+
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
 
@@ -1164,7 +1174,7 @@ impl DatasetIndexInternalExt for Dataset {
         if let Some(fri_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
             let uuid = fri_meta.uuid.to_string();
             if let Some(index) = self.session.index_cache.get_frag_reuse(&uuid) {
-                log::debug!("Found vector index in cache uuid: {}", uuid);
+                log::debug!("Found fragment reuse index in cache uuid: {}", uuid);
                 return Ok(Some(index));
             }
 
@@ -1181,6 +1191,35 @@ impl DatasetIndexInternalExt for Dataset {
             self.session
                 .index_cache
                 .insert_frag_reuse(&uuid, index.clone());
+            Ok(Some(index))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn open_mem_wal_index(
+        &self,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<Arc<MemWalIndex>>> {
+        if let Some(mem_wal_meta) = self.load_index_by_name(MEM_WAL_INDEX_NAME).await? {
+            let uuid = mem_wal_meta.uuid.to_string();
+            if let Some(index) = self.session.index_cache.get_mem_wal(&uuid) {
+                log::debug!("Found MemWAL index in cache uuid: {}", uuid);
+                return Ok(Some(index));
+            }
+
+            let index_meta = self.load_index(&uuid).await?.ok_or_else(|| Error::Index {
+                message: format!("Index with id {} does not exist", uuid),
+                location: location!(),
+            })?;
+            let index = open_mem_wal_index(index_meta)?;
+
+            info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_MEM_WAL);
+            metrics.record_index_load();
+
+            self.session
+                .index_cache
+                .insert_mem_wal(&uuid, index.clone());
             Ok(Some(index))
         } else {
             Ok(None)

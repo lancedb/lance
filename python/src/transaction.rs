@@ -93,6 +93,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     updated_fragments,
                     new_fragments,
                     fields_modified,
+                    mem_wal_to_flush: None,
                 };
                 Ok(Self(op))
             }
@@ -217,6 +218,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
                 let updated_fragments = export_vec(py, updated_fragments.as_slice())?;

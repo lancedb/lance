@@ -6,6 +6,7 @@ use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_
 use crate::Dataset;
 use lance_core::Error;
 use lance_index::frag_reuse::{FragReuseIndexDetails, FragReuseVersion, FRAG_REUSE_INDEX_NAME};
+use lance_index::is_system_index;
 use lance_table::format::Index;
 use lance_table::io::manifest::read_manifest_indexes;
 use log::warn;
@@ -102,7 +103,7 @@ fn is_index_remap_caught_up(
     frag_reuse_version: &FragReuseVersion,
     index_meta: &Index,
 ) -> lance_core::Result<bool> {
-    if index_meta.name == FRAG_REUSE_INDEX_NAME {
+    if is_system_index(index_meta) {
         return Ok(true);
     }
 
