@@ -48,6 +48,14 @@ jobs:
       CC: clang-18
       CXX: clang++-18
     steps:
+      # Remove not needed tools from runner
+      - uses: easimon/maximize-build-space@v10
+        with:
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
+          remove-docker-images: true
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -103,6 +111,14 @@ jobs:
         shell: bash
         working-directory: python
     steps:
+      # Remove not needed tools from runner
+      - uses: easimon/maximize-build-space@v10
+        with:
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
+          remove-docker-images: true
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -221,6 +237,14 @@ jobs:
         shell: bash
         working-directory: python
     steps:
+      # Remove not needed tools from runner
+      - uses: easimon/maximize-build-space@v10
+        with:
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
+          remove-docker-images: true
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
