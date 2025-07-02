@@ -241,12 +241,16 @@ impl BlockingDataset {
         Ok(())
     }
 
-    pub fn replace_field_metadata(&mut self, metadata_map: HashMap<String, HashMap<String, String>>) -> Result<()> {
+    pub fn replace_field_metadata(
+        &mut self,
+        metadata_map: HashMap<String, HashMap<String, String>>,
+    ) -> Result<()> {
         let schema = self.inner.schema();
         let mut new_field_meta: HashMap<u32, HashMap<String, String>> = HashMap::new();
         for (field_name, metadata) in metadata_map {
-            let field = schema.field(field_name.as_str())
-                .ok_or_else(|| Error::runtime_error(format!("Field \"{}\" not found", field_name)))?;
+            let field = schema.field(field_name.as_str()).ok_or_else(|| {
+                Error::runtime_error(format!("Field \"{}\" not found", field_name))
+            })?;
             new_field_meta.insert(field.id as u32, metadata);
         }
         println!("new_field_meta: {:?}", new_field_meta);
@@ -1592,7 +1596,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceSchemaMetadat
 ) {
     ok_or_throw_without_return!(
         env,
-        inner_replace_schema_metadata(&mut env, java_dataset, jschema_metadata))
+        inner_replace_schema_metadata(&mut env, java_dataset, jschema_metadata)
+    )
 }
 
 fn inner_replace_schema_metadata(
@@ -1608,18 +1613,19 @@ fn inner_replace_schema_metadata(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceFieldMetadata<'local>(
-    mut env: JNIEnv<'local>,
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceFieldMetadata(
+    mut env: JNIEnv,
     java_dataset: JObject,
     jfield_metadata_map: JObject,
 ) {
     ok_or_throw_without_return!(
         env,
-        inner_replace_field_metadata(&mut env, java_dataset, jfield_metadata_map))
+        inner_replace_field_metadata(&mut env, java_dataset, jfield_metadata_map)
+    )
 }
 
-fn inner_replace_field_metadata<'local>(
-    env: &mut JNIEnv<'local>,
+fn inner_replace_field_metadata(
+    env: &mut JNIEnv,
     java_dataset: JObject,
     jfield_metadata_map: JObject,
 ) -> Result<()> {
