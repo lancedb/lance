@@ -202,6 +202,7 @@ impl FsstPerValueDecompressor {
 
 impl VariablePerValueDecompressor for FsstPerValueDecompressor {
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
+        // TODO: extend me to support 64 bits
         // Step 1. Run inner decompressor
         let mut compressed_variable_data = self
             .inner_decompressor
