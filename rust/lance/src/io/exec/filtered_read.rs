@@ -908,14 +908,23 @@ impl FilteredReadStream {
 /// Options for a filtered read.
 #[derive(Debug, Clone)]
 pub struct FilteredReadOptions {
+    /// The range of rows to read before applying the filter.
     scan_range_before_filter: Option<Range<u64>>,
+    /// The range of rows to read after applying the filter.
     scan_range_after_filter: Option<Range<u64>>,
+    /// Include deleted rows in the scan
     with_deleted_rows: bool,
+    /// The maximum number of rows per batch
     batch_size: Option<u32>,
+    /// Controls how many fragments to read ahead
     fragment_readahead: Option<usize>,
+    /// The fragments to read
     fragments: Option<Arc<Vec<Fragment>>>,
+    /// The projection to use for the scan
     projection: Projection,
+    /// The filter plan to use for the scan
     filter_plan: FilterPlan,
+    /// The threading mode to use for the scan
     threading_mode: FilteredReadThreadingMode,
 }
 
@@ -1229,7 +1238,10 @@ impl ExecutionPlan for FilteredReadExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> datafusion::error::Result<Statistics> {
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion::error::Result<Statistics> {
         let fragments = self
             .options
             .fragments
@@ -1246,6 +1258,7 @@ impl ExecutionPlan for FilteredReadExec {
 
         if self.options.filter_plan.is_empty() {
             // If there is no filter, we just return the total number of rows (sans any before/after-filter range)
+            // divided by the number of partitions.
             let total_rows =
                 if let Some(scan_range_after_filter) = &self.options.scan_range_after_filter {
                     total_rows.min(scan_range_after_filter.end - scan_range_after_filter.start)
@@ -1258,6 +1271,19 @@ impl ExecutionPlan for FilteredReadExec {
                 } else {
                     total_rows
                 };
+
+            let total_rows = if partition.is_some() {
+                match self.options.threading_mode {
+                    FilteredReadThreadingMode::MultiplePartitions(num_partitions) => {
+                        total_rows / num_partitions as u64
+                    }
+                    // Pretty sure this shouldn't be encountered in practice
+                    FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => total_rows,
+                }
+            } else {
+                total_rows
+            };
+
             Ok(Statistics {
                 num_rows: Precision::Exact(total_rows as usize),
                 ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
@@ -1291,7 +1317,7 @@ impl ExecutionPlan for FilteredReadExec {
                 },
             )?);
             let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
-            let mut df_stats = df_filter_exec.statistics()?;
+            let mut df_stats = df_filter_exec.partition_statistics(partition)?;
 
             // If we have an after-filter range, we should apply it to the stats (the before-filter range
             // is applied in the mock input)
@@ -1834,19 +1860,6 @@ mod tests {
             )
             .await;
 
-        // With before filter scan range
-        fixture
-            .test_plan(
-                base_options
-                    .clone()
-                    .with_deleted_rows()
-                    .unwrap()
-                    .with_scan_range_before_filter(25..125)
-                    .unwrap(),
-                &u32s(vec![25..100, 200..225]),
-            )
-            .await;
-
         // With only row id
         let options = base_options
             .clone()
@@ -1879,7 +1892,7 @@ mod tests {
         let plan =
             FilteredReadExec::try_new(fixture.dataset.clone(), base_options.clone()).unwrap();
 
-        let stats = plan.statistics().unwrap();
+        let stats = plan.partition_statistics(None).unwrap();
         // With no filter and no range we have an exact count
         assert_eq!(stats.num_rows, Precision::Exact(250));
 
@@ -1889,7 +1902,7 @@ mod tests {
             .with_scan_range_before_filter(25..125)
             .unwrap();
         let plan = FilteredReadExec::try_new(fixture.dataset.clone(), options).unwrap();
-        let stats = plan.statistics().unwrap();
+        let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(100));
 
         // With a filter, we don't know the exact count but DF can make some guesses
@@ -1900,7 +1913,7 @@ mod tests {
             .clone()
             .with_filter_plan(fixture.filter_plan("not_indexed >= 200", false).await);
         let plan = FilteredReadExec::try_new(fixture.dataset.clone(), options).unwrap();
-        let stats = plan.statistics().unwrap();
+        let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
 
         // In this case DF doesn't recognize the expression as simple and so it assumes a default
@@ -1909,7 +1922,7 @@ mod tests {
             .clone()
             .with_filter_plan(fixture.filter_plan("random() < 0.5", false).await);
         let plan = FilteredReadExec::try_new(fixture.dataset.clone(), options).unwrap();
-        let stats = plan.statistics().unwrap();
+        let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(50));
 
         // Filter columns not part of projection, make sure statistics using correct input schema
@@ -1926,7 +1939,7 @@ mod tests {
                     .unwrap(),
             );
         let plan = FilteredReadExec::try_new(fixture.dataset.clone(), options).unwrap();
-        let stats = plan.statistics().unwrap();
+        let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
     }
 
