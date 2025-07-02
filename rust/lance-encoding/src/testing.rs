@@ -202,7 +202,6 @@ async fn test_decode(
             let expected_size = (batch_size as usize).min(expected.len() - offset);
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
-            println!("expected={}, actual={}", expected.len(), actual.len());
             if expected.len() != actual.len() {
                 panic!(
                     "Mismatch in length (at offset={}) expected {} but got {}",
@@ -265,8 +264,6 @@ pub async fn check_round_trip_encoding_random(field: Field, version: LanceFileVe
     let array_generator_provider = RandomArrayGeneratorProvider {
         field: field.clone(),
     };
-
-    let test_cases = TestCases::default().with_batch_size(50);
     check_round_trip_encoding_generated(field, Box::new(array_generator_provider), version).await;
 }
 

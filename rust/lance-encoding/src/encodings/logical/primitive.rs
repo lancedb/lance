@@ -549,14 +549,35 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 / dictionary.num_values();
             let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
-            // if dictionary encoding is applied, indices are of type `Int32`
+            // if dictionary encoding is applied, decode indices based on their actual bit width
             if let DataBlock::FixedWidth(mut fixed_width_data_block) = data {
-                let indices = fixed_width_data_block.data.borrow_to_typed_slice::<i32>();
-                let indices = indices.as_ref();
+                match fixed_width_data_block.bits_per_value {
+                    32 => {
+                        let indices = fixed_width_data_block.data.borrow_to_typed_slice::<i32>();
+                        let indices = indices.as_ref();
 
-                indices.iter().for_each(|&idx| {
-                    data_builder.append(dictionary, idx as u64..idx as u64 + 1);
-                });
+                        indices.iter().for_each(|&idx| {
+                            data_builder.append(dictionary, idx as u64..idx as u64 + 1);
+                        });
+                    }
+                    64 => {
+                        let indices = fixed_width_data_block.data.borrow_to_typed_slice::<i64>();
+                        let indices = indices.as_ref();
+
+                        indices.iter().for_each(|&idx| {
+                            data_builder.append(dictionary, idx as u64..idx as u64 + 1);
+                        });
+                    }
+                    _ => {
+                        return Err(lance_core::Error::Internal {
+                            message: format!(
+                                "Unsupported dictionary index bit width: {} bits",
+                                fixed_width_data_block.bits_per_value
+                            ),
+                            location: location!(),
+                        });
+                    }
+                }
 
                 let data = data_builder.finish();
                 return Ok(DecodedPage {
@@ -1130,8 +1151,10 @@ impl MiniBlockScheduler {
             .iter()
             .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
-        let value_decompressor = decompressors
-            .create_miniblock_decompressor(layout.value_compression.as_ref().unwrap())?;
+        let value_decompressor = decompressors.create_miniblock_decompressor(
+            layout.value_compression.as_ref().unwrap(),
+            decompressors,
+        )?;
 
         let dictionary = if let Some(dictionary_encoding) = layout.dictionary.as_ref() {
             let num_dictionary_items = layout.num_dictionary_items;

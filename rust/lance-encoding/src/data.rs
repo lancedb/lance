@@ -269,13 +269,6 @@ impl<T: OffsetSizeTrait> VariableWidthDataBlockBuilder<T> {
 
 impl<T: OffsetSizeTrait> DataBlockBuilderImpl for VariableWidthDataBlockBuilder<T> {
     fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
-        println!(
-            "VariableWidthDataBlockBuilder::append - selection={:?}, current offsets.len()={}, appending block with {} values",
-            selection,
-            self.offsets.len(),
-            selection.end - selection.start
-        );
-
         let block = data_block.as_variable_width_ref().unwrap();
         assert!(block.bits_per_offset == T::get_byte_width() as u8 * 8);
 
@@ -298,21 +291,10 @@ impl<T: OffsetSizeTrait> DataBlockBuilderImpl for VariableWidthDataBlockBuilder<
                     T::from_usize(previous_len).unwrap()
                 }),
         );
-
-        println!(
-            "VariableWidthDataBlockBuilder::append - after append, offsets.len()={}",
-            self.offsets.len()
-        );
     }
 
     fn finish(self: Box<Self>) -> DataBlock {
         let num_values = (self.offsets.len() - 1) as u64;
-        println!(
-            "VariableWidthDataBlockBuilder::finish - offsets.len()={}, calculated num_values={}",
-            self.offsets.len(),
-            num_values
-        );
-
         DataBlock::VariableWidth(VariableWidthBlock {
             data: LanceBuffer::Owned(self.bytes),
             offsets: LanceBuffer::reinterpret_vec(self.offsets),
@@ -676,13 +658,6 @@ pub struct VariableWidthBlock {
 
 impl VariableWidthBlock {
     fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
-        println!(
-            "VariableWidthBlock::into_arrow - num_values={}, offsets.len()={}, bits_per_offset={}",
-            self.num_values,
-            self.offsets.len() / (self.bits_per_offset as usize / 8),
-            self.bits_per_offset
-        );
-
         let data_buffer = self.data.into_buffer();
         let offsets_buffer = self.offsets.into_buffer();
         let builder = ArrayDataBuilder::new(data_type)

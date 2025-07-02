@@ -18,9 +18,8 @@ const FSST_CODE_MASK: u16 = FSST_CODE_MAX - 1;
 const FSST_SAMPLETARGET: usize = 1 << 14;
 const FSST_SAMPLEMAXSZ: usize = 2 * FSST_SAMPLETARGET;
 
-// if the input size is less than 4MB, we mark the file header and copy the input to the output as is
-//  TODO: FIX ME.
-pub const FSST_LEAST_INPUT_SIZE: usize = 32 * 1024; // 4MB
+// if the input size is less than 32 KB, we mark the file header and copy the input to the output as is
+pub const FSST_LEAST_INPUT_SIZE: usize = 32 * 1024;
 
 // if the max length of the input strings are less than `FSST_LEAST_INPUT_MAX_LENGTH`, we shouldn't use FSST.
 pub const FSST_LEAST_INPUT_MAX_LENGTH: u64 = 5;
@@ -559,9 +558,8 @@ fn build_symbol_table<T: OffsetSizeTrait>(
 ) -> io::Result<Box<SymbolTable>> {
     let mut st = SymbolTable::new();
     let mut best_table = SymbolTable::new();
-    // TODO FIX ME!!!!
-    //let mut best_gain = -1 * T::from_usize(FSST_SAMPLEMAXSZ).unwrap(); // worst case (everything exception)
-    let mut best_gain = T::from_usize(0).unwrap(); // Start with 0, will be updated during iteration
+    // worst case (everything exception), will be updated later
+    let mut best_gain = T::zero() - T::from_usize(FSST_SAMPLEMAXSZ).unwrap();
 
     let mut byte_histo = [0; 256];
     for c in &sample_buf {
@@ -592,7 +590,7 @@ fn build_symbol_table<T: OffsetSizeTrait>(
             let mut prev_code = st.find_longest_symbol_from_char_slice(&word[curr..]);
             curr += st.symbols[prev_code as usize].symbol_len() as usize;
 
-            // Fix the gain calculation - avoid arithmetic on Option<T>
+            // Avoid arithmetic on Option<T>
             let symbol_len = st.symbols[prev_code as usize].symbol_len() as usize;
             let escape_cost = if is_escape_code(prev_code) { 1 } else { 0 };
             let gain_contribution = symbol_len.saturating_sub(1 + escape_cost);
@@ -631,7 +629,7 @@ fn build_symbol_table<T: OffsetSizeTrait>(
                     symbol_len = st.symbols[curr_code as usize].symbol_len();
                 }
 
-                // Fix the gain calculation
+                // Avoid arithmetic on Option<T>
                 let symbol_len_usize = symbol_len as usize;
                 let escape_cost = if is_escape_code(curr_code) { 1 } else { 0 };
                 let gain_contribution = symbol_len_usize.saturating_sub(1 + escape_cost);
@@ -828,12 +826,6 @@ fn decompress_bulk<T: OffsetSizeTrait>(
             let escape_mask = (next_block & 0x80808080u32)
                 & ((((!next_block) & 0x7F7F7F7Fu32) + 0x7F7F7F7Fu32) ^ 0x80808080u32);
             if escape_mask == 0 {
-                // Ensure we have enough space for all 4 bytes (worst case: 4 * MAX_SYMBOL_LENGTH)
-                let required_space = *out_curr + 4 * MAX_SYMBOL_LENGTH;
-                if required_space > out.len() {
-                    out.resize(required_space.max(out.len() * 2), 0);
-                }
-
                 // 0th byte
                 code = compressed_strs[in_curr] as usize;
                 len = lens[code] as usize;
@@ -874,12 +866,6 @@ fn decompress_bulk<T: OffsetSizeTrait>(
                 in_curr += 1;
                 *out_curr += len;
             } else {
-                // Ensure space needed for escape cases (worst case: 3 * MAX_SYMBOL_LENGTH + 1 escape byte)
-                let required_space = *out_curr + 3 * MAX_SYMBOL_LENGTH + 1;
-                if required_space > out.len() {
-                    out.resize(required_space.max(out.len() * 2), 0);
-                }
-
                 let first_escape_pos = escape_mask.trailing_zeros() >> 3;
                 if first_escape_pos == 3 {
                     // 0th byte
@@ -967,12 +953,6 @@ fn decompress_bulk<T: OffsetSizeTrait>(
 
         // handle the remaining bytes
         if in_curr + 2 <= in_end {
-            // Ensure we have enough space for the next operations
-            let required_space = *out_curr + MAX_SYMBOL_LENGTH + 1; // +1 for escape byte
-            if required_space > out.len() {
-                out.resize(required_space.max(out.len() * 2), 0); // Double the size to avoid frequent resizing
-            }
-
             out[*out_curr] = compressed_strs[in_curr + 1];
             if compressed_strs[in_curr] != FSST_ESC {
                 let code = compressed_strs[in_curr] as usize;
@@ -984,10 +964,6 @@ fn decompress_bulk<T: OffsetSizeTrait>(
                 *out_curr += lens[code] as usize;
                 if compressed_strs[in_curr] != FSST_ESC {
                     let code = compressed_strs[in_curr] as usize;
-                    let required_space = *out_curr + lens[code] as usize;
-                    if required_space > out.len() {
-                        out.resize(required_space.max(out.len() * 2), 0);
-                    }
                     unsafe {
                         let src = symbols[code];
                         ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
