@@ -46,14 +46,10 @@ pub(crate) fn open_mem_wal_index(index: Index) -> Result<Arc<MemWalIndex>> {
 /// Find the latest generation
 pub async fn find_latest_mem_wal_generation(
     dataset: &Dataset,
-    region: &str
+    region: &str,
 ) -> Result<Option<MemWal>> {
-    if let Some(mem_wal_index) =
-        dataset.open_mem_wal_index(&NoOpMetricsCollector).await?
-    {
-        if let Some(generations) =
-            mem_wal_index.mem_wal_map.get(region)
-        {
+    if let Some(mem_wal_index) = dataset.open_mem_wal_index(&NoOpMetricsCollector).await? {
+        if let Some(generations) = mem_wal_index.mem_wal_map.get(region) {
             // MemWALs of the same region is ordered increasingly by its generation
             let mut values_iter = generations.values().rev();
             if let Some(latest_mem_wal) = values_iter.next() {
