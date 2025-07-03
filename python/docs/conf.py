@@ -5,7 +5,7 @@ import os
 
 # -- Project information -----------------------------------------------------
 
-project = "Lance"
+project = "pylance"
 copyright = "%Y, Lance Developer"
 author = "Lance Developer"
 
