@@ -10,17 +10,17 @@ build:
     rust: "1.86"
   jobs:
     pre_build:
-      - python -m pip install --upgrade pip setuptools wheel maturin
-      - maturin develop --release
+      - cd python && python -m pip install --upgrade pip setuptools wheel maturin
+      - cd python && maturin develop --release
 
 python:
   install:
-    - requirements: docs/requirements.txt
+    - requirements: python/docs/requirements.txt
     - method: pip
       path: python
 
 sphinx:
-  configuration: docs/source/conf.py
+  configuration: python/docs/source/conf.py
 
 formats:
   - htmlzip

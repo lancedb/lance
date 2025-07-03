@@ -9,7 +9,7 @@ project = "Lance"
 copyright = "%Y, Lance Developer"
 author = "Lance Developer"
 
-sys.path.insert(0, os.path.abspath("../python"))
+sys.path.insert(0, os.path.abspath(".."))
 
 
 # -- General configuration ---------------------------------------------------
