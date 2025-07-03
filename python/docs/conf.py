@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
 # Configuration file for the Sphinx documentation builder.
 
 import sys
