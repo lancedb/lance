@@ -20,7 +20,7 @@ python:
       path: python
 
 sphinx:
-  configuration: python/docs/source/conf.py
+  configuration: python/docs/conf.py
 
 formats:
   - htmlzip

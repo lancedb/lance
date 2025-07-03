@@ -37,6 +37,7 @@ trace-*.json
 **/*~
 **/__pycache__
 build/
+_build/
 dist/
 *.egg-info/
 .python-version

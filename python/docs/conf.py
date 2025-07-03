@@ -54,6 +54,11 @@ intersphinx_disabled_domains = ['std']
 # -- Options for HTML output -------------------------------------------------
 
 html_theme = 'sphinx_rtd_theme'
+html_theme_options = {
+    "collapse_navigation": False,   # Show all entries expanded
+    "navigation_depth": 4,          # Show nested headings
+    "titles_only": False            # Show both page titles and section titles
+}
 
 # -- doctest configuration ---------------------------------------------------
 
