@@ -617,6 +617,10 @@ impl FileWriter {
         Ok(self.rows_written)
     }
 
+    pub async fn abort(&mut self) {
+        self.writer.abort().await;
+    }
+
     pub async fn tell(&mut self) -> Result<u64> {
         Ok(self.writer.tell().await? as u64)
     }
