@@ -2922,7 +2922,8 @@ mod tests {
         // Get initial counts for some word searches
         // Extract some test words from the generated documents
         let large_string_array = doc_col.as_any().downcast_ref::<LargeStringArray>().unwrap();
-        let sample_words: Vec<String> = large_string_array.value(0)
+        let sample_words: Vec<String> = large_string_array
+            .value(0)
             .split_whitespace()
             .take(10)
             .map(|s| s.to_string())
@@ -3063,7 +3064,8 @@ mod tests {
         // Get initial counts for some word searches
         // Extract some test words from the generated documents
         let large_string_array = doc_col.as_any().downcast_ref::<LargeStringArray>().unwrap();
-        let sample_words: Vec<String> = large_string_array.value(0)
+        let sample_words: Vec<String> = large_string_array
+            .value(0)
             .split_whitespace()
             .take(10)
             .map(|s| s.to_string())

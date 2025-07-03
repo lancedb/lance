@@ -2292,7 +2292,11 @@ pub mod array {
     /// Create a generator of random sentences
     ///
     /// Generates strings containing between min_words and max_words random English words joined by spaces
-    pub fn random_sentence(min_words: usize, max_words: usize, is_large: bool) -> Box<dyn ArrayGenerator> {
+    pub fn random_sentence(
+        min_words: usize,
+        max_words: usize,
+        is_large: bool,
+    ) -> Box<dyn ArrayGenerator> {
         Box::new(RandomSentenceGenerator::new(min_words, max_words, is_large))
     }
 

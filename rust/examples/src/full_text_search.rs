@@ -28,13 +28,13 @@ async fn main() {
     const TOTAL: usize = 10_000_000;
     let tempdir = tempfile::tempdir().unwrap();
     let dataset_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
-    
+
     let create_index = true;
     if create_index {
         let row_id_col = Arc::new(UInt64Array::from(
             (0..TOTAL).map(|i| i as u64).collect_vec(),
         ));
-        
+
         // Generate random words using lance-datagen
         let mut words_gen = array::random_sentence(1, 100, true);
         let doc_col = words_gen

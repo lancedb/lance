@@ -47,7 +47,7 @@ fn bench_inverted(c: &mut Criterion) {
     let row_id_col = Arc::new(UInt64Array::from(
         (0..TOTAL).map(|i| i as u64).collect_vec(),
     ));
-    
+
     // Generate random words with 1-100 words per document
     let mut words_gen = array::random_sentence(1, 100, true);
     let doc_col = words_gen
@@ -82,12 +82,15 @@ fn bench_inverted(c: &mut Criterion) {
 
     let params = FtsSearchParams::new().with_limit(Some(10));
     let no_filter = Arc::new(NoFilter);
-    
+
     // Get some sample words from the generated documents for search
     let large_string_array = doc_col.as_any().downcast_ref::<LargeStringArray>().unwrap();
     let sample_doc = large_string_array.value(0);
-    let sample_words: Vec<String> = sample_doc.split_whitespace().map(|s| s.to_owned()).collect();
-    
+    let sample_words: Vec<String> = sample_doc
+        .split_whitespace()
+        .map(|s| s.to_owned())
+        .collect();
+
     c.bench_function(format!("invert_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             // Pick a random word from our sample

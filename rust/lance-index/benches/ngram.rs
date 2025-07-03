@@ -42,7 +42,7 @@ fn bench_ngram(c: &mut Criterion) {
     let row_id_col = Arc::new(UInt64Array::from(
         (0..TOTAL).map(|i| i as u64).collect_vec(),
     ));
-    
+
     // Generate random words with 1-30 words per document
     let mut words_gen = array::random_sentence(1, 30, false);
     let doc_col = words_gen
