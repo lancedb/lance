@@ -10,6 +10,8 @@ build:
     rust: "1.86"
   jobs:
     pre_build:
+      - apt update
+      - apt install -y protobuf-compiler libssl-dev
       - cd python && python -m pip install --upgrade pip setuptools wheel maturin
       - cd python && maturin develop --release
 
