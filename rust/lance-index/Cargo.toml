@@ -74,7 +74,6 @@ lance-testing.workspace = true
 tempfile.workspace = true
 test-log.workspace = true
 datafusion-sql.workspace = true
-random_word = { version = "0.4.3", features = ["en"] }
 rstest.workspace = true
 
 [features]

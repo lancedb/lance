@@ -4124,7 +4124,6 @@ dependencies = [
  "prost 0.13.5",
  "prost-types 0.13.5",
  "rand 0.8.5",
- "random_word 0.4.3",
  "roaring",
  "rstest",
  "serde",
@@ -4244,7 +4243,7 @@ dependencies = [
  "pprof",
  "rand 0.8.5",
  "rand_xoshiro",
- "random_word 0.5.0",
+ "random_word",
 ]
 
 [[package]]
@@ -4311,12 +4310,12 @@ dependencies = [
  "itertools 0.13.0",
  "lance",
  "lance-core",
+ "lance-datagen",
  "lance-index",
  "lance-linalg",
  "object_store",
  "parquet",
  "rand 0.8.5",
- "random_word 0.4.3",
  "tempfile",
  "tokenizers",
  "tokio",
@@ -4420,7 +4419,6 @@ dependencies = [
  "prost-build 0.13.5",
  "protobuf-src",
  "rand 0.8.5",
- "random_word 0.4.3",
  "rayon",
  "roaring",
  "rstest",
@@ -6237,20 +6235,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
 dependencies = [
  "rand_core 0.6.4",
-]
-
-[[package]]
-name = "random_word"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07eed67a16dde2cc3c7f65c072acd8d5b2e53d4aab95067c320db851c7651f29"
-dependencies = [
- "ahash",
- "brotli 3.5.0",
- "once_cell",
- "paste",
- "rand 0.8.5",
- "unicase",
 ]
 
 [[package]]

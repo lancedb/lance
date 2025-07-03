@@ -42,6 +42,7 @@ lance = { workspace = true }
 lance-index = { workspace = true }
 lance-core = { workspace = true }
 lance-linalg = { workspace = true }
+lance-datagen = { workspace = true }
 object_store = {workspace = true}
 tempfile = { workspace = true }
 tokio = { workspace = true }
@@ -50,5 +51,4 @@ env_logger = "0.11.7"
 hf-hub = "0.4.2"
 parquet = "55.1"
 tokenizers = "0.15.2"
-random_word = { version = "0.4.3", features = ["en"] }
 rand.workspace = true
