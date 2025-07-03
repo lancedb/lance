@@ -14,6 +14,7 @@ use futures::stream;
 use itertools::Itertools;
 use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
+use lance_datagen::{array, RowCount};
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Operator};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
@@ -42,28 +43,23 @@ fn bench_inverted(c: &mut Criterion) {
         ))
     });
 
-    // generate 2000 different tokens
-    let tokens = random_word::all(random_word::Lang::En);
+    // generate random words using lance-datagen
     let row_id_col = Arc::new(UInt64Array::from(
         (0..TOTAL).map(|i| i as u64).collect_vec(),
     ));
-    let docs = (0..TOTAL)
-        .map(|_| {
-            let num_words = rand::random::<usize>() % 100 + 1;
-            let doc = (0..num_words)
-                .map(|_| tokens[rand::random::<usize>() % tokens.len()])
-                .collect::<Vec<_>>();
-            doc.join(" ")
-        })
-        .collect_vec();
-    let doc_col = Arc::new(LargeStringArray::from(docs));
+
+    // Generate random words with 1-100 words per document
+    let mut words_gen = array::random_sentence(1, 100, true);
+    let doc_col = words_gen
+        .generate_default(RowCount::from(TOTAL as u64))
+        .unwrap();
     let batch = RecordBatch::try_new(
         arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("doc", arrow_schema::DataType::LargeUtf8, false),
             arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
         ])
         .into(),
-        vec![doc_col, row_id_col],
+        vec![doc_col.clone(), row_id_col],
     )
     .unwrap();
 
@@ -86,14 +82,23 @@ fn bench_inverted(c: &mut Criterion) {
 
     let params = FtsSearchParams::new().with_limit(Some(10));
     let no_filter = Arc::new(NoFilter);
+
+    // Get some sample words from the generated documents for search
+    let large_string_array = doc_col.as_any().downcast_ref::<LargeStringArray>().unwrap();
+    let sample_doc = large_string_array.value(0);
+    let sample_words: Vec<String> = sample_doc
+        .split_whitespace()
+        .map(|s| s.to_owned())
+        .collect();
+
     c.bench_function(format!("invert_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
+            // Pick a random word from our sample
+            let word_idx = rand::random::<usize>() % sample_words.len();
             black_box(
                 invert_index
                     .bm25_search(
-                        [tokens[rand::random::<usize>() % tokens.len()].to_owned()]
-                            .to_vec()
-                            .into(),
+                        vec![sample_words[word_idx].clone()].into(),
                         params.clone().into(),
                         Operator::Or,
                         no_filter.clone(),

@@ -10,12 +10,13 @@ use std::sync::Arc;
 
 use all_asserts::assert_gt;
 use arrow::array::AsArray;
-use arrow::array::{LargeStringArray, RecordBatch, RecordBatchIterator, UInt64Array};
+use arrow::array::{Array, LargeStringArray, RecordBatch, RecordBatchIterator, UInt64Array};
 use arrow::datatypes::UInt64Type;
 use arrow_schema::{DataType, Field, Schema};
 use itertools::Itertools;
 use lance::Dataset;
 use lance_core::ROW_ID;
+use lance_datagen::{array, RowCount};
 use lance_index::scalar::inverted::flat_full_text_search;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use lance_index::DatasetIndexExt;
@@ -27,24 +28,18 @@ async fn main() {
     const TOTAL: usize = 10_000_000;
     let tempdir = tempfile::tempdir().unwrap();
     let dataset_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
-    let tokens = (0..10_000)
-        .map(|_| random_word::gen(random_word::Lang::En))
-        .collect_vec();
+
     let create_index = true;
     if create_index {
         let row_id_col = Arc::new(UInt64Array::from(
             (0..TOTAL).map(|i| i as u64).collect_vec(),
         ));
-        let docs = (0..TOTAL)
-            .map(|_| {
-                let num_words = rand::random::<usize>() % 100 + 1;
-                let doc = (0..num_words)
-                    .map(|_| tokens[rand::random::<usize>() % tokens.len()])
-                    .collect::<Vec<_>>();
-                doc.join(" ")
-            })
-            .collect_vec();
-        let doc_col = Arc::new(LargeStringArray::from(docs));
+
+        // Generate random words using lance-datagen
+        let mut words_gen = array::random_sentence(1, 100, true);
+        let doc_col = words_gen
+            .generate_default(RowCount::from(TOTAL as u64))
+            .unwrap();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("doc", DataType::LargeUtf8, false),
@@ -74,7 +69,22 @@ async fn main() {
     }
 
     let dataset = Dataset::open(dataset_dir.as_ref()).await.unwrap();
-    let query_string = tokens[0];
+    // Use a sample word for query - fetch first doc and pick a word from it
+    let sample_batch = dataset
+        .scan()
+        .project(&["doc"])
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let sample_doc = sample_batch["doc"]
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .unwrap()
+        .value(0);
+    let query_string = sample_doc.split_whitespace().next().unwrap();
     let query = FullTextSearchQuery::new(query_string.to_owned()).limit(Some(10));
     println!("query: {:?}", query);
     let batch = dataset

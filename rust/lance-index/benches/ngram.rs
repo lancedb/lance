@@ -4,13 +4,14 @@
 use std::{sync::Arc, time::Duration};
 
 use arrow::array::AsArray;
-use arrow_array::{RecordBatch, StringArray, UInt64Array};
+use arrow_array::{RecordBatch, UInt64Array};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
 use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
+use lance_datagen::{array, RowCount};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions};
@@ -37,21 +38,16 @@ fn bench_ngram(c: &mut Criterion) {
         ))
     });
 
-    // generate 2000 different tokens
-    let tokens = random_word::all(random_word::Lang::En);
+    // generate random words using lance-datagen
     let row_id_col = Arc::new(UInt64Array::from(
         (0..TOTAL).map(|i| i as u64).collect_vec(),
     ));
-    let docs = (0..TOTAL)
-        .map(|_| {
-            let num_words = rand::random::<usize>() % 30 + 1;
-            let doc = (0..num_words)
-                .map(|_| tokens[rand::random::<usize>() % tokens.len()])
-                .collect::<Vec<_>>();
-            doc.join(" ")
-        })
-        .collect_vec();
-    let doc_col = Arc::new(StringArray::from(docs));
+
+    // Generate random words with 1-30 words per document
+    let mut words_gen = array::random_sentence(1, 30, false);
+    let doc_col = words_gen
+        .generate_default(RowCount::from(TOTAL as u64))
+        .unwrap();
     let batch = RecordBatch::try_new(
         arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("doc", arrow_schema::DataType::Utf8, false),

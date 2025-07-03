@@ -15,8 +15,8 @@ use arrow_array::{
     make_array,
     types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
     Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, LargeListArray,
-    ListArray, NullArray, PrimitiveArray, RecordBatch, RecordBatchOptions, RecordBatchReader,
-    StringArray, StructArray,
+    LargeStringArray, ListArray, NullArray, PrimitiveArray, RecordBatch, RecordBatchOptions,
+    RecordBatchReader, StringArray, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SchemaRef};
 use futures::{stream::BoxStream, StreamExt};
@@ -894,24 +894,26 @@ impl ArrayGenerator for RandomBinaryGenerator {
 }
 
 #[derive(Debug)]
-struct RandomWordsGenerator {
+struct RandomSentenceGenerator {
     min_words: usize,
     max_words: usize,
     words: &'static [&'static str],
+    is_large: bool,
 }
 
-impl RandomWordsGenerator {
-    fn new(min_words: usize, max_words: usize) -> Self {
+impl RandomSentenceGenerator {
+    pub fn new(min_words: usize, max_words: usize, is_large: bool) -> Self {
         let words = random_word::all(random_word::Lang::En);
         Self {
             min_words,
             max_words,
             words,
+            is_large,
         }
     }
 }
 
-impl ArrayGenerator for RandomWordsGenerator {
+impl ArrayGenerator for RandomSentenceGenerator {
     fn generate(
         &mut self,
         length: RowCount,
@@ -928,11 +930,19 @@ impl ArrayGenerator for RandomWordsGenerator {
             values.push(sentence);
         }
 
-        Ok(Arc::new(StringArray::from(values)))
+        if self.is_large {
+            Ok(Arc::new(LargeStringArray::from(values)))
+        } else {
+            Ok(Arc::new(StringArray::from(values)))
+        }
     }
 
     fn data_type(&self) -> &DataType {
-        &DataType::Utf8
+        if self.is_large {
+            &DataType::LargeUtf8
+        } else {
+            &DataType::Utf8
+        }
     }
 
     fn element_size_bytes(&self) -> Option<ByteCount> {
@@ -941,6 +951,53 @@ impl ArrayGenerator for RandomWordsGenerator {
         let avg_word_length = 6;
         let avg_words = (self.min_words + self.max_words) / 2;
         Some(ByteCount::from((avg_word_length * avg_words) as u64))
+    }
+}
+
+#[derive(Debug)]
+struct RandomWordGenerator {
+    words: &'static [&'static str],
+    is_large: bool,
+}
+
+impl RandomWordGenerator {
+    pub fn new(is_large: bool) -> Self {
+        let words = random_word::all(random_word::Lang::En);
+        Self { words, is_large }
+    }
+}
+
+impl ArrayGenerator for RandomWordGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn Array>, ArrowError> {
+        let mut values = Vec::with_capacity(length.0 as usize);
+
+        for _ in 0..length.0 {
+            let word = self.words[rng.gen_range(0..self.words.len())];
+            values.push(word.to_string());
+        }
+
+        if self.is_large {
+            Ok(Arc::new(LargeStringArray::from(values)))
+        } else {
+            Ok(Arc::new(StringArray::from(values)))
+        }
+    }
+
+    fn data_type(&self) -> &DataType {
+        if self.is_large {
+            &DataType::LargeUtf8
+        } else {
+            &DataType::Utf8
+        }
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        // Average English word length is ~5 characters
+        Some(ByteCount::from(5))
     }
 }
 
@@ -2232,11 +2289,22 @@ pub mod array {
         Box::<RandomBooleanGenerator>::default()
     }
 
-    /// Create a generator of random words
+    /// Create a generator of random sentences
     ///
-    /// Generates strings containing between min_words and max_words random English words
-    pub fn random_words(min_words: usize, max_words: usize) -> Box<dyn ArrayGenerator> {
-        Box::new(RandomWordsGenerator::new(min_words, max_words))
+    /// Generates strings containing between min_words and max_words random English words joined by spaces
+    pub fn random_sentence(
+        min_words: usize,
+        max_words: usize,
+        is_large: bool,
+    ) -> Box<dyn ArrayGenerator> {
+        Box::new(RandomSentenceGenerator::new(min_words, max_words, is_large))
+    }
+
+    /// Create a generator of random words (one word per row)
+    ///
+    /// Generates strings containing a single random English word per row
+    pub fn random_word(is_large: bool) -> Box<dyn ArrayGenerator> {
+        Box::new(RandomWordGenerator::new(is_large))
     }
 
     pub fn rand_list(item_type: &DataType, is_large: bool) -> Box<dyn ArrayGenerator> {
@@ -2483,7 +2551,7 @@ mod tests {
             arrow_array::StringArray::from_iter_values([">@p", "n `", "NWa"])
         );
 
-        let mut gen = array::random_words(1, 5);
+        let mut gen = array::random_sentence(1, 5, false);
         let words = gen.generate(RowCount::from(10), &mut rng).unwrap();
         assert_eq!(words.data_type(), &DataType::Utf8);
         let words_array = words.as_any().downcast_ref::<StringArray>().unwrap();

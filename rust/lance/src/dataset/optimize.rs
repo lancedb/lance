@@ -2895,21 +2895,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_inverted_index_with_defer_index_remap() {
-        // Generate random words for documents
-        let tokens = random_word::all(random_word::Lang::En);
-        let docs: Vec<String> = (0..6000)
-            .map(|_| {
-                let num_words = rand::random::<usize>() % 100 + 1;
-                let doc = (0..num_words)
-                    .map(|_| tokens[rand::random::<usize>() % tokens.len()])
-                    .collect::<Vec<_>>();
-                doc.join(" ")
-            })
-            .collect();
+        // Generate random words using lance-datagen
+        let mut words_gen = lance_datagen::array::random_sentence(1, 100, true);
+        let doc_col = words_gen
+            .generate_default(lance_datagen::RowCount::from(6000))
+            .unwrap();
 
         let batch = RecordBatch::try_new(
             Schema::new(vec![Field::new("doc", DataType::LargeUtf8, false)]).into(),
-            vec![Arc::new(LargeStringArray::from(docs))],
+            vec![doc_col.clone()],
         )
         .unwrap();
         let schema_ref = batch.schema();
@@ -2926,9 +2920,17 @@ mod tests {
         .unwrap();
 
         // Get initial counts for some word searches
-        let test_word1 = tokens[100];
-        let test_word2 = tokens[200];
-        let test_word3 = tokens[300];
+        // Extract some test words from the generated documents
+        let large_string_array = doc_col.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let sample_words: Vec<String> = large_string_array
+            .value(0)
+            .split_whitespace()
+            .take(10)
+            .map(|s| s.to_string())
+            .collect();
+        let test_word1 = &sample_words[0];
+        let test_word2 = &sample_words[1];
+        let test_word3 = &sample_words[2];
 
         // Create an inverted index on the doc column
         let index_name = Some("doc_idx".into());
@@ -3035,21 +3037,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_ngram_index_with_defer_index_remap() {
-        // Generate random words for documents
-        let tokens = random_word::all(random_word::Lang::En);
-        let docs: Vec<String> = (0..6000)
-            .map(|_| {
-                let num_words = rand::random::<usize>() % 100 + 1;
-                let doc = (0..num_words)
-                    .map(|_| tokens[rand::random::<usize>() % tokens.len()])
-                    .collect::<Vec<_>>();
-                doc.join(" ")
-            })
-            .collect();
+        // Generate random words using lance-datagen
+        let mut words_gen = lance_datagen::array::random_sentence(1, 100, true);
+        let doc_col = words_gen
+            .generate_default(lance_datagen::RowCount::from(6000))
+            .unwrap();
 
         let batch = RecordBatch::try_new(
             Schema::new(vec![Field::new("doc", DataType::LargeUtf8, false)]).into(),
-            vec![Arc::new(LargeStringArray::from(docs))],
+            vec![doc_col.clone()],
         )
         .unwrap();
         let schema_ref = batch.schema();
@@ -3066,9 +3062,17 @@ mod tests {
         .unwrap();
 
         // Get initial counts for some word searches
-        let test_word1 = tokens[100];
-        let test_word2 = tokens[200];
-        let test_word3 = tokens[300];
+        // Extract some test words from the generated documents
+        let large_string_array = doc_col.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let sample_words: Vec<String> = large_string_array
+            .value(0)
+            .split_whitespace()
+            .take(10)
+            .map(|s| s.to_string())
+            .collect();
+        let test_word1 = &sample_words[0];
+        let test_word2 = &sample_words[1];
+        let test_word3 = &sample_words[2];
 
         // Create an inverted index on the doc column
         let index_name = Some("doc_idx".into());
