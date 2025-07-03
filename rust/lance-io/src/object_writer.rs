@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::FutureExt;
+use log::warn;
 use object_store::MultipartUpload;
 use object_store::{path::Path, Error as OSError, ObjectStore, Result as OSResult};
 use rand::Rng;
@@ -22,6 +23,7 @@ use tracing::Instrument;
 
 use crate::traits::Writer;
 use snafu::location;
+use tokio::runtime::Handle;
 
 /// Start at 5MB.
 const INITIAL_UPLOAD_STEP: usize = 1024 * 1024 * 5;
@@ -151,6 +153,10 @@ impl UploadState {
             }
             _ => unreachable!(),
         };
+    }
+
+    fn any_to_abort(&mut self) -> Self {
+        std::mem::replace(self, Self::Done(WriteResult::default()))
     }
 }
 
@@ -317,19 +323,36 @@ impl ObjectWriter {
             unreachable!()
         }
     }
+
+    pub async fn abort(&mut self) {
+        if let Some(abort_task) = self.inner_abort() {
+            abort_task.await;
+        }
+    }
+
+    fn inner_abort(&mut self) -> Option<BoxFuture<'static, ()>> {
+        let state = self.state.any_to_abort();
+        if let UploadState::InProgress { mut upload, .. } = state {
+            let abort_task = async move {
+                let _ = upload.abort().await;
+            }
+            .boxed();
+            Some(abort_task)
+        } else {
+            None
+        }
+    }
 }
 
 impl Drop for ObjectWriter {
     fn drop(&mut self) {
-        // If there is a multipart upload started but not finished, we should abort it.
-        if matches!(self.state, UploadState::InProgress { .. }) {
-            // Take ownership of the state.
-            let state =
-                std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
-            if let UploadState::InProgress { mut upload, .. } = state {
-                tokio::task::spawn(async move {
-                    let _ = upload.abort().await;
+        if let Some(abort_task) = self.inner_abort() {
+            if let Ok(handle) = Handle::try_current() {
+                handle.spawn(async move {
+                    abort_task.await;
                 });
+            } else {
+                warn!("Failed to abort object writer because runtime not found.");
             }
         }
     }
@@ -538,5 +561,17 @@ mod tests {
         }
         let res = object_writer.shutdown().await.unwrap();
         assert_eq!(res.size, buf.len() * 5);
+    }
+
+    #[tokio::test]
+    async fn test_abort_write() {
+        let store = LanceObjectStore::memory();
+
+        let mut object_writer = futures::executor::block_on(async move {
+            ObjectWriter::new(&store, &Path::from("/foo"))
+                .await
+                .unwrap()
+        });
+        object_writer.abort().await;
     }
 }

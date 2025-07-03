@@ -270,6 +270,15 @@ class LanceFileWriter:
         self.closed = True
         return self._writer.finish()
 
+    def abort(self):
+        """
+        Abort writing file.
+        """
+        if self.closed:
+            return
+        self.closed = True
+        self._writer.abort()
+
     def add_schema_metadata(self, key: str, value: str) -> None:
         """
         Add a metadata (key/value pair) entry to the schema. This method allows you to

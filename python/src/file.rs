@@ -324,6 +324,11 @@ impl LanceFileWriter {
         self.inner_lock()?.add_schema_metadata(key, value);
         Ok(())
     }
+
+    pub fn abort(&self) -> PyResult<()> {
+        RT.runtime.block_on(self.inner_lock()?.abort());
+        Ok(())
+    }
 }
 
 fn path_to_parent(path: &Path) -> PyResult<(Path, String)> {
