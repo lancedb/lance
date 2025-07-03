@@ -219,7 +219,7 @@ impl Default for WriteParams {
             enable_move_stable_row_ids: false,
             enable_v2_manifest_paths: false,
             session: None,
-            auto_cleanup: Some(AutoCleanupParams::default()),
+            auto_cleanup: None,
         }
     }
 }
@@ -1063,5 +1063,12 @@ mod tests {
         assert_eq!(reader.num_batches(), 1);
         let batch = reader.read_batch(0, .., &schema).await.unwrap();
         assert_eq!(batch, data);
+    }
+
+    #[test]
+    fn test_auto_cleanup_default_disabled() {
+        // Test that auto-cleanup is disabled by default in WriteParams
+        let default_params = WriteParams::default();
+        assert!(default_params.auto_cleanup.is_none());
     }
 }

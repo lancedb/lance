@@ -558,7 +558,7 @@ mod tests {
     use snafu::location;
 
     use crate::{
-        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
+        dataset::{builder::DatasetBuilder, AutoCleanupParams, ReadParams, WriteMode, WriteParams},
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
@@ -660,6 +660,15 @@ mod tests {
             data: impl RecordBatchReader + Send + 'static,
             mode: WriteMode,
         ) -> Result<()> {
+            self.write_data_impl_with_params(data, mode, None).await
+        }
+
+        async fn write_data_impl_with_params(
+            &self,
+            data: impl RecordBatchReader + Send + 'static,
+            mode: WriteMode,
+            auto_cleanup: Option<AutoCleanupParams>,
+        ) -> Result<()> {
             Dataset::write(
                 data,
                 &self.dataset_path,
@@ -667,6 +676,7 @@ mod tests {
                     store_params: Some(self.os_params()),
                     commit_handler: Some(Arc::new(RenameCommitHandler)),
                     mode,
+                    auto_cleanup,
                     ..Default::default()
                 }),
             )
@@ -681,6 +691,15 @@ mod tests {
 
         async fn create_some_data(&self) -> Result<()> {
             self.write_some_data_impl(WriteMode::Create).await
+        }
+
+        async fn create_some_data_with_auto_cleanup(&self) -> Result<()> {
+            self.write_data_impl_with_params(
+                some_batch(),
+                WriteMode::Create,
+                Some(AutoCleanupParams::default()),
+            )
+            .await
         }
 
         async fn overwrite_some_data(&self) -> Result<()> {
@@ -1022,7 +1041,7 @@ mod tests {
         // commit.
         let fixture = MockDatasetFixture::try_new().unwrap();
 
-        fixture.create_some_data().await.unwrap();
+        fixture.create_some_data_with_auto_cleanup().await.unwrap();
 
         let dataset_config = &fixture.open().await.unwrap().manifest.config;
         let cleanup_interval: usize = dataset_config
