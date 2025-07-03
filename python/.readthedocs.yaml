@@ -14,7 +14,7 @@ build:
     - export PATH=$PWD/protoc/bin:$PATH
     - PATH=$PWD/protoc/bin:$PATH && protoc --version
     - pip install maturin
-    - cd python && maturin build --release -o dist
+    - PATH=$PWD/protoc/bin:$PATH && cd python && maturin build --release -o dist
     - pip install python/dist/*.whl
 
 python:
