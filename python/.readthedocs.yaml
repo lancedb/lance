@@ -12,7 +12,7 @@ build:
     - curl -L -o protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip
     - unzip protoc.zip -d protoc
     - export PATH=$PWD/protoc/bin:$PATH
-    - protoc --version
+    - protoc/bin/protoc --version
     - pip install maturin
     - cd python && maturin build --release -o dist
     - pip install python/dist/*.whl
