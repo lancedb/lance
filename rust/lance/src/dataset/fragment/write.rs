@@ -101,7 +101,10 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut writer = lance_file::v2::writer::FileWriter::try_new(
             obj_writer,
             schema,
-            FileWriterOptions::default(),
+            FileWriterOptions {
+                format_version: params.data_storage_version,
+                ..Default::default()
+            },
         )?;
 
         let (major, minor) = writer.version().to_numbers();
@@ -287,6 +290,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_arrow::SchemaExt;
+    use rstest::rstest;
 
     use super::*;
 
@@ -483,5 +487,36 @@ mod tests {
         assert_eq!(fragments[2].deletion_file, None);
         assert_eq!(fragments[2].files.len(), 1);
         assert_eq!(fragments[2].files[0].column_indices, vec![0, 1]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_write_fragments_with_format_version(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::Legacy,
+            LanceFileVersion::Stable
+        )]
+        file_version: LanceFileVersion,
+    ) {
+        let data = test_data();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let writer_params = WriteParams {
+            data_storage_version: Some(file_version),
+            ..Default::default()
+        };
+        let fragment = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+            .write_params(&writer_params)
+            .write(data, None)
+            .await
+            .unwrap();
+
+        assert!(!fragment.files.is_empty());
+        fragment.files.iter().for_each(|f| {
+            let (major_version, minor_version) = file_version.to_numbers();
+            assert_eq!(f.file_major_version, major_version);
+            assert_eq!(f.file_minor_version, minor_version);
+        })
     }
 }

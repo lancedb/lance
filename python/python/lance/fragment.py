@@ -446,6 +446,7 @@ class LanceFragment(pa.dataset.Fragment):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
+        with_row_address: bool = False,
         batch_readahead: int = 16,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
@@ -455,6 +456,7 @@ class LanceFragment(pa.dataset.Fragment):
             limit=limit,
             offset=offset,
             with_row_id=with_row_id,
+            with_row_address=with_row_address,
             batch_readahead=batch_readahead,
         ).to_batches()
 
@@ -465,6 +467,7 @@ class LanceFragment(pa.dataset.Fragment):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
+        with_row_address: bool = False,
     ) -> pa.Table:
         return self.scanner(
             columns=columns,
@@ -472,6 +475,7 @@ class LanceFragment(pa.dataset.Fragment):
             limit=limit,
             offset=offset,
             with_row_id=with_row_id,
+            with_row_address=with_row_address,
         ).to_table()
 
     def merge(

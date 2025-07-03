@@ -1202,6 +1202,9 @@ class LanceDataset(pa.dataset.Dataset):
             The names of the columns that the UDF will read. If None, then the
             UDF will read all columns. This is only used when transforms is a
             UDF. Otherwise, the read columns are inferred from the SQL expressions.
+
+            This can include _rowid or _rowaddr to read the row id or row address
+            from the dataset.
         reader_schema: pa.Schema, optional
             Only valid if transforms is a `ReaderLike` object.  This will be used to
             determine the schema of the reader.
