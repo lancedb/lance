@@ -13,6 +13,8 @@ build:
     - unzip protoc.zip -d protoc
     - export PATH=$PWD/protoc/bin:$PATH
     - pip install maturin
+    - cd python && maturin build --release -o dist
+    - pip install python/dist/*.whl
 
 python:
   install:
