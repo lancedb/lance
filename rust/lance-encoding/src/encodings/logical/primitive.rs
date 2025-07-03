@@ -1932,15 +1932,12 @@ impl FullZipScheduler {
     ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
         // Check if we have cached repetition index data
         if let Some(cached_state) = &self.cached_state {
-            if let Some(rep_index_buffer) = &cached_state.rep_index_buffer {
-                // Use cached data directly
-                return self.schedule_ranges_with_cached_rep(
-                    ranges,
-                    io,
-                    rep_index_buffer,
-                    rep_index.bytes_per_value,
-                );
-            }
+            return self.schedule_ranges_with_cached_rep(
+                ranges,
+                io,
+                &cached_state.rep_index_buffer,
+                rep_index.bytes_per_value,
+            );
         }
 
         // Fall back to loading from disk
@@ -2026,20 +2023,13 @@ impl FullZipScheduler {
 /// Cacheable state for FullZip encoding, storing the decoded repetition index
 #[derive(Debug)]
 struct FullZipCacheableState {
-    /// The decoded repetition index, if present
-    rep_index: Option<RepetitionIndex>,
     /// The raw repetition index buffer for future decoding
-    rep_index_buffer: Option<LanceBuffer>,
+    rep_index_buffer: LanceBuffer,
 }
 
 impl DeepSizeOf for FullZipCacheableState {
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.rep_index.deep_size_of_children(context)
-            + self
-                .rep_index_buffer
-                .as_ref()
-                .map(|buf| buf.len())
-                .unwrap_or(0)
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        self.rep_index_buffer.len()
     }
 }
 
@@ -2050,15 +2040,33 @@ impl CachedPageData for FullZipCacheableState {
 }
 
 impl StructuralPageScheduler for FullZipScheduler {
-    /// Initializes the scheduler. Currently returns NoCachedPageData as caching is disabled by default.
-    /// In future PRs, this will support opt-in caching of the repetition index.
+    /// Initializes the scheduler. If there's a repetition index, loads and caches it.
+    /// Otherwise returns NoCachedPageData.
     fn initialize<'a>(
         &'a mut self,
-        _io: &Arc<dyn EncodingsIo>,
+        io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        // TODO: Add opt-in caching of repetition index
-        // Currently disabled by default, will be enabled via configuration in follow-up PRs
-        std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
+        // Check if we have a repetition index
+        if let Some(rep_index) = &self.rep_index {
+            // Calculate the total size of the repetition index
+            let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
+            let rep_index_range = rep_index.buf_position..(rep_index.buf_position + total_size);
+
+            // Load the repetition index buffer
+            let io_clone = io.clone();
+            let future = async move {
+                let rep_index_data = io_clone.submit_request(vec![rep_index_range], 0).await?;
+                let rep_index_buffer = LanceBuffer::from_bytes(rep_index_data[0].clone(), 1);
+
+                // Create and return the cacheable state
+                Ok(Arc::new(FullZipCacheableState { rep_index_buffer }) as Arc<dyn CachedPageData>)
+            };
+
+            future.boxed()
+        } else {
+            // No repetition index, skip caching
+            std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
+        }
     }
 
     /// Loads previously cached repetition index data from the cache system.
@@ -4850,8 +4858,6 @@ mod tests {
         assert_eq!(skip_in_chunk, 0);
     }
 
-    // TODO: Re-enable this test when caching configuration is implemented in follow-up PRs
-    #[ignore]
     #[tokio::test]
     async fn test_fullzip_repetition_index_caching() {
         use crate::testing::SimulatedScheduler;
@@ -4942,14 +4948,6 @@ mod tests {
 
         // Verify the cached data contains the repetition index
         let cached_state = scheduler.cached_state.as_ref().unwrap();
-        assert!(
-            cached_state.rep_index_buffer.is_some(),
-            "Cached state should contain repetition index buffer"
-        );
-        assert!(
-            cached_state.rep_index.is_some(),
-            "Cached state should contain decoded repetition index"
-        );
 
         // Test that schedule_ranges_rep uses the cached data
         let ranges = vec![0..10, 20..30];
