@@ -63,6 +63,8 @@ logs
 
 docs/_build
 docs/api/python
+docs/site
+docs/build
 
 **/.ipynb_checkpoints/
 docs/notebooks
