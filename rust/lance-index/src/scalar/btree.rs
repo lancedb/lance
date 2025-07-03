@@ -55,12 +55,12 @@ const BTREE_PAGES_NAME: &str = "page_data.lance";
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
 
-lazy_static::lazy_static! {
-    static ref CACHE_SIZE: u64 = std::env::var("LANCE_BTREE_CACHE_SIZE")
+static CACHE_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::env::var("LANCE_BTREE_CACHE_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(512 * 1024 * 1024);
-}
+        .unwrap_or(512 * 1024 * 1024)
+});
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]

@@ -142,9 +142,7 @@ impl IopsQuota {
     }
 }
 
-lazy_static::lazy_static! {
-    static ref IOPS_QUOTA: IopsQuota = IopsQuota::new();
-}
+static IOPS_QUOTA: std::sync::LazyLock<IopsQuota> = std::sync::LazyLock::new(IopsQuota::new);
 
 // We want to allow requests that have a lower priority than any
 // currently in-flight request.  This helps avoid potential deadlocks

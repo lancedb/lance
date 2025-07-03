@@ -3,7 +3,7 @@ name = "pylance"
 version = "0.31.0"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
-rust-version = "1.65"
+rust-version = "1.80"
 exclude = ["python/lance/conftest.py"]
 publish = false
 
@@ -47,7 +47,6 @@ lance-io = { path = "../rust/lance-io" }
 lance-linalg = { path = "../rust/lance-linalg" }
 lance-table = { path = "../rust/lance-table" }
 lance-datafusion = { path = "../rust/lance-datafusion" }
-lazy_static = "1"
 log = "0.4"
 prost = "0.13.2"
 pyo3 = { version = "0.24.1", features = [

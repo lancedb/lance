@@ -5,7 +5,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use arrow_array::RecordBatch;
@@ -31,7 +31,6 @@ use datafusion::{
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
-use lazy_static::lazy_static;
 
 use futures::{stream, StreamExt};
 use lance_arrow::SchemaExt;
@@ -262,16 +261,15 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     SessionContext::new_with_config_rt(session_config, runtime_env)
 }
 
-lazy_static! {
-    static ref DEFAULT_SESSION_CONTEXT: SessionContext =
-        new_session_context(&LanceExecutionOptions::default());
-    static ref DEFAULT_SESSION_CONTEXT_WITH_SPILLING: SessionContext = {
-        new_session_context(&LanceExecutionOptions {
-            use_spilling: true,
-            ..Default::default()
-        })
-    };
-}
+static DEFAULT_SESSION_CONTEXT: LazyLock<SessionContext> =
+    LazyLock::new(|| new_session_context(&LanceExecutionOptions::default()));
+
+static DEFAULT_SESSION_CONTEXT_WITH_SPILLING: LazyLock<SessionContext> = LazyLock::new(|| {
+    new_session_context(&LanceExecutionOptions {
+        use_spilling: true,
+        ..Default::default()
+    })
+});
 
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE && options.target_partition.is_none()

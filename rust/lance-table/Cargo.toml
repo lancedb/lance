@@ -29,7 +29,6 @@ bytes.workspace = true
 chrono.workspace = true
 deepsize.workspace = true
 futures.workspace = true
-lazy_static = { workspace = true, optional = true }
 log.workspace = true
 object_store.workspace = true
 prost.workspace = true
@@ -62,7 +61,7 @@ prost-build.workspace = true
 protobuf-src = { version = "2.1", optional = true }
 
 [features]
-dynamodb = ["aws-sdk-dynamodb", "lazy_static", "aws-credential-types", "lance-io/aws"]
+dynamodb = ["aws-sdk-dynamodb", "aws-credential-types", "lance-io/aws"]
 protoc = ["dep:protobuf-src"]
 
 [package.metadata.docs.rs]

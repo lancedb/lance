@@ -733,7 +733,10 @@ impl PerValueCompressor for ValueEncoder {
 // public tests module because we share the PRIMITIVE_TYPES constant with fixed_size_list
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, LazyLock},
+    };
 
     use arrow_array::{
         make_array, Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array,
@@ -822,12 +825,12 @@ pub(crate) mod tests {
         }
     }
 
-    lazy_static::lazy_static! {
-        static ref LARGE_TYPES: Vec<DataType> = vec![DataType::FixedSizeList(
+    static LARGE_TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
+        vec![DataType::FixedSizeList(
             Arc::new(Field::new("", DataType::Int32, false)),
             128,
-        )];
-    }
+        )]
+    });
 
     #[rstest]
     #[test_log::test(tokio::test)]
