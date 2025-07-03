@@ -9,7 +9,9 @@ build:
     python: "3.11"
     rust: "1.86"
   commands:
-    - apt install -y protobuf-compiler libssl-dev
+    - curl -L -o protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip
+    - unzip protoc.zip -d protoc
+    - export PATH=$PWD/protoc/bin:$PATH
     - pip install maturin
     - cd python && maturin develop --release
 
