@@ -9,7 +9,6 @@ build:
     python: "3.11"
     rust: "1.86"
   commands:
-    - apt update
     - apt install -y protobuf-compiler libssl-dev
     - pip install maturin
     - cd python && maturin develop --release
