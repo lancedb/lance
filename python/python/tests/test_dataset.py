@@ -186,6 +186,7 @@ def test_to_batches_with_partial_last_batch(tmp_path: Path):
     all_batches = list(
         dataset.to_batches(batch_size=batch_size, strict_batch_size=True)
     )
+    print(all_batches)
     assert sum(b.num_rows for b in all_batches) == row_count_per_file * 3  # Total rows
     assert all(b.num_rows == batch_size for b in all_batches[:-1])  # Full batches
     assert all_batches[-1].num_rows == 1  # Final partial batch
@@ -921,9 +922,9 @@ def test_analyze_filtered_scan(tmp_path: Path):
     base_dir = tmp_path / "test"
     ds = lance.write_dataset(table, base_dir)
     plan = ds.scanner(columns=[], filter="a < 50", with_row_id=True).analyze_plan()
-    print(plan)
-    assert re.search(r"^\s*LanceScan:.*output_rows=100.*$", plan, re.MULTILINE)
-    assert re.search(r"^\s*FilterExec:.*output_rows=50.*$", plan, re.MULTILINE)
+    assert re.search(
+        r"^\s*LanceRead:.*output_rows=50.*rows_scanned=100.*$", plan, re.MULTILINE
+    )
 
 
 def test_analyze_index_scan(tmp_path: Path):
@@ -931,9 +932,8 @@ def test_analyze_index_scan(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("filter", "BTREE")
     plan = dataset.scanner(filter="filter = 10").analyze_plan()
-    assert (
-        "MaterializeIndex: query=[filter = 10]@filter_idx, metrics=[output_rows=1"
-        in plan
+    assert re.search(
+        r"^\s*LanceRead:.*output_rows=1.*rows_scanned=1.*$", plan, re.MULTILINE
     )
 
 
@@ -943,7 +943,9 @@ def test_analyze_scan(tmp_path: Path):
     plan = dataset.scanner().analyze_plan()
     # The bytes_read part might get brittle if we change file versions a lot
     # future us are free to ignore that part.
-    assert "bytes_read=3643, iops=3, requests=3" in plan
+    assert re.search(
+        r"^\s*LanceRead:.*bytes_read=3643.*iops=3.*requests=3.*$", plan, re.MULTILINE
+    )
 
 
 def test_analyze_take(tmp_path: Path):
@@ -951,7 +953,9 @@ def test_analyze_take(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("a", "BTREE")
     plan = dataset.scanner(filter="a = 50").analyze_plan()
-    assert "bytes_read=16, iops=2, requests=2" in plan
+    assert re.search(
+        r"^\s*LanceRead:.*bytes_read=16.*iops=2.*requests=2.*$", plan, re.MULTILINE
+    )
 
 
 def test_analyze_vector_search(tmp_path: Path):
@@ -2817,10 +2821,12 @@ def test_scan_deleted_rows(tmp_path: Path):
         == 7
     )
 
-    with pytest.raises(ValueError, match="Cannot include deleted rows"):
-        ds.scanner(
-            include_deleted_rows=True, with_row_id=True, filter="b < 30"
-        ).to_table()
+    assert (
+        ds.scanner(include_deleted_rows=True, with_row_id=True, filter="b < 30")
+        .to_table()
+        .num_rows
+        == 5
+    )
 
     with pytest.raises(ValueError, match="with_row_id is false"):
         ds.scanner(include_deleted_rows=True, filter="a < 30").to_table()
@@ -3394,13 +3400,19 @@ def test_use_scalar_index(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("filter", "BTREE")
 
-    assert "MaterializeIndex" in dataset.scanner(filter="filter = 10").explain_plan(
-        True
+    assert (
+        "indexed_filter=[filter = 10]@filter_idx, refine_filter=--"
+        in dataset.scanner(filter="filter = 10").explain_plan(True)
     )
-    assert "MaterializeIndex" in dataset.scanner(
-        filter="filter = 10", use_scalar_index=True
-    ).explain_plan(True)
-    assert "MaterializeIndex" not in dataset.scanner(
+
+    assert (
+        "indexed_filter=[filter = 10]@filter_idx, refine_filter=--"
+        in dataset.scanner(filter="filter = 10", use_scalar_index=True).explain_plan(
+            True
+        )
+    )
+
+    assert "indexed_filter=--, refine_filter=filter = Int64(10)" in dataset.scanner(
         filter="filter = 10", use_scalar_index=False
     ).explain_plan(True)
 
