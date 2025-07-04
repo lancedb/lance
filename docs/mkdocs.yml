@@ -90,7 +90,7 @@ nav:
     - Tensorflow: integrations/tensorflow.md
     - Ray: integrations/ray.md
     - Huggingface: integrations/huggingface.md
-    - Spark: https://lancedb.github.io/lance-spark
+    - Apache Spark: https://lancedb.github.io/lance-spark
     - Trino: https://github.com/lancedb/lance-trino
     - PostgreSQL: https://github.com/lancedb/pglance
   - Community:
@@ -110,3 +110,4 @@ nav:
       - Overview: sdk_docs.md
       - Python: https://lancedb.github.io/lance-python-doc
       - Rust: https://docs.rs/lance/latest/lance
+      - Java: https://www.javadoc.io/doc/com.lancedb/lance-core/latest/index.html

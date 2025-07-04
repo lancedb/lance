@@ -6,3 +6,4 @@ all classes, functions, and methods available in each language.
 
 - [Python](https://lancedb.github.io/lance-python-doc)
 - [Rust](https://docs.rs/lance/latest/lance)
+- [Java](https://www.javadoc.io/doc/com.lancedb/lance-core/latest/index.html)
