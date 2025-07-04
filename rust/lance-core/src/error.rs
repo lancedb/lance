@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::ArrowError;
-use snafu::{Location, Snafu};
+use snafu::{Backtrace, Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -38,7 +38,7 @@ pub enum Error {
         path: object_store::path::Path,
         source: BoxedError,
         location: Location,
-        // TODO: add backtrace?
+        backtrace: Backtrace,
     },
     #[snafu(display("Not supported: {source}, {location}"))]
     NotSupported {
@@ -124,6 +124,7 @@ impl Error {
             path,
             source: message.into(),
             location,
+            backtrace: Backtrace::capture(),
         }
     }
 
@@ -455,6 +456,55 @@ mod test {
             }
             #[allow(unreachable_patterns)]
             _ => panic!("expected ObjectStore error"),
+        }
+    }
+
+    #[test]
+    fn test_corrupt_file_backtrace() {
+        fn function_3() -> Result<()> {
+            let path = object_store::path::Path::from("test/corrupt/file.dat");
+            Err(Error::corrupt_file(
+                path,
+                "File header corrupted",
+                snafu::Location::new(file!(), line!(), column!()),
+            ))
+        }
+
+        fn function_2() -> Result<()> {
+            function_3()
+        }
+
+        fn function_1() -> Result<()> {
+            function_2()
+        }
+
+        let result = function_1();
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            Error::CorruptFile {
+                path,
+                source,
+                location,
+                backtrace,
+            } => {
+                assert_eq!(path.as_ref(), "test/corrupt/file.dat");
+                assert_eq!(source.to_string(), "File header corrupted");
+                assert!(location.file.contains("error.rs"));
+                let backtrace_str = backtrace.to_string();
+
+                if !backtrace_str.trim().is_empty() {
+                    assert!(
+                        backtrace_str.contains("test_corrupt_file_backtrace")
+                            || backtrace_str.contains("function_3")
+                            || backtrace_str.contains("function_2")
+                            || backtrace_str.contains("function_1"),
+                        "Backtrace should contain test function names, got: {}",
+                        backtrace_str
+                    );
+                }
+            }
+            other => panic!("Expected CorruptFile error, got: {:?}", other),
         }
     }
 }
