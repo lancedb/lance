@@ -85,7 +85,8 @@ nav:
     - Extension Arrays: guide/arrays.md
   - Format:
     - Format: format/format.md
-  - Integrations:
+  - Catalog Integrations: https://lancedb.github.io/lance-namespace
+  - Compute Integrations:
     - PyTorch: integrations/pytorch.md
     - Tensorflow: integrations/tensorflow.md
     - Ray: integrations/ray.md
