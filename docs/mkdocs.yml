@@ -91,6 +91,7 @@ nav:
     - Tensorflow: integrations/tensorflow.md
     - Ray: integrations/ray.md
     - Huggingface: integrations/huggingface.md
+    - Apache DataFusion: integrations/datafusion.md
     - Apache Spark: https://lancedb.github.io/lance-spark
     - Trino: https://github.com/lancedb/lance-trino
     - PostgreSQL: https://github.com/lancedb/pglance
