@@ -81,4 +81,6 @@ pub const DATASET_EVENT_OPEN: &str = "dataset_open";
 pub const DATASET_EVENT_WRITE: &str = "dataset_write";
 pub const DATASET_EVENT_DROP_COLUMN: &str = "dataset_drop_column";
 pub const DATASET_EVENT_DELETE_ROW: &str = "dataset_delete_row";
+pub const DATASET_EVENT_COMPACTION: &str = "dataset_compaction";
+pub const DATASET_EVENT_CLEANUP: &str = "dataset_cleanup";
 pub const EXECUTION_PLAN_RUN: &str = "plan_run";
