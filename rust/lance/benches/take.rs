@@ -363,7 +363,7 @@ fn generate_lance_dataset_path() -> (String, Option<tempfile::TempDir>) {
             let temp_dir = tempfile::tempdir().unwrap();
             let file_path = temp_dir.path().join(uuid);
             (
-                format!("file://{}.lance", file_path.to_str().unwrap().to_string()),
+                format!("file://{}.lance", file_path.to_str().unwrap()),
                 Some(temp_dir),
             )
         }
