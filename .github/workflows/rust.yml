@@ -57,7 +57,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
       - name: Clippy
-        run: cargo clippy --locked --features ${{ env.ALL_FEATURES }} --tests --benches --examples -Dwarnings
+        run: cargo clippy --locked --features ${{ env.ALL_FEATURES }} --all-targets -- -D warnings
 
   cargo-deny:
     name: Check Rust dependencies (cargo-deny)
