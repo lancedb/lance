@@ -26,12 +26,11 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
-use lance_index::vector::v3::subindex::IvfSubIndex;
-use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
-use lance_linalg::{
-    distance::DistanceType,
-    kmeans::{KMeans as LanceKMeans, KMeansParams},
+use lance_index::vector::kmeans::{
+    compute_partitions, KMeans as LanceKMeans, KMeansAlgoFloat, KMeansParams,
 };
+use lance_index::vector::v3::subindex::IvfSubIndex;
+use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use pyo3::intern;

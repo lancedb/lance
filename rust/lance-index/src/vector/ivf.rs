@@ -10,13 +10,11 @@ use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array};
 
 pub use builder::IvfBuildParams;
 use lance_core::Result;
-use lance_linalg::{
-    distance::{DistanceType, MetricType},
-    kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array},
-};
+use lance_linalg::distance::{DistanceType, MetricType};
 use tracing::instrument;
 
 use crate::vector::ivf::transform::PartitionTransformer;
+use crate::vector::kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array};
 use crate::vector::{pq::ProductQuantizer, transform::Transformer};
 
 use super::flat::transform::FlatTransformer;
