@@ -4,6 +4,7 @@
 //! Cache implementation
 
 use std::any::{Any, TypeId};
+use std::borrow::Cow;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -150,8 +151,14 @@ impl LanceCache {
 
     pub fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str, metadata: Arc<T>) {
         let key = self.get_key(key);
-        self.cache
-            .insert((key, TypeId::of::<T>()), SizedRecord::new(metadata));
+        let record = SizedRecord::new(metadata);
+        tracing::trace!(
+            target: "lance_cache::insert",
+            key = key,
+            type_id = std::any::type_name::<T>(),
+            size = (record.size_accessor)(&record.record),
+        );
+        self.cache.insert((key, TypeId::of::<T>()), record);
     }
 
     pub fn insert_unsized<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
@@ -214,6 +221,44 @@ impl LanceCache {
             misses: self.misses.load(Ordering::Relaxed),
         }
     }
+
+    // CacheKey-based methods
+    pub fn insert_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        self.insert(&cache_key.key(), metadata)
+    }
+
+    pub fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        self.get::<K::ValueType>(&cache_key.key())
+    }
+
+    pub async fn get_or_insert_with_key<K, F, Fut>(
+        &self,
+        cache_key: K,
+        loader: F,
+    ) -> Result<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<K::ValueType>>,
+    {
+        let key_str = cache_key.key().into_owned();
+        self.get_or_insert(key_str, |_| loader()).await
+    }
+}
+
+pub trait CacheKey {
+    type ValueType;
+
+    fn key(&self) -> Cow<'_, str>;
 }
 
 #[derive(Debug, Clone)]
