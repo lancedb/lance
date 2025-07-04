@@ -6,7 +6,6 @@ on:
   pull_request:
     paths:
       - docs/**
-      - python/python/**
       - .github/workflows/docs-check.yml
 
 env:
