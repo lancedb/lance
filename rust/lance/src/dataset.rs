@@ -102,6 +102,8 @@ pub use write::{
     WriteParams,
 };
 
+pub use transaction::COMMIT_MESSAGE_KEY;
+
 const INDICES_DIR: &str = "_indices";
 
 pub const DATA_DIR: &str = "data";
@@ -565,6 +567,85 @@ impl Dataset {
     /// Get the fully qualified URI of this dataset.
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    async fn modify_existing_manifest_config<F>(&self, version: u64, modifier: F) -> Result<()>
+    where
+        F: FnOnce(&mut Manifest) -> Result<()>,
+    {
+        let manifest_location = self
+            .commit_handler
+            .resolve_version_location(&self.base, version, &self.object_store.inner)
+            .await?;
+
+        let mut manifest = Self::load_manifest(
+            self.object_store.as_ref(),
+            &manifest_location,
+            &self.base,
+            self.session.as_ref(),
+        )
+        .await?;
+
+        modifier(&mut manifest)?;
+
+        modify_existing_manifest_file(
+            self.object_store(),
+            self.commit_handler.as_ref(),
+            &self.base,
+            &mut manifest,
+            None,
+            self.manifest_location.naming_scheme,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// List all commit messages with version numbers
+    pub async fn list_commit_messages(&self) -> Result<Vec<(u64, Option<String>)>> {
+        let versions = self.versions().await?;
+        let mut result = Vec::new();
+        for version in versions {
+            // Convert Version to u64 using the version's value field
+            let version_number = version.version;
+
+            let manifest_location = self
+                .commit_handler
+                .resolve_version_location(&self.base, version_number, &self.object_store.inner)
+                .await?;
+
+            let manifest = Self::load_manifest(
+                self.object_store.as_ref(),
+                &manifest_location,
+                &self.base,
+                self.session.as_ref(),
+            )
+            .await?;
+
+            let commit_message = manifest.config.get(COMMIT_MESSAGE_KEY).cloned();
+            result.push((version_number, commit_message));
+        }
+        Ok(result)
+    }
+
+    // add or update commit message for specific version
+    pub async fn commit_message(&self, message: String, version: u64) -> Result<()> {
+        self.modify_existing_manifest_config(version, |manifest| {
+            manifest
+                .config
+                .insert(COMMIT_MESSAGE_KEY.to_string(), message.clone());
+            Ok(())
+        })
+        .await
+    }
+
+    //remove commit message for specific version
+    pub async fn delete_message(&self, version: u64) -> Result<()> {
+        self.modify_existing_manifest_config(version, |manifest| {
+            manifest.delete_config_keys(&[COMMIT_MESSAGE_KEY]);
+            Ok(())
+        })
+        .await
     }
 
     /// Get the full manifest of the dataset version.
@@ -1798,6 +1879,7 @@ pub(crate) struct ManifestWriteConfig {
     use_move_stable_row_ids: bool,             // default false
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
+    commit_message: Option<String>,
 }
 
 impl Default for ManifestWriteConfig {
@@ -1808,6 +1890,75 @@ impl Default for ManifestWriteConfig {
             use_move_stable_row_ids: false,
             use_legacy_format: None,
             storage_format: None,
+            commit_message: None,
+        }
+    }
+}
+
+/// modify the existing manifest file and commit to specific version,
+/// experimentally API designed for commit_message management,
+/// should not be called in concurrent situation
+pub(crate) async fn modify_existing_manifest_file(
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    base_path: &Path,
+    manifest: &mut Manifest,
+    indices: Option<Vec<Index>>,
+    naming_scheme: ManifestNamingScheme,
+) -> std::result::Result<ManifestLocation, CommitError> {
+    let path = naming_scheme.manifest_path(base_path, manifest.version);
+    // Generate backup path by appending ".backup" to the original filename
+    let backup_path = Path::from(format!("{}.backup", path.as_ref()));
+
+    // Track if backup was created
+    let mut backup_created = false;
+
+    if object_store.exists(&path).await? {
+        tracing::info!("Attempting to commit message to existing version: {} and path: {}, make sure no other conflict operation ongoing", manifest.version, path);
+
+        // Delete the existing manifest file prior to commit operation.
+        // The commit handler is designed to write directly to the final manifest path.
+        // There is no support for temporary file creation in existing commit API.
+        // Therefore, we must backup and remove any existing file at the target path first.
+        object_store.copy(&path, &backup_path).await?;
+        backup_created = true;
+        object_store.delete(&path).await?;
+    } else {
+        tracing::warn!("Attempted to delete non-existent path: {}", path);
+    }
+
+    let commit_result = commit_handler
+        .commit(
+            manifest,
+            indices,
+            base_path,
+            object_store,
+            write_manifest_file_to_path,
+            naming_scheme,
+        )
+        .await;
+
+    match commit_result {
+        Ok(location) => {
+            // On successful commit: clean up backup if created
+            if backup_created {
+                if let Err(e) = object_store.delete(&backup_path).await {
+                    tracing::warn!("Failed to delete backup file: {}", e);
+                }
+            }
+            Ok(location)
+        }
+        Err(e) => {
+            // On commit failure: restore backup if created
+            if backup_created {
+                if let Err(restore_err) = object_store.copy(&backup_path, &path).await {
+                    tracing::error!("Failed to restore from backup: {}", restore_err);
+                }
+                if let Err(clean_err) = object_store.delete(&backup_path).await {
+                    tracing::warn!("Failed to clean backup after restore: {}", clean_err);
+                }
+            }
+            Err(e)
         }
     }
 }
@@ -2364,6 +2515,7 @@ mod tests {
                 use_move_stable_row_ids: false,
                 use_legacy_format: None,
                 storage_format: None,
+                commit_message: None,
             },
             dataset.manifest_location.naming_scheme,
         )
