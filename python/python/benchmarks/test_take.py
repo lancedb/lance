@@ -49,6 +49,8 @@ def create_dataset(
     return lance.write_dataset(
         table,
         path,
+        max_rows_per_file=file_size,
+        max_rows_per_group=batch_size,
         data_storage_version=data_storage_version,
     )
 
