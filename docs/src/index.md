@@ -2,7 +2,7 @@
 
 ![Lance Logo](./logo/wide.png)
 
-## Modern columnar data format for ML and LLMs
+## Modern Columnar Data Format for ML and LLMs
 
 Lance is an open table and file format that is easy and fast to version, query and train on.
 It's designed to be used with images, videos, 3D point clouds, audio and of course tabular data.
@@ -24,19 +24,3 @@ The key features of Lance include:
 * **Row Level Transaction:** fully ACID transaction with row level conflict resolution.
 
 * **Ecosystem Integrations:** Apache Arrow, PyTorch, Tensorflow, Ray, HuggingFace, Apache Spark, Trino, DuckDB, PostgreSQL, and more on the way.
-
-## Installation
-
-You can install Lance via pip:
-
-```bash
-pip install pylance
-```
-
-For the latest features and bug fixes, you can install the preview version:
-
-```bash
-pip install --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance
-```
-
-Preview releases receive the same level of testing as regular releases.

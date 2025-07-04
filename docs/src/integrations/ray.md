@@ -1,4 +1,4 @@
-# Lance ❤️ Ray
+# Ray Integration
 
 [Ray](https://www.anyscale.com/product/open-source/ray) effortlessly scale up ML workload to large distributed
 compute environment.

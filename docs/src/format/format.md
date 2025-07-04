@@ -1,6 +1,8 @@
-# Lance Formats
+# Lance Format
 
-The Lance format is both a table format and a file format. Lance typically refers to tables as "datasets". 
+The Lance format contains both a table format and a columnar file format.
+When combined, we refer to it as a data format. 
+Because Lance can store both structured and unstructured multimodal data, Lance typically refers to tables as "datasets".
 A Lance dataset is designed to efficiently handle secondary indices, fast ingestion and modification of data, 
 and a rich set of schema and data evolution features.
 

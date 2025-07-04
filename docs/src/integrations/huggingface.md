@@ -1,4 +1,4 @@
-# Lance ❤️ HuggingFace
+# HuggingFace Integration
 
 The HuggingFace Hub has become the go to place for ML practitioners to find pre-trained models and useful datasets.
 

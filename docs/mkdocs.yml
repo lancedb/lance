@@ -24,8 +24,10 @@ theme:
         icon: material/brightness-4
         name: Switch to light mode
   features:
+    - navigation.tabs
     - navigation.sections
-    - navigation.expand
+    - navigation.instant
+    - navigation.tracking
     - navigation.top
     - search.highlight
     - search.share
@@ -67,8 +69,10 @@ extra:
       link: https://twitter.com/lancedb
 
 nav:
-  - Welcome: index.md
-  - Quickstart: quickstart.md
+  - Introduction: index.md
+  - Getting Started:
+    - Install: start/install.md
+    - Quickstart: start/quickstart.md
   - User Guide:
     - Read and Write: guide/read_and_write.md
     - Data Evolution: guide/data_evolution.md
@@ -82,10 +86,10 @@ nav:
   - Format:
     - Format: format/format.md
   - Integrations:
-    - Huggingface: integrations/huggingface.md
-    - Tensorflow: integrations/tensorflow.md
     - PyTorch: integrations/pytorch.md
+    - Tensorflow: integrations/tensorflow.md
     - Ray: integrations/ray.md
+    - Huggingface: integrations/huggingface.md
     - Spark: https://lancedb.github.io/lance-spark
     - Trino: https://github.com/lancedb/lance-trino
     - PostgreSQL: https://github.com/lancedb/pglance
@@ -102,6 +106,7 @@ nav:
       - Write/Read Dataset: examples/rust/write_read_dataset.md
       - HNSW Vector Index: examples/rust/hnsw.md
       - LLM Dataset Creation: examples/rust/llm_dataset_creation.md
-  - Generated Docs:
-    - Python: https://lancedb.github.io/lance-python-doc
-    - Rust: https://docs.rs/lance/latest/lance
+  - SDK Docs:
+      - Overview: sdk_docs.md
+      - Python: https://lancedb.github.io/lance-python-doc
+      - Rust: https://docs.rs/lance/latest/lance
