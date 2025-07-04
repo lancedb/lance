@@ -1,14 +1,3 @@
-pyarrow
-sphinx>=8
-sphinx-copybutton
-sphinx-immaterial
-breathe
-cython
-pandas
-piccolo-theme
-duckdb>=1
-jupyterlab
-fastai
-xmltodict
-tensorflow
-ray[data]
+mkdocs-material
+mkdocs_protobuf
+mkdocs-linkcheck
