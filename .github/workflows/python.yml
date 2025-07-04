@@ -33,7 +33,7 @@ env:
   FORCE_COLOR: "1"
   # Change this to bust all caches (may be needed periodically if the caches accumulate
   # a lot of cruft).
-  CACHE_PREFIX: "1"
+  CACHE_PREFIX: "2"
 
 jobs:
   lint:
@@ -60,6 +60,8 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
       - name: Install linting tools
         run: |
           pip install ruff==0.11.2 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas]
@@ -73,10 +75,6 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
-      - name: Install rustfmt
-        run: rustup component add rustfmt
-      - name: Install clippy
-        run: rustup component add clippy
       - name: Lint Rust
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
@@ -117,6 +115,8 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
       - uses: ./.github/workflows/build_linux_wheel
       - uses: ./.github/workflows/run_tests
       - name: Generate forward compatibility files
@@ -132,9 +132,7 @@ jobs:
           source venv/bin/activate
           pip install pytest --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==0.29.1.beta2
           pytest python/tests/forward_compat --run-forward
-      # Make sure wheels are not included in the Rust cache
-      - name: Delete wheels
-        run: sudo rm -rf target/wheels
+
   linux-arm:
     timeout-minutes: 45
     runs-on: ubuntu-2404-4x-arm64
@@ -156,6 +154,8 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
       - uses: ./.github/workflows/build_linux_wheel
         with:
           arm-build: "true"
@@ -165,9 +165,6 @@ jobs:
           sudo apt update -y -qq
           sudo apt install -y libhdf5-dev
       - uses: ./.github/workflows/run_tests
-      # Make sure wheels are not included in the Rust cache
-      - name: Delete wheels
-        run: sudo rm -rf target/wheels
   mac:
     timeout-minutes: 45
     name: Python macOS 3.12 ARM
@@ -189,13 +186,13 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
       - uses: ./.github/workflows/build_mac_wheel
       - uses: ./.github/workflows/run_tests
         with:
           skip-torch: "true"
-      # Make sure wheels are not included in the Rust cache
-      - name: Delete wheels
-        run: rm -rf target/wheels
+
   windows:
     runs-on: windows-latest
     timeout-minutes: 90
@@ -212,6 +209,8 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
       - uses: ./.github/workflows/build_windows_wheel
       - uses: ./.github/workflows/run_tests
   aws-integtest:
@@ -234,12 +233,11 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
       - uses: ./.github/workflows/build_linux_wheel
       - name: Install dependencies
         run: |
           pip install ray[data]
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - uses: ./.github/workflows/run_integtests
-      # Make sure wheels are not included in the Rust cache
-      - name: Delete wheels
-        run: sudo rm -rf target/wheels

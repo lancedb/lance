@@ -39,10 +39,6 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
-      # pin the toolchain version to avoid surprises
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy, rustfmt
       - uses: rui314/setup-mold@v1
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -77,6 +73,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: java/core/lance-jni -> ../target/rust-maven-plugin/lance-jni
+          cache-targets: false
+          cache-workspace-crates: true
       - name: Set up Java ${{ matrix.java-version }}
         uses: actions/setup-java@v4
         with:
