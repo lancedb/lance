@@ -62,7 +62,7 @@ plugins:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/lancedb/lance-spark
+      link: https://github.com/lancedb/lance
     - icon: fontawesome/brands/discord
       link: https://discord.gg/zMM32dvNtd
     - icon: fontawesome/brands/twitter
