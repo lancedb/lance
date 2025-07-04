@@ -44,7 +44,7 @@ use snafu::location;
 use futures::future::Either;
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
-use lance_index::DatasetIndexExt;
+use lance_index::{is_system_index, DatasetIndexExt};
 use log;
 use object_store::path::Path;
 use prost::Message;
@@ -501,6 +501,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
     for index in indices {
         if needs_recalculating.contains(&index.name)
             || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
+                && !is_system_index(index)
         {
             debug_assert_eq!(index.fields.len(), 1);
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;

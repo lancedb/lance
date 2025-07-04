@@ -11,6 +11,8 @@
 
 use std::{any::Any, sync::Arc};
 
+use crate::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use crate::mem_wal::MEM_WAL_INDEX_NAME;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -20,6 +22,7 @@ use snafu::location;
 use std::convert::TryFrom;
 
 pub mod frag_reuse;
+pub mod mem_wal;
 pub mod metrics;
 pub mod optimize;
 pub mod prefilter;
@@ -91,6 +94,8 @@ pub enum IndexType {
 
     FragmentReuse = 6,
 
+    MemWal = 7,
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -111,6 +116,7 @@ impl std::fmt::Display for IndexType {
             Self::Inverted => write!(f, "Inverted"),
             Self::NGram => write!(f, "NGram"),
             Self::FragmentReuse => write!(f, "FragmentReuse"),
+            Self::MemWal => write!(f, "MemWal"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -132,6 +138,8 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::LabelList as i32 => Ok(Self::LabelList),
             v if v == Self::NGram as i32 => Ok(Self::NGram),
             v if v == Self::Inverted as i32 => Ok(Self::Inverted),
+            v if v == Self::FragmentReuse as i32 => Ok(Self::FragmentReuse),
+            v if v == Self::MemWal as i32 => Ok(Self::MemWal),
             v if v == Self::Vector as i32 => Ok(Self::Vector),
             v if v == Self::IvfFlat as i32 => Ok(Self::IvfFlat),
             v if v == Self::IvfSq as i32 => Ok(Self::IvfSq),
@@ -173,6 +181,10 @@ impl IndexType {
         )
     }
 
+    pub fn is_system(&self) -> bool {
+        matches!(self, Self::FragmentReuse | Self::MemWal)
+    }
+
     /// Returns the current format version of the index type,
     /// bump this when the index format changes.
     /// Indices which higher version than these will be ignored for compatibility,
@@ -187,6 +199,7 @@ impl IndexType {
             Self::Inverted => 0,
             Self::NGram => 0,
             Self::FragmentReuse => 0,
+            Self::MemWal => 0,
 
             // for now all vector indices are built by the same builder,
             // so they share the same version.
@@ -214,4 +227,8 @@ pub struct IndexMetadata {
     #[serde(rename = "type")]
     pub index_type: String,
     pub distance_type: String,
+}
+
+pub fn is_system_index(index_meta: &lance_table::format::Index) -> bool {
+    index_meta.name == FRAG_REUSE_INDEX_NAME || index_meta.name == MEM_WAL_INDEX_NAME
 }
