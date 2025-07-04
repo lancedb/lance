@@ -1628,7 +1628,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct FullZipRepIndexDetails {
     buf_position: u64,
     bytes_per_value: u64, // Will be 1, 2, 4, or 8
@@ -1835,14 +1835,16 @@ impl FullZipScheduler {
                 let end_offset = (r.end * bytes_per_value) as usize;
 
                 let start_slice = &buffer[start_offset..start_offset + bytes_per_value as usize];
-                let start_val = ByteUnpacker::new(start_slice.iter().copied(), bytes_per_value as usize)
-                    .next()
-                    .unwrap();
+                let start_val =
+                    ByteUnpacker::new(start_slice.iter().copied(), bytes_per_value as usize)
+                        .next()
+                        .unwrap();
 
                 let end_slice = &buffer[end_offset..end_offset + bytes_per_value as usize];
-                let end_val = ByteUnpacker::new(end_slice.iter().copied(), bytes_per_value as usize)
-                    .next()
-                    .unwrap();
+                let end_val =
+                    ByteUnpacker::new(end_slice.iter().copied(), bytes_per_value as usize)
+                        .next()
+                        .unwrap();
 
                 (data_buf_position + start_val)..(data_buf_position + end_val)
             })
@@ -1857,7 +1859,8 @@ impl FullZipScheduler {
         ranges
             .iter()
             .flat_map(|r| {
-                let first_val_start = rep_index.buf_position + (r.start * rep_index.bytes_per_value);
+                let first_val_start =
+                    rep_index.buf_position + (r.start * rep_index.bytes_per_value);
                 let first_val_end = first_val_start + rep_index.bytes_per_value;
                 let last_val_start = rep_index.buf_position + (r.end * rep_index.bytes_per_value);
                 let last_val_end = last_val_start + rep_index.bytes_per_value;
@@ -1901,13 +1904,12 @@ impl FullZipScheduler {
         }
     }
 
-
     /// Schedules ranges in the presence of a repetition index
     fn schedule_ranges_rep(
         &self,
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
-        rep_index: &FullZipRepIndexDetails,
+        rep_index: FullZipRepIndexDetails,
     ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
         // Copy necessary fields to avoid lifetime issues
         let data_buf_position = self.data_buf_position;
@@ -1917,8 +1919,7 @@ impl FullZipScheduler {
         let bits_per_offset = self.bits_per_offset;
         let ranges = ranges.to_vec();
         let io_clone = io.clone();
-        let rep_index = rep_index.clone();
-        
+
         Ok(async move {
             // Step 1: Resolve byte ranges from repetition index
             let byte_ranges = Self::resolve_byte_ranges(
@@ -1930,17 +1931,17 @@ impl FullZipScheduler {
                 priority,
             )
             .await?;
-            
+
             // Step 2: Load data
             let data = io_clone.submit_request(byte_ranges, priority).await?;
             let data = data
                 .into_iter()
                 .map(|d| LanceBuffer::from_bytes(d, 1))
                 .collect::<VecDeque<_>>();
-            
+
             // Step 3: Calculate total rows
             let num_rows: u64 = ranges.iter().map(|r| r.end - r.start).sum();
-            
+
             // Step 4: Create decoder
             Self::create_decoder(details, data, num_rows, bits_per_offset)
         }
@@ -2068,7 +2069,7 @@ impl StructuralPageScheduler for FullZipScheduler {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
-        if let Some(rep_index) = self.rep_index.as_ref() {
+        if let Some(rep_index) = self.rep_index {
             self.schedule_ranges_rep(ranges, io, rep_index)
         } else {
             self.schedule_ranges_simple(ranges, io.as_ref())
@@ -4933,7 +4934,7 @@ mod tests {
         let result = scheduler.schedule_ranges_rep(
             &ranges,
             &io_dyn,
-            &FullZipRepIndexDetails {
+            FullZipRepIndexDetails {
                 buf_position: 1000,
                 bytes_per_value,
             },
