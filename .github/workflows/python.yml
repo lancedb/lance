@@ -6,6 +6,7 @@ on:
       - main
   pull_request:
     paths:
+      - Cargo.*
       - python/**
       - rust/**
       - protos/**
