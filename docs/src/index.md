@@ -23,4 +23,4 @@ The key features of Lance include:
 
 * **Row Level Transaction:** fully ACID transaction with row level conflict resolution.
 
-* **Ecosystem Integrations:** Apache Arrow, PyTorch, Tensorflow, Ray, HuggingFace, Apache Spark, Trino, DuckDB, PostgreSQL, and more on the way.
+* **Ecosystem Integrations:** PyTorch, Tensorflow, Ray, HuggingFace, Apache Arrow, Apache DataFusion, Apache Spark, Trino, DuckDB, PostgreSQL, and more on the way.
