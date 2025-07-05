@@ -474,9 +474,19 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
+        let filtered_columns: Vec<_> = columns
+            .iter()
+            .filter(|(col, _)| {
+                let col_name = col.as_ref();
+                self.nearest.is_some()
+                    || !(self.with_row_id && col_name == ROW_ID
+                        || self.with_row_address && col_name == ROW_ADDR)
+            })
+            .map(|(c, t)| (c.as_ref(), t.as_ref()))
+            .collect();
         let base_schema = self.scan_output_schema(self.dataset.schema(), true)?;
         self.projection_plan =
-            ProjectionPlan::try_new(&base_schema, columns, /*load_blobs=*/ false)?;
+            ProjectionPlan::try_new(&base_schema, &filtered_columns, /*load_blobs=*/ false)?;
         if self.projection_plan.sibling_schema.is_some() {
             return Err(Error::NotSupported {
                 source: "Scanning columns with non-default storage class is not yet supported"
