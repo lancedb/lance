@@ -98,7 +98,7 @@ nav:
     - Trino: https://github.com/lancedb/lance-trino
   - Community:
     - Contributing: community/contributing.md
-    - Lancelot: community/committers.md
+    - Lancelot: community/lancelot.md
   - Examples:
     - Python:
       - LLM Dataset Creation: examples/python/llm_dataset_creation.md
