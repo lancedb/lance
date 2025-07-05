@@ -245,6 +245,7 @@ impl LanceFileWriter {
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
         keep_original_array: Option<bool>,
+        max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
         let (object_store, path) =
             object_store_from_uri_or_path(uri_or_path, storage_options).await?;
@@ -252,6 +253,7 @@ impl LanceFileWriter {
         let options = FileWriterOptions {
             data_cache_bytes,
             keep_original_array,
+            max_page_bytes,
             format_version: version
                 .map(|v| v.parse::<LanceFileVersion>())
                 .transpose()
@@ -279,7 +281,7 @@ impl LanceFileWriter {
 #[pymethods]
 impl LanceFileWriter {
     #[new]
-    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, keep_original_array=None))]
+    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, keep_original_array=None, max_page_bytes=None))]
     pub fn new(
         path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
@@ -287,6 +289,7 @@ impl LanceFileWriter {
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
         keep_original_array: Option<bool>,
+        max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
         RT.runtime.block_on(Self::open(
             path,
@@ -295,6 +298,7 @@ impl LanceFileWriter {
             version,
             storage_options,
             keep_original_array,
+            max_page_bytes,
         ))
     }
 
