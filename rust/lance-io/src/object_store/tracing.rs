@@ -15,7 +15,7 @@ use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOpts, PutOptions,
     PutPayload, PutResult, Result as OSResult, UploadPart,
 };
-use tracing::{debug_span, instrument, Span};
+use tracing::{debug_span, instrument, Instrument, Span};
 
 #[derive(Debug)]
 pub struct TracedMultipartUpload {
@@ -28,10 +28,7 @@ impl MultipartUpload for TracedMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let write_span = self.write_span.clone();
         let fut = self.target.put_part(data);
-        Box::pin(async move {
-            let _guard = write_span.enter();
-            fut.await
-        })
+        Box::pin(fut.instrument(write_span))
     }
 
     #[instrument(level = "debug")]
