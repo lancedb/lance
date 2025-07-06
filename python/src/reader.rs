@@ -23,6 +23,7 @@ use futures::stream::StreamExt;
 
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner as LanceScanner};
 use lance_io::stream::RecordBatchStream;
+use pyo3::Python;
 
 use crate::RT;
 
@@ -57,16 +58,19 @@ impl Iterator for LanceReader {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let stream = self.stream.clone();
-        RT.spawn(None, async move {
-            let mut stream = stream.lock().await;
-            stream.next().await
-        })
-        .transpose()
-        .map(|rs| match rs {
-            Ok(Ok(batch)) => Ok(batch),
-            Ok(Err(err)) => Err(ArrowError::from(err)),
-            Err(err) => Err(ArrowError::ExternalError(Box::new(err))),
+        Python::with_gil(|py| {
+            let stream = self.stream.clone();
+            // spawn the task in the background executor
+            RT.spawn(Some(py), async move {
+                let mut stream = stream.lock().await;
+                stream.next().await
+            })
+            .transpose()
+            .map(|rs| match rs {
+                Ok(Ok(batch)) => Ok(batch),
+                Ok(Err(err)) => Err(ArrowError::from(err)),
+                Err(err) => Err(ArrowError::ExternalError(Box::new(err))),
+            })
         })
     }
 }
