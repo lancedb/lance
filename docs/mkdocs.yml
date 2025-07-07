@@ -85,14 +85,17 @@ nav:
     - Extension Arrays: guide/arrays.md
   - Format:
     - Format: format/format.md
-  - Integrations:
-    - PyTorch: integrations/pytorch.md
-    - Tensorflow: integrations/tensorflow.md
-    - Ray: integrations/ray.md
-    - Huggingface: integrations/huggingface.md
+  - Catalog Integrations: https://lancedb.github.io/lance-namespace
+  - Compute Integrations:
+    - Apache DataFusion: integrations/datafusion.md
     - Apache Spark: https://lancedb.github.io/lance-spark
-    - Trino: https://github.com/lancedb/lance-trino
+    - DuckDB: integrations/duckdb.md
+    - Huggingface: integrations/huggingface.md
     - PostgreSQL: https://github.com/lancedb/pglance
+    - PyTorch: integrations/pytorch.md
+    - Ray: integrations/ray.md
+    - Tensorflow: integrations/tensorflow.md
+    - Trino: https://github.com/lancedb/lance-trino
   - Community:
     - Contributing: community/contributing.md
   - Examples:
