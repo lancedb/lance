@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -43,7 +42,7 @@ use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
+use lance_core::{ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::{
     analyze_plan, execute_plan, LanceExecutionOptions, StrictBatchSizeExec,
 };
@@ -290,6 +289,12 @@ impl LanceFilter {
 pub struct Scanner {
     dataset: Arc<Dataset>,
 
+    /// The projection plan for the scanner
+    ///
+    /// This includes
+    /// - The physical projection that must be read from the dataset
+    /// - Dynamic expressions that are evaluated after the physical projection
+    /// - The names of the output columns
     projection_plan: ProjectionPlan,
 
     /// If true then the filter will be applied before an index scan
@@ -338,12 +343,6 @@ pub struct Scanner {
     /// to handle this better in the future as well)
     use_scalar_index: bool,
 
-    /// Scan the dataset with a meta column: "_rowid"
-    with_row_id: bool,
-
-    /// Scan the dataset with a meta column: "_rowaddr"
-    with_row_address: bool,
-
     /// Whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -388,10 +387,7 @@ fn escape_column_name(name: &str) -> String {
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         // By default, we only scan the local schema
-        let projection_plan = ProjectionPlan::new_empty(
-            Arc::new(dataset.local_schema().clone()),
-            /*load_blobs= */ false,
-        );
+        let projection_plan = ProjectionPlan::new(dataset.clone());
         Self {
             dataset,
             projection_plan,
@@ -408,8 +404,6 @@ impl Scanner {
             ordering: None,
             nearest: None,
             use_stats: true,
-            with_row_id: false,
-            with_row_address: false,
             ordered: true,
             fragments: None,
             fast_search: false,
@@ -485,16 +479,7 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
-        let base_schema = self.scan_output_schema(self.dataset.schema(), true)?;
-        self.projection_plan =
-            ProjectionPlan::try_new(&base_schema, columns, /*load_blobs=*/ false)?;
-        if self.projection_plan.sibling_schema.is_some() {
-            return Err(Error::NotSupported {
-                source: "Scanning columns with non-default storage class is not yet supported"
-                    .into(),
-                location: location!(),
-            });
-        }
+        self.projection_plan.project_from_expressions(columns)?;
         Ok(self)
     }
 
@@ -982,13 +967,13 @@ impl Scanner {
 
     /// Instruct the scanner to return the `_rowid` meta column from the dataset.
     pub fn with_row_id(&mut self) -> &mut Self {
-        self.with_row_id = true;
+        self.projection_plan.include_row_id();
         self
     }
 
     /// Instruct the scanner to return the `_rowaddr` meta column from the dataset.
     pub fn with_row_address(&mut self) -> &mut Self {
-        self.with_row_address = true;
+        self.projection_plan.include_row_addr();
         self
     }
 
@@ -1014,7 +999,7 @@ impl Scanner {
     /// after setting all other options.
     pub fn get_filter(&self) -> Result<Option<Expr>> {
         if let Some(filter) = &self.filter {
-            let filter_schema = self.scan_input_schema()?;
+            let filter_schema = self.filterable_schema()?;
             Ok(Some(filter.to_datafusion(
                 self.dataset.schema(),
                 filter_schema.as_ref(),
@@ -1024,7 +1009,7 @@ impl Scanner {
         }
     }
 
-    fn get_extra_columns(&self, force_row_id: bool) -> Vec<ArrowField> {
+    fn add_extra_columns(&self, schema: Schema) -> Result<Schema> {
         let mut extra_columns = vec![];
 
         if self.nearest.as_ref().is_some() {
@@ -1035,89 +1020,54 @@ impl Scanner {
             extra_columns.push(ArrowField::new(SCORE_COL, DataType::Float32, true));
         }
 
-        if self.with_row_id || force_row_id {
-            extra_columns.push(ROW_ID_FIELD.clone());
-        }
-
-        if self.with_row_address {
-            extra_columns.push(ROW_ADDR_FIELD.clone());
-        }
-
-        extra_columns
-    }
-
-    pub(crate) fn scan_input_schema(&self) -> Result<Arc<Schema>> {
-        let extra_columns = self.get_extra_columns(false);
-
-        if !extra_columns.is_empty() {
-            let physical_schema = self
-                .dataset
-                .schema()
-                .merge(&ArrowSchema::new(extra_columns))?;
-            Ok(Arc::new(physical_schema))
+        if extra_columns.is_empty() {
+            Ok(schema)
         } else {
-            Ok(Arc::new(self.dataset.schema().clone()))
+            schema.merge(&ArrowSchema::new(extra_columns))
         }
     }
 
-    /// The output schema from the initial scan stage of a plan
+    /// The full schema available to filters
     ///
-    /// This includes columns that are added by the scan but don't exist in the dataset
-    /// schema (e.g. _distance, _rowid, _rowaddr)
-    pub(crate) fn scan_output_schema(
-        &self,
-        base_schema: &Schema,
-        force_row_id: bool,
-    ) -> Result<Arc<Schema>> {
-        let extra_columns = self.get_extra_columns(force_row_id);
-
-        let schema = if !extra_columns.is_empty() {
-            base_schema.merge(&ArrowSchema::new(extra_columns))?
-        } else {
-            base_schema.clone()
-        };
-
-        // drop metadata
-        // NOTE: this is the current behavior as we don't return metadata in queries
-        // but do return metadata for regular scans
-        // We should make this behavior consistent -- probably by not returning metadata always
-        if self.nearest.is_some() {
-            Ok(Arc::new(Schema {
-                fields: schema.fields,
-                metadata: HashMap::new(),
-            }))
-        } else {
-            Ok(Arc::new(schema))
-        }
+    /// This is the schema of the dataset, any metadata columns like _rowid or _rowaddr
+    /// and any extra columns like _distance or _score
+    fn filterable_schema(&self) -> Result<Arc<Schema>> {
+        let base_schema = Projection::full(self.dataset.clone())
+            .with_row_id()
+            .with_row_addr()
+            .to_schema();
+        Ok(Arc::new(self.add_extra_columns(base_schema)?))
     }
 
-    pub(crate) fn output_expr(&self) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
+    pub(crate) fn output_expr(
+        &self,
+        current_schema: &ArrowSchema,
+    ) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
         // Append the extra columns
-        let mut output_expr = self.projection_plan.to_physical_exprs()?;
-
-        let physical_schema = ArrowSchema::from(
-            self.scan_output_schema(&self.projection_plan.physical_schema, false)?
-                .as_ref(),
-        );
+        let mut output_expr = self.projection_plan.to_physical_exprs(current_schema)?;
 
         // distance goes before the row_id column
         if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
-            let vector_expr = expressions::col(DIST_COL, &physical_schema)?;
+            let vector_expr = expressions::col(DIST_COL, current_schema)?;
             output_expr.push((vector_expr, DIST_COL.to_string()));
         }
 
         if self.full_text_query.is_some() && output_expr.iter().all(|(_, name)| name != SCORE_COL) {
-            let score_expr = expressions::col(SCORE_COL, &physical_schema)?;
+            let score_expr = expressions::col(SCORE_COL, current_schema)?;
             output_expr.push((score_expr, SCORE_COL.to_string()));
         }
 
-        if self.with_row_id && output_expr.iter().all(|(_, name)| name != ROW_ID) {
-            let row_id_expr = expressions::col(ROW_ID, &physical_schema)?;
+        if self.projection_plan.physical_projection.with_row_id
+            && output_expr.iter().all(|(_, name)| name != ROW_ID)
+        {
+            let row_id_expr = expressions::col(ROW_ID, current_schema)?;
             output_expr.push((row_id_expr, ROW_ID.to_string()));
         }
 
-        if self.with_row_address && output_expr.iter().all(|(_, name)| name != ROW_ADDR) {
-            let row_addr_expr = expressions::col(ROW_ADDR, &physical_schema)?;
+        if self.projection_plan.physical_projection.with_row_addr
+            && output_expr.iter().all(|(_, name)| name != ROW_ADDR)
+        {
+            let row_addr_expr = expressions::col(ROW_ADDR, current_schema)?;
             output_expr.push((row_addr_expr, ROW_ADDR.to_string()));
         }
 
@@ -1167,8 +1117,9 @@ impl Scanner {
     fn create_count_plan(&self) -> BoxFuture<Result<Arc<dyn ExecutionPlan>>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
-            if !self.projection_plan.physical_schema.fields.is_empty() {
-                let columns: Vec<&str> = self.projection_plan.physical_schema.fields
+            if !self.projection_plan.physical_projection.is_metadata_only() {
+                let physical_schema = self.projection_plan.physical_projection.to_schema();
+                let columns: Vec<&str> = physical_schema.fields
                 .iter()
                 .map(|field| field.name.as_str())
                 .collect();
@@ -1269,6 +1220,14 @@ impl Scanner {
             MaterializationStyle::AllLate => false,
             MaterializationStyle::AllEarlyExcept(ref cols) => !cols.contains(&(field.id as u32)),
             MaterializationStyle::Heuristic => {
+                if field.is_blob() {
+                    // By default, blobs are loaded as descriptions, and so should be early
+                    //
+                    // TODO: Once we make blob handling configurable, we should use the blob
+                    // handling setting here.
+                    return true;
+                }
+
                 let byte_width = field.data_type().byte_width_opt();
                 let is_cloud = self.dataset.object_store().is_cloud();
                 if is_cloud {
@@ -1287,7 +1246,7 @@ impl Scanner {
     fn calc_eager_projection(
         &self,
         filter_plan: &FilterPlan,
-        desired_schema: &Schema,
+        desired_projection: &Projection,
     ) -> Result<Projection> {
         // Note: We use all_columns and not refine_columns here.  If a column is covered by an index but
         // the user has requested it, then we do not use it for late materialization.
@@ -1309,11 +1268,9 @@ impl Scanner {
             });
         }
 
-        Ok(self
-            .dataset
-            .empty_projection()
-            // Start with the desired schema
-            .union_schema(desired_schema)
+        // Start with the desired fields
+        Ok(desired_projection
+            .clone()
             // Subtract columns that are expensive
             .subtract_predicate(|f| !self.is_early_field(f))
             // Add back columns that we need for filtering
@@ -1321,9 +1278,11 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
-        if self.projection_plan.physical_schema.fields.is_empty()
-            && !self.with_row_id
-            && !self.with_row_address
+        // Note: it's _ok_ (though maybe dubious) if the projection is empty and there is a vector search
+        // or FTS because we might be projecting just the _distance / _score columns
+        if self.projection_plan.physical_projection.is_empty()
+            && self.nearest.is_none()
+            && self.full_text_query.is_none()
         {
             return Err(Error::InvalidInput {
                 source:
@@ -1333,26 +1292,9 @@ impl Scanner {
             });
         }
 
-        if self.include_deleted_rows && !self.with_row_id {
+        if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
             return Err(Error::InvalidInput {
                 source: "include_deleted_rows is set but with_row_id is false".into(),
-                location: location!(),
-            });
-        }
-
-        if let Some(first_blob_col) = self
-            .projection_plan
-            .physical_schema
-            .fields
-            .iter()
-            .find(|f| !f.is_default_storage())
-        {
-            return Err(Error::NotSupported {
-                source: format!(
-                    "Scanning blob columns such as \"{}\" is not yet supported",
-                    first_blob_col.name
-                )
-                .into(),
                 location: location!(),
             });
         }
@@ -1361,7 +1303,7 @@ impl Scanner {
     }
 
     async fn create_filter_plan(&self, use_scalar_index: bool) -> Result<FilterPlan> {
-        let filter_schema = self.scan_input_schema()?;
+        let filter_schema = self.filterable_schema()?;
         let planner = Planner::new(Arc::new(filter_schema.as_ref().into()));
 
         if let Some(filter) = self.filter.as_ref() {
@@ -1563,22 +1505,13 @@ impl Scanner {
         }
 
         // Stage 5: take remaining columns required for projection
-        let physical_schema =
-            self.scan_output_schema(&self.projection_plan.physical_schema, false)?;
-        let physical_projection = self
-            .dataset
-            .empty_projection()
-            .union_schema(&physical_schema);
-        plan = self.take(plan, physical_projection)?;
-        // Stage 6: physical projection -- reorder physical columns needed before final projection
-        let output_arrow_schema = physical_schema.as_ref().into();
-
-        if plan.schema().as_ref() != &output_arrow_schema {
-            plan = Arc::new(project(plan, &physical_schema.as_ref().into())?);
-        }
+        plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
         // Stage 7: final projection
-        plan = Arc::new(DFProjectionExec::try_new(self.output_expr()?, plan)?);
+        plan = Arc::new(DFProjectionExec::try_new(
+            self.output_expr(plan.schema().as_ref())?,
+            plan,
+        )?);
 
         // Stage 8: If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
@@ -1655,9 +1588,9 @@ impl Scanner {
 
             let scan = self.scan_fragments(
                 projection.with_row_id,
-                self.with_row_address,
+                self.projection_plan.physical_projection.with_row_addr,
                 make_deletions_null,
-                projection.into_schema_ref(),
+                Arc::new(projection.to_bare_schema()),
                 fragments,
                 scan_range,
                 ordered,
@@ -1766,22 +1699,17 @@ impl Scanner {
         filter_plan: &mut FilterPlan,
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
-        let mut projection = if filter_plan.has_two_steps() {
+        let projection = if filter_plan.has_two_steps() {
             // If the filter plan has two steps (a scalar indexed portion and a refine portion) then
             // it makes sense to grab cheap columns during the first step to avoid taking them for
             // the second step.
-            self.calc_eager_projection(filter_plan, self.projection_plan.physical_schema.as_ref())?
+            self.calc_eager_projection(filter_plan, &self.projection_plan.physical_projection)?
                 .with_row_id()
         } else {
             // If the filter plan only has one step then we just do a filtered read of all the
             // columns that the user asked for.
-            self.dataset
-                .empty_projection()
-                .union_schema(&self.projection_plan.physical_schema)
+            self.projection_plan.physical_projection.clone()
         };
-
-        projection.with_row_id |= self.with_row_id;
-        projection.with_row_addr = self.with_row_address;
 
         let scan_range = if filter_plan.is_empty() {
             log::trace!("pushing scan_range into filtered_read");
@@ -2632,7 +2560,7 @@ impl Scanner {
             plan = Arc::new(LanceFilterExec::try_new(optimized_filter, plan)?);
         }
 
-        if self.with_row_address {
+        if self.projection_plan.physical_projection.with_row_addr {
             plan = Arc::new(AddRowAddrExec::try_new(plan, self.dataset.clone(), 0)?);
         }
 
@@ -2658,14 +2586,14 @@ impl Scanner {
             let filter_cols = Planner::column_names_in_expr(filter);
             let scan_projection = projection.union_columns(filter_cols, OnMissing::Error)?;
 
-            let scan_schema = scan_projection.into_schema_ref();
+            let scan_schema = Arc::new(scan_projection.to_bare_schema());
             let scan_arrow_schema = Arc::new(scan_schema.as_ref().into());
             let planner = Planner::new(scan_arrow_schema);
             let optimized_filter = planner.optimize_expr(filter.clone())?;
 
             let new_data_scan = self.scan_fragments(
                 true,
-                self.with_row_address,
+                self.projection_plan.physical_projection.with_row_addr,
                 false,
                 scan_schema,
                 missing_frags.into(),
@@ -2774,8 +2702,8 @@ impl Scanner {
             fragment_readahead: self
                 .fragment_readahead
                 .unwrap_or(LEGACY_DEFAULT_FRAGMENT_READAHEAD),
-            with_row_id: self.with_row_id,
-            with_row_address: self.with_row_address,
+            with_row_id: self.projection_plan.physical_projection.with_row_id,
+            with_row_address: self.projection_plan.physical_projection.with_row_addr,
             make_deletions_null,
             ordered_output: self.ordered,
         };
@@ -2789,7 +2717,7 @@ impl Scanner {
         Ok(Arc::new(LancePushdownScanExec::try_new(
             self.dataset.clone(),
             fragments,
-            self.projection_plan.physical_schema.clone(),
+            Arc::new(self.projection_plan.physical_projection.to_bare_schema()),
             filter_plan.refine_expr.clone().unwrap(),
             config,
         )?))
@@ -3146,7 +3074,7 @@ pub mod test_dataset {
 
     use super::*;
 
-    use std::vec;
+    use std::{collections::HashMap, vec};
 
     use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::ArrowError;
@@ -3597,6 +3525,26 @@ mod test {
             .copied()
             .collect();
         assert_eq!(expected_i, actual_i);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_can_project_distance() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+
+        let mut scan = dataset.scan();
+        let key: Float32Array = (32..64).map(|v| v as f32).collect();
+        scan.nearest("vec", &key, 5).unwrap();
+        scan.refine(5);
+        scan.project(&["_distance"]).unwrap();
+
+        let batch = scan.try_into_batch().await.unwrap();
+
+        assert_eq!(batch.num_rows(), 5);
+        assert_eq!(batch.num_columns(), 1);
     }
 
     #[rstest]
@@ -5219,9 +5167,7 @@ mod test {
         }
 
         async fn check_vector_queries(&self, params: &ScalarTestParams) {
-            println!("check_vector_queries (scalar index only)");
             self.check_vector_scalar_indexed_only(params).await;
-            println!("check_vector_queries (scalar index and refine)");
             self.check_vector_scalar_indexed_and_refine(params).await;
         }
 
@@ -5299,9 +5245,7 @@ mod test {
         }
 
         async fn check_simple_queries(&self, params: &ScalarTestParams) {
-            println!("check_simple_queries (scalar index only)");
             self.check_simple_indexed_only(params).await;
-            println!("check_simple_queries (scalar index and refine)");
             self.check_simple_indexed_and_refine(params).await;
         }
     }
@@ -5710,6 +5654,7 @@ mod test {
 
     #[rstest]
     #[tokio::test]
+    #[test_log::test]
     async fn test_plans(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
@@ -5727,7 +5672,7 @@ mod test {
         // ---------------------------------------------------------------------
         // V2 writer does not use LancePushdownScan
         if data_storage_version == LanceFileVersion::Legacy {
-            println!("Pushdown scan");
+            log::info!("Test case: Pushdown scan");
             assert_plan_equals(
                 &dataset.dataset,
                 |scan| scan.project(&["s"])?.filter("i > 10 and i < 20"),
@@ -5735,7 +5680,7 @@ mod test {
             ).await?;
         }
 
-        println!("Project and filter");
+        log::info!("Test case: Project and filter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[s@2 as s]
   Take: columns=\"i, _rowid, (s)\"
@@ -5761,7 +5706,7 @@ mod test {
 
         // Integer fields will be eagerly materialized while string/vec fields
         // are not.
-        println!("Late materialization");
+        log::info!("Test case: Late materialization");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@3 as vec]
             Take: columns=\"i, s, _rowid, (vec)\"
@@ -5783,7 +5728,7 @@ mod test {
         .await?;
 
         // Custom materialization
-        println!("Custom materialization (all early)");
+        log::info!("Test case: Custom materialization (all early)");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@2 as vec]
   FilterExec: s@1 IS NOT NULL
@@ -5804,7 +5749,7 @@ mod test {
         )
         .await?;
 
-        println!("Custom materialization 2 (all late)");
+        log::info!("Test case: Custom materialization 2 (all late)");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@2 as i, s@0 as s, vec@3 as vec]
   Take: columns=\"s, _rowid, (i), (vec)\"
@@ -5829,7 +5774,7 @@ mod test {
         )
         .await?;
 
-        println!("Custom materialization 3 (mixed)");
+        log::info!("Test case: Custom materialization 3 (mixed)");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@3 as i, s@0 as s, vec@1 as vec]
   Take: columns=\"s, vec, _rowid, (i)\"
@@ -5856,7 +5801,7 @@ mod test {
         )
         .await?;
 
-        println!("Scan out of order");
+        log::info!("Test case: Scan out of order");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
@@ -5873,7 +5818,7 @@ mod test {
         // KNN
         // ---------------------------------------------------------------------
         let q: Float32Array = (32..32 + dim).map(|v| v as f32).collect();
-        println!("Basic KNN");
+        log::info!("Test case: Basic KNN");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   Take: columns=\"vec, _rowid, _distance, (i), (s)\"
@@ -5902,7 +5847,7 @@ mod test {
         // KNN + Limit (arguably the user, or us, should fold the limit into the KNN but we don't today)
         // ---------------------------------------------------------------------
         let q: Float32Array = (32..32 + dim).map(|v| v as f32).collect();
-        println!("KNN with extraneous limit");
+        log::info!("Test case: KNN with extraneous limit");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   Take: columns=\"vec, _rowid, _distance, (i), (s)\"
@@ -5933,22 +5878,14 @@ mod test {
         // ANN
         // ---------------------------------------------------------------------
         dataset.make_vector_index().await?;
-        println!("Basic ANN");
-        let expected = if data_storage_version == LanceFileVersion::Legacy {
+        log::info!("Test case: Basic ANN");
+        let expected =
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=42), expr=...
         ANNSubIndex: name=..., k=42, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1"
-        } else {
-            "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      SortExec: TopK(fetch=42), expr=...
-        ANNSubIndex: name=..., k=42, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1"
-        };
+          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 42),
@@ -5956,8 +5893,8 @@ mod test {
         )
         .await?;
 
-        println!("ANN with refine");
-        let expected = if data_storage_version == LanceFileVersion::Legacy {
+        log::info!("Test case: ANN with refine");
+        let expected =
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
@@ -5968,20 +5905,7 @@ mod test {
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=40), expr=...
                   ANNSubIndex: name=..., k=40, deltas=1
-                    ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1"
-        } else {
-            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@... IS NOT NULL
-        SortExec: TopK(fetch=10), expr=...
-          KNNVectorDistance: metric=l2
-            Take: columns=\"_distance, _rowid, (vec)\"
-              CoalesceBatchesExec: target_batch_size=8192
-                SortExec: TopK(fetch=40), expr=...
-                  ANNSubIndex: name=..., k=40, deltas=1
-                    ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1"
-        };
+                    ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
             |scan| Ok(scan.nearest("vec", &q, 10)?.refine(4)),
@@ -5990,7 +5914,7 @@ mod test {
         .await?;
 
         // use_index = False -> same plan as KNN
-        println!("ANN with index disabled");
+        log::info!("Test case: ANN with index disabled");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   Take: columns=\"vec, _rowid, _distance, (i), (s)\"
@@ -6016,9 +5940,8 @@ mod test {
         )
         .await?;
 
-        println!("ANN with postfilter");
-        let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowid@1 as _rowid]
+        log::info!("Test case: ANN with postfilter");
+        let expected = "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowid@1 as _rowid]
   Take: columns=\"_distance, _rowid, i, (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@2 > 10
@@ -6026,18 +5949,7 @@ mod test {
           CoalesceBatchesExec: target_batch_size=8192
             SortExec: TopK(fetch=17), expr=...
               ANNSubIndex: name=..., k=17, deltas=1
-                ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1"
-        } else {
-            "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowid@1 as _rowid]
-  Take: columns=\"_distance, _rowid, i, (s), (vec)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: i@2 > 10
-        Take: columns=\"_distance, _rowid, (i)\"
-          CoalesceBatchesExec: target_batch_size=8192
-            SortExec: TopK(fetch=17), expr=...
-              ANNSubIndex: name=..., k=17, deltas=1
-                ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1"
-        };
+                ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -6051,7 +5963,7 @@ mod test {
         )
         .await?;
 
-        println!("ANN with prefilter");
+        log::info!("Test case: ANN with prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
@@ -6085,9 +5997,8 @@ mod test {
         .await?;
 
         dataset.append_new_data().await?;
-        println!("Combined KNN/ANN");
-        let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+        log::info!("Test case: Combined KNN/ANN");
+        let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
@@ -6104,27 +6015,7 @@ mod test {
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=6), expr=...
                       ANNSubIndex: name=..., k=6, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1"
-        } else {
-            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@... IS NOT NULL
-        SortExec: TopK(fetch=6), expr=...
-          KNNVectorDistance: metric=l2
-            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-              UnionExec
-                ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
-                  FilterExec: _distance@... IS NOT NULL
-                    SortExec: TopK(fetch=6), expr=...
-                      KNNVectorDistance: metric=l2
-                        LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-                Take: columns=\"_distance, _rowid, (vec)\"
-                  CoalesceBatchesExec: target_batch_size=8192
-                    SortExec: TopK(fetch=6), expr=...
-                      ANNSubIndex: name=..., k=6, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1"
-        };
+                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 6),
@@ -6135,9 +6026,8 @@ mod test {
         .await?;
 
         // new data and with filter
-        println!("Combined KNN/ANN with postfilter");
-        let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+        log::info!("Test case: Combined KNN/ANN with postfilter");
+        let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@3 > 10
@@ -6157,30 +6047,7 @@ mod test {
                         CoalesceBatchesExec: target_batch_size=8192
                           SortExec: TopK(fetch=15), expr=...
                             ANNSubIndex: name=..., k=15, deltas=1
-                              ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1"
-        } else {
-            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, i, (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: i@3 > 10
-        Take: columns=\"_rowid, vec, _distance, (i)\"
-          CoalesceBatchesExec: target_batch_size=8192
-            FilterExec: _distance@... IS NOT NULL
-              SortExec: TopK(fetch=15), expr=...
-                KNNVectorDistance: metric=l2
-                  RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-                    UnionExec
-                      ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
-                        FilterExec: _distance@... IS NOT NULL
-                          SortExec: TopK(fetch=15), expr=...
-                            KNNVectorDistance: metric=l2
-                              LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-                      Take: columns=\"_distance, _rowid, (vec)\"
-                        CoalesceBatchesExec: target_batch_size=8192
-                          SortExec: TopK(fetch=15), expr=...
-                            ANNSubIndex: name=..., k=15, deltas=1
-                              ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1"
-        };
+                              ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1";
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 15)?.filter("i > 10"),
@@ -6189,7 +6056,7 @@ mod test {
         .await?;
 
         // new data and with prefilter
-        println!("Combined KNN/ANN with prefilter");
+        log::info!("Test case: Combined KNN/ANN with prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
@@ -6255,24 +6122,15 @@ mod test {
         dataset.make_vector_index().await?;
         dataset.make_scalar_index().await?;
 
-        println!("ANN with scalar index");
-        let expected = if data_storage_version == LanceFileVersion::Legacy {
+        log::info!("Test case: ANN with scalar index");
+        let expected =
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
           ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
-          ScalarIndexQuery: query=[i > 10]@i_idx"
-        } else {
-            "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      SortExec: TopK(fetch=5), expr=...
-        ANNSubIndex: name=..., k=5, deltas=1
-          ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
-          ScalarIndexQuery: query=[i > 10]@i_idx"
-        };
+          ScalarIndexQuery: query=[i > 10]@i_idx";
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -6285,7 +6143,7 @@ mod test {
         )
         .await?;
 
-        println!("ANN with scalar index disabled");
+        log::info!("Test case: ANN with scalar index disabled");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
@@ -6320,9 +6178,8 @@ mod test {
 
         dataset.append_new_data().await?;
 
-        println!("Combined KNN/ANN with scalar index");
-        let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+        log::info!("Test case: Combined KNN/ANN with scalar index");
+        let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
@@ -6341,29 +6198,7 @@ mod test {
                     SortExec: TopK(fetch=8), expr=...
                       ANNSubIndex: name=..., k=8, deltas=1
                         ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
-                        ScalarIndexQuery: query=[i > 10]@i_idx"
-        } else {
-            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@... IS NOT NULL
-        SortExec: TopK(fetch=8), expr=...
-          KNNVectorDistance: metric=l2
-            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-              UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
-                  FilterExec: _distance@... IS NOT NULL
-                    SortExec: TopK(fetch=8), expr=...
-                      KNNVectorDistance: metric=l2
-                        FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-                Take: columns=\"_distance, _rowid, (vec)\"
-                  CoalesceBatchesExec: target_batch_size=8192
-                    SortExec: TopK(fetch=8), expr=...
-                      ANNSubIndex: name=..., k=8, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
-                        ScalarIndexQuery: query=[i > 10]@i_idx"
-        };
+                        ScalarIndexQuery: query=[i > 10]@i_idx";
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -6377,9 +6212,10 @@ mod test {
         .await?;
 
         // Update scalar index but not vector index
-        println!("Combined KNN/ANN with updated scalar index and outdated vector index");
-        let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+        log::info!(
+            "Test case: Combined KNN/ANN with updated scalar index and outdated vector index"
+        );
+        let expected = "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
@@ -6398,29 +6234,7 @@ mod test {
                     SortExec: TopK(fetch=11), expr=...
                       ANNSubIndex: name=..., k=11, deltas=1
                         ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
-                        ScalarIndexQuery: query=[i > 10]@i_idx"
-        } else {
-            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@... IS NOT NULL
-        SortExec: TopK(fetch=11), expr=...
-          KNNVectorDistance: metric=l2
-            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-              UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
-                  FilterExec: _distance@... IS NOT NULL
-                    SortExec: TopK(fetch=11), expr=...
-                      KNNVectorDistance: metric=l2
-                        FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-                Take: columns=\"_distance, _rowid, (vec)\"
-                  CoalesceBatchesExec: target_batch_size=8192
-                    SortExec: TopK(fetch=11), expr=...
-                      ANNSubIndex: name=..., k=11, deltas=1
-                        ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
-                        ScalarIndexQuery: query=[i > 10]@i_idx"
-        };
+                        ScalarIndexQuery: query=[i > 10]@i_idx";
         dataset.make_scalar_index().await?;
         assert_plan_equals(
             &dataset.dataset,
@@ -6436,7 +6250,7 @@ mod test {
 
         // Scans with scalar index
         // ---------------------------------------------------------------------
-        println!("Filtered read with scalar index");
+        log::info!("Test case: Filtered read with scalar index");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[s@1 as s]
   Take: columns=\"_rowid, (s)\"
@@ -6454,7 +6268,9 @@ mod test {
         .await?;
 
         if data_storage_version != LanceFileVersion::Legacy {
-            println!("Filtered read with scalar index disabled (late materialization)");
+            log::info!(
+                "Test case: Filtered read with scalar index disabled (late materialization)"
+            );
             assert_plan_equals(
                 &dataset.dataset,
                 |scan| {
@@ -6471,7 +6287,7 @@ mod test {
             .await?;
         }
 
-        println!("Empty projection");
+        log::info!("Test case: Empty projection");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
   AddRowAddrExec
@@ -6493,7 +6309,7 @@ mod test {
         .await?;
 
         dataset.append_new_data().await?;
-        println!("Combined Scalar/non-scalar filtered read");
+        log::info!("Test case: Combined Scalar/non-scalar filtered read");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[s@1 as s]
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
@@ -6515,7 +6331,7 @@ mod test {
         )
         .await?;
 
-        println!("Combined Scalar/non-scalar filtered read with empty projection");
+        log::info!("Test case: Combined Scalar/non-scalar filtered read with empty projection");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
@@ -6543,18 +6359,17 @@ mod test {
 
         // Scans with dynamic projection
         // When an expression is specified in the projection, the plan should include a ProjectionExec
-        println!("Dynamic projection");
+        log::info!("Test case: Dynamic projection");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            "ProjectionExec: expr=[regexp_match(s@0, .*) as matches]
-  ProjectionExec: expr=[s@1 as s]
-    RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-      UnionExec
-        Take: columns=\"_rowid, (s)\"
-          CoalesceBatchesExec: target_batch_size=8192
-            MaterializeIndex: query=[i > 10]@i_idx
-        ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
-          FilterExec: i@0 > 10
-            LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"
+            "ProjectionExec: expr=[regexp_match(s@1, .*) as matches]
+  RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+    UnionExec
+      Take: columns=\"_rowid, (s)\"
+        CoalesceBatchesExec: target_batch_size=8192
+          MaterializeIndex: query=[i > 10]@i_idx
+      ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
+        FilterExec: i@0 > 10
+          LanceScan: uri=..., row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "ProjectionExec: expr=[regexp_match(s@0, .*) as matches]
   LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
@@ -6574,18 +6389,11 @@ mod test {
         // ---------------------------------------------------------------------
         // All rows are indexed
         dataset.make_fts_index().await?;
-        println!("Full text search (match query)");
-        let expected = if data_storage_version == LanceFileVersion::Legacy {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+        log::info!("Test case: Full text search (match query)");
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello"#
-        } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
-    CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: query=hello"#
-        };
+      MatchQuery: query=hello"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -6597,18 +6405,11 @@ mod test {
         )
         .await?;
 
-        println!("Full text search (phrase query)");
-        let expected = if data_storage_version == LanceFileVersion::Legacy {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+        log::info!("Test case: Full text search (phrase query)");
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      PhraseQuery: query=hello world"#
-        } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
-    CoalesceBatchesExec: target_batch_size=8192
-      PhraseQuery: query=hello world"#
-        };
+      PhraseQuery: query=hello world"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -6621,22 +6422,13 @@ mod test {
         )
         .await?;
 
-        println!("Full text search (boost query)");
-        let expected = if data_storage_version == LanceFileVersion::Legacy {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+        log::info!("Test case: Full text search (boost query)");
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       BoostQuery: negative_boost=1
         MatchQuery: query=hello
-        MatchQuery: query=world"#
-        } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
-    CoalesceBatchesExec: target_batch_size=8192
-      BoostQuery: negative_boost=1
-        MatchQuery: query=hello
-        MatchQuery: query=world"#
-        };
+        MatchQuery: query=world"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -6653,7 +6445,7 @@ mod test {
         )
         .await?;
 
-        println!("Full text search with prefilter");
+        log::info!("Test case: Full text search with prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
@@ -6685,9 +6477,8 @@ mod test {
         )
         .await?;
 
-        println!("Full text search with unindexed rows");
-        let expected = if data_storage_version == LanceFileVersion::Legacy {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+        log::info!("Test case: Full text search with unindexed rows");
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
@@ -6695,18 +6486,7 @@ mod test {
           UnionExec
             MatchQuery: query=hello
             FlatMatchQuery: query=hello
-              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"#
-        } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
-    CoalesceBatchesExec: target_batch_size=8192
-      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            MatchQuery: query=hello
-            FlatMatchQuery: query=hello
-              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"#
-        };
+              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"#;
         dataset.append_new_data().await?;
         assert_plan_equals(
             &dataset.dataset,
@@ -6719,7 +6499,7 @@ mod test {
         )
         .await?;
 
-        println!("Full text search with unindexed rows and prefilter");
+        log::info!("Test case: Full text search with unindexed rows and prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
