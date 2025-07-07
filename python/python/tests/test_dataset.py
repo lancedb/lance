@@ -3688,3 +3688,35 @@ def test_metadata_cache_size(tmp_path):
     # With zero cache size, session should be smaller than default
     # (it won't be exactly 0 due to struct overhead)
     assert zero_cache_size < default_size
+
+
+def test_dataset_sql(tmp_path: Path):
+    table = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
+    ds = lance.write_dataset(table, tmp_path / "test")
+
+    query = ds.sql("SELECT * FROM test WHERE id > 1").table_name("test").build()
+    explain_plan = query.explain_plan(verbose=True)
+    assert "Filter" in explain_plan
+
+    result = query.to_batch_records()
+    expected = pa.table({"id": [2, 3], "value": ["b", "c"]})
+    assert pa.Table.from_batches(result) == expected
+
+    stream_result = (
+        ds.sql("SELECT value FROM test WHERE id = 1")
+        .table_name("test")
+        .build()
+        .to_stream_reader()
+    )
+    batches = list(stream_result)
+    assert len(batches) == 1
+    assert batches[0].to_pydict() == {"value": ["a"]}
+
+    complex_query = ds.sql("""
+                           SELECT id as user_id, UPPER(value) as val
+                           FROM dataset
+                           WHERE id BETWEEN 1 AND 3
+                           """).build()
+    complex_result = complex_query.to_batch_records()
+    expected_complex = pa.table({"user_id": [1, 2, 3], "val": ["A", "B", "C"]})
+    assert pa.Table.from_batches(complex_result) == expected_complex
