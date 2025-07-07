@@ -239,7 +239,7 @@ impl LanceFilter {
         match self {
             Self::Sql(sql) => {
                 let schema = Arc::new(ArrowSchema::from(full_schema));
-                let planner = Planner::new(schema);
+                let planner = Planner::new(schema.clone());
                 let filter = planner.parse_filter(sql)?;
                 planner.optimize_expr(filter).map_err(|e| {
                     Error::invalid_input(
@@ -1117,6 +1117,9 @@ impl Scanner {
     fn create_count_plan(&self) -> BoxFuture<Result<Arc<dyn ExecutionPlan>>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
+            if self.projection_plan.physical_projection.is_empty() {
+                return Err(Error::invalid_input(format!("count_rows called but with_row_id is false"), location!()));
+            }
             if !self.projection_plan.physical_projection.is_metadata_only() {
                 let physical_schema = self.projection_plan.physical_projection.to_schema();
                 let columns: Vec<&str> = physical_schema.fields
