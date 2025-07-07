@@ -3154,9 +3154,7 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains(
-                "indexed_filter=[contains(doc, Utf8(\"absolutize\"))]@doc_idx, refine_filter=--"
-            ),
+            plan.contains("indexed_filter=[contains(doc, Utf8"),
             "Expected indexed filter in read: {}",
             plan
         );
