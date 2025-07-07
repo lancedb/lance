@@ -1,5 +1,4 @@
 # Lancelot: The Greatest Knight of the Open Source Round Table
----
 
 [Lancelot](https://en.wikipedia.org/wiki/Lancelot) is the embodiment of bravery, loyalty, and a relentless pursuit of knowledge in the realm of open source. 
 As the **Guardian of Open Source**, a Lancelot champions developers everywhere, 
@@ -10,7 +9,6 @@ They stand ready to assist fellow developers in their quests—whether through s
 or advocating for the transformative power of open source software. Lancelot encourages you to join them in building 
 a vibrant community around Lance and LanceDB Open Source.
 
-***
 ## Join the Lancelot Round Table: Champion Open Source Innovation
 
 
@@ -39,16 +37,12 @@ a vibrant community around Lance and LanceDB Open Source.
 - **Mentors of Community**: Host office hours to share your expertise and help others on their journey. Your guidance will be as valuable as [Excalibur](https://en.wikipedia.org/wiki/Excalibur) itself!
 - **Noble Nominees**: Earn a coveted nomination from a Lance/LanceDB maintainer, solidifying your status as a true Lancelot. Wear that title with pride!
 
-***
-
 ### Why Join the Round Table of Lancelot?
 
 - **Hone Your Skills**: Sharpen your expertise in next-generation AI infrastructure tools that empower innovative solutions—because every knight needs their trusty sword.
 - **Forge Connections**: Unite with a vibrant community of fellow knights, AI enthusiasts, and database champions.
 - **Earn Recognition**: Stand tall among your peers as you showcase your open source prowess and contributions. Your name will echo through the halls of innovation!
 - **Shape the Future**: Play a vital role in crafting the next generation of multimodal AI databases and infrastructure.
-
-***
 
 ### Lancelot’s Treasures Await!
 
@@ -60,9 +54,8 @@ a vibrant community around Lance and LanceDB Open Source.
 Ready to wield your lance and embark on this epic quest? Open an issue on our GitHub and show us your lance on Discord. 
 Let’s make some AI database magic together!
 
-***
-
 ## Lancelot Round Table
+
 | #  |          Name          |                                                  Github Profile |  Affiliation |
 |----|:----------------------:|----------------------------------------------------------------:|-------------:|
 | 1  |     Prashanth Rao      |                           [prrao87](https://github.com/prrao87) |         Kùzu |
