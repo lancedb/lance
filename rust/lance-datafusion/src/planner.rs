@@ -788,17 +788,19 @@ impl Planner {
             )
         })?;
 
+        let coerced = coerce_filter_type_to_boolean(resolved);
+
         // Verify filter returns boolean
         let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
-        let (ret_type, _) = resolved.data_type_and_nullable(&df_schema)?;
+        let (ret_type, _) = coerced.data_type_and_nullable(&df_schema)?;
         if ret_type != ArrowDataType::Boolean {
-            return Err(Error::InvalidInput {
+            Err(Error::InvalidInput {
                 source: format!("The filter {} does not return a boolean", filter).into(),
                 location: location!(),
-            });
+            })
+        } else {
+            Ok(coerced)
         }
-
-        Ok(coerce_filter_type_to_boolean(resolved))
     }
 
     /// Create Logical [Expr] from a SQL expression.
