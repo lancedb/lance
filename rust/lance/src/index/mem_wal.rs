@@ -48,23 +48,23 @@ pub async fn find_latest_mem_wal_generation(
     dataset: &Dataset,
     region: &str,
 ) -> Result<Option<MemWal>> {
-    if let Some(mem_wal_index) = dataset.open_mem_wal_index(&NoOpMetricsCollector).await? {
-        if let Some(generations) = mem_wal_index.mem_wal_map.get(region) {
-            // MemWALs of the same region is ordered increasingly by its generation
-            let mut values_iter = generations.values().rev();
-            if let Some(latest_mem_wal) = values_iter.next() {
-                Ok(Some(latest_mem_wal.clone()))
-            } else {
-                Err(Error::Internal {
-                    message: format!("Encountered MemWAL index mapping that has a region with an empty list of generations: {}", region),
-                    location: location!(),
-                })
-            }
-        } else {
-            Ok(None)
-        }
+    let Some(mem_wal_index) = dataset.open_mem_wal_index(&NoOpMetricsCollector).await? else {
+        return Ok(None);
+    };
+
+    let Some(generations) = mem_wal_index.mem_wal_map.get(region) else {
+        return Ok(None);
+    };
+
+    // MemWALs of the same region is ordered increasingly by its generation
+    let mut values_iter = generations.values().rev();
+    if let Some(latest_mem_wal) = values_iter.next() {
+        Ok(Some(latest_mem_wal.clone()))
     } else {
-        Ok(None)
+        Err(Error::Internal {
+            message: format!("Encountered MemWAL index mapping that has a region with an empty list of generations: {}", region),
+            location: location!(),
+        })
     }
 }
 

@@ -1213,29 +1213,29 @@ impl DatasetIndexInternalExt for Dataset {
         &self,
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<Arc<MemWalIndex>>> {
-        if let Some(mem_wal_meta) = self.load_index_by_name(MEM_WAL_INDEX_NAME).await? {
-            let uuid = mem_wal_meta.uuid.to_string();
-            if let Some(index) = self.session.index_cache.get_mem_wal(&uuid) {
-                log::debug!("Found MemWAL index in cache uuid: {}", uuid);
-                return Ok(Some(index));
-            }
+        let Some(mem_wal_meta) = self.load_index_by_name(MEM_WAL_INDEX_NAME).await? else {
+            return Ok(None);
+        };
 
-            let index_meta = self.load_index(&uuid).await?.ok_or_else(|| Error::Index {
-                message: format!("Index with id {} does not exist", uuid),
-                location: location!(),
-            })?;
-            let index = open_mem_wal_index(index_meta)?;
-
-            info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_MEM_WAL);
-            metrics.record_index_load();
-
-            self.session
-                .index_cache
-                .insert_mem_wal(&uuid, index.clone());
-            Ok(Some(index))
-        } else {
-            Ok(None)
+        let uuid = mem_wal_meta.uuid.to_string();
+        if let Some(index) = self.session.index_cache.get_mem_wal(&uuid) {
+            log::debug!("Found MemWAL index in cache uuid: {}", uuid);
+            return Ok(Some(index));
         }
+
+        let index_meta = self.load_index(&uuid).await?.ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
+        let index = open_mem_wal_index(index_meta)?;
+
+        info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_MEM_WAL);
+        metrics.record_index_load();
+
+        self.session
+            .index_cache
+            .insert_mem_wal(&uuid, index.clone());
+        Ok(Some(index))
     }
 
     #[instrument(level = "trace", skip_all)]
