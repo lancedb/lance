@@ -565,7 +565,7 @@ impl InvertedPartition {
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
-        let mut builder = InnerBuilder::new(self.id);
+        let mut builder = InnerBuilder::new(self.id, self.inverted_list.has_positions());
         builder.tokens = self.tokens;
         builder.docs = self.docs;
 
@@ -759,6 +759,27 @@ impl TokenSet {
             TokenMap::HashMap(ref map) => map.get(token).copied(),
             TokenMap::Fst(ref map) => map.get(token).map(|id| id as u32),
         }
+    }
+
+    // the `removed_token_ids` must be sorted
+    pub fn remap(&mut self, removed_token_ids: &[u32]) {
+        if removed_token_ids.is_empty() {
+            return;
+        }
+
+        let TokenMap::HashMap(ref mut map) = self.tokens else {
+            return;
+        };
+
+        map.retain(
+            |_, token_id| match removed_token_ids.binary_search(token_id) {
+                Ok(_) => false,
+                Err(index) => {
+                    *token_id -= index as u32;
+                    true
+                }
+            },
+        );
     }
 
     pub fn next_id(&self) -> u32 {
@@ -1992,7 +2013,13 @@ pub fn is_phrase_query(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use ::object_store::path::Path;
+    use lance_core::cache::LanceCache;
+    use lance_io::object_store::ObjectStore;
+    use tempfile::tempdir;
+
     use crate::scalar::inverted::encoding::decompress_posting_list;
+    use crate::scalar::lance_format::LanceIndexStore;
 
     use super::*;
 
@@ -2032,5 +2059,55 @@ mod tests {
             .iter()
             .zip(expected.frequencies.iter())
             .all(|(a, b)| a == b));
+    }
+
+    #[tokio::test]
+    async fn test_remap_to_empty_posting_list() {
+        let mut builder = InnerBuilder::new(0, false);
+
+        // index of docs:
+        // 0: lance
+        // 1: lake lake
+        // 2: lake lake lake
+        builder.tokens.add("lance".to_owned());
+        builder.tokens.add("lake".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[1].add(1, PositionRecorder::Count(2));
+        builder.posting_lists[1].add(2, PositionRecorder::Count(3));
+        builder.docs.append(0, 1);
+        builder.docs.append(1, 1);
+        builder.docs.append(2, 1);
+
+        let mapping = HashMap::from([(0, None), (2, Some(3))]);
+        builder.remap(&mapping).await.unwrap();
+
+        // after remap, the doc 0 is removed, and the doc 2 is updated to 3
+        assert_eq!(builder.tokens.len(), 1);
+        assert_eq!(builder.tokens.get("lake"), Some(0));
+        assert_eq!(builder.posting_lists.len(), 1);
+        assert_eq!(builder.posting_lists[0].len(), 2);
+        assert_eq!(builder.docs.len(), 2);
+        assert_eq!(builder.docs.row_id(0), 1);
+        assert_eq!(builder.docs.row_id(1), 3);
+
+        let tmpdir = tempdir().unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        builder.write(store.as_ref()).await.unwrap();
+
+        // remap to delete all docs
+        let mapping = HashMap::from([(1, None), (3, None)]);
+        builder.remap(&mapping).await.unwrap();
+
+        assert_eq!(builder.tokens.len(), 0);
+        assert_eq!(builder.posting_lists.len(), 0);
+        assert_eq!(builder.docs.len(), 0);
+
+        builder.write(store.as_ref()).await.unwrap();
     }
 }

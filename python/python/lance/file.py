@@ -201,6 +201,7 @@ class LanceFileWriter:
         data_cache_bytes: Optional[int] = None,
         version: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        max_page_bytes: Optional[int] = None,
         **kwargs,
     ):
         """
@@ -225,6 +226,10 @@ class LanceFileWriter:
         storage_options : optional, dict
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        max_page_bytes : optional, int
+            The maximum size of a page in bytes, if a single array would create a
+            page larger than this then it will be split into multiple pages. The
+            default value is 32MB.
         """
         if isinstance(path, Path):
             path = str(path)
@@ -234,6 +239,7 @@ class LanceFileWriter:
             data_cache_bytes=data_cache_bytes,
             version=version,
             storage_options=storage_options,
+            max_page_bytes=max_page_bytes,
             **kwargs,
         )
         self.closed = False

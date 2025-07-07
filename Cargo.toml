@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "java/core/lance-jni",
     "rust/examples",
     "rust/lance",
     "rust/lance-arrow",
@@ -16,7 +15,7 @@ members = [
     "rust/lance-testing",
     "rust/lance-encoding/src/compression_algo/fsst",
 ]
-exclude = ["python"]
+exclude = ["python", "java/core/lance-jni"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
@@ -53,7 +52,6 @@ lance-encoding = { version = "=0.31.1", path = "./rust/lance-encoding" }
 lance-file = { version = "=0.31.1", path = "./rust/lance-file" }
 lance-index = { version = "=0.31.1", path = "./rust/lance-index" }
 lance-io = { version = "=0.31.1", path = "./rust/lance-io" }
-lance-jni = { version = "=0.31.1", path = "./java/core/lance-jni" }
 lance-linalg = { version = "=0.31.1", path = "./rust/lance-linalg" }
 lance-table = { version = "=0.31.1", path = "./rust/lance-table" }
 lance-test-macros = { version = "=0.31.1", path = "./rust/lance-test-macros" }
