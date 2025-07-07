@@ -56,6 +56,15 @@ def test_schema_only(tmp_path):
     assert reader.metadata().schema == schema
 
 
+def test_write_with_max_page_bytes(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    with LanceFileWriter(str(path), schema, max_page_bytes=1) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    reader = LanceFileReader(str(path))
+    assert len(reader.metadata().columns[0].pages) == 3
+
+
 def test_aborted_write(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
