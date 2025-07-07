@@ -240,7 +240,7 @@ def test_vector_transform(tmpdir, small_rand_dataset, small_rand_ivf, small_rand
     assert reader.metadata().num_rows == (SMALL_ROWS_PER_FRAGMENT * len(fragments))
     data = next(reader.read_all(batch_size=10000).to_batches())
 
-    row_id = data.column("_rowid")
+    row_id = data.column("row_id")
     assert row_id.type == pa.uint64()
 
     pq_code = data.column("__pq_code")
@@ -281,7 +281,7 @@ def test_vector_transform_with_precomputed_partitions(
     assert reader.metadata().num_rows == (SMALL_ROWS_PER_FRAGMENT * len(fragments))
     data = next(reader.read_all(batch_size=10000).to_batches())
 
-    row_id = data.column("_rowid")
+    row_id = data.column("row_id")
     assert row_id.type == pa.uint64()
 
     pq_code = data.column("__pq_code")
