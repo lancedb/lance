@@ -1397,6 +1397,8 @@ impl FileFragment {
     /// the fragment. They can be used to derive new columns. This is allowed to
     /// be empty.
     ///
+    /// The columns `_rowaddr` and `_rowid` can be used to load the row id or row address
+    ///
     /// The `schemas` parameter is a tuple of the write schema (just the new fields)
     /// and the full schema (the target schema after the update). If the write
     /// schema is None, it is inferred from the first batch of results. The full
@@ -1584,10 +1586,16 @@ impl FileFragment {
         // We do this on the expression level after expression optimization has
         // occurred so we also catch expressions that are equivalent to `true`
         if let Some(predicate) = &scanner.get_filter()? {
-            if matches!(predicate, Expr::Literal(ScalarValue::Boolean(Some(false)))) {
+            if matches!(
+                predicate,
+                Expr::Literal(ScalarValue::Boolean(Some(false)), _)
+            ) {
                 return Ok(Some(self));
             }
-            if matches!(predicate, Expr::Literal(ScalarValue::Boolean(Some(true)))) {
+            if matches!(
+                predicate,
+                Expr::Literal(ScalarValue::Boolean(Some(true)), _)
+            ) {
                 return Ok(None);
             }
         }

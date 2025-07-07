@@ -387,44 +387,50 @@ impl AnyQuery for SargableQuery {
         match self {
             Self::Range(lower, upper) => match (lower, upper) {
                 (Bound::Unbounded, Bound::Unbounded) => {
-                    Expr::Literal(ScalarValue::Boolean(Some(true)))
+                    Expr::Literal(ScalarValue::Boolean(Some(true)), None)
                 }
                 (Bound::Unbounded, Bound::Included(rhs)) => {
-                    col_expr.lt_eq(Expr::Literal(rhs.clone()))
+                    col_expr.lt_eq(Expr::Literal(rhs.clone(), None))
                 }
-                (Bound::Unbounded, Bound::Excluded(rhs)) => col_expr.lt(Expr::Literal(rhs.clone())),
+                (Bound::Unbounded, Bound::Excluded(rhs)) => {
+                    col_expr.lt(Expr::Literal(rhs.clone(), None))
+                }
                 (Bound::Included(lhs), Bound::Unbounded) => {
-                    col_expr.gt_eq(Expr::Literal(lhs.clone()))
+                    col_expr.gt_eq(Expr::Literal(lhs.clone(), None))
                 }
-                (Bound::Included(lhs), Bound::Included(rhs)) => {
-                    col_expr.between(Expr::Literal(lhs.clone()), Expr::Literal(rhs.clone()))
-                }
+                (Bound::Included(lhs), Bound::Included(rhs)) => col_expr.between(
+                    Expr::Literal(lhs.clone(), None),
+                    Expr::Literal(rhs.clone(), None),
+                ),
                 (Bound::Included(lhs), Bound::Excluded(rhs)) => col_expr
                     .clone()
-                    .gt_eq(Expr::Literal(lhs.clone()))
-                    .and(col_expr.lt(Expr::Literal(rhs.clone()))),
-                (Bound::Excluded(lhs), Bound::Unbounded) => col_expr.gt(Expr::Literal(lhs.clone())),
+                    .gt_eq(Expr::Literal(lhs.clone(), None))
+                    .and(col_expr.lt(Expr::Literal(rhs.clone(), None))),
+                (Bound::Excluded(lhs), Bound::Unbounded) => {
+                    col_expr.gt(Expr::Literal(lhs.clone(), None))
+                }
                 (Bound::Excluded(lhs), Bound::Included(rhs)) => col_expr
                     .clone()
-                    .gt(Expr::Literal(lhs.clone()))
-                    .and(col_expr.lt_eq(Expr::Literal(rhs.clone()))),
+                    .gt(Expr::Literal(lhs.clone(), None))
+                    .and(col_expr.lt_eq(Expr::Literal(rhs.clone(), None))),
                 (Bound::Excluded(lhs), Bound::Excluded(rhs)) => col_expr
                     .clone()
-                    .gt(Expr::Literal(lhs.clone()))
-                    .and(col_expr.lt(Expr::Literal(rhs.clone()))),
+                    .gt(Expr::Literal(lhs.clone(), None))
+                    .and(col_expr.lt(Expr::Literal(rhs.clone(), None))),
             },
             Self::IsIn(values) => col_expr.in_list(
                 values
                     .iter()
-                    .map(|val| Expr::Literal(val.clone()))
+                    .map(|val| Expr::Literal(val.clone(), None))
                     .collect::<Vec<_>>(),
                 false,
             ),
-            Self::FullTextSearch(query) => col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(
-                query.query.to_string(),
-            )))),
+            Self::FullTextSearch(query) => col_expr.like(Expr::Literal(
+                ScalarValue::Utf8(Some(query.query.to_string())),
+                None,
+            )),
             Self::IsNull() => col_expr.is_null(),
-            Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone())),
+            Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone(), None)),
         }
     }
 
@@ -472,7 +478,7 @@ impl AnyQuery for LabelListQuery {
                     func: Arc::new(array_has::ArrayHasAll::new().into()),
                     args: vec![
                         Expr::Column(Column::new_unqualified(col)),
-                        Expr::Literal(ScalarValue::List(labels_arr)),
+                        Expr::Literal(ScalarValue::List(labels_arr), None),
                     ],
                 })
             }
@@ -492,7 +498,7 @@ impl AnyQuery for LabelListQuery {
                     func: Arc::new(array_has::ArrayHasAny::new().into()),
                     args: vec![
                         Expr::Column(Column::new_unqualified(col)),
-                        Expr::Literal(ScalarValue::List(labels_arr)),
+                        Expr::Literal(ScalarValue::List(labels_arr), None),
                     ],
                 })
             }
@@ -532,7 +538,7 @@ impl AnyQuery for TextQuery {
                 func: Arc::new(ContainsFunc::new().into()),
                 args: vec![
                     Expr::Column(Column::new_unqualified(col)),
-                    Expr::Literal(ScalarValue::Utf8(Some(substr.clone()))),
+                    Expr::Literal(ScalarValue::Utf8(Some(substr.clone())), None),
                 ],
             }),
         }

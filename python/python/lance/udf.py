@@ -171,11 +171,33 @@ def normalize_transform(
     read_columns: Optional[List[str]] = None,
     reader_schema: Optional[pa.Schema] = None,
 ):
+    filtered_read_columns = None
+    with_row_id = False
+    with_row_address = False
+    if read_columns is not None:
+        filtered_read_columns = []
+        for col in read_columns:
+            if col == "_rowid":
+                with_row_id = True
+            elif col == "_rowaddr":
+                with_row_address = True
+            else:
+                filtered_read_columns.append(col)
+
     if isinstance(udf_like, BatchUDF):
         if udf_like.output_schema is None:
             # Infer the schema based on the first batch
             sample_batch = udf_like(
-                next(iter(data_source.to_batches(limit=1, columns=read_columns)))
+                next(
+                    iter(
+                        data_source.to_batches(
+                            limit=1,
+                            columns=filtered_read_columns,
+                            with_row_id=with_row_id,
+                            with_row_address=with_row_address,
+                        )
+                    )
+                )
             )
             if isinstance(sample_batch, pd.DataFrame):
                 sample_batch = pa.RecordBatch.from_pandas(sample_batch)
@@ -194,7 +216,16 @@ def normalize_transform(
     elif callable(udf_like):
         try:
             sample_batch = udf_like(
-                next(iter(data_source.to_batches(limit=1, columns=read_columns)))
+                next(
+                    iter(
+                        data_source.to_batches(
+                            limit=1,
+                            columns=filtered_read_columns,
+                            with_row_id=with_row_id,
+                            with_row_address=with_row_address,
+                        )
+                    )
+                )
             )
             if isinstance(sample_batch, pd.DataFrame):
                 sample_batch = pa.RecordBatch.from_pandas(sample_batch)

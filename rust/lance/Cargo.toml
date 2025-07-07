@@ -77,7 +77,6 @@ prost_old = { version = "0.12.6", package = "prost", optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 tempfile.workspace = true
 tracing.workspace = true
-lazy_static = { workspace = true }
 humantime = { workspace = true }
 async_cell = "0.2.2"
 
@@ -102,7 +101,6 @@ env_logger = "0.11.7"
 test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
-random_word = { version = "0.4.3", features = ["en"] }
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }

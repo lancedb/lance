@@ -67,14 +67,14 @@ pub use ffi::JNIEnvExt;
 use env_logger::{Builder, Env};
 use std::sync::Arc;
 
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
 
-lazy_static! {
-    pub static ref RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_multi_thread()
+pub static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("Failed to create tokio runtime");
-}
+        .expect("Failed to create tokio runtime")
+});
 
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_JniLoader_initLanceLogger() {

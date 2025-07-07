@@ -73,6 +73,7 @@ use arrow_schema::DataType;
 use dataset::builder::DatasetBuilder;
 pub use lance_core::{datatypes, error};
 pub use lance_core::{Error, Result};
+use std::sync::LazyLock;
 
 pub mod arrow;
 pub mod datafusion;
@@ -94,6 +95,5 @@ pub async fn open_dataset<T: AsRef<str>>(table_uri: T) -> Result<Dataset> {
     DatasetBuilder::from_uri(table_uri.as_ref()).load().await
 }
 
-lazy_static::lazy_static! {
-    pub static ref DIST_FIELD : arrow_schema::Field = arrow_schema::Field::new(DIST_COL, DataType::Float32, true);
-}
+pub static DIST_FIELD: LazyLock<arrow_schema::Field> =
+    LazyLock::new(|| arrow_schema::Field::new(DIST_COL, DataType::Float32, true));

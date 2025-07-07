@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::BinaryHeap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
 
@@ -49,9 +49,8 @@ use tokio::sync::Semaphore;
 use crate::Result;
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
-lazy_static::lazy_static! {
-    static ref HNSW_PARTITIONS_BUILD_PARALLEL: usize = get_num_compute_intensive_cpus();
-}
+static HNSW_PARTITIONS_BUILD_PARALLEL: LazyLock<usize> =
+    LazyLock::new(get_num_compute_intensive_cpus);
 
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
 async fn merge_streams(

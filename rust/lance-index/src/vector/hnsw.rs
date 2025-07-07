@@ -25,14 +25,16 @@ const HNSW_TYPE: &str = "HNSW";
 const VECTOR_ID_COL: &str = "__vector_id";
 const POINTER_COL: &str = "__pointer";
 
-lazy_static::lazy_static! {
-    /// POINTER field.
-    ///
-    pub static ref POINTER_FIELD: Field = Field::new(POINTER_COL, DataType::UInt32, true);
+use std::sync::LazyLock;
 
-    /// Id of the vector in the [VectorStorage].
-    pub static ref VECTOR_ID_FIELD: Field = Field::new(VECTOR_ID_COL, DataType::UInt32, true);
-}
+/// POINTER field.
+///
+pub static POINTER_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::new(POINTER_COL, DataType::UInt32, true));
+
+/// Id of the vector in the [VectorStorage].
+pub static VECTOR_ID_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::new(VECTOR_ID_COL, DataType::UInt32, true));
 
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswMetadata {

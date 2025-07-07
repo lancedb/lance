@@ -432,7 +432,7 @@ mod tests {
         let expected = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::new_unqualified("x"))),
             op: Operator::Lt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)), None)),
         });
         assert_eq!(df_expr, expected);
     }
@@ -443,7 +443,7 @@ mod tests {
         let expr = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::new_unqualified("x"))),
             op: Operator::Lt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)), None)),
         });
 
         let bytes = encode_substrait(expr.clone(), Arc::new(schema.clone())).unwrap();

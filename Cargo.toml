@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "java/core/lance-jni",
     "rust/examples",
     "rust/lance",
     "rust/lance-arrow",
@@ -16,12 +15,12 @@ members = [
     "rust/lance-testing",
     "rust/lance-encoding/src/compression_algo/fsst",
 ]
-exclude = ["python"]
+exclude = ["python", "java/core/lance-jni"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
 [workspace.package]
-version = "0.31.0"
+version = "0.31.1"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -44,21 +43,19 @@ categories = [
 rust-version = "1.82.0"
 
 [workspace.dependencies]
-lance = { version = "=0.31.0", path = "./rust/lance" }
-lance-arrow = { version = "=0.31.0", path = "./rust/lance-arrow" }
-lance-core = { version = "=0.31.0", path = "./rust/lance-core" }
-lance-datafusion = { version = "=0.31.0", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=0.31.0", path = "./rust/lance-datagen" }
-lance-encoding = { version = "=0.31.0", path = "./rust/lance-encoding" }
-lance-encoding-datafusion = { version = "=0.31.0", path = "./rust/lance-encoding-datafusion" }
-lance-file = { version = "=0.31.0", path = "./rust/lance-file" }
-lance-index = { version = "=0.31.0", path = "./rust/lance-index" }
-lance-io = { version = "=0.31.0", path = "./rust/lance-io" }
-lance-jni = { version = "=0.31.0", path = "./java/core/lance-jni" }
-lance-linalg = { version = "=0.31.0", path = "./rust/lance-linalg" }
-lance-table = { version = "=0.31.0", path = "./rust/lance-table" }
-lance-test-macros = { version = "=0.31.0", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=0.31.0", path = "./rust/lance-testing" }
+lance = { version = "=0.31.1", path = "./rust/lance" }
+lance-arrow = { version = "=0.31.1", path = "./rust/lance-arrow" }
+lance-core = { version = "=0.31.1", path = "./rust/lance-core" }
+lance-datafusion = { version = "=0.31.1", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=0.31.1", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=0.31.1", path = "./rust/lance-encoding" }
+lance-file = { version = "=0.31.1", path = "./rust/lance-file" }
+lance-index = { version = "=0.31.1", path = "./rust/lance-index" }
+lance-io = { version = "=0.31.1", path = "./rust/lance-io" }
+lance-linalg = { version = "=0.31.1", path = "./rust/lance-linalg" }
+lance-table = { version = "=0.31.1", path = "./rust/lance-table" }
+lance-test-macros = { version = "=0.31.1", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=0.31.1", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "55.1", optional = false, features = ["prettyprint"] }
@@ -96,7 +93,7 @@ criterion = { version = "0.5", features = [
     "html_reports",
 ] }
 crossbeam-queue = "0.3"
-datafusion = { version = "47.0", default-features = false, features = [
+datafusion = { version = "48.0", default-features = false, features = [
     "nested_expressions",
     "regex_expressions",
     "unicode_expressions",
@@ -105,28 +102,27 @@ datafusion = { version = "47.0", default-features = false, features = [
     "datetime_expressions",
     "string_expressions",
 ] }
-datafusion-common = "47.0"
-datafusion-functions = { version = "47.0", features = ["regex_expressions"] }
-datafusion-sql = "47.0"
-datafusion-expr = "47.0"
-datafusion-ffi = "47.0"
-datafusion-execution = "47.0"
-datafusion-optimizer = "47.0"
-datafusion-physical-expr = { version = "47.0" }
-datafusion-physical-plan = { version = "47.0" }
-datafusion-substrait = { version = "47.0" }
+datafusion-common = "48.0"
+datafusion-functions = { version = "48.0", features = ["regex_expressions"] }
+datafusion-sql = "48.0"
+datafusion-expr = "48.0"
+datafusion-ffi = "48.0"
+datafusion-execution = "48.0"
+datafusion-optimizer = "48.0"
+datafusion-physical-expr = { version = "48.0" }
+datafusion-physical-plan = { version = "48.0" }
+datafusion-substrait = { version = "48.0" }
 deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=0.31.0", path = "./rust/lance-encoding/src/compression_algo/fsst" }
+fsst = { version = "=0.31.1", path = "./rust/lance-encoding/src/compression_algo/fsst" }
 futures = "0.3"
 http = "1.1.0"
 humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
 jieba-rs = { version = "0.7", default-features = false }
-lazy_static = "1"
 log = "0.4"
 mockall = { version = "0.13.1" }
 mock_instant = { version = "0.3.1", features = ["sync"] }

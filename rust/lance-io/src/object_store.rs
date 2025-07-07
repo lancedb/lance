@@ -52,10 +52,11 @@ const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
 #[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
 const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
 
-lazy_static::lazy_static! {
-    pub static ref DEFAULT_MAX_IOP_SIZE: u64 = std::env::var("LANCE_MAX_IOP_SIZE")
-        .map(|val| val.parse().unwrap()).unwrap_or(16 * 1024 * 1024);
-}
+pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::env::var("LANCE_MAX_IOP_SIZE")
+        .map(|val| val.parse().unwrap())
+        .unwrap_or(16 * 1024 * 1024)
+});
 
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 

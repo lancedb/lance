@@ -42,10 +42,10 @@ use lance_core::utils::{
 };
 use lance_core::{container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
-use lazy_static::lazy_static;
 use moka::future::Cache;
 use roaring::RoaringBitmap;
 use snafu::location;
+use std::sync::LazyLock;
 use tracing::{info, instrument};
 
 use super::{
@@ -90,18 +90,17 @@ pub const LENGTH_COL: &str = "_length";
 pub const BLOCK_MAX_SCORE_COL: &str = "_block_max_score";
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
-lazy_static! {
-    pub static ref SCORE_FIELD: Field = Field::new(SCORE_COL, DataType::Float32, true);
-    pub static ref FTS_SCHEMA: SchemaRef =
-        Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()]));
-}
+pub static SCORE_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
+pub static FTS_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()])));
 
-lazy_static! {
-    pub static ref CACHE_SIZE: usize = std::env::var("LANCE_INVERTED_CACHE_SIZE")
+pub static CACHE_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_INVERTED_CACHE_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(512 * 1024 * 1024);
-}
+        .unwrap_or(512 * 1024 * 1024)
+});
 
 #[derive(Clone)]
 pub struct InvertedIndex {

@@ -21,11 +21,11 @@ use snafu::location;
 /// Resolve a Value
 fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
     match expr {
-        Expr::Literal(scalar_value) => {
+        Expr::Literal(scalar_value, metadata) => {
             Ok(Expr::Literal(safe_coerce_scalar(scalar_value, data_type).ok_or_else(|| Error::invalid_input(
                 format!("Received literal {expr} and could not convert to literal of type '{data_type:?}'"),
                 location!(),
-            ))?))
+            ))?, metadata.clone()))
         }
         _ => Err(Error::invalid_input(
             format!("Expected a literal of type '{data_type:?}' but received: {expr}"),
@@ -38,7 +38,7 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
 /// or returns None if it is not.
 pub fn get_as_string_scalar_opt(expr: &Expr) -> Option<&str> {
     match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s))) => Some(s),
+        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(s),
         _ => None,
     }
 }
@@ -117,7 +117,7 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                 }))
             } else if let Some(left_type) = resolve_column_type(left.as_ref(), schema) {
                 match right.as_ref() {
-                    Expr::Literal(_) => Ok(Expr::BinaryExpr(BinaryExpr {
+                    Expr::Literal(..) => Ok(Expr::BinaryExpr(BinaryExpr {
                         left: left.clone(),
                         op: *op,
                         right: Box::new(resolve_value(right.as_ref(), &left_type)?),
@@ -136,7 +136,7 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                 }
             } else if let Some(right_type) = resolve_column_type(right.as_ref(), schema) {
                 match left.as_ref() {
-                    Expr::Literal(_) => Ok(Expr::BinaryExpr(BinaryExpr {
+                    Expr::Literal(..) => Ok(Expr::BinaryExpr(BinaryExpr {
                         left: Box::new(resolve_value(left.as_ref(), &right_type)?),
                         op: *op,
                         right: right.clone(),
@@ -187,7 +187,7 @@ pub fn coerce_expr(expr: &Expr, dtype: &DataType) -> Result<Expr> {
             op: *op,
             right: Box::new(coerce_expr(right, dtype)?),
         })),
-        Expr::Literal(l) => Ok(resolve_value(&Expr::Literal(l.clone()), dtype)?),
+        literal_expr @ Expr::Literal(..) => Ok(resolve_value(literal_expr, dtype)?),
         _ => Ok(expr.clone()),
     }
 }
@@ -234,7 +234,7 @@ impl ExprExt for Expr {
             func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
             args: vec![
                 self.clone(),
-                Self::Literal(ScalarValue::Utf8(Some(name.to_string()))),
+                Self::Literal(ScalarValue::Utf8(Some(name.to_string())), None),
             ],
         })
     }
@@ -255,7 +255,10 @@ pub mod tests {
         let expr = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column("a".to_string().into())),
             op: Operator::Eq,
-            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("a".to_string())))),
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("a".to_string())),
+                None,
+            )),
         });
 
         let resolved = resolve_expr(&expr, &Schema::try_from(&arrow_schema).unwrap()).unwrap();
@@ -263,7 +266,7 @@ pub mod tests {
             Expr::BinaryExpr(be) => {
                 assert_eq!(
                     be.right.as_ref(),
-                    &Expr::Literal(ScalarValue::LargeUtf8(Some("a".to_string())))
+                    &Expr::Literal(ScalarValue::LargeUtf8(Some("a".to_string())), None)
                 )
             }
             _ => unreachable!("Expected BinaryExpr"),
@@ -277,9 +280,9 @@ pub mod tests {
             left: Box::new(Expr::Column("a".to_string().into())),
             op: Operator::Eq,
             right: Box::new(Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(Expr::Literal(ScalarValue::Int64(Some(2)))),
+                left: Box::new(Expr::Literal(ScalarValue::Int64(Some(2)), None)),
                 op: Operator::Minus,
-                right: Box::new(Expr::Literal(ScalarValue::Int64(Some(-1)))),
+                right: Box::new(Expr::Literal(ScalarValue::Int64(Some(-1)), None)),
             })),
         });
         let resolved = resolve_expr(&expr, &Schema::try_from(&arrow_schema).unwrap()).unwrap();
@@ -289,11 +292,11 @@ pub mod tests {
                 Expr::BinaryExpr(r_be) => {
                     assert_eq!(
                         r_be.left.as_ref(),
-                        &Expr::Literal(ScalarValue::Float64(Some(2.0)))
+                        &Expr::Literal(ScalarValue::Float64(Some(2.0)), None)
                     );
                     assert_eq!(
                         r_be.right.as_ref(),
-                        &Expr::Literal(ScalarValue::Float64(Some(-1.0)))
+                        &Expr::Literal(ScalarValue::Float64(Some(-1.0)), None)
                     );
                 }
                 _ => panic!("Expected BinaryExpr"),
@@ -308,26 +311,26 @@ pub mod tests {
         let arrow_schema = ArrowSchema::new(vec![Field::new("a", DataType::Float32, false)]);
         let expr = Expr::in_list(
             Expr::Column("a".to_string().into()),
-            vec![Expr::Literal(ScalarValue::Float64(Some(0.0)))],
+            vec![Expr::Literal(ScalarValue::Float64(Some(0.0)), None)],
             false,
         );
         let resolved = resolve_expr(&expr, &Schema::try_from(&arrow_schema).unwrap()).unwrap();
         let expected = Expr::in_list(
             Expr::Column("a".to_string().into()),
-            vec![Expr::Literal(ScalarValue::Float32(Some(0.0)))],
+            vec![Expr::Literal(ScalarValue::Float32(Some(0.0)), None)],
             false,
         );
         assert_eq!(resolved, expected);
 
         let expr = Expr::in_list(
             Expr::Column("a".to_string().into()),
-            vec![Expr::Literal(ScalarValue::Float64(Some(0.0)))],
+            vec![Expr::Literal(ScalarValue::Float64(Some(0.0)), None)],
             true,
         );
         let resolved = resolve_expr(&expr, &Schema::try_from(&arrow_schema).unwrap()).unwrap();
         let expected = Expr::in_list(
             Expr::Column("a".to_string().into()),
-            vec![Expr::Literal(ScalarValue::Float32(Some(0.0)))],
+            vec![Expr::Literal(ScalarValue::Float32(Some(0.0)), None)],
             true,
         );
         assert_eq!(resolved, expected);

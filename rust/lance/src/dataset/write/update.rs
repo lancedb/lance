@@ -131,16 +131,19 @@ impl UpdateBuilder {
             expr = match expr {
                 // TODO: remove this branch once DataFusion supports casting List to FSL
                 // This should happen in Arrow 51.0.0
-                Expr::Literal(value @ ScalarValue::List(_))
+                Expr::Literal(value @ ScalarValue::List(_), metadata)
                     if matches!(dest_type, DataType::FixedSizeList(_, _)) =>
                 {
-                    Expr::Literal(safe_coerce_scalar(&value, &dest_type).ok_or_else(|| {
-                        ArrowError::CastError(format!(
-                            "Failed to cast {} to {} during planning",
-                            value.data_type(),
-                            dest_type
-                        ))
-                    })?)
+                    Expr::Literal(
+                        safe_coerce_scalar(&value, &dest_type).ok_or_else(|| {
+                            ArrowError::CastError(format!(
+                                "Failed to cast {} to {} during planning",
+                                value.data_type(),
+                                dest_type
+                            ))
+                        })?,
+                        metadata,
+                    )
                 }
                 _ => expr
                     .cast_to(&dest_type, &df_schema)

@@ -540,9 +540,12 @@ impl ExecutionPlan for TakeExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Result<datafusion::physical_plan::Statistics> {
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<datafusion::physical_plan::Statistics> {
         Ok(Statistics {
-            num_rows: self.input.statistics()?.num_rows,
+            num_rows: self.input.partition_statistics(partition)?.num_rows,
             ..Statistics::new_unknown(self.schema().as_ref())
         })
     }

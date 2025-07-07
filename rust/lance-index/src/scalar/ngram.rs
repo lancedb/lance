@@ -49,19 +49,30 @@ const TOKENS_COL: &str = "tokens";
 const POSTING_LIST_COL: &str = "posting_list";
 const POSTINGS_FILENAME: &str = "ngram_postings.lance";
 
-lazy_static::lazy_static! {
-    pub static ref TOKENS_FIELD: Field = Field::new(TOKENS_COL, DataType::UInt32, true);
-    pub static ref POSTINGS_FIELD: Field = Field::new(POSTING_LIST_COL, DataType::Binary, false);
-    pub static ref POSTINGS_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![TOKENS_FIELD.clone(), POSTINGS_FIELD.clone()]));
-    pub static ref TEXT_PREPPER: TextAnalyzer = TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
+use std::sync::LazyLock;
+
+pub static TOKENS_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::new(TOKENS_COL, DataType::UInt32, true));
+pub static POSTINGS_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::new(POSTING_LIST_COL, DataType::Binary, false));
+pub static POSTINGS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        TOKENS_FIELD.clone(),
+        POSTINGS_FIELD.clone(),
+    ]))
+});
+pub static TEXT_PREPPER: LazyLock<TextAnalyzer> = LazyLock::new(|| {
+    TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
         .filter(tantivy::tokenizer::LowerCaser)
         .filter(tantivy::tokenizer::AsciiFoldingFilter)
-        .build();
-    /// Currently we ALWAYS use trigrams with ascii folding and lower casing.  We may want to make this configurable in the future.
-    pub static ref NGRAM_TOKENIZER: TextAnalyzer = TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::all_ngrams(3, 3).unwrap())
+        .build()
+});
+/// Currently we ALWAYS use trigrams with ascii folding and lower casing.  We may want to make this configurable in the future.
+pub static NGRAM_TOKENIZER: LazyLock<TextAnalyzer> = LazyLock::new(|| {
+    TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::all_ngrams(3, 3).unwrap())
         .filter(tantivy::tokenizer::AlphaNumOnlyFilter)
-        .build();
-}
+        .build()
+});
 
 // Helper function to apply a function to each token in a text
 fn tokenize_visitor(tokenizer: &TextAnalyzer, text: &str, mut visitor: impl FnMut(&String)) {
@@ -502,21 +513,32 @@ pub struct NGramIndexBuilderOptions {
     tokens_per_spill: usize,
 }
 
-lazy_static::lazy_static! {
-    // A higher value will use more RAM.  A lower value will have to do more spilling
-    static ref DEFAULT_TOKENS_PER_SPILL: usize = std::env::var("LANCE_NGRAM_TOKENS_PER_SPILL")
+// A higher value will use more RAM.  A lower value will have to do more spilling
+static DEFAULT_TOKENS_PER_SPILL: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_NGRAM_TOKENS_PER_SPILL")
         .unwrap_or_else(|_| "1000000000".to_string())
         .parse()
-        .expect("failed to parse LANCE_NGRAM_TOKENS_PER_SPILL");
-    // How many partitions to use for shuffling out the work.  We slightly
-    // over-allocate this since the amount of work per-partition is not uniform.
-    //
-    // Increasing this may increase the performance but it could increase RAM (since we will spill less often)
-    // and could hurt performance (since there will be more files at the end for the final spill)
-    static ref DEFAULT_NUM_PARTITIONS: usize = std::env::var("LANCE_NGRAM_NUM_PARTITIONS").map(|s| s.parse().expect("failed to parse LANCE_NGRAM_PARALLELISM")).unwrap_or((get_num_compute_intensive_cpus() * 4).max(128));
-    // Just enough so that tokenizing is faster than I/O
-    static ref DEFAULT_TOKENIZE_PARALLELISM: usize = std::env::var("LANCE_NGRAM_TOKENIZE_PARALLELISM").map(|s| s.parse().expect("failed to parse LANCE_NGRAM_TOKENIZE_PARALLELISM")).unwrap_or(8);
-}
+        .expect("failed to parse LANCE_NGRAM_TOKENS_PER_SPILL")
+});
+// How many partitions to use for shuffling out the work.  We slightly
+// over-allocate this since the amount of work per-partition is not uniform.
+//
+// Increasing this may increase the performance but it could increase RAM (since we will spill less often)
+// and could hurt performance (since there will be more files at the end for the final spill)
+static DEFAULT_NUM_PARTITIONS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_NGRAM_NUM_PARTITIONS")
+        .map(|s| s.parse().expect("failed to parse LANCE_NGRAM_PARALLELISM"))
+        .unwrap_or((get_num_compute_intensive_cpus() * 4).max(128))
+});
+// Just enough so that tokenizing is faster than I/O
+static DEFAULT_TOKENIZE_PARALLELISM: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_NGRAM_TOKENIZE_PARALLELISM")
+        .map(|s| {
+            s.parse()
+                .expect("failed to parse LANCE_NGRAM_TOKENIZE_PARALLELISM")
+        })
+        .unwrap_or(8)
+});
 
 impl Default for NGramIndexBuilderOptions {
     fn default() -> Self {
