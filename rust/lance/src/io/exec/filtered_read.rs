@@ -355,7 +355,7 @@ impl FilteredReadStream {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let output_schema = Arc::new(options.projection.to_arrow_schema()?);
+        let output_schema = Arc::new(options.projection.to_arrow_schema());
 
         let obj_store = dataset.object_store.clone();
         let scheduler_config = SchedulerConfig::max_bandwidth(obj_store.as_ref());
@@ -736,6 +736,13 @@ impl FilteredReadStream {
                 let partition_metrics_clone = partition_metrics.clone();
                 let batch_stream = futures_stream
                     .try_buffered(num_threads)
+                    .try_filter_map(move |batch| {
+                        std::future::ready(Ok(if batch.num_rows() == 0 {
+                            None
+                        } else {
+                            Some(batch)
+                        }))
+                    })
                     .inspect_ok(move |batch| {
                         partition_metrics_clone
                             .baseline_metrics
@@ -784,6 +791,13 @@ impl FilteredReadStream {
                         .instrument(tracing::debug_span!("filtered_read_task"))
                     }
                 })
+                .try_filter_map(move |batch| {
+                    std::future::ready(Ok(if batch.num_rows() == 0 {
+                        None
+                    } else {
+                        Some(batch)
+                    }))
+                })
                 .finally(move || {
                     if active_partitions_counter.fetch_sub(1, Ordering::Relaxed) == 1 {
                         global_metrics.io_metrics.record_final(&scan_scheduler);
@@ -800,7 +814,7 @@ impl FilteredReadStream {
     async fn read_fragment(
         mut fragment_read_task: ScopedFragmentRead,
     ) -> Result<impl Stream<Item = Result<ReadBatchFut>>> {
-        let output_schema = Arc::new(fragment_read_task.projection.to_arrow_schema()?);
+        let output_schema = Arc::new(fragment_read_task.projection.to_arrow_schema());
 
         if let Some(filter) = &fragment_read_task.filter {
             let filter_cols = Planner::column_names_in_expr(filter);
@@ -815,7 +829,7 @@ impl FilteredReadStream {
             }
         }
 
-        let read_schema = fragment_read_task.projection.to_schema();
+        let read_schema = fragment_read_task.projection.to_bare_schema();
         let mut fragment_reader = fragment_read_task
             .fragment
             .open(&read_schema, fragment_read_task.frag_read_config())
@@ -833,7 +847,7 @@ impl FilteredReadStream {
             .filter
             .map(|filter| {
                 let planner =
-                    Planner::new(Arc::new(fragment_read_task.projection.to_arrow_schema()?));
+                    Planner::new(Arc::new(fragment_read_task.projection.to_arrow_schema()));
                 planner.create_physical_expr(&filter)
             })
             .transpose()?;
@@ -1118,7 +1132,7 @@ impl FilteredReadExec {
                 location: location!(),
             });
         }
-        let output_schema = Arc::new(options.projection.to_arrow_schema()?);
+        let output_schema = Arc::new(options.projection.to_arrow_schema());
         let num_partitions = match options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -1178,7 +1192,7 @@ impl DisplayAs for FilteredReadExec {
         let columns = self
             .options
             .projection
-            .to_schema()
+            .to_bare_schema()
             .fields
             .iter()
             .map(|f| f.name.as_str())
@@ -1304,7 +1318,7 @@ impl ExecutionPlan for FilteredReadExec {
                 .with_row_id()
                 .with_row_addr();
 
-            let planner = Arc::new(Planner::new(Arc::new(read_projection.to_arrow_schema()?)));
+            let planner = Arc::new(Planner::new(Arc::new(read_projection.to_arrow_schema())));
             let physical_filter = planner.create_physical_expr(filter)?;
 
             let mock_input = Arc::new(Self::try_new(
@@ -1844,6 +1858,27 @@ mod tests {
                 .with_filter_plan(filter_plan);
             fixture.test_plan(options, &u32s(vec![250..400])).await;
         }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_filter_empty_batches() {
+        let fixture = Arc::new(TestFixture::new().await);
+
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+
+        let filter_plan = fixture.filter_plan("not_indexed == 317", false).await;
+        let options = base_options
+            .clone()
+            .with_filter_plan(filter_plan)
+            .with_batch_size(10);
+
+        let plan = FilteredReadExec::try_new(fixture.dataset.clone(), options).unwrap();
+
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
     }
 
     #[test_log::test(tokio::test)]
