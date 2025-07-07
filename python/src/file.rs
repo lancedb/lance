@@ -324,10 +324,13 @@ impl LanceFileWriter {
         self.inner_lock()?.add_schema_metadata(key, value);
         Ok(())
     }
+}
 
-    pub fn abort(&self) -> PyResult<()> {
-        RT.runtime.block_on(self.inner_lock()?.abort());
-        Ok(())
+impl Drop for LanceFileWriter {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner_lock() {
+            RT.runtime.block_on(inner.abort());
+        }
     }
 }
 

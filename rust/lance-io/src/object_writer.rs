@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use log::warn;
 use object_store::MultipartUpload;
 use object_store::{path::Path, Error as OSError, ObjectStore, Result as OSResult};
 use rand::Rng;
@@ -351,8 +350,6 @@ impl Drop for ObjectWriter {
                 handle.spawn(async move {
                     abort_task.await;
                 });
-            } else {
-                warn!("Failed to abort object writer because runtime not found.");
             }
         }
     }
