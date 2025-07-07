@@ -338,7 +338,7 @@ impl FragmentScanner {
             .filter(|(_, predicate)| {
                 futures::future::ready(!matches!(
                     predicate,
-                    Expr::Literal(ScalarValue::Boolean(Some(false)))
+                    Expr::Literal(ScalarValue::Boolean(Some(false)), _)
                 ))
             })
             .map(move |(batch_id, predicate)| {
@@ -370,7 +370,7 @@ impl FragmentScanner {
 
     async fn read_batch(&self, batch_id: usize, predicate: Expr) -> Result<Option<RecordBatch>> {
         match predicate {
-            Expr::Literal(ScalarValue::Boolean(Some(true))) => {
+            Expr::Literal(ScalarValue::Boolean(Some(true)), _) => {
                 // Predicate is always true, we just need to load the projection.
                 let mut projection_reader = self.reader.clone();
                 if self.config.with_row_id {
@@ -385,7 +385,7 @@ impl FragmentScanner {
                 let batch = self.final_projection(batch)?;
                 Ok(Some(batch))
             }
-            Expr::Literal(ScalarValue::Boolean(Some(false))) => {
+            Expr::Literal(ScalarValue::Boolean(Some(false)), _) => {
                 // Predicate is always false, we can skip this batch.
                 Ok(None)
             }

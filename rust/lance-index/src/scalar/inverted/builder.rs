@@ -21,9 +21,9 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
-use lazy_static::lazy_static;
 use object_store::path::Path;
 use snafu::location;
+use std::sync::LazyLock;
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
@@ -38,35 +38,41 @@ use super::{
 // WARNING: changing this value will break the compatibility with existing indexes
 pub const BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
-lazy_static! {
-    // the (compressed) size of each flush for posting lists in MiB,
-    // when the `LANCE_FTS_FLUSH_THRESHOLD` is reached, the flush will be triggered,
-    // higher for better indexing performance, but more memory usage,
-    // it's in 16 MiB by default
-    static ref LANCE_FTS_FLUSH_SIZE: usize = std::env::var("LANCE_FTS_FLUSH_SIZE")
+// the (compressed) size of each flush for posting lists in MiB,
+// when the `LANCE_FTS_FLUSH_THRESHOLD` is reached, the flush will be triggered,
+// higher for better indexing performance, but more memory usage,
+// it's in 16 MiB by default
+static LANCE_FTS_FLUSH_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_FLUSH_SIZE")
         .unwrap_or_else(|_| "16".to_string())
         .parse()
-        .expect("failed to parse LANCE_FTS_FLUSH_SIZE");
-    // the number of shards to split the indexing work,
-    // the indexing process would spawn `LANCE_FTS_NUM_SHARDS` workers to build FTS,
-    // higher for faster indexing performance, but more memory usage,
-    // it's `the number of compute intensive CPUs` by default
-    pub static ref LANCE_FTS_NUM_SHARDS: usize = std::env::var("LANCE_FTS_NUM_SHARDS")
-        .unwrap_or_else(|_|  get_num_compute_intensive_cpus().to_string())
+        .expect("failed to parse LANCE_FTS_FLUSH_SIZE")
+});
+// the number of shards to split the indexing work,
+// the indexing process would spawn `LANCE_FTS_NUM_SHARDS` workers to build FTS,
+// higher for faster indexing performance, but more memory usage,
+// it's `the number of compute intensive CPUs` by default
+pub static LANCE_FTS_NUM_SHARDS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_NUM_SHARDS")
+        .unwrap_or_else(|_| get_num_compute_intensive_cpus().to_string())
         .parse()
-        .expect("failed to parse LANCE_FTS_NUM_SHARDS");
-    // the partition size limit in MiB (uncompressed format)
-    // higher for better indexing & query performance, but more memory usage,
-    pub static ref LANCE_FTS_PARTITION_SIZE: u64 = std::env::var("LANCE_FTS_PARTITION_SIZE")
+        .expect("failed to parse LANCE_FTS_NUM_SHARDS")
+});
+// the partition size limit in MiB (uncompressed format)
+// higher for better indexing & query performance, but more memory usage,
+pub static LANCE_FTS_PARTITION_SIZE: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_PARTITION_SIZE")
         .unwrap_or_else(|_| "256".to_string())
         .parse()
-        .expect("failed to parse LANCE_FTS_PARTITION_SIZE");
-    // the target size of partition after merging in MiB (uncompressed format)
-    pub static ref LANCE_FTS_TARGET_SIZE: u64 = std::env::var("LANCE_FTS_TARGET_SIZE")
+        .expect("failed to parse LANCE_FTS_PARTITION_SIZE")
+});
+// the target size of partition after merging in MiB (uncompressed format)
+pub static LANCE_FTS_TARGET_SIZE: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_TARGET_SIZE")
         .unwrap_or_else(|_| "4096".to_string())
         .parse()
-        .expect("failed to parse LANCE_FTS_TARGET_SIZE");
-}
+        .expect("failed to parse LANCE_FTS_TARGET_SIZE")
+});
 
 #[derive(Debug)]
 pub struct InvertedIndexBuilder {

@@ -44,7 +44,7 @@ impl TryFrom<u8> for Action {
 
 impl Action {
     fn as_literal_expr(&self) -> Expr {
-        Expr::Literal(ScalarValue::UInt8(Some(*self as u8)))
+        Expr::Literal(ScalarValue::UInt8(Some(*self as u8)), None)
     }
 }
 

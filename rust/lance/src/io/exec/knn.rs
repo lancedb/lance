@@ -4,7 +4,7 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use arrow::datatypes::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
@@ -243,8 +243,8 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         )) as SendableRecordBatchStream)
     }
 
-    fn statistics(&self) -> DataFusionResult<Statistics> {
-        let inner_stats = self.input.statistics()?;
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+        let inner_stats = self.input.partition_statistics(partition)?;
         let schema = self.input.schema();
         let dist_stats = inner_stats
             .column_statistics
@@ -280,17 +280,23 @@ impl ExecutionPlan for KNNVectorDistanceExec {
     }
 }
 
-lazy_static::lazy_static! {
-    pub static ref KNN_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
+pub static KNN_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
         Field::new(DIST_COL, DataType::Float32, true),
         ROW_ID_FIELD.clone(),
-    ]));
+    ]))
+});
 
-    pub static ref KNN_PARTITION_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
-        Field::new(PART_ID_COLUMN, DataType::List(Field::new("item", DataType::UInt32, false).into()), false),
+pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new(
+            PART_ID_COLUMN,
+            DataType::List(Field::new("item", DataType::UInt32, false).into()),
+            false,
+        ),
         Field::new(INDEX_UUID_COLUMN, DataType::Utf8, false),
-    ]));
-}
+    ]))
+});
 
 pub fn new_knn_exec(
     dataset: Arc<Dataset>,
@@ -1014,12 +1020,20 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         )))
     }
 
-    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> DataFusionResult<datafusion::physical_plan::Statistics> {
         Ok(Statistics {
             num_rows: Precision::Exact(
                 self.query.k
                     * self.query.refine_factor.unwrap_or(1) as usize
-                    * self.input.statistics()?.num_rows.get_value().unwrap_or(&1),
+                    * self
+                        .input
+                        .partition_statistics(partition)?
+                        .num_rows
+                        .get_value()
+                        .unwrap_or(&1),
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
         })

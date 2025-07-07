@@ -18,9 +18,9 @@ use lance_core::{Result, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
-use lazy_static::lazy_static;
 use object_store::path::Path;
 use quantizer::{QuantizationType, Quantizer};
+use std::sync::LazyLock;
 use v3::subindex::SubIndexType;
 
 pub mod bq;
@@ -52,15 +52,16 @@ pub const PQ_CODE_COLUMN: &str = "__pq_code";
 pub const SQ_CODE_COLUMN: &str = "__sq_code";
 pub const LOSS_METADATA_KEY: &str = "_loss";
 
-lazy_static! {
-    pub static ref VECTOR_RESULT_SCHEMA: arrow_schema::SchemaRef =
-        arrow_schema::SchemaRef::new(arrow_schema::Schema::new(vec![
-            Field::new(DIST_COL, arrow_schema::DataType::Float32, false),
-            ROW_ID_FIELD.clone(),
-        ]));
-    pub static ref PART_ID_FIELD: arrow_schema::Field =
-        arrow_schema::Field::new(PART_ID_COLUMN, arrow_schema::DataType::UInt32, true);
-}
+pub static VECTOR_RESULT_SCHEMA: LazyLock<arrow_schema::SchemaRef> = LazyLock::new(|| {
+    arrow_schema::SchemaRef::new(arrow_schema::Schema::new(vec![
+        Field::new(DIST_COL, arrow_schema::DataType::Float32, false),
+        ROW_ID_FIELD.clone(),
+    ]))
+});
+
+pub static PART_ID_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(PART_ID_COLUMN, arrow_schema::DataType::UInt32, true)
+});
 
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]

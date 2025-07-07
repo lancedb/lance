@@ -668,7 +668,7 @@ mod tests {
     };
     use lance_linalg::distance::{multivec_distance, DistanceType};
     use lance_linalg::kernels::normalize_fsl;
-    use lance_testing::datagen::generate_random_array_with_range;
+    use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
     use object_store::path::Path;
     use rand::distributions::uniform::SampleUniform;
     use rstest::rstest;
@@ -2042,5 +2042,34 @@ mod tests {
         let pq_meta: ProductQuantizationMetadata =
             get_pq_metadata(&dataset, scheduler.clone()).await;
         assert!(pq_meta.buffer_index().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_optimize_with_empty_partition() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        let num_rows = dataset.count_all_rows().await.unwrap();
+        let nlist = num_rows + 2;
+        let centroids = generate_random_array(nlist * DIM);
+        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
+        let ivf_params =
+            IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::Cosine,
+            ivf_params,
+            PQBuildParams::default(),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        append_dataset::<Float32Type>(&mut dataset, 1, 0.0..1.0).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
@@ -45,9 +45,13 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{debug_span, instrument};
 
-lazy_static::lazy_static! {
-    pub static ref SCALAR_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![Field::new("result".to_string(), DataType::Binary, true)]));
-}
+pub static SCALAR_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![Field::new(
+        "result".to_string(),
+        DataType::Binary,
+        true,
+    )]))
+});
 
 #[async_trait]
 impl ScalarIndexLoader for Dataset {
@@ -195,9 +199,8 @@ impl ExecutionPlan for ScalarIndexExec {
     }
 }
 
-lazy_static::lazy_static! {
-    pub static ref INDEX_LOOKUP_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
-}
+pub static INDEX_LOOKUP_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
 /// An execution node that translates index values into row addresses
 ///
@@ -402,9 +405,8 @@ impl ExecutionPlan for MapIndexExec {
     }
 }
 
-lazy_static::lazy_static! {
-    pub static ref MATERIALIZE_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
-}
+pub static MATERIALIZE_INDEX_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
 /// An execution node that performs a scalar index search and materializes the mask into row ids
 ///

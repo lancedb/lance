@@ -16,6 +16,7 @@
 // under the License.
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
@@ -34,9 +35,8 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::Registry;
 
-lazy_static::lazy_static! {
-    static ref SUBSCRIBER: Arc<RwLock<Option<LoggingPassthroughState>>> = Arc::new(RwLock::new(None));
-}
+static SUBSCRIBER: LazyLock<Arc<RwLock<Option<LoggingPassthroughState>>>> =
+    LazyLock::new(|| Arc::new(RwLock::new(None)));
 
 struct LoggingPassthroughState {
     inner: Option<ChromeLayer<Registry>>,

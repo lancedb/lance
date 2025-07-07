@@ -4,7 +4,7 @@
 //! Lance data types, [Schema] and [Field]
 
 use std::fmt::{self, Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
@@ -33,16 +33,23 @@ pub const STRUCTURAL_ENCODING_META_KEY: &str = "lance-encoding:structural-encodi
 pub const STRUCTURAL_ENCODING_MINIBLOCK: &str = "miniblock";
 pub const STRUCTURAL_ENCODING_FULLZIP: &str = "fullzip";
 
-lazy_static::lazy_static! {
-    pub static ref BLOB_DESC_FIELDS: Fields =
-        Fields::from(vec![
-            ArrowField::new("position", DataType::UInt64, true),
-            ArrowField::new("size", DataType::UInt64, true),
-        ]);
-    pub static ref BLOB_DESC_FIELD: ArrowField =
-    ArrowField::new("description", DataType::Struct(BLOB_DESC_FIELDS.clone()), true);
-    pub static ref BLOB_DESC_LANCE_FIELD: Field = Field::try_from(&*BLOB_DESC_FIELD).unwrap();
-}
+pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("position", DataType::UInt64, true),
+        ArrowField::new("size", DataType::UInt64, true),
+    ])
+});
+
+pub static BLOB_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
+    ArrowField::new(
+        "description",
+        DataType::Struct(BLOB_DESC_FIELDS.clone()),
+        true,
+    )
+});
+
+pub static BLOB_DESC_LANCE_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::try_from(&*BLOB_DESC_FIELD).unwrap());
 
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.

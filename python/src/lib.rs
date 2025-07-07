@@ -23,7 +23,7 @@
 #![allow(clippy::useless_conversion)]
 
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use std::ffi::CString;
 
@@ -58,9 +58,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
 use session::Session;
-
-#[macro_use]
-extern crate lazy_static;
 
 pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
@@ -110,9 +107,7 @@ fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 // TODO: make this runtime configurable (e.g. num threads)
-lazy_static! {
-    static ref RT: BackgroundExecutor = BackgroundExecutor::new();
-}
+static RT: LazyLock<BackgroundExecutor> = LazyLock::new(BackgroundExecutor::new);
 
 pub fn init_logging(mut log_builder: Builder) {
     let logger = log_builder.build();

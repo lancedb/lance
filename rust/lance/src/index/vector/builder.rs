@@ -683,6 +683,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             // for PQ, the PQ codes are transposed, so we need to transpose them back
             if matches!(Q::quantization_type(), QuantizationType::Product) {
                 for batch in part_batches.iter_mut() {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+
                     let codes = batch[PQ_CODE_COLUMN]
                         .as_fixed_size_list()
                         .values()

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
 
 /// A level of SIMD support for some feature
 pub enum SimdSupport {
@@ -14,39 +14,37 @@ pub enum SimdSupport {
     Lasx,
 }
 
-lazy_static! {
-    /// Support for FP16 SIMD operations
-    pub static ref FP16_SIMD_SUPPORT: SimdSupport = {
-        #[cfg(target_arch = "aarch64")]
-        {
-            if aarch64::has_neon_f16_support() {
-                SimdSupport::Neon
-            } else {
-                SimdSupport::None
-            }
+/// Support for FP16 SIMD operations
+pub static FP16_SIMD_SUPPORT: LazyLock<SimdSupport> = LazyLock::new(|| {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if aarch64::has_neon_f16_support() {
+            SimdSupport::Neon
+        } else {
+            SimdSupport::None
         }
-        #[cfg(target_arch = "x86_64")]
-        {
-            if x86::has_avx512_f16_support() {
-                SimdSupport::Avx512
-            } else if is_x86_feature_detected!("avx2") {
-                SimdSupport::Avx2
-            } else {
-                SimdSupport::None
-            }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86::has_avx512_f16_support() {
+            SimdSupport::Avx512
+        } else if is_x86_feature_detected!("avx2") {
+            SimdSupport::Avx2
+        } else {
+            SimdSupport::None
         }
-        #[cfg(target_arch = "loongarch64")]
-        {
-            if loongarch64::has_lasx_support() {
-                SimdSupport::Lasx
-            } else if loongarch64::has_lsx_support() {
-                SimdSupport::Lsx
-            } else {
-                SimdSupport::None
-            }
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        if loongarch64::has_lasx_support() {
+            SimdSupport::Lasx
+        } else if loongarch64::has_lsx_support() {
+            SimdSupport::Lsx
+        } else {
+            SimdSupport::None
         }
-    };
-}
+    }
+});
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {

@@ -1,9 +1,9 @@
 [package]
 name = "pylance"
-version = "0.31.0"
+version = "0.31.1"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
-rust-version = "1.65"
+rust-version = "1.80"
 exclude = ["python/lance/conftest.py"]
 publish = false
 
@@ -18,9 +18,9 @@ arrow-data = "55.1"
 arrow-schema = "55.1"
 arrow-select = "55.1"
 object_store = "0.12.2"
-datafusion = "47.0"
-datafusion-ffi = "47.0"
-datafusion-common = "47.0"
+datafusion = "48.0"
+datafusion-ffi = "48.0"
+datafusion-common = "48.0"
 async-trait = "0.1"
 chrono = "0.4.41"
 env_logger = "0.11.7"
@@ -47,7 +47,6 @@ lance-io = { path = "../rust/lance-io" }
 lance-linalg = { path = "../rust/lance-linalg" }
 lance-table = { path = "../rust/lance-table" }
 lance-datafusion = { path = "../rust/lance-datafusion" }
-lazy_static = "1"
 log = "0.4"
 prost = "0.13.2"
 pyo3 = { version = "0.24.1", features = [

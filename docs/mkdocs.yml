@@ -1,0 +1,116 @@
+site_name: Lance
+site_description: Modern columnar data format for ML and LLMs
+site_url: https://lancedb.github.io/lance/
+docs_dir: src
+
+repo_name: lancedb/lance
+repo_url: https://github.com/lancedb/lance
+
+theme:
+  name: material
+  logo: logo/white.png
+  favicon: logo/logo.png
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.instant
+    - navigation.tracking
+    - navigation.top
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+  - mkdocs_protobuf:
+      proto_dir: ../protos
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/lancedb/lance
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/zMM32dvNtd
+    - icon: fontawesome/brands/twitter
+      link: https://twitter.com/lancedb
+
+nav:
+  - Introduction: index.md
+  - Getting Started:
+    - Install: start/install.md
+    - Quickstart: start/quickstart.md
+  - User Guide:
+    - Read and Write: guide/read_and_write.md
+    - Data Evolution: guide/data_evolution.md
+    - Blob API: guide/blob.md
+    - Tags: guide/tags.md
+    - Object Store Configuration: guide/object_store.md
+    - Distributed Write: guide/distributed_write.md
+    - Performance Guide: guide/performance.md
+    - Tokenizer: guide/tokenizer.md
+    - Extension Arrays: guide/arrays.md
+  - Format:
+    - Format: format/format.md
+  - Catalog Integrations: https://lancedb.github.io/lance-namespace
+  - Compute Integrations:
+    - Apache DataFusion: integrations/datafusion.md
+    - Apache Spark: https://lancedb.github.io/lance-spark
+    - DuckDB: integrations/duckdb.md
+    - Huggingface: integrations/huggingface.md
+    - PostgreSQL: https://github.com/lancedb/pglance
+    - PyTorch: integrations/pytorch.md
+    - Ray: integrations/ray.md
+    - Tensorflow: integrations/tensorflow.md
+    - Trino: https://github.com/lancedb/lance-trino
+  - Community:
+    - Contributing: community/contributing.md
+  - Examples:
+    - Python:
+      - LLM Dataset Creation: examples/python/llm_dataset_creation.md
+      - LLM Training: examples/python/llm_training.md
+      - Multimodal Dataset Creation: examples/python/flickr8k_dataset_creation.md
+      - Multimodal Training: examples/python/clip_training.md
+      - Deep Learning Artifact Management: examples/python/artifact_management.md
+    - Rust:
+      - Write/Read Dataset: examples/rust/write_read_dataset.md
+      - HNSW Vector Index: examples/rust/hnsw.md
+      - LLM Dataset Creation: examples/rust/llm_dataset_creation.md
+  - SDK Docs:
+      - Overview: sdk_docs.md
+      - Python: https://lancedb.github.io/lance-python-doc
+      - Rust: https://docs.rs/lance/latest/lance
+      - Java: https://www.javadoc.io/doc/com.lancedb/lance-core/latest/index.html

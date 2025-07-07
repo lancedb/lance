@@ -1,72 +1,46 @@
-name: Deploy docs to Pages
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
+name: publish-site
 on:
   push:
-    branches: ["main"]
+    branches:
+      - main
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
-
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-# Allow one concurrent deployment
-concurrency:
-  group: "pages"
-  cancel-in-progress: true
-
-env:
-  RUSTFLAGS: "-C debuginfo=0"
-  # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
-  # CI builds are faster with incremental disabled.
-  CARGO_INCREMENTAL: "0"
+  contents: write
 
 jobs:
-  # Single deploy job since we're just deploying
   deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - name: Configure Git Credentials
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: 3.11
           cache: 'pip'
           cache-dependency-path: "docs/requirements.txt"
-      - name: Install dependencies
-        run: |
-          sudo apt install -y -qq doxygen pandoc
-      - name: Build python wheel
-        uses: ./.github/workflows/build_linux_wheel
-      - name: Free disk space
-        working-directory: python
-        run: |
-          sudo chown 1001:118 -R target
-          mv target/wheels/*.whl ./
-          cargo clean
-      - name: Build Python
-        working-directory: python
-        run: |
-          python -m pip install ../python/*.whl
-          python -m pip install -r ../docs/requirements.txt
-      - name: Build docs
-        working-directory: docs
-        run: |
-          make nbconvert
-          make html
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      - uses: actions/cache@v4
         with:
-          path: 'docs/_build/html'
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          key: mkdocs-material-${{ env.cache_id }}
+          path: .cache
+          restore-keys: |
+            mkdocs-material-
+      - run: pip install -r docs/requirements.txt
+      - name: Deploy
+        working-directory: docs
+        run: mkdocs gh-deploy --force
