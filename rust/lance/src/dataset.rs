@@ -75,7 +75,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
-use crate::dataset::delta::{DeltaData, DatasetDelta, DeltaMetadata};
+use crate::dataset::delta::{DatasetDelta, DeltaData, DeltaMetadata};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{
@@ -650,14 +650,16 @@ impl Dataset {
     pub async fn diff_metadata(&self, compared_version: u64) -> Result<DeltaMetadata> {
         self.validate_version(compared_version).await?;
         let delta_ds = self.build_delta_dataset(compared_version).await?;
-        Ok(delta_ds.diff_metadata().await?)
+        delta_ds.diff_metadata().await
     }
 
     /// Diff a specified version and return the changed record batches.
+    /// Since lance does not support trace row updates currently, so the updates
+    /// would be split into ADDED and REMOVED sets.
     pub async fn diff(&self, compared_version: u64) -> Result<DeltaData> {
         self.validate_version(compared_version).await?;
         let delta_ds = self.build_delta_dataset(compared_version).await?;
-        Ok(delta_ds.diff().await?)
+        delta_ds.diff().await
     }
 
     // TODO: Cache this
