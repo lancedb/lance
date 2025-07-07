@@ -1666,6 +1666,8 @@ pub struct FullZipScheduler {
     details: Arc<FullZipDecodeDetails>,
     /// Cached state containing the decoded repetition index
     cached_state: Option<Arc<FullZipCacheableState>>,
+    /// Whether to enable caching of repetition indices
+    enable_cache: bool,
 }
 
 impl FullZipScheduler {
@@ -1753,6 +1755,7 @@ impl FullZipScheduler {
             rows_in_page,
             bits_per_offset,
             cached_state: None,
+            enable_cache: false, // Default to false, will be set later
         })
     }
 
@@ -2026,8 +2029,9 @@ impl StructuralPageScheduler for FullZipScheduler {
         &'a mut self,
         io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        // Check if we have a repetition index
-        if let Some(rep_index) = &self.rep_index {
+        // Check if caching is enabled and we have a repetition index
+        if self.enable_cache && self.rep_index.is_some() {
+            let rep_index = self.rep_index.as_ref().unwrap();
             // Calculate the total size of the repetition index
             let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
             let rep_index_range = rep_index.buf_position..(rep_index.buf_position + total_size);
@@ -2044,7 +2048,7 @@ impl StructuralPageScheduler for FullZipScheduler {
 
             future.boxed()
         } else {
-            // No repetition index, skip caching
+            // Caching disabled or no repetition index, skip caching
             std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
         }
     }
@@ -2732,6 +2736,7 @@ impl StructuralPrimitiveFieldScheduler {
     pub fn try_new(
         column_info: &ColumnInfo,
         decompressors: &dyn DecompressionStrategy,
+        cache_repetition_index: bool,
     ) -> Result<Self> {
         let page_schedulers = column_info
             .page_infos
@@ -2743,6 +2748,7 @@ impl StructuralPrimitiveFieldScheduler {
                     page_index,
                     column_info.index as usize,
                     decompressors,
+                    cache_repetition_index,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2757,6 +2763,7 @@ impl StructuralPrimitiveFieldScheduler {
         page_index: usize,
         _column_index: usize,
         decompressors: &dyn DecompressionStrategy,
+        cache_repetition_index: bool,
     ) -> Result<PageInfoAndScheduler> {
         let scheduler: Box<dyn StructuralPageScheduler> =
             match page_info.encoding.as_structural().layout.as_ref() {
@@ -2770,13 +2777,15 @@ impl StructuralPrimitiveFieldScheduler {
                     )?)
                 }
                 Some(pb::page_layout::Layout::FullZipLayout(full_zip)) => {
-                    Box::new(FullZipScheduler::try_new(
+                    let mut scheduler = FullZipScheduler::try_new(
                         &page_info.buffer_offsets_and_sizes,
                         page_info.priority,
                         page_info.num_rows,
                         full_zip,
                         decompressors,
-                    )?)
+                    )?;
+                    scheduler.enable_cache = cache_repetition_index;
+                    Box::new(scheduler)
                 }
                 Some(pb::page_layout::Layout::AllNullLayout(all_null)) => {
                     let def_meaning = all_null
@@ -4900,6 +4909,7 @@ mod tests {
                 max_visible_def: 0,
             }),
             cached_state: None,
+            enable_cache: true, // Enable caching for test
         };
 
         // First initialization should load and cache the repetition index
@@ -4958,6 +4968,7 @@ mod tests {
             bits_per_offset: 32,
             details: scheduler.details.clone(),
             cached_state: None,
+            enable_cache: true, // Enable caching for test
         };
 
         // Load cached data from the first scheduler
@@ -4972,6 +4983,102 @@ mod tests {
         assert!(
             Arc::ptr_eq(cached_state, cached_state2),
             "Both schedulers should share the same cached data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fullzip_cache_config_controls_caching() {
+        use crate::testing::SimulatedScheduler;
+
+        // Simplified FixedPerValueDecompressor for testing
+        #[derive(Debug)]
+        struct TestFixedDecompressor;
+
+        impl FixedPerValueDecompressor for TestFixedDecompressor {
+            fn decompress(
+                &self,
+                _data: FixedWidthDataBlock,
+                _num_rows: u64,
+            ) -> crate::Result<DataBlock> {
+                unimplemented!("Test decompressor")
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                32
+            }
+        }
+
+        // Test that enable_cache flag actually controls caching behavior
+        let rows_in_page = 1000_u64;
+        let bytes_per_value = 4_u64;
+        
+        // Create simulated data
+        let rep_index_data = vec![0u8; ((rows_in_page + 1) * bytes_per_value) as usize];
+        let value_data = vec![0u8; 4000]; // Dummy value data
+        let mut full_data = vec![0u8; 1000]; // Padding before rep index
+        full_data.extend_from_slice(&rep_index_data);
+        full_data.extend_from_slice(&value_data);
+        
+        let data = bytes::Bytes::from(full_data);
+        let io = Arc::new(SimulatedScheduler::new(data));
+        
+        // Test 1: With caching disabled
+        let mut scheduler_no_cache = FullZipScheduler {
+            data_buf_position: 0,
+            rep_index: Some(FullZipRepIndexDetails {
+                buf_position: 1000,
+                bytes_per_value,
+            }),
+            priority: 0,
+            rows_in_page,
+            bits_per_offset: 32,
+            details: Arc::new(FullZipDecodeDetails {
+                value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
+                def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::NullableItem]),
+                ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 1),
+                max_rep: 0,
+                max_visible_def: 0,
+            }),
+            cached_state: None,
+            enable_cache: false, // Caching disabled
+        };
+        
+        let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
+        let cached_data = scheduler_no_cache.initialize(&io_dyn).await.unwrap();
+        
+        // Should return NoCachedPageData when caching is disabled
+        assert!(
+            cached_data.as_arc_any().downcast_ref::<super::NoCachedPageData>().is_some(),
+            "With enable_cache=false, should return NoCachedPageData"
+        );
+        
+        // Test 2: With caching enabled
+        let mut scheduler_with_cache = FullZipScheduler {
+            data_buf_position: 0,
+            rep_index: Some(FullZipRepIndexDetails {
+                buf_position: 1000,
+                bytes_per_value,
+            }),
+            priority: 0,
+            rows_in_page,
+            bits_per_offset: 32,
+            details: Arc::new(FullZipDecodeDetails {
+                value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
+                def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::NullableItem]),
+                ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 1),
+                max_rep: 0,
+                max_visible_def: 0,
+            }),
+            cached_state: None,
+            enable_cache: true, // Caching enabled
+        };
+        
+        let cached_data2 = scheduler_with_cache.initialize(&io_dyn).await.unwrap();
+        
+        // Should return FullZipCacheableState when caching is enabled
+        assert!(
+            cached_data2.as_arc_any().downcast_ref::<super::FullZipCacheableState>().is_some(),
+            "With enable_cache=true, should return FullZipCacheableState"
         );
     }
 }
