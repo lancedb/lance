@@ -767,23 +767,19 @@ impl TokenSet {
             return;
         }
 
-        if let TokenMap::HashMap(ref mut map) = self.tokens {
-            let mut removed_tokens = Vec::with_capacity(removed_token_ids.len());
-            for (token, token_id) in map.iter_mut() {
-                match removed_token_ids.binary_search(token_id) {
-                    Ok(_) => {
-                        removed_tokens.push(token.clone());
-                    }
-                    Err(index) => {
-                        *token_id -= index as u32;
-                    }
-                }
-            }
+        let TokenMap::HashMap(ref mut map) = self.tokens else {
+            return;
+        };
 
-            for removed_token in removed_tokens {
-                map.remove(&removed_token);
-            }
-        }
+        map.retain(
+            |_, token_id| match removed_token_ids.binary_search(token_id) {
+                Ok(_) => false,
+                Err(index) => {
+                    *token_id -= index as u32;
+                    true
+                }
+            },
+        );
     }
 
     pub fn next_id(&self) -> u32 {
