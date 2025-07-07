@@ -5,33 +5,126 @@ use crate::{
     dataset::transaction::{Operation, Transaction},
     Dataset,
 };
-use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::Result;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
+use datafusion::logical_expr::Expr;
+use datafusion::scalar::ScalarValue;
+use futures::{StreamExt, TryStreamExt};
+use lance_core::{ROW_ADDR, Result};
 use lance_table::format::Fragment;
+use roaring::{RoaringBitmap, RoaringTreemap};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// Apply deletions to fragments based on a RoaringTreemap of row IDs.
+/// 
+/// Returns the set of modified fragments and removed fragments, if any.
+async fn apply_deletions(
+    dataset: &Dataset,
+    removed_row_ids: &RoaringTreemap,
+) -> Result<(Vec<Fragment>, Vec<u64>)> {
+    let bitmaps = Arc::new(removed_row_ids.bitmaps().collect::<BTreeMap<_, _>>());
+
+    enum FragmentChange {
+        Unchanged,
+        Modified(Fragment),
+        Removed(u64),
+    }
+
+    let mut updated_fragments = Vec::new();
+    let mut removed_fragments = Vec::new();
+
+    let mut stream = futures::stream::iter(dataset.get_fragments())
+        .map(move |fragment| {
+            let bitmaps_ref = bitmaps.clone();
+            async move {
+                let fragment_id = fragment.id();
+                if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
+                    match fragment.extend_deletions(*bitmap).await {
+                        Ok(Some(new_fragment)) => {
+                            Ok(FragmentChange::Modified(new_fragment.metadata))
+                        }
+                        Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Ok(FragmentChange::Unchanged)
+                }
+            }
+        })
+        .buffer_unordered(dataset.object_store.io_parallelism());
+
+    while let Some(res) = stream.next().await.transpose()? {
+        match res {
+            FragmentChange::Unchanged => {}
+            FragmentChange::Modified(fragment) => updated_fragments.push(fragment),
+            FragmentChange::Removed(fragment_id) => removed_fragments.push(fragment_id),
+        }
+    }
+
+    Ok((updated_fragments, removed_fragments))
+}
 
 pub async fn delete(ds: &mut Dataset, predicate: &str) -> Result<()> {
-    let mut updated_fragments: Vec<Fragment> = Vec::new();
-    let mut deleted_fragment_ids: Vec<u64> = Vec::new();
-    stream::iter(ds.get_fragments())
-        .map(|f| async move {
-            let old_fragment = f.metadata.clone();
-            let new_fragment = f.delete(predicate).await?.map(|f| f.metadata);
-            Ok((old_fragment, new_fragment))
-        })
-        .buffer_unordered(get_num_compute_intensive_cpus())
-        // Drop the fragments that were deleted.
-        .try_for_each(|(old_fragment, new_fragment)| {
-            if let Some(new_fragment) = new_fragment {
-                if new_fragment != old_fragment {
-                    updated_fragments.push(new_fragment);
+    // Create a single scanner for the entire dataset
+    let mut scanner = ds.scan();
+    scanner
+        .with_row_address()
+        .filter(predicate)?
+        .project::<&str>(&[])?;
+
+    // Check if the filter optimized to true (delete everything) or false (delete nothing)
+    let (updated_fragments, deleted_fragment_ids) = if let Some(filter_expr) = scanner.get_filter()? {
+        if matches!(
+            filter_expr,
+            Expr::Literal(ScalarValue::Boolean(Some(false)), _)
+        ) {
+            // Predicate evaluated to false - no deletions
+            (Vec::new(), Vec::new())
+        } else if matches!(
+            filter_expr,
+            Expr::Literal(ScalarValue::Boolean(Some(true)), _)
+        ) {
+            // Predicate evaluated to true - delete all fragments
+            let deleted_fragment_ids = ds.get_fragments().iter().map(|f| f.id() as u64).collect();
+            (Vec::new(), deleted_fragment_ids)
+        } else {
+            // Regular predicate - scan and collect row addresses to delete
+            let mut fragment_bitmaps: BTreeMap<u32, RoaringBitmap> = BTreeMap::new();
+            
+            let mut stream = scanner.try_into_stream().await?;
+            
+            while let Some(batch) = stream.try_next().await? {
+                let array = batch[ROW_ADDR].clone();
+                let row_addrs = array.as_primitive::<UInt64Type>();
+                
+                for row_addr in row_addrs.iter().flatten() {
+                    // Extract fragment ID and row ID from row address
+                    let fragment_id = (row_addr >> 32) as u32;
+                    let row_id = (row_addr & 0xFFFFFFFF) as u32;
+                    
+                    fragment_bitmaps
+                        .entry(fragment_id)
+                        .or_insert_with(RoaringBitmap::new)
+                        .insert(row_id);
                 }
-            } else {
-                deleted_fragment_ids.push(old_fragment.id);
             }
-            futures::future::ready(Ok::<_, crate::Error>(()))
-        })
-        .await?;
+            
+            // Build RoaringTreemap from fragment bitmaps
+            let mut removed_row_ids = RoaringTreemap::new();
+            for (fragment_id, bitmap) in fragment_bitmaps {
+                for row_id in bitmap {
+                    let global_row_id = ((fragment_id as u64) << 32) | (row_id as u64);
+                    removed_row_ids.insert(global_row_id);
+                }
+            }
+            
+            apply_deletions(ds, &removed_row_ids).await?
+        }
+    } else {
+        // No filter was applied - this shouldn't happen but treat as delete nothing
+        (Vec::new(), Vec::new())
+    };
 
     let transaction = Transaction::new(
         ds.manifest.version,
@@ -60,6 +153,7 @@ mod tests {
     use crate::utils::test::TestDatasetGenerator;
     use arrow_array::{RecordBatch, UInt32Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use futures::TryStreamExt;
     use lance_file::version::LanceFileVersion;
     use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
     use rstest::rstest;
@@ -229,5 +323,116 @@ mod tests {
         assert_eq!(fragments[0].id(), 0);
         assert_eq!(fragments[1].id(), 2);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_delete_with_single_scanner() {
+        fn sequence_data(range: Range<u32>) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::UInt32, false),
+                ArrowField::new("x", DataType::UInt32, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt32Array::from_iter_values(range.clone())),
+                    Arc::new(UInt32Array::from_iter_values(range.map(|v| v * 2))),
+                ],
+            )
+            .unwrap()
+        }
+
+        // Create dataset with multiple fragments
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
+        
+        // Create 5 fragments with 100 rows each
+        let mut batches = Vec::new();
+        for i in 0..5 {
+            let start = i * 100;
+            let end = (i + 1) * 100;
+            let data = sequence_data(start..end);
+            batches.push(data);
+        }
+        
+        let mut dataset = TestDatasetGenerator::new(batches, LanceFileVersion::Stable)
+            .make_hostile(&tmp_path)
+            .await;
+
+        // Delete rows across multiple fragments using the new scanner-based implementation
+        let predicate = "i >= 50 AND i < 150";
+        dataset.delete(predicate).await.unwrap();
+        
+        // Verify the deletion worked correctly
+        let mut scanner = dataset.scan();
+        scanner.filter(predicate).unwrap();
+        let count = scanner.try_into_stream().await.unwrap()
+            .try_fold(0, |acc, batch| async move {
+                Ok(acc + batch.num_rows())
+            })
+            .await
+            .unwrap();
+        
+        assert_eq!(count, 0, "All rows matching the predicate should be deleted");
+        
+        // Verify that rows outside the predicate still exist
+        let mut remaining_scanner = dataset.scan();
+        remaining_scanner.filter("i < 50 OR i >= 150").unwrap();
+        let remaining_count = remaining_scanner.try_into_stream().await.unwrap()
+            .try_fold(0, |acc, batch| async move {
+                Ok(acc + batch.num_rows())
+            })
+            .await
+            .unwrap();
+        
+        assert_eq!(remaining_count, 400, "400 rows should remain after deletion");
+        
+        // Check that fragments were handled correctly
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() == 5, "All fragments should still exist");
+        
+        // Fragment 0 (rows 0-99) should have 50 deletions (50-99)
+        let frag0_dv = fragments[0].get_deletion_vector().await.unwrap().unwrap();
+        assert_eq!(frag0_dv.len(), 50);
+        
+        // Fragment 1 (rows 100-199) should be fully deleted or have 50 deletions (100-149)
+        let frag1_dv = fragments[1].get_deletion_vector().await.unwrap().unwrap();
+        assert_eq!(frag1_dv.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_delete_false_predicate_still_commits() {
+        fn sequence_data(range: Range<u32>) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::UInt32, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![Arc::new(UInt32Array::from_iter_values(range))],
+            )
+            .unwrap()
+        }
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
+        
+        let data = sequence_data(0..100);
+        let mut dataset = TestDatasetGenerator::new(vec![data], LanceFileVersion::Stable)
+            .make_hostile(&tmp_path)
+            .await;
+
+        let initial_version = dataset.version().version;
+        
+        // Delete with false predicate - should still commit but not delete anything
+        dataset.delete("false").await.unwrap();
+        
+        // Verify version incremented (commit happened)
+        assert_eq!(dataset.version().version, initial_version + 1);
+        
+        // Verify no rows were deleted
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 100);
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_none());
     }
 }
