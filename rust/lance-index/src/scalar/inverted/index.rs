@@ -770,7 +770,7 @@ impl TokenSet {
         if let TokenMap::HashMap(ref mut map) = self.tokens {
             let mut removed_tokens = Vec::with_capacity(removed_token_ids.len());
             for (token, token_id) in map.iter_mut() {
-                match removed_token_ids.binary_search(&token_id) {
+                match removed_token_ids.binary_search(token_id) {
                     Ok(_) => {
                         removed_tokens.push(token.clone());
                     }
