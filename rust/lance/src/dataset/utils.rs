@@ -47,7 +47,6 @@ fn extract_row_addrs(
     Ok(batch.project(&non_row_addr_cols)?)
 }
 
-
 /// Given a stream that includes a row address column, return a stream that will
 /// capture the row addresses in a `RoaringTreemap` and return a stream without the
 /// row address column.
@@ -74,4 +73,3 @@ pub fn make_rowaddr_capture_stream(
     let stream = RecordBatchStreamAdapter::new(schema, stream);
     Ok(Box::pin(stream))
 }
-
