@@ -311,8 +311,7 @@ impl ReaderProjection {
     }
 }
 
-#[derive(Clone, Debug)]
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct FileReaderOptions {
     validate_on_decode: bool,
     /// Whether to cache repetition indices for better performance

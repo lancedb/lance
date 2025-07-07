@@ -5011,17 +5011,17 @@ mod tests {
         // Test that enable_cache flag actually controls caching behavior
         let rows_in_page = 1000_u64;
         let bytes_per_value = 4_u64;
-        
+
         // Create simulated data
         let rep_index_data = vec![0u8; ((rows_in_page + 1) * bytes_per_value) as usize];
         let value_data = vec![0u8; 4000]; // Dummy value data
         let mut full_data = vec![0u8; 1000]; // Padding before rep index
         full_data.extend_from_slice(&rep_index_data);
         full_data.extend_from_slice(&value_data);
-        
+
         let data = bytes::Bytes::from(full_data);
         let io = Arc::new(SimulatedScheduler::new(data));
-        
+
         // Test 1: With caching disabled
         let mut scheduler_no_cache = FullZipScheduler {
             data_buf_position: 0,
@@ -5042,16 +5042,19 @@ mod tests {
             cached_state: None,
             enable_cache: false, // Caching disabled
         };
-        
+
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
         let cached_data = scheduler_no_cache.initialize(&io_dyn).await.unwrap();
-        
+
         // Should return NoCachedPageData when caching is disabled
         assert!(
-            cached_data.as_arc_any().downcast_ref::<super::NoCachedPageData>().is_some(),
+            cached_data
+                .as_arc_any()
+                .downcast_ref::<super::NoCachedPageData>()
+                .is_some(),
             "With enable_cache=false, should return NoCachedPageData"
         );
-        
+
         // Test 2: With caching enabled
         let mut scheduler_with_cache = FullZipScheduler {
             data_buf_position: 0,
@@ -5072,12 +5075,15 @@ mod tests {
             cached_state: None,
             enable_cache: true, // Caching enabled
         };
-        
+
         let cached_data2 = scheduler_with_cache.initialize(&io_dyn).await.unwrap();
-        
+
         // Should return FullZipCacheableState when caching is enabled
         assert!(
-            cached_data2.as_arc_any().downcast_ref::<super::FullZipCacheableState>().is_some(),
+            cached_data2
+                .as_arc_any()
+                .downcast_ref::<super::FullZipCacheableState>()
+                .is_some(),
             "With enable_cache=true, should return FullZipCacheableState"
         );
     }
