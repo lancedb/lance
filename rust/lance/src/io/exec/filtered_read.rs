@@ -1311,12 +1311,7 @@ impl ExecutionPlan for FilteredReadExec {
             // stats and basic filter shape)
             let filter = self.options.filter_plan.full_expr.as_ref().unwrap();
 
-            let read_projection = self
-                .dataset
-                .empty_projection()
-                .union_columns(self.options.filter_plan.all_columns(), OnMissing::Error)?
-                .with_row_id()
-                .with_row_addr();
+            let read_projection = self.options.projection.clone();
 
             let planner = Arc::new(Planner::new(Arc::new(read_projection.to_arrow_schema())));
             let physical_filter = planner.create_physical_expr(filter)?;

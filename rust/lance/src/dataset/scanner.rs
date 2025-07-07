@@ -2938,7 +2938,12 @@ impl Scanner {
                 .collect::<Vec<_>>(),
         );
 
-        if filter_plan.is_exact_index_search() {
+        // Can only use ScalarIndexExec when the scalar index is exact and we are not scanning
+        // a subset of the fragments.
+        //
+        // TODO: We could enhance ScalarIndexExec with a fragment bitmap to filter out rows that
+        // are not in the fragments we are scanning.
+        if filter_plan.is_exact_index_search() && self.fragments.is_none() {
             let index_query = filter_plan.index_query.as_ref().expect_ok()?;
             let (_, missing_frags) = self
                 .partition_frags_by_coverage(index_query, fragments.clone())
