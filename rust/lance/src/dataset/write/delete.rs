@@ -3,18 +3,17 @@
 
 use crate::{
     dataset::transaction::{Operation, Transaction},
+    dataset::utils::make_rowaddr_capture_stream,
     Dataset,
 };
-use arrow_array::cast::AsArray;
-use arrow_array::types::UInt64Type;
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::{ROW_ADDR, Result};
+use lance_core::Result;
 use lance_table::format::Fragment;
-use roaring::{RoaringBitmap, RoaringTreemap};
+use roaring::RoaringTreemap;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Apply deletions to fragments based on a RoaringTreemap of row IDs.
 /// 
@@ -90,36 +89,24 @@ pub async fn delete(ds: &mut Dataset, predicate: &str) -> Result<()> {
             (Vec::new(), deleted_fragment_ids)
         } else {
             // Regular predicate - scan and collect row addresses to delete
-            let mut fragment_bitmaps: BTreeMap<u32, RoaringBitmap> = BTreeMap::new();
+            let removed_row_addrs = Arc::new(RwLock::new(RoaringTreemap::new()));
+            let stream = scanner.try_into_stream().await?.into();
+            let stream = make_rowaddr_capture_stream(removed_row_addrs.clone(), stream)?;
             
-            let mut stream = scanner.try_into_stream().await?;
-            
-            while let Some(batch) = stream.try_next().await? {
-                let array = batch[ROW_ADDR].clone();
-                let row_addrs = array.as_primitive::<UInt64Type>();
-                
-                for row_addr in row_addrs.iter().flatten() {
-                    // Extract fragment ID and row ID from row address
-                    let fragment_id = (row_addr >> 32) as u32;
-                    let row_id = (row_addr & 0xFFFFFFFF) as u32;
-                    
-                    fragment_bitmaps
-                        .entry(fragment_id)
-                        .or_insert_with(RoaringBitmap::new)
-                        .insert(row_id);
-                }
+            // Process the stream to capture row addresses
+            // We need to consume the stream to trigger the capture
+            futures::pin_mut!(stream);
+            while let Some(_batch) = stream.try_next().await? {
+                // The row addresses are captured automatically by make_rowaddr_capture_stream
             }
             
-            // Build RoaringTreemap from fragment bitmaps
-            let mut removed_row_ids = RoaringTreemap::new();
-            for (fragment_id, bitmap) in fragment_bitmaps {
-                for row_id in bitmap {
-                    let global_row_id = ((fragment_id as u64) << 32) | (row_id as u64);
-                    removed_row_ids.insert(global_row_id);
-                }
-            }
+            // Extract the row addresses from the Arc
+            let removed_row_addrs = {
+                let guard = removed_row_addrs.read().unwrap();
+                guard.clone()
+            };
             
-            apply_deletions(ds, &removed_row_ids).await?
+            apply_deletions(ds, &removed_row_addrs).await?
         }
     } else {
         // No filter was applied - this shouldn't happen but treat as delete nothing

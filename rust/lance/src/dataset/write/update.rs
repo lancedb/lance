@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
-use super::super::utils::make_rowid_capture_stream;
+use super::super::utils::make_rowaddr_capture_stream;
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
@@ -226,7 +226,7 @@ pub struct UpdateJob {
 impl UpdateJob {
     pub async fn execute(self) -> Result<UpdateResult> {
         let mut scanner = self.dataset.scan();
-        scanner.with_row_id();
+        scanner.with_row_address();
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -234,10 +234,10 @@ impl UpdateJob {
 
         let stream = scanner.try_into_stream().await?.into();
 
-        // We keep track of seen row ids so we can delete them from the existing
+        // We keep track of seen row addresses so we can delete them from the existing
         // fragments.
         let removed_row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
-        let stream = make_rowid_capture_stream(removed_row_ids.clone(), stream)?;
+        let stream = make_rowaddr_capture_stream(removed_row_ids.clone(), stream)?;
 
         let schema = stream.schema();
 
