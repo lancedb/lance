@@ -958,8 +958,9 @@ struct MiniBlockSchedulerDictionary {
     num_dictionary_items: u64,
 }
 
+/// Individual block metadata within a MiniBlock repetition index.
 #[derive(Debug)]
-struct RepIndexBlock {
+struct MiniBlockRepIndexBlock {
     // The index of the first row that starts after the beginning of this block.  If the block
     // has a preamble this will be the row after the preamble.  If the block is entirely preamble
     // then this will be a row that starts in some future block.
@@ -973,24 +974,28 @@ struct RepIndexBlock {
     has_trailer: bool,
 }
 
-impl DeepSizeOf for RepIndexBlock {
+impl DeepSizeOf for MiniBlockRepIndexBlock {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
         0
     }
 }
 
+/// Repetition index for MiniBlock encoding.
+///
+/// Stores block-level offset information to enable efficient random
+/// access to nested data structures within mini-blocks.
 #[derive(Debug)]
-struct RepetitionIndex {
-    blocks: Vec<RepIndexBlock>,
+struct MiniBlockRepIndex {
+    blocks: Vec<MiniBlockRepIndexBlock>,
 }
 
-impl DeepSizeOf for RepetitionIndex {
+impl DeepSizeOf for MiniBlockRepIndex {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.blocks.deep_size_of_children(context)
     }
 }
 
-impl RepetitionIndex {
+impl MiniBlockRepIndex {
     fn decode(rep_index: &[Vec<u64>]) -> Self {
         let mut chunk_has_preamble = false;
         let mut offset = 0;
@@ -1008,7 +1013,7 @@ impl RepetitionIndex {
                 starts_including_trailer -= 1;
             }
 
-            blocks.push(RepIndexBlock {
+            blocks.push(MiniBlockRepIndexBlock {
                 first_row: offset,
                 starts_including_trailer,
                 has_preamble: chunk_has_preamble,
@@ -1029,7 +1034,7 @@ struct MiniBlockCacheableState {
     /// Metadata that describes each chunk in the page
     chunk_meta: Vec<ChunkMeta>,
     /// The decoded repetition index
-    rep_index: RepetitionIndex,
+    rep_index: MiniBlockRepIndex,
     /// The dictionary for the page, if any
     dictionary: Option<Arc<DataBlock>>,
 }
@@ -1260,7 +1265,10 @@ impl ChunkInstructions {
     // We assume that `user_ranges` are in sorted order and non-overlapping
     //
     // The output will be a set of `ChunkInstructions` which tell us how to read from the chunks
-    fn schedule_instructions(rep_index: &RepetitionIndex, user_ranges: &[Range<u64>]) -> Vec<Self> {
+    fn schedule_instructions(
+        rep_index: &MiniBlockRepIndex,
+        user_ranges: &[Range<u64>],
+    ) -> Vec<Self> {
         // This is an in-exact capacity guess but pretty good.  The actual capacity can be
         // smaller if instructions are merged.  It can be larger if there are multiple instructions
         // per row which can happen with lists.
@@ -1515,7 +1523,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
 
             let mut page_meta = MiniBlockCacheableState {
                 chunk_meta,
-                rep_index: RepetitionIndex::decode(&rep_index),
+                rep_index: MiniBlockRepIndex::decode(&rep_index),
                 dictionary: None,
             };
 
@@ -4247,7 +4255,7 @@ mod tests {
     use super::{
         ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
         FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipRepIndexDetails,
-        FullZipScheduler, PerValueDecompressor, PreambleAction, RepetitionIndex,
+        FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor, PreambleAction,
         StructuralPageScheduler,
     };
 
@@ -4556,7 +4564,7 @@ mod tests {
     #[test]
     fn test_schedule_instructions() {
         let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
-        let repetition_index = RepetitionIndex::decode(&repetition_index);
+        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
 
         let check = |user_ranges, expected_instructions| {
             let instructions =
@@ -4710,7 +4718,7 @@ mod tests {
         }
 
         let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
-        let repetition_index = RepetitionIndex::decode(&repetition_index);
+        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
         let user_ranges = vec![1..7, 10..14];
 
         // First, schedule the ranges
@@ -4794,7 +4802,7 @@ mod tests {
 
         // Regression case.  Need a chunk with preamble, rows, and trailer (the middle chunk here)
         let repetition_index = vec![vec![5, 2], vec![3, 3], vec![20, 0]];
-        let repetition_index = RepetitionIndex::decode(&repetition_index);
+        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
         let user_ranges = vec![0..28];
 
         // First, schedule the ranges
