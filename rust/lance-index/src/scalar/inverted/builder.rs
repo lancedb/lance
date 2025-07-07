@@ -268,15 +268,17 @@ impl Default for InvertedIndexBuilder {
 #[derive(Debug)]
 pub struct InnerBuilder {
     id: u64,
+    with_position: bool,
     pub(crate) tokens: TokenSet,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
     pub(crate) docs: DocSet,
 }
 
 impl InnerBuilder {
-    pub fn new(id: u64) -> Self {
+    pub fn new(id: u64, with_position: bool) -> Self {
         Self {
             id,
+            with_position,
             tokens: TokenSet::default(),
             posting_lists: Vec::new(),
             docs: DocSet::default(),
@@ -288,12 +290,26 @@ impl InnerBuilder {
     }
 
     pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        // no need to remap the TokenSet,
-        // no row_id is stored in the TokenSet
+        // for the docs, we need to remove the rows that are removed from the doc set,
+        // and update the row ids of the rows that are updated
         let removed = self.docs.remap(mapping);
-        for posting_list in self.posting_lists.iter_mut() {
+
+        // for the posting lists, we need to remap the doc ids:
+        // - if the a row is removed, we need to shift the doc ids of the following rows
+        // - if a row is updated (assigned a new row id), we don't need to do anything with the posting lists
+        let mut empty_posting_lists = Vec::new();
+        for (token_id, posting_list) in self.posting_lists.iter_mut().enumerate() {
             posting_list.remap(&removed);
+            if posting_list.is_empty() {
+                empty_posting_lists.push(token_id as u32);
+            }
         }
+        self.posting_lists
+            .retain(|posting_list| !posting_list.is_empty());
+
+        // for the tokens, remap the token ids if any posting list is empty
+        self.tokens.remap(&empty_posting_lists);
+
         Ok(())
     }
 
@@ -315,7 +331,7 @@ impl InnerBuilder {
         let mut writer = store
             .new_index_file(
                 &posting_file_path(self.id),
-                inverted_list_schema(self.posting_lists[0].has_positions()),
+                inverted_list_schema(self.with_position),
             )
             .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
@@ -324,9 +340,9 @@ impl InnerBuilder {
             "writing {} posting lists of partition {}, with position {}",
             posting_lists.len(),
             id,
-            posting_lists[0].has_positions()
+            self.with_position
         );
-        let schema = inverted_list_schema(posting_lists[0].has_positions());
+        let schema = inverted_list_schema(self.with_position);
 
         let mut batches = stream::iter(posting_lists)
             .map(|posting_list| {
@@ -422,7 +438,10 @@ impl IndexWorker {
         Ok(Self {
             store,
             tokenizer,
-            builder: InnerBuilder::new(id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            builder: InnerBuilder::new(
+                id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                with_position,
+            ),
             partitions: Vec::new(),
             id_alloc,
             schema,
@@ -500,11 +519,13 @@ impl IndexWorker {
             self.estimated_size / (1024 * 1024)
         );
         self.estimated_size = 0;
+        let with_position = self.has_position();
         let mut builder = std::mem::replace(
             &mut self.builder,
             InnerBuilder::new(
                 self.id_alloc
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                with_position,
             ),
         );
         builder.write(self.store.as_ref()).await?;

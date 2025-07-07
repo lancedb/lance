@@ -565,7 +565,7 @@ impl InvertedPartition {
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
-        let mut builder = InnerBuilder::new(self.id);
+        let mut builder = InnerBuilder::new(self.id, self.inverted_list.has_positions());
         builder.tokens = self.tokens;
         builder.docs = self.docs;
 
@@ -758,6 +758,31 @@ impl TokenSet {
         match self.tokens {
             TokenMap::HashMap(ref map) => map.get(token).copied(),
             TokenMap::Fst(ref map) => map.get(token).map(|id| id as u32),
+        }
+    }
+
+    // the `removed_token_ids` must be sorted
+    pub fn remap(&mut self, removed_token_ids: &[u32]) {
+        if removed_token_ids.is_empty() {
+            return;
+        }
+
+        if let TokenMap::HashMap(ref mut map) = self.tokens {
+            let mut removed_tokens = Vec::with_capacity(removed_token_ids.len());
+            for (token, token_id) in map.iter_mut() {
+                match removed_token_ids.binary_search(&token_id) {
+                    Ok(_) => {
+                        removed_tokens.push(token.clone());
+                    }
+                    Err(index) => {
+                        *token_id -= index as u32;
+                    }
+                }
+            }
+
+            for removed_token in removed_tokens {
+                map.remove(&removed_token);
+            }
         }
     }
 
@@ -2042,7 +2067,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remap_to_empty_posting_list() {
-        let mut builder = InnerBuilder::new(0);
+        let mut builder = InnerBuilder::new(0, false);
 
         // index of docs:
         // 0: lance
@@ -2077,6 +2102,16 @@ mod tests {
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
             Arc::new(LanceCache::no_cache()),
         ));
+        builder.write(store.as_ref()).await.unwrap();
+
+        // remap to delete all docs
+        let mapping = HashMap::from([(1, None), (3, None)]);
+        builder.remap(&mapping).await.unwrap();
+
+        assert_eq!(builder.tokens.len(), 0);
+        assert_eq!(builder.posting_lists.len(), 0);
+        assert_eq!(builder.docs.len(), 0);
+
         builder.write(store.as_ref()).await.unwrap();
     }
 }
