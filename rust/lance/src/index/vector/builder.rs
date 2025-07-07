@@ -228,10 +228,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         debug_assert_eq!(self.existing_indices.len(), 1);
-        let ivf_model = self.ivf.as_ref().ok_or(Error::invalid_input(
-            "IVF model not set before remapping",
-            location!(),
-        ))?;
+        let Some(ivf_model) = self.ivf.as_ref() else {
+            return Err(Error::invalid_input(
+                "IVF model not set before remapping",
+                location!(),
+            ));
+        };
         let existing_index = self.existing_indices[0].clone();
         let mapping = Arc::new(mapping.clone());
         let mapped_stream = stream::iter(0..ivf_model.num_partitions())
@@ -291,10 +293,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     #[instrument(name = "load_or_build_ivf", level = "debug", skip_all)]
     async fn load_or_build_ivf(&self) -> Result<IvfModel> {
-        let dataset = self.dataset.as_ref().ok_or(Error::invalid_input(
-            "dataset not set before loading or building IVF",
-            location!(),
-        ))?;
+        let Some(dataset) = self.dataset.as_ref() else {
+            return Err(Error::invalid_input(
+                "dataset not set before loading or building IVF",
+                location!(),
+            ));
+        };
 
         let dim = utils::get_vector_dim(dataset.schema(), &self.column)?;
         match &self.ivf {
@@ -333,10 +337,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             return Ok(self.quantizer.clone().unwrap());
         }
 
-        let dataset = self.dataset.as_ref().ok_or(Error::invalid_input(
-            "dataset not set before loading or building quantizer",
-            location!(),
-        ))?;
+        let Some(dataset) = self.dataset.as_ref() else {
+            return Err(Error::invalid_input(
+                "dataset not set before loading or building quantizer",
+                location!(),
+            ));
+        };
         let sample_size_hint = match &self.quantizer_params {
             Some(params) => params.sample_size(),
             None => 256 * 256, // here it must be retrain, let's just set sample size to the default value
@@ -404,10 +410,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     async fn shuffle_dataset(&mut self) -> Result<()> {
-        let dataset = self.dataset.as_ref().ok_or(Error::invalid_input(
-            "dataset not set before shuffling",
-            location!(),
-        ))?;
+        let Some(dataset) = self.dataset.as_ref() else {
+            return Err(Error::invalid_input(
+                "dataset not set before shuffling",
+                location!(),
+            ));
+        };
 
         let stream = match self
             .ivf_params
@@ -460,18 +468,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         }
         let data = data.unwrap();
 
-        let ivf = self.ivf.as_ref().ok_or(Error::invalid_input(
-            "IVF not set before shuffle data",
-            location!(),
-        ))?;
-        let quantizer = self.quantizer.clone().ok_or(Error::invalid_input(
-            "quantizer not set before shuffle data",
-            location!(),
-        ))?;
-        let shuffler = self.shuffler.as_ref().ok_or(Error::invalid_input(
-            "shuffler not set before shuffle data",
-            location!(),
-        ))?;
+        let Some(ivf) = self.ivf.as_ref() else {
+            return Err(Error::invalid_input(
+                "IVF not set before shuffle data",
+                location!(),
+            ));
+        };
+        let Some(quantizer) = self.quantizer.clone() else {
+            return Err(Error::invalid_input(
+                "quantizer not set before shuffle data",
+                location!(),
+            ));
+        };
+        let Some(shuffler) = self.shuffler.as_ref() else {
+            return Err(Error::invalid_input(
+                "shuffler not set before shuffle data",
+                location!(),
+            ));
+        };
 
         let transformer = Arc::new(
             lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
@@ -565,22 +579,30 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     #[instrument(name = "build_partitions", level = "debug", skip_all)]
     async fn build_partitions(&mut self) -> Result<BuildStream<S, Q>> {
-        let ivf = self.ivf.as_mut().ok_or(Error::invalid_input(
-            "IVF not set before building partitions",
-            location!(),
-        ))?;
-        let quantizer = self.quantizer.clone().ok_or(Error::invalid_input(
-            "quantizer not set before building partition",
-            location!(),
-        ))?;
-        let sub_index_params = self.sub_index_params.clone().ok_or(Error::invalid_input(
-            "sub index params not set before building partition",
-            location!(),
-        ))?;
-        let reader = self.shuffle_reader.as_ref().ok_or(Error::invalid_input(
-            "shuffle reader not set before building partitions",
-            location!(),
-        ))?;
+        let Some(ivf) = self.ivf.as_mut() else {
+            return Err(Error::invalid_input(
+                "IVF not set before building partitions",
+                location!(),
+            ));
+        };
+        let Some(quantizer) = self.quantizer.clone() else {
+            return Err(Error::invalid_input(
+                "quantizer not set before building partition",
+                location!(),
+            ));
+        };
+        let Some(sub_index_params) = self.sub_index_params.clone() else {
+            return Err(Error::invalid_input(
+                "sub index params not set before building partition",
+                location!(),
+            ));
+        };
+        let Some(reader) = self.shuffle_reader.as_ref() else {
+            return Err(Error::invalid_input(
+                "shuffle reader not set before building partitions",
+                location!(),
+            ));
+        };
 
         let reader = reader.clone();
         let existing_indices = Arc::new(self.existing_indices.clone());
@@ -701,14 +723,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     #[instrument(name = "merge_partitions", level = "debug", skip_all)]
     async fn merge_partitions(&mut self, mut build_stream: BuildStream<S, Q>) -> Result<()> {
-        let ivf = self.ivf.as_ref().ok_or(Error::invalid_input(
-            "IVF not set before merge partitions",
-            location!(),
-        ))?;
-        let quantizer = self.quantizer.clone().ok_or(Error::invalid_input(
-            "quantizer not set before merge partitions",
-            location!(),
-        ))?;
+        let Some(ivf) = self.ivf.as_ref() else {
+            return Err(Error::invalid_input(
+                "IVF not set before merge partitions",
+                location!(),
+            ));
+        };
+        let Some(quantizer) = self.quantizer.clone() else {
+            return Err(Error::invalid_input(
+                "quantizer not set before merge partitions",
+                location!(),
+            ));
+        };
 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
@@ -735,7 +761,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let mut part_id = 0;
         let mut total_loss = 0.0;
-        log::info!("merging partitions");
+        log::info!("merging {} partitions", ivf.num_partitions());
         while let Some(part) = build_stream.try_next().await? {
             part_id += 1;
             let Some((storage, index, loss)) = part else {
@@ -834,7 +860,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         storage_writer.finish().await?;
         index_writer.finish().await?;
 
-        log::info!("merging partitions done");
+        log::info!("merging {} partitions done", ivf.num_partitions());
 
         Ok(())
     }
