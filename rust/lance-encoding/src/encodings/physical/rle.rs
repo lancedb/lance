@@ -33,7 +33,6 @@
 //! - 16-bit: u16, i16
 //! - 32-bit: u32, i32, f32
 //! - 64-bit: u64, i64, f64
-//! - 128-bit: decimal128
 //!
 //! ## Compression Strategy
 //!
@@ -97,7 +96,6 @@ impl RleMiniBlockEncoder {
                     16 => self.encode_chunk_rolling::<u16>(data, offset, values_remaining),
                     32 => self.encode_chunk_rolling::<u32>(data, offset, values_remaining),
                     64 => self.encode_chunk_rolling::<u64>(data, offset, values_remaining),
-                    128 => self.encode_chunk_rolling::<u128>(data, offset, values_remaining),
                     _ => unreachable!("RLE encoding bits_per_value must be 8, 16, 32, 64, or 128"),
                 };
 
@@ -195,7 +193,7 @@ impl RleMiniBlockEncoder {
         let checkpoints = match type_size {
             1 => vec![256, 512, 1024, 2048, 4096], // u8 can start from 256
             2 => vec![128, 256, 512, 1024, 2048, 4096], // u16 can start from 128
-            _ => vec![64, 128, 256, 512, 1024, 2048, 4096], // u32/u64/u128: no difference
+            _ => vec![64, 128, 256, 512, 1024, 2048, 4096], // u32/u64: no difference
         };
         let valid_checkpoints: Vec<usize> = checkpoints
             .into_iter()
@@ -380,7 +378,6 @@ impl RleMiniBlockDecompressor {
             16 => self.decode_generic::<u16>(values_buffer, lengths_buffer, num_values)?,
             32 => self.decode_generic::<u32>(values_buffer, lengths_buffer, num_values)?,
             64 => self.decode_generic::<u64>(values_buffer, lengths_buffer, num_values)?,
-            128 => self.decode_generic::<u128>(values_buffer, lengths_buffer, num_values)?,
             _ => unreachable!("RLE decoding bits_per_value must be 8, 16, 32, 64, or 128"),
         };
 
@@ -576,31 +573,6 @@ mod tests {
 
         // Test u64
         test_round_trip_helper(vec![1_000_000_000u64; 5], 64);
-
-        // Test 128-bit
-        let data_128 = [1u128, 1, 1, 2, 2, 3, 3, 3, 3];
-        let bytes_128: Vec<u8> = data_128.iter().flat_map(|&v| v.to_le_bytes()).collect();
-
-        let encoder = RleMiniBlockEncoder::new();
-        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: 128,
-            data: LanceBuffer::Owned(bytes_128.clone()),
-            num_values: 9,
-            block_info: BlockInfo::default(),
-        });
-
-        let (compressed, _) = encoder.compress(block).unwrap();
-        let decompressor = RleMiniBlockDecompressor::new(128);
-        let decompressed = decompressor
-            .decompress(compressed.data, compressed.num_values)
-            .unwrap();
-
-        match decompressed {
-            DataBlock::FixedWidth(ref block) => {
-                assert_eq!(block.data.as_ref(), bytes_128);
-            }
-            _ => panic!("Expected FixedWidth block"),
-        }
     }
 
     fn test_round_trip_helper<T>(data: Vec<T>, bits_per_value: u64)
