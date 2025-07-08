@@ -869,10 +869,6 @@ public class Dataset implements Closeable {
     return new MergeInsertBuilder(this, List.of(onColumn));
   }
 
-  // 添加获取 native handle 的方法（package-private）
-  long getNativeHandle() {
-    return nativeDatasetHandle;
-  }
 
   BufferAllocator getAllocator() {
     return allocator;

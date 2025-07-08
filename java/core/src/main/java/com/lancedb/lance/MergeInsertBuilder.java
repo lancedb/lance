@@ -130,7 +130,7 @@ public class MergeInsertBuilder implements AutoCloseable {
 
             // 将字节数组转换为 ArrowArrayStream
             byte[] data = outputStream.toByteArray();
-            Data.exportArrayStream(root.getAllocator(), root, stream);
+            Data.exportArrayStream(this.allocator, root, stream);
 
         } catch (Exception e) {
             throw new RuntimeException("Failed to convert VectorSchemaRoot to ArrowArrayStream", e);
@@ -154,5 +154,4 @@ public class MergeInsertBuilder implements AutoCloseable {
     private static native void retryTimeoutNative(long builderHandle, long timeoutMillis);
     private static native MergeInsertResult executeNative(long builderHandle, long streamAddress);
     private static native void closeNative(long builderHandle);
-    private static native void convertToStream(VectorSchemaRoot root, ArrowArrayStream stream);
 }
