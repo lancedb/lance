@@ -190,7 +190,13 @@ impl RleMiniBlockEncoder {
         let mut bytes_used = 0usize;
 
         // Power-of-2 checkpoints for ensuring non-last chunks have valid sizes
-        let checkpoints = vec![64, 128, 256, 512, 1024, 2048, 4096];
+        // For smaller data types like u8, we can use larger initial checkpoints
+        // since they take less space per value
+        let checkpoints = match type_size {
+            1 => vec![256, 512, 1024, 2048, 4096], // u8 can start from 256
+            2 => vec![128, 256, 512, 1024, 2048, 4096], // u16 can start from 128
+            _ => vec![64, 128, 256, 512, 1024, 2048, 4096], // u32/u64/u128: no difference
+        };
         let valid_checkpoints: Vec<usize> = checkpoints
             .into_iter()
             .filter(|&p| p <= values_remaining)
