@@ -851,6 +851,33 @@ public class Dataset implements Closeable {
     }
   }
 
+  /**
+   * 创建 merge insert 操作构建器
+   * @param onColumns 用于匹配的列名列表
+   * @return MergeInsertBuilder 实例
+   */
+  public MergeInsertBuilder mergeInsert(List<String> onColumns) {
+    return new MergeInsertBuilder(this, onColumns);
+  }
+
+  /**
+   * 创建 merge insert 操作构建器（单列版本）
+   * @param onColumn 用于匹配的列名
+   * @return MergeInsertBuilder 实例
+   */
+  public MergeInsertBuilder mergeInsert(String onColumn) {
+    return new MergeInsertBuilder(this, List.of(onColumn));
+  }
+
+  // 添加获取 native handle 的方法（package-private）
+  long getNativeHandle() {
+    return nativeDatasetHandle;
+  }
+
+  BufferAllocator getAllocator() {
+    return allocator;
+  }
+
   private native void nativeCreateTag(String tag, long version);
 
   private native void nativeDeleteTag(String tag);
