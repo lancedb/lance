@@ -804,6 +804,19 @@ impl FileReader {
         })
     }
 
+    /// Creates a `ReaderProjection` from a list of column names, based on the provided schema.
+    pub fn create_projection_from_columns(
+        metadata:  &Arc<CachedFileMetadata>,
+        columns: Option<Vec<String>>,
+    ) -> Option<ReaderProjection> {
+        if let Some(columns) = columns {
+            let col_names: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
+            ReaderProjection::from_column_names(metadata.version(), metadata.file_schema.as_ref(), &col_names).ok()
+        } else {
+            None
+        }
+    }
+
     // The actual decoder needs all the column infos that make up a type.  In other words, if
     // the first type in the schema is Struct<i32, i32> then the decoder will need 3 column infos.
     //
@@ -1352,12 +1365,13 @@ impl FileReader {
         batch_size: u32,
         batch_readahead: u32,
         filter: FilterExpression,
+        projection: Option<ReaderProjection>,
     ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
         self.read_stream_projected(
             params,
             batch_size,
             batch_readahead,
-            self.base_projection.clone(),
+            projection.unwrap_or(self.base_projection.clone()),
             filter,
         )
     }
@@ -1660,6 +1674,7 @@ pub mod tests {
                     read_size,
                     16,
                     FilterExpression::no_filter(),
+                    None,
                 )
                 .unwrap();
 
@@ -1833,14 +1848,15 @@ pub mod tests {
                 .await
                 .unwrap();
 
-                let batch_stream = file_reader
-                    .read_stream(
-                        lance_io::ReadBatchParams::RangeFull,
-                        1024,
-                        16,
-                        FilterExpression::no_filter(),
-                    )
-                    .unwrap();
+            let batch_stream = file_reader
+                .read_stream(
+                    lance_io::ReadBatchParams::RangeFull,
+                    1024,
+                    16,
+                    FilterExpression::no_filter(),
+                    None,
+                )
+                .unwrap();
 
                 let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
                 verify_expected(
@@ -1979,6 +1995,7 @@ pub mod tests {
                 total_rows as u32,
                 16,
                 FilterExpression::no_filter(),
+                None,
             )
             .unwrap()
             .try_collect::<Vec<_>>()
@@ -2059,6 +2076,7 @@ pub mod tests {
                 (total_rows / 10) as u32,
                 16,
                 FilterExpression::no_filter(),
+                None,
             )
             .unwrap();
 

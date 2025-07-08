@@ -50,6 +50,7 @@ use std::{
 };
 use std::{pin::Pin, sync::Arc};
 use url::Url;
+use lance_core::datatypes::Schema;
 
 #[pyclass(get_all)]
 #[derive(Clone, Debug, Serialize)]
@@ -466,6 +467,7 @@ impl LanceFileReader {
         params: ReadBatchParams,
         batch_size: u32,
         batch_readahead: u32,
+        projection: Option<ReaderProjection>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         // read_stream is a synchronous method but it launches tasks and needs to be
         // run in the context of a tokio runtime
@@ -477,6 +479,7 @@ impl LanceFileReader {
                 batch_size,
                 batch_readahead,
                 FilterExpression::no_filter(),
+                projection
             )
             .infer_error()?;
         Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
@@ -496,37 +499,45 @@ impl LanceFileReader {
             .block_on(Self::open(path, storage_options, columns))
     }
 
+    #[pyo3(signature=(batch_size, batch_readahead, columns=None))]
     pub fn read_all(
         &mut self,
         batch_size: u32,
         batch_readahead: u32,
+        columns: Option<Vec<String>>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         self.read_stream(
             lance_io::ReadBatchParams::RangeFull,
             batch_size,
             batch_readahead,
+            FileReader::create_projection_from_columns(&self.inner.metadata(), columns),
         )
     }
 
+    #[pyo3(signature = (offset, num_rows, batch_size, batch_readahead, columns=None))]
     pub fn read_range(
         &mut self,
         offset: u64,
         num_rows: u64,
         batch_size: u32,
         batch_readahead: u32,
+        columns: Option<Vec<String>>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         self.read_stream(
             lance_io::ReadBatchParams::Range((offset as usize)..(offset + num_rows) as usize),
             batch_size,
             batch_readahead,
+            FileReader::create_projection_from_columns(&self.inner.metadata(), columns),
         )
     }
 
+    #[pyo3(signature = (row_indices, batch_size, batch_readahead, columns=None))]
     pub fn take_rows(
         &mut self,
         row_indices: Vec<u64>,
         batch_size: u32,
         batch_readahead: u32,
+        columns: Option<Vec<String>>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         let indices = row_indices
             .into_iter()
@@ -537,6 +548,7 @@ impl LanceFileReader {
             lance_io::ReadBatchParams::Indices(indices_arr),
             batch_size,
             batch_readahead,
+            FileReader::create_projection_from_columns(&self.inner.metadata(), columns),
         )
     }
 

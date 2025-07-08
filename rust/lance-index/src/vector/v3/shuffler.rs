@@ -294,6 +294,7 @@ impl ShuffleReader for IvfShufflerReader {
                 u32::MAX,
                 16,
                 FilterExpression::no_filter(),
+                None,
             )?,
         ))))
     }
