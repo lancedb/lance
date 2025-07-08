@@ -1,7 +1,7 @@
 /*
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * You may obtain a copy of the License a
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -72,13 +72,13 @@ public class ReadOptions {
     private Optional<Integer> version = Optional.empty();
     private Optional<Integer> blockSize = Optional.empty();
     private int indexCacheSize = 256;
-    private int metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rust
+    private int metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rus
     private Map<String, String> storageOptions = new HashMap<>();
 
     /**
      * Set the version of the dataset to read. If not set, read from latest version.
      *
-     * @param version the version of the dataset
+     * @param version the version of the datase
      * @return this builder
      */
     public Builder setVersion(int version) {

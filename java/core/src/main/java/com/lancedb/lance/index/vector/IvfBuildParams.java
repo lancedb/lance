@@ -1,7 +1,7 @@
 /*
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * You may obtain a copy of the License a
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,7 +17,7 @@ import org.apache.commons.lang3.builder.ToStringBuilder;
 
 /**
  * Parameters for building an IVF index. Train IVF centroids for the given vector column. This will
- * run k-means clustering on the given vector column to train the IVF centroids. This is the first
+ * run k-means clustering on the given vector column to train the IVF centroids. This is the firs
  * step in several vector indices. The centroids will be used to partition the vectors into
  * different clusters. IVF centroids are trained from a sample of the data (determined by the
  * sample_rate). While this sample is not huge it might still be quite large.

@@ -1,7 +1,7 @@
 /*
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * You may obtain a copy of the License a
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -16,14 +16,10 @@ package com.lancedb.lance.flink;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.*;
-import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.flink.cdc.common.event.*;
 import org.apache.flink.cdc.common.data.RecordData;
-import org.apache.flink.cdc.common.types.DataType;
-import org.apache.flink.cdc.common.types.DataTypes;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -51,7 +47,7 @@ public class CDCToArrowConverter {
     }
 
     public VectorSchemaRoot convertToArrow(List<ChangeEvent> events) {
-        // 创建 VectorSchemaRoot
+        // 创建 VectorSchemaRoo
         VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator);
 
         // 预分配向量容量
