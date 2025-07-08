@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance_linalg::kmeans::KMeansAlgoFloat;
-use lance_linalg::{distance::MetricType, kmeans::compute_partitions};
+use lance_index::vector::kmeans::{compute_partitions, KMeansAlgoFloat};
+use lance_linalg::distance::MetricType;
 use lance_testing::datagen::generate_random_array_with_seed;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
