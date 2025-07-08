@@ -90,7 +90,7 @@ impl PyTraceEvent {
 
 impl From<TraceEvent> for PyTraceEvent {
     fn from(event: TraceEvent) -> Self {
-        PyTraceEvent {
+        Self {
             target: event.target,
             args: PyTraceEventArgs(event.args),
         }
@@ -181,8 +181,8 @@ struct EventToStr {
 impl Visit for EventToStr {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let name = field.name();
-        let name = if name.starts_with("r#") {
-            &name[2..]
+        let name = if let Some(name_stripped) = name.strip_prefix("r#") {
+            name_stripped
         } else {
             name
         };
@@ -198,8 +198,8 @@ struct EventToMap {
 impl EventToMap {
     fn field_to_str(field: &Field) -> &str {
         let name = field.name();
-        if name.starts_with("r#") {
-            &name[2..]
+        if let Some(name_stripped) = name.strip_prefix("r#") {
+            name_stripped
         } else {
             name
         }
