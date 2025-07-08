@@ -11,7 +11,7 @@ use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::Schema;
 use future::try_join_all;
 use futures::prelude::*;
-use lance_arrow::{RecordBatchExt, SchemaExt};
+use lance_arrow::RecordBatchExt;
 use lance_core::{
     cache::LanceCache,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
@@ -114,19 +114,13 @@ impl Shuffler for IvfShuffler {
 
         let num_partitions = self.num_partitions;
         let mut partition_sizes = vec![0; num_partitions];
-        let schema = data.schema().without_column(PART_ID_COLUMN);
         let mut writers = stream::iter(0..num_partitions)
             .map(|partition_id| {
                 let part_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
                 let object_store = self.object_store.clone();
-                let schema = schema.clone();
                 async move {
                     let writer = object_store.create(&part_path).await?;
-                    FileWriter::try_new(
-                        writer,
-                        lance_core::datatypes::Schema::try_from(&schema)?,
-                        Default::default(),
-                    )
+                    Result::Ok(FileWriter::new_lazy(writer, Default::default()))
                 }
             })
             .buffered(self.object_store.io_parallelism())
