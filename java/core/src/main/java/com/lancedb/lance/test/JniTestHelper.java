@@ -58,4 +58,20 @@ public class JniTestHelper {
   public static native void parseQuery(Optional<Query> query);
 
   public static native void parseIndexParams(IndexParams indexParams);
+
+  /**
+   * Benchmark data transfer between Java and native code.
+   *
+   * @param dataSize the size of data to transfer
+   * @return execution time in nanoseconds
+   */
+  public static native long benchmarkDataTransfer(int dataSize);
+
+  /**
+   * Benchmark memory allocation in native code.
+   *
+   * @param allocationCount number of allocations to perform
+   * @return execution time in nanoseconds
+   */
+  public static native long benchmarkMemoryAllocation(int allocationCount);
 }
