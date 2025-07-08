@@ -15,7 +15,6 @@ use distance::build_distance_table_dot;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
-use lance_linalg::kmeans::compute_partition;
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::Float;
 use prost::Message;
@@ -35,6 +34,7 @@ use super::quantizer::{
     Quantization, QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
 };
 use super::{pb, PQ_CODE_COLUMN};
+use crate::vector::kmeans::compute_partition;
 pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
 
