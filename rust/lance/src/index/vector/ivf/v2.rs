@@ -2084,7 +2084,7 @@ mod tests {
         let mut vectors = Vec::new();
         for i in 0..num_rows {
             if i < 8192 {
-                vectors.extend(std::iter::repeat_n(std::f32::NAN, DIM));
+                vectors.extend(std::iter::repeat_n(f32::NAN, DIM));
             } else {
                 vectors.extend(std::iter::repeat_n(rand::random::<f32>(), DIM));
             }
