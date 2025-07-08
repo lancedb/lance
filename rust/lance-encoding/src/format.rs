@@ -23,7 +23,7 @@ use pb::{
     AllNullLayout, ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Block, Dictionary,
     FixedSizeBinary, FixedSizeList, Flat, Fsst, InlineBitpacking, MiniBlockLayout, Nullable,
     OutOfLineBitpacking, PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout, RepDefLayer,
-    Variable,
+    Rle, Variable,
 };
 
 use crate::{encodings::physical::block::CompressionConfig, repdef::DefinitionInterpretation};
@@ -185,6 +185,12 @@ impl ProtobufUtils {
                 binary: Some(Box::new(data)),
                 symbol_table: symbol_table.into(),
             }))),
+        }
+    }
+
+    pub fn rle(bits_per_value: u64) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::Rle(Rle { bits_per_value })),
         }
     }
 

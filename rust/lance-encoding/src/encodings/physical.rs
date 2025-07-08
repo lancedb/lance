@@ -7,4 +7,5 @@ pub mod block;
 pub mod constant;
 pub mod fsst;
 pub mod packed;
+pub mod rle;
 pub mod value;

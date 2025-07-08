@@ -16,6 +16,10 @@
 //! Fullzip compression is a per-value approach where we require that values are transparently
 //! compressed so that we can locate them later.
 
+/// Default threshold for RLE compression selection.
+/// RLE is chosen when the run count is less than this fraction of total values.
+const DEFAULT_RLE_COMPRESSION_THRESHOLD: f64 = 0.5;
+
 use crate::{
     buffer::LanceBuffer,
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
@@ -36,6 +40,7 @@ use crate::{
             packed::{
                 PackedStructFixedWidthMiniBlockDecompressor, PackedStructFixedWidthMiniBlockEncoder,
             },
+            rle::{RleMiniBlockDecompressor, RleMiniBlockEncoder},
             value::{ValueDecompressor, ValueEncoder},
         },
     },
@@ -121,6 +126,21 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     if compression == "none" {
                         return Ok(Box::new(ValueEncoder::default()));
                     }
+                }
+
+                // Check if RLE would be beneficial
+                let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
+                let num_values = fixed_width_data.num_values;
+
+                // Use RLE if the run count is less than the threshold
+                if (run_count as f64) < (num_values as f64) * DEFAULT_RLE_COMPRESSION_THRESHOLD
+                    && (fixed_width_data.bits_per_value == 8
+                        || fixed_width_data.bits_per_value == 16
+                        || fixed_width_data.bits_per_value == 32
+                        || fixed_width_data.bits_per_value == 64
+                        || fixed_width_data.bits_per_value == 128)
+                {
+                    return Ok(Box::new(RleMiniBlockEncoder::new()));
                 }
 
                 let bit_widths = data.expect_stat(Stat::BitWidth);
@@ -344,6 +364,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 // In the future, we might need to do something more complex here if FSL supports
                 // compression.
                 Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
+            }
+            pb::array_encoding::ArrayEncoding::Rle(rle) => {
+                Ok(Box::new(RleMiniBlockDecompressor::new(rle.bits_per_value)))
             }
             _ => todo!(),
         }

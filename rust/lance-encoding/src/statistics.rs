@@ -25,6 +25,7 @@ pub enum Stat {
     FixedSize,
     NullCount,
     MaxLength,
+    RunCount,
 }
 
 impl fmt::Debug for Stat {
@@ -36,6 +37,7 @@ impl fmt::Debug for Stat {
             Self::FixedSize => write!(f, "FixedSize"),
             Self::NullCount => write!(f, "NullCount"),
             Self::MaxLength => write!(f, "MaxLength"),
+            Self::RunCount => write!(f, "RunCount"),
         }
     }
 }
@@ -105,10 +107,14 @@ impl ComputeStat for FixedWidthDataBlock {
             None
         };
 
+        // compute run count
+        let run_count_array = self.run_count();
+
         let mut info = self.block_info.0.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
         info.insert(Stat::BitWidth, max_bit_widths);
         info.insert(Stat::MaxLength, max_len_array);
+        info.insert(Stat::RunCount, run_count_array);
         if let Some(cardinality_array) = cardidinality_array {
             info.insert(Stat::Cardinality, cardinality_array);
         }
@@ -384,6 +390,67 @@ impl FixedWidthDataBlock {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Counts the number of runs (consecutive sequences of equal values) in the data.
+    ///
+    /// A "run" is defined as a sequence of one or more consecutive equal values.
+    /// For example:
+    /// - `[1, 1, 2, 2, 2, 3]` has 3 runs: [1,1], [2,2,2], and [3]
+    /// - `[1, 2, 3, 4]` has 4 runs (each value is its own run)
+    /// - `[5, 5, 5, 5]` has 1 run
+    ///
+    /// This count is used to determine if RLE compression would be effective.
+    /// Fewer runs relative to the total number of values indicates better RLE compression potential.
+    fn run_count(&mut self) -> Arc<dyn Array> {
+        assert!(self.num_values > 0);
+
+        // Inner function to count runs in typed data
+        fn count_runs<T: PartialEq + Copy>(slice: &[T]) -> u64 {
+            if slice.is_empty() {
+                return 0;
+            }
+
+            // Start with 1 run (the first value)
+            let mut runs = 1u64;
+            let mut prev = slice[0];
+
+            // Count value transitions (each transition indicates a new run)
+            for &val in &slice[1..] {
+                if val != prev {
+                    runs += 1;
+                    prev = val;
+                }
+            }
+
+            runs
+        }
+
+        let run_count = match self.bits_per_value {
+            8 => {
+                let u8_slice = self.data.borrow_to_typed_slice::<u8>();
+                count_runs(u8_slice.as_ref())
+            }
+            16 => {
+                let u16_slice = self.data.borrow_to_typed_slice::<u16>();
+                count_runs(u16_slice.as_ref())
+            }
+            32 => {
+                let u32_slice = self.data.borrow_to_typed_slice::<u32>();
+                count_runs(u32_slice.as_ref())
+            }
+            64 => {
+                let u64_slice = self.data.borrow_to_typed_slice::<u64>();
+                count_runs(u64_slice.as_ref())
+            }
+            128 => {
+                let u128_slice = self.data.borrow_to_typed_slice::<u128>();
+                count_runs(u128_slice.as_ref())
+            }
+            _ => self.num_values, // For other bit widths, assume no runs
+        };
+
+        Arc::new(UInt64Array::from(vec![run_count]))
     }
 }
 
@@ -1005,5 +1072,49 @@ mod tests {
         let actual_max_length = block.expect_single_stat::<UInt64Type>(Stat::MaxLength);
 
         assert_eq!(actual_max_length, expected_max_length);
+    }
+
+    #[test]
+    fn test_run_count_stat() {
+        // Test with highly repetitive data
+        let int32_array = Int32Array::from(vec![1, 1, 1, 2, 2, 2, 3, 3, 3]);
+        let block = DataBlock::from_array(int32_array);
+        let expected_run_count = 3;
+        let actual_run_count = block.expect_single_stat::<UInt64Type>(Stat::RunCount);
+        assert_eq!(actual_run_count, expected_run_count);
+
+        // Test with no repetition
+        let int32_array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let block = DataBlock::from_array(int32_array);
+        let expected_run_count = 5;
+        let actual_run_count = block.expect_single_stat::<UInt64Type>(Stat::RunCount);
+        assert_eq!(actual_run_count, expected_run_count);
+
+        // Test with mixed pattern
+        let int32_array = Int32Array::from(vec![1, 1, 2, 3, 3, 3, 4, 5, 5]);
+        let block = DataBlock::from_array(int32_array);
+        let expected_run_count = 5;
+        let actual_run_count = block.expect_single_stat::<UInt64Type>(Stat::RunCount);
+        assert_eq!(actual_run_count, expected_run_count);
+
+        // Test with single value
+        let int32_array = Int32Array::from(vec![42, 42, 42, 42, 42]);
+        let block = DataBlock::from_array(int32_array);
+        let expected_run_count = 1;
+        let actual_run_count = block.expect_single_stat::<UInt64Type>(Stat::RunCount);
+        assert_eq!(actual_run_count, expected_run_count);
+
+        // Test with different data types
+        let uint8_array = UInt8Array::from(vec![1, 1, 2, 2, 3, 3]);
+        let block = DataBlock::from_array(uint8_array);
+        let expected_run_count = 3;
+        let actual_run_count = block.expect_single_stat::<UInt64Type>(Stat::RunCount);
+        assert_eq!(actual_run_count, expected_run_count);
+
+        let int64_array = Int64Array::from(vec![100, 100, 200, 300, 300]);
+        let block = DataBlock::from_array(int64_array);
+        let expected_run_count = 3;
+        let actual_run_count = block.expect_single_stat::<UInt64Type>(Stat::RunCount);
+        assert_eq!(actual_run_count, expected_run_count);
     }
 }
