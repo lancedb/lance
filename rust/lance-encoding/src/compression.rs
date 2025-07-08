@@ -122,27 +122,10 @@ impl CompressionStrategy for DefaultCompressionStrategy {
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         match data {
             DataBlock::FixedWidth(fixed_width_data) => {
-                if let Some(compression) = field.metadata.get(COMPRESSION_META_KEY) {
-                    if compression == "none" {
-                        return Ok(Box::new(ValueEncoder::default()));
-                    }
-                }
-
-                // Check if RLE would be beneficial
-                let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
-                let num_values = fixed_width_data.num_values;
-
-                // Use RLE if the run count is less than the threshold
-                if (run_count as f64) < (num_values as f64) * DEFAULT_RLE_COMPRESSION_THRESHOLD
-                    && (fixed_width_data.bits_per_value == 8
-                        || fixed_width_data.bits_per_value == 16
-                        || fixed_width_data.bits_per_value == 32
-                        || fixed_width_data.bits_per_value == 64
-                        || fixed_width_data.bits_per_value == 128)
-                {
-                    return Ok(Box::new(RleMiniBlockEncoder::new()));
-                }
-
+                let is_byte_width_aligned = fixed_width_data.bits_per_value == 8
+                    || fixed_width_data.bits_per_value == 16
+                    || fixed_width_data.bits_per_value == 32
+                    || fixed_width_data.bits_per_value == 64;
                 let bit_widths = data.expect_stat(Stat::BitWidth);
                 let bit_widths = bit_widths.as_primitive::<UInt64Type>();
                 // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
@@ -152,13 +135,36 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 // size might be smaller than the compressed size.
                 let too_small = bit_widths.len() == 1
                     && InlineBitpacking::min_size_bytes(bit_widths.value(0)) >= data.data_size();
-                if !has_all_zeros
-                    && !too_small
-                    && (fixed_width_data.bits_per_value == 8
-                        || fixed_width_data.bits_per_value == 16
-                        || fixed_width_data.bits_per_value == 32
-                        || fixed_width_data.bits_per_value == 64)
+
+                if let Some(compression) = field.metadata.get(COMPRESSION_META_KEY) {
+                    match compression.as_str() {
+                        "none" => return Ok(Box::new(ValueEncoder::default())),
+                        "rle" if is_byte_width_aligned => {
+                            return Ok(Box::new(RleMiniBlockEncoder::new()));
+                        }
+                        "bitpacking" if is_byte_width_aligned => {
+                            if !has_all_zeros {
+                                return Ok(Box::new(InlineBitpacking::new(
+                                    fixed_width_data.bits_per_value,
+                                )));
+                            }
+                        }
+                        _ => {} // Unknown compression type, fall through to auto-selection
+                    }
+                }
+
+                // Check if RLE would be beneficial
+                let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
+                let num_values = fixed_width_data.num_values;
+
+                // Use RLE if the run count is less than the threshold
+                if (run_count as f64) < (num_values as f64) * DEFAULT_RLE_COMPRESSION_THRESHOLD
+                    && is_byte_width_aligned
                 {
+                    return Ok(Box::new(RleMiniBlockEncoder::new()));
+                }
+
+                if !has_all_zeros && !too_small && is_byte_width_aligned {
                     Ok(Box::new(InlineBitpacking::new(
                         fixed_width_data.bits_per_value,
                     )))

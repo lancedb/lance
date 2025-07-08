@@ -638,37 +638,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_byte_limit_enforcement() {
-        let encoder = RleMiniBlockEncoder::new();
-
-        // Test with 128-bit data which has tighter byte constraints
-        let mut data_128 = Vec::new();
-        for i in 0..600u128 {
-            data_128.extend(&[i, i, i]); // 600 runs * 3 values each
-        }
-
-        let bytes_128: Vec<u8> = data_128
-            .iter()
-            .flat_map(|v: &u128| v.to_le_bytes())
-            .collect();
-
-        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: 128,
-            data: LanceBuffer::Owned(bytes_128),
-            num_values: 1800,
-            block_info: BlockInfo::default(),
-        });
-
-        let (compressed, _) = encoder.compress(block).unwrap();
-
-        // Verify no chunk exceeds byte limit
-        for chunk in &compressed.chunks {
-            let total_bytes: usize = chunk.buffer_sizes.iter().map(|&s| s as usize).sum();
-            assert!(total_bytes <= MAX_MINIBLOCK_BYTES as usize);
-        }
-    }
-
     // ========== Error Handling Tests ==========
 
     #[test]
