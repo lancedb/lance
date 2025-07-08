@@ -54,6 +54,10 @@ def test_tracing():
     os.remove(trace_name)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="test fails in CI on Windows but passes locally on Windows",
+)
 def test_tracing_callback(tmp_path):
     script = tmp_path / "script.py"
     script.write_text(
