@@ -2370,6 +2370,24 @@ def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):
     )
 
 
+def test_update_with_retry_parameters(tmp_path: Path):
+    """Test that update accepts conflict_retries and retry_timeout parameters"""
+    nrows = 10
+    tab = pa.table({"a": range(nrows), "b": range(nrows)})
+    lance.write_dataset(tab, tmp_path / "dataset", mode="append")
+
+    dataset = lance.dataset(tmp_path / "dataset")
+
+    # Test with custom conflict_retries and retry_timeout
+    update_dict = dataset.update(
+        updates=dict(b="b + 1"), conflict_retries=5, retry_timeout=timedelta(seconds=60)
+    )
+
+    expected = pa.table({"a": range(10), "b": range(1, 11)})
+    assert dataset.to_table(columns=["a", "b"]) == expected
+    check_update_stats(update_dict, (10,))
+
+
 def test_scan_with_batch_size(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     df = pd.DataFrame({"a": range(10000), "b": range(10000)})
