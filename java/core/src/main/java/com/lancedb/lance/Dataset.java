@@ -755,6 +755,18 @@ public class Dataset implements Closeable {
     }
   }
 
+  /**
+   * Get the native handle of the dataset.
+   *
+   * @return the native handle
+   */
+  public long getNativeHandle() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDatasetHandle;
+    }
+  }
+
   public Fragment getFragment(int fragmentId) {
     FragmentMetadata metadata = getFragmentNative(fragmentId);
     return new Fragment(this, metadata);
