@@ -80,7 +80,8 @@ public class CDCToArrowConverter {
         return root;
     }
 
-    private void processDataChangeEvent(DataChangeEvent event, VectorSchemaRoot root, int rowIndex) {
+    private void processDataChangeEvent(DataChangeEvent event,
+                                        VectorSchemaRoot root, int rowIndex) {
         RowKind op = event.op();
         RecordData recordData = null;
         String opType = null;
