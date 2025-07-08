@@ -109,7 +109,6 @@ pub extern "system" fn Java_com_lancedb_lance_MergeInsertBuilder_createNativeBui
 ) -> jlong {
     let dataset = unsafe { &*(dataset_handle as *const LanceDataset) };
 
-    // 转换 Java String 数组为 Rust Vec<String>
     let len = env.get_array_length(&on_columns).unwrap() as usize;
     let mut columns = Vec::with_capacity(len);
 
@@ -120,10 +119,8 @@ pub extern "system" fn Java_com_lancedb_lance_MergeInsertBuilder_createNativeBui
         columns.push(rust_str);
     }
 
-    // 创建 MergeInsertBuilder
     match LanceMergeInsertBuilder::try_new(Arc::new(dataset.clone()), columns) {
         Ok(mut builder) => {
-            // 设置默认行为
             builder
                 .when_matched(WhenMatched::DoNothing)
                 .when_not_matched(WhenNotMatched::DoNothing);
@@ -151,7 +148,6 @@ pub extern "system" fn Java_com_lancedb_lance_MergeInsertBuilder_whenMatchedUpda
         WhenMatched::UpdateAll
     } else {
         let condition_str: String = env.get_string(&condition).unwrap().into();
-        // 实现条件解析
         match WhenMatched::update_if(&builder.dataset, &condition_str) {
             Ok(matched) => matched,
             Err(e) => {
