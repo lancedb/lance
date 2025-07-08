@@ -1311,9 +1311,16 @@ impl ExecutionPlan for FilteredReadExec {
             // stats and basic filter shape)
             let filter = self.options.filter_plan.full_expr.as_ref().unwrap();
 
-            let read_projection = self.options.projection.clone();
+            // Need to add in filter columns even though they aren't part of the projection
+            let read_projection = self
+                .options
+                .projection
+                .clone()
+                .union_columns(self.options.filter_plan.all_columns(), OnMissing::Error)?;
 
-            let planner = Arc::new(Planner::new(Arc::new(read_projection.to_arrow_schema())));
+            let read_schema = Arc::new(read_projection.to_arrow_schema());
+
+            let planner = Arc::new(Planner::new(read_schema.clone()));
             let physical_filter = planner.create_physical_expr(filter)?;
 
             let mock_input = Arc::new(Self::try_new(
@@ -1340,6 +1347,29 @@ impl ExecutionPlan for FilteredReadExec {
                 df_stats.num_rows
             };
             df_stats.num_rows = total_rows;
+
+            let schema = self.schema();
+
+            // We might have added some columns to the schema so the filter compiles but we drop this
+            // columns during the filtered read and they aren't part of the output.  So we need to make
+            // sure and drop them from the column stats as well.
+            assert_eq!(read_schema.fields.len(), df_stats.column_statistics.len());
+            let mut proj_iter = schema.fields.iter().peekable();
+            let mut stats_iter = read_schema.fields.iter();
+            df_stats.column_statistics.retain(|_| {
+                let stats_field = stats_iter.next().unwrap();
+                if let Some(proj_field) = proj_iter.peek() {
+                    if proj_field.name() == stats_field.name() {
+                        proj_iter.next();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            });
+
             Ok(df_stats)
         }
     }
@@ -1971,6 +2001,7 @@ mod tests {
         let plan = FilteredReadExec::try_new(fixture.dataset.clone(), options).unwrap();
         let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
+        assert_eq!(stats.column_statistics.len(), 1);
     }
 
     #[test_log::test(tokio::test)]
