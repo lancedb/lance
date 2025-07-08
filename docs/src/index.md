@@ -1,4 +1,4 @@
-# 
+# Introduction
 
 ![Lance Logo](./logo/wide.png)
 
