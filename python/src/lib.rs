@@ -79,6 +79,7 @@ pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::fragment::{write_fragments, write_fragments_transaction};
+use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
@@ -155,6 +156,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
+    m.add_class::<PyTraceEvent>()?;
     m.add_class::<TraceGuard>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
@@ -167,6 +169,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(infer_tfrecord_schema))?;
     m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
+    m.add_wrapped(wrap_pyfunction!(capture_trace_events))?;
+    m.add_wrapped(wrap_pyfunction!(shutdown_tracing))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
