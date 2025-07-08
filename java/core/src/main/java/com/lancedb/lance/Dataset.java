@@ -38,6 +38,7 @@ import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -853,6 +854,7 @@ public class Dataset implements Closeable {
 
   /**
    * 创建 merge insert 操作构建器
+   *
    * @param onColumns 用于匹配的列名列表
    * @return MergeInsertBuilder 实例
    */
@@ -862,13 +864,13 @@ public class Dataset implements Closeable {
 
   /**
    * 创建 merge insert 操作构建器（单列版本）
+   *
    * @param onColumn 用于匹配的列名
    * @return MergeInsertBuilder 实例
    */
   public MergeInsertBuilder mergeInsert(String onColumn) {
-    return new MergeInsertBuilder(this, List.of(onColumn));
+    return new MergeInsertBuilder(this, Arrays.asList(onColumn));
   }
-
 
   BufferAllocator getAllocator() {
     return allocator;
