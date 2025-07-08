@@ -248,25 +248,136 @@ The JNI layer provides comprehensive error handling:
 
 Comprehensive unit tests are provided in:
 
-- `MergeInsertTest.java` - Basic functionality tests
-- `MergeInsertIntegrationTest.java` - Integration tests
-- `tests.rs` - Rust JNI function tests
+- `java/core/src/test/java/com/lancedb/lance/MergeInsertTest.java` - Unit tests for basic functionality, error handling, boundary conditions, and resource management
+- `java/core/src/test/java/com/lancedb/lance/MergeInsertIntegrationTest.java` - Integration tests for complete workflows
+- `java/core/lance-jni/src/tests.rs` - Rust-side JNI function tests
+
+The tests cover:
+
+**Basic Functionality:**
+- Builder creation with various column configurations
+- Fluent API configuration chaining
+- Resource cleanup and memory management
+
+**Error Handling:**
+- Invalid column names and datasets
+- Null and empty parameters
+- Extreme values and edge cases
+- SQL condition parsing errors
+
+**Boundary Conditions:**
+- Empty column lists
+- Very long condition strings
+- Unicode and special characters
+- Negative and extreme numeric values
+
+**Performance Testing:**
+- Many columns and complex schemas
+- Stress testing with multiple builders
+- Memory leak detection
+- Concurrent access patterns
+
+**Resource Management:**
+- Proper cleanup of native resources
+- Multiple close operations
+- Closed dataset handling
+- Memory allocation patterns
 
 #### Performance Considerations
 
-- The JNI layer minimizes data copying between Java and Rust
-- Native memory is properly managed with automatic cleanup
-- Async operations are handled efficiently with tokio runtime
-- Error handling is optimized for minimal overhead
+- **Memory Management**: The JNI layer automatically manages memory for native objects
+- **Resource Cleanup**: Always call `close()` on builders to prevent memory leaks
+- **Concurrent Access**: Builders are not thread-safe; use separate instances per thread
+- **Large Datasets**: For very large datasets, consider batching operations
+- **Condition Complexity**: Complex SQL conditions may impact performance
 
-#### Memory Management
+#### Best Practices
 
-The JNI implementation ensures proper memory management:
+1. **Always use try-with-resources**:
+   ```java
+   try (MergeInsertBuilder builder = MergeInsertBuilder.create(dataset, "id")) {
+       // Use builder
+   }
+   ```
 
-- Native handles are automatically cleaned up when Java objects are garbage collected
-- `AutoCloseable` interface ensures resources are released
-- Memory leaks are prevented through careful pointer management
-- Exception safety is maintained throughout the JNI layer
+2. **Validate inputs early**:
+   ```java
+   if (dataset == null || columns == null || columns.isEmpty()) {
+       throw new IllegalArgumentException("Invalid parameters");
+   }
+   ```
+
+3. **Handle errors gracefully**:
+   ```java
+   try {
+       MergeInsertResult result = builder.execute(newData);
+       // Process result
+   } catch (RuntimeException e) {
+       // Handle JNI errors
+   }
+   ```
+
+4. **Use appropriate retry settings**:
+   ```java
+   builder.conflictRetries(10)
+          .retryTimeout(5000L);
+   ```
+
+5. **Monitor performance**:
+   ```java
+   long startTime = System.currentTimeMillis();
+   MergeInsertResult result = builder.execute(newData);
+   long duration = System.currentTimeMillis() - startTime;
+   ```
+
+#### Advanced Usage Examples
+
+**Conditional Updates:**
+```java
+MergeInsertBuilder builder = MergeInsertBuilder.create(dataset, "id")
+    .whenMatchedUpdateAll("source.value > target.value")
+    .whenNotMatchedInsertAll();
+```
+
+**Complex Conditions:**
+```java
+String condition = "source.value > target.value AND source.name != target.name";
+MergeInsertBuilder builder = MergeInsertBuilder.create(dataset, "id")
+    .whenMatchedUpdateAll(condition)
+    .whenNotMatchedBySourceDelete("target.id > 100");
+```
+
+**Multiple Join Columns:**
+```java
+MergeInsertBuilder builder = MergeInsertBuilder.create(dataset, Arrays.asList("id", "name"))
+    .whenMatchedUpdateAll()
+    .whenNotMatchedInsertAll();
+```
+
+**High-Performance Configuration:**
+```java
+MergeInsertBuilder builder = MergeInsertBuilder.create(dataset, "id")
+    .whenMatchedUpdateAll()
+    .whenNotMatchedInsertAll()
+    .conflictRetries(100)
+    .retryTimeout(30000L);
+```
+
+#### Troubleshooting
+
+**Common Issues:**
+
+1. **Memory Leaks**: Ensure all builders are properly closed
+2. **Performance Issues**: Check retry settings and condition complexity
+3. **JNI Errors**: Verify column names and dataset validity
+4. **Concurrent Access**: Use separate builders per thread
+
+**Debug Tips:**
+
+- Enable JNI logging: `-Djava.library.path=/path/to/lance-jni`
+- Monitor memory usage during large operations
+- Use smaller batch sizes for very large datasets
+- Profile SQL conditions for performance bottlenecks
 
 ## What makes Lance different
 
