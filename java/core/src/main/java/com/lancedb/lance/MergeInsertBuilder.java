@@ -14,9 +14,15 @@
 package com.lancedb.lance;
 
 import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.time.Duration;
 import java.util.List;
 
@@ -116,9 +122,20 @@ public class MergeInsertBuilder implements AutoCloseable {
   // VectorSchemaRoot 到 ArrowArrayStream 转换
   private void convertToStream(VectorSchemaRoot root, ArrowArrayStream stream) {
     try {
-      // 简化的转换实现，暂时使用基本方法
-      // TODO: 实现正确的 VectorSchemaRoot 到 ArrowArrayStream 转换
-      throw new UnsupportedOperationException("VectorSchemaRoot conversion not yet implemented");
+      // 将 VectorSchemaRoot 写入字节流
+      ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, outputStream)) {
+        writer.start();
+        writer.writeBatch();
+        writer.end();
+      }
+
+      // 从字节流创建 ArrowReader
+      ByteArrayInputStream inputStream = new ByteArrayInputStream(outputStream.toByteArray());
+      try (ArrowReader reader = new ArrowStreamReader(inputStream, allocator)) {
+        // 使用 Data.exportArrayStream 将 ArrowReader 转换为 ArrowArrayStream
+        Data.exportArrayStream(allocator, reader, stream);
+      }
     } catch (Exception e) {
       throw new RuntimeException("Failed to convert VectorSchemaRoot to ArrowArrayStream", e);
     }
