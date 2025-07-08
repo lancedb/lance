@@ -74,6 +74,9 @@ from .optimize import (
     RewriteResult as RewriteResult,
 )
 from .schema import LanceSchema as LanceSchema
+from .trace import TraceEvent as TraceEvent
+from .trace import capture_trace_events as capture_trace_events
+from .trace import shutdown_tracing as shutdown_tracing
 from .trace import trace_to_chrome as trace_to_chrome
 
 def infer_tfrecord_schema(
