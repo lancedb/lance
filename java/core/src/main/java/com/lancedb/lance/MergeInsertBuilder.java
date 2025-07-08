@@ -13,196 +13,148 @@
  */
 package com.lancedb.lance;
 
+import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
-
-import java.util.Arrays;
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;  
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;  
+import java.io.ByteArrayOutputStream;  
+import java.nio.channels.Channels;  
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.time.Duration;
 
-/**
- * Builder for merge insert operations.
- *
- * This class provides a fluent API for building merge insert operations,
- * which allow you to merge new data with existing data in a Lance dataset.
- *
- * <p>Example usage:</p>
- * <pre>{@code
- * MergeInsertBuilder builder = MergeInsertBuilder.create(dataset, Arrays.asList("id"));
- * MergeInsertResult result = builder
- *     .whenMatchedUpdateAll()
- *     .whenNotMatchedInsertAll()
- *     .execute(newData);
- * }</pre>
- */
 public class MergeInsertBuilder implements AutoCloseable {
-
-    private final long nativeHandle;
-    private final Dataset dataset;
-    private final List<String> onColumns;
-
-    /**
-     * Create a new MergeInsertBuilder.
-     *
-     * @param dataset the target dataset
-     * @param onColumns the columns to join on
-     * @return a new MergeInsertBuilder
-     */
-    public static MergeInsertBuilder create(Dataset dataset, List<String> onColumns) {
-        return new MergeInsertBuilder(dataset, onColumns);
-    }
-
-    /**
-     * Create a new MergeInsertBuilder.
-     *
-     * @param dataset the target dataset
-     * @param onColumns the columns to join on
-     * @return a new MergeInsertBuilder
-     */
-    public static MergeInsertBuilder create(Dataset dataset, String... onColumns) {
-        return create(dataset, Arrays.asList(onColumns));
-    }
-
-    private MergeInsertBuilder(Dataset dataset, List<String> onColumns) {
+    private long nativeBuilderHandle;
+    private Dataset dataset;
+    private List<String> onColumns;
+    private BufferAllocator allocator;
+    
+    // 私有构造函数，通过 Dataset.mergeInsert() 创建
+    MergeInsertBuilder(Dataset dataset, List<String> onColumns) {
         this.dataset = dataset;
         this.onColumns = onColumns;
-
-        // Convert List<String> to String[] for JNI call
-        String[] columnsArray = onColumns.toArray(new String[0]);
-
-        // Call native method to create the builder
-        this.nativeHandle = createNativeBuilder(dataset.getNativeHandle(), columnsArray);
-
-        if (this.nativeHandle == 0) {
-            throw new RuntimeException("Failed to create MergeInsertBuilder");
-        }
+        this.allocator = dataset.getAllocator();
+        this.nativeBuilderHandle = createNativeBuilder(
+            dataset.getNativeHandle(), 
+            onColumns.toArray(new String[0])
+        );
     }
-
+    
     /**
-     * Configure the builder to update all columns when there is a match.
-     *
-     * @return this builder
-     */
-    public MergeInsertBuilder whenMatchedUpdateAll() {
-        whenMatchedUpdateAllNative(nativeHandle, null);
-        return this;
-    }
-
-    /**
-     * Configure the builder to update all columns when there is a match and the condition is true.
-     *
-     * @param condition the condition expression
+     * 配置匹配行的更新行为
+     * @param condition 可选的 SQL 条件表达式
      * @return this builder
      */
     public MergeInsertBuilder whenMatchedUpdateAll(String condition) {
-        whenMatchedUpdateAllNative(nativeHandle, condition);
+        whenMatchedUpdateAllNative(nativeBuilderHandle, condition);
         return this;
     }
-
+    
     /**
-     * Configure the builder to insert all columns when there is no match.
-     *
+     * 配置未匹配行的插入行为
      * @return this builder
      */
     public MergeInsertBuilder whenNotMatchedInsertAll() {
-        whenNotMatchedInsertAllNative(nativeHandle);
+        whenNotMatchedInsertAllNative(nativeBuilderHandle);
         return this;
     }
-
+    
     /**
-     * Configure the builder to delete rows when there is no match in the source.
-     *
-     * @return this builder
-     */
-    public MergeInsertBuilder whenNotMatchedBySourceDelete() {
-        whenNotMatchedBySourceDeleteNative(nativeHandle, null);
-        return this;
-    }
-
-    /**
-     * Configure the builder to delete rows when there is no match in the source and the expression is true.
-     *
-     * @param expr the expression
+     * 配置源表中未匹配行的删除行为
+     * @param expr 可选的删除条件表达式
      * @return this builder
      */
     public MergeInsertBuilder whenNotMatchedBySourceDelete(String expr) {
-        whenNotMatchedBySourceDeleteNative(nativeHandle, expr);
+        whenNotMatchedBySourceDeleteNative(nativeBuilderHandle, expr);
         return this;
     }
-
+    
     /**
-     * Set the number of conflict retries.
-     *
-     * @param maxRetries the maximum number of retries
+     * 设置冲突重试次数
+     * @param maxRetries 最大重试次数，默认 10
      * @return this builder
      */
     public MergeInsertBuilder conflictRetries(int maxRetries) {
-        conflictRetriesNative(nativeHandle, maxRetries);
+        conflictRetriesNative(nativeBuilderHandle, maxRetries);
         return this;
     }
-
+    
     /**
-     * Set the retry timeout in milliseconds.
-     *
-     * @param timeoutMillis the timeout in milliseconds
+     * 设置重试超时时间
+     * @param timeout 超时时间，默认 30 秒
      * @return this builder
      */
-    public MergeInsertBuilder retryTimeout(long timeoutMillis) {
-        retryTimeoutNative(nativeHandle, timeoutMillis);
+    public MergeInsertBuilder retryTimeout(Duration timeout) {
+        retryTimeoutNative(nativeBuilderHandle, timeout.toMillis());
         return this;
     }
-
+    
     /**
-     * Execute the merge insert operation.
-     *
-     * @param newData the new data to merge
-     * @return the result of the merge insert operation
+     * 执行 merge insert 操作
+     * @param stream Arrow 数据流
+     * @return 合并统计信息
      */
-    public MergeInsertResult execute(VectorSchemaRoot newData) {
-        // For now, return a mock result since the actual implementation requires Arrow IPC
-        // In a real implementation, this would use Arrow IPC to export the data
-        // and call the native method with the stream address
-
-        // TODO: Implement proper Arrow IPC export
-        // long streamAddress = exportVectorSchemaRoot(newData);
-        // try {
-        //     Object result = executeNative(nativeHandle, streamAddress);
-        //     if (result instanceof MergeInsertResult) {
-        //         return (MergeInsertResult) result;
-        //     } else {
-        //         throw new RuntimeException("Unexpected result type from native execution");
-        //     }
-        // } finally {
-        //     releaseVectorSchemaRoot(streamAddress);
-        // }
-
-        return new MergeInsertResult(0L, 0L, 0L);
+    public MergeInsertResult execute(ArrowArrayStream stream) {
+        return executeNative(nativeBuilderHandle, stream.memoryAddress());
     }
-
-    @Override
-    public void close() {
-        if (nativeHandle != 0) {
-            closeNative(nativeHandle);
+    
+    /**
+     * 执行 merge insert 操作（VectorSchemaRoot 版本）
+     * @param root Arrow 数据
+     * @return 合并统计信息
+     */
+    public MergeInsertResult execute(VectorSchemaRoot root) {
+        try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+            // 将 VectorSchemaRoot 转换为 ArrowArrayStream
+            convertToStream(root, stream);
+            return execute(stream);
         }
     }
-
-    // Native method declarations
-
-    private static native long createNativeBuilder(long datasetHandle, String[] onColumns);
-
-    private static native void whenMatchedUpdateAllNative(long builderHandle, String condition);
-
-    private static native void whenNotMatchedInsertAllNative(long builderHandle);
-
-    private static native void whenNotMatchedBySourceDeleteNative(long builderHandle, String expr);
-
-    private static native void conflictRetriesNative(long builderHandle, int maxRetries);
-
-    private static native void retryTimeoutNative(long builderHandle, long timeoutMillis);
-
-    private static native Object executeNative(long builderHandle, long streamAddress);
-
-    private static native void closeNative(long builderHandle);
-
-    static {
-        JniLoader.ensureLoaded();
+    
+    //VectorSchemaRoot 到 ArrowArrayStream 转换
+    private static void convertToStream(VectorSchemaRoot root, ArrowArrayStream stream) {  
+        try {  
+            // 创建内存输出流  
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();  
+          
+            // 使用 ArrowStreamWriter 写入数据  
+            try (ArrowStreamWriter writer = new ArrowStreamWriter(  
+                    root,   
+                    null,   
+                    Channels.newChannel(outputStream))) {  
+              
+                writer.start();  
+                writer.writeBatch();  
+                writer.end();  
+            }   
+          
+            // 将字节数组转换为 ArrowArrayStream  
+            byte[] data = outputStream.toByteArray();  
+            Data.exportArrayStream(root.getAllocator(), root, stream);  
+          
+        } catch (Exception e) {  
+            throw new RuntimeException("Failed to convert VectorSchemaRoot to ArrowArrayStream", e);  
+        }  
     }
-} 
+    
+    @Override
+    public void close() {
+        if (nativeBuilderHandle != 0) {
+            closeNative(nativeBuilderHandle);
+            nativeBuilderHandle = 0;
+        }
+    }
+    
+    // Native 方法声明
+    private static native long createNativeBuilder(long datasetHandle, String[] onColumns);
+    private static native void whenMatchedUpdateAllNative(long builderHandle, String condition);
+    private static native void whenNotMatchedInsertAllNative(long builderHandle);
+    private static native void whenNotMatchedBySourceDeleteNative(long builderHandle, String expr);
+    private static native void conflictRetriesNative(long builderHandle, int maxRetries);
+    private static native void retryTimeoutNative(long builderHandle, long timeoutMillis);
+    private static native MergeInsertResult executeNative(long builderHandle, long streamAddress);
+    private static native void closeNative(long builderHandle);
+    private static native void convertToStream(VectorSchemaRoot root, ArrowArrayStream stream);
+}

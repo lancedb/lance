@@ -31,8 +31,6 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Collections;
-import java.util.ArrayList;
-import org.apache.arrow.vector.types.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
