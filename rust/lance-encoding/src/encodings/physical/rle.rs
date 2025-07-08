@@ -119,10 +119,7 @@ impl RleMiniBlockEncoder {
             };
 
             let chunk = MiniBlockChunk {
-                buffer_sizes: vec![
-                    (num_runs * bytes_per_value) as u16,
-                    num_runs as u16,
-                ],
+                buffer_sizes: vec![(num_runs * bytes_per_value) as u16, num_runs as u16],
                 log_num_values,
             };
 
@@ -497,38 +494,38 @@ mod tests {
     use lance_core::datatypes::Field;
 
     // ========== Core Functionality Tests ==========
-    
+
     #[test]
     fn test_basic_rle_encoding() {
         let encoder = RleMiniBlockEncoder::new();
-        
+
         // Test basic RLE pattern: [1, 1, 1, 2, 2, 3, 3, 3, 3]
         let array = Int32Array::from(vec![1, 1, 1, 2, 2, 3, 3, 3, 3]);
         let data_block = DataBlock::from_array(array);
-        
+
         let (compressed, _) = encoder.compress(data_block).unwrap();
-        
+
         assert_eq!(compressed.num_values, 9);
         assert_eq!(compressed.chunks.len(), 1);
-        
+
         // Verify compression happened (3 runs instead of 9 values)
         let values_buffer = &compressed.data[0];
         let lengths_buffer = &compressed.data[1];
         assert_eq!(values_buffer.len(), 12); // 3 i32 values
-        assert_eq!(lengths_buffer.len(), 3);  // 3 u8 lengths
+        assert_eq!(lengths_buffer.len(), 3); // 3 u8 lengths
     }
 
     #[test]
     fn test_long_run_splitting() {
         let encoder = RleMiniBlockEncoder::new();
-        
+
         // Create a run longer than 255 to test splitting
         let mut data = vec![42i32; 1000]; // Will be split into 255+255+255+235
-        data.extend(&[100i32; 300]);      // Will be split into 255+45
-        
+        data.extend(&[100i32; 300]); // Will be split into 255+45
+
         let array = Int32Array::from(data);
         let (compressed, _) = encoder.compress(DataBlock::from_array(array)).unwrap();
-        
+
         // Should have 6 runs total (4 for first value, 2 for second)
         let lengths_buffer = &compressed.data[1];
         assert_eq!(lengths_buffer.len(), 6);
@@ -538,20 +535,20 @@ mod tests {
     fn test_compression_strategy_selection() {
         let strategy = DefaultCompressionStrategy;
         let field = Field::new_arrow("test", arrow_schema::DataType::Int32, false).unwrap();
-        
+
         // High repetition - should select RLE
         let repetitive_array = Int32Array::from(vec![1; 1000]);
         let repetitive_block = DataBlock::from_array(repetitive_array);
-        
+
         let compressor = strategy
             .create_miniblock_compressor(&field, &repetitive_block)
             .unwrap();
         assert!(format!("{:?}", compressor).contains("RleMiniBlockEncoder"));
-        
+
         // No repetition - should NOT select RLE
         let unique_array = Int32Array::from((0..1000).collect::<Vec<i32>>());
         let unique_block = DataBlock::from_array(unique_array);
-        
+
         let compressor = strategy
             .create_miniblock_compressor(&field, &unique_block)
             .unwrap();
@@ -559,37 +556,25 @@ mod tests {
     }
 
     // ========== Round-trip Tests for Different Types ==========
-    
+
     #[test]
     fn test_round_trip_all_types() {
         // Test u8
-        test_round_trip_helper(
-            vec![42u8, 42, 42, 100, 100, 255, 255, 255, 255],
-            8,
-        );
-        
+        test_round_trip_helper(vec![42u8, 42, 42, 100, 100, 255, 255, 255, 255], 8);
+
         // Test u16
-        test_round_trip_helper(
-            vec![1000u16, 1000, 2000, 2000, 2000, 3000],
-            16,
-        );
-        
+        test_round_trip_helper(vec![1000u16, 1000, 2000, 2000, 2000, 3000], 16);
+
         // Test i32
-        test_round_trip_helper(
-            vec![100i32, 100, 100, -200, -200, 300, 300, 300, 300],
-            32,
-        );
-        
+        test_round_trip_helper(vec![100i32, 100, 100, -200, -200, 300, 300, 300, 300], 32);
+
         // Test u64
-        test_round_trip_helper(
-            vec![1_000_000_000u64; 5],
-            64,
-        );
-        
+        test_round_trip_helper(vec![1_000_000_000u64; 5], 64);
+
         // Test 128-bit
         let data_128 = [1u128, 1, 1, 2, 2, 3, 3, 3, 3];
         let bytes_128: Vec<u8> = data_128.iter().flat_map(|&v| v.to_le_bytes()).collect();
-        
+
         let encoder = RleMiniBlockEncoder::new();
         let block = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: 128,
@@ -597,13 +582,13 @@ mod tests {
             num_values: 9,
             block_info: BlockInfo::default(),
         });
-        
+
         let (compressed, _) = encoder.compress(block).unwrap();
         let decompressor = RleMiniBlockDecompressor::new(128);
         let decompressed = decompressor
             .decompress(compressed.data, compressed.num_values)
             .unwrap();
-            
+
         match decompressed {
             DataBlock::FixedWidth(ref block) => {
                 assert_eq!(block.data.as_ref(), bytes_128);
@@ -611,27 +596,31 @@ mod tests {
             _ => panic!("Expected FixedWidth block"),
         }
     }
-    
+
     fn test_round_trip_helper<T>(data: Vec<T>, bits_per_value: u64)
     where
         T: bytemuck::Pod + PartialEq + std::fmt::Debug,
     {
         let encoder = RleMiniBlockEncoder::new();
-        let bytes: Vec<u8> = data.iter().flat_map(|v| bytemuck::bytes_of(v)).copied().collect();
-        
+        let bytes: Vec<u8> = data
+            .iter()
+            .flat_map(|v| bytemuck::bytes_of(v))
+            .copied()
+            .collect();
+
         let block = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value,
             data: LanceBuffer::Owned(bytes.clone()),
             num_values: data.len() as u64,
             block_info: BlockInfo::default(),
         });
-        
+
         let (compressed, _) = encoder.compress(block).unwrap();
         let decompressor = RleMiniBlockDecompressor::new(bits_per_value);
         let decompressed = decompressor
             .decompress(compressed.data, compressed.num_values)
             .unwrap();
-            
+
         match decompressed {
             DataBlock::FixedWidth(ref block) => {
                 assert_eq!(block.data.as_ref(), bytes);
@@ -641,22 +630,22 @@ mod tests {
     }
 
     // ========== Chunk Boundary Tests ==========
-    
+
     #[test]
     fn test_power_of_two_chunking() {
         let encoder = RleMiniBlockEncoder::new();
-        
+
         // Create data that will require multiple chunks
         let test_sizes = vec![1000, 2500, 5000, 10000];
-        
+
         for size in test_sizes {
             let data: Vec<i32> = (0..size)
                 .map(|i| i / 50) // Create runs of 50
                 .collect();
-                
+
             let array = Int32Array::from(data);
             let (compressed, _) = encoder.compress(DataBlock::from_array(array)).unwrap();
-            
+
             // Verify all non-last chunks have power-of-2 values
             for (i, chunk) in compressed.chunks.iter().enumerate() {
                 if i < compressed.chunks.len() - 1 {
@@ -670,31 +659,31 @@ mod tests {
             }
         }
     }
-    
+
     #[test]
     fn test_byte_limit_enforcement() {
         let encoder = RleMiniBlockEncoder::new();
-        
+
         // Test with 128-bit data which has tighter byte constraints
         let mut data_128 = Vec::new();
         for i in 0..600u128 {
             data_128.extend(&[i, i, i]); // 600 runs * 3 values each
         }
-        
+
         let bytes_128: Vec<u8> = data_128
             .iter()
             .flat_map(|v: &u128| v.to_le_bytes())
             .collect();
-            
+
         let block = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: 128,
             data: LanceBuffer::Owned(bytes_128),
             num_values: 1800,
             block_info: BlockInfo::default(),
         });
-        
+
         let (compressed, _) = encoder.compress(block).unwrap();
-        
+
         // Verify no chunk exceeds byte limit
         for chunk in &compressed.chunks {
             let total_bytes: usize = chunk.buffer_sizes.iter().map(|&s| s as usize).sum();
@@ -703,27 +692,27 @@ mod tests {
     }
 
     // ========== Error Handling Tests ==========
-    
+
     #[test]
     #[should_panic(expected = "RLE decompressor expects exactly 2 buffers")]
     fn test_invalid_buffer_count() {
         let decompressor = RleMiniBlockDecompressor::new(32);
         let _ = decompressor.decompress(vec![LanceBuffer::Owned(vec![1, 2, 3, 4])], 10);
     }
-    
+
     #[test]
     #[should_panic(expected = "Inconsistent RLE buffers")]
     fn test_buffer_consistency() {
         let decompressor = RleMiniBlockDecompressor::new(32);
         let values = LanceBuffer::Owned(vec![1, 0, 0, 0]); // 1 i32 value
-        let lengths = LanceBuffer::Owned(vec![5, 10]);     // 2 lengths - mismatch!
+        let lengths = LanceBuffer::Owned(vec![5, 10]); // 2 lengths - mismatch!
         let _ = decompressor.decompress(vec![values, lengths], 15);
     }
-    
+
     #[test]
     fn test_empty_data_handling() {
         let encoder = RleMiniBlockEncoder::new();
-        
+
         // Test empty block
         let empty_block = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: 32,
@@ -731,15 +720,15 @@ mod tests {
             num_values: 0,
             block_info: BlockInfo::default(),
         });
-        
+
         let (compressed, _) = encoder.compress(empty_block).unwrap();
         assert_eq!(compressed.num_values, 0);
         assert!(compressed.data.is_empty());
-        
+
         // Test decompression of empty data
         let decompressor = RleMiniBlockDecompressor::new(32);
         let decompressed = decompressor.decompress(vec![], 0).unwrap();
-        
+
         match decompressed {
             DataBlock::FixedWidth(ref block) => {
                 assert_eq!(block.num_values, 0);
@@ -750,36 +739,36 @@ mod tests {
     }
 
     // ========== Integration Test ==========
-    
+
     #[test]
     fn test_multi_chunk_round_trip() {
         let encoder = RleMiniBlockEncoder::new();
-        
+
         // Create data that spans multiple chunks with mixed patterns
         let mut data = Vec::new();
-        
+
         // High compression section
         data.extend(vec![999i32; 2000]);
-        // Low compression section  
+        // Low compression section
         data.extend(0..1000);
         // Another high compression section
         data.extend(vec![777i32; 2000]);
-        
+
         let array = Int32Array::from(data.clone());
         let (compressed, _) = encoder.compress(DataBlock::from_array(array)).unwrap();
-        
+
         // Manually decompress all chunks
         let mut reconstructed = Vec::new();
         let mut buffer_idx = 0;
         let mut values_processed = 0u64;
-        
+
         for chunk in &compressed.chunks {
             let chunk_values = if chunk.log_num_values > 0 {
                 1u64 << chunk.log_num_values
             } else {
                 compressed.num_values - values_processed
             };
-            
+
             let decompressor = RleMiniBlockDecompressor::new(32);
             let chunk_data = decompressor
                 .decompress(
@@ -790,10 +779,10 @@ mod tests {
                     chunk_values,
                 )
                 .unwrap();
-                
+
             buffer_idx += 2;
             values_processed += chunk_values;
-            
+
             match chunk_data {
                 DataBlock::FixedWidth(ref block) => {
                     let values: &[i32] = bytemuck::cast_slice(block.data.as_ref());
@@ -802,7 +791,7 @@ mod tests {
                 _ => panic!("Expected FixedWidth block"),
             }
         }
-        
+
         assert_eq!(reconstructed, data);
     }
 }
