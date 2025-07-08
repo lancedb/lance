@@ -1,11 +1,11 @@
 [package]
 name = "lance-jni"
-version = "0.31.1"
-edition = "2021"
-authors = ["Lance Devs <dev@lancedb.com>"]
-rust-version = "1.80"
-license = "Apache-2.0"
-repository = "https://github.com/lancedb/lance"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 readme = "../../README.md"
 description = "JNI bindings for Lance Columnar format"
 
@@ -13,24 +13,19 @@ description = "JNI bindings for Lance Columnar format"
 crate-type = ["cdylib"]
 
 [dependencies]
-lance = { path = "../../../rust/lance", features = ["substrait"] }
-lance-datafusion = { path = "../../../rust/lance-datafusion" }
-lance-encoding = { path = "../../../rust/lance-encoding" }
-lance-linalg = { path = "../../../rust/lance-linalg" }
-lance-index = { path = "../../../rust/lance-index" }
-lance-io = { path = "../../../rust/lance-io" }
-lance-core = { path = "../../../rust/lance-core" }
-lance-file = { path = "../../../rust/lance-file" }
-arrow = { version = "55.1", features = ["ffi"] }
-arrow-schema = "55.1"
-object_store = { version = "0.12.2" }
-tokio = { version = "1.23", features = [
-    "rt-multi-thread",
-    "macros",
-    "fs",
-    "sync",
-] }
-jni = "0.21.1"
-serde_json = { version = "1" }
-log = "0.4"
-env_logger = "0.11.7"
+lance = { workspace = true, features = ["substrait"] }
+lance-datafusion.workspace = true
+lance-encoding.workspace = true
+lance-linalg.workspace = true
+lance-index.workspace = true
+lance-io.workspace = true
+lance-core.workspace = true
+lance-file.workspace = true
+arrow = { workspace = true, features = ["ffi"] }
+arrow-schema.workspace = true
+object_store.workspace = true
+tokio.workspace = true
+jni.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true

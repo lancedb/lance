@@ -14,8 +14,9 @@ members = [
     "rust/lance-test-macros",
     "rust/lance-testing",
     "rust/lance-encoding/src/compression_algo/fsst",
+    "python",
+    "java/core/lance-jni",
 ]
-exclude = ["python", "java/core/lance-jni"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
@@ -115,6 +116,7 @@ datafusion-substrait = { version = "48.0" }
 deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
+env_logger = "0.11.7"
 fst = { version = "0.4.7", features = ["levenshtein"] }
 fsst = { version = "=0.31.1", path = "./rust/lance-encoding/src/compression_algo/fsst" }
 futures = "0.3"
@@ -123,12 +125,14 @@ humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
 jieba-rs = { version = "0.7", default-features = false }
+jni = "0.21.1"
 log = "0.4"
 mockall = { version = "0.13.1" }
 mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = { version = "0.12", features = ["future", "sync"] }
 num-traits = "0.2"
 object_store = { version = "0.12.2" }
+once_cell = "1.21.3"
 pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.14.0", features = ["flamegraph", "criterion"] }
@@ -136,6 +140,7 @@ proptest = "1.3.1"
 prost = "0.13.2"
 prost-build = "0.13.2"
 prost-types = "0.13.2"
+pyo3 = { version = "0.24.1", features = ["extension-module", "abi3-py39", "py-clone", "chrono"] }
 rand = { version = "0.8.3", features = ["small_rng"] }
 rangemap = { version = "1.0" }
 rayon = "1.10"
@@ -144,6 +149,7 @@ rstest = "0.23.0"
 rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }
+serde_yaml = "0.9.34"
 shellexpand = "3.0"
 snafu = "0.8"
 tantivy = { version = "0.22.0", features = ["stopwords"] }
@@ -160,6 +166,8 @@ tokio = { version = "1.23", features = [
 tokio-stream = "0.1.14"
 tokio-util = { version = "0.7.10" }
 tracing = "0.1"
+tracing-chrome = "0.7.1"
+tracing-subscriber = "0.3.17"
 url = "2.3"
 uuid = { version = "1.2", features = ["v4", "serde"] }
 pretty_assertions = "1.4.0"

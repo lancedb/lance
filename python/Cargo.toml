@@ -1,9 +1,9 @@
 [package]
 name = "pylance"
-version = "0.31.1"
-edition = "2021"
-authors = ["Lance Devs <dev@lancedb.com>"]
-rust-version = "1.80"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
 exclude = ["python/lance/conftest.py"]
 publish = false
 
@@ -12,65 +12,50 @@ name = "lance"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow = { version = "55.1", features = ["pyarrow"] }
-arrow-array = "55.1"
-arrow-data = "55.1"
-arrow-schema = "55.1"
-arrow-select = "55.1"
-object_store = "0.12.2"
-datafusion = "48.0"
-datafusion-ffi = "48.0"
-datafusion-common = "48.0"
-async-trait = "0.1"
-chrono = "0.4.41"
-env_logger = "0.11.7"
-futures = "0.3"
-half = { version = "2.5", default-features = false, features = [
-    "num-traits",
-    "std",
-] }
-lance = { path = "../rust/lance", features = [
-    "tensorflow",
-    "dynamodb",
-    "substrait",
-] }
-lance-arrow = { path = "../rust/lance-arrow" }
-lance-core = { path = "../rust/lance-core" }
-lance-datagen = { path = "../rust/lance-datagen", optional = true }
-lance-encoding = { path = "../rust/lance-encoding" }
-lance-file = { path = "../rust/lance-file" }
-lance-index = { path = "../rust/lance-index", features = [
-    "tokenizer-lindera",
-    "tokenizer-jieba",
-] }
-lance-io = { path = "../rust/lance-io" }
-lance-linalg = { path = "../rust/lance-linalg" }
-lance-table = { path = "../rust/lance-table" }
-lance-datafusion = { path = "../rust/lance-datafusion" }
-log = "0.4"
-prost = "0.13.2"
-pyo3 = { version = "0.24.1", features = [
-    "extension-module",
-    "abi3-py39",
-    "py-clone",
-    "chrono",
-] }
-tokio = { version = "1.23", features = ["rt-multi-thread"] }
-uuid = "1.3.0"
-serde_json = "1"
-serde = "1.0.197"
-serde_yaml = "0.9.34"
-snafu = "0.8"
-tracing-chrome = "0.7.1"
-tracing-subscriber = "0.3.17"
-tracing = { version = "0.1" }
-url = "2.5.0"
-bytes = "1.4"
-once_cell = "1.21.3"
+arrow = { workspace = true, features = ["pyarrow"] }
+arrow-array.workspace = true
+arrow-data.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+object_store.workspace = true
+datafusion.workspace = true
+datafusion-ffi.workspace = true
+datafusion-common.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+env_logger.workspace = true
+futures.workspace = true
+half.workspace = true
+lance = { workspace = true, features = ["tensorflow", "dynamodb", "substrait"] }
+lance-arrow.workspace = true
+lance-core.workspace = true
+lance-datagen = { workspace = true, optional = true }
+lance-encoding.workspace = true
+lance-file.workspace = true
+lance-index = { workspace = true, features = ["tokenizer-lindera", "tokenizer-jieba"] }
+lance-io.workspace = true
+lance-linalg.workspace = true
+lance-table.workspace = true
+lance-datafusion.workspace = true
+log.workspace = true
+prost.workspace = true
+pyo3.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+snafu.workspace = true
+tracing-chrome.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+url.workspace = true
+bytes.workspace = true
+once_cell.workspace = true
 
 [features]
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
 
 [build-dependencies]
-prost-build = "0.11"
+prost-build.workspace = true
