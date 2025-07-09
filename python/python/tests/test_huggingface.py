@@ -13,10 +13,8 @@ pil = pytest.importorskip("PIL")
 
 def test_write_hf_dataset(tmp_path: Path):
     hf_ds = datasets.load_dataset(
-        "poloclub/diffusiondb",
-        name="2m_first_1k",
+        "rotten_tomatoes",
         split="train[:50]",
-        trust_remote_code=True,
     )
 
     ds = lance.write_dataset(hf_ds, tmp_path)
