@@ -43,7 +43,8 @@
 //! ## Chunk Handling
 //!
 //! - Maximum chunk size: 4096 values (miniblock constraint)
-//! - Each chunk is independently encoded with its own values/lengths buffers
+//! - All chunks share two global buffers (values and lengths)
+//! - Each chunk's buffer_sizes indicate its portion of the global buffers
 //! - Non-last chunks always contain power-of-2 values
 //! - Byte limits are enforced dynamically during encoding
 
@@ -83,7 +84,9 @@ impl RleMiniBlockEncoder {
 
         let bytes_per_value = (bits_per_value / 8) as usize;
 
-        let mut all_buffers = Vec::new();
+        // Global buffers to accumulate all chunks' data
+        let mut all_values = Vec::new();
+        let mut all_lengths = Vec::new();
         let mut chunks = Vec::new();
 
         let mut offset = 0usize;
@@ -96,15 +99,16 @@ impl RleMiniBlockEncoder {
                     16 => self.encode_chunk_rolling::<u16>(data, offset, values_remaining),
                     32 => self.encode_chunk_rolling::<u32>(data, offset, values_remaining),
                     64 => self.encode_chunk_rolling::<u64>(data, offset, values_remaining),
-                    _ => unreachable!("RLE encoding bits_per_value must be 8, 16, 32, 64, or 128"),
+                    _ => unreachable!("RLE encoding bits_per_value must be 8, 16, 32 or 64"),
                 };
 
             if values_processed == 0 {
                 break;
             }
 
-            let values_buffer = LanceBuffer::Owned(values_bytes);
-            let lengths_buffer = LanceBuffer::Owned(lengths_bytes);
+            // Append chunk data to global buffers
+            all_values.extend_from_slice(&values_bytes);
+            all_lengths.extend_from_slice(&lengths_bytes);
 
             let log_num_values = if is_last_chunk {
                 0
@@ -121,15 +125,20 @@ impl RleMiniBlockEncoder {
                 log_num_values,
             };
 
-            all_buffers.push(values_buffer);
-            all_buffers.push(lengths_buffer);
             chunks.push(chunk);
 
             offset += values_processed;
             values_remaining -= values_processed;
         }
 
-        Ok((all_buffers, chunks))
+        // Return exactly two buffers: values and lengths
+        Ok((
+            vec![
+                LanceBuffer::Owned(all_values),
+                LanceBuffer::Owned(all_lengths),
+            ],
+            chunks,
+        ))
     }
 
     /// Encodes a chunk of data using RLE compression with dynamic boundary detection.
@@ -706,8 +715,14 @@ mod tests {
 
         // Manually decompress all chunks
         let mut reconstructed = Vec::new();
-        let mut buffer_idx = 0;
+        let mut values_offset = 0usize;
+        let mut lengths_offset = 0usize;
         let mut values_processed = 0u64;
+
+        // We now have exactly 2 global buffers
+        assert_eq!(compressed.data.len(), 2);
+        let global_values = &compressed.data[0];
+        let global_lengths = &compressed.data[1];
 
         for chunk in &compressed.chunks {
             let chunk_values = if chunk.log_num_values > 0 {
@@ -716,18 +731,24 @@ mod tests {
                 compressed.num_values - values_processed
             };
 
+            // Extract chunk buffers from global buffers using buffer_sizes
+            let values_size = chunk.buffer_sizes[0] as usize;
+            let lengths_size = chunk.buffer_sizes[1] as usize;
+
+            let chunk_values_buffer = global_values.slice_with_length(values_offset, values_size);
+            let chunk_lengths_buffer =
+                global_lengths.slice_with_length(lengths_offset, lengths_size);
+
             let decompressor = RleMiniBlockDecompressor::new(32);
             let chunk_data = decompressor
                 .decompress(
-                    vec![
-                        compressed.data[buffer_idx].deep_copy(),
-                        compressed.data[buffer_idx + 1].deep_copy(),
-                    ],
+                    vec![chunk_values_buffer, chunk_lengths_buffer],
                     chunk_values,
                 )
                 .unwrap();
 
-            buffer_idx += 2;
+            values_offset += values_size;
+            lengths_offset += lengths_size;
             values_processed += chunk_values;
 
             match chunk_data {
