@@ -281,7 +281,9 @@ impl RleMiniBlockEncoder {
             }
         }
 
-        if values_processed == typed_data.len() {
+        // After the loop, we always have a pending run that needs to be added
+        // unless we've exceeded the byte limit or ended exactly at a run boundary
+        if current_length > 0 {
             let run_chunks = current_length.div_ceil(255) as usize;
             let bytes_needed = run_chunks * (type_size + 1);
 
@@ -786,5 +788,198 @@ mod tests {
         }
 
         assert_eq!(reconstructed, data);
+    }
+
+    #[test]
+    fn test_exact_1024_values_bug() {
+        let encoder = RleMiniBlockEncoder::new();
+
+        // Try different patterns that might trigger the bug
+        let test_patterns = vec![
+            // Pattern 1: runs of 2
+            {
+                let mut data = Vec::new();
+                for i in 0..512 {
+                    data.push(i as i32);
+                    data.push(i as i32);
+                }
+                data
+            },
+            // Pattern 2: single run that ends at exactly 1024
+            vec![42i32; 1024],
+            // Pattern 3: alternating values
+            {
+                let mut data = Vec::new();
+                for i in 0..1024 {
+                    data.push((i % 2) as i32);
+                }
+                data
+            },
+            // Pattern 4: runs that end right at boundary
+            {
+                let mut data = Vec::new();
+                // 255 + 255 + 255 + 255 + 4 = 1024
+                data.extend(vec![1i32; 255]);
+                data.extend(vec![2i32; 255]);
+                data.extend(vec![3i32; 255]);
+                data.extend(vec![4i32; 255]);
+                data.extend(vec![5i32; 4]);
+                data
+            },
+            // Pattern 5: unique values ending exactly at 1024
+            { (0..1024).map(|i| i as i32).collect::<Vec<_>>() },
+        ];
+
+        for (idx, data) in test_patterns.iter().enumerate() {
+            assert_eq!(data.len(), 1024);
+
+            let array = Int32Array::from(data.clone());
+            let (compressed, _) = encoder.compress(DataBlock::from_array(array)).unwrap();
+
+            // Decompress and verify
+            let decompressor = RleMiniBlockDecompressor::new(32);
+            match decompressor.decompress(compressed.data, compressed.num_values) {
+                Ok(decompressed) => match decompressed {
+                    DataBlock::FixedWidth(ref block) => {
+                        let values: &[i32] = bytemuck::cast_slice(block.data.as_ref());
+                        assert_eq!(
+                            values.len(),
+                            1024,
+                            "Pattern {} failed: got {} values",
+                            idx,
+                            values.len()
+                        );
+                        assert_eq!(values, &data[..], "Pattern {} data mismatch", idx);
+                    }
+                    _ => panic!("Expected FixedWidth block"),
+                },
+                Err(e) => {
+                    panic!("Pattern {} failed with error: {}", idx, e);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_unique_values_at_boundary() {
+        let encoder = RleMiniBlockEncoder::new();
+
+        // This specific pattern should trigger the bug:
+        // 1023 unique values followed by one that's the same
+        let mut data = Vec::new();
+        for i in 0..1023 {
+            data.push(i as i32);
+        }
+        data.push(1022i32); // Last value is the same as second-to-last
+        assert_eq!(data.len(), 1024);
+
+        let array = Int32Array::from(data.clone());
+        let (compressed, _) = encoder.compress(DataBlock::from_array(array)).unwrap();
+
+        println!("Compressed chunks: {}", compressed.chunks.len());
+        for (i, chunk) in compressed.chunks.iter().enumerate() {
+            let chunk_values = if chunk.log_num_values > 0 {
+                1u64 << chunk.log_num_values
+            } else {
+                compressed.num_values
+            };
+            println!(
+                "Chunk {}: {} values, buffer_sizes: {:?}",
+                i, chunk_values, chunk.buffer_sizes
+            );
+        }
+
+        // Count the total values encoded
+        let total_runs = compressed.data[1].len(); // Number of runs
+        println!("Total runs: {}", total_runs);
+
+        // Decompress and verify
+        let decompressor = RleMiniBlockDecompressor::new(32);
+        match decompressor.decompress(compressed.data, compressed.num_values) {
+            Ok(decompressed) => match decompressed {
+                DataBlock::FixedWidth(ref block) => {
+                    let values: &[i32] = bytemuck::cast_slice(block.data.as_ref());
+                    assert_eq!(
+                        values.len(),
+                        1024,
+                        "Got {} values, expected 1024",
+                        values.len()
+                    );
+                    assert_eq!(values, &data[..]);
+                }
+                _ => panic!("Expected FixedWidth block"),
+            },
+            Err(e) => {
+                panic!("Decompression failed: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_bug_4092_bytes() {
+        // Test the exact scenario that produces 4092 bytes instead of 4096
+        let encoder = RleMiniBlockEncoder::new();
+
+        // Create pattern: 1022 unique values, then one value repeated 3 times
+        let mut data = Vec::new();
+        for i in 0..1022 {
+            data.push(i as i32);
+        }
+        data.push(999999i32);
+        data.push(999999i32);
+        assert_eq!(data.len(), 1024);
+
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(bytes.len(), 4096);
+
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::Owned(bytes.clone()),
+            num_values: 1024,
+            block_info: BlockInfo::default(),
+        });
+
+        let (compressed, _) = encoder.compress(block).unwrap();
+
+        println!("=== Debug Info ===");
+        println!("Compressed chunks: {}", compressed.chunks.len());
+        println!("Total compressed values: {}", compressed.num_values);
+
+        // Check how many runs were encoded
+        let values_buffer = &compressed.data[0];
+        let lengths_buffer = &compressed.data[1];
+        println!(
+            "Values buffer size: {} bytes ({} values)",
+            values_buffer.len(),
+            values_buffer.len() / 4
+        );
+        println!("Lengths buffer size: {} runs", lengths_buffer.len());
+
+        // Try to decode and see what happens
+        let decompressor = RleMiniBlockDecompressor::new(32);
+        match decompressor.decompress(compressed.data, compressed.num_values) {
+            Ok(decompressed) => match decompressed {
+                DataBlock::FixedWidth(ref block) => {
+                    println!(
+                        "Decoded {} bytes ({} values)",
+                        block.data.len(),
+                        block.data.len() / 4
+                    );
+                    assert_eq!(
+                        block.data.len(),
+                        4096,
+                        "Expected 4096 bytes but got {}",
+                        block.data.len()
+                    );
+                }
+                _ => panic!("Expected FixedWidth block"),
+            },
+            Err(e) => {
+                println!("Decompression error: {}", e);
+                if e.to_string().contains("4092") {
+                    panic!("Found the bug! {}", e);
+                }
+            }
+        }
     }
 }
