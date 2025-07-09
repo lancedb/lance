@@ -15,15 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
+use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::TrySendError;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::thread::JoinHandle;
 
+use datafusion_common::HashMap;
 use pyo3::pyclass;
 use pyo3::pyfunction;
 use pyo3::pymethods;
+use pyo3::types::PyDict;
+use pyo3::types::PyDictMethods;
+use pyo3::types::PyTuple;
+use pyo3::Bound;
+use pyo3::IntoPyObject;
+use pyo3::PyErr;
+use pyo3::PyObject;
 use pyo3::PyResult;
+use pyo3::Python;
+use tracing::field::Field;
 use tracing::field::Visit;
 use tracing::span;
 use tracing::subscriber;
@@ -38,18 +53,123 @@ use tracing_subscriber::Registry;
 static SUBSCRIBER: LazyLock<Arc<RwLock<Option<LoggingPassthroughState>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(None)));
 
+struct TraceEvent {
+    target: String,
+    args: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct PyTraceEventArgs(HashMap<String, String>);
+
+impl<'py> IntoPyObject<'py> for PyTraceEventArgs {
+    type Target = PyDict;
+    type Output = Bound<'py, PyDict>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+        let dict = PyDict::new(py);
+        for (key, value) in self.0 {
+            dict.set_item(key, value)?;
+        }
+        Ok(dict.into_pyobject(py)?)
+    }
+}
+
+#[pyclass(get_all, name = "TraceEvent")]
+pub struct PyTraceEvent {
+    target: String,
+    args: PyTraceEventArgs,
+}
+
+#[pymethods]
+impl PyTraceEvent {
+    pub fn __repr__(&self) -> String {
+        format!("TraceEvent(target={}, args={:?})", self.target, self.args.0)
+    }
+}
+
+impl From<TraceEvent> for PyTraceEvent {
+    fn from(event: TraceEvent) -> Self {
+        Self {
+            target: event.target,
+            args: PyTraceEventArgs(event.args),
+        }
+    }
+}
+
 struct LoggingPassthroughState {
     inner: Option<ChromeLayer<Registry>>,
     level: log::Level,
+    callback_sender: Option<mpsc::SyncSender<TraceEvent>>,
+    callback_handle: Option<JoinHandle<()>>,
+    warned_about_overflow: AtomicBool,
 }
 
 impl LoggingPassthroughState {
     fn new(level: log::Level) -> Self {
-        Self { inner: None, level }
+        Self {
+            inner: None,
+            level,
+            callback_sender: None,
+            callback_handle: None,
+            warned_about_overflow: AtomicBool::new(false),
+        }
     }
 
     fn set_inner(&mut self, inner: ChromeLayer<Registry>) {
         self.inner = Some(inner);
+    }
+
+    fn set_callback(&mut self, callback: PyObject) {
+        if self.callback_sender.is_some() {
+            panic!("Callback already set");
+        }
+        let (sender, receiver) = mpsc::sync_channel(1000);
+        self.callback_sender = Some(sender);
+        self.callback_handle = Some(std::thread::spawn(move || {
+            while let Ok(event) = receiver.recv() {
+                Python::with_gil(|py| {
+                    let call_python = |py: Python, event: TraceEvent| {
+                        let py_event = PyTraceEvent::from(event);
+                        let args = match PyTuple::new(py, [py_event]) {
+                            Ok(args) => args,
+                            Err(err) => {
+                                log::error!("Failed to create PyTuple: {}", err);
+                                return;
+                            }
+                        };
+                        match callback.call1(py, args) {
+                            Ok(_) => (),
+                            Err(err) => {
+                                log::error!("Failed to call trace event callback: {}", err);
+                            }
+                        }
+                    };
+                    call_python(py, event);
+                    // Don't release the GIL if there are more events to process
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(event) => call_python(py, event),
+                            // No more events to process, exit the loop
+                            Err(TryRecvError::Empty) => break,
+                            // Channel was disconnected, exit the thread
+                            Err(TryRecvError::Disconnected) => {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        }));
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(handle) = self.callback_handle.take() {
+            // This will signal the callback handler to exit
+            self.callback_sender.take();
+            // Wait for remaining trace events to be processed
+            handle.join().unwrap();
+        }
     }
 }
 
@@ -60,7 +180,42 @@ struct EventToStr {
 
 impl Visit for EventToStr {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.str += &format!("{}={:?} ", field.name(), value);
+        let name = field.name();
+        let name = if let Some(name_stripped) = name.strip_prefix("r#") {
+            name_stripped
+        } else {
+            name
+        };
+        self.str += &format!("{}={:?} ", name, value);
+    }
+}
+
+#[derive(Default)]
+struct EventToMap {
+    args: HashMap<String, String>,
+}
+
+impl EventToMap {
+    fn field_to_str(field: &Field) -> &str {
+        let name = field.name();
+        if let Some(name_stripped) = name.strip_prefix("r#") {
+            name_stripped
+        } else {
+            name
+        }
+    }
+}
+
+impl Visit for EventToMap {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let name = Self::field_to_str(field);
+        let value = format!("{:?}", value);
+        self.args.insert(name.to_string(), value);
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        let name = Self::field_to_str(field);
+        self.args.insert(name.to_string(), value.to_string());
     }
 }
 
@@ -94,6 +249,32 @@ impl tracing_subscriber::Layer<Registry> for LoggingPassthroughRef {
         let mut fields = EventToStr::default();
         event.record(&mut fields);
         log::log!(target: "lance::events", state.level, "target=\"{}\" {}", event.metadata().target(), fields.str);
+
+        if let Some(callback_sender) = state.callback_sender.as_ref() {
+            let mut args = EventToMap::default();
+            event.record(&mut args);
+            match callback_sender.try_send(TraceEvent {
+                target: event.metadata().target().to_string(),
+                args: args.args,
+            }) {
+                Ok(_) => (),
+                Err(TrySendError::Full(_)) => {
+                    if state
+                        .warned_about_overflow
+                        .compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        log::warn!("Trace event queue overflowed, some events may be dropped");
+                    }
+                }
+                Err(TrySendError::Disconnected(_)) => (),
+            }
+        }
 
         if let Some(inner) = state.inner.as_ref() {
             inner.on_event(event, ctx);
@@ -172,4 +353,21 @@ pub fn initialize_tracing(level: log::Level) {
     let subscriber =
         Registry::default().with(LoggingPassthroughRef(SUBSCRIBER.clone()).with_filter(filter));
     subscriber::set_global_default(subscriber).unwrap();
+}
+
+#[pyfunction]
+#[pyo3(signature=(callback))]
+pub fn capture_trace_events(callback: PyObject) {
+    SUBSCRIBER
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .set_callback(callback);
+}
+
+#[pyfunction]
+#[pyo3(signature=())]
+pub fn shutdown_tracing() {
+    SUBSCRIBER.write().unwrap().as_mut().unwrap().shutdown();
 }

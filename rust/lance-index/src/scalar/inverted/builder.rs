@@ -298,19 +298,19 @@ impl InnerBuilder {
         // - if the a row is removed, we need to shift the doc ids of the following rows
         // - if a row is updated (assigned a new row id), we don't need to do anything with the posting lists
         let mut token_id = 0;
-        let mut empty_posting_lists = Vec::new();
+        let mut removed_token_ids = Vec::new();
         self.posting_lists.retain_mut(|posting_list| {
             posting_list.remap(&removed);
             let keep = !posting_list.is_empty();
             if !keep {
-                empty_posting_lists.push(token_id as u32);
+                removed_token_ids.push(token_id as u32);
             }
             token_id += 1;
             keep
         });
 
         // for the tokens, remap the token ids if any posting list is empty
-        self.tokens.remap(&empty_posting_lists);
+        self.tokens.remap(&removed_token_ids);
 
         Ok(())
     }

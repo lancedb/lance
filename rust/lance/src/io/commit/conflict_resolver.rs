@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
-use crate::io::{commit::deletion_file_cache_key, deletion::read_dataset_deletion_file};
+use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     dataset::transaction::{Operation, Transaction},
     Dataset,
@@ -967,9 +967,12 @@ impl<'a> TransactionRebase<'a> {
                     .await?;
 
                     // Make sure this is available in the cache for future conflict resolution.
-                    let key =
-                        deletion_file_cache_key(*fragment_id, new_deletion_file.as_ref().unwrap());
-                    dataset.metadata_cache.insert(&key, Arc::new(dv));
+                    let deletion_file = new_deletion_file.as_ref().unwrap();
+                    let key = crate::session::caches::DeletionFileKey {
+                        fragment_id: *fragment_id,
+                        deletion_file,
+                    };
+                    dataset.metadata_cache.insert_with_key(&key, Arc::new(dv));
 
                     // TODO: also cleanup the old deletion file.
                     new_deletion_files.insert(*fragment_id, new_deletion_file);
@@ -1207,6 +1210,7 @@ mod tests {
 
     use super::*;
     use crate::dataset::transaction::RewriteGroup;
+    use crate::session::caches::DeletionFileKey;
     use crate::{
         dataset::{CommitBuilder, InsertBuilder, WriteParams},
         io,
@@ -1332,11 +1336,14 @@ mod tests {
         .await
         .unwrap();
 
-        let cache_key =
-            deletion_file_cache_key(fragment.id, fragment.deletion_file.as_ref().unwrap());
+        let deletion_file = fragment.deletion_file.as_ref().unwrap();
+        let key = DeletionFileKey {
+            fragment_id: fragment.id,
+            deletion_file,
+        };
         dataset
             .metadata_cache
-            .insert(&cache_key, Arc::new(current_deletions));
+            .insert_with_key(&key, Arc::new(current_deletions));
 
         fragment.clone()
     }
