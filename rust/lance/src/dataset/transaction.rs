@@ -1242,7 +1242,7 @@ impl Transaction {
                         &mut final_indices,
                         &[],
                         &[MemWal {
-                            flushed: true,
+                            state: lance_index::mem_wal::State::Flushed,
                             ..mem_wal_to_flush.clone()
                         }],
                         &[mem_wal_to_flush.clone()],

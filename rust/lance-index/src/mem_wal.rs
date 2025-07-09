@@ -17,6 +17,55 @@ use std::sync::Arc;
 
 pub const MEM_WAL_INDEX_NAME: &str = "__lance_mem_wal";
 
+/// Represents the state of a MemWAL in its lifecycle
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Serialize, Deserialize, DeepSizeOf)]
+pub enum State {
+    /// MemWAL is open and accepting new entries
+    Open,
+    /// MemWAL has been sealed and no longer accepts new entries
+    Sealed,
+    /// MemWAL has been flushed to the source Lance table
+    Flushed,
+}
+
+impl From<State> for pb::mem_wal_index_details::mem_wal::State {
+    fn from(state: State) -> Self {
+        match state {
+            State::Open => Self::Open,
+            State::Sealed => Self::Sealed,
+            State::Flushed => Self::Flushed,
+        }
+    }
+}
+
+impl TryFrom<pb::mem_wal_index_details::mem_wal::State> for State {
+    type Error = Error;
+
+    fn try_from(state: pb::mem_wal_index_details::mem_wal::State) -> lance_core::Result<Self> {
+        match state {
+            pb::mem_wal_index_details::mem_wal::State::Open => Ok(Self::Open),
+            pb::mem_wal_index_details::mem_wal::State::Sealed => Ok(Self::Sealed),
+            pb::mem_wal_index_details::mem_wal::State::Flushed => Ok(Self::Flushed),
+        }
+    }
+}
+
+impl TryFrom<i32> for State {
+    type Error = Error;
+
+    fn try_from(value: i32) -> lance_core::Result<Self> {
+        match value {
+            0 => Ok(Self::Open),
+            1 => Ok(Self::Sealed),
+            2 => Ok(Self::Flushed),
+            _ => Err(Error::invalid_input(
+                format!("Unknown MemWAL state value: {}", value),
+                location!(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Serialize, Deserialize, DeepSizeOf)]
 pub struct MemWalId {
     pub region: String,
@@ -58,8 +107,7 @@ pub struct MemWal {
     pub mem_table_location: String,
     pub wal_location: String,
     pub wal_entries: Vec<u8>,
-    pub sealed: bool,
-    pub flushed: bool,
+    pub state: State,
 }
 
 impl From<&MemWal> for pb::mem_wal_index_details::MemWal {
@@ -69,8 +117,7 @@ impl From<&MemWal> for pb::mem_wal_index_details::MemWal {
             mem_table_location: mem_wal.mem_table_location.clone(),
             wal_location: mem_wal.wal_location.clone(),
             wal_entries: mem_wal.wal_entries.clone(),
-            sealed: mem_wal.sealed,
-            flushed: mem_wal.flushed,
+            state: pb::mem_wal_index_details::mem_wal::State::from(mem_wal.state.clone()) as i32,
         }
     }
 }
@@ -79,13 +126,14 @@ impl TryFrom<pb::mem_wal_index_details::MemWal> for MemWal {
     type Error = Error;
 
     fn try_from(mem_wal: pb::mem_wal_index_details::MemWal) -> lance_core::Result<Self> {
+        let state = State::try_from(mem_wal.state)?;
+
         Ok(Self {
             id: MemWalId::try_from(mem_wal.id.unwrap())?,
             mem_table_location: mem_wal.mem_table_location.clone(),
             wal_location: mem_wal.wal_location.clone(),
-            wal_entries: mem_wal.wal_entries.clone(),
-            sealed: mem_wal.sealed,
-            flushed: mem_wal.flushed,
+            wal_entries: mem_wal.wal_entries,
+            state,
         })
     }
 }
@@ -97,8 +145,7 @@ impl MemWal {
             mem_table_location: mem_table_location.to_owned(),
             wal_location: wal_location.to_owned(),
             wal_entries: pb::U64Segment::from(U64Segment::Range(0..0)).encode_to_vec(),
-            sealed: false,
-            flushed: false,
+            state: State::Open,
         }
     }
 
@@ -106,25 +153,13 @@ impl MemWal {
         U64Segment::try_from(pb::U64Segment::decode(self.wal_entries.as_slice()).unwrap()).unwrap()
     }
 
-    pub fn check_sealed(&self, expected: bool) -> lance_core::Result<()> {
-        if self.sealed != expected {
+    /// Check if the MemWAL is in the expected state
+    pub fn check_state(&self, expected: State) -> lance_core::Result<()> {
+        if self.state != expected {
             return Err(Error::invalid_input(
                 format!(
-                    "MemWAL {:?} is sealed: {}, but expected {}",
-                    self.id, self.sealed, expected
-                ),
-                location!(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn check_flushed(&self, expected: bool) -> lance_core::Result<()> {
-        if self.flushed != expected {
-            return Err(Error::invalid_input(
-                format!(
-                    "MemWAL {:?} is flushed: {}, but expected {}",
-                    self.id, self.flushed, expected
+                    "MemWAL {:?} is in state {:?}, but expected {:?}",
+                    self.id, self.state, expected
                 ),
                 location!(),
             ));

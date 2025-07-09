@@ -152,13 +152,14 @@ pub async fn advance_mem_wal_generation(
                     ));
                 }
 
-                let (updated_mem_wal, removed_mem_wal) = if !latest_mem_wal.sealed {
-                    let mut updated_mem_wal = latest_mem_wal.clone();
-                    updated_mem_wal.sealed = true;
-                    (Some(updated_mem_wal), Some(latest_mem_wal.clone()))
-                } else {
-                    (None, None)
-                };
+                let (updated_mem_wal, removed_mem_wal) =
+                    if latest_mem_wal.state == lance_index::mem_wal::State::Open {
+                        let mut updated_mem_wal = latest_mem_wal.clone();
+                        updated_mem_wal.state = lance_index::mem_wal::State::Sealed;
+                        (Some(updated_mem_wal), Some(latest_mem_wal.clone()))
+                    } else {
+                        (None, None)
+                    };
 
                 let added_mem_wal = MemWal::new_empty(
                     MemWalId::new(region, latest_mem_wal.id.generation + 1),
@@ -245,9 +246,8 @@ pub async fn append_mem_wal_entry(
     expected_mem_table_location: &str,
 ) -> Result<MemWal> {
     let mutate = |mem_wal: &MemWal| -> Result<MemWal> {
-        // Can only append to unsealed and unflushed MemWALs
-        mem_wal.check_flushed(false)?;
-        mem_wal.check_sealed(false)?;
+        // Can only append to open MemWALs
+        mem_wal.check_state(lance_index::mem_wal::State::Open)?;
         mem_wal.check_expected_mem_table_location(expected_mem_table_location)?;
 
         let mut updated_mem_wal = mem_wal.clone();
@@ -271,13 +271,12 @@ pub async fn mark_mem_wal_as_sealed(
     expected_mem_table_location: &str,
 ) -> Result<MemWal> {
     let mutate = |mem_wal: &MemWal| -> Result<MemWal> {
-        // Can only seal unsealed or flushed MemWALs
-        mem_wal.check_flushed(false)?;
-        mem_wal.check_sealed(false)?;
+        // Can only seal open MemWALs
+        mem_wal.check_state(lance_index::mem_wal::State::Open)?;
         mem_wal.check_expected_mem_table_location(expected_mem_table_location)?;
 
         let mut updated_mem_wal = mem_wal.clone();
-        updated_mem_wal.sealed = true;
+        updated_mem_wal.state = lance_index::mem_wal::State::Sealed;
         Ok(updated_mem_wal)
     };
 
@@ -292,13 +291,12 @@ pub async fn mark_mem_wal_as_flushed(
     expected_mem_table_location: &str,
 ) -> Result<MemWal> {
     let mutate = |mem_wal: &MemWal| -> Result<MemWal> {
-        // Can only flush sealed but unflushed MemWALs
-        mem_wal.check_sealed(true)?;
-        mem_wal.check_flushed(false)?;
+        // Can only flush sealed MemWALs
+        mem_wal.check_state(lance_index::mem_wal::State::Sealed)?;
         mem_wal.check_expected_mem_table_location(expected_mem_table_location)?;
 
         let mut updated_mem_wal = mem_wal.clone();
-        updated_mem_wal.flushed = true;
+        updated_mem_wal.state = lance_index::mem_wal::State::Flushed;
         Ok(updated_mem_wal)
     };
 
@@ -392,7 +390,7 @@ pub async fn trim_mem_wal_index(dataset: &mut Dataset) -> Result<()> {
         let mut removed = Vec::new();
         for (_, generations) in mem_wal_index.mem_wal_map.iter() {
             for (_, mem_wal) in generations.iter() {
-                if mem_wal.flushed {
+                if mem_wal.state == lance_index::mem_wal::State::Flushed {
                     removed.push(mem_wal.clone());
                 }
             }
@@ -548,8 +546,7 @@ mod tests {
         assert_eq!(mem_wal.id.generation, 0);
         assert_eq!(mem_wal.mem_table_location, "mem_table_location_0");
         assert_eq!(mem_wal.wal_location, "wal_location_0");
-        assert!(!mem_wal.sealed);
-        assert!(!mem_wal.flushed);
+        assert_eq!(mem_wal.state, lance_index::mem_wal::State::Open);
 
         // Second call to advance_mem_wal_generation should seal generation 0 and create generation 1
         advance_mem_wal_generation(
@@ -589,16 +586,14 @@ mod tests {
         assert_eq!(gen_0.id.generation, 0);
         assert_eq!(gen_0.mem_table_location, "mem_table_location_0");
         assert_eq!(gen_0.wal_location, "wal_location_0");
-        assert!(gen_0.sealed);
-        assert!(!gen_0.flushed);
+        assert_eq!(gen_0.state, lance_index::mem_wal::State::Sealed);
 
         // Verify generation 1 is unsealed
         assert_eq!(gen_1.id.region, "GLOBAL");
         assert_eq!(gen_1.id.generation, 1);
         assert_eq!(gen_1.mem_table_location, "mem_table_location_1");
         assert_eq!(gen_1.wal_location, "wal_location_1");
-        assert!(!gen_1.sealed);
-        assert!(!gen_1.flushed);
+        assert_eq!(gen_1.state, lance_index::mem_wal::State::Open);
 
         // Test that using the same MemTable location should fail
         let result = advance_mem_wal_generation(
@@ -733,7 +728,7 @@ mod tests {
 
         // Check the specific error message
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is sealed: true, but expected false"), 
+        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is in state Sealed, but expected Open"), 
                 "Error message should indicate the MemWAL is sealed, got: {}", error);
 
         // Test failure case: cannot append to flushed MemWAL
@@ -749,7 +744,7 @@ mod tests {
 
         // Check the specific error message
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is flushed: true, but expected false"), 
+        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is in state Flushed, but expected Open"), 
                 "Error message should indicate the MemWAL is flushed, got: {}", error);
     }
 
@@ -801,7 +796,11 @@ mod tests {
 
         let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
         let mem_wal = &mem_wal_details.mem_wal_list[0];
-        assert!(!mem_wal.sealed, "Generation 0 should initially be unsealed");
+        assert_eq!(
+            mem_wal.state,
+            lance_index::mem_wal::State::Open,
+            "Generation 0 should initially be open"
+        );
 
         // Test success case: seal generation 0
         mark_mem_wal_as_sealed(&mut dataset, "GLOBAL", 0, "mem_table_location_0")
@@ -817,7 +816,11 @@ mod tests {
 
         let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
         let mem_wal = &mem_wal_details.mem_wal_list[0];
-        assert!(mem_wal.sealed, "Generation 0 should now be sealed");
+        assert_eq!(
+            mem_wal.state,
+            lance_index::mem_wal::State::Sealed,
+            "Generation 0 should now be sealed"
+        );
 
         // Create a new generation and test sealing it
         advance_mem_wal_generation(
@@ -844,7 +847,11 @@ mod tests {
             .find(|m| m.id.generation == 1)
             .expect("Generation 1 should exist");
 
-        assert!(!gen_1.sealed, "Generation 1 should be unsealed");
+        assert_eq!(
+            gen_1.state,
+            lance_index::mem_wal::State::Open,
+            "Generation 1 should be open"
+        );
 
         // Seal generation 1
         mark_mem_wal_as_sealed(&mut dataset, "GLOBAL", 1, "mem_table_location_1")
@@ -865,7 +872,11 @@ mod tests {
             .find(|m| m.id.generation == 1)
             .expect("Generation 1 should exist");
 
-        assert!(gen_1.sealed, "Generation 1 should be sealed");
+        assert_eq!(
+            gen_1.state,
+            lance_index::mem_wal::State::Sealed,
+            "Generation 1 should be sealed"
+        );
 
         // Test that sealing an already sealed MemWAL should fail
         let result =
@@ -877,8 +888,8 @@ mod tests {
 
         // Check the specific error message
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 1 } is sealed: true, but expected false"), 
-                "Error message should indicate the MemWAL is already sealed, got: {}", error);
+        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 1 } is in state Sealed, but expected Open"), 
+                "Error message should indicate the MemWAL is not open, got: {}", error);
 
         // Test that sealing an already flushed MemWAL should fail
         mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 0, "mem_table_location_0")
@@ -893,7 +904,7 @@ mod tests {
 
         // Check the specific error message
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is flushed: true, but expected false"),
+        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is in state Flushed, but expected Open"),
                 "Error message should indicate the MemWAL is already flushed, got: {}", error);
     }
 
@@ -945,9 +956,10 @@ mod tests {
 
         let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
         let mem_wal = &mem_wal_details.mem_wal_list[0];
-        assert!(
-            !mem_wal.flushed,
-            "Generation 0 should initially be unflushed"
+        assert_eq!(
+            mem_wal.state,
+            lance_index::mem_wal::State::Open,
+            "Generation 0 should initially be open"
         );
 
         // Test failure case: cannot flush unsealed MemWAL
@@ -960,7 +972,7 @@ mod tests {
 
         // Check the specific error message
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is sealed: false, but expected true"), 
+        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is in state Open, but expected Sealed"), 
                 "Error message should indicate the MemWAL is not sealed, got: {}", error);
 
         // Seal generation 0 first
@@ -982,7 +994,11 @@ mod tests {
 
         let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
         let mem_wal = &mem_wal_details.mem_wal_list[0];
-        assert!(mem_wal.flushed, "Generation 0 should now be flushed");
+        assert_eq!(
+            mem_wal.state,
+            lance_index::mem_wal::State::Flushed,
+            "Generation 0 should now be flushed"
+        );
 
         // Test failure case: cannot flush already flushed MemWAL
         let result =
@@ -994,7 +1010,7 @@ mod tests {
 
         // Check the specific error message
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is flushed: true, but expected false"), 
+        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is in state Flushed, but expected Sealed"), 
                 "Error message should indicate the MemWAL is already flushed, got: {}", error);
     }
 
@@ -1201,14 +1217,20 @@ mod tests {
             .find(|m| m.id.generation == 2)
             .expect("Generation 2 should exist");
 
-        assert!(gen_0.flushed, "Generation 0 should be flushed");
-        assert!(
-            gen_1.sealed && !gen_1.flushed,
+        assert_eq!(
+            gen_0.state,
+            lance_index::mem_wal::State::Flushed,
+            "Generation 0 should be flushed"
+        );
+        assert_eq!(
+            gen_1.state,
+            lance_index::mem_wal::State::Sealed,
             "Generation 1 should be sealed but not flushed"
         );
-        assert!(
-            !gen_2.sealed && !gen_2.flushed,
-            "Generation 2 should be unsealed and unflushed"
+        assert_eq!(
+            gen_2.state,
+            lance_index::mem_wal::State::Open,
+            "Generation 2 should be open"
         );
 
         // Trim the MemWAL index
@@ -1247,13 +1269,15 @@ mod tests {
             .find(|m| m.id.generation == 2)
             .expect("Generation 2 should still exist");
 
-        assert!(
-            gen_1.sealed && !gen_1.flushed,
+        assert_eq!(
+            gen_1.state,
+            lance_index::mem_wal::State::Sealed,
             "Generation 1 should still be sealed but not flushed"
         );
-        assert!(
-            !gen_2.sealed && !gen_2.flushed,
-            "Generation 2 should still be unsealed and unflushed"
+        assert_eq!(
+            gen_2.state,
+            lance_index::mem_wal::State::Open,
+            "Generation 2 should still be open"
         );
 
         // Test trimming when no MemWALs are flushed (should do nothing)
@@ -1367,8 +1391,11 @@ mod tests {
 
         let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
         let mem_wal = &mem_wal_details.mem_wal_list[0];
-        assert!(mem_wal.sealed, "MemWAL should be sealed");
-        assert!(!mem_wal.flushed, "MemWAL should not be flushed yet");
+        assert_eq!(
+            mem_wal.state,
+            lance_index::mem_wal::State::Sealed,
+            "MemWAL should be sealed but not flushed yet"
+        );
 
         // Create new data for merge insert
         let new_data = lance_datagen::gen()
@@ -1405,8 +1432,11 @@ mod tests {
 
         let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
         let mem_wal = &mem_wal_details.mem_wal_list[0];
-        assert!(mem_wal.sealed, "MemWAL should still be sealed");
-        assert!(mem_wal.flushed, "MemWAL should now be flushed");
+        assert_eq!(
+            mem_wal.state,
+            lance_index::mem_wal::State::Flushed,
+            "MemWAL should now be flushed"
+        );
 
         // Test that trying to mark a non-existent MemWAL as flushed fails
         let mut merge_insert_job = crate::dataset::MergeInsertBuilder::try_new(
@@ -1464,7 +1494,11 @@ mod tests {
             .iter()
             .find(|m| m.id.generation == 1)
             .expect("Generation 1 should exist");
-        assert!(!gen_1.sealed, "Generation 1 should be unsealed");
+        assert_eq!(
+            gen_1.state,
+            lance_index::mem_wal::State::Open,
+            "Generation 1 should be open"
+        );
 
         let mut merge_insert_job_unsealed = crate::dataset::MergeInsertBuilder::try_new(
             updated_dataset.clone(),
@@ -1485,7 +1519,7 @@ mod tests {
 
         // Check the specific error message
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 1 } is sealed: false, but expected true"), 
+        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 1 } is in state Open, but expected Sealed"),
                 "Error message should indicate the MemWAL is not sealed, got: {}", error);
 
         // Test that trying to mark an already flushed MemWAL as flushed fails
@@ -1508,7 +1542,7 @@ mod tests {
 
         // Check the specific error message
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is flushed: true, but expected false"), 
+        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is in state Flushed, but expected Sealed"),
                 "Error message should indicate the MemWAL is already flushed, got: {}", error);
 
         // Test that merge insert with mark_mem_wal_as_flushed works correctly when MemWAL is in proper state
@@ -1532,8 +1566,11 @@ mod tests {
             .iter()
             .find(|m| m.id.generation == 1)
             .expect("Generation 1 should exist");
-        assert!(gen_1.sealed, "Generation 1 should be sealed");
-        assert!(!gen_1.flushed, "Generation 1 should not be flushed");
+        assert_eq!(
+            gen_1.state,
+            lance_index::mem_wal::State::Sealed,
+            "Generation 1 should be sealed"
+        );
 
         // Create merge insert that flushes generation 1
         let new_data_valid = lance_datagen::gen()
@@ -1576,8 +1613,11 @@ mod tests {
             .iter()
             .find(|m| m.id.generation == 1)
             .expect("Generation 1 should still exist");
-        assert!(gen_1.sealed, "Generation 1 should still be sealed");
-        assert!(gen_1.flushed, "Generation 1 should now be flushed");
+        assert_eq!(
+            gen_1.state,
+            lance_index::mem_wal::State::Flushed,
+            "Generation 1 should now be flushed"
+        );
     }
 
     #[tokio::test]
@@ -2008,12 +2048,18 @@ mod tests {
             .expect("Generation 1 should exist");
 
         // Verify generation 0 is sealed and flushed
-        assert!(gen_0.sealed, "Generation 0 should be sealed");
-        assert!(gen_0.flushed, "Generation 0 should be flushed");
+        assert_eq!(
+            gen_0.state,
+            lance_index::mem_wal::State::Flushed,
+            "Generation 0 should be flushed"
+        );
 
         // Verify generation 1 is unsealed and unflushed
-        assert!(!gen_1.sealed, "Generation 1 should be unsealed");
-        assert!(!gen_1.flushed, "Generation 1 should be unflushed");
+        assert_eq!(
+            gen_1.state,
+            lance_index::mem_wal::State::Open,
+            "Generation 1 should be open"
+        );
 
         // Verify that generation 1 has the new entry
         let wal_entries = gen_1.wal_entries();
@@ -2161,16 +2207,25 @@ mod tests {
             .expect("Generation 2 should exist");
 
         // Verify generation 0 is sealed and flushed
-        assert!(gen_0.sealed, "Generation 0 should be sealed");
-        assert!(gen_0.flushed, "Generation 0 should be flushed");
+        assert_eq!(
+            gen_0.state,
+            lance_index::mem_wal::State::Flushed,
+            "Generation 0 should be flushed"
+        );
 
         // Verify generation 1 is sealed (due to advance) but unflushed
-        assert!(gen_1.sealed, "Generation 1 should be sealed due to advance");
-        assert!(!gen_1.flushed, "Generation 1 should be unflushed");
+        assert_eq!(
+            gen_1.state,
+            lance_index::mem_wal::State::Sealed,
+            "Generation 1 should be sealed due to advance"
+        );
 
         // Verify generation 2 is unsealed and unflushed
-        assert!(!gen_2.sealed, "Generation 2 should be unsealed");
-        assert!(!gen_2.flushed, "Generation 2 should be unflushed");
+        assert_eq!(
+            gen_2.state,
+            lance_index::mem_wal::State::Open,
+            "Generation 2 should be open"
+        );
 
         // Verify that generation 1 has the expected entries
         let wal_entries = gen_1.wal_entries();

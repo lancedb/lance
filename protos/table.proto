@@ -440,6 +440,19 @@ message MemWalIndexDetails {
   // A combination of MemTable and WAL for fast upsert.
   message MemWal {
 
+    enum State {
+      // MemWAL is open and accepting new entries
+      OPEN = 0;
+      // When a MemTable is considered full, the writer should update this MemWAL as sealed
+      // and create a new MemWAL to write to atomically.
+      SEALED = 1;
+      // When a MemTable is sealed, it can be flushed asynchronously to the table.
+      // When the flush completes, the process should commit the new dataset version
+      // and mark this MemWAL as flushed atomically.
+      // After a MemWAL is flushed, the cleanup process can delete the WAL.
+      FLUSHED = 2;
+    }
+
     MemWalId id = 1;
 
     // The MemTable location, which is likely an in-memory address starting with memory://.
@@ -466,16 +479,11 @@ message MemWalIndexDetails {
     // causing some holes within the U64Segment range.
     bytes wal_entries = 4;
 
-    // Indicates if the MemWAL has been sealed.
-    // When a MemTable is considered full, the writer should update this MemWAL as sealed
-    // and create a new MemWAL to write to atomically.
-    bool sealed = 5;
-
-    // Indicates if the MemWAL has been flushed to the source Lance table.
-    // When a MemTable is sealed, it can be flushed asynchronously to the table.
-    // When the flush completes, the process should commit the new dataset version
-    // and mark this MemWAL as flushed atomically.
-    // After a MemWAL is flushed, the cleanup process can delete the WAL.
-    bool flushed = 6;
+    // The current state of the MemWAL, indicating its lifecycle phase.
+    // States progress: OPEN -> SEALED -> FLUSHED
+    // OPEN: MemWAL is accepting new WAL entries
+    // SEALED: MemWAL has been sealed and no longer accepts new WAL entries
+    // FLUSHED: MemWAL has been flushed to the source Lance table and can be cleaned up
+    State state = 5;
   }
 }
