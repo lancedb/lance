@@ -86,7 +86,7 @@ impl RleMiniBlockEncoder {
 
         // Pre-allocate global buffers with estimated capacity
         // Assume average compression ratio of ~10:1 (10 values per run)
-        let estimated_runs = (num_values as usize / 10).max(100);
+        let estimated_runs = num_values as usize / 10;
         let mut all_values = Vec::with_capacity(estimated_runs * bytes_per_value);
         let mut all_lengths = Vec::with_capacity(estimated_runs);
         let mut chunks = Vec::new();
