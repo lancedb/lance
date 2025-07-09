@@ -216,11 +216,11 @@ impl RleMiniBlockEncoder {
 
         // Record starting positions for this chunk
         let values_start = all_values.len();
-        let lengths_start = all_lengths.len();
 
         let mut current_value = typed_data[0];
         let mut current_length = 1u64;
         let mut bytes_used = 0usize;
+        let mut total_values_encoded = 0usize; // Track total encoded values
 
         // Power-of-2 checkpoints for ensuring non-last chunks have valid sizes
         // For smaller data types like u8, we can use larger initial checkpoints
@@ -260,19 +260,14 @@ impl RleMiniBlockEncoder {
                 }
 
                 bytes_used += self.add_run(&current_value, current_length, all_values, all_lengths);
+                total_values_encoded += current_length as usize;
                 current_value = value;
                 current_length = 1;
             }
 
-            // Calculate current total encoded values
-            let current_total_encoded: usize = all_lengths[lengths_start..]
-                .iter()
-                .map(|&len| len as usize)
-                .sum();
-
             // Check if we reached a power-of-2 checkpoint
             if checkpoint_idx < valid_checkpoints.len()
-                && current_total_encoded >= valid_checkpoints[checkpoint_idx]
+                && total_values_encoded >= valid_checkpoints[checkpoint_idx]
             {
                 last_checkpoint_state = Some((
                     all_values.len(),
@@ -292,21 +287,16 @@ impl RleMiniBlockEncoder {
 
             if bytes_used + bytes_needed <= MAX_MINIBLOCK_BYTES as usize {
                 let _ = self.add_run(&current_value, current_length, all_values, all_lengths);
+                total_values_encoded += current_length as usize;
             }
         }
 
-        // Calculate total values encoded
-        let total_encoded: usize = all_lengths[lengths_start..]
-            .iter()
-            .map(|&len| len as usize)
-            .sum();
-
         // Determine if we've processed all remaining values
-        let is_last_chunk = total_encoded == values_remaining;
+        let is_last_chunk = total_values_encoded == values_remaining;
 
         // Non-last chunks must have power-of-2 values for miniblock format
         if !is_last_chunk {
-            if total_encoded.is_power_of_two() {
+            if total_values_encoded.is_power_of_two() {
                 // Already at power-of-2 boundary
             } else if let Some((val_pos, len_pos, _, checkpoint_values)) = last_checkpoint_state {
                 // Roll back to last valid checkpoint
@@ -321,16 +311,7 @@ impl RleMiniBlockEncoder {
         }
 
         let num_runs = (all_values.len() - values_start) / type_size;
-
-        // Calculate actual values encoded by summing the run lengths
-        let lengths_slice = &all_lengths[lengths_start..];
-        let actual_values_encoded: usize = lengths_slice.iter().map(|&len| len as usize).sum();
-
-        (
-            num_runs,
-            actual_values_encoded,
-            actual_values_encoded == values_remaining,
-        )
+        (num_runs, total_values_encoded, is_last_chunk)
     }
 
     fn add_run<T>(
