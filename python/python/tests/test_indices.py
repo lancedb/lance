@@ -11,9 +11,9 @@ import pytest
 from lance.file import LanceFileReader
 from lance.indices import IndicesBuilder, IvfModel, PqModel
 
-NUM_ROWS_PER_FRAGMENT = 10000
-DIMENSION = 128
-NUM_SUBVECTORS = 8
+NUM_ROWS_PER_FRAGMENT = 2_000
+DIMENSION = 32
+NUM_SUBVECTORS = 2
 NUM_FRAGMENTS = 3
 NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
 NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
@@ -244,7 +244,7 @@ def test_vector_transform(tmpdir, small_rand_dataset, small_rand_ivf, small_rand
     assert row_id.type == pa.uint64()
 
     pq_code = data.column("__pq_code")
-    assert pq_code.type == pa.list_(pa.uint8(), 8)
+    assert pq_code.type == pa.list_(pa.uint8(), NUM_SUBVECTORS)
 
     part_id = data.column("__ivf_part_id")
     assert part_id.type == pa.uint32()

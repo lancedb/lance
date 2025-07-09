@@ -1,7 +1,7 @@
 ifeq ($(CI), true)
-    PYTEST_ARGS = -vvv -s --durations=30
+    PYTEST_ARGS = -vvv -s -n auto --durations=30
 else
-    PYTEST_ARGS = -vvv -s
+    PYTEST_ARGS = -vvv -s -n auto
 endif
 
 test:
