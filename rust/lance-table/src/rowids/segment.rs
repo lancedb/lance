@@ -393,11 +393,9 @@ impl U64Segment {
                 bitmap.get(idx)
             }
             Self::SortedArray(array) => {
-                // Use binary search for sorted arrays
-                array.iter().any(|v| v == val)
+                array.binary_search(val).is_ok()
             }
             Self::Array(array) => {
-                // Linear search for unsorted arrays
                 array.iter().any(|v| v == val)
             }
         }
