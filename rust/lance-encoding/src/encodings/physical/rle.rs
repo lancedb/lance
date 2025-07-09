@@ -478,19 +478,20 @@ impl RleMiniBlockDecompressor {
         for (value, &length) in values.iter().zip(lengths.iter()) {
             let run_length = length as usize;
             let bytes_to_write = run_length * type_size;
+            let bytes_of_value = bytemuck::bytes_of(value);
 
             if decoded.len() + bytes_to_write > expected_byte_count {
                 let remaining_bytes = expected_byte_count - decoded.len();
                 let remaining_values = remaining_bytes / type_size;
 
                 for _ in 0..remaining_values {
-                    decoded.extend_from_slice(bytemuck::bytes_of(value));
+                    decoded.extend_from_slice(bytes_of_value);
                 }
                 break;
             }
 
             for _ in 0..run_length {
-                decoded.extend_from_slice(bytemuck::bytes_of(value));
+                decoded.extend_from_slice(bytes_of_value);
             }
         }
 
