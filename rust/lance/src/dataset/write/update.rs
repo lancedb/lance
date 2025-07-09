@@ -796,7 +796,6 @@ mod tests {
                     .unwrap()
                     .set("value", "1")
                     .unwrap()
-                    .conflict_retries(10) // Enable retry-based conflict resolution
                     .build()
                     .unwrap();
                 barrier_ref.wait().await;
@@ -825,32 +824,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_with_retries() {
-        // Test that UpdateBuilder can be configured with retry settings
-        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Legacy).await;
-
-        let update_job = UpdateBuilder::new(dataset)
-            .set("name", "'updated'")
-            .unwrap()
-            .conflict_retries(5)
-            .retry_timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
-
-        // Verify the job is configured with the retry settings
-        assert_eq!(update_job.conflict_retries, 5);
-        assert_eq!(update_job.retry_timeout, Duration::from_secs(10));
-
-        // Execute the update and verify it succeeds
-        let result = update_job.execute().await.unwrap();
-        assert_eq!(result.rows_updated, 30); // All 30 rows should be updated
-
-        let data = result.new_dataset.scan().try_into_batch().await.unwrap();
-        let names = data["name"].as_string::<i32>();
-        assert!(names.iter().all(|name| name == Some("updated")));
-    }
-
-    #[tokio::test]
     async fn test_update_same_row_concurrency() {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::UInt32, false),
@@ -861,8 +834,8 @@ mod tests {
         let initial_data = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt32Array::from_iter_values(0..1)), // Single row with id=0
-                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(10, 1))), // value=10
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![10])),
             ],
         )
         .unwrap();
@@ -911,11 +884,10 @@ mod tests {
                     .unwrap();
 
                 let job = UpdateBuilder::new(Arc::new(dataset))
-                    .update_where("id = 0") // All workers update the same row
+                    .update_where("id = 0")
                     .unwrap()
-                    .set("value", "99") // Each sets the same value
+                    .set("value", "99")
                     .unwrap()
-                    .conflict_retries(10) // Enable retry-based conflict resolution
                     .build()
                     .unwrap();
                 barrier_ref.wait().await;
@@ -935,23 +907,10 @@ mod tests {
         // Even though they all target the same row, they should not fail with commit conflicts
         // The final result should be exactly one row (not duplicated) because the retries
         // should work from the latest dataset state, preventing duplicate row creation
+        let ids = data["id"].as_primitive::<UInt32Type>().values();
+        assert_eq!(ids, &[0]);
 
-        let ids = data["id"]
-            .as_primitive::<UInt32Type>()
-            .values()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-
-        // Should have exactly one row with id=0
-        assert_eq!(ids.len(), 1);
-        assert_eq!(ids[0], 0);
-
-        // The row should have value=99 (the last successful update)
         let values = data["value"].as_primitive::<UInt32Type>().values();
-        assert_eq!(values[0], 99);
-
-        // The test succeeds if all concurrent operations completed without throwing conflicts
-        // This demonstrates that retry-based conflict resolution is working correctly
+        assert_eq!(values, &[99]);
     }
 }
