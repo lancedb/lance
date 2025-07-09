@@ -345,10 +345,12 @@ class ShardedFragmentSampler(FragmentSampler):
         If set true, randomize
     seed : int
         The random seed to use when randomize is set true.
+    pad : bool
+        Whether to apply padding in order to ensure even sharding. Similar to pytorch's Distributed data sampler.
     """
 
     def __init__(
-        self, rank: int, world_size: int, randomize: bool = False, seed: int = 0
+        self, rank: int, world_size: int, randomize: bool = False, seed: int = 0, pad: bool = False
     ):
         super().__init__()
 
@@ -357,6 +359,7 @@ class ShardedFragmentSampler(FragmentSampler):
         self._randomize = randomize
         self._seed = seed
         self._epoch = 0
+        self._pad = pad
 
     def set_epoch(self, epoch: int):
         self._epoch = epoch
@@ -380,8 +383,20 @@ class ShardedFragmentSampler(FragmentSampler):
         if self._randomize:
             random.seed(self._seed)
             random.shuffle(fragments)
-        for idx in range(self._rank, len(fragments), self._world_size):
-            yield fragments[idx]
+        num_fragments = len(fragments)
+        total_size = num_fragments
+
+        if self._pad:
+            num_samples_per_replica = math.ceil(num_fragments / self.world_size)
+            total_size = num_samples_per_replica * self.world_size
+        
+        padding_size = total_size - num_fragments
+        if padding_size > 0:
+            fragments += fragments[:padding_size]
+        
+        for i in range(self.rank, total_size, self.world_size):
+            yield fragments[i]
+            
 
 
 class ShardedBatchSampler(Sampler):
