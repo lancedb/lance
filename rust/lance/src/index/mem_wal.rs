@@ -57,8 +57,7 @@ pub async fn find_latest_mem_wal_generation(
     };
 
     // MemWALs of the same region is ordered increasingly by its generation
-    let mut values_iter = generations.values().rev();
-    if let Some(latest_mem_wal) = values_iter.next() {
+    if let Some(latest_mem_wal) = generations.values().last() {
         Ok(Some(latest_mem_wal.clone()))
     } else {
         Err(Error::Internal {
@@ -120,9 +119,8 @@ pub async fn advance_mem_wal_generation(
         let (added_mem_wal, updated_mem_wal, removed_mem_wal) = if let Some(generations) =
             mem_wal_index.mem_wal_map.get(region)
         {
-            // MemWALs of the same region is ordered increasingly by its generation
-            let mut values_iter = generations.values().rev();
-            if let Some(latest_mem_wal) = values_iter.next() {
+            if let Some(latest_mem_wal) = generations.values().last() {
+                // TODO: technically should check against all WAL locations
                 if latest_mem_wal.wal_location == new_wal_location {
                     return Err(Error::invalid_input(
                         format!(

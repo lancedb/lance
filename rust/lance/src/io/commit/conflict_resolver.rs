@@ -1018,7 +1018,7 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::UpdateMemWalState {
             added,
             updated,
-            removed,
+            removed: _,
             ..
         } = &self.transaction.operation
         {
@@ -1030,8 +1030,7 @@ impl<'a> TransactionRebase<'a> {
                 } => {
                     // 1. if the current or last committed job is trimming flushed MemWALs,
                     // it is compatible with any other UpdateMemWalState commits
-                    if (committed_added.is_empty()
-                        && committed_updated.is_empty())
+                    if (committed_added.is_empty() && committed_updated.is_empty())
                         || (added.is_empty() && updated.is_empty())
                     {
                         return Ok(());
