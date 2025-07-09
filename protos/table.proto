@@ -457,9 +457,6 @@ message MemWalIndexDetails {
 
     // The MemTable location, which is likely an in-memory address starting with memory://.
     // The actual details of how the MemTable is stored is outside the concern of Lance.
-    // When the MemTable crashes, before starting to replay from the WAL,
-    // the new writer must compare-and-swap this location.
-    // After replay, any writer checks this location and commit must fail if this location has changed.
     string mem_table_location = 2;
 
     // the root location of the WAL.
@@ -485,5 +482,13 @@ message MemWalIndexDetails {
     // SEALED: MemWAL has been sealed and no longer accepts new WAL entries
     // FLUSHED: MemWAL has been flushed to the source Lance table and can be cleaned up
     State state = 5;
+
+    // The owner identifier for this MemWAL, used for compare-and-swap operations.
+    // When a writer wants to perform any operation on this MemWAL, it must provide
+    // the expected owner_id. This serves as an optimistic lock to prevent concurrent
+    // writers from interfering with each other. When a new writer starts replay,
+    // it must first atomically update this owner_id to claim ownership.
+    // All subsequent operations will fail if the owner_id has changed.
+    string owner_id = 6;
   }
 }

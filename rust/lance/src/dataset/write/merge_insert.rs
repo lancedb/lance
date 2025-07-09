@@ -383,7 +383,7 @@ impl MergeInsertBuilder {
     pub async fn mark_mem_wal_as_flushed(
         &mut self,
         mem_wal_id: MemWalId,
-        expected_mem_table_location: &str,
+        expected_owner_id: &str,
     ) -> Result<&mut Self> {
         if let Some(mem_wal_index) = self
             .dataset
@@ -393,7 +393,7 @@ impl MergeInsertBuilder {
             if let Some(generations) = mem_wal_index.mem_wal_map.get(mem_wal_id.region.as_str()) {
                 if let Some(mem_wal) = generations.get(&mem_wal_id.generation) {
                     mem_wal.check_state(lance_index::mem_wal::State::Sealed)?;
-                    mem_wal.check_expected_mem_table_location(expected_mem_table_location)?;
+                    mem_wal.check_expected_owner_id(expected_owner_id)?;
                     self.params.mem_wal_to_flush = Some(mem_wal.clone());
                     Ok(self)
                 } else {

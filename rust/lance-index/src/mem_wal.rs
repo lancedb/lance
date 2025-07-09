@@ -108,6 +108,7 @@ pub struct MemWal {
     pub wal_location: String,
     pub wal_entries: Vec<u8>,
     pub state: State,
+    pub owner_id: String,
 }
 
 impl From<&MemWal> for pb::mem_wal_index_details::MemWal {
@@ -118,6 +119,7 @@ impl From<&MemWal> for pb::mem_wal_index_details::MemWal {
             wal_location: mem_wal.wal_location.clone(),
             wal_entries: mem_wal.wal_entries.clone(),
             state: pb::mem_wal_index_details::mem_wal::State::from(mem_wal.state.clone()) as i32,
+            owner_id: mem_wal.owner_id.clone(),
         }
     }
 }
@@ -134,18 +136,25 @@ impl TryFrom<pb::mem_wal_index_details::MemWal> for MemWal {
             wal_location: mem_wal.wal_location.clone(),
             wal_entries: mem_wal.wal_entries,
             state,
+            owner_id: mem_wal.owner_id,
         })
     }
 }
 
 impl MemWal {
-    pub fn new_empty(id: MemWalId, mem_table_location: &str, wal_location: &str) -> Self {
+    pub fn new_empty(
+        id: MemWalId,
+        mem_table_location: &str,
+        wal_location: &str,
+        owner_id: &str,
+    ) -> Self {
         Self {
             id,
             mem_table_location: mem_table_location.to_owned(),
             wal_location: wal_location.to_owned(),
             wal_entries: pb::U64Segment::from(U64Segment::Range(0..0)).encode_to_vec(),
             state: State::Open,
+            owner_id: owner_id.to_owned(),
         }
     }
 
@@ -167,12 +176,12 @@ impl MemWal {
         Ok(())
     }
 
-    pub fn check_expected_mem_table_location(&self, expected: &str) -> lance_core::Result<()> {
-        if self.mem_table_location != expected {
+    pub fn check_expected_owner_id(&self, expected: &str) -> lance_core::Result<()> {
+        if self.owner_id != expected {
             return Err(Error::invalid_input(
                 format!(
-                    "MemWAL {:?} has MemTable location: {}, but expected {}",
-                    self.id, self.mem_table_location, expected
+                    "MemWAL {:?} has owner_id: {}, but expected {}",
+                    self.id, self.owner_id, expected
                 ),
                 location!(),
             ));
