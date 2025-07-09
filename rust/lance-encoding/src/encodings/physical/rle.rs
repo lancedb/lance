@@ -84,31 +84,55 @@ impl RleMiniBlockEncoder {
 
         let bytes_per_value = (bits_per_value / 8) as usize;
 
-        // Global buffers to accumulate all chunks' data
-        let mut all_values = Vec::new();
-        let mut all_lengths = Vec::new();
+        // Pre-allocate global buffers with estimated capacity
+        // Assume average compression ratio of ~10:1 (10 values per run)
+        let estimated_runs = (num_values as usize / 10).max(100);
+        let mut all_values = Vec::with_capacity(estimated_runs * bytes_per_value);
+        let mut all_lengths = Vec::with_capacity(estimated_runs);
         let mut chunks = Vec::new();
 
         let mut offset = 0usize;
         let mut values_remaining = num_values as usize;
 
         while values_remaining > 0 {
-            let (values_bytes, lengths_bytes, num_runs, values_processed, is_last_chunk) =
-                match bits_per_value {
-                    8 => self.encode_chunk_rolling::<u8>(data, offset, values_remaining),
-                    16 => self.encode_chunk_rolling::<u16>(data, offset, values_remaining),
-                    32 => self.encode_chunk_rolling::<u32>(data, offset, values_remaining),
-                    64 => self.encode_chunk_rolling::<u64>(data, offset, values_remaining),
-                    _ => unreachable!("RLE encoding bits_per_value must be 8, 16, 32 or 64"),
-                };
+            let values_start = all_values.len();
+            let lengths_start = all_lengths.len();
+
+            let (_num_runs, values_processed, is_last_chunk) = match bits_per_value {
+                8 => self.encode_chunk_rolling::<u8>(
+                    data,
+                    offset,
+                    values_remaining,
+                    &mut all_values,
+                    &mut all_lengths,
+                ),
+                16 => self.encode_chunk_rolling::<u16>(
+                    data,
+                    offset,
+                    values_remaining,
+                    &mut all_values,
+                    &mut all_lengths,
+                ),
+                32 => self.encode_chunk_rolling::<u32>(
+                    data,
+                    offset,
+                    values_remaining,
+                    &mut all_values,
+                    &mut all_lengths,
+                ),
+                64 => self.encode_chunk_rolling::<u64>(
+                    data,
+                    offset,
+                    values_remaining,
+                    &mut all_values,
+                    &mut all_lengths,
+                ),
+                _ => unreachable!("RLE encoding bits_per_value must be 8, 16, 32 or 64"),
+            };
 
             if values_processed == 0 {
                 break;
             }
-
-            // Append chunk data to global buffers
-            all_values.extend_from_slice(&values_bytes);
-            all_lengths.extend_from_slice(&lengths_bytes);
 
             let log_num_values = if is_last_chunk {
                 0
@@ -120,8 +144,11 @@ impl RleMiniBlockEncoder {
                 values_processed.ilog2() as u8
             };
 
+            let values_size = all_values.len() - values_start;
+            let lengths_size = all_lengths.len() - lengths_start;
+
             let chunk = MiniBlockChunk {
-                buffer_sizes: vec![(num_runs * bytes_per_value) as u16, num_runs as u16],
+                buffer_sizes: vec![values_size as u16, lengths_size as u16],
                 log_num_values,
             };
 
@@ -154,8 +181,6 @@ impl RleMiniBlockEncoder {
     /// - Dynamically determines if this is the last chunk
     ///
     /// # Returns:
-    /// - values_bytes: Buffer containing unique run values
-    /// - lengths_bytes: Buffer containing run lengths (u8)
     /// - num_runs: Number of runs encoded
     /// - values_processed: Number of input values processed
     /// - is_last_chunk: Whether this chunk processed all remaining values
@@ -164,7 +189,9 @@ impl RleMiniBlockEncoder {
         data: &LanceBuffer,
         offset: usize,
         values_remaining: usize,
-    ) -> (Vec<u8>, Vec<u8>, usize, usize, bool)
+        all_values: &mut Vec<u8>,
+        all_lengths: &mut Vec<u8>,
+    ) -> (usize, usize, bool)
     where
         T: bytemuck::Pod + PartialEq + Copy + std::fmt::Debug,
     {
@@ -177,19 +204,19 @@ impl RleMiniBlockEncoder {
         let chunk_end = chunk_start + max_values * type_size;
 
         if chunk_start >= data_slice.len() {
-            return (Vec::new(), Vec::new(), 0, 0, false);
+            return (0, 0, false);
         }
 
         let chunk_data = &data_slice[chunk_start..chunk_end.min(data_slice.len())];
         let typed_data: &[T] = bytemuck::cast_slice(chunk_data);
 
         if typed_data.is_empty() {
-            return (Vec::new(), Vec::new(), 0, 0, false);
+            return (0, 0, false);
         }
 
-        let estimated_runs = (max_values / 10).max(1).min(max_values);
-        let mut values = Vec::with_capacity(estimated_runs * type_size);
-        let mut lengths = Vec::with_capacity(estimated_runs);
+        // Record starting positions for this chunk
+        let values_start = all_values.len();
+        let _lengths_start = all_lengths.len();
 
         let mut current_value = typed_data[0];
         let mut current_length = 1u64;
@@ -224,24 +251,18 @@ impl RleMiniBlockEncoder {
 
                 // Stop if adding this run would exceed byte limit
                 if bytes_used + bytes_needed > MAX_MINIBLOCK_BYTES as usize {
-                    if let Some((val_len, len_len, _, checkpoint_values)) = last_checkpoint_state {
+                    if let Some((val_pos, len_pos, _, checkpoint_values)) = last_checkpoint_state {
                         // Roll back to last power-of-2 checkpoint
-                        values.truncate(val_len);
-                        lengths.truncate(len_len);
-                        return (
-                            values,
-                            lengths,
-                            val_len / type_size,
-                            checkpoint_values,
-                            false,
-                        );
+                        all_values.truncate(val_pos);
+                        all_lengths.truncate(len_pos);
+                        let num_runs = (val_pos - values_start) / type_size;
+                        return (num_runs, checkpoint_values, false);
                     }
                     values_processed -= current_length as usize;
                     break;
                 }
 
-                bytes_used +=
-                    self.add_run(&current_value, current_length, &mut values, &mut lengths);
+                bytes_used += self.add_run(&current_value, current_length, all_values, all_lengths);
                 current_value = value;
                 current_length = 1;
                 values_processed += 1;
@@ -250,8 +271,12 @@ impl RleMiniBlockEncoder {
             if checkpoint_idx < valid_checkpoints.len()
                 && values_processed == valid_checkpoints[checkpoint_idx]
             {
-                last_checkpoint_state =
-                    Some((values.len(), lengths.len(), bytes_used, values_processed));
+                last_checkpoint_state = Some((
+                    all_values.len(),
+                    all_lengths.len(),
+                    bytes_used,
+                    values_processed,
+                ));
                 checkpoint_idx += 1;
             }
         }
@@ -261,7 +286,7 @@ impl RleMiniBlockEncoder {
             let bytes_needed = run_chunks * (type_size + 1);
 
             if bytes_used + bytes_needed <= MAX_MINIBLOCK_BYTES as usize {
-                let _ = self.add_run(&current_value, current_length, &mut values, &mut lengths);
+                let _ = self.add_run(&current_value, current_length, all_values, all_lengths);
             } else {
                 values_processed -= current_length as usize;
             }
@@ -274,28 +299,28 @@ impl RleMiniBlockEncoder {
         if !is_last_chunk {
             if values_processed.is_power_of_two() {
                 // Already at power-of-2 boundary
-            } else if let Some((val_len, len_len, _, checkpoint_values)) = last_checkpoint_state {
+            } else if let Some((val_pos, len_pos, _, checkpoint_values)) = last_checkpoint_state {
                 // Roll back to last valid checkpoint
-                values.truncate(val_len);
-                lengths.truncate(len_len);
-                let num_runs = val_len / type_size;
-                return (values, lengths, num_runs, checkpoint_values, false);
+                all_values.truncate(val_pos);
+                all_lengths.truncate(len_pos);
+                let num_runs = (val_pos - values_start) / type_size;
+                return (num_runs, checkpoint_values, false);
             } else {
                 // No valid checkpoint, can't create a valid chunk
-                return (Vec::new(), Vec::new(), 0, 0, false);
+                return (0, 0, false);
             }
         }
 
-        let num_runs = values.len() / type_size;
-        (values, lengths, num_runs, values_processed, is_last_chunk)
+        let num_runs = (all_values.len() - values_start) / type_size;
+        (num_runs, values_processed, is_last_chunk)
     }
 
     fn add_run<T>(
         &self,
         value: &T,
         length: u64,
-        values: &mut Vec<u8>,
-        lengths: &mut Vec<u8>,
+        all_values: &mut Vec<u8>,
+        all_lengths: &mut Vec<u8>,
     ) -> usize
     where
         T: bytemuck::Pod,
@@ -306,17 +331,17 @@ impl RleMiniBlockEncoder {
         let remainder = (length % 255) as u8;
 
         let total_chunks = num_full_chunks + if remainder > 0 { 1 } else { 0 };
-        values.reserve(total_chunks * type_size);
-        lengths.reserve(total_chunks);
+        all_values.reserve(total_chunks * type_size);
+        all_lengths.reserve(total_chunks);
 
         for _ in 0..num_full_chunks {
-            values.extend_from_slice(value_bytes);
-            lengths.push(255);
+            all_values.extend_from_slice(value_bytes);
+            all_lengths.push(255);
         }
 
         if remainder > 0 {
-            values.extend_from_slice(value_bytes);
-            lengths.push(remainder);
+            all_values.extend_from_slice(value_bytes);
+            all_lengths.push(remainder);
         }
 
         total_chunks * (type_size + 1)
