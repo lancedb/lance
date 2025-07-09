@@ -767,8 +767,17 @@ impl TokenSet {
             return;
         }
 
-        let TokenMap::HashMap(ref mut map) = self.tokens else {
-            return;
+        let mut map = match std::mem::take(&mut self.tokens) {
+            TokenMap::HashMap(map) => map,
+            TokenMap::Fst(map) => {
+                let mut new_map = HashMap::with_capacity(map.len());
+                let mut stream = map.into_stream();
+                while let Some((token, token_id)) = stream.next() {
+                    new_map.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
+                }
+
+                new_map
+            }
         };
 
         map.retain(
@@ -780,6 +789,8 @@ impl TokenSet {
                 }
             },
         );
+
+        self.tokens = TokenMap::HashMap(map);
     }
 
     pub fn next_id(&self) -> u32 {
@@ -2063,6 +2074,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_remap_to_empty_posting_list() {
+        let tmpdir = tempdir().unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
         let mut builder = InnerBuilder::new(0, false);
 
         // index of docs:
@@ -2079,6 +2097,12 @@ mod tests {
         builder.docs.append(0, 1);
         builder.docs.append(1, 1);
         builder.docs.append(2, 1);
+        builder.write(store.as_ref()).await.unwrap();
+
+        let index = InvertedPartition::load(store.clone(), 0, None)
+            .await
+            .unwrap();
+        let mut builder = index.into_builder().await.unwrap();
 
         let mapping = HashMap::from([(0, None), (2, Some(3))]);
         builder.remap(&mapping).await.unwrap();
@@ -2092,12 +2116,6 @@ mod tests {
         assert_eq!(builder.docs.row_id(0), 1);
         assert_eq!(builder.docs.row_id(1), 3);
 
-        let tmpdir = tempdir().unwrap();
-        let store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
-            Arc::new(LanceCache::no_cache()),
-        ));
         builder.write(store.as_ref()).await.unwrap();
 
         // remap to delete all docs
