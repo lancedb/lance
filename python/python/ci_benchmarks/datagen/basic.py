@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 # Creates a dataset containing some basic patterns of synthetic data.
+#
+# Unlike the image EDA dataset (which has similar patterns) this dataset
+# is much smaller and easier to run locally.
 
 import lance
 import pyarrow as pa

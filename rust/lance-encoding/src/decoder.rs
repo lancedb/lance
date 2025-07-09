@@ -232,7 +232,7 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
 use lance_core::{ArrowResult, Error, Result};
-use tracing::{instrument, Instrument};
+use tracing::instrument;
 
 use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
@@ -1388,21 +1388,17 @@ impl BatchDecodeStream {
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
-                let task = tokio::spawn(
-                    (async move {
-                        let next_task = next_task?;
-                        next_task.into_batch(emitted_batch_size_warning)
-                    })
-                    .in_current_span(),
-                );
+                let task = async move {
+                    let next_task = next_task?;
+                    next_task.into_batch(emitted_batch_size_warning)
+                };
                 (task, num_rows)
             });
             next_task.map(|(task, num_rows)| {
-                let task = task.map(|join_wrapper| join_wrapper.unwrap()).boxed();
                 // This should be true since batch size is u32
                 debug_assert!(num_rows <= u32::MAX as u64);
                 let next_task = ReadBatchTask {
-                    task,
+                    task: task.boxed(),
                     num_rows: num_rows as u32,
                 };
                 (next_task, slf)
@@ -1715,18 +1711,17 @@ impl StructuralBatchDecodeStream {
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
-                let task = tokio::spawn(async move {
+                let task = async move {
                     let next_task = next_task?;
                     next_task.into_batch(emitted_batch_size_warning)
-                });
+                };
                 (task, num_rows)
             });
             next_task.map(|(task, num_rows)| {
-                let task = task.map(|join_wrapper| join_wrapper.unwrap()).boxed();
                 // This should be true since batch size is u32
                 debug_assert!(num_rows <= u32::MAX as u64);
                 let next_task = ReadBatchTask {
-                    task,
+                    task: task.boxed(),
                     num_rows: num_rows as u32,
                 };
                 (next_task, slf)

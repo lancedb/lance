@@ -1739,7 +1739,7 @@ impl Scanner {
         filter_plan: &mut FilterPlan,
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
-        let projection = if filter_plan.has_two_steps() {
+        let projection = if filter_plan.has_refine() {
             // If the filter plan has two steps (a scalar indexed portion and a refine portion) then
             // it makes sense to grab cheap columns during the first step to avoid taking them for
             // the second step.
@@ -5701,7 +5701,6 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    #[test_log::test]
     async fn test_plans(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,

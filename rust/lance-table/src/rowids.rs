@@ -35,6 +35,7 @@ pub use serde::{read_row_ids, write_row_ids};
 use snafu::location;
 
 use segment::U64Segment;
+use tracing::instrument;
 
 use crate::utils::LanceIteratorExtension;
 
@@ -351,6 +352,7 @@ impl RowIdSequence {
     ///
     /// This function is useful when determining which row offsets to read from a fragment given
     /// a mask.
+    #[instrument(level = "debug", skip_all)]
     pub fn mask_to_offset_ranges(&self, mask: &RowIdMask) -> Vec<Range<u64>> {
         let mut offset = 0;
         let mut ranges = Vec::new();
