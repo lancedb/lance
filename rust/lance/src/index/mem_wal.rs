@@ -7,10 +7,11 @@ use crate::Dataset;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MemWal, MemWalId, MemWalIndex, MemWalIndexDetails, MEM_WAL_INDEX_NAME};
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::{is_system_index, DatasetIndexExt};
 use lance_table::format::{pb, Index};
 use prost::Message;
 use snafu::location;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -312,9 +313,9 @@ pub(crate) fn update_mem_wal_index_in_indices_list(
     dataset_read_version: u64,
     dataset_new_version: u64,
     indices: &mut Vec<Index>,
-    added: &[MemWal],
-    updated: &[MemWal],
-    removed: &[MemWal],
+    added: Vec<MemWal>,
+    updated: Vec<MemWal>,
+    removed: Vec<MemWal>,
 ) -> Result<()> {
     let new_meta = if let Some(pos) = indices
         .iter()
@@ -330,18 +331,16 @@ pub(crate) fn update_mem_wal_index_in_indices_list(
             .mem_wal_list
             .retain(|m| !removed_set.contains(&m.id));
 
-        // Update the dataset version for added and updated MemWals
-        let mut added_with_version = added.to_vec();
-        for mem_wal in &mut added_with_version {
+        for mut mem_wal in added.into_iter() {
             mem_wal.last_updated_dataset_version = dataset_new_version;
-        }
-        let mut updated_with_version = updated.to_vec();
-        for mem_wal in &mut updated_with_version {
-            mem_wal.last_updated_dataset_version = dataset_new_version;
+            details.mem_wal_list.push(mem_wal);
         }
 
-        details.mem_wal_list.extend(added_with_version);
-        details.mem_wal_list.extend(updated_with_version);
+        for mut mem_wal in updated.into_iter() {
+            mem_wal.last_updated_dataset_version = dataset_new_version;
+            details.mem_wal_list.push(mem_wal);
+        }
+
         new_mem_wal_index_meta(dataset_read_version, details.mem_wal_list)?
     } else {
         // This should only happen with new index creation when opening the first MemWAL
@@ -352,10 +351,10 @@ pub(crate) fn update_mem_wal_index_in_indices_list(
             ));
         }
 
-        // Update the dataset version for added MemWals
-        let mut added_with_version = added.to_vec();
-        for mem_wal in &mut added_with_version {
+        let mut added_with_version = Vec::with_capacity(added.len());
+        for mut mem_wal in added.into_iter() {
             mem_wal.last_updated_dataset_version = dataset_new_version;
+            added_with_version.push(mem_wal);
         }
 
         new_mem_wal_index_meta(dataset_read_version, added_with_version)?
@@ -425,11 +424,28 @@ pub async fn update_mem_wal_owner(
 /// Trim all the MemWALs that are already flushed.
 pub async fn trim_mem_wal_index(dataset: &mut Dataset) -> Result<()> {
     if let Some(mem_wal_index) = dataset.open_mem_wal_index(&NoOpMetricsCollector).await? {
+        let indices = dataset.load_indices().await?;
+
+        // group by name to get the latest version of each index
+        // For delta indices, we take the highest dataset version
+        let mut index_versions = HashMap::new();
+        for index in indices.iter() {
+            if !is_system_index(index) {
+                let current_version = index_versions.entry(index.name.clone()).or_insert(0);
+                *current_version = (*current_version).max(index.dataset_version);
+            }
+        }
+
+        let min_index_dataset_version = index_versions.values().min().copied().unwrap_or(u64::MAX);
+
         let mut removed = Vec::new();
         for (_, generations) in mem_wal_index.mem_wal_map.iter() {
             for (_, mem_wal) in generations.iter() {
                 if mem_wal.state == lance_index::mem_wal::State::Flushed {
-                    removed.push(mem_wal.clone());
+                    // all indices are caught up, can trim it
+                    if mem_wal.last_updated_dataset_version <= min_index_dataset_version {
+                        removed.push(mem_wal.clone());
+                    }
                 }
             }
         }
@@ -531,14 +547,17 @@ pub(crate) fn new_mem_wal_index_meta(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::dataset::{WriteDestination, WriteMode, WriteParams};
+    use crate::index::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::{Float32Type, Int32Type};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datagen::{BatchCount, Dimension, RowCount};
     use lance_index::mem_wal::{MemWalId, MEM_WAL_INDEX_NAME};
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::DatasetIndexExt;
-
-    use super::*;
+    use lance_linalg::distance::MetricType;
 
     #[tokio::test]
     async fn test_advance_mem_wal_generation() {
@@ -1252,7 +1271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_trim_mem_wal_index() {
+    async fn test_trim_mem_wal_index_with_reindex() {
         // Create a dataset with some data
         let mut dataset = lance_datagen::gen()
             .col(
@@ -1321,50 +1340,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify the states before trimming
-        let indices = dataset.load_indices().await.unwrap();
-        let mem_wal_index_meta = indices
-            .iter()
-            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
-            .expect("MemWAL index should exist");
-
-        let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
-        let gen_0 = mem_wal_details
-            .mem_wal_list
-            .iter()
-            .find(|m| m.id.generation == 0)
-            .expect("Generation 0 should exist");
-        let gen_1 = mem_wal_details
-            .mem_wal_list
-            .iter()
-            .find(|m| m.id.generation == 1)
-            .expect("Generation 1 should exist");
-        let gen_2 = mem_wal_details
-            .mem_wal_list
-            .iter()
-            .find(|m| m.id.generation == 2)
-            .expect("Generation 2 should exist");
-
-        assert_eq!(
-            gen_0.state,
-            lance_index::mem_wal::State::Flushed,
-            "Generation 0 should be flushed"
-        );
-        assert_eq!(
-            gen_1.state,
-            lance_index::mem_wal::State::Sealed,
-            "Generation 1 should be sealed but not flushed"
-        );
-        assert_eq!(
-            gen_2.state,
-            lance_index::mem_wal::State::Open,
-            "Generation 2 should be open"
-        );
-
-        // Trim the MemWAL index
+        // Test case 1: No indices exist (besides MemWAL index itself)
+        // Should trim flushed MemWAL since no other indices exist
         trim_mem_wal_index(&mut dataset).await.unwrap();
 
-        // Verify that only flushed MemWALs (generation 0) were removed
         let indices = dataset.load_indices().await.unwrap();
         let mem_wal_index_meta = indices
             .iter()
@@ -1375,7 +1354,7 @@ mod tests {
         assert_eq!(
             mem_wal_details.mem_wal_list.len(),
             2,
-            "Should have 2 generations after trimming"
+            "Should have 2 generations after trimming (no other indices)"
         );
 
         // Verify generation 0 was removed
@@ -1385,30 +1364,36 @@ mod tests {
             .any(|m| m.id.generation == 0);
         assert!(!gen_0_exists, "Generation 0 should be removed");
 
-        // Verify generation 1 and 2 still exist
-        let gen_1 = mem_wal_details
-            .mem_wal_list
-            .iter()
-            .find(|m| m.id.generation == 1)
-            .expect("Generation 1 should still exist");
-        let gen_2 = mem_wal_details
-            .mem_wal_list
-            .iter()
-            .find(|m| m.id.generation == 2)
-            .expect("Generation 2 should still exist");
+        // Test case 2: Create index after MemWAL flush, then flush another generation
+        advance_mem_wal_generation(
+            &mut dataset,
+            "GLOBAL",
+            "mem_table_location_3",
+            "wal_location_3",
+            Some("owner_2"),
+            "owner_3",
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(
-            gen_1.state,
-            lance_index::mem_wal::State::Sealed,
-            "Generation 1 should still be sealed but not flushed"
-        );
-        assert_eq!(
-            gen_2.state,
-            lance_index::mem_wal::State::Open,
-            "Generation 2 should still be open"
-        );
+        // Seal and flush generation 1
+        mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 1, "owner_1")
+            .await
+            .unwrap();
 
-        // Test trimming when no MemWALs are flushed (should do nothing)
+        // Create an index after the MemWAL was flushed
+        dataset
+            .create_index(
+                &["i"],
+                lance_index::IndexType::Scalar,
+                Some("scalar_after".into()),
+                &lance_index::scalar::ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Should trim the flushed MemWAL since the index was created after it
         trim_mem_wal_index(&mut dataset).await.unwrap();
 
         let indices = dataset.load_indices().await.unwrap();
@@ -1421,30 +1406,35 @@ mod tests {
         assert_eq!(
             mem_wal_details.mem_wal_list.len(),
             2,
-            "Should still have 2 generations after second trim"
+            "Should have 2 generations after trimming (index created after MemWAL)"
         );
 
-        // Test with multiple regions
-        advance_mem_wal_generation(
-            &mut dataset,
-            "REGION_A",
-            "mem_table_location_a_0",
-            "wal_location_a_0",
-            None,
-            "owner_0",
-        )
-        .await
-        .unwrap();
+        // Verify generation 1 was removed
+        let gen_1_exists = mem_wal_details
+            .mem_wal_list
+            .iter()
+            .any(|m| m.id.generation == 1);
+        assert!(!gen_1_exists, "Generation 1 should be removed");
 
-        // Seal and flush the region A MemWAL
-        mark_mem_wal_as_sealed(&mut dataset, "REGION_A", 0, "owner_0")
+        // Test case 3: Create index before MemWAL flush
+        // Create another index before flushing the next generation
+        dataset
+            .create_index(
+                &["i"],
+                lance_index::IndexType::Scalar,
+                Some("scalar_before".into()),
+                &lance_index::scalar::ScalarIndexParams::default(),
+                false,
+            )
             .await
             .unwrap();
-        mark_mem_wal_as_flushed(&mut dataset, "REGION_A", 0, "owner_0")
+
+        // Now flush generation 2 (created before the vector index)
+        mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 2, "owner_2")
             .await
             .unwrap();
 
-        // Trim again - should remove the flushed region A MemWAL
+        // Should NOT trim generation 2 since the index was created before it
         trim_mem_wal_index(&mut dataset).await.unwrap();
 
         let indices = dataset.load_indices().await.unwrap();
@@ -1454,23 +1444,143 @@ mod tests {
             .expect("MemWAL index should still exist");
 
         let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
-
-        // Should only have GLOBAL region MemWALs left
-        let global_mem_wals = mem_wal_details
-            .mem_wal_list
-            .iter()
-            .filter(|m| m.id.region == "GLOBAL")
-            .count();
-        assert_eq!(global_mem_wals, 2, "Should have 2 GLOBAL region MemWALs");
-
-        let region_a_mem_wals = mem_wal_details
-            .mem_wal_list
-            .iter()
-            .filter(|m| m.id.region == "REGION_A")
-            .count();
         assert_eq!(
-            region_a_mem_wals, 0,
-            "Should have 0 REGION_A MemWALs after trimming"
+            mem_wal_details.mem_wal_list.len(),
+            2,
+            "Should still have 2 generations (index created before MemWAL, so cannot trim)"
+        );
+
+        // Verify generation 2 still exists
+        let gen_2_exists = mem_wal_details
+            .mem_wal_list
+            .iter()
+            .any(|m| m.id.generation == 2);
+        assert!(gen_2_exists, "Generation 2 should still exist");
+    }
+
+    #[tokio::test]
+    async fn test_trim_mem_wal_index_with_delta_index() {
+        // Create a dataset with enough data for vector index clustering
+        let mut dataset = lance_datagen::gen()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(5), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        // Create initial vector index
+        dataset
+            .create_index(
+                &["vec"],
+                lance_index::IndexType::Vector,
+                Some("vector_index".into()),
+                &VectorIndexParams::ivf_pq(8, 8, 8, MetricType::Cosine, 50),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Create MemWAL index and generation 0
+        advance_mem_wal_generation(
+            &mut dataset,
+            "GLOBAL",
+            "mem_table_location_0",
+            "wal_location_0",
+            None,
+            "owner_0",
+        )
+        .await
+        .unwrap();
+
+        // Seal the MemWAL
+        mark_mem_wal_as_sealed(&mut dataset, "GLOBAL", 0, "owner_0")
+            .await
+            .unwrap();
+
+        // Append new data files to the dataset (without rewriting existing files)
+        let new_data = lance_datagen::gen()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col(
+                "i",
+                lance_datagen::array::step_custom::<Int32Type>(500, 1000),
+            )
+            .into_reader_rows(RowCount::from(100), BatchCount::from(5));
+
+        // Append some new data
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..WriteParams::default()
+        };
+        dataset = Dataset::write(
+            new_data,
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+        // Flush the MemWAL separately
+        mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 0, "owner_0")
+            .await
+            .unwrap();
+
+        // Verify the MemWAL is now flushed
+        let indices = dataset.load_indices().await.unwrap();
+        let mem_wal_index_meta = indices
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+            .expect("MemWAL index should exist");
+        let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
+        assert_eq!(mem_wal_details.mem_wal_list.len(), 1);
+        let mem_wal = &mem_wal_details.mem_wal_list[0];
+        assert_eq!(mem_wal.state, lance_index::mem_wal::State::Flushed);
+
+        // Now use optimize_indices to create delta index (this is how delta indices are actually created)
+        let optimize_options = OptimizeOptions {
+            num_indices_to_merge: 0,
+            ..OptimizeOptions::default()
+        };
+        dataset.optimize_indices(&optimize_options).await.unwrap();
+
+        // Verify we now have multiple indices with the same name (delta indices)
+        let indices = dataset.load_indices().await.unwrap();
+        let vector_indices: Vec<_> = indices
+            .iter()
+            .filter(|idx| idx.name == "vector_index")
+            .collect();
+        assert_eq!(vector_indices.len(), 2);
+        // If we have delta indices, verify they work correctly
+        // Verify the delta index has a higher dataset version than the original
+        let mut versions: Vec<_> = vector_indices
+            .iter()
+            .map(|idx| idx.dataset_version)
+            .collect();
+        versions.sort();
+        assert!(
+            versions[versions.len() - 1] > versions[0],
+            "Latest delta index should have higher dataset version than original"
+        );
+
+        // Now the MemWAL should be trimmed because the delta index was created after the flush
+        // Our logic should take the maximum dataset version for each index name
+        trim_mem_wal_index(&mut dataset).await.unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let mem_wal_index_meta = indices
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+            .expect("MemWAL index should still exist");
+        let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
+        assert_eq!(
+            mem_wal_details.mem_wal_list.len(),
+            0,
+            "MemWAL should be trimmed because delta index was created after flush"
         );
     }
 

@@ -38,6 +38,7 @@ use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
 pub use lance_index::IndexParams;
 use lance_index::{
+    is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
     scalar::inverted::tokenizer::InvertedIndexParams,
 };
@@ -642,7 +643,7 @@ impl DatasetIndexExt for Dataset {
                 indices_to_optimize
                     .as_ref()
                     .is_none_or(|names| names.contains(&idx.name))
-                    && idx.name != FRAG_REUSE_INDEX_NAME
+                    && !is_system_index(idx)
             })
             .map(|idx| (idx.name.clone(), idx))
             .into_group_map();

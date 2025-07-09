@@ -1254,12 +1254,12 @@ impl Transaction {
                         self.read_version,
                         current_manifest.map_or(1, |m| m.version + 1),
                         &mut final_indices,
-                        &[],
-                        &[MemWal {
+                        vec![],
+                        vec![MemWal {
                             state: lance_index::mem_wal::State::Flushed,
                             ..mem_wal_to_flush.clone()
                         }],
-                        &[mem_wal_to_flush.clone()],
+                        vec![mem_wal_to_flush.clone()],
                     )?;
                 }
             }
@@ -1469,9 +1469,9 @@ impl Transaction {
                     self.read_version,
                     current_manifest.map_or(1, |m| m.version + 1),
                     &mut final_indices,
-                    added,
-                    updated,
-                    removed,
+                    added.clone(),
+                    updated.clone(),
+                    removed.clone(),
                 )?;
             }
         };
