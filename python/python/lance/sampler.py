@@ -387,14 +387,14 @@ class ShardedFragmentSampler(FragmentSampler):
         total_size = num_fragments
 
         if self._pad:
-            num_samples_per_replica = math.ceil(num_fragments / self.world_size)
-            total_size = num_samples_per_replica * self.world_size
+            num_samples_per_replica = math.ceil(num_fragments / self._world_size)
+            total_size = num_samples_per_replica * self._world_size
         
         padding_size = total_size - num_fragments
         if padding_size > 0:
             fragments += fragments[:padding_size]
         
-        for i in range(self.rank, total_size, self.world_size):
+        for i in range(self._rank, total_size, self._world_size):
             yield fragments[i]
             
 
