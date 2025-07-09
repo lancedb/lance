@@ -309,7 +309,8 @@ pub async fn mark_mem_wal_as_flushed(
 /// Mark the specific MemWAL as flushed, in the list of indices in the dataset.
 /// This is intended to be used as a part of the Update transaction after resolving all conflicts.
 pub(crate) fn update_mem_wal_index_in_indices_list(
-    dataset_version: u64,
+    dataset_read_version: u64,
+    dataset_new_version: u64,
     indices: &mut Vec<Index>,
     added: &[MemWal],
     updated: &[MemWal],
@@ -328,9 +329,20 @@ pub(crate) fn update_mem_wal_index_in_indices_list(
         details
             .mem_wal_list
             .retain(|m| !removed_set.contains(&m.id));
-        details.mem_wal_list.extend(added.iter().cloned());
-        details.mem_wal_list.extend(updated.iter().cloned());
-        new_mem_wal_index_meta(dataset_version, details.mem_wal_list)?
+
+        // Update the dataset version for added and updated MemWals
+        let mut added_with_version = added.to_vec();
+        for mem_wal in &mut added_with_version {
+            mem_wal.last_updated_dataset_version = dataset_new_version;
+        }
+        let mut updated_with_version = updated.to_vec();
+        for mem_wal in &mut updated_with_version {
+            mem_wal.last_updated_dataset_version = dataset_new_version;
+        }
+
+        details.mem_wal_list.extend(added_with_version);
+        details.mem_wal_list.extend(updated_with_version);
+        new_mem_wal_index_meta(dataset_read_version, details.mem_wal_list)?
     } else {
         // This should only happen with new index creation when opening the first MemWAL
         if !updated.is_empty() || !removed.is_empty() {
@@ -339,7 +351,14 @@ pub(crate) fn update_mem_wal_index_in_indices_list(
                 location!(),
             ));
         }
-        new_mem_wal_index_meta(dataset_version, added.to_vec())?
+
+        // Update the dataset version for added MemWals
+        let mut added_with_version = added.to_vec();
+        for mem_wal in &mut added_with_version {
+            mem_wal.last_updated_dataset_version = dataset_new_version;
+        }
+
+        new_mem_wal_index_meta(dataset_read_version, added_with_version)?
     };
 
     indices.push(new_meta);
@@ -539,6 +558,7 @@ mod tests {
         assert!(!indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME));
 
         // First call to advance_mem_wal_generation should create the MemWAL index and generation 0
+        let initial_version = dataset.manifest.version;
         advance_mem_wal_generation(
             &mut dataset,
             "GLOBAL",
@@ -567,8 +587,10 @@ mod tests {
         assert_eq!(mem_wal.mem_table_location, "mem_table_location_0");
         assert_eq!(mem_wal.wal_location, "wal_location_0");
         assert_eq!(mem_wal.state, lance_index::mem_wal::State::Open);
+        assert_eq!(mem_wal.last_updated_dataset_version, initial_version + 1);
 
         // Second call to advance_mem_wal_generation should seal generation 0 and create generation 1
+        let version_before_second_advance = dataset.manifest.version;
         advance_mem_wal_generation(
             &mut dataset,
             "GLOBAL",
@@ -608,6 +630,11 @@ mod tests {
         assert_eq!(gen_0.mem_table_location, "mem_table_location_0");
         assert_eq!(gen_0.wal_location, "wal_location_0");
         assert_eq!(gen_0.state, lance_index::mem_wal::State::Sealed);
+        // Verify the sealed MemWAL has updated version
+        assert_eq!(
+            gen_0.last_updated_dataset_version,
+            version_before_second_advance + 1
+        );
 
         // Verify generation 1 is unsealed
         assert_eq!(gen_1.id.region, "GLOBAL");
@@ -615,6 +642,11 @@ mod tests {
         assert_eq!(gen_1.mem_table_location, "mem_table_location_1");
         assert_eq!(gen_1.wal_location, "wal_location_1");
         assert_eq!(gen_1.state, lance_index::mem_wal::State::Open);
+        // Verify the new MemWAL has correct version
+        assert_eq!(
+            gen_1.last_updated_dataset_version,
+            version_before_second_advance + 1
+        );
 
         // Test that using the same MemTable location should fail
         let result = advance_mem_wal_generation(
@@ -685,6 +717,7 @@ mod tests {
         assert!(result.is_err(), "Should fail when generation doesn't exist");
 
         // Test success case: append entry to generation 0
+        let version_before_append = dataset.manifest.version;
         append_mem_wal_entry(&mut dataset, "GLOBAL", 0, 123, "owner_0")
             .await
             .unwrap();
@@ -705,11 +738,17 @@ mod tests {
             wal_entries.contains(123),
             "WAL entries should contain entry_id 123"
         );
+        // Verify the MemWAL version was updated after append
+        assert_eq!(
+            mem_wal.last_updated_dataset_version,
+            version_before_append + 1
+        );
 
         // Test appending multiple entries
         append_mem_wal_entry(&mut dataset, "GLOBAL", 0, 456, "owner_0")
             .await
             .unwrap();
+        let version_after_second_append = dataset.manifest.version;
         append_mem_wal_entry(&mut dataset, "GLOBAL", 0, 789, "owner_0")
             .await
             .unwrap();
@@ -736,6 +775,11 @@ mod tests {
         assert!(
             wal_entries.contains(789),
             "WAL entries should contain entry_id 789"
+        );
+        // Verify the MemWAL version was updated after the last append
+        assert_eq!(
+            mem_wal.last_updated_dataset_version,
+            version_after_second_append + 1
         );
 
         // Test failure case: cannot append to sealed MemWAL
@@ -822,6 +866,7 @@ mod tests {
         );
 
         // Test success case: seal generation 0
+        let version_before_seal = dataset.manifest.version;
         mark_mem_wal_as_sealed(&mut dataset, "GLOBAL", 0, "owner_0")
             .await
             .unwrap();
@@ -839,6 +884,11 @@ mod tests {
             mem_wal.state,
             lance_index::mem_wal::State::Sealed,
             "Generation 0 should now be sealed"
+        );
+        // Verify the MemWAL version was updated after sealing
+        assert_eq!(
+            mem_wal.last_updated_dataset_version,
+            version_before_seal + 1
         );
 
         // Create a new generation and test sealing it
@@ -874,6 +924,7 @@ mod tests {
         );
 
         // Seal generation 1
+        let version_before_seal_gen1 = dataset.manifest.version;
         mark_mem_wal_as_sealed(&mut dataset, "GLOBAL", 1, "owner_1")
             .await
             .unwrap();
@@ -896,6 +947,11 @@ mod tests {
             gen_1.state,
             lance_index::mem_wal::State::Sealed,
             "Generation 1 should be sealed"
+        );
+        // Verify the MemWAL version was updated after sealing generation 1
+        assert_eq!(
+            gen_1.last_updated_dataset_version,
+            version_before_seal_gen1 + 1
         );
 
         // Test that sealing an already sealed MemWAL should fail
@@ -996,6 +1052,7 @@ mod tests {
             .unwrap();
 
         // Test success case: mark sealed generation 0 as flushed
+        let version_before_flush = dataset.manifest.version;
         mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 0, "owner_0")
             .await
             .unwrap();
@@ -1013,6 +1070,11 @@ mod tests {
             mem_wal.state,
             lance_index::mem_wal::State::Flushed,
             "Generation 0 should now be flushed"
+        );
+        // Verify the MemWAL version was updated after flushing
+        assert_eq!(
+            mem_wal.last_updated_dataset_version,
+            version_before_flush + 1
         );
 
         // Test failure case: cannot flush already flushed MemWAL
@@ -1111,6 +1173,7 @@ mod tests {
         );
 
         // Test success case: start replay with different MemTable location
+        let version_before_owner_update = dataset.manifest.version;
         update_mem_wal_owner(
             &mut dataset,
             "GLOBAL",
@@ -1134,6 +1197,11 @@ mod tests {
             mem_wal.mem_table_location, "new_mem_table_location",
             "MemTable location should be updated"
         );
+        // Verify the MemWAL version was updated after owner change
+        assert_eq!(
+            mem_wal.last_updated_dataset_version,
+            version_before_owner_update + 1
+        );
 
         // Test success case: can replay generation 1
         advance_mem_wal_generation(
@@ -1147,6 +1215,7 @@ mod tests {
         .await
         .unwrap();
 
+        let version_before_gen1_owner_update = dataset.manifest.version;
         update_mem_wal_owner(
             &mut dataset,
             "GLOBAL",
@@ -1174,6 +1243,11 @@ mod tests {
         assert_eq!(
             gen_1.mem_table_location, "mem_table_location_1",
             "Generation 1 MemTable location should be updated"
+        );
+        // Verify the MemWAL version was updated after generation 1 owner change
+        assert_eq!(
+            gen_1.last_updated_dataset_version,
+            version_before_gen1_owner_update + 1
         );
     }
 

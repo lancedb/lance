@@ -1252,6 +1252,7 @@ impl Transaction {
                 if let Some(mem_wal_to_flush) = mem_wal_to_flush {
                     update_mem_wal_index_in_indices_list(
                         self.read_version,
+                        current_manifest.map_or(1, |m| m.version + 1),
                         &mut final_indices,
                         &[],
                         &[MemWal {
@@ -1466,6 +1467,7 @@ impl Transaction {
             } => {
                 update_mem_wal_index_in_indices_list(
                     self.read_version,
+                    current_manifest.map_or(1, |m| m.version + 1),
                     &mut final_indices,
                     added,
                     updated,

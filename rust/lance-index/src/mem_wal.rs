@@ -105,6 +105,7 @@ pub struct MemWal {
     pub wal_entries: Vec<u8>,
     pub state: State,
     pub owner_id: String,
+    pub last_updated_dataset_version: u64,
 }
 
 impl From<&MemWal> for pb::mem_wal_index_details::MemWal {
@@ -116,6 +117,7 @@ impl From<&MemWal> for pb::mem_wal_index_details::MemWal {
             wal_entries: mem_wal.wal_entries.clone(),
             state: pb::mem_wal_index_details::mem_wal::State::from(mem_wal.state.clone()) as i32,
             owner_id: mem_wal.owner_id.clone(),
+            last_updated_dataset_version: mem_wal.last_updated_dataset_version,
         }
     }
 }
@@ -133,6 +135,7 @@ impl TryFrom<pb::mem_wal_index_details::MemWal> for MemWal {
             wal_entries: mem_wal.wal_entries,
             state,
             owner_id: mem_wal.owner_id,
+            last_updated_dataset_version: mem_wal.last_updated_dataset_version,
         })
     }
 }
@@ -151,6 +154,7 @@ impl MemWal {
             wal_entries: pb::U64Segment::from(U64Segment::Range(0..0)).encode_to_vec(),
             state: State::Open,
             owner_id: owner_id.to_owned(),
+            last_updated_dataset_version: 0, // placeholder, this will be filled during build_manifest
         }
     }
 

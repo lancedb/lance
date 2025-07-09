@@ -490,5 +490,9 @@ message MemWalIndexDetails {
     // it must first atomically update this owner_id to claim ownership.
     // All subsequent operations will fail if the owner_id has changed.
     string owner_id = 6;
+
+    // The dataset version that last updated this MemWAL.
+    // This is set to the new dataset version whenever the MemWAL is created or modified.
+    uint64 last_updated_dataset_version = 7;
   }
 }
