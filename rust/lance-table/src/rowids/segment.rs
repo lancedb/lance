@@ -392,12 +392,8 @@ impl U64Segment {
                 let idx = (val - range.start) as usize;
                 bitmap.get(idx)
             }
-            Self::SortedArray(array) => {
-                array.binary_search(val).is_ok()
-            }
-            Self::Array(array) => {
-                array.iter().any(|v| v == val)
-            }
+            Self::SortedArray(array) => array.binary_search(val).is_ok(),
+            Self::Array(array) => array.iter().any(|v| v == val),
         }
     }
 
@@ -467,40 +463,30 @@ impl U64Segment {
                         start: range.start,
                         end: val + 1,
                     };
-                    let mut new_bitmap =
-                        Bitmap::new_full((new_range.end - new_range.start) as usize);
-
-                    for (idx, is_set) in bitmap.iter().enumerate() {
-                        if !is_set {
-                            new_bitmap.clear(idx);
-                        }
-                    }
+                    let new_bitmap = bitmap
+                        .iter()
+                        .chain(std::iter::once(true))
+                        .collect::<Vec<bool>>();
 
                     Self::RangeWithBitmap {
                         range: new_range,
-                        bitmap: new_bitmap,
+                        bitmap: Bitmap::from(new_bitmap.as_slice()),
                     }
                 } else {
                     let new_range = Range {
                         start: range.start,
                         end: val + 1,
                     };
-                    let mut new_bitmap =
-                        Bitmap::new_full((new_range.end - new_range.start) as usize);
-
-                    for (idx, is_set) in bitmap.iter().enumerate() {
-                        if !is_set {
-                            new_bitmap.clear(idx);
-                        }
-                    }
-
-                    for idx in range.end..val {
-                        new_bitmap.clear((idx - range.start) as usize);
-                    }
+                    let gap_size = (val - range.end) as usize;
+                    let new_bitmap = bitmap
+                        .iter()
+                        .chain(std::iter::repeat_n(false, gap_size))
+                        .chain(std::iter::once(true))
+                        .collect::<Vec<bool>>();
 
                     Self::RangeWithBitmap {
                         range: new_range,
-                        bitmap: new_bitmap,
+                        bitmap: Bitmap::from(new_bitmap.as_slice()),
                     }
                 }
             }
