@@ -257,6 +257,27 @@ impl ReadBatchParams {
         }
     }
 
+    pub fn iter_offset_ranges<'a>(
+        &'a self,
+    ) -> Result<Box<dyn Iterator<Item = Range<u32>> + Send + 'a>> {
+        match self {
+            Self::Indices(indices) => Ok(Box::new(indices.values().iter().map(|i| *i..(*i + 1)))),
+            Self::Range(r) => Ok(Box::new(std::iter::once(r.start as u32..r.end as u32))),
+            Self::Ranges(ranges) => Ok(Box::new(
+                ranges.iter().map(|r| r.start as u32..r.end as u32),
+            )),
+            Self::RangeFull => Err(Error::invalid_input(
+                "cannot materialize RangeFull",
+                location!(),
+            )),
+            Self::RangeTo(r) => Ok(Box::new(std::iter::once(0..r.end as u32))),
+            Self::RangeFrom(_) => Err(Error::invalid_input(
+                "cannot materialize RangeFrom",
+                location!(),
+            )),
+        }
+    }
+
     /// Convert a read range into a vector of row ranges
     pub fn to_ranges(&self) -> Result<Vec<Range<u64>>> {
         match self {

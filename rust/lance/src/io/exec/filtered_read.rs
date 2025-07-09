@@ -372,7 +372,10 @@ impl FilteredReadStream {
         .await?;
 
         let fragment_streams = futures::stream::iter(scoped_fragments)
-            .map(Self::read_fragment)
+            .map(|scoped_fragment| {
+                tokio::task::spawn(Self::read_fragment(scoped_fragment))
+                    .map(|thread_result| thread_result.unwrap())
+            })
             .buffered(fragment_readahead);
         let task_stream = fragment_streams.try_flatten().boxed();
 
@@ -480,6 +483,8 @@ impl FilteredReadStream {
                     .applicable_fragments
                     .contains(fragment.id() as u32)
                 {
+                    let _span =
+                        tracing::span!(tracing::Level::DEBUG, "apply_index_result").entered();
                     // There is an index result, and it applies to this fragment, so we can maybe
                     // reduce the amount of data we read, and we can potentially push the scan range
                     // down
@@ -571,6 +576,7 @@ impl FilteredReadStream {
         Ok(scoped_fragments)
     }
 
+    #[instrument(level = "debug", skip_all)]
     fn filter_deleted_rows(
         ranges: Vec<Range<u64>>,
         deletion_vector: &Arc<DeletionVector>,
@@ -582,7 +588,7 @@ impl FilteredReadStream {
         .collect()
     }
 
-    #[instrument(skip_all)]
+    #[instrument(level = "debug", skip_all)]
     fn full_frag_range(
         num_physical_rows: u64,
         deletion_vector: &Option<Arc<DeletionVector>>,
@@ -632,7 +638,7 @@ impl FilteredReadStream {
         (to_skip, to_take)
     }
 
-    #[instrument(skip_all)]
+    #[instrument(level = "debug", skip_all)]
     fn trim_ranges(
         physical_ranges: Vec<Range<u64>>,
         logical_position: Range<u64>,
