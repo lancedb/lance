@@ -17,14 +17,10 @@ use std::sync::Arc;
 
 pub const MEM_WAL_INDEX_NAME: &str = "__lance_mem_wal";
 
-/// Represents the state of a MemWAL in its lifecycle
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Serialize, Deserialize, DeepSizeOf)]
 pub enum State {
-    /// MemWAL is open and accepting new entries
     Open,
-    /// MemWAL has been sealed and no longer accepts new entries
     Sealed,
-    /// MemWAL has been flushed to the source Lance table
     Flushed,
 }
 
@@ -242,7 +238,8 @@ impl MemWalIndex {
 
 #[derive(Serialize)]
 struct MemWalStatistics {
-    num_mem_wal: usize,
+    num_mem_wal: u64,
+    num_regions: u64,
 }
 
 #[async_trait]
@@ -264,7 +261,8 @@ impl Index for MemWalIndex {
 
     fn statistics(&self) -> lance_core::Result<serde_json::Value> {
         let stats = MemWalStatistics {
-            num_mem_wal: self.mem_wal_map.values().map(|m| m.len()).sum(),
+            num_mem_wal: self.mem_wal_map.values().map(|m| m.len()).sum::<usize>() as u64,
+            num_regions: self.mem_wal_map.len() as u64,
         };
         serde_json::to_value(stats).map_err(|e| Error::Internal {
             message: format!("failed to serialize MemWAL index statistics: {}", e),
