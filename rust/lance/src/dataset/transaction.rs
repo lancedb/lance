@@ -870,8 +870,21 @@ impl PartialEq for Operation {
             (Self::UpdateMemWalState { .. }, Self::DataReplacement { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
-            (Self::UpdateMemWalState { .. }, Self::UpdateMemWalState { .. }) => {
-                std::mem::discriminant(self) == std::mem::discriminant(other)
+            (
+                Self::UpdateMemWalState {
+                    added: a_added,
+                    updated: a_updated,
+                    removed: a_removed,
+                },
+                Self::UpdateMemWalState {
+                    added: b_added,
+                    updated: b_updated,
+                    removed: b_removed,
+                },
+            ) => {
+                compare_vec(a_added, b_added)
+                    && compare_vec(a_updated, b_updated)
+                    && compare_vec(a_removed, b_removed)
             }
         }
     }

@@ -458,48 +458,100 @@ impl U64Segment {
                 }
             }
             Self::RangeWithBitmap { range, bitmap } => {
-                if val == range.end {
-                    let new_range = Range {
-                        start: range.start,
-                        end: val + 1,
-                    };
-                    let new_bitmap = bitmap
-                        .iter()
-                        .chain(std::iter::once(true))
-                        .collect::<Vec<bool>>();
+                let new_range = Range {
+                    start: range.start,
+                    end: val + 1,
+                };
+                let gap_size = (val - range.end) as usize;
+                let new_bitmap = bitmap
+                    .iter()
+                    .chain(std::iter::repeat_n(false, gap_size))
+                    .chain(std::iter::once(true))
+                    .collect::<Vec<bool>>();
 
-                    Self::RangeWithBitmap {
-                        range: new_range,
-                        bitmap: Bitmap::from(new_bitmap.as_slice()),
-                    }
-                } else {
-                    let new_range = Range {
-                        start: range.start,
-                        end: val + 1,
-                    };
-                    let gap_size = (val - range.end) as usize;
-                    let new_bitmap = bitmap
-                        .iter()
-                        .chain(std::iter::repeat_n(false, gap_size))
-                        .chain(std::iter::once(true))
-                        .collect::<Vec<bool>>();
-
-                    Self::RangeWithBitmap {
-                        range: new_range,
-                        bitmap: Bitmap::from(new_bitmap.as_slice()),
-                    }
+                Self::RangeWithBitmap {
+                    range: new_range,
+                    bitmap: Bitmap::from(new_bitmap.as_slice()),
                 }
             }
-            Self::SortedArray(array) => {
-                let mut new_array = array.iter().collect::<Vec<u64>>();
-                new_array.push(val);
-                Self::SortedArray(EncodedU64Array::U64(new_array))
-            }
-            Self::Array(array) => {
-                let mut new_array = array.iter().collect::<Vec<u64>>();
-                new_array.push(val);
-                Self::Array(EncodedU64Array::U64(new_array))
-            }
+            Self::SortedArray(array) => match array {
+                EncodedU64Array::U64(mut vec) => {
+                    vec.push(val);
+                    Self::SortedArray(EncodedU64Array::U64(vec))
+                }
+                EncodedU64Array::U16 { base, offsets } => {
+                    if let Some(offset) = val.checked_sub(base) {
+                        if offset <= u16::MAX as u64 {
+                            let mut offsets = offsets;
+                            offsets.push(offset as u16);
+                            return Ok(Self::SortedArray(EncodedU64Array::U16 { base, offsets }));
+                        } else if offset <= u32::MAX as u64 {
+                            let mut u32_offsets: Vec<u32> =
+                                offsets.into_iter().map(|o| o as u32).collect();
+                            u32_offsets.push(offset as u32);
+                            return Ok(Self::SortedArray(EncodedU64Array::U32 {
+                                base,
+                                offsets: u32_offsets,
+                            }));
+                        }
+                    }
+                    let mut new_array: Vec<u64> =
+                        offsets.into_iter().map(|o| base + o as u64).collect();
+                    new_array.push(val);
+                    Self::SortedArray(EncodedU64Array::from(new_array))
+                }
+                EncodedU64Array::U32 { base, mut offsets } => {
+                    if let Some(offset) = val.checked_sub(base) {
+                        if offset <= u32::MAX as u64 {
+                            offsets.push(offset as u32);
+                            return Ok(Self::SortedArray(EncodedU64Array::U32 { base, offsets }));
+                        }
+                    }
+                    let mut new_array: Vec<u64> =
+                        offsets.into_iter().map(|o| base + o as u64).collect();
+                    new_array.push(val);
+                    Self::SortedArray(EncodedU64Array::from(new_array))
+                }
+            },
+            Self::Array(array) => match array {
+                EncodedU64Array::U64(mut vec) => {
+                    vec.push(val);
+                    Self::Array(EncodedU64Array::U64(vec))
+                }
+                EncodedU64Array::U16 { base, offsets } => {
+                    if let Some(offset) = val.checked_sub(base) {
+                        if offset <= u16::MAX as u64 {
+                            let mut offsets = offsets;
+                            offsets.push(offset as u16);
+                            return Ok(Self::Array(EncodedU64Array::U16 { base, offsets }));
+                        } else if offset <= u32::MAX as u64 {
+                            let mut u32_offsets: Vec<u32> =
+                                offsets.into_iter().map(|o| o as u32).collect();
+                            u32_offsets.push(offset as u32);
+                            return Ok(Self::Array(EncodedU64Array::U32 {
+                                base,
+                                offsets: u32_offsets,
+                            }));
+                        }
+                    }
+                    let mut new_array: Vec<u64> =
+                        offsets.into_iter().map(|o| base + o as u64).collect();
+                    new_array.push(val);
+                    Self::Array(EncodedU64Array::from(new_array))
+                }
+                EncodedU64Array::U32 { base, mut offsets } => {
+                    if let Some(offset) = val.checked_sub(base) {
+                        if offset <= u32::MAX as u64 {
+                            offsets.push(offset as u32);
+                            return Ok(Self::Array(EncodedU64Array::U32 { base, offsets }));
+                        }
+                    }
+                    let mut new_array: Vec<u64> =
+                        offsets.into_iter().map(|o| base + o as u64).collect();
+                    new_array.push(val);
+                    Self::Array(EncodedU64Array::from(new_array))
+                }
+            },
         })
     }
 

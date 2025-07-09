@@ -1026,14 +1026,13 @@ impl<'a> TransactionRebase<'a> {
                 Operation::UpdateMemWalState {
                     added: committed_added,
                     updated: committed_updated,
-                    removed: committed_removed,
+                    removed: _,
                 } => {
                     // 1. if the current or last committed job is trimming flushed MemWALs,
                     // it is compatible with any other UpdateMemWalState commits
                     if (committed_added.is_empty()
-                        && committed_updated.is_empty()
-                        && !committed_removed.is_empty())
-                        || (added.is_empty() && updated.is_empty() && !removed.is_empty())
+                        && committed_updated.is_empty())
+                        || (added.is_empty() && updated.is_empty())
                     {
                         return Ok(());
                     }
@@ -1069,6 +1068,9 @@ impl<'a> TransactionRebase<'a> {
                     mem_wal_to_flush, ..
                 } => {
                     if mem_wal_to_flush.is_some() {
+                        // TODO: This check could be more detailed, there is an assumption that
+                        //  once a MemWAL is sealed, there is no other operation that could change
+                        //  the state back to open, and at that point it can always be flushed.
                         Ok(())
                     } else {
                         Err(self.incompatible_conflict_err(
@@ -1107,14 +1109,14 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if !committed.is_empty() {
-            if committed.is_empty() || to_commit.is_empty() {
+            if to_commit.is_empty() {
                 return Ok(());
             }
 
             if committed.len() > 1 {
                 return Err(Error::Internal {
                     message: format!(
-                        "Committing MemWALs is not supported, but found committed: {:?}",
+                        "Committing multiple MemWALs is not supported, but found committed: {:?}",
                         committed
                     ),
                     location: location!(),
@@ -1124,7 +1126,7 @@ impl<'a> TransactionRebase<'a> {
             if to_commit.len() > 1 {
                 return Err(Error::NotSupported {
                     source: format!(
-                        "Committing MemWALs is not supported, but found attempt to commit: {:?}",
+                        "Committing multiple MemWALs is not supported, but found attempt to commit: {:?}",
                         to_commit
                     )
                     .into(),
@@ -1132,16 +1134,14 @@ impl<'a> TransactionRebase<'a> {
                 });
             }
 
-            if let (Some(committed_mem_wal), Some(to_commit_mem_wal)) =
-                (committed.first(), to_commit.first())
-            {
-                if committed_mem_wal.id == to_commit_mem_wal.id {
-                    return Err(self.incompatible_conflict_err(
-                        other_transaction,
-                        other_version,
-                        location!(),
-                    ));
-                }
+            let committed_mem_wal = committed.first().unwrap();
+            let to_commit_mem_wal = to_commit.first().unwrap();
+            if committed_mem_wal.id == to_commit_mem_wal.id {
+                return Err(self.incompatible_conflict_err(
+                    other_transaction,
+                    other_version,
+                    location!(),
+                ));
             }
         }
 
