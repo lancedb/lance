@@ -5,6 +5,7 @@ use log::trace;
 
 use crate::{
     buffer::LanceBuffer,
+    compression::MiniBlockDecompressor,
     data::DataBlock,
     encodings::{
         logical::primitive::miniblock::{MiniBlockCompressed, MiniBlockCompressor},
@@ -83,20 +84,17 @@ impl MiniBlockCompressor for CompressedMiniBlockCompressor {
 /// compression (LZ4, Zstd) and then delegates to an inner miniblock decompressor.
 #[derive(Debug)]
 pub struct CompressedMiniBlockDecompressor {
-    inner: Box<dyn crate::compression::MiniBlockDecompressor>,
+    inner: Box<dyn MiniBlockDecompressor>,
     compression: CompressionConfig,
 }
 
 impl CompressedMiniBlockDecompressor {
-    pub fn new(
-        inner: Box<dyn crate::compression::MiniBlockDecompressor>,
-        compression: CompressionConfig,
-    ) -> Self {
+    pub fn new(inner: Box<dyn MiniBlockDecompressor>, compression: CompressionConfig) -> Self {
         Self { inner, compression }
     }
 }
 
-impl crate::compression::MiniBlockDecompressor for CompressedMiniBlockDecompressor {
+impl MiniBlockDecompressor for CompressedMiniBlockDecompressor {
     fn decompress(&self, mut data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         // Create the buffer decompressor based on compression scheme
         let decompressor = GeneralBufferCompressor::get_compressor(self.compression);
@@ -123,9 +121,11 @@ impl crate::compression::MiniBlockDecompressor for CompressedMiniBlockDecompress
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
     use crate::data::{BlockInfo, FixedWidthDataBlock};
     use crate::encodings::physical::block::CompressionScheme;
     use crate::encodings::physical::rle::RleMiniBlockEncoder;
+    use crate::encodings::physical::value::ValueEncoder;
 
     #[test]
     fn test_compressed_miniblock_with_rle() {
@@ -229,8 +229,6 @@ mod tests {
 
     #[test]
     fn test_compressed_mini_block_round_trip() {
-        use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
-
         // Create test data with repetitive patterns that compress well
         // Need enough data to trigger compression (>= 1024 bytes)
         let mut values = Vec::with_capacity(2048);
@@ -259,15 +257,6 @@ mod tests {
 
         // Compress the data
         let (compressed, encoding) = compressor.compress(block).unwrap();
-
-        println!(
-            "Test: Compressed data has {} buffers",
-            compressed.data.len()
-        );
-        for (i, buf) in compressed.data.iter().enumerate() {
-            println!("  Buffer {}: {} bytes", i, buf.len());
-        }
-        println!("Encoding type: {:?}", encoding);
 
         // Create decompressor using the encoding
         let decompression_strategy = DefaultDecompressionStrategy::default();
@@ -343,8 +332,6 @@ mod tests {
     #[test]
     fn test_compressed_mini_block_large_buffers() {
         // Use value encoding which doesn't compress data, ensuring large buffers
-        use crate::encodings::physical::value::ValueEncoder;
-
         // Create 1024 i32 values (4KB of data)
         let values: Vec<i32> = (0..1024).collect();
         let data = LanceBuffer::from_bytes(

@@ -379,37 +379,42 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     block::CompressionScheme,
                     compressed_mini_block::CompressedMiniBlockDecompressor,
                 };
-                
+
                 // Create inner decompressor
                 let inner_decompressor = self.create_miniblock_decompressor(
-                    compressed.inner.as_ref().ok_or_else(|| Error::invalid_input(
-                        "CompressedMiniBlock missing inner encoding",
-                        location!(),
-                    ))?,
+                    compressed.inner.as_ref().ok_or_else(|| {
+                        Error::invalid_input(
+                            "CompressedMiniBlock missing inner encoding",
+                            location!(),
+                        )
+                    })?,
                 )?;
-                
+
                 // Parse compression config
-                let compression = compressed.compression.as_ref()
-                    .ok_or_else(|| Error::invalid_input(
-                        "CompressedMiniBlock missing compression config", 
+                let compression = compressed.compression.as_ref().ok_or_else(|| {
+                    Error::invalid_input(
+                        "CompressedMiniBlock missing compression config",
                         location!(),
-                    ))?;
-                
+                    )
+                })?;
+
                 let scheme = match compression.scheme.as_str() {
                     "lz4" => CompressionScheme::Lz4,
                     "zstd" => CompressionScheme::Zstd,
                     "none" => CompressionScheme::None,
-                    other => return Err(Error::invalid_input(
-                        format!("Unknown compression scheme: {}", other),
-                        location!(),
-                    )),
+                    other => {
+                        return Err(Error::invalid_input(
+                            format!("Unknown compression scheme: {}", other),
+                            location!(),
+                        ))
+                    }
                 };
-                
+
                 let compression_config = crate::encodings::physical::block::CompressionConfig::new(
                     scheme,
                     compression.level,
                 );
-                
+
                 Ok(Box::new(CompressedMiniBlockDecompressor::new(
                     inner_decompressor,
                     compression_config,
