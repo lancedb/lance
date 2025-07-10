@@ -102,7 +102,7 @@ use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
 use super::rowids::load_row_id_sequences;
 use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
-use super::utils::make_rowid_capture_stream;
+use super::utils::make_rowaddr_capture_stream;
 use super::{write_fragments_internal, WriteMode, WriteParams};
 
 pub mod remapping;
@@ -687,9 +687,9 @@ async fn rewrite_files(
         .scan_in_order(true);
     let (row_ids, reader) = if needs_remapping {
         let row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
-        scanner.with_row_id();
+        scanner.with_row_address();
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
-        let data_no_row_ids = make_rowid_capture_stream(row_ids.clone(), data)?;
+        let data_no_row_ids = make_rowaddr_capture_stream(row_ids.clone(), data)?;
         (Some(row_ids), data_no_row_ids)
     } else {
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
