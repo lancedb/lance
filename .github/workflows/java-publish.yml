@@ -82,7 +82,7 @@ jobs:
             source \$HOME/.cargo/env
             cargo --version
             
-            cd java
+            cd java/core/lance-jni
             
             # https://github.com/rustls/rustls/issues/1967
             export CC=clang
@@ -94,7 +94,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: liblance_jni_linux_arm_64.zip
-          path: target/release/liblance_jni.so
+          path: java/core/lance-jni/target/release/liblance_jni.so
           retention-days: 1
           if-no-files-found: error
   linux-x86:
@@ -156,7 +156,7 @@ jobs:
             source \$HOME/.cargo/env
             cargo --version
           
-            cd java
+            cd java/core/lance-jni
           
             # https://github.com/rustls/rustls/issues/1967
             export CC=clang
@@ -168,7 +168,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: liblance_jni_linux_x86_64.zip
-          path: target/release/liblance_jni.so
+          path: java/core/lance-jni/target/release/liblance_jni.so
           retention-days: 1
           if-no-files-found: error
   macos-arm64:
