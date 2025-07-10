@@ -35,48 +35,41 @@ const MIN_BUFFER_SIZE_FOR_COMPRESSION: usize = 256;
 impl MiniBlockCompressor for CompressedMiniBlockCompressor {
     fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)> {
         // First, compress with the inner compressor
-        let (mut compressed, inner_encoding) = self.inner.compress(page)?;
+        let (mut inner_compressed, inner_encoding) = self.inner.compress(page)?;
 
-        // Most miniblock encoders produce 2 buffers (values and lengths)
-        // but some like ValueEncoder may produce only 1 buffer
-
-        // Check if any buffer is large enough to warrant compression
-        let should_compress = compressed
-            .data
-            .iter()
-            .all(|v| v.len() >= MIN_BUFFER_SIZE_FOR_COMPRESSION);
-
-        // Return the original encoding without compression
-        if !should_compress {
-            return Ok((compressed, inner_encoding));
+        // Return the original encoding without compression if the first buffer is
+        // not large enough
+        if inner_compressed.data[0].len() < MIN_BUFFER_SIZE_FOR_COMPRESSION {
+            return Ok((inner_compressed, inner_encoding));
         }
 
         let compressor = GeneralBufferCompressor::get_compressor(self.compression);
 
-        for (i, buffer) in compressed.data.iter_mut().enumerate() {
-            assert!(!buffer.is_empty(), "buffer must have valid content");
+        let mut compressed_buffer = Vec::new();
+        compressor.compress(&inner_compressed.data[0], &mut compressed_buffer)?;
 
-            let mut compressed_buffer = Vec::new();
-            compressor.compress(buffer.as_ref(), &mut compressed_buffer)?;
+        let original_size = inner_compressed.data[0].len();
+        let compressed_size = compressed_buffer.len();
 
-            let original_size = buffer.len();
-            let compressed_size = compressed_buffer.len();
-
-            trace!(
-                "Buffer {} compressed from {} to {} bytes (ratio: {:.2})",
-                i,
-                original_size,
-                compressed_size,
-                compressed_size as f32 / original_size as f32
-            );
-
-            // Update buffer only - chunks don't need updating since they reference global buffers
-            *buffer = LanceBuffer::from(compressed_buffer);
+        // If original_size is smaller than compressed_size, we just return the
+        // not compressed one.
+        if original_size <= compressed_size {
+            return Ok((inner_compressed, inner_encoding));
         }
+
+        trace!(
+            "Buffer compressed from {} to {} bytes (ratio: {:.2})",
+            original_size,
+            compressed_size,
+            compressed_size as f32 / original_size as f32
+        );
+
+        // Update buffer only - chunks don't need updating since they reference global buffers
+        inner_compressed.data[0] = LanceBuffer::from(compressed_buffer);
 
         // Return compressed encoding
         let encoding = ProtobufUtils::compressed_mini_block(inner_encoding, self.compression);
-        Ok((compressed, encoding))
+        Ok((inner_compressed, encoding))
     }
 }
 
@@ -99,22 +92,13 @@ impl MiniBlockDecompressor for CompressedMiniBlockDecompressor {
         // Create the buffer decompressor based on compression scheme
         let decompressor = GeneralBufferCompressor::get_compressor(self.compression);
 
-        // Decompress all buffers
-        let mut decompressed_buffers = Vec::with_capacity(data.len());
-        for buffer in data.iter_mut() {
-            // Handle empty buffers
-            if buffer.is_empty() {
-                decompressed_buffers.push(LanceBuffer::empty());
-                continue;
-            }
-
-            let mut decompressed = Vec::new();
-            decompressor.decompress(buffer.as_ref(), &mut decompressed)?;
-            decompressed_buffers.push(LanceBuffer::from(decompressed));
-        }
+        // Decompress only the first buffer, keep others as-is
+        let mut decompressed = Vec::new();
+        decompressor.decompress(&data[0], &mut decompressed)?;
+        data[0] = LanceBuffer::from(decompressed);
 
         // Delegate to the inner decompressor
-        self.inner.decompress(decompressed_buffers, num_values)
+        self.inner.decompress(data, num_values)
     }
 }
 
