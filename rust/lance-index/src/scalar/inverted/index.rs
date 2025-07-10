@@ -2136,7 +2136,7 @@ mod tests {
         builder.docs.append(2, 1);
         builder.write(store.as_ref()).await.unwrap();
 
-        let index = InvertedPartition::load(store.clone(), 0, None)
+        let index = InvertedPartition::load(store.clone(), 0, None, LanceCache::no_cache())
             .await
             .unwrap();
         let mut builder = index.into_builder().await.unwrap();

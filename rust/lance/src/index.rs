@@ -94,12 +94,12 @@ use crate::{dataset::Dataset, Error, Result};
 // Cache keys for different index types
 #[derive(Debug, Clone)]
 pub struct ScalarIndexCacheKey<'a> {
-    pub uuid: &'a Uuid,
+    pub uuid: &'a str,
     pub fri_uuid: Option<&'a Uuid>,
 }
 
 impl<'a> ScalarIndexCacheKey<'a> {
-    pub fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
+    pub fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
         Self { uuid, fri_uuid }
     }
 }
@@ -111,19 +111,19 @@ impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
         if let Some(fri_uuid) = self.fri_uuid {
             format!("{}-{}", self.uuid, fri_uuid).into()
         } else {
-            self.uuid.to_string().into()
+            self.uuid.into()
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct VectorIndexCacheKey<'a> {
-    pub uuid: &'a Uuid,
+    pub uuid: &'a str,
     pub fri_uuid: Option<&'a Uuid>,
 }
 
 impl<'a> VectorIndexCacheKey<'a> {
-    pub fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
+    pub fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
         Self { uuid, fri_uuid }
     }
 }
@@ -135,19 +135,19 @@ impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
         if let Some(fri_uuid) = self.fri_uuid {
             format!("{}-{}", self.uuid, fri_uuid).into()
         } else {
-            self.uuid.to_string().into()
+            self.uuid.into()
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct FragReuseIndexCacheKey<'a> {
-    pub uuid: &'a Uuid,
+    pub uuid: &'a str,
     pub fri_uuid: Option<&'a Uuid>,
 }
 
 impl<'a> FragReuseIndexCacheKey<'a> {
-    pub fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
+    pub fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
         Self { uuid, fri_uuid }
     }
 }
@@ -159,7 +159,7 @@ impl CacheKey for FragReuseIndexCacheKey<'_> {
         if let Some(fri_uuid) = self.fri_uuid {
             format!("{}-{}", self.uuid, fri_uuid).into()
         } else {
-            self.uuid.to_string().into()
+            self.uuid.into()
         }
     }
 }
@@ -1047,22 +1047,17 @@ impl DatasetIndexInternalExt for Dataset {
     ) -> Result<Arc<dyn Index>> {
         // Checking for cache existence is cheap so we just check both scalar and vector caches
         let frag_reuse_uuid = self.frag_reuse_index_uuid();
-        let uuid_parsed = Uuid::parse_str(uuid).map_err(|_| Error::Index {
-            message: format!("Invalid UUID format: {}", uuid),
-            location: location!(),
-        })?;
-        let cache_key = ScalarIndexCacheKey::new(&uuid_parsed, frag_reuse_uuid.as_ref());
+        let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key) {
             return Ok(index.as_index());
         }
 
-        let vector_cache_key = VectorIndexCacheKey::new(&uuid_parsed, frag_reuse_uuid.as_ref());
+        let vector_cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&vector_cache_key) {
             return Ok(index.as_index());
         }
 
-        let frag_reuse_cache_key =
-            FragReuseIndexCacheKey::new(&uuid_parsed, frag_reuse_uuid.as_ref());
+        let frag_reuse_cache_key = FragReuseIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&frag_reuse_cache_key) {
             return Ok(index.as_index());
         }
@@ -1093,11 +1088,7 @@ impl DatasetIndexInternalExt for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let frag_reuse_uuid = self.frag_reuse_index_uuid();
-        let uuid_parsed = Uuid::parse_str(uuid).map_err(|_| Error::Index {
-            message: format!("Invalid UUID format: {}", uuid),
-            location: location!(),
-        })?;
-        let cache_key = ScalarIndexCacheKey::new(&uuid_parsed, frag_reuse_uuid.as_ref());
+        let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key) {
             return Ok(index);
         }
@@ -1124,11 +1115,7 @@ impl DatasetIndexInternalExt for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
         let frag_reuse_uuid = self.frag_reuse_index_uuid();
-        let uuid_parsed = Uuid::parse_str(uuid).map_err(|_| Error::Index {
-            message: format!("Invalid UUID format: {}", uuid),
-            location: location!(),
-        })?;
-        let cache_key = VectorIndexCacheKey::new(&uuid_parsed, frag_reuse_uuid.as_ref());
+        let cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
 
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key) {
             log::debug!("Found vector index in cache uuid: {}", uuid);
