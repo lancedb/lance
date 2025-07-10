@@ -161,6 +161,8 @@ message Transaction {
     repeated DataFragment new_fragments = 3;
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;
+    /// The MemWAL (pre-image) that should be marked as flushed after this transaction
+    MemWalIndexDetails.MemWal mem_wal_to_flush = 5;
   }
   
   // An operation that updates the table config.
@@ -185,6 +187,17 @@ message Transaction {
     repeated DataReplacementGroup replacements = 1;
   }
 
+  // Update the state of the MemWal index
+  message UpdateMemWalState {
+
+    repeated MemWalIndexDetails.MemWal added = 1;
+
+    repeated MemWalIndexDetails.MemWal updated = 2;
+
+    // If a MemWAL is updated, its pre-image should be in the removed list.
+    repeated MemWalIndexDetails.MemWal removed = 3;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -199,6 +212,7 @@ message Transaction {
     Project project = 109;
     UpdateConfig update_config = 110;
     DataReplacement data_replacement = 111;
+    UpdateMemWalState update_mem_wal_state = 112;
   }
 
   // An operation to apply to the blob dataset
