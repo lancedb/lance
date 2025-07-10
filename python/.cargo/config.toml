@@ -9,10 +9,6 @@ debug = true
 codegen-units = 16
 lto = "thin"
 
-# Share target directory with main project.
-[build]
-target-dir = "../target"
-
 [target.'cfg(all())']
 rustflags = [
     "-Wclippy::all",
