@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use log::trace;
+use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,
@@ -32,10 +33,99 @@ impl CompressedMiniBlockCompressor {
 /// Minimum buffer size to consider for compression
 const MIN_BUFFER_SIZE_FOR_COMPRESSION: usize = 256;
 
+use super::super::logical::primitive::miniblock::MiniBlockChunk;
+
+/// Encode chunks into a simple binary format
+/// Format: [chunk_count(u32)][chunk1][chunk2]...
+/// Each chunk: [buffer_count(u16)][buffer_sizes...][log_num_values(u8)]
+fn encode_chunks(chunks: &[MiniBlockChunk]) -> Vec<u8> {
+    let mut result = Vec::new();
+
+    // Write chunk count
+    result.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+
+    // Write each chunk
+    for chunk in chunks {
+        // Buffer count
+        result.extend_from_slice(&(chunk.buffer_sizes.len() as u16).to_le_bytes());
+        // Each buffer size
+        for &size in &chunk.buffer_sizes {
+            result.extend_from_slice(&size.to_le_bytes());
+        }
+        // log_num_values
+        result.push(chunk.log_num_values);
+    }
+
+    result
+}
+
+/// Decode chunks from binary format
+fn decode_chunks(data: &[u8]) -> Result<Vec<MiniBlockChunk>> {
+    use lance_core::Error;
+
+    let mut offset = 0;
+
+    // Read chunk count
+    if data.len() < 4 {
+        return Err(Error::io(
+            "Invalid chunk encoding: insufficient data for chunk count".to_string(),
+            location!(),
+        ));
+    }
+    let chunk_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    offset += 4;
+
+    let mut chunks = Vec::with_capacity(chunk_count);
+
+    // Read each chunk
+    for _ in 0..chunk_count {
+        // Read buffer count
+        if offset + 2 > data.len() {
+            return Err(Error::io(
+                "Invalid chunk encoding: insufficient data for buffer count".to_string(),
+                location!(),
+            ));
+        }
+        let buffer_count = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+
+        // Read buffer sizes
+        let mut buffer_sizes = Vec::with_capacity(buffer_count);
+        for _ in 0..buffer_count {
+            if offset + 2 > data.len() {
+                return Err(Error::io(
+                    "Invalid chunk encoding: insufficient data for buffer size".to_string(),
+                    location!(),
+                ));
+            }
+            let size = u16::from_le_bytes([data[offset], data[offset + 1]]);
+            buffer_sizes.push(size);
+            offset += 2;
+        }
+
+        // Read log_num_values
+        if offset >= data.len() {
+            return Err(Error::io(
+                "Invalid chunk encoding: insufficient data for log_num_values".to_string(),
+                location!(),
+            ));
+        }
+        let log_num_values = data[offset];
+        offset += 1;
+
+        chunks.push(MiniBlockChunk {
+            buffer_sizes,
+            log_num_values,
+        });
+    }
+
+    Ok(chunks)
+}
+
 impl MiniBlockCompressor for CompressedMiniBlockCompressor {
     fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)> {
         // First, compress with the inner compressor
-        let (mut inner_compressed, inner_encoding) = self.inner.compress(page)?;
+        let (inner_compressed, inner_encoding) = self.inner.compress(page)?;
 
         // Return the original encoding without compression if there's no data or
         // the first buffer is not large enough
@@ -45,33 +135,55 @@ impl MiniBlockCompressor for CompressedMiniBlockCompressor {
             return Ok((inner_compressed, inner_encoding));
         }
 
+        // Combine all buffers into one for compression
+        let mut combined_data = Vec::new();
+        for buffer in &inner_compressed.data {
+            combined_data.extend_from_slice(buffer.as_ref());
+        }
+
+        let original_size = combined_data.len();
+
+        // Compress the combined data
         let compressor = GeneralBufferCompressor::get_compressor(self.compression);
+        let mut compressed_data = Vec::new();
+        compressor.compress(&combined_data, &mut compressed_data)?;
 
-        let mut compressed_buffer = Vec::new();
-        compressor.compress(&inner_compressed.data[0], &mut compressed_buffer)?;
+        let compressed_size = compressed_data.len();
 
-        let original_size = inner_compressed.data[0].len();
-        let compressed_size = compressed_buffer.len();
-
-        // If original_size is smaller than compressed_size, we just return the
-        // not compressed one.
+        // If compression doesn't help, return the original
         if original_size <= compressed_size {
             return Ok((inner_compressed, inner_encoding));
         }
 
         trace!(
-            "Buffer compressed from {} to {} bytes (ratio: {:.2})",
+            "Combined buffers compressed from {} to {} bytes (ratio: {:.2})",
             original_size,
             compressed_size,
             compressed_size as f32 / original_size as f32
         );
 
-        // Update buffer only - chunks don't need updating since they reference global buffers
-        inner_compressed.data[0] = LanceBuffer::from(compressed_buffer);
+        // Encode the original chunks structure
+        let encoded_chunks = encode_chunks(&inner_compressed.chunks);
+        let encoded_chunks_size = encoded_chunks.len() as u16;
+
+        // Create the result with two buffers:
+        // Buffer 0: Compressed data
+        // Buffer 1: Encoded chunks structure
+        let compressed_miniblock = MiniBlockCompressed {
+            data: vec![
+                LanceBuffer::from(compressed_data),
+                LanceBuffer::from(encoded_chunks),
+            ],
+            chunks: vec![MiniBlockChunk {
+                buffer_sizes: vec![compressed_size as u16, encoded_chunks_size],
+                log_num_values: 0, // 0 indicates this is the final/only chunk
+            }],
+            num_values: inner_compressed.num_values,
+        };
 
         // Return compressed encoding
         let encoding = ProtobufUtils::compressed_mini_block(inner_encoding, self.compression);
-        Ok((inner_compressed, encoding))
+        Ok((compressed_miniblock, encoding))
     }
 }
 
@@ -90,17 +202,67 @@ impl CompressedMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for CompressedMiniBlockDecompressor {
-    fn decompress(&self, mut data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
-        // Create the buffer decompressor based on compression scheme
+    fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        // We expect exactly 2 buffers:
+        // Buffer 0: Compressed data
+        // Buffer 1: Encoded chunks structure
+        if data.len() != 2 {
+            return Err(lance_core::Error::io(
+                format!(
+                    "CompressedMiniBlockDecompressor expects 2 buffers, got {}",
+                    data.len()
+                ),
+                location!(),
+            ));
+        }
+
+        // Decompress the data
         let decompressor = GeneralBufferCompressor::get_compressor(self.compression);
+        let mut decompressed_data = Vec::new();
+        decompressor.decompress(&data[0], &mut decompressed_data)?;
 
-        // Decompress only the first buffer, keep others as-is
-        let mut decompressed = Vec::new();
-        decompressor.decompress(&data[0], &mut decompressed)?;
-        data[0] = LanceBuffer::from(decompressed);
+        // Decode the chunks structure
+        let chunks = decode_chunks(data[1].as_ref())?;
 
-        // Delegate to the inner decompressor
-        self.inner.decompress(data, num_values)
+        // Calculate the number of unique buffers
+        // Each chunk references global buffers, so we need to determine the unique buffer count
+        let mut max_buffer_count = 0;
+        for chunk in &chunks {
+            max_buffer_count = max_buffer_count.max(chunk.buffer_sizes.len());
+        }
+
+        // Calculate total size for each buffer by summing across chunks
+        let mut buffer_total_sizes = vec![0usize; max_buffer_count];
+        for chunk in &chunks {
+            for (i, &size) in chunk.buffer_sizes.iter().enumerate() {
+                buffer_total_sizes[i] += size as usize;
+            }
+        }
+
+        // Reconstruct the original buffers
+        let mut reconstructed_buffers = Vec::new();
+        let mut offset = 0;
+
+        for buffer_size in buffer_total_sizes {
+            if offset + buffer_size > decompressed_data.len() {
+                return Err(lance_core::Error::io(
+                    format!(
+                        "Buffer reconstruction failed: offset {} + size {} exceeds data length {}",
+                        offset,
+                        buffer_size,
+                        decompressed_data.len()
+                    ),
+                    location!(),
+                ));
+            }
+            let buffer =
+                LanceBuffer::from(decompressed_data[offset..offset + buffer_size].to_vec());
+            reconstructed_buffers.push(buffer);
+            offset += buffer_size;
+        }
+
+        // Delegate to the inner decompressor with reconstructed buffers
+        self.inner.decompress(reconstructed_buffers, num_values)
     }
 }
 
@@ -375,8 +537,36 @@ mod tests {
         }
 
         assert_eq!(compressed.num_values, 1024);
-        // ValueEncoder produces 1 buffer
-        assert_eq!(compressed.data.len(), 1);
+        // Compressed miniblock produces 2 buffers: compressed data + encoded chunks
+        assert_eq!(compressed.data.len(), 2);
+    }
+
+    #[test]
+    fn test_chunk_encoding_decoding() {
+        // Test the chunk encoding and decoding functions
+        let chunks = vec![
+            MiniBlockChunk {
+                buffer_sizes: vec![100, 200],
+                log_num_values: 10,
+            },
+            MiniBlockChunk {
+                buffer_sizes: vec![150, 250, 50],
+                log_num_values: 8,
+            },
+            MiniBlockChunk {
+                buffer_sizes: vec![300],
+                log_num_values: 0,
+            },
+        ];
+
+        let encoded = encode_chunks(&chunks);
+        let decoded = decode_chunks(&encoded).unwrap();
+
+        assert_eq!(chunks.len(), decoded.len());
+        for (original, decoded) in chunks.iter().zip(decoded.iter()) {
+            assert_eq!(original.buffer_sizes, decoded.buffer_sizes);
+            assert_eq!(original.log_num_values, decoded.log_num_values);
+        }
     }
 
     #[test]
@@ -431,7 +621,8 @@ mod tests {
         }
 
         assert_eq!(compressed.num_values, 2048);
-        assert_eq!(compressed.data.len(), 1);
+        // Compressed miniblock produces 2 buffers: compressed data + encoded chunks
+        assert_eq!(compressed.data.len(), 2);
 
         // Test decompression
         let decompression_strategy = DefaultDecompressionStrategy::default();
