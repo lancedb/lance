@@ -350,7 +350,7 @@ class ShardedFragmentSampler(FragmentSampler):
     """
 
     def __init__(
-        self, rank: int, world_size: int, randomize: bool = False, seed: int = 0, pad: bool = False
+        self, rank: int, world_size: int, randomize: bool = False, seed: int = 0, pad: bool = False, drop_last: bool = False
     ):
         super().__init__()
 
@@ -360,6 +360,9 @@ class ShardedFragmentSampler(FragmentSampler):
         self._seed = seed
         self._epoch = 0
         self._pad = pad
+        self._drop_last = drop_last
+        if pad and drop_last:
+            raise ValueError("Only one of pad or drop_last can be true")
 
     def set_epoch(self, epoch: int):
         self._epoch = epoch
@@ -376,9 +379,7 @@ class ShardedFragmentSampler(FragmentSampler):
         world_size = torch.distributed.get_world_size()
         return ShardedFragmentSampler(rank, world_size, randomize=randomize, seed=seed)
 
-    def iter_fragments(
-        self, dataset: lance.LanceDataset, **kwargs
-    ) -> Generator[lance.LanceFragment, None, None]:
+    def iter_fragments(self, dataset: lance.LanceDataset, **kwargs):
         fragments = dataset.get_fragments()
         if self._randomize:
             random.seed(self._seed)
@@ -389,11 +390,15 @@ class ShardedFragmentSampler(FragmentSampler):
         if self._pad:
             num_samples_per_replica = math.ceil(num_fragments / self._world_size)
             total_size = num_samples_per_replica * self._world_size
+        elif self._drop_last:
+            num_samples_per_replica = num_fragments // self._world_size
+            total_size = num_samples_per_replica * self._world_size
         
-        padding_size = total_size - num_fragments
-        if padding_size > 0:
-            fragments += fragments[:padding_size]
-        
+        if total_size > num_fragments: 
+            fragments += fragments[:(total_size - num_fragments)]
+        elif total_size < num_fragments: 
+            fragments = fragments[:total_size]
+
         for i in range(self._rank, total_size, self._world_size):
             yield fragments[i]
             
