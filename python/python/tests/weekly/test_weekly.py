@@ -82,7 +82,7 @@ def create_or_load_dataset(dataset_name: str, kwargs: dict):
     try:
         ds.create_scalar_index(
             "text",
-            index_type="FTS",
+            index_type="INVERTED",
             with_position=kwargs.get("with_position", False),
             replace=True,
         )
@@ -153,7 +153,7 @@ class VectorSearch(ReadOnlyOperation):
         self.filter = filter
 
     def run(self, ds: lance.LanceDataset):
-        stats = ds.index_stats("vector_idx")
+        stats = ds.index_statistics("vector_idx")
         if stats is None:
             print("No vector index found")
             return
@@ -174,7 +174,7 @@ class FullTextSearch(ReadOnlyOperation):
         self.filter = filter
 
     def run(self, ds: lance.LanceDataset):
-        stats = ds.index_stats("text_idx")
+        stats = ds.index_statistics("text_idx")
         if stats is None:
             print("No text index found")
             return
