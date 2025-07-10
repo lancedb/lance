@@ -217,15 +217,11 @@ impl LanceCache {
 
     pub fn stats(&self) -> CacheStats {
         self.cache.run_pending_tasks();
-        let mut total_size = 0;
-        for (_key, value) in self.cache.iter() {
-            total_size += (value.size_accessor)(&value.record);
-        }
         CacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             num_entries: self.cache.entry_count() as usize,
-            size_bytes: total_size,
+            size_bytes: self.cache.weighted_size() as usize,
         }
     }
 

@@ -544,9 +544,7 @@ pub(crate) async fn open_vector_index(
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
 
-    let frag_reuse_uuid = dataset
-        .frag_reuse_index_uuid()
-        .expect("Fragment reuse index UUID should be set");
+    let frag_reuse_uuid = dataset.frag_reuse_index_uuid();
 
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
@@ -573,7 +571,9 @@ pub(crate) async fn open_vector_index(
                     reader.clone(),
                     last_stage.unwrap(),
                     metric_type,
-                    dataset.index_cache.for_index(uuid, Some(&frag_reuse_uuid)),
+                    dataset
+                        .index_cache
+                        .for_index(uuid, frag_reuse_uuid.as_ref()),
                 )?));
             }
             Some(Stage::Pq(pq_proto)) => {
