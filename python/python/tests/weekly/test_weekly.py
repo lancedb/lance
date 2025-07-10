@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright The LanceDB Authors
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 # Weekly tests that runs all operations on a large dataset,
 # these operations are ran in random order repeated 10 times
 
 import abc
 import itertools
-import math
 from typing import Optional
 
 import lance
@@ -16,8 +15,8 @@ import pytest
 
 # For testing, use smaller numbers to make tests run faster
 # In production, you might want to use: NUM_ROWS = 1_000_000
-NUM_ROWS = 10_000  # Reduced from 1M to 10K for faster testing
-BATCH_SIZE = 500
+NUM_ROWS = 1_000_000
+BATCH_SIZE = 10_000
 DIM = 32
 
 schema = pa.schema(
@@ -47,8 +46,8 @@ def random_batch(start_id: int, batch_size: int) -> pa.Table:
     )
 
 
-def create_or_load_table(name: str, kwargs: dict):
-    uri = f"tests/weekly/{name}"
+def create_or_load_dataset(dataset_name: str, kwargs: dict):
+    uri = f"tests/weekly/{dataset_name}"
 
     # Try to open existing dataset first
     try:
@@ -192,24 +191,12 @@ class FullTextSearch(ReadOnlyOperation):
         print(query.analyze_plan())
 
 
-@pytest.fixture(scope="session")
-def dataset_without_position():
-    """Create or load dataset without position tracking for FTS"""
-    return create_or_load_table("test_table", {"with_position": False})
-
-
-@pytest.fixture(scope="session")
-def dataset_with_position():
-    """Create or load dataset with position tracking for FTS"""
-    return create_or_load_table(
-        "test_table_with_position", {"with_position": True, "remove_stop_words": False}
-    )
-
-
 @pytest.mark.weekly
-def test_weekly_operations_without_position(dataset_without_position):
+@pytest.mark.parametrize("with_position", [False, True])
+def test_all_permutations(with_position):
     """Test all operations on dataset without FTS position tracking"""
-    ds = dataset_without_position
+    dataset_name = f"test_table_with_position_{with_position}"
+    ds = create_or_load_dataset(dataset_name, {"with_position": with_position})
 
     write_operations = [
         Append(),
@@ -230,94 +217,6 @@ def test_weekly_operations_without_position(dataset_without_position):
         FullTextSearch(has_position=False, filter="id > 1_000"),
     ]
 
-    for permutation in itertools.permutations(range(len(write_operations))):
-        for idx in permutation:
-            write_operation = write_operations[idx]
-            print(f"Running {write_operation.__class__.__name__}")
-            write_operation.run(ds)
-
-            # write operation changed the status of the table,
-            # then we need to run all read only operations after it
-            for read_only_operation in read_only_operations:
-                print(f"Running {read_only_operation.__class__.__name__}")
-                read_only_operation.run(ds)
-
-
-@pytest.mark.weekly
-def test_weekly_operations_with_position(dataset_with_position):
-    """Test all operations on dataset with FTS position tracking"""
-    ds = dataset_with_position
-
-    write_operations = [
-        Append(),
-        Delete(delete_all=False),
-        Delete(delete_all=True),
-        Optimize(num_indices_to_merge=0, column="id"),
-        Optimize(num_indices_to_merge=0, column="vector"),  # delta index
-        Optimize(num_indices_to_merge=1, column="vector"),  # merge index
-        Optimize(num_indices_to_merge=0, column="text"),
-        Compact(),
-    ]
-
-    read_only_operations = [
-        # Read only operations
-        VectorSearch(),
-        VectorSearch(filter="id > 1_000"),
-        FullTextSearch(has_position=True),
-        FullTextSearch(has_position=True, filter="id > 1_000"),
-    ]
-
-    # Run a subset of permutations to keep test time reasonable
-    num_permutations = min(
-        2, math.factorial(len(write_operations))
-    )  # Reduced from 5 to 2 for faster testing
-    print(f"Running {num_permutations} permutations")
-
-    for i, permutation in enumerate(
-        itertools.permutations(range(len(write_operations)))
-    ):
-        if i >= num_permutations:
-            break
-
-        for idx in permutation:
-            write_operation = write_operations[idx]
-            print(f"Running {write_operation.__class__.__name__}")
-            write_operation.run(ds)
-
-            # write operation changed the status of the table,
-            # then we need to run all read only operations after it
-            for read_only_operation in read_only_operations:
-                print(f"Running {read_only_operation.__class__.__name__}")
-                read_only_operation.run(ds)
-
-
-# Keep the original functions for backward compatibility
-def run(name: str, kwargs: dict):
-    print(f"Running {name} with kwargs: {kwargs}")
-    ds = create_or_load_table(name, kwargs)
-
-    write_operations = [
-        Append(),
-        Delete(delete_all=False),
-        Delete(delete_all=True),
-        Optimize(num_indices_to_merge=0, column="id"),
-        Optimize(num_indices_to_merge=0, column="vector"),  # delta index
-        Optimize(num_indices_to_merge=1, column="vector"),  # merge index
-        Optimize(num_indices_to_merge=0, column="text"),
-        Compact(),
-    ]
-
-    has_position = kwargs.get("with_position", False)
-    read_only_operations = [
-        # Read only operations
-        VectorSearch(),
-        VectorSearch(filter="id > 1_000"),
-        FullTextSearch(has_position=has_position),
-        FullTextSearch(has_position=has_position, filter="id > 1_000"),
-    ]
-
-    # iterate on all permutations of write operations
-    print(f"Running {math.factorial(len(write_operations))} permutations")
     for permutation in itertools.permutations(range(len(write_operations))):
         for idx in permutation:
             write_operation = write_operations[idx]
