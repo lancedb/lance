@@ -13,6 +13,7 @@ use lance_table::format::Index;
 use moka::sync::Cache;
 
 use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::mem_wal::MemWalIndex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Default, DeepSizeOf)]
@@ -37,6 +38,7 @@ pub struct IndexCache {
     scalar_cache: Arc<Cache<String, Arc<dyn ScalarIndex>>>,
     vector_cache: Arc<Cache<String, Arc<dyn VectorIndex>>>,
     frag_reuse_cache: Arc<Cache<String, Arc<FragReuseIndex>>>,
+    mem_wal_cache: Arc<Cache<String, Arc<MemWalIndex>>>,
     // this is for v3 index, sadly we can't use the same cache as the vector index for now
     vector_partition_cache: Arc<Cache<String, Arc<dyn VectorIndexCacheEntry>>>,
 
@@ -75,6 +77,11 @@ impl DeepSizeOf for IndexCache {
                 .map(|(_, v)| v.deep_size_of_children(context))
                 .sum::<usize>()
             + self
+                .mem_wal_cache
+                .iter()
+                .map(|(_, v)| v.deep_size_of_children(context))
+                .sum::<usize>()
+            + self
                 .metadata_cache
                 .iter()
                 .map(|(_, v)| v.deep_size_of_children(context))
@@ -89,8 +96,9 @@ impl IndexCache {
             scalar_cache: Arc::new(Cache::new(capacity as u64)),
             vector_cache: Arc::new(Cache::new(capacity as u64)),
             vector_partition_cache: Arc::new(Cache::new(capacity as u64)),
-            // there is always 1 fragment reuse index that should be used
+            // there is always 1 fragment reuse index and MemWAL index that should be used
             frag_reuse_cache: Arc::new(Cache::new(1)),
+            mem_wal_cache: Arc::new(Cache::new(1)),
             metadata_cache: Arc::new(Cache::new(capacity as u64)),
             type_cache: Arc::new(Cache::new(capacity as u64)),
             cache_stats: Arc::new(CacheStats::default()),
@@ -112,6 +120,9 @@ impl IndexCache {
         self.frag_reuse_cache.invalidate_all();
         self.frag_reuse_cache.run_pending_tasks();
 
+        self.mem_wal_cache.invalidate_all();
+        self.mem_wal_cache.run_pending_tasks();
+
         self.metadata_cache.invalidate_all();
         self.metadata_cache.run_pending_tasks();
 
@@ -130,6 +141,7 @@ impl IndexCache {
         self.vector_cache.run_pending_tasks();
         self.vector_partition_cache.run_pending_tasks();
         self.frag_reuse_cache.run_pending_tasks();
+        self.mem_wal_cache.run_pending_tasks();
         self.metadata_cache.run_pending_tasks();
         (self.scalar_cache.entry_count()
             + self.vector_cache.entry_count()
@@ -143,6 +155,7 @@ impl IndexCache {
             + self.vector_cache.entry_count()
             + self.vector_partition_cache.entry_count()
             + self.frag_reuse_cache.entry_count()
+            + self.metadata_cache.entry_count()
             + self.metadata_cache.entry_count()) as usize
     }
 
@@ -197,6 +210,16 @@ impl IndexCache {
         }
     }
 
+    pub(crate) fn get_mem_wal(&self, key: &str) -> Option<Arc<MemWalIndex>> {
+        if let Some(index) = self.mem_wal_cache.get(key) {
+            self.cache_stats.record_hit();
+            Some(index)
+        } else {
+            self.cache_stats.record_miss();
+            None
+        }
+    }
+
     /// Insert a new entry into the cache.
     pub(crate) fn insert_scalar(&self, key: &str, index: Arc<dyn ScalarIndex>) {
         self.scalar_cache.insert(key.to_string(), index);
@@ -208,6 +231,10 @@ impl IndexCache {
 
     pub(crate) fn insert_frag_reuse(&self, key: &str, index: Arc<FragReuseIndex>) {
         self.frag_reuse_cache.insert(key.to_string(), index);
+    }
+
+    pub(crate) fn insert_mem_wal(&self, key: &str, index: Arc<MemWalIndex>) {
+        self.mem_wal_cache.insert(key.to_string(), index);
     }
 
     pub(crate) fn insert_vector_partition(&self, key: &str, index: Arc<dyn VectorIndexCacheEntry>) {
