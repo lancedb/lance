@@ -66,6 +66,9 @@ make test
 make integtest
 ```
 
+To run the tests on OS X, you may need to increase the default limit on the number of open files:
+`ulimit -n 2048`
+
 ## Rust Development
 
 To format and lint Rust code:
