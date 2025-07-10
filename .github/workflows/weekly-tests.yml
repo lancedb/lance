@@ -75,13 +75,13 @@ jobs:
         working-directory: python
         shell: bash
         run: |
-          pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
+          pip3 install .[tests]
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
       - name: Install Pylance
         run: |
-          pip install --extra-index-url https://pypi.fury.io/lancedb/ pylance==${{ matrix.pylance-version }}
+          pip install --extra-index-url https://pypi.fury.io/pylance/ pylance==${{ matrix.pylance-version }}
       - name: Run weekly tests
         id: run_weekly_tests
         run: |
@@ -120,16 +120,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
-        working-directory: python
-        shell: bash
-        run: |
-          pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
-      - name: Install LanceDB
-        run: pip install -e .
+      - name: Install Lance
+        run: pip install -e .[tests]
       - name: Run weekly tests
         run: |
           for f in python/tests/weekly/*.py; do
