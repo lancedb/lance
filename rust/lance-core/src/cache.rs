@@ -216,9 +216,16 @@ impl LanceCache {
     }
 
     pub fn stats(&self) -> CacheStats {
+        self.cache.run_pending_tasks();
+        let mut total_size = 0;
+        for (_key, value) in self.cache.iter() {
+            total_size += (value.size_accessor)(&value.record);
+        }
         CacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
+            num_entries: self.cache.entry_count() as usize,
+            size_bytes: total_size,
         }
     }
 
@@ -263,7 +270,7 @@ impl LanceCache {
 
     pub fn insert_unsized_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
     where
-        K: CacheKey,
+        K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         self.insert_unsized(&cache_key.key(), metadata)
@@ -271,7 +278,7 @@ impl LanceCache {
 
     pub fn get_unsized_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
     where
-        K: CacheKey,
+        K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         self.get_unsized::<K::ValueType>(&cache_key.key())
@@ -284,12 +291,22 @@ pub trait CacheKey {
     fn key(&self) -> Cow<'_, str>;
 }
 
+pub trait UnsizedCacheKey {
+    type ValueType: ?Sized;
+
+    fn key(&self) -> Cow<'_, str>;
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheStats {
     /// Number of times `get`, `get_unsized`, or `get_or_insert` found an item in the cache.
     pub hits: u64,
     /// Number of times `get`, `get_unsized`, or `get_or_insert` did not find an item in the cache.
     pub misses: u64,
+    /// Number of entries currently in the cache.
+    pub num_entries: usize,
+    /// Total size in bytes of all entries in the cache.
+    pub size_bytes: usize,
 }
 
 impl CacheStats {
