@@ -31,7 +31,8 @@ use crate::{
                 VariableDecoder, VariableEncoder,
             },
             bitpack::InlineBitpacking,
-            block::CompressedBufferEncoder,
+            block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
+            compressed_mini_block::CompressedMiniBlockCompressor,
             constant::ConstantDecompressor,
             fsst::{
                 FsstMiniBlockDecompressor, FsstMiniBlockEncoder, FsstPerValueDecompressor,
@@ -140,6 +141,12 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     match compression.as_str() {
                         "none" => return Ok(Box::new(ValueEncoder::default())),
                         "rle" if is_byte_width_aligned => {
+                            if fixed_width_data.bits_per_value >= 64 {
+                                return Ok(Box::new(CompressedMiniBlockCompressor::new(
+                                    Box::new(RleMiniBlockEncoder::new()),
+                                    CompressionConfig::new(CompressionScheme::Lz4, None),
+                                )));
+                            }
                             return Ok(Box::new(RleMiniBlockEncoder::new()));
                         }
                         "bitpacking" if is_byte_width_aligned => {
@@ -161,6 +168,12 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 if (run_count as f64) < (num_values as f64) * DEFAULT_RLE_COMPRESSION_THRESHOLD
                     && is_byte_width_aligned
                 {
+                    if fixed_width_data.bits_per_value >= 64 {
+                        return Ok(Box::new(CompressedMiniBlockCompressor::new(
+                            Box::new(RleMiniBlockEncoder::new()),
+                            CompressionConfig::new(CompressionScheme::Lz4, None),
+                        )));
+                    }
                     return Ok(Box::new(RleMiniBlockEncoder::new()));
                 }
 
