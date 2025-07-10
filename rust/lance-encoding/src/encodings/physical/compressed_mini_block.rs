@@ -243,10 +243,8 @@ mod tests {
     }
 
     fn run_round_trip_test(test_case: TestCase) {
-        let compressor = CompressedMiniBlockCompressor::new(
-            test_case.inner_encoder,
-            test_case.compression,
-        );
+        let compressor =
+            CompressedMiniBlockCompressor::new(test_case.inner_encoder, test_case.compression);
 
         // Compress the data
         let (compressed, encoding) = compressor.compress(test_case.data).unwrap();
