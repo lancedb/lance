@@ -1469,6 +1469,8 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         updates: Dict[str, str],
         where: Optional[str] = None,
+        conflict_retries: int = 10,
+        retry_timeout: timedelta = timedelta(seconds=30),
     ) -> UpdateResult:
         """
         Update column values for rows matching where.
@@ -1479,6 +1481,14 @@ class LanceDataset(pa.dataset.Dataset):
             A mapping of column names to a SQL expression.
         where : str, optional
             A SQL predicate indicating which rows should be updated.
+        conflict_retries : int, optional
+            Number of times to retry the operation if there is contention.
+            Default is 10.
+        retry_timeout : timedelta, optional
+            The timeout used to limit retries. This is the maximum time to spend on
+            the operation before giving up. At least one attempt will be made,
+            regardless of how long it takes to complete. Subsequent attempts will be
+            cancelled once this timeout is reached. Default is 30 seconds.
 
         Returns
         -------
@@ -1501,7 +1511,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(where, pa.compute.Expression):
             where = str(where)
-        return self._ds.update(updates, where)
+        return self._ds.update(updates, where, conflict_retries, retry_timeout)
 
     def versions(self):
         """
