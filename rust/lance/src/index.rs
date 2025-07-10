@@ -13,7 +13,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::cache::{CacheKey, DeepSizeOf};
+use lance_core::cache::{CacheKey, UnsizedCacheKey};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tracing::{
@@ -91,74 +91,21 @@ use crate::index::vector::remap_vector_index;
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
 use crate::{dataset::Dataset, Error, Result};
 
-// Cache wrappers for index trait objects
-#[derive(Debug, Clone, DeepSizeOf)]
-pub struct CachedScalarIndex(Arc<dyn ScalarIndex>);
-
-impl CachedScalarIndex {
-    pub fn new(index: Arc<dyn ScalarIndex>) -> Self {
-        Self(index)
-    }
-
-    pub fn into_inner(self) -> Arc<dyn ScalarIndex> {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, DeepSizeOf)]
-pub struct CachedVectorIndex(Arc<dyn VectorIndex>);
-
-impl CachedVectorIndex {
-    pub fn new(index: Arc<dyn VectorIndex>) -> Self {
-        Self(index)
-    }
-
-    pub fn into_inner(self) -> Arc<dyn VectorIndex> {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, DeepSizeOf)]
-pub struct CachedFragReuseIndex(Arc<FragReuseIndex>);
-
-impl CachedFragReuseIndex {
-    pub fn new(index: Arc<FragReuseIndex>) -> Self {
-        Self(index)
-    }
-
-    pub fn into_inner(self) -> Arc<FragReuseIndex> {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, DeepSizeOf)]
-pub struct CachedMemWalIndex(Arc<MemWalIndex>);
-
-impl CachedMemWalIndex {
-    pub fn new(index: Arc<MemWalIndex>) -> Self {
-        Self(index)
-    }
-
-    pub fn into_inner(self) -> Arc<MemWalIndex> {
-        self.0
-    }
-}
-
 // Cache keys for different index types
 #[derive(Debug, Clone)]
-pub struct ScalarIndexCacheKey {
-    pub uuid: Uuid,
-    pub fri_uuid: Option<Uuid>,
+pub struct ScalarIndexCacheKey<'a> {
+    pub uuid: &'a Uuid,
+    pub fri_uuid: Option<&'a Uuid>,
 }
 
-impl ScalarIndexCacheKey {
-    pub fn new(uuid: Uuid, fri_uuid: Option<Uuid>) -> Self {
+impl<'a> ScalarIndexCacheKey<'a> {
+    pub fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
         Self { uuid, fri_uuid }
     }
 }
 
-impl CacheKey for ScalarIndexCacheKey {
-    type ValueType = CachedScalarIndex;
+impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
+    type ValueType = dyn ScalarIndex;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         if let Some(fri_uuid) = self.fri_uuid {
@@ -170,19 +117,19 @@ impl CacheKey for ScalarIndexCacheKey {
 }
 
 #[derive(Debug, Clone)]
-pub struct VectorIndexCacheKey {
-    pub uuid: Uuid,
-    pub fri_uuid: Option<Uuid>,
+pub struct VectorIndexCacheKey<'a> {
+    pub uuid: &'a Uuid,
+    pub fri_uuid: Option<&'a Uuid>,
 }
 
-impl VectorIndexCacheKey {
-    pub fn new(uuid: Uuid, fri_uuid: Option<Uuid>) -> Self {
+impl<'a> VectorIndexCacheKey<'a> {
+    pub fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
         Self { uuid, fri_uuid }
     }
 }
 
-impl CacheKey for VectorIndexCacheKey {
-    type ValueType = CachedVectorIndex;
+impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
+    type ValueType = dyn VectorIndex;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         if let Some(fri_uuid) = self.fri_uuid {
@@ -194,19 +141,19 @@ impl CacheKey for VectorIndexCacheKey {
 }
 
 #[derive(Debug, Clone)]
-pub struct FragReuseIndexCacheKey {
-    pub uuid: Uuid,
-    pub fri_uuid: Option<Uuid>,
+pub struct FragReuseIndexCacheKey<'a> {
+    pub uuid: &'a Uuid,
+    pub fri_uuid: Option<&'a Uuid>,
 }
 
-impl FragReuseIndexCacheKey {
-    pub fn new(uuid: Uuid, fri_uuid: Option<Uuid>) -> Self {
+impl<'a> FragReuseIndexCacheKey<'a> {
+    pub fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
         Self { uuid, fri_uuid }
     }
 }
 
-impl CacheKey for FragReuseIndexCacheKey {
-    type ValueType = CachedFragReuseIndex;
+impl CacheKey for FragReuseIndexCacheKey<'_> {
+    type ValueType = FragReuseIndex;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         if let Some(fri_uuid) = self.fri_uuid {
@@ -218,19 +165,19 @@ impl CacheKey for FragReuseIndexCacheKey {
 }
 
 #[derive(Debug, Clone)]
-pub struct MemWalCacheKey {
-    pub uuid: Uuid,
-    pub fri_uuid: Option<Uuid>,
+pub struct MemWalCacheKey<'a> {
+    pub uuid: &'a Uuid,
+    pub fri_uuid: Option<&'a Uuid>,
 }
 
-impl MemWalCacheKey {
-    pub fn new(uuid: Uuid, fri_uuid: Option<Uuid>) -> Self {
+impl<'a> MemWalCacheKey<'a> {
+    pub fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
         Self { uuid, fri_uuid }
     }
 }
 
-impl CacheKey for MemWalCacheKey {
-    type ValueType = CachedMemWalIndex;
+impl CacheKey for MemWalCacheKey<'_> {
+    type ValueType = MemWalIndex;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         if let Some(fri_uuid) = self.fri_uuid {
@@ -1104,19 +1051,20 @@ impl DatasetIndexInternalExt for Dataset {
             message: format!("Invalid UUID format: {}", uuid),
             location: location!(),
         })?;
-        let cache_key = ScalarIndexCacheKey::new(uuid_parsed, frag_reuse_uuid);
+        let cache_key = ScalarIndexCacheKey::new(&uuid_parsed, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key) {
-            return Ok(index.as_ref().clone().into_inner().as_index());
+            return Ok(index.as_index());
         }
 
-        let vector_cache_key = VectorIndexCacheKey::new(uuid_parsed, frag_reuse_uuid);
+        let vector_cache_key = VectorIndexCacheKey::new(&uuid_parsed, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&vector_cache_key) {
-            return Ok(index.as_ref().clone().into_inner().as_index());
+            return Ok(index.as_index());
         }
 
-        let frag_reuse_cache_key = FragReuseIndexCacheKey::new(uuid_parsed, frag_reuse_uuid);
-        if let Some(index) = self.index_cache.get_unsized_with_key(&frag_reuse_cache_key) {
-            return Ok(index.as_ref().clone().into_inner().as_index());
+        let frag_reuse_cache_key =
+            FragReuseIndexCacheKey::new(&uuid_parsed, frag_reuse_uuid.as_ref());
+        if let Some(index) = self.index_cache.get_with_key(&frag_reuse_cache_key) {
+            return Ok(index.as_index());
         }
 
         // Sometimes we want to open an index and we don't care if it is a scalar or vector index.
@@ -1149,9 +1097,9 @@ impl DatasetIndexInternalExt for Dataset {
             message: format!("Invalid UUID format: {}", uuid),
             location: location!(),
         })?;
-        let cache_key = ScalarIndexCacheKey::new(uuid_parsed, frag_reuse_uuid);
+        let cache_key = ScalarIndexCacheKey::new(&uuid_parsed, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key) {
-            return Ok(index.as_ref().clone().into_inner());
+            return Ok(index);
         }
 
         let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
@@ -1165,7 +1113,7 @@ impl DatasetIndexInternalExt for Dataset {
         metrics.record_index_load();
 
         self.index_cache
-            .insert_unsized_with_key(&cache_key, Arc::new(CachedScalarIndex::new(index.clone())));
+            .insert_unsized_with_key(&cache_key, index.clone());
         Ok(index)
     }
 
@@ -1180,11 +1128,11 @@ impl DatasetIndexInternalExt for Dataset {
             message: format!("Invalid UUID format: {}", uuid),
             location: location!(),
         })?;
-        let cache_key = VectorIndexCacheKey::new(uuid_parsed, frag_reuse_uuid);
+        let cache_key = VectorIndexCacheKey::new(&uuid_parsed, frag_reuse_uuid.as_ref());
 
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key) {
             log::debug!("Found vector index in cache uuid: {}", uuid);
-            return Ok(index.as_ref().clone().into_inner());
+            return Ok(index);
         }
 
         let fri = self.open_frag_reuse_index(metrics).await?;
@@ -1381,7 +1329,7 @@ impl DatasetIndexInternalExt for Dataset {
         let index = index?;
         metrics.record_index_load();
         self.index_cache
-            .insert_unsized_with_key(&cache_key, Arc::new(CachedVectorIndex::new(index.clone())));
+            .insert_unsized_with_key(&cache_key, index.clone());
         Ok(index)
     }
 
@@ -1427,10 +1375,10 @@ impl DatasetIndexInternalExt for Dataset {
         };
 
         let frag_reuse_uuid = self.frag_reuse_index_uuid();
-        let cache_key = MemWalCacheKey::new(mem_wal_meta.uuid, frag_reuse_uuid);
-        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key) {
+        let cache_key = MemWalCacheKey::new(&mem_wal_meta.uuid, frag_reuse_uuid.as_ref());
+        if let Some(index) = self.index_cache.get_with_key(&cache_key) {
             log::debug!("Found MemWAL index in cache uuid: {}", mem_wal_meta.uuid);
-            return Ok(Some(index.as_ref().clone().into_inner()));
+            return Ok(Some(index));
         }
 
         let uuid = mem_wal_meta.uuid.to_string();
@@ -1444,8 +1392,7 @@ impl DatasetIndexInternalExt for Dataset {
         info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_MEM_WAL);
         metrics.record_index_load();
 
-        self.index_cache
-            .insert_unsized_with_key(&cache_key, Arc::new(CachedMemWalIndex::new(index.clone())));
+        self.index_cache.insert_with_key(&cache_key, index.clone());
         Ok(Some(index))
     }
 

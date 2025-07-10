@@ -35,7 +35,7 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::{
-    cache::{CacheKey, LanceCache},
+    cache::{LanceCache, UnsizedCacheKey},
     traits::DatasetTakeRows,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
     Error, Result, ROW_ID_FIELD,
@@ -92,19 +92,6 @@ pub mod io;
 pub mod v2;
 
 // Cache wrapper for vector index trait objects
-#[derive(Debug, Clone, DeepSizeOf)]
-pub struct CachedVectorIndex(Arc<dyn VectorIndex>);
-
-impl CachedVectorIndex {
-    pub fn new(index: Arc<dyn VectorIndex>) -> Self {
-        Self(index)
-    }
-
-    pub fn into_inner(self) -> Arc<dyn VectorIndex> {
-        self.0
-    }
-}
-
 // Cache key for IVF partitions in the legacy IVF index
 #[derive(Debug, Clone)]
 pub struct LegacyIVFPartitionKey {
@@ -117,8 +104,8 @@ impl LegacyIVFPartitionKey {
     }
 }
 
-impl CacheKey for LegacyIVFPartitionKey {
-    type ValueType = CachedVectorIndex;
+impl UnsizedCacheKey for LegacyIVFPartitionKey {
+    type ValueType = dyn VectorIndex;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("ivf-{}", self.partition_id).into()
@@ -198,7 +185,7 @@ impl IVFIndex {
     ) -> Result<Arc<dyn VectorIndex>> {
         let cache_key = LegacyIVFPartitionKey::new(partition_id);
         let part_index = if let Some(part_idx) = self.index_cache.get_unsized_with_key(&cache_key) {
-            part_idx.as_ref().clone().into_inner()
+            part_idx
         } else {
             metrics.record_part_load();
             tracing::info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key.key().as_ref());
@@ -208,7 +195,7 @@ impl IVFIndex {
             // check the cache again, as the partition may have been loaded by another
             // thread that held the lock on loading the partition
             if let Some(part_idx) = self.index_cache.get_unsized_with_key(&cache_key) {
-                part_idx.as_ref().clone().into_inner()
+                part_idx
             } else {
                 if partition_id >= self.ivf.num_partitions() {
                     return Err(Error::Index {
@@ -233,10 +220,8 @@ impl IVFIndex {
                     .await?;
                 let idx: Arc<dyn VectorIndex> = idx.into();
                 if write_cache {
-                    self.index_cache.insert_unsized_with_key(
-                        &cache_key,
-                        Arc::new(CachedVectorIndex::new(idx.clone())),
-                    );
+                    self.index_cache
+                        .insert_unsized_with_key(&cache_key, idx.clone());
                 }
                 idx
             }
