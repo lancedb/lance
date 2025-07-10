@@ -43,7 +43,7 @@ impl MiniBlockCompressor for CompressedMiniBlockCompressor {
         let should_compress = compressed
             .data
             .iter()
-            .any(|v| v.len() >= MIN_BUFFER_SIZE_FOR_COMPRESSION);
+            .all(|v| v.len() >= MIN_BUFFER_SIZE_FOR_COMPRESSION);
 
         if !should_compress {
             trace!("Buffers too small for compression, returning uncompressed data");
@@ -260,6 +260,15 @@ mod tests {
 
         // Compress the data
         let (compressed, encoding) = compressor.compress(block).unwrap();
+
+        println!(
+            "Test: Compressed data has {} buffers",
+            compressed.data.len()
+        );
+        for (i, buf) in compressed.data.iter().enumerate() {
+            println!("  Buffer {}: {} bytes", i, buf.len());
+        }
+        println!("Encoding type: {:?}", encoding);
 
         // Create decompressor using the encoding
         let decompression_strategy = DefaultDecompressionStrategy::default();
