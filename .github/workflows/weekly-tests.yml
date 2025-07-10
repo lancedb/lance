@@ -75,28 +75,20 @@ jobs:
         working-directory: python
         shell: bash
         run: |
-          pip3 install .[tests]
+          pip3 install $(ls target/wheels/pylance-*.whl)[tests]
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
       - name: Install Pylance
         run: |
-          pip install --extra-index-url https://pypi.fury.io/pylance/ pylance==${{ matrix.pylance-version }}
+          pip install pylance==${{ matrix.pylance-version }}
       - name: Run weekly tests
         id: run_weekly_tests
-        run: |
-          for f in python/tests/weekly/*.py; do
-            echo "===== Running $f ====="
-            python "$f"
-          done
+        run: pytest python/tests/weekly/test_weekly.py
       - name: Upgrade Pylance
         run: pip install -e .
       - name: Run weekly tests again
-        run: |
-          for f in python/tests/weekly/*.py; do
-            echo "===== Running $f ====="
-            python "$f"
-          done
+        run: pytest python/tests/weekly/test_weekly.py
 
   # This job is used to test the weekly tests on the main branch.
   weekly-linux-fresh-main:
@@ -120,14 +112,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install dependencies
+        working-directory: python
+        shell: bash
+        run: |
+          pip3 install $(ls target/wheels/pylance-*.whl)[tests]
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
       - name: Install Lance
-        run: pip install -e .[tests]
+        run: pip install -e .
       - name: Run weekly tests
-        run: |
-          for f in python/tests/weekly/*.py; do
-            echo "===== Running $f ====="
-            python "$f"
-          done
+        run: pytest python/tests/weekly/test_weekly.py
