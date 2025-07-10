@@ -71,6 +71,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install dependencies
+        working-directory: python
+        shell: bash
+        run: |
+          pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -115,6 +120,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install dependencies
+        working-directory: python
+        shell: bash
+        run: |
+          pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
