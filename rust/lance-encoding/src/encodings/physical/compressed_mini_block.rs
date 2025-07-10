@@ -384,9 +384,9 @@ mod tests {
         // Create test data with repeated patterns that LZ4 can compress well
         let mut values = Vec::with_capacity(2048);
         // Create a pattern with some repetition
-        for i in 0..256 {
+        for i in 0..256i32 {
             for _ in 0..8 {
-                values.push(i as i32);
+                values.push(i);
             }
         }
 
