@@ -194,6 +194,23 @@ impl ProtobufUtils {
         }
     }
 
+    pub fn compressed_mini_block(
+        inner: ArrayEncoding,
+        compression: CompressionConfig,
+    ) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::CompressedMiniBlock(Box::new(
+                pb::CompressedMiniBlock {
+                    inner: Some(Box::new(inner)),
+                    compression: Some(pb::Compression {
+                        scheme: compression.scheme.to_string(),
+                        level: compression.level,
+                    }),
+                },
+            ))),
+        }
+    }
+
     pub fn packed_struct(
         child_encodings: Vec<ArrayEncoding>,
         packed_buffer_index: u32,

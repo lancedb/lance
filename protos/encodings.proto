@@ -4,7 +4,7 @@
 syntax = "proto3";
 
 package lance.encodings;
- 
+
 import "google/protobuf/empty.proto";
 
 // This file contains a specification for encodings that can be used
@@ -280,6 +280,14 @@ message Rle {
   uint64 bits_per_value = 1;
 }
 
+// Compressed miniblock encoding - wraps another miniblock encoding with compression
+message CompressedMiniBlock {
+  // The inner miniblock encoding (e.g., Rle, Bitpacked, etc.)
+  ArrayEncoding inner = 1;
+  // The compression scheme to apply to the miniblock buffers
+  Compression compression = 2;
+}
+
 // Encodings that decode into an Arrow array
 message ArrayEncoding {
     oneof array_encoding {
@@ -302,6 +310,7 @@ message ArrayEncoding {
         PackedStructFixedWidthMiniBlock packed_struct_fixed_width_mini_block = 17;
         Block block = 18;
         Rle rle = 19;
+        CompressedMiniBlock compressed_mini_block = 20;
     }
 }
 
