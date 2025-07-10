@@ -55,6 +55,19 @@ use lance_datafusion::{
     utils::reader_to_stream,
 };
 
+use crate::{
+    datafusion::dataframe::SessionContextExt,
+    dataset::{
+        fragment::{FileFragment, FragReadConfig},
+        transaction::{Operation, Transaction},
+        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
+    },
+    index::DatasetIndexInternalExt,
+    io::exec::{
+        project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner, TakeExec,
+    },
+    Dataset,
+};
 use datafusion_physical_expr::expressions::Column;
 use futures::{
     future::Either,
@@ -75,26 +88,14 @@ use lance_datafusion::{
     utils::StreamingWriteSource,
 };
 use lance_file::version::LanceFileVersion;
+use lance_index::mem_wal::{MemWal, MemWalId};
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
 use lance_table::format::{Fragment, Index};
 use log::info;
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
 use tokio::task::JoinSet;
-
-use crate::{
-    datafusion::dataframe::SessionContextExt,
-    dataset::{
-        fragment::{FileFragment, FragReadConfig},
-        transaction::{Operation, Transaction},
-        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
-    },
-    index::DatasetIndexInternalExt,
-    io::exec::{
-        project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner, TakeExec,
-    },
-    Dataset,
-};
 
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 
@@ -240,6 +241,9 @@ struct MergeInsertParams {
     delete_not_matched_by_source: WhenNotMatchedBySource,
     conflict_retries: u32,
     retry_timeout: Duration,
+    // If set, this MemWAL should be marked as flushed, and will be committed to replace the
+    // MemWAL that is currently in the index with the same ID.
+    mem_wal_to_flush: Option<MemWal>,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -318,6 +322,7 @@ impl MergeInsertBuilder {
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
                 conflict_retries: 10,
                 retry_timeout: Duration::from_secs(30),
+                mem_wal_to_flush: None,
             },
         })
     }
@@ -371,6 +376,47 @@ impl MergeInsertBuilder {
     pub fn retry_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.params.retry_timeout = timeout;
         self
+    }
+
+    /// Indicate that this merge-insert uses data in a sealed MemTable.
+    /// Once write is completed, the corresponding MemTable should also be marked as flushed.
+    pub async fn mark_mem_wal_as_flushed(
+        &mut self,
+        mem_wal_id: MemWalId,
+        expected_owner_id: &str,
+    ) -> Result<&mut Self> {
+        if let Some(mem_wal_index) = self
+            .dataset
+            .open_mem_wal_index(&NoOpMetricsCollector)
+            .await?
+        {
+            if let Some(generations) = mem_wal_index.mem_wal_map.get(mem_wal_id.region.as_str()) {
+                if let Some(mem_wal) = generations.get(&mem_wal_id.generation) {
+                    mem_wal.check_state(lance_index::mem_wal::State::Sealed)?;
+                    mem_wal.check_expected_owner_id(expected_owner_id)?;
+                    self.params.mem_wal_to_flush = Some(mem_wal.clone());
+                    Ok(self)
+                } else {
+                    Err(Error::invalid_input(
+                        format!(
+                            "Cannot find MemWAL generation {} for region {}",
+                            mem_wal_id.generation, mem_wal_id.region
+                        ),
+                        location!(),
+                    ))
+                }
+            } else {
+                Err(Error::invalid_input(
+                    format!("Cannot find MemWAL for region {}", mem_wal_id.region),
+                    location!(),
+                ))
+            }
+        } else {
+            Err(Error::NotSupported {
+                source: "MemWAL is not enabled".into(),
+                location: location!(),
+            })
+        }
     }
 
     /// Crate a merge insert job
@@ -1354,6 +1400,7 @@ impl MergeInsertJob {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                mem_wal_to_flush: self.params.mem_wal_to_flush,
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
@@ -1386,6 +1433,7 @@ impl MergeInsertJob {
                 // On this path we only make deletions against updated_fragments and will not
                 // modify any field values.
                 fields_modified: vec![],
+                mem_wal_to_flush: self.params.mem_wal_to_flush,
             };
 
             let affected_rows = Some(RowIdTreeMap::from(removed_row_ids));

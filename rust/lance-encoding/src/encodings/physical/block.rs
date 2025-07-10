@@ -22,13 +22,13 @@
 //! transparent).
 
 use arrow_buffer::ArrowNativeType;
-use snafu::location;
-use std::{
-    io::{Cursor, Write},
-    str::FromStr,
-};
-
 use lance_core::{Error, Result};
+use snafu::location;
+
+use std::io::Cursor;
+use std::{io::Write, str::FromStr};
+use zstd::bulk::decompress_to_buffer;
+use zstd::stream::copy_decode;
 
 use crate::{
     buffer::LanceBuffer,
@@ -109,11 +109,69 @@ impl ZstdBufferCompressor {
     pub fn new(compression_level: i32) -> Self {
         Self { compression_level }
     }
+
+    // https://datatracker.ietf.org/doc/html/rfc8878
+    fn is_raw_stream_format(&self, input_buf: &[u8]) -> bool {
+        if input_buf.len() < 8 {
+            return true; // can't be length prefixed format if less than 8 bytes
+        }
+        // read the first 4 bytes as the magic number
+        let mut magic_buf = [0u8; 4];
+        magic_buf.copy_from_slice(&input_buf[..4]);
+        let magic = u32::from_le_bytes(magic_buf);
+
+        // see RFC 8878, section 3.1.1. Zstandard Frames, which defines the magic number
+        const ZSTD_MAGIC_NUMBER: u32 = 0xFD2FB528;
+        if magic == ZSTD_MAGIC_NUMBER {
+            // the compressed buffer starts like a Zstd frame.
+            // Per RFC 8878, the reserved bit (with Bit Number 3, the 4th bit) in the FHD (frame header descriptor) MUST be 0
+            // see section 3.1.1.1.1. 'Frame_Header_Descriptor' and section 3.1.1.1.1.4. 'Reserved Bit' for details
+            const FHD_BYTE_INDEX: usize = 4;
+            let fhd_byte = input_buf[FHD_BYTE_INDEX];
+            const FHD_RESERVED_BIT_MASK: u8 = 0b0001_0000;
+            let reserved_bit = fhd_byte & FHD_RESERVED_BIT_MASK;
+
+            if reserved_bit != 0 {
+                // this bit is 1. This is NOT a valid zstd frame.
+                // therefore, it must be length prefixed format where the length coincidentally
+                // started with the magic number
+                false
+            } else {
+                // the reserved bit is 0. This is consistent with a valid Zstd frame.
+                // treat it as raw stream format
+                true
+            }
+        } else {
+            // doesn't start with the magic number, so it can't be the raw stream format
+            false
+        }
+    }
+
+    fn decompress_length_prefixed_zstd(
+        &self,
+        input_buf: &[u8],
+        output_buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        const LENGTH_PREFIX_SIZE: usize = 8;
+        let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
+        len_buf.copy_from_slice(&input_buf[..LENGTH_PREFIX_SIZE]);
+
+        let uncompressed_len = u64::from_le_bytes(len_buf) as usize;
+
+        let start = output_buf.len();
+        output_buf.resize(start + uncompressed_len, 0);
+
+        let compressed_data = &input_buf[LENGTH_PREFIX_SIZE..];
+        decompress_to_buffer(compressed_data, &mut output_buf[start..])?;
+        Ok(())
+    }
 }
 
 impl BufferCompressor for ZstdBufferCompressor {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-        let mut encoder = zstd::Encoder::new(output_buf, self.compression_level)?;
+        output_buf.write_all(&(input_buf.len() as u64).to_le_bytes())?;
+        let mut encoder = zstd::stream::Encoder::new(output_buf, self.compression_level)?;
+
         encoder.write_all(input_buf)?;
         match encoder.finish() {
             Ok(_) => Ok(()),
@@ -122,8 +180,17 @@ impl BufferCompressor for ZstdBufferCompressor {
     }
 
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-        let source = Cursor::new(input_buf);
-        zstd::stream::copy_decode(source, output_buf)?;
+        if input_buf.is_empty() {
+            return Ok(());
+        }
+
+        let is_raw_stream_format = self.is_raw_stream_format(input_buf);
+        if is_raw_stream_format {
+            copy_decode(Cursor::new(input_buf), output_buf)?;
+        } else {
+            self.decompress_length_prefixed_zstd(input_buf, output_buf)?;
+        }
+
         Ok(())
     }
 
@@ -396,5 +463,87 @@ mod tests {
     #[test]
     fn test_compression_scheme_from_str_invalid() {
         assert!(CompressionScheme::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_compress_zstd_with_length_prefixed() {
+        let compressor = ZstdBufferCompressor::new(0);
+        let input_data = b"Hello, world!";
+        let mut compressed_data = Vec::new();
+
+        compressor
+            .compress(input_data, &mut compressed_data)
+            .unwrap();
+        let mut decompressed_data = Vec::new();
+        compressor
+            .decompress(&compressed_data, &mut decompressed_data)
+            .unwrap();
+        assert_eq!(input_data, decompressed_data.as_slice());
+    }
+
+    #[test]
+    fn test_zstd_compress_decompress_multiple_times() {
+        let compressor = ZstdBufferCompressor::new(0);
+        let (input_data_1, input_data_2) = (b"Hello ", b"World");
+        let mut compressed_data = Vec::new();
+
+        compressor
+            .compress(input_data_1, &mut compressed_data)
+            .unwrap();
+        let compressed_length_1 = compressed_data.len();
+
+        compressor
+            .compress(input_data_2, &mut compressed_data)
+            .unwrap();
+
+        let mut decompressed_data = Vec::new();
+        compressor
+            .decompress(
+                &compressed_data[..compressed_length_1],
+                &mut decompressed_data,
+            )
+            .unwrap();
+
+        compressor
+            .decompress(
+                &compressed_data[compressed_length_1..],
+                &mut decompressed_data,
+            )
+            .unwrap();
+
+        // the output should contain both input_data_1 and input_data_2
+        assert_eq!(
+            decompressed_data.len(),
+            input_data_1.len() + input_data_2.len()
+        );
+        assert_eq!(
+            &decompressed_data[..input_data_1.len()],
+            input_data_1,
+            "First part of decompressed data should match input_1"
+        );
+        assert_eq!(
+            &decompressed_data[input_data_1.len()..],
+            input_data_2,
+            "Second part of decompressed data should match input_2"
+        );
+    }
+
+    #[test]
+    fn test_compress_zstd_raw_stream_format_and_decompress_with_length_prefixed() {
+        let compressor = ZstdBufferCompressor::new(0);
+        let input_data = b"Hello, world!";
+        let mut compressed_data = Vec::new();
+
+        // compress using raw stream format
+        let mut encoder = zstd::Encoder::new(&mut compressed_data, 0).unwrap();
+        encoder.write_all(input_data).unwrap();
+        encoder.finish().expect("failed to encode data with zstd");
+
+        // decompress using length prefixed format
+        let mut decompressed_data = Vec::new();
+        compressor
+            .decompress(&compressed_data, &mut decompressed_data)
+            .unwrap();
+        assert_eq!(input_data, decompressed_data.as_slice());
     }
 }
