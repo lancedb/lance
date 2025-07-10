@@ -73,17 +73,22 @@ def callback(evt):
 capture_trace_events(callback)
 
 lance.write_dataset(pa.table({"x": range(100)}), "memory://test")
-assert len(events) == 2
+assert len(events) == 3
 
-print(events[0].args["mode"])
-assert events[0].target == "lance::file_audit"
-assert events[0].args["mode"] == "create"
-assert events[0].args["type"] == "data"
+print(events[0].args["event"])
+assert events[0].target == "lance::dataset_events"
+assert events[0].args["event"] == "dataset_create_or_write"
+assert events[0].args["uri"] == "memory://test"
 
-print(events[1])
+print(events[1].args["mode"])
 assert events[1].target == "lance::file_audit"
 assert events[1].args["mode"] == "create"
-assert events[1].args["type"] == "manifest"
+assert events[1].args["type"] == "data"
+
+print(events[2])
+assert events[2].target == "lance::file_audit"
+assert events[2].args["mode"] == "create"
+assert events[2].args["type"] == "manifest"
 """
     )
     subprocess.run(

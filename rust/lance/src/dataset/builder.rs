@@ -9,7 +9,6 @@ use crate::{
     session::Session,
     Dataset,
 };
-use lance_core::utils::tracing::{DATASET_EVENT_OPEN, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptions, DEFAULT_CLOUD_IO_PARALLELISM,
@@ -21,7 +20,7 @@ use lance_table::{
 use object_store::{aws::AwsCredentialProvider, path::Path, DynObjectStore};
 use prost::Message;
 use snafu::location;
-use tracing::{info, instrument};
+use tracing::instrument;
 use url::Url;
 /// builder for loading a [`Dataset`].
 #[derive(Debug, Clone)]
@@ -271,7 +270,6 @@ impl DatasetBuilder {
 
     #[instrument(skip_all)]
     pub async fn load(mut self) -> Result<Dataset> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_EVENT_OPEN, path = &self.table_uri);
         let session = match self.session.as_ref() {
             Some(session) => session.clone(),
             None => Arc::new(Session::new(

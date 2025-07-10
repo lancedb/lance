@@ -15,7 +15,6 @@ use crate::{
     Dataset, Error, Result,
 };
 use lance_core::utils::mask::RowIdTreeMap;
-use lance_core::utils::tracing::{DATASET_EVENT_CREATE, DATASET_EVENT_WRITE, TRACE_DATASET_EVENTS};
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::{
@@ -23,7 +22,6 @@ use lance_table::{
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 use snafu::location;
-use tracing::info;
 
 use super::{resolve_commit_handler, WriteDestination};
 
@@ -276,7 +274,6 @@ impl<'a> CommitBuilder<'a> {
         };
 
         let (manifest, manifest_location) = if let Some(dataset) = dest.dataset() {
-            info!(target: TRACE_DATASET_EVENTS, event=DATASET_EVENT_WRITE, path = &dataset.uri);
             if self.detached {
                 if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
                     return Err(Error::NotSupported {
@@ -313,7 +310,6 @@ impl<'a> CommitBuilder<'a> {
                 location: location!(),
             });
         } else {
-            info!(target: TRACE_DATASET_EVENTS, event=DATASET_EVENT_CREATE, path = &base_path.to_string());
             commit_new_dataset(
                 object_store.as_ref(),
                 commit_handler.as_ref(),
