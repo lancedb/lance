@@ -324,25 +324,6 @@ impl From<Schema> for ProjectionRequest {
     }
 }
 
-/// Customize the params of dataset's sql API.
-#[derive(Clone, Debug)]
-pub struct SqlOptions {
-    /// the dataset to run the SQL query
-    dataset: Option<Dataset>,
-
-    /// the SQL query to run
-    sql: String,
-
-    /// the name of the table to register in the datafusion context
-    table_name: String,
-
-    /// if true, the query result will include the internal row id
-    row_id: bool,
-
-    /// if true, the query result will include the internal row address
-    row_addr: bool,
-}
-
 impl Dataset {
     /// Open an existing dataset.
     ///
