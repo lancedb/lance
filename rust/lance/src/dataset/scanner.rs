@@ -4195,7 +4195,6 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    #[test_log::test]
     async fn test_ann_prefilter(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
@@ -5263,7 +5262,6 @@ mod test {
     // different configurations to ensure that we get consistent results
     #[rstest]
     #[tokio::test]
-    #[test_log::test]
     async fn test_secondary_index_scans(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,

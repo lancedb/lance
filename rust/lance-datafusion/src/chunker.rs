@@ -294,12 +294,6 @@ where
             }
         }
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        // We may reduce the number of batches but there is no guarantee.  We will never
-        // increase the number of batches.
-        self.inner.size_hint()
-    }
 }
 
 #[cfg(test)]
