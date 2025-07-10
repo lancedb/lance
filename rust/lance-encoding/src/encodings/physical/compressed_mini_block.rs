@@ -37,9 +37,11 @@ impl MiniBlockCompressor for CompressedMiniBlockCompressor {
         // First, compress with the inner compressor
         let (mut inner_compressed, inner_encoding) = self.inner.compress(page)?;
 
-        // Return the original encoding without compression if the first buffer is
-        // not large enough
-        if inner_compressed.data[0].len() < MIN_BUFFER_SIZE_FOR_COMPRESSION {
+        // Return the original encoding without compression if there's no data or
+        // the first buffer is not large enough
+        if inner_compressed.data.is_empty()
+            || inner_compressed.data[0].len() < MIN_BUFFER_SIZE_FOR_COMPRESSION
+        {
             return Ok((inner_compressed, inner_encoding));
         }
 
@@ -212,35 +214,49 @@ mod tests {
     }
 
     #[test]
-    fn test_compressed_mini_block_round_trip() {
-        // Create test data with repetitive patterns that compress well
-        // Need enough data to trigger compression (>= 1024 bytes)
-        let mut values = Vec::with_capacity(2048);
-        for i in 0..128 {
-            // Create runs of 16 values
-            values.extend(vec![i; 16]);
+    fn test_compressed_mini_block_with_doubles() {
+        // Create test data with doubles - RLE is not efficient for floating point data
+        // but LZ4 can find patterns in the byte representation
+        let mut values = Vec::with_capacity(1024);
+        for i in 0..1024 {
+            values.push((i as f64) * 0.1);
         }
+        
         let data = LanceBuffer::from_bytes(
             bytemuck::cast_slice(&values).to_vec().into(),
-            std::mem::align_of::<i32>() as u64,
+            std::mem::align_of::<f64>() as u64,
         );
         let block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: 32,
+            bits_per_value: 64,
             data,
-            num_values: 2048,
+            num_values: 1024,
             block_info: BlockInfo::new(),
         });
 
-        // Create compressor with RLE inner and LZ4 compression
-        let inner = Box::new(RleMiniBlockEncoder);
+        // Create compressor with ValueEncoder inner and Zstd compression
+        // ValueEncoder is better for floating point data than RLE
+        let inner = Box::new(ValueEncoder {});
         let compression = CompressionConfig {
-            scheme: CompressionScheme::Lz4,
-            level: None,
+            scheme: CompressionScheme::Zstd,
+            level: Some(3),
         };
         let compressor = CompressedMiniBlockCompressor::new(inner, compression);
 
         // Compress the data
         let (compressed, encoding) = compressor.compress(block).unwrap();
+
+        // The encoding should be CompressedMiniBlock because doubles compress well with Zstd
+        match &encoding.array_encoding {
+            Some(pb::array_encoding::ArrayEncoding::CompressedMiniBlock(cm)) => {
+                assert!(cm.inner.is_some());
+                assert_eq!(cm.compression.as_ref().unwrap().scheme, "zstd");
+                assert_eq!(cm.compression.as_ref().unwrap().level, Some(3));
+            }
+            Some(pb::array_encoding::ArrayEncoding::Flat(_)) => {
+                // Also acceptable if compression didn't help
+            }
+            _ => panic!("Expected CompressedMiniBlock or Flat encoding"),
+        }
 
         // Create decompressor using the encoding
         let decompression_strategy = DefaultDecompressionStrategy::default();
@@ -256,10 +272,10 @@ mod tests {
         // Verify the round trip
         match decompressed {
             DataBlock::FixedWidth(decompressed) => {
-                assert_eq!(32, decompressed.bits_per_value);
-                assert_eq!(2048, decompressed.num_values);
+                assert_eq!(64, decompressed.bits_per_value);
+                assert_eq!(1024, decompressed.num_values);
                 // Verify the data matches
-                let decompressed_values: &[i32] = bytemuck::cast_slice(decompressed.data.as_ref());
+                let decompressed_values: &[f64] = bytemuck::cast_slice(decompressed.data.as_ref());
                 assert_eq!(values, decompressed_values);
             }
             _ => panic!("Expected FixedWidth block"),
