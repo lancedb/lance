@@ -85,6 +85,12 @@ use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
 use std::sync::{Arc, RwLock};
 
+use super::fragment::FileFragment;
+use super::index::DatasetIndexRemapperOptions;
+use super::rowids::load_row_id_sequences;
+use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
+use super::utils::make_rowid_capture_stream;
+use super::{write_fragments_internal, WriteMode, WriteParams};
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Dataset;
 use crate::Result;
@@ -92,18 +98,13 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::{DATASET_EVENT_COMPACTION, TRACE_DATASET_EVENTS};
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
-
-use super::fragment::FileFragment;
-use super::index::DatasetIndexRemapperOptions;
-use super::rowids::load_row_id_sequences;
-use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
-use super::utils::make_rowid_capture_stream;
-use super::{write_fragments_internal, WriteMode, WriteParams};
+use tracing::info;
 
 pub mod remapping;
 
@@ -217,6 +218,7 @@ pub async fn compact_files(
     mut options: CompactionOptions,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
+    info!(target: TRACE_DATASET_EVENTS, event=DATASET_EVENT_COMPACTION, path = &dataset.uri);
     options.validate();
 
     let compaction_plan: CompactionPlan = plan_compaction(dataset, &options).await?;
