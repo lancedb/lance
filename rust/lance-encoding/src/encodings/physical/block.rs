@@ -137,25 +137,62 @@ pub struct Lz4BufferCompressor {}
 
 impl BufferCompressor for Lz4BufferCompressor {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-        lz4::block::compress_to_buffer(input_buf, None, true, output_buf)
-            .map_err(|err| Error::Internal {
-                message: format!("LZ4 compression error: {}", err),
-                location: location!(),
-            })
-            .map(|_| ())
+        // Remember the starting position
+        let start_pos = output_buf.len();
+
+        // LZ4 needs space for the compressed data
+        let max_size = lz4::block::compress_bound(input_buf.len())?;
+        // Resize to ensure we have enough space (including 4 bytes for size header)
+        output_buf.resize(start_pos + max_size + 4, 0);
+
+        let compressed_size =
+            lz4::block::compress_to_buffer(input_buf, None, true, &mut output_buf[start_pos..])
+                .map_err(|err| Error::Internal {
+                    message: format!("LZ4 compression error: {}", err),
+                    location: location!(),
+                })?;
+
+        // Truncate to actual size
+        output_buf.truncate(start_pos + compressed_size);
+        Ok(())
     }
 
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-        lz4::block::decompress_to_buffer(input_buf, None, output_buf)
-            .map_err(|err| Error::Internal {
-                message: format!("LZ4 decompression error: {}", err),
+        // When prepend_size is true, LZ4 stores the uncompressed size in the first 4 bytes
+        // We can read this to know exactly how much space we need
+        if input_buf.len() < 4 {
+            return Err(Error::Internal {
+                message: "LZ4 compressed data too short".to_string(),
                 location: location!(),
-            })
-            .map(|_| ())
+            });
+        }
+
+        // Read the uncompressed size from the first 4 bytes (little-endian)
+        let uncompressed_size =
+            u32::from_le_bytes([input_buf[0], input_buf[1], input_buf[2], input_buf[3]]) as usize;
+
+        // Remember the starting position
+        let start_pos = output_buf.len();
+
+        // Resize to ensure we have the exact space needed
+        output_buf.resize(start_pos + uncompressed_size, 0);
+
+        // Now decompress directly into the buffer slice
+        let decompressed_size =
+            lz4::block::decompress_to_buffer(input_buf, None, &mut output_buf[start_pos..])
+                .map_err(|err| Error::Internal {
+                    message: format!("LZ4 decompression error: {}", err),
+                    location: location!(),
+                })?;
+
+        // Truncate to actual decompressed size (should be same as uncompressed_size)
+        output_buf.truncate(start_pos + decompressed_size);
+
+        Ok(())
     }
 
     fn name(&self) -> &str {
-        "zstd"
+        "lz4"
     }
 }
 

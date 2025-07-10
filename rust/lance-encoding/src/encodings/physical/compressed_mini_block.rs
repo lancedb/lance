@@ -221,7 +221,7 @@ mod tests {
         for i in 0..1024 {
             values.push((i as f64) * 0.1);
         }
-        
+
         let data = LanceBuffer::from_bytes(
             bytemuck::cast_slice(&values).to_vec().into(),
             std::mem::align_of::<f64>() as u64,
@@ -377,5 +377,83 @@ mod tests {
         assert_eq!(compressed.num_values, 1024);
         // ValueEncoder produces 1 buffer
         assert_eq!(compressed.data.len(), 1);
+    }
+
+    #[test]
+    fn test_compressed_mini_block_with_lz4() {
+        // Create test data with repeated patterns that LZ4 can compress well
+        let mut values = Vec::with_capacity(2048);
+        // Create a pattern with some repetition
+        for i in 0..256 {
+            for _ in 0..8 {
+                values.push(i as i32);
+            }
+        }
+
+        let data = LanceBuffer::from_bytes(
+            bytemuck::cast_slice(&values).to_vec().into(),
+            std::mem::align_of::<i32>() as u64,
+        );
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: 32,
+            data,
+            num_values: 2048,
+            block_info: BlockInfo::new(),
+        });
+
+        // Create compressor with ValueEncoder and LZ4 compression
+        let inner = Box::new(ValueEncoder {});
+        let compression = CompressionConfig {
+            scheme: CompressionScheme::Lz4,
+            level: None,
+        };
+        let compressor = CompressedMiniBlockCompressor::new(inner, compression);
+
+        // Compress the data
+        let (compressed, encoding) = compressor.compress(block).unwrap();
+
+        // Should get CompressedMiniBlock encoding
+        match &encoding.array_encoding {
+            Some(pb::array_encoding::ArrayEncoding::CompressedMiniBlock(cm)) => {
+                assert!(cm.inner.is_some());
+                assert_eq!(cm.compression.as_ref().unwrap().scheme, "lz4");
+                assert_eq!(cm.compression.as_ref().unwrap().level, None);
+
+                // Verify inner encoding is Flat (from ValueEncoder)
+                match &cm.inner.as_ref().unwrap().array_encoding {
+                    Some(pb::array_encoding::ArrayEncoding::Flat(flat)) => {
+                        assert_eq!(flat.bits_per_value, 32);
+                    }
+                    _ => panic!("Expected Flat inner encoding"),
+                }
+            }
+            _ => panic!("Expected CompressedMiniBlock encoding"),
+        }
+
+        assert_eq!(compressed.num_values, 2048);
+        assert_eq!(compressed.data.len(), 1);
+
+        // Test decompression
+        let decompression_strategy = DefaultDecompressionStrategy::default();
+        let decompressor = decompression_strategy
+            .create_miniblock_decompressor(&encoding)
+            .unwrap();
+
+        // Decompress the data
+        let decompressed = decompressor
+            .decompress(compressed.data, compressed.num_values)
+            .unwrap();
+
+        // Verify the round trip
+        match decompressed {
+            DataBlock::FixedWidth(decompressed) => {
+                assert_eq!(32, decompressed.bits_per_value);
+                assert_eq!(2048, decompressed.num_values);
+                // Verify the data matches
+                let decompressed_values: &[i32] = bytemuck::cast_slice(decompressed.data.as_ref());
+                assert_eq!(values, decompressed_values);
+            }
+            _ => panic!("Expected FixedWidth block"),
+        }
     }
 }
