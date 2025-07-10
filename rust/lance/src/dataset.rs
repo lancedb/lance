@@ -75,6 +75,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
+use crate::dataset::sql::SqlOptions;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{
