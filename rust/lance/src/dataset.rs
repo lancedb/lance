@@ -7,7 +7,6 @@
 use arrow_array::{RecordBatch, RecordBatchReader};
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{prelude::*, Duration};
-use datafusion::prelude::SessionContext;
 use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -61,6 +60,7 @@ pub mod refs;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
+mod sql;
 pub mod statistics;
 mod take;
 pub mod transaction;
@@ -75,7 +75,6 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
-use crate::datafusion::LanceTableProvider;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{
@@ -342,50 +341,6 @@ pub struct SqlOptions {
 
     /// if true, the query result will include the internal row address
     row_addr: bool,
-}
-
-impl SqlOptions {
-    pub fn table_name(mut self, table_name: &str) -> Self {
-        self.table_name = table_name.to_string();
-        self
-    }
-
-    pub fn with_row_id(mut self, row_id: bool) -> Self {
-        self.row_id = row_id;
-        self
-    }
-
-    pub fn with_row_addr(mut self, row_addr: bool) -> Self {
-        self.row_addr = row_addr;
-        self
-    }
-
-    pub async fn execute(self) -> Result<Vec<RecordBatch>> {
-        let ctx = SessionContext::new();
-        ctx.register_table(
-            self.table_name,
-            Arc::new(LanceTableProvider::new(
-                Arc::new(self.dataset.unwrap()),
-                self.row_id,
-                self.row_addr,
-            )),
-        )?;
-        let df = ctx.sql(&self.sql).await?;
-        let result = df.collect().await?;
-        Ok(result)
-    }
-}
-
-impl Default for SqlOptions {
-    fn default() -> Self {
-        Self {
-            dataset: None,
-            sql: "".to_string(),
-            table_name: "".to_string(),
-            row_id: false,
-            row_addr: false,
-        }
-    }
 }
 
 impl Dataset {
@@ -1517,6 +1472,7 @@ impl Dataset {
 
     /// Run a SQL query against the dataset.
     /// The underlying SQL engine is DataFusion.
+    /// Please refer to the DataFusion documentation for supported SQL syntax.
     pub fn sql(&mut self, sql: &str) -> SqlOptions {
         SqlOptions {
             dataset: Some(self.clone()),
@@ -6626,6 +6582,9 @@ mod tests {
             .table_name("foo")
             .execute()
             .await
+            .unwrap()
+            .collect()
+            .await
             .unwrap();
         assert_eq!(results.len(), 1);
         let results = results.into_iter().next().unwrap();
@@ -6640,6 +6599,9 @@ mod tests {
             .with_row_id(true)
             .with_row_addr(true)
             .execute()
+            .await
+            .unwrap()
+            .collect()
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
