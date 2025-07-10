@@ -17,7 +17,11 @@ use itertools::Itertools;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, DATASET_EVENT_CLEANUP, DATASET_EVENT_CREATE_OR_WRITE, DATASET_EVENT_DELETE_ROW, DATASET_EVENT_DROP_COLUMN, DATASET_EVENT_OPEN, TRACE_DATASET_EVENTS, TRACE_FILE_AUDIT};
+use lance_core::utils::tracing::{
+    AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, DATASET_EVENT_CLEANUP, DATASET_EVENT_CREATE_OR_WRITE,
+    DATASET_EVENT_DELETE_ROW, DATASET_EVENT_DROP_COLUMN, DATASET_EVENT_OPEN, TRACE_DATASET_EVENTS,
+    TRACE_FILE_AUDIT,
+};
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
