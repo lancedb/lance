@@ -40,13 +40,10 @@ impl MiniBlockCompressor for CompressedMiniBlockCompressor {
         // but some like ValueEncoder may produce only 1 buffer
 
         // Check if any buffer is large enough to warrant compression
-        let mut should_compress = false;
-        for buffer in &compressed.data {
-            if buffer.len() >= MIN_BUFFER_SIZE_FOR_COMPRESSION {
-                should_compress = true;
-                break;
-            }
-        }
+        let should_compress = compressed
+            .data
+            .iter()
+            .any(|v| v.len() >= MIN_BUFFER_SIZE_FOR_COMPRESSION);
 
         if !should_compress {
             trace!("Buffers too small for compression, returning uncompressed data");
@@ -57,9 +54,7 @@ impl MiniBlockCompressor for CompressedMiniBlockCompressor {
         let compressor = GeneralBufferCompressor::get_compressor(self.compression);
 
         for (i, buffer) in compressed.data.iter_mut().enumerate() {
-            if buffer.is_empty() {
-                continue;
-            }
+            assert!(!buffer.is_empty(), "buffer must have valid content");
 
             let mut compressed_buffer = Vec::new();
             compressor.compress(buffer.as_ref(), &mut compressed_buffer)?;
@@ -75,23 +70,8 @@ impl MiniBlockCompressor for CompressedMiniBlockCompressor {
                 compressed_size as f32 / original_size as f32
             );
 
-            // Update buffer and size
+            // Update buffer only - chunks don't need updating since they reference global buffers
             *buffer = LanceBuffer::from(compressed_buffer);
-
-            // Update the buffer size in chunks
-            let mut buffer_idx = 0;
-            for chunk in &mut compressed.chunks {
-                for size in chunk.buffer_sizes.iter_mut() {
-                    if buffer_idx == i {
-                        *size = compressed_size as u16;
-                        break;
-                    }
-                    buffer_idx += 1;
-                }
-                if buffer_idx > i {
-                    break;
-                }
-            }
         }
 
         // Return compressed encoding
