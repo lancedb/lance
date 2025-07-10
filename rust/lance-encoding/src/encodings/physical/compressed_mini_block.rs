@@ -45,9 +45,8 @@ impl MiniBlockCompressor for CompressedMiniBlockCompressor {
             .iter()
             .all(|v| v.len() >= MIN_BUFFER_SIZE_FOR_COMPRESSION);
 
+        // Return the original encoding without compression
         if !should_compress {
-            trace!("Buffers too small for compression, returning uncompressed data");
-            // Return the original encoding without compression
             return Ok((compressed, inner_encoding));
         }
 
