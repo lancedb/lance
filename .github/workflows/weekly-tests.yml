@@ -75,7 +75,7 @@ jobs:
         working-directory: python
         shell: bash
         run: |
-          pip3 install $(ls target/wheels/pylance-*.whl)[tests]
+          pip install -e ".[tests]"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -86,7 +86,7 @@ jobs:
         id: run_weekly_tests
         run: pytest python/tests/weekly/test_weekly.py
       - name: Upgrade Pylance
-        run: pip install -e .
+        run: pip install -e ".[tests]"
       - name: Run weekly tests again
         run: pytest python/tests/weekly/test_weekly.py
 
@@ -112,15 +112,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
-        working-directory: python
-        shell: bash
-        run: |
-          pip3 install $(ls target/wheels/pylance-*.whl)[tests]
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
       - name: Install Lance
-        run: pip install -e .
+        run: pip install -e ".[tests]"
       - name: Run weekly tests
         run: pytest python/tests/weekly/test_weekly.py
