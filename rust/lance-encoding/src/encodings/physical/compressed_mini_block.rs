@@ -28,8 +28,8 @@ impl CompressedMiniBlockCompressor {
     }
 }
 
-// Minimum buffer size to consider for compression
-const MIN_BUFFER_SIZE_FOR_COMPRESSION: usize = 1024;
+/// Minimum buffer size to consider for compression
+const MIN_BUFFER_SIZE_FOR_COMPRESSION: usize = 256;
 
 impl MiniBlockCompressor for CompressedMiniBlockCompressor {
     fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)> {
@@ -48,63 +48,55 @@ impl MiniBlockCompressor for CompressedMiniBlockCompressor {
             }
         }
 
-        trace!(
-            "Buffer sizes: {:?}, should_compress: {}",
-            compressed.data.iter().map(|b| b.len()).collect::<Vec<_>>(),
-            should_compress
-        );
-
-        // Only compress if at least one buffer is large enough
-        if should_compress {
-            // Create the buffer compressor
-            let compressor = GeneralBufferCompressor::get_compressor(self.compression);
-
-            // Compress both buffers
-            for (i, buffer) in compressed.data.iter_mut().enumerate() {
-                if !buffer.is_empty() {
-                    let mut compressed_buffer = Vec::new();
-                    compressor.compress(buffer.as_ref(), &mut compressed_buffer)?;
-
-                    let original_size = buffer.len();
-                    let compressed_size = compressed_buffer.len();
-
-                    trace!(
-                        "Buffer {} compressed from {} to {} bytes (ratio: {:.2})",
-                        i,
-                        original_size,
-                        compressed_size,
-                        compressed_size as f32 / original_size as f32
-                    );
-
-                    // Update buffer and size
-                    *buffer = LanceBuffer::from(compressed_buffer);
-
-                    // Update the buffer size in chunks
-                    let mut buffer_idx = 0;
-                    for chunk in &mut compressed.chunks {
-                        for size in chunk.buffer_sizes.iter_mut() {
-                            if buffer_idx == i {
-                                *size = compressed_size as u16;
-                                break;
-                            }
-                            buffer_idx += 1;
-                        }
-                        if buffer_idx > i {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Return compressed encoding
-            let encoding =
-                ProtobufUtils::compressed_mini_block(inner_encoding, self.compression);
-            Ok((compressed, encoding))
-        } else {
+        if !should_compress {
             trace!("Buffers too small for compression, returning uncompressed data");
             // Return the original encoding without compression
-            Ok((compressed, inner_encoding))
+            return Ok((compressed, inner_encoding));
         }
+
+        let compressor = GeneralBufferCompressor::get_compressor(self.compression);
+
+        for (i, buffer) in compressed.data.iter_mut().enumerate() {
+            if buffer.is_empty() {
+                continue;
+            }
+
+            let mut compressed_buffer = Vec::new();
+            compressor.compress(buffer.as_ref(), &mut compressed_buffer)?;
+
+            let original_size = buffer.len();
+            let compressed_size = compressed_buffer.len();
+
+            trace!(
+                "Buffer {} compressed from {} to {} bytes (ratio: {:.2})",
+                i,
+                original_size,
+                compressed_size,
+                compressed_size as f32 / original_size as f32
+            );
+
+            // Update buffer and size
+            *buffer = LanceBuffer::from(compressed_buffer);
+
+            // Update the buffer size in chunks
+            let mut buffer_idx = 0;
+            for chunk in &mut compressed.chunks {
+                for size in chunk.buffer_sizes.iter_mut() {
+                    if buffer_idx == i {
+                        *size = compressed_size as u16;
+                        break;
+                    }
+                    buffer_idx += 1;
+                }
+                if buffer_idx > i {
+                    break;
+                }
+            }
+        }
+
+        // Return compressed encoding
+        let encoding = ProtobufUtils::compressed_mini_block(inner_encoding, self.compression);
+        Ok((compressed, encoding))
     }
 }
 
