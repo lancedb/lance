@@ -70,6 +70,7 @@ def create_or_load_dataset(dataset_name: str, kwargs: dict):
     ds.create_scalar_index("id", index_type="BTREE", replace=True)
     ds.create_index(
         "vector",
+        index_type="IVF_PQ",
         metric="cosine",
         num_partitions=1024,
         num_sub_vectors=DIM // 8,
