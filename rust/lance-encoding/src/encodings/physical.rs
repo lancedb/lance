@@ -6,5 +6,7 @@ pub mod bitpack;
 pub mod block;
 pub mod constant;
 pub mod fsst;
+pub mod general;
 pub mod packed;
+pub mod rle;
 pub mod value;
