@@ -415,71 +415,23 @@ mod tests {
 
     #[test]
     fn test_compressed_mini_block_with_doubles() {
-        // Create test data with doubles - RLE is not efficient for floating point data
-        // but LZ4 can find patterns in the byte representation
-        let mut values = Vec::with_capacity(1024);
-        for i in 0..1024 {
-            values.push((i as f64) * 0.1);
-        }
-
-        let data = LanceBuffer::from_bytes(
-            bytemuck::cast_slice(&values).to_vec().into(),
-            std::mem::align_of::<f64>() as u64,
-        );
-        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: 64,
-            data,
-            num_values: 1024,
-            block_info: BlockInfo::new(),
-        });
-
-        // Create compressor with ValueEncoder inner and Zstd compression
-        // ValueEncoder is better for floating point data than RLE
-        let inner = Box::new(ValueEncoder {});
-        let compression = CompressionConfig {
-            scheme: CompressionScheme::Zstd,
-            level: Some(3),
+        // Test with large sequential doubles that should compress well with Zstd
+        // The test focuses on verifying that GeneralMiniBlock works correctly
+        // when wrapping a simple ValueEncoder
+        let test_case = TestCase {
+            name: "float_values_with_zstd",
+            inner_encoder: Box::new(ValueEncoder {}),
+            compression: CompressionConfig {
+                scheme: CompressionScheme::Zstd,
+                level: Some(3),
+            },
+            // Create enough data to ensure compression is applied
+            data: create_pattern_f64_block(1024, |i| (i / 10) as f64),
+            expected_compressed: true,
+            min_compression_ratio: 0.5, // Zstd should achieve good compression on repetitive data
         };
-        let compressor = GeneralMiniBlockCompressor::new(inner, compression);
-
-        // Compress the data
-        let (compressed, encoding) = compressor.compress(block).unwrap();
-
-        // The encoding should be GeneralMiniBlock because doubles compress well with Zstd
-        match &encoding.array_encoding {
-            Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(cm)) => {
-                assert!(cm.inner.is_some());
-                assert_eq!(cm.compression.as_ref().unwrap().scheme, "zstd");
-                assert_eq!(cm.compression.as_ref().unwrap().level, Some(3));
-            }
-            Some(pb::array_encoding::ArrayEncoding::Flat(_)) => {
-                // Also acceptable if compression didn't help
-            }
-            _ => panic!("Expected GeneralMiniBlock or Flat encoding"),
-        }
-
-        // Create decompressor using the encoding
-        let decompression_strategy = DefaultDecompressionStrategy::default();
-        let decompressor = decompression_strategy
-            .create_miniblock_decompressor(&encoding)
-            .unwrap();
-
-        // Decompress the data
-        let decompressed = decompressor
-            .decompress(compressed.data, compressed.num_values)
-            .unwrap();
-
-        // Verify the round trip
-        match decompressed {
-            DataBlock::FixedWidth(decompressed) => {
-                assert_eq!(64, decompressed.bits_per_value);
-                assert_eq!(1024, decompressed.num_values);
-                // Verify the data matches
-                let decompressed_values: &[f64] = bytemuck::cast_slice(decompressed.data.as_ref());
-                assert_eq!(values, decompressed_values);
-            }
-            _ => panic!("Expected FixedWidth block"),
-        }
+        
+        run_round_trip_test(test_case);
     }
 
     #[test]
