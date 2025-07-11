@@ -12,6 +12,7 @@ use lance_table::{
 };
 use snafu::location;
 
+use super::{resolve_commit_handler, WriteDestination};
 use crate::{
     dataset::{
         builder::DatasetBuilder,
@@ -24,7 +25,8 @@ use crate::{
     Dataset, Error, Result,
 };
 
-use super::{resolve_commit_handler, WriteDestination};
+use lance_core::utils::tracing::{CREATE_EVENT, NEW_VERSION_EVENT, TRACE_DATASET_EVENTS};
+use tracing::info;
 
 /// Create a new commit from a [`Transaction`].
 ///
@@ -282,6 +284,14 @@ impl<'a> CommitBuilder<'a> {
                         location: location!(),
                     });
                 }
+                info!(
+                    target: TRACE_DATASET_EVENTS,
+                    event=NEW_VERSION_EVENT,
+                    uri=dataset.uri,
+                    version=transaction.read_version + 1,
+                    detached=true,
+                    operation=&transaction.operation.name()
+                );
                 commit_detached_transaction(
                     dataset,
                     object_store.as_ref(),
@@ -292,6 +302,14 @@ impl<'a> CommitBuilder<'a> {
                 )
                 .await?
             } else {
+                info!(
+                    target: TRACE_DATASET_EVENTS,
+                    event=NEW_VERSION_EVENT,
+                    uri=dataset.uri,
+                    version=transaction.read_version + 1,
+                    detached=false,
+                    operation=&transaction.operation.name()
+                );
                 commit_transaction(
                     dataset,
                     object_store.as_ref(),
@@ -311,6 +329,15 @@ impl<'a> CommitBuilder<'a> {
                 location: location!(),
             });
         } else {
+            info!(target: TRACE_DATASET_EVENTS, event=CREATE_EVENT, path=&base_path.to_string());
+            info!(
+                target: TRACE_DATASET_EVENTS,
+                event=NEW_VERSION_EVENT,
+                path=&base_path.to_string(),
+                version=transaction.read_version + 1,
+                detached=false,
+                operation=&transaction.operation.name()
+            );
             commit_new_dataset(
                 object_store.as_ref(),
                 commit_handler.as_ref(),
