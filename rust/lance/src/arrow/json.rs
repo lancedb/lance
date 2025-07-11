@@ -13,13 +13,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::datatypes::LogicalType;
 use lance_core::error::{Error, Result};
+use utoipa::ToSchema;
 
 /// JSON representation of an Apache Arrow [DataType].
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
 pub struct JsonDataType {
     #[serde(rename = "type")]
     type_: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
     fields: Option<Vec<JsonField>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     length: Option<usize>,
@@ -180,7 +182,7 @@ impl TryFrom<&JsonDataType> for DataType {
 }
 
 /// JSON representation of an Apache Arrow [Field].
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
 pub struct JsonField {
     name: String,
     #[serde(rename = "type")]
@@ -226,7 +228,7 @@ impl TryFrom<&JsonField> for Field {
 }
 
 /// JSON representation of a Apache Arrow [Schema].
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
 pub struct JsonSchema {
     fields: Vec<JsonField>,
 

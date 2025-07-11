@@ -79,6 +79,7 @@ tempfile.workspace = true
 tracing.workspace = true
 humantime = { workspace = true }
 async_cell = "0.2.2"
+utoipa.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
