@@ -552,9 +552,7 @@ pub async fn encode_batch(
         let mut tasks =
             encoder.maybe_encode(arr.clone(), &mut external_buffers, repdef, 0, num_rows)?;
         tasks.extend(encoder.flush(&mut external_buffers)?);
-        for buffer in external_buffers.take_buffers() {
-            data_buffer.extend_from_slice(&buffer);
-        }
+
         let mut pages = HashMap::<u32, Vec<PageInfo>>::new();
         for task in tasks {
             let encoded_page = task.await?;
@@ -564,6 +562,10 @@ pub async fn encode_batch(
                 .or_default()
                 .push(write_page_to_data_buffer(encoded_page, &mut data_buffer));
         }
+        for buffer in external_buffers.take_buffers() {
+            data_buffer.extend_from_slice(&buffer);
+        }
+
         let mut external_buffers =
             OutOfLineBuffers::new(data_buffer.len() as u64, options.buffer_alignment);
         let encoded_columns = encoder.finish(&mut external_buffers).await?;
