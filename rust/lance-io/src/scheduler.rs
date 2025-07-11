@@ -478,12 +478,16 @@ impl IoTask {
             let bytes_fut = self
                 .reader
                 .get_range(self.to_read.start as usize..self.to_read.end as usize);
+            // Add global IOPS counter
             IOPS_COUNTER.fetch_add(1, Ordering::Release);
-            let result = bytes_fut.await.map_err(Error::from);
-            if result.is_ok() {
-                BYTES_READ_COUNTER.fetch_add(self.num_bytes(), Ordering::Release);
-            }
-            result
+            // Read and add bytes read counter if success
+            let num_bytes = self.num_bytes();
+            bytes_fut
+                .inspect(move |_| {
+                    BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
+                })
+                .await
+                .map_err(Error::from)
         };
         IOPS_QUOTA.release();
         (self.when_done)(bytes);
