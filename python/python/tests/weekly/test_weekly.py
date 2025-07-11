@@ -153,7 +153,7 @@ class VectorSearch(ReadOnlyOperation):
         self.filter = filter
 
     def run(self, ds: lance.LanceDataset):
-        stats = ds.index_statistics("vector_idx")
+        stats = ds.stats.index_stats("vector_idx")
         if stats is None:
             print("No vector index found")
             return
@@ -174,7 +174,7 @@ class FullTextSearch(ReadOnlyOperation):
         self.filter = filter
 
     def run(self, ds: lance.LanceDataset):
-        stats = ds.index_statistics("text_idx")
+        stats = ds.stats.index_stats("text_idx")
         if stats is None:
             print("No text index found")
             return
