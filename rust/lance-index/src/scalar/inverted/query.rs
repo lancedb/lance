@@ -7,6 +7,7 @@ use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
+use utoipa::ToSchema;
 
 #[derive(Debug, Clone)]
 pub struct FtsSearchParams {
@@ -70,7 +71,7 @@ impl Default for FtsSearchParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
 pub enum Operator {
     And,
     Or,
@@ -109,7 +110,7 @@ pub trait FtsQueryNode {
     fn columns(&self) -> HashSet<String>;
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FtsQuery {
     // leaf queries
@@ -119,6 +120,8 @@ pub enum FtsQuery {
     // compound queries
     Boost(BoostQuery),
     MultiMatch(MultiMatchQuery),
+    // Openapi generator does not support recursive schema
+    #[schema(value_type = Object)]
     Boolean(BooleanQuery),
 }
 
@@ -281,7 +284,7 @@ impl From<BooleanQuery> for FtsQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct MatchQuery {
     // The column to search in.
     // If None, it will be determined at query time.
@@ -388,7 +391,7 @@ impl FtsQueryNode for MatchQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct PhraseQuery {
     // The column to search in.
     // If None, it will be determined at query time.
@@ -428,9 +431,11 @@ impl FtsQueryNode for PhraseQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct BoostQuery {
+    #[schema(value_type = Object)]
     pub positive: Box<FtsQuery>,
+    #[schema(value_type = Object)]
     pub negative: Box<FtsQuery>,
     #[serde(default = "BoostQuery::default_negative_boost")]
     pub negative_boost: f32,
@@ -458,7 +463,7 @@ impl FtsQueryNode for BoostQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, ToSchema)]
 pub struct MultiMatchQuery {
     // each query must be a match query with specified column
     pub match_queries: Vec<MatchQuery>,
