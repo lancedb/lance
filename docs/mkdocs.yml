@@ -71,8 +71,9 @@ extra:
 nav:
   - Introduction: index.md
   - Getting Started:
-    - Install: start/install.md
     - Quickstart: start/quickstart.md
+    - Versioning: start/versioning.md
+    - Vector Search: start/search.md
   - User Guide:
     - Read and Write: guide/read_and_write.md
     - Data Evolution: guide/data_evolution.md
