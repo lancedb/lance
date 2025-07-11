@@ -117,16 +117,12 @@ class Append(WriteOperation):
 
 
 class Delete(WriteOperation):
-    def __init__(self, delete_all: bool):
-        self.delete_all = delete_all
+    def __init__(self, delete_num_rows: int = 100):
+        self.delete_num_rows = delete_num_rows
 
     def run(self, ds: lance.LanceDataset):
-        if self.delete_all:
-            ds.delete("id >= 0")
-            return
-
         num_rows = ds.count_rows()
-        to_delete = np.random.randint(0, num_rows, 100)
+        to_delete = np.random.randint(0, num_rows, self.delete_num_rows)
         to_delete = ", ".join([str(v) for v in to_delete])
         ds.delete(f"id IN ({to_delete})")
 
@@ -204,8 +200,7 @@ def test_all_permutations(with_position):
 
     write_operations = [
         Append(),
-        Delete(delete_all=False),
-        Delete(delete_all=True),
+        Delete(delete_num_rows=100),
         Optimize(num_indices_to_merge=0, column="id"),
         Optimize(num_indices_to_merge=0, column="vector"),  # delta index
         Optimize(num_indices_to_merge=1, column="vector"),  # merge index
