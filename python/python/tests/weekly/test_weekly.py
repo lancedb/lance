@@ -188,8 +188,10 @@ class FullTextSearch(ReadOnlyOperation):
 
     def do_query(self, ds: lance.LanceDataset, query_text: str):
         query: lance.LanceScanner = ds.scanner(
-            full_text_query=query_text, filter=self.filter
-        ).limit(10)
+            full_text_query=query_text,
+            filter=self.filter,
+            limit=10,
+        )
         print(query.analyze_plan())
 
 
