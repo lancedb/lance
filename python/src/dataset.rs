@@ -1451,6 +1451,30 @@ impl Dataset {
             .infer_error()
     }
 
+    fn list_commit_messages(&mut self) -> PyResult<Vec<(u64, Option<String>)>> {
+        let new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.list_commit_messages())?
+            .infer_error()
+    }
+
+    fn commit_message(&mut self, message: String, version: u64) -> PyResult<()> {
+        let new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.commit_message(message, version))?
+            .infer_error()?;
+        self.ds = Arc::new(new_self);
+
+        Ok(())
+    }
+
+    fn delete_message(&mut self, version: u64) -> PyResult<()> {
+        let new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.delete_message(version))?
+            .infer_error()?;
+        self.ds = Arc::new(new_self);
+
+        Ok(())
+    }
+
     fn count_fragments(&self) -> usize {
         self.ds.count_fragments()
     }
@@ -2053,6 +2077,10 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p.auto_cleanup = Some(auto_cleanup_params);
         } else {
             p.auto_cleanup = None;
+        }
+
+        if let Some(commit_message) = get_dict_opt::<String>(options, "commit_message")? {
+            p.commit_message = Some(commit_message);
         }
 
         p.commit_handler = get_commit_handler(options)?;

@@ -123,7 +123,8 @@ impl<'a> InsertBuilder<'a> {
             .with_storage_format(context.storage_version)
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
-            .with_object_store(context.object_store.clone());
+            .with_object_store(context.object_store.clone())
+            .with_commit_message(context.params.commit_message.clone());
 
         if let Some(params) = context.params.store_params.as_ref() {
             commit_builder = commit_builder.with_store_params(params.clone());
