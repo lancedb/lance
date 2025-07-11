@@ -478,18 +478,23 @@ impl Dataset {
                 let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
 
                 let ds = self_.ds.clone();
-                let idx_type = RT
-                    .block_on(Some(self_.py()), async {
-                        let idx = ds
-                            .open_generic_index(
-                                &idx_schema.fields[0].name,
-                                &idx.uuid.to_string(),
-                                &NoOpMetricsCollector,
-                            )
-                            .await?;
-                        Ok::<_, lance::Error>(idx.index_type())
-                    })?
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                let idx_type = match RT.block_on(Some(self_.py()), async {
+                    let idx = ds
+                        .open_generic_index(
+                            &idx_schema.fields[0].name,
+                            &idx.uuid.to_string(),
+                            &NoOpMetricsCollector,
+                        )
+                        .await?;
+                    Ok::<_, lance::Error>(idx.index_type().to_string())
+                })? {
+                    Ok(r) => r,
+                    Err(error) => {
+                        log::warn!("Cannot derive index type for {:?}: {}", idx, error);
+                        // mark the type as unknown for any new index type
+                        "Unknown".to_owned()
+                    }
+                };
 
                 let field_names = idx_schema
                     .fields
@@ -508,7 +513,7 @@ impl Dataset {
                 // TODO: once we add more than vector indices, we need to:
                 // 1. Change protos and write path to persist index type
                 // 2. Use the new field from idx instead of hard coding it to Vector
-                dict.set_item("type", idx_type.to_string()).unwrap();
+                dict.set_item("type", idx_type).unwrap();
                 dict.set_item("uuid", idx.uuid.to_string()).unwrap();
                 dict.set_item("fields", field_names).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
