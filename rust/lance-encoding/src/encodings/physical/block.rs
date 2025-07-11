@@ -86,6 +86,7 @@ impl FromStr for CompressionScheme {
         match s {
             "none" => Ok(Self::None),
             "zstd" => Ok(Self::Zstd),
+            "lz4" => Ok(Self::Lz4),
             _ => Err(Error::invalid_input(
                 format!("Unknown compression scheme: {}", s),
                 location!(),

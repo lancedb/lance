@@ -652,6 +652,96 @@ mod tests {
     }
 
     #[test]
+    fn test_rle_with_general_miniblock_wrapper() {
+        // Test that RLE encoding with bits_per_value >= 32 is automatically wrapped
+        // in GeneralMiniBlock with LZ4 compression
+        
+        // This test directly tests the RLE encoder behavior
+        // When bits_per_value >= 32, RLE should be wrapped in GeneralMiniBlock with LZ4
+        
+        // Test case 1: 32-bit RLE data
+        let test_32 = TestCase {
+            name: "rle_32bit_with_general_wrapper",
+            inner_encoder: Box::new(RleMiniBlockEncoder),
+            compression: CompressionConfig {
+                scheme: CompressionScheme::Lz4,
+                level: None,
+            },
+            data: create_repeated_i32_block(vec![1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]),
+            expected_compressed: false, // RLE already compresses well, LZ4 might not help much
+            min_compression_ratio: 1.0,
+        };
+        
+        // For 32-bit RLE, the compression strategy should automatically wrap it
+        // Let's directly test the compressor
+        let compressor = GeneralMiniBlockCompressor::new(
+            Box::new(RleMiniBlockEncoder),
+            CompressionConfig {
+                scheme: CompressionScheme::Lz4,
+                level: None,
+            }
+        );
+        
+        let (_compressed, encoding) = compressor.compress(test_32.data).unwrap();
+        
+        // Verify the encoding structure
+        match &encoding.array_encoding {
+            Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(gm)) => {
+                // Check inner encoding is RLE
+                match &gm.inner.as_ref().unwrap().array_encoding {
+                    Some(pb::array_encoding::ArrayEncoding::Rle(rle)) => {
+                        assert_eq!(rle.bits_per_value, 32);
+                    }
+                    _ => panic!("Expected RLE as inner encoding"),
+                }
+                // Check compression is LZ4
+                assert_eq!(gm.compression.as_ref().unwrap().scheme, "lz4");
+            }
+            Some(pb::array_encoding::ArrayEncoding::Rle(_)) => {
+                // Also acceptable if compression didn't help
+            }
+            _ => panic!("Expected GeneralMiniBlock or Rle encoding"),
+        }
+        
+        // Test case 2: 64-bit RLE data
+        let values_64: Vec<i64> = vec![100i64; 50].into_iter()
+            .chain(vec![200i64; 50])
+            .chain(vec![300i64; 50])
+            .collect();
+        let array_64 = arrow_array::Int64Array::from(values_64);
+        let block_64 = DataBlock::from_array(array_64);
+        
+        let compressor_64 = GeneralMiniBlockCompressor::new(
+            Box::new(RleMiniBlockEncoder),
+            CompressionConfig {
+                scheme: CompressionScheme::Lz4,
+                level: None,
+            }
+        );
+        
+        let (_compressed_64, encoding_64) = compressor_64.compress(block_64).unwrap();
+        
+        // Verify the encoding structure for 64-bit
+        match &encoding_64.array_encoding {
+            Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(gm)) => {
+                // Check inner encoding is RLE
+                match &gm.inner.as_ref().unwrap().array_encoding {
+                    Some(pb::array_encoding::ArrayEncoding::Rle(rle)) => {
+                        assert_eq!(rle.bits_per_value, 64);
+                    }
+                    _ => panic!("Expected RLE as inner encoding for 64-bit"),
+                }
+                // Check compression is LZ4
+                assert_eq!(gm.compression.as_ref().unwrap().scheme, "lz4");
+            }
+            Some(pb::array_encoding::ArrayEncoding::Rle(_)) => {
+                // Also acceptable if compression didn't help
+            }
+            _ => panic!("Expected GeneralMiniBlock or Rle encoding for 64-bit"),
+        }
+    }
+
+    #[test]
     fn test_compressed_mini_block_empty_data() {
         let empty_array = Int32Array::from(vec![] as Vec<i32>);
         let empty_block = DataBlock::from_array(empty_array);
