@@ -67,7 +67,7 @@ message Manifest {
   // associated with that writer.
   WriterVersion writer_version = 13;
 
-  // If presented, the file position of the index metadata.
+  // If present, the file position of the index metadata.
   optional uint64 index_section = 6;
 
   // Version creation Timestamp, UTC timezone
