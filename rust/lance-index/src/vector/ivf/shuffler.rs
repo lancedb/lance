@@ -670,10 +670,14 @@ impl IvfShuffler {
                 }
                 num_processed += 1;
 
-                let batch = batch?;
+                let mut batch = batch?;
 
                 if batch.num_rows() == 0 {
                     continue;
+                }
+
+                if let Some((row_id_idx, _)) = batch.schema().column_with_name("row_id") {
+                    batch = batch.rename_column(row_id_idx, ROW_ID)?;
                 }
 
                 let part_ids: &UInt32Array = batch[PART_ID_COLUMN].as_primitive();

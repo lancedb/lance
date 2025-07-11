@@ -11,6 +11,8 @@ use humantime::format_duration;
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::datatypes::Schema;
 use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::ROW_ADDR;
+use lance_core::ROW_ID;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
@@ -325,6 +327,20 @@ impl<'a> InsertBuilder<'a> {
                 }
 
                 data_schema.check_compatible(&m.schema, &schema_cmp_opts)?;
+            }
+        }
+
+        // Make sure we aren't using any reserved column names
+        for field in data_schema.fields.iter() {
+            if field.name == ROW_ID || field.name == ROW_ADDR {
+                return Err(Error::InvalidInput {
+                    source: format!(
+                        "The column {} is a reserved name and cannot be used in a Lance dataset",
+                        field.name
+                    )
+                    .into(),
+                    location: location!(),
+                });
             }
         }
 
