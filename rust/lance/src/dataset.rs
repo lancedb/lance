@@ -75,7 +75,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
-use crate::dataset::sql::SqlOptions;
+use crate::dataset::sql::SqlBuilder;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{
@@ -1455,8 +1455,8 @@ impl Dataset {
     /// Run a SQL query against the dataset.
     /// The underlying SQL engine is DataFusion.
     /// Please refer to the DataFusion documentation for supported SQL syntax.
-    pub fn sql(&mut self, sql: &str) -> SqlOptions {
-        SqlOptions {
+    pub fn sql(&mut self, sql: &str) -> SqlBuilder {
+        SqlBuilder {
             dataset: Some(self.clone()),
             sql: sql.to_string(),
             ..Default::default()
@@ -1906,9 +1906,7 @@ mod tests {
     use crate::dataset::transaction::DataReplacementGroup;
     use crate::dataset::WriteMode::Overwrite;
     use crate::index::vector::VectorIndexParams;
-    use crate::utils::test::{
-        copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount, TestDatasetGenerator,
-    };
+    use crate::utils::test::copy_test_data_to_tmp;
 
     use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
@@ -1945,7 +1943,6 @@ mod tests {
     use lance_table::format::{DataFile, WriterVersion};
 
     use all_asserts::assert_true;
-    use arrow_array::types::Int64Type;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -6541,54 +6538,5 @@ mod tests {
         assert_eq!(dataset.get_fragments()[0].id(), 3);
         assert_eq!(dataset.get_fragments()[1].id(), 4);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(4));
-    }
-
-    #[tokio::test]
-    async fn test_sql() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let mut ds = gen()
-            .col("x", array::step::<Int32Type>())
-            .col("y", array::step_custom::<Int32Type>(0, 2))
-            .into_dataset(
-                test_uri,
-                FragmentCount::from(10),
-                FragmentRowCount::from(10),
-            )
-            .await
-            .unwrap();
-
-        let results = ds
-            .sql("SELECT SUM(x) FROM foo WHERE y > 100")
-            .table_name("foo")
-            .execute()
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        let results = results.into_iter().next().unwrap();
-        assert_eq!(results.num_columns(), 1);
-        assert_eq!(results.num_rows(), 1);
-        // SUM(0..100) - SUM(0..50) = 3675
-        assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 3675);
-
-        let results = ds
-            .sql("SELECT x, y, _rowid, _rowaddr FROM foo where y > 100")
-            .table_name("foo")
-            .with_row_id(true)
-            .with_row_addr(true)
-            .execute()
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        let results = results.into_iter().next().unwrap();
-        assert_eq!(results.num_columns(), 4);
-        assert_true!(results.column(2).as_primitive::<UInt64Type>().value(0) > 100);
-        assert_true!(results.column(3).as_primitive::<UInt64Type>().value(0) > 100);
     }
 }

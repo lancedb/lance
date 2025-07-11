@@ -111,11 +111,6 @@ pub enum Error {
         minor_version: u16,
         location: Location,
     },
-    #[snafu(display("DataFusion inner error: {source}, {location}"))]
-    DataFusionInnerError {
-        source: BoxedError,
-        location: Location,
-    },
 }
 
 impl Error {
