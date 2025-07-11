@@ -162,6 +162,7 @@ class VectorSearch(ReadOnlyOperation):
             nearest={
                 "q": query_vector,
                 "k": 10,
+                "column": "vector",
             },
             filter=self.filter,
         )
