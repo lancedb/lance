@@ -14,8 +14,9 @@ use datafusion_expr::{
 };
 
 use futures::join;
-use lance_core::{utils::mask::RowIdMask, Result};
+use lance_core::{utils::mask::RowIdMask, Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
+use snafu::location;
 use tracing::instrument;
 
 use super::{
@@ -685,6 +686,28 @@ pub enum IndexExprResult {
     // Some of the rows in the block list might be in the result.  Every row in the allow list is
     // definitely in the result.
     AtLeast(RowIdMask),
+}
+
+impl IndexExprResult {
+    pub fn discriminant(&self) -> u32 {
+        match self {
+            IndexExprResult::Exact(_) => 0,
+            IndexExprResult::AtMost(_) => 1,
+            IndexExprResult::AtLeast(_) => 2,
+        }
+    }
+
+    pub fn from_parts(mask: RowIdMask, discriminant: u32) -> Result<Self> {
+        match discriminant {
+            0 => Ok(IndexExprResult::Exact(mask)),
+            1 => Ok(IndexExprResult::AtMost(mask)),
+            2 => Ok(IndexExprResult::AtLeast(mask)),
+            _ => Err(Error::InvalidInput {
+                source: format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
+                location: location!(),
+            }),
+        }
+    }
 }
 
 impl ScalarIndexExpr {

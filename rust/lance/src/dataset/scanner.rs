@@ -1650,9 +1650,15 @@ impl Scanner {
             read_options = read_options.with_deleted_rows()?;
         }
 
+        let index_input = filter_plan.index_query.clone().map(|index_query| {
+            Arc::new(ScalarIndexExec::new(self.dataset.clone(), index_query))
+                as Arc<dyn ExecutionPlan>
+        });
+
         Ok(Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
             read_options,
+            index_input,
         )?))
     }
 
