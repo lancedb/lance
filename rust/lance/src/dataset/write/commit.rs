@@ -25,6 +25,7 @@ use crate::{
     Dataset, Error, Result,
 };
 
+use lance_core::utils::tracing::{CREATE_EVENT, NEW_VERSION_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
 
 /// Create a new commit from a [`Transaction`].
