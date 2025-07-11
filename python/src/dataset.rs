@@ -58,7 +58,7 @@ use lance_arrow::as_fixed_size_list_array;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
-use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::query::Occur};
+use lance_index::{infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur};
 use lance_index::{
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams, ScalarIndexType},
@@ -479,14 +479,18 @@ impl Dataset {
 
                 let ds = self_.ds.clone();
                 let idx_type = match RT.block_on(Some(self_.py()), async {
-                    let idx = ds
-                        .open_generic_index(
-                            &idx_schema.fields[0].name,
-                            &idx.uuid.to_string(),
-                            &NoOpMetricsCollector,
-                        )
-                        .await?;
-                    Ok::<_, lance::Error>(idx.index_type().to_string())
+                    if let Some(system_index_type) = infer_system_index_type(idx) {
+                        Ok::<_, lance::Error>(system_index_type.to_string())
+                    } else {
+                        let idx = ds
+                            .open_generic_index(
+                                &idx_schema.fields[0].name,
+                                &idx.uuid.to_string(),
+                                &NoOpMetricsCollector,
+                            )
+                            .await?;
+                        Ok::<_, lance::Error>(idx.index_type().to_string())
+                    }
                 })? {
                     Ok(r) => r,
                     Err(error) => {
