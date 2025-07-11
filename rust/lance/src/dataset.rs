@@ -1151,7 +1151,7 @@ impl Dataset {
         Some(FileFragment::new(dataset, fragment.clone()))
     }
 
-    pub(crate) fn fragments(&self) -> &Arc<Vec<Fragment>> {
+    pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
         &self.manifest.fragments
     }
 

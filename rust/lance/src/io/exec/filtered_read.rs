@@ -929,23 +929,23 @@ impl FilteredReadStream {
 #[derive(Debug, Clone)]
 pub struct FilteredReadOptions {
     /// The range of rows to read before applying the filter.
-    scan_range_before_filter: Option<Range<u64>>,
+    pub scan_range_before_filter: Option<Range<u64>>,
     /// The range of rows to read after applying the filter.
-    scan_range_after_filter: Option<Range<u64>>,
+    pub scan_range_after_filter: Option<Range<u64>>,
     /// Include deleted rows in the scan
-    with_deleted_rows: bool,
+    pub with_deleted_rows: bool,
     /// The maximum number of rows per batch
-    batch_size: Option<u32>,
+    pub batch_size: Option<u32>,
     /// Controls how many fragments to read ahead
-    fragment_readahead: Option<usize>,
+    pub fragment_readahead: Option<usize>,
     /// The fragments to read
-    fragments: Option<Arc<Vec<Fragment>>>,
+    pub fragments: Option<Arc<Vec<Fragment>>>,
     /// The projection to use for the scan
-    projection: Projection,
+    pub projection: Projection,
     /// The filter plan to use for the scan
-    filter_plan: FilterPlan,
+    pub filter_plan: FilterPlan,
     /// The threading mode to use for the scan
-    threading_mode: FilteredReadThreadingMode,
+    pub threading_mode: FilteredReadThreadingMode,
 }
 
 impl FilteredReadOptions {
@@ -1190,6 +1190,14 @@ impl FilteredReadExec {
         .try_flatten();
 
         Box::pin(RecordBatchStreamAdapter::new(self.schema(), stream))
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn options(&self) -> &FilteredReadOptions {
+        &self.options
     }
 }
 
