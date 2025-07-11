@@ -52,7 +52,7 @@ use crate::{
 use arrow::{array::AsArray, datatypes::UInt64Type};
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::{
-    datatypes::{Field, COMPRESSION_META_KEY},
+    datatypes::{Field, COMPRESSION_META_KEY, RLE_THREHOLD_META_KEY},
     Error, Result,
 };
 use snafu::location;
@@ -138,35 +138,26 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     && InlineBitpacking::min_size_bytes(bit_widths.value(0)) >= data.data_size();
 
                 if let Some(compression) = field.metadata.get(COMPRESSION_META_KEY) {
-                    match compression.as_str() {
-                        "none" => return Ok(Box::new(ValueEncoder::default())),
-                        "rle" if is_byte_width_aligned => {
-                            if fixed_width_data.bits_per_value >= 32 {
-                                return Ok(Box::new(GeneralMiniBlockCompressor::new(
-                                    Box::new(RleMiniBlockEncoder::new()),
-                                    CompressionConfig::new(CompressionScheme::Lz4, None),
-                                )));
-                            }
-                            return Ok(Box::new(RleMiniBlockEncoder::new()));
-                        }
-                        "bitpacking" if is_byte_width_aligned => {
-                            if !has_all_zeros {
-                                return Ok(Box::new(InlineBitpacking::new(
-                                    fixed_width_data.bits_per_value,
-                                )));
-                            }
-                        }
-                        _ => {} // Unknown compression type, fall through to auto-selection
+                    if compression.as_str() == "none" {
+                        return Ok(Box::new(ValueEncoder::default()));
                     }
                 }
+
+                let rle_threshold: f64 =
+                    if let Some(value) = field.metadata.get(RLE_THREHOLD_META_KEY) {
+                        value.as_str().parse().map_err(|_| {
+                            Error::invalid_input("rle threhold is not a valid float64", location!())
+                        })?
+                    } else {
+                        DEFAULT_RLE_COMPRESSION_THRESHOLD
+                    };
 
                 // Check if RLE would be beneficial
                 let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
                 let num_values = fixed_width_data.num_values;
 
                 // Use RLE if the run count is less than the threshold
-                if (run_count as f64) < (num_values as f64) * DEFAULT_RLE_COMPRESSION_THRESHOLD
-                    && is_byte_width_aligned
+                if (run_count as f64) < (num_values as f64) * rle_threshold && is_byte_width_aligned
                 {
                     if fixed_width_data.bits_per_value >= 32 {
                         return Ok(Box::new(GeneralMiniBlockCompressor::new(
