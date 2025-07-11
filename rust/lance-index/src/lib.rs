@@ -232,3 +232,13 @@ pub struct IndexMetadata {
 pub fn is_system_index(index_meta: &lance_table::format::Index) -> bool {
     index_meta.name == FRAG_REUSE_INDEX_NAME || index_meta.name == MEM_WAL_INDEX_NAME
 }
+
+pub fn infer_system_index_type(index_meta: &lance_table::format::Index) -> Option<IndexType> {
+    if index_meta.name == FRAG_REUSE_INDEX_NAME {
+        Some(IndexType::FragmentReuse)
+    } else if index_meta.name == MEM_WAL_INDEX_NAME {
+        Some(IndexType::MemWal)
+    } else {
+        None
+    }
+}
