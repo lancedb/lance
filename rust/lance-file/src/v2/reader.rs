@@ -314,6 +314,9 @@ impl ReaderProjection {
 #[derive(Clone, Debug, Default)]
 pub struct FileReaderOptions {
     validate_on_decode: bool,
+    /// Whether to cache repetition indices for better performance
+    /// Default is false for backward compatibility
+    pub cache_repetition_index: bool,
 }
 
 #[derive(Debug)]
@@ -836,6 +839,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         should_validate: bool,
+        cache_repetition_index: bool,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Reading range {:?} with batch_size {} from file with {} rows and {} columns into schema with {} columns",
@@ -852,6 +856,7 @@ impl FileReader {
             decoder_plugins,
             io,
             should_validate,
+            cache_repetition_index,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
@@ -885,6 +890,7 @@ impl FileReader {
             projection,
             filter,
             self.options.validate_on_decode,
+            self.options.cache_repetition_index,
         )
     }
 
@@ -899,6 +905,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         should_validate: bool,
+        cache_repetition_index: bool,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
@@ -915,6 +922,7 @@ impl FileReader {
             decoder_plugins,
             io,
             should_validate,
+            cache_repetition_index,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -946,6 +954,7 @@ impl FileReader {
             projection,
             FilterExpression::no_filter(),
             self.options.validate_on_decode,
+            self.options.cache_repetition_index,
         )
     }
 
@@ -960,6 +969,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         should_validate: bool,
+        cache_repetition_index: bool,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         debug!(
@@ -978,6 +988,7 @@ impl FileReader {
             decoder_plugins,
             io,
             should_validate,
+            cache_repetition_index,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1009,6 +1020,7 @@ impl FileReader {
             projection,
             filter,
             self.options.validate_on_decode,
+            self.options.cache_repetition_index,
         )
     }
 
@@ -1162,6 +1174,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             should_validate: self.options.validate_on_decode,
+            cache_repetition_index: self.options.cache_repetition_index,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -1201,6 +1214,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             should_validate: self.options.validate_on_decode,
+            cache_repetition_index: self.options.cache_repetition_index,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1240,6 +1254,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             should_validate: self.options.validate_on_decode,
+            cache_repetition_index: self.options.cache_repetition_index,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
@@ -2120,6 +2135,7 @@ pub mod tests {
             file_reader.scheduler.clone(),
             test_cache(),
             &FilterExpression::no_filter(),
+            false,
         )
         .await
         .unwrap();

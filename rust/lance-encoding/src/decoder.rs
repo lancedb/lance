@@ -473,6 +473,7 @@ pub struct PageBuffers<'a, 'b, 'c> {
 pub struct CoreFieldDecoderStrategy {
     pub validate_data: bool,
     pub decompressor_strategy: Arc<dyn DecompressionStrategy>,
+    pub cache_repetition_index: bool,
 }
 
 impl Default for CoreFieldDecoderStrategy {
@@ -480,11 +481,18 @@ impl Default for CoreFieldDecoderStrategy {
         Self {
             validate_data: false,
             decompressor_strategy: Arc::new(DefaultDecompressionStrategy {}),
+            cache_repetition_index: false,
         }
     }
 }
 
 impl CoreFieldDecoderStrategy {
+    /// Create a new strategy with cache_repetition_index enabled
+    pub fn with_cache_repetition_index(mut self, cache_repetition_index: bool) -> Self {
+        self.cache_repetition_index = cache_repetition_index;
+        self
+    }
+
     /// This is just a sanity check to ensure there is no "wrapped encodings"
     /// that haven't been handled.
     fn ensure_values_encoded(column_info: &ColumnInfo, field_name: &str) -> Result<()> {
@@ -660,6 +668,7 @@ impl CoreFieldDecoderStrategy {
             let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                 column_info.as_ref(),
                 self.decompressor_strategy.as_ref(),
+                self.cache_repetition_index,
             )?);
 
             // advance to the next top level column
@@ -674,6 +683,7 @@ impl CoreFieldDecoderStrategy {
                     let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                         column_info.as_ref(),
                         self.decompressor_strategy.as_ref(),
+                        self.cache_repetition_index,
                     )?);
 
                     // advance to the next top level column
@@ -699,6 +709,7 @@ impl CoreFieldDecoderStrategy {
                 let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                     column_info.as_ref(),
                     self.decompressor_strategy.as_ref(),
+                    self.cache_repetition_index,
                 )?);
                 column_infos.next_top_level();
                 Ok(scheduler)
@@ -921,6 +932,7 @@ impl DecodeBatchScheduler {
         io: Arc<dyn EncodingsIo>,
         cache: Arc<LanceCache>,
         filter: &FilterExpression,
+        cache_repetition_index: bool,
     ) -> Result<Self> {
         assert!(num_rows > 0);
         let buffers = FileBuffers {
@@ -941,8 +953,10 @@ impl DecodeBatchScheduler {
         if column_infos[0].is_structural() {
             let mut column_iter = ColumnInfoIter::new(column_infos.to_vec(), column_indices);
 
-            let mut root_scheduler = CoreFieldDecoderStrategy::default()
-                .create_structural_field_scheduler(&root_field, &mut column_iter)?;
+            let strategy = CoreFieldDecoderStrategy::default()
+                .with_cache_repetition_index(cache_repetition_index);
+            let mut root_scheduler =
+                strategy.create_structural_field_scheduler(&root_field, &mut column_iter)?;
 
             let context = SchedulerContext::new(io, cache.clone());
             root_scheduler.initialize(filter, &context).await?;
@@ -964,8 +978,10 @@ impl DecodeBatchScheduler {
                 .chain(column_indices.iter().map(|i| i.saturating_add(1)))
                 .collect::<Vec<_>>();
             let mut column_iter = ColumnInfoIter::new(columns, &adjusted_column_indices);
-            let root_scheduler = CoreFieldDecoderStrategy::default()
-                .create_legacy_field_scheduler(&root_field, &mut column_iter, buffers)?;
+            let strategy = CoreFieldDecoderStrategy::default()
+                .with_cache_repetition_index(cache_repetition_index);
+            let root_scheduler =
+                strategy.create_legacy_field_scheduler(&root_field, &mut column_iter, buffers)?;
 
             let context = SchedulerContext::new(io, cache.clone());
             root_scheduler.initialize(filter, &context).await?;
@@ -1742,6 +1758,8 @@ pub struct SchedulerDecoderConfig {
     pub io: Arc<dyn EncodingsIo>,
     pub cache: Arc<LanceCache>,
     pub should_validate: bool,
+    /// Whether to cache repetition indices for better performance
+    pub cache_repetition_index: bool,
 }
 
 fn check_scheduler_on_drop(
@@ -1858,6 +1876,7 @@ fn create_scheduler_decoder(
             config.io.clone(),
             config.cache,
             &filter,
+            config.cache_repetition_index,
         )
         .await
         {
@@ -1968,6 +1987,7 @@ pub fn schedule_and_decode_blocking(
         config.io.clone(),
         config.cache,
         &filter,
+        config.cache_repetition_index,
     ))?;
 
     // Schedule the requested rows
@@ -2518,6 +2538,7 @@ pub async fn decode_batch(
         io_scheduler.clone(),
         cache,
         filter,
+        false, // cache_repetition_index - default to false for decode_batch
     )
     .await?;
     let (tx, rx) = unbounded_channel();
