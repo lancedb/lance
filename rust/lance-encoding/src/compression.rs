@@ -37,7 +37,7 @@ use crate::{
                 FsstMiniBlockDecompressor, FsstMiniBlockEncoder, FsstPerValueDecompressor,
                 FsstPerValueEncoder,
             },
-            general::GeneralMiniBlockCompressor,
+            general::{GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor},
             packed::{
                 PackedStructFixedWidthMiniBlockDecompressor, PackedStructFixedWidthMiniBlockEncoder,
             },
@@ -388,10 +388,6 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(RleMiniBlockDecompressor::new(rle.bits_per_value)))
             }
             pb::array_encoding::ArrayEncoding::GeneralMiniBlock(general) => {
-                use crate::encodings::physical::{
-                    block::CompressionScheme, general::GeneralMiniBlockDecompressor,
-                };
-
                 // Create inner decompressor
                 let inner_decompressor = self.create_miniblock_decompressor(
                     general.inner.as_ref().ok_or_else(|| {
@@ -404,17 +400,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     Error::invalid_input("GeneralMiniBlock missing compression config", location!())
                 })?;
 
-                let scheme = match compression.scheme.as_str() {
-                    "lz4" => CompressionScheme::Lz4,
-                    "zstd" => CompressionScheme::Zstd,
-                    "none" => CompressionScheme::None,
-                    other => {
-                        return Err(Error::invalid_input(
-                            format!("Unknown compression scheme: {}", other),
-                            location!(),
-                        ))
-                    }
-                };
+                let scheme = compression.scheme.parse()?;
 
                 let compression_config = crate::encodings::physical::block::CompressionConfig::new(
                     scheme,
