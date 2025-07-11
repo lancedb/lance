@@ -18,12 +18,12 @@ use crate::{
 /// A miniblock compressor that wraps another miniblock compressor and applies
 /// general-purpose compression (LZ4, Zstd) to the resulting buffers.
 #[derive(Debug)]
-pub struct CompressedMiniBlockCompressor {
+pub struct GeneralMiniBlockCompressor {
     inner: Box<dyn MiniBlockCompressor>,
     compression: CompressionConfig,
 }
 
-impl CompressedMiniBlockCompressor {
+impl GeneralMiniBlockCompressor {
     pub fn new(inner: Box<dyn MiniBlockCompressor>, compression: CompressionConfig) -> Self {
         Self { inner, compression }
     }
@@ -34,7 +34,7 @@ const MIN_BUFFER_SIZE_FOR_COMPRESSION: usize = 4 * 1024;
 
 use super::super::logical::primitive::miniblock::MiniBlockChunk;
 
-impl MiniBlockCompressor for CompressedMiniBlockCompressor {
+impl MiniBlockCompressor for GeneralMiniBlockCompressor {
     fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)> {
         // First, compress with the inner compressor
         let (inner_compressed, inner_encoding) = self.inner.compress(page)?;
@@ -103,7 +103,7 @@ impl MiniBlockCompressor for CompressedMiniBlockCompressor {
         };
 
         // Return compressed encoding
-        let encoding = ProtobufUtils::compressed_mini_block(inner_encoding, self.compression);
+        let encoding = ProtobufUtils::general_mini_block(inner_encoding, self.compression);
         Ok((compressed_result, encoding))
     }
 }
@@ -111,18 +111,18 @@ impl MiniBlockCompressor for CompressedMiniBlockCompressor {
 /// A miniblock decompressor that first decompresses buffers using general-purpose
 /// compression (LZ4, Zstd) and then delegates to an inner miniblock decompressor.
 #[derive(Debug)]
-pub struct CompressedMiniBlockDecompressor {
+pub struct GeneralMiniBlockDecompressor {
     inner: Box<dyn MiniBlockDecompressor>,
     compression: CompressionConfig,
 }
 
-impl CompressedMiniBlockDecompressor {
+impl GeneralMiniBlockDecompressor {
     pub fn new(inner: Box<dyn MiniBlockDecompressor>, compression: CompressionConfig) -> Self {
         Self { inner, compression }
     }
 }
 
-impl MiniBlockDecompressor for CompressedMiniBlockDecompressor {
+impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
     fn decompress(&self, mut data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let mut decompressed_buffer = Vec::new();
 
@@ -244,14 +244,14 @@ mod tests {
 
     fn run_round_trip_test(test_case: TestCase) {
         let compressor =
-            CompressedMiniBlockCompressor::new(test_case.inner_encoder, test_case.compression);
+            GeneralMiniBlockCompressor::new(test_case.inner_encoder, test_case.compression);
 
         // Compress the data
         let (compressed, encoding) = compressor.compress(test_case.data).unwrap();
 
         // Check if compression was applied as expected
         match &encoding.array_encoding {
-            Some(pb::array_encoding::ArrayEncoding::CompressedMiniBlock(cm)) => {
+            Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(cm)) => {
                 assert!(
                     test_case.expected_compressed,
                     "{}: Expected compression to be applied",
@@ -275,7 +275,7 @@ mod tests {
                         }
                         _ => {
                             panic!(
-                                "{}: Expected CompressedMiniBlock but got {:?}",
+                                "{}: Expected GeneralMiniBlock but got {:?}",
                                 test_case.name, encoding.array_encoding
                             );
                         }
@@ -440,14 +440,14 @@ mod tests {
             scheme: CompressionScheme::Zstd,
             level: Some(3),
         };
-        let compressor = CompressedMiniBlockCompressor::new(inner, compression);
+        let compressor = GeneralMiniBlockCompressor::new(inner, compression);
 
         // Compress the data
         let (compressed, encoding) = compressor.compress(block).unwrap();
 
-        // The encoding should be CompressedMiniBlock because doubles compress well with Zstd
+        // The encoding should be GeneralMiniBlock because doubles compress well with Zstd
         match &encoding.array_encoding {
-            Some(pb::array_encoding::ArrayEncoding::CompressedMiniBlock(cm)) => {
+            Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(cm)) => {
                 assert!(cm.inner.is_some());
                 assert_eq!(cm.compression.as_ref().unwrap().scheme, "zstd");
                 assert_eq!(cm.compression.as_ref().unwrap().level, Some(3));
@@ -455,7 +455,7 @@ mod tests {
             Some(pb::array_encoding::ArrayEncoding::Flat(_)) => {
                 // Also acceptable if compression didn't help
             }
-            _ => panic!("Expected CompressedMiniBlock or Flat encoding"),
+            _ => panic!("Expected GeneralMiniBlock or Flat encoding"),
         }
 
         // Create decompressor using the encoding
@@ -508,20 +508,20 @@ mod tests {
             scheme: CompressionScheme::Zstd,
             level: Some(3),
         };
-        let compressor = CompressedMiniBlockCompressor::new(inner, compression);
+        let compressor = GeneralMiniBlockCompressor::new(inner, compression);
 
         // Compress the data
         let (compressed, encoding) = compressor.compress(block).unwrap();
 
         // Verify the encoding structure
         match &encoding.array_encoding {
-            Some(pb::array_encoding::ArrayEncoding::CompressedMiniBlock(cm)) => {
+            Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(cm)) => {
                 assert!(cm.inner.is_some());
                 assert_eq!(cm.compression.as_ref().unwrap().scheme, "zstd");
                 assert_eq!(cm.compression.as_ref().unwrap().level, Some(3));
             }
             Some(pb::array_encoding::ArrayEncoding::Rle(_)) => {}
-            _ => panic!("Expected CompressedMiniBlock or Rle encoding"),
+            _ => panic!("Expected GeneralMiniBlock or Rle encoding"),
         }
 
         // Verify basic properties
@@ -551,14 +551,14 @@ mod tests {
             scheme: CompressionScheme::Zstd,
             level: Some(3),
         };
-        let compressor = CompressedMiniBlockCompressor::new(inner, compression);
+        let compressor = GeneralMiniBlockCompressor::new(inner, compression);
 
         // Compress the data
         let (compressed, encoding) = compressor.compress(block).unwrap();
 
-        // Should get CompressedMiniBlock encoding since buffer is 4KB
+        // Should get GeneralMiniBlock encoding since buffer is 4KB
         match &encoding.array_encoding {
-            Some(pb::array_encoding::ArrayEncoding::CompressedMiniBlock(cm)) => {
+            Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(cm)) => {
                 assert!(cm.inner.is_some());
                 assert_eq!(cm.compression.as_ref().unwrap().scheme, "zstd");
                 assert_eq!(cm.compression.as_ref().unwrap().level, Some(3));
@@ -571,7 +571,7 @@ mod tests {
                     _ => panic!("Expected Flat inner encoding"),
                 }
             }
-            _ => panic!("Expected CompressedMiniBlock encoding"),
+            _ => panic!("Expected GeneralMiniBlock encoding"),
         }
 
         assert_eq!(compressed.num_values, 1024);
@@ -607,14 +607,14 @@ mod tests {
             scheme: CompressionScheme::Lz4,
             level: None,
         };
-        let compressor = CompressedMiniBlockCompressor::new(inner, compression);
+        let compressor = GeneralMiniBlockCompressor::new(inner, compression);
 
         // Compress the data
         let (compressed, encoding) = compressor.compress(block).unwrap();
 
-        // Should get CompressedMiniBlock encoding
+        // Should get GeneralMiniBlock encoding
         match &encoding.array_encoding {
-            Some(pb::array_encoding::ArrayEncoding::CompressedMiniBlock(cm)) => {
+            Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(cm)) => {
                 assert!(cm.inner.is_some());
                 assert_eq!(cm.compression.as_ref().unwrap().scheme, "lz4");
                 assert_eq!(cm.compression.as_ref().unwrap().level, None);
@@ -627,7 +627,7 @@ mod tests {
                     _ => panic!("Expected Flat inner encoding"),
                 }
             }
-            _ => panic!("Expected CompressedMiniBlock encoding"),
+            _ => panic!("Expected GeneralMiniBlock encoding"),
         }
 
         assert_eq!(compressed.num_values, 2048);
@@ -686,7 +686,7 @@ mod tests {
     fn test_compressed_mini_block_rle_multiple_buffers() {
         // RLE produces 2 buffers (values and lengths), test that both are handled correctly
         let data = create_repeated_i32_block(vec![1; 100]);
-        let compressor = CompressedMiniBlockCompressor::new(
+        let compressor = GeneralMiniBlockCompressor::new(
             Box::new(RleMiniBlockEncoder),
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,
@@ -704,7 +704,7 @@ mod tests {
         let empty_array = Int32Array::from(vec![] as Vec<i32>);
         let empty_block = DataBlock::from_array(empty_array);
 
-        let compressor = CompressedMiniBlockCompressor::new(
+        let compressor = GeneralMiniBlockCompressor::new(
             Box::new(ValueEncoder {}),
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,

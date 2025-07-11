@@ -194,13 +194,13 @@ impl ProtobufUtils {
         }
     }
 
-    pub fn compressed_mini_block(
+    pub fn general_mini_block(
         inner: ArrayEncoding,
         compression: CompressionConfig,
     ) -> ArrayEncoding {
         ArrayEncoding {
-            array_encoding: Some(ArrayEncodingEnum::CompressedMiniBlock(Box::new(
-                pb::CompressedMiniBlock {
+            array_encoding: Some(ArrayEncodingEnum::GeneralMiniBlock(Box::new(
+                pb::GeneralMiniBlock {
                     inner: Some(Box::new(inner)),
                     compression: Some(pb::Compression {
                         scheme: compression.scheme.to_string(),

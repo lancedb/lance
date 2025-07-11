@@ -32,12 +32,12 @@ use crate::{
             },
             bitpack::InlineBitpacking,
             block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
-            compressed_mini_block::CompressedMiniBlockCompressor,
             constant::ConstantDecompressor,
             fsst::{
                 FsstMiniBlockDecompressor, FsstMiniBlockEncoder, FsstPerValueDecompressor,
                 FsstPerValueEncoder,
             },
+            general::GeneralMiniBlockCompressor,
             packed::{
                 PackedStructFixedWidthMiniBlockDecompressor, PackedStructFixedWidthMiniBlockEncoder,
             },
@@ -142,7 +142,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                         "none" => return Ok(Box::new(ValueEncoder::default())),
                         "rle" if is_byte_width_aligned => {
                             if fixed_width_data.bits_per_value >= 64 {
-                                return Ok(Box::new(CompressedMiniBlockCompressor::new(
+                                return Ok(Box::new(GeneralMiniBlockCompressor::new(
                                     Box::new(RleMiniBlockEncoder::new()),
                                     CompressionConfig::new(CompressionScheme::Lz4, None),
                                 )));
@@ -169,7 +169,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     && is_byte_width_aligned
                 {
                     if fixed_width_data.bits_per_value >= 64 {
-                        return Ok(Box::new(CompressedMiniBlockCompressor::new(
+                        return Ok(Box::new(GeneralMiniBlockCompressor::new(
                             Box::new(RleMiniBlockEncoder::new()),
                             CompressionConfig::new(CompressionScheme::Lz4, None),
                         )));
@@ -387,28 +387,21 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             pb::array_encoding::ArrayEncoding::Rle(rle) => {
                 Ok(Box::new(RleMiniBlockDecompressor::new(rle.bits_per_value)))
             }
-            pb::array_encoding::ArrayEncoding::CompressedMiniBlock(compressed) => {
+            pb::array_encoding::ArrayEncoding::GeneralMiniBlock(general) => {
                 use crate::encodings::physical::{
-                    block::CompressionScheme,
-                    compressed_mini_block::CompressedMiniBlockDecompressor,
+                    block::CompressionScheme, general::GeneralMiniBlockDecompressor,
                 };
 
                 // Create inner decompressor
                 let inner_decompressor = self.create_miniblock_decompressor(
-                    compressed.inner.as_ref().ok_or_else(|| {
-                        Error::invalid_input(
-                            "CompressedMiniBlock missing inner encoding",
-                            location!(),
-                        )
+                    general.inner.as_ref().ok_or_else(|| {
+                        Error::invalid_input("GeneralMiniBlock missing inner encoding", location!())
                     })?,
                 )?;
 
                 // Parse compression config
-                let compression = compressed.compression.as_ref().ok_or_else(|| {
-                    Error::invalid_input(
-                        "CompressedMiniBlock missing compression config",
-                        location!(),
-                    )
+                let compression = general.compression.as_ref().ok_or_else(|| {
+                    Error::invalid_input("GeneralMiniBlock missing compression config", location!())
                 })?;
 
                 let scheme = match compression.scheme.as_str() {
@@ -428,7 +421,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     compression.level,
                 );
 
-                Ok(Box::new(CompressedMiniBlockDecompressor::new(
+                Ok(Box::new(GeneralMiniBlockDecompressor::new(
                     inner_decompressor,
                     compression_config,
                 )))

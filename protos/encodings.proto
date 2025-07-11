@@ -280,8 +280,8 @@ message Rle {
   uint64 bits_per_value = 1;
 }
 
-// Compressed miniblock encoding - wraps another miniblock encoding with compression
-message CompressedMiniBlock {
+// General miniblock encoding - wraps another miniblock encoding with compression
+message GeneralMiniBlock {
   // The inner miniblock encoding (e.g., Rle, Bitpacked, etc.)
   ArrayEncoding inner = 1;
   // The compression scheme to apply to the miniblock buffers
@@ -310,7 +310,7 @@ message ArrayEncoding {
         PackedStructFixedWidthMiniBlock packed_struct_fixed_width_mini_block = 17;
         Block block = 18;
         Rle rle = 19;
-        CompressedMiniBlock compressed_mini_block = 20;
+        GeneralMiniBlock general_mini_block = 20;
     }
 }
 
