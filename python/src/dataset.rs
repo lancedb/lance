@@ -58,7 +58,9 @@ use lance_arrow::as_fixed_size_list_array;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
-use lance_index::{infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur};
+use lance_index::{
+    infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
+};
 use lance_index::{
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams, ScalarIndexType},
