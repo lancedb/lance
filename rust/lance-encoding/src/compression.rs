@@ -52,7 +52,7 @@ use crate::{
 use arrow::{array::AsArray, datatypes::UInt64Type};
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::{
-    datatypes::{Field, COMPRESSION_META_KEY, RLE_THREHOLD_META_KEY},
+    datatypes::{Field, COMPRESSION_META_KEY, RLE_THRESHOLD_META_KEY},
     Error, Result,
 };
 use snafu::location;
@@ -144,7 +144,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 }
 
                 let rle_threshold: f64 =
-                    if let Some(value) = field.metadata.get(RLE_THREHOLD_META_KEY) {
+                    if let Some(value) = field.metadata.get(RLE_THRESHOLD_META_KEY) {
                         value.as_str().parse().map_err(|_| {
                             Error::invalid_input("rle threhold is not a valid float64", location!())
                         })?
