@@ -655,10 +655,10 @@ mod tests {
     fn test_rle_with_general_miniblock_wrapper() {
         // Test that RLE encoding with bits_per_value >= 32 is automatically wrapped
         // in GeneralMiniBlock with LZ4 compression
-        
+
         // This test directly tests the RLE encoder behavior
         // When bits_per_value >= 32, RLE should be wrapped in GeneralMiniBlock with LZ4
-        
+
         // Test case 1: 32-bit RLE data
         let test_32 = TestCase {
             name: "rle_32bit_with_general_wrapper",
@@ -671,7 +671,7 @@ mod tests {
             expected_compressed: false, // RLE already compresses well, LZ4 might not help much
             min_compression_ratio: 1.0,
         };
-        
+
         // For 32-bit RLE, the compression strategy should automatically wrap it
         // Let's directly test the compressor
         let compressor = GeneralMiniBlockCompressor::new(
@@ -679,11 +679,11 @@ mod tests {
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,
                 level: None,
-            }
+            },
         );
-        
+
         let (_compressed, encoding) = compressor.compress(test_32.data).unwrap();
-        
+
         // Verify the encoding structure
         match &encoding.array_encoding {
             Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(gm)) => {
@@ -702,25 +702,26 @@ mod tests {
             }
             _ => panic!("Expected GeneralMiniBlock or Rle encoding"),
         }
-        
+
         // Test case 2: 64-bit RLE data
-        let values_64: Vec<i64> = vec![100i64; 50].into_iter()
+        let values_64: Vec<i64> = vec![100i64; 50]
+            .into_iter()
             .chain(vec![200i64; 50])
             .chain(vec![300i64; 50])
             .collect();
         let array_64 = arrow_array::Int64Array::from(values_64);
         let block_64 = DataBlock::from_array(array_64);
-        
+
         let compressor_64 = GeneralMiniBlockCompressor::new(
             Box::new(RleMiniBlockEncoder),
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,
                 level: None,
-            }
+            },
         );
-        
+
         let (_compressed_64, encoding_64) = compressor_64.compress(block_64).unwrap();
-        
+
         // Verify the encoding structure for 64-bit
         match &encoding_64.array_encoding {
             Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(gm)) => {
