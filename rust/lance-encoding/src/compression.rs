@@ -143,14 +143,15 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     }
                 }
 
-                let rle_threshold: f64 =
-                    if let Some(value) = field.metadata.get(RLE_THRESHOLD_META_KEY) {
-                        value.as_str().parse().map_err(|_| {
-                            Error::invalid_input("rle threhold is not a valid float64", location!())
-                        })?
-                    } else {
-                        DEFAULT_RLE_COMPRESSION_THRESHOLD
-                    };
+                let rle_threshold: f64 = if let Some(value) =
+                    field.metadata.get(RLE_THRESHOLD_META_KEY)
+                {
+                    value.as_str().parse().map_err(|_| {
+                        Error::invalid_input("rle threshold is not a valid float64", location!())
+                    })?
+                } else {
+                    DEFAULT_RLE_COMPRESSION_THRESHOLD
+                };
 
                 // Check if RLE would be beneficial
                 let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
