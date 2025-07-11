@@ -9,22 +9,22 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
-/// Customize the params of dataset's sql API.
+/// A SQL builder to prepare options for running SQL queries against a Lance dataset.
 #[derive(Clone, Debug)]
 pub struct SqlBuilder {
-    /// the dataset to run the SQL query
+    /// The dataset to run the SQL query
     pub(crate) dataset: Option<Dataset>,
 
-    /// the SQL query to run
+    /// The SQL query to run
     pub(crate) sql: String,
 
     /// the name of the table to register in the datafusion context
     pub(crate) table_name: Option<String>,
 
-    /// if true, the query result will include the internal row id
+    /// If true, the query result will include the internal row id
     pub(crate) row_id: bool,
 
-    /// if true, the query result will include the internal row address
+    /// If true, the query result will include the internal row address
     pub(crate) row_addr: bool,
 }
 
