@@ -430,7 +430,7 @@ mod tests {
             expected_compressed: true,
             min_compression_ratio: 0.5, // Zstd should achieve good compression on repetitive data
         };
-        
+
         run_round_trip_test(test_case);
     }
 
