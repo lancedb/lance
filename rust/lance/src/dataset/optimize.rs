@@ -98,7 +98,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::utils::tracing::{DATASET_EVENT_COMPACTION, TRACE_DATASET_EVENTS};
+use lance_core::utils::tracing::{COMPACTION_EVENT, TRACE_DATASET_EVENTS};
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, RowIdMeta};
@@ -218,7 +218,7 @@ pub async fn compact_files(
     mut options: CompactionOptions,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
-    info!(target: TRACE_DATASET_EVENTS, event=DATASET_EVENT_COMPACTION, uri = &dataset.uri);
+    info!(target: TRACE_DATASET_EVENTS, event=COMPACTION_EVENT, uri = &dataset.uri);
     options.validate();
 
     let compaction_plan: CompactionPlan = plan_compaction(dataset, &options).await?;
