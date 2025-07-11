@@ -3,6 +3,15 @@
 
 use std::sync::Arc;
 
+use lance_core::utils::mask::RowIdTreeMap;
+use lance_file::version::LanceFileVersion;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_table::{
+    format::{is_detached_version, DataStorageFormat},
+    io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
+};
+use snafu::location;
+
 use super::{resolve_commit_handler, WriteDestination};
 use crate::{
     dataset::{
@@ -15,15 +24,7 @@ use crate::{
     session::Session,
     Dataset, Error, Result,
 };
-use lance_core::utils::mask::RowIdTreeMap;
-use lance_core::utils::tracing::{CREATE_EVENT, NEW_VERSION_EVENT, TRACE_DATASET_EVENTS};
-use lance_file::version::LanceFileVersion;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
-use lance_table::{
-    format::{is_detached_version, DataStorageFormat},
-    io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
-};
-use snafu::location;
+
 use tracing::info;
 
 /// Create a new commit from a [`Transaction`].
