@@ -141,7 +141,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     match compression.as_str() {
                         "none" => return Ok(Box::new(ValueEncoder::default())),
                         "rle" if is_byte_width_aligned => {
-                            if fixed_width_data.bits_per_value >= 64 {
+                            if fixed_width_data.bits_per_value >= 32 {
                                 return Ok(Box::new(GeneralMiniBlockCompressor::new(
                                     Box::new(RleMiniBlockEncoder::new()),
                                     CompressionConfig::new(CompressionScheme::Lz4, None),
@@ -168,7 +168,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 if (run_count as f64) < (num_values as f64) * DEFAULT_RLE_COMPRESSION_THRESHOLD
                     && is_byte_width_aligned
                 {
-                    if fixed_width_data.bits_per_value >= 64 {
+                    if fixed_width_data.bits_per_value >= 32 {
                         return Ok(Box::new(GeneralMiniBlockCompressor::new(
                             Box::new(RleMiniBlockEncoder::new()),
                             CompressionConfig::new(CompressionScheme::Lz4, None),
