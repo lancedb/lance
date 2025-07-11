@@ -3,7 +3,7 @@ use crate::utils::to_java_map;
 use arrow::datatypes::DataType;
 use arrow_schema::{TimeUnit, UnionFields};
 use jni::objects::{JObject, JValue};
-use jni::sys::{jboolean, jint, jlong};
+use jni::sys::{jboolean, jint};
 use jni::JNIEnv;
 use lance_core::datatypes::Field;
 
@@ -40,7 +40,7 @@ fn convert_children_fields<'local>(
 ) -> Result<JObject<'local>> {
     let children_list = env.new_object("java/util/ArrayList", "()V", &[])?;
     for lance_field in lance_field.children.iter() {
-        let field = convert_to_java_field(env, &lance_field)?;
+        let field = convert_to_java_field(env, lance_field)?;
         env.call_method(
             &children_list,
             "add",

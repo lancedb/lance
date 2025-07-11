@@ -296,10 +296,10 @@ pub fn to_rust_map(env: &mut JNIEnv, jmap: &JMap) -> Result<HashMap<String, Stri
     })
 }
 
-pub fn to_java_map<'local>(
-    env: &mut JNIEnv<'local>,
+pub fn to_java_map(
+    env: &mut JNIEnv,
     map: &HashMap<String, String>,
-) -> Result<JObject<'local>> {
+) -> Result<JObject> {
     let java_map = env.new_object("java/util/HashMap", "()V", &[])?;
     for (k, v) in map {
         let jkey = env.new_string(k)?;
