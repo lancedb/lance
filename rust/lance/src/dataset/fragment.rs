@@ -24,7 +24,7 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{cache::CacheKey, datatypes::Schema, Error, Result};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
@@ -1327,7 +1327,7 @@ impl FileFragment {
         let cache = self.dataset.metadata_cache.file_metadata_cache(path);
 
         let file_metadata = cache
-            .get_or_insert("".into(), |_| async {
+            .get_or_insert_with_key(FileMetadataCacheKey, || async {
                 let file_metadata: CachedFileMetadata =
                     v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
                 Ok(file_metadata)
@@ -1677,6 +1677,18 @@ impl FileFragment {
         .await?;
 
         Ok(Some(self))
+    }
+}
+
+// Cache key for file metadata
+#[derive(Debug, Clone)]
+struct FileMetadataCacheKey;
+
+impl CacheKey for FileMetadataCacheKey {
+    type ValueType = CachedFileMetadata;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "".into()
     }
 }
 

@@ -58,6 +58,7 @@ use crate::dataset::{
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::caches::DSMetadataCache;
+use crate::session::index_caches::IndexMetadataKey;
 use crate::Dataset;
 
 mod conflict_resolver;
@@ -846,11 +847,10 @@ pub(crate) async fn commit_transaction(
                     .metadata_cache
                     .insert_with_key(&manifest_key, Arc::new(manifest.clone()));
                 if !indices.is_empty() {
-                    dataset.session().index_cache.insert_metadata(
-                        dataset.base.as_ref(),
-                        target_version,
-                        Arc::new(indices),
-                    );
+                    let key = IndexMetadataKey {
+                        version: target_version,
+                    };
+                    dataset.index_cache.insert_with_key(&key, Arc::new(indices));
                 }
 
                 match auto_cleanup_hook(&dataset, &manifest).await {
