@@ -30,11 +30,11 @@ public class LanceSchema {
     this.metadata = metadata;
   }
 
-  public List<LanceField> getFields() {
+  public List<LanceField> fields() {
     return fields;
   }
 
-  public Map<String, String> getMetadata() {
+  public Map<String, String> metadata() {
     return Collections.unmodifiableMap(metadata);
   }
 
