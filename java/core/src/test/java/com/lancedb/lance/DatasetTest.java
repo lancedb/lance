@@ -836,4 +836,16 @@ public class DatasetTest {
       assertFalse(currentConfig.containsKey("key1"));
     }
   }
+
+  @Test
+  void testGetLanceSchema() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.ComplexTestDataset testDataset =
+          new TestUtils.ComplexTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      assertEquals(testDataset.getSchema(), dataset.getLanceSchema().asArrowSchema());
+    }
+  }
 }

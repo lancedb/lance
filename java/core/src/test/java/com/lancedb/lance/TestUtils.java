@@ -24,8 +24,12 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowFileReader;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.SeekableReadChannel;
+import org.apache.arrow.vector.types.DateUnit;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel;
 
@@ -37,6 +41,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Optional;
@@ -46,30 +51,22 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TestUtils {
-  public static class SimpleTestDataset {
-    private final Schema schema =
-        new Schema(
-            Arrays.asList(
-                Field.nullable("id", new ArrowType.Int(32, true)),
-                Field.nullable("name", new ArrowType.Utf8())),
-            null);
+  private abstract static class TestDataset {
     private final BufferAllocator allocator;
     private final String datasetPath;
 
-    public SimpleTestDataset(BufferAllocator allocator, String datasetPath) {
+    public TestDataset(BufferAllocator allocator, String datasetPath) {
       this.allocator = allocator;
       this.datasetPath = datasetPath;
     }
 
-    public Schema getSchema() {
-      return schema;
-    }
+    public abstract Schema getSchema();
 
     public Dataset createEmptyDataset() {
       Dataset dataset =
-          Dataset.create(allocator, datasetPath, schema, new WriteParams.Builder().build());
+          Dataset.create(allocator, datasetPath, getSchema(), new WriteParams.Builder().build());
       assertEquals(0, dataset.countRows());
-      assertEquals(schema, dataset.getSchema());
+      assertEquals(getSchema(), dataset.getSchema());
       List<Fragment> fragments = dataset.getFragments();
       assertEquals(0, fragments.size());
       assertEquals(1, dataset.version());
@@ -87,7 +84,7 @@ public class TestUtils {
 
     public List<FragmentMetadata> createNewFragment(int rowCount, int maxRowsPerFile) {
       List<FragmentMetadata> fragmentMetas;
-      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(getSchema(), allocator)) {
         root.allocateNew();
         IntVector idVector = (IntVector) root.getVector("id");
         VarCharVector nameVector = (VarCharVector) root.getVector("name");
@@ -117,7 +114,7 @@ public class TestUtils {
 
     public Dataset writeSortByDataset(long version) {
       List<FragmentMetadata> fragmentMetas;
-      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(getSchema(), allocator)) {
         root.allocateNew();
         IntVector idVector = (IntVector) root.getVector("id");
         VarCharVector nameVector = (VarCharVector) root.getVector("name");
@@ -281,5 +278,75 @@ public class TestUtils {
     ByteBuffer substraitExpression = ByteBuffer.allocateDirect(decodedSubstrait.length);
     substraitExpression.put(decodedSubstrait);
     return substraitExpression;
+  }
+
+  public static class SimpleTestDataset extends TestDataset {
+    private static final Schema schema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", new ArrowType.Utf8())),
+            null);
+
+    public SimpleTestDataset(BufferAllocator allocator, String datasetPath) {
+      super(allocator, datasetPath);
+    }
+
+    @Override
+    public Schema getSchema() {
+      return schema;
+    }
+  }
+
+  public static class ComplexTestDataset extends TestDataset {
+    public static final Schema COMPLETE_SCHEMA =
+        new Schema(
+            Arrays.asList(
+                // basic scalar types
+                Field.nullable("null_col", ArrowType.Null.INSTANCE),
+                Field.nullable("bool_col", ArrowType.Bool.INSTANCE),
+                Field.nullable("int8_col", new ArrowType.Int(8, true)),
+                Field.nullable("uint32_col", new ArrowType.Int(32, false)),
+                Field.nullable(
+                    "float64_col", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)),
+
+                // strings and binary types
+                Field.nullable("utf8_col", ArrowType.Utf8.INSTANCE),
+                Field.nullable("large_utf8_col", ArrowType.LargeUtf8.INSTANCE),
+                Field.nullable("binary_col", ArrowType.Binary.INSTANCE),
+                Field.nullable("fixed_binary_col", new ArrowType.FixedSizeBinary(16)),
+
+                // time and date types
+                Field.notNullable("date32_col", new ArrowType.Date(DateUnit.DAY)),
+                Field.nullable(
+                    "timestamp_col", new ArrowType.Timestamp(TimeUnit.MICROSECOND, "UTC")),
+                Field.nullable("time64_nano_col", new ArrowType.Time(TimeUnit.NANOSECOND, 64)),
+
+                // decimals
+                Field.notNullable("decimal128_col", new ArrowType.Decimal(38, 10, 128)),
+                Field.nullable("decimal256_col", new ArrowType.Decimal(76, 20, 256)),
+
+                // nested types
+                new Field(
+                    "list_col",
+                    FieldType.nullable(new ArrowType.List()),
+                    Collections.singletonList(Field.nullable("item", new ArrowType.Int(32, true)))),
+
+                // struct and union types
+                new Field(
+                    "struct_col",
+                    FieldType.nullable(new ArrowType.Struct()),
+                    Arrays.asList(
+                        Field.nullable("field1", ArrowType.Utf8.INSTANCE),
+                        Field.nullable("field2", new ArrowType.Int(16, true))))));
+
+    public ComplexTestDataset(BufferAllocator allocator, String datasetPath) {
+      super(allocator, datasetPath);
+    }
+
+    @Override
+    public Schema getSchema() {
+      return COMPLETE_SCHEMA;
+    }
   }
 }

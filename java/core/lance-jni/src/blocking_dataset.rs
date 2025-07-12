@@ -14,8 +14,11 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::schema::convert_to_java_field;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
-use crate::utils::{extract_storage_options, extract_write_params, get_index_params, to_rust_map};
+use crate::utils::{
+    extract_storage_options, extract_write_params, get_index_params, to_java_map, to_rust_map,
+};
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
@@ -708,6 +711,41 @@ fn inner_get_fragment<'local>(
         None => JObject::default(),
     };
     Ok(obj)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetLanceSchema<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_lance_schema(&mut env, java_dataset))
+}
+
+fn inner_get_lance_schema<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let schema = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset.inner.schema().clone()
+    };
+    let jfield_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for lance_field in schema.fields.iter() {
+        let java_field = convert_to_java_field(env, lance_field)?;
+        env.call_method(
+            &jfield_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&java_field)],
+        )?;
+    }
+    let metadata = to_java_map(env, &schema.metadata)?;
+    Ok(env.new_object(
+        "com/lancedb/lance/schema/LanceSchema",
+        "(Ljava/util/List;Ljava/util/Map;)V",
+        &[JValue::Object(&jfield_list), JValue::Object(&metadata)],
+    )?)
 }
 
 #[no_mangle]

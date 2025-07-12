@@ -19,6 +19,7 @@ import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.schema.ColumnAlteration;
+import com.lancedb.lance.schema.LanceSchema;
 import com.lancedb.lance.schema.SqlExpressions;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -651,7 +652,7 @@ public class Dataset implements Closeable {
   private native List<FragmentMetadata> getFragmentsNative();
 
   /**
-   * Gets the schema of the dataset.
+   * Gets the arrow schema of the dataset.
    *
    * @return the arrow schema
    */
@@ -666,6 +667,20 @@ public class Dataset implements Closeable {
   }
 
   private native void importFfiSchema(long arrowSchemaMemoryAddress);
+
+  /**
+   * Get the {@link com.lancedb.lance.schema.LanceSchema} of the dataset with field ids.
+   *
+   * @return the LanceSchema
+   */
+  public LanceSchema getLanceSchema() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetLanceSchema();
+    }
+  }
+
+  private native LanceSchema nativeGetLanceSchema();
 
   /** @return all the created indexes names */
   public List<String> listIndexes() {
