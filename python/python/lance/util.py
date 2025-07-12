@@ -28,22 +28,23 @@ def _normalize_metric_type(metric_type: str) -> MetricType:
     return cast("MetricType", normalized)
 
 
-def sanitize_ts(ts: ts_types) -> datetime:
+def sanitize_ts(ts: "ts_types") -> datetime:
     """Returns a python datetime object from various timestamp input types."""
     if _check_for_pandas(ts) and isinstance(ts, str):
-        ts = pd.to_datetime(ts).to_pydatetime()
+        return pd.to_datetime(ts).to_pydatetime()
     elif isinstance(ts, str):
         try:
-            ts = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+            return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
         except ValueError:
             raise ValueError(
                 f"Failed to parse timestamp string {ts}. Try installing Pandas."
             )
-    elif _check_for_pandas(ts) and isinstance(ts, pd.Timestamp):
-        ts = ts.to_pydatetime()
-    elif not isinstance(ts, datetime):
+    elif _check_for_pandas(ts) and hasattr(ts, 'to_pydatetime'):
+        return ts.to_pydatetime()  # type: ignore[attr-defined]
+    elif isinstance(ts, datetime):
+        return ts
+    else:
         raise TypeError(f"Unrecognized version timestamp {ts} of type {type(ts)}")
-    return ts
 
 
 def td_to_micros(td: timedelta) -> int:
