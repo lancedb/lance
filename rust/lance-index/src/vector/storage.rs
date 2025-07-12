@@ -293,6 +293,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                     u32::MAX,
                     1,
                     FilterExpression::no_filter(),
+                    None,
                 )?
                 .try_collect::<Vec<_>>()
                 .await?;
