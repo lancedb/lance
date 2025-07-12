@@ -479,7 +479,6 @@ impl IoTask {
                 .reader
                 .get_range(self.to_read.start as usize..self.to_read.end as usize);
             IOPS_COUNTER.fetch_add(1, Ordering::Release);
-            // Read and add bytes read counter if success
             let num_bytes = self.num_bytes();
             bytes_fut
                 .inspect(move |_| {
