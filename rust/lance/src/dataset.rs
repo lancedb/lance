@@ -1770,12 +1770,12 @@ impl Dataset {
     /// Update schema metadata
     pub async fn replace_schema_metadata(
         &mut self,
-        upsert_values: impl IntoIterator<Item = (String, String)>,
+        new_values: impl IntoIterator<Item = (String, String)>,
     ) -> Result<()> {
         self.update_op(Operation::UpdateConfig {
             upsert_values: None,
             delete_keys: None,
-            schema_metadata: Some(HashMap::from_iter(upsert_values)),
+            schema_metadata: Some(HashMap::from_iter(new_values)),
             field_metadata: None,
         })
         .await
