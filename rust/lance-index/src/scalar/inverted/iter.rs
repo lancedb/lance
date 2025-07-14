@@ -94,8 +94,23 @@ type InnerIterator = std::iter::Zip<std::vec::IntoIter<u32>, std::vec::IntoIter<
 
 impl CompressedPostingListIterator {
     pub fn new(length: usize, blocks: LargeBinaryArray, positions: Option<ListArray>) -> Self {
-        debug_assert!(length > 0);
-        debug_assert_eq!(blocks.len(), length.div_ceil(BLOCK_SIZE));
+        assert!(length > 0);
+        assert_eq!(blocks.len(), length.div_ceil(BLOCK_SIZE));
+        if let Some(positions) = positions.as_ref() {
+            assert_eq!(
+                positions.len(),
+                length,
+                "length: {}, positions: {}",
+                length,
+                positions.len()
+            );
+            assert!(
+                positions.values().as_binary::<i64>().values().len() < i32::MAX as usize,
+                "positions length {} should be less than {}",
+                positions.values().as_binary::<i64>().values().len(),
+                i32::MAX
+            );
+        }
 
         Self {
             remainder: length % BLOCK_SIZE,

@@ -1915,6 +1915,7 @@ mod tests {
     };
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
+    use lance_datagen::array::random_word;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
@@ -1933,6 +1934,7 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
+    use rand::Rng;
     use rstest::rstest;
     use std::cmp::Ordering;
     use tempfile::{tempdir, TempDir};
@@ -5547,6 +5549,94 @@ mod tests {
             .project(&["id"])
             .unwrap()
             .full_text_search(FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fts_index_with_positions() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let uri = tempdir.path().to_str().unwrap().to_owned();
+        tempdir.close().unwrap();
+
+        let words = ["lance", "full", "text", "search"];
+        // generate 4096 rows that each one is a permutation of the words
+        let mut lance_search_count = 0;
+        let mut full_text_count = 0;
+        let mut doc_array = (0..15_000)
+            .map(|_| {
+                let mut rng = rand::thread_rng();
+                let mut text = String::with_capacity(4);
+                for _ in 0..rng.gen_range(127..512) {
+                    text.push_str(words[rng.gen_range(0..words.len())]);
+                }
+                if text.contains("lance search") {
+                    lance_search_count += 1;
+                }
+                if text.contains("full text") {
+                    full_text_count += 1;
+                }
+                text
+            })
+            .collect_vec();
+        doc_array.push("position for phrase query".to_owned());
+
+        let params = InvertedIndexParams::default().with_position(true);
+        let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(doc_array));
+        let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+                arrow_schema::Field::new("id", DataType::UInt64, false),
+            ])
+            .into(),
+            vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+        dataset
+            .create_index(&["doc"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new("lance search".to_owned()).into(),
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), lance_search_count);
+
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new("full text".to_owned()).into(),
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), full_text_count);
+
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new("phrase query".to_owned()).into(),
+            ))
             .unwrap()
             .try_into_batch()
             .await
