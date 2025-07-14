@@ -3418,19 +3418,15 @@ def test_use_scalar_index(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("filter", "BTREE")
 
-    assert (
-        "indexed_filter=[filter = 10]@filter_idx, refine_filter=--"
-        in dataset.scanner(filter="filter = 10").explain_plan(True)
-    )
+    assert "ScalarIndexQuery: query=[filter = 10]@filter_idx" in dataset.scanner(
+        filter="filter = 10"
+    ).explain_plan(True)
 
-    assert (
-        "indexed_filter=[filter = 10]@filter_idx, refine_filter=--"
-        in dataset.scanner(filter="filter = 10", use_scalar_index=True).explain_plan(
-            True
-        )
-    )
+    assert "ScalarIndexQuery: query=[filter = 10]@filter_idx" in dataset.scanner(
+        filter="filter = 10", use_scalar_index=True
+    ).explain_plan(True)
 
-    assert "indexed_filter=--, refine_filter=filter = Int64(10)" in dataset.scanner(
+    assert "ScalarIndexQuery" not in dataset.scanner(
         filter="filter = 10", use_scalar_index=False
     ).explain_plan(True)
 

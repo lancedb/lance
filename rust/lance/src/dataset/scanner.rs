@@ -5436,7 +5436,7 @@ mod test {
         assert_plan_node_equals(
             plan,
             "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
-  LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, indexed_filter=--, refine_filter=--",
+  LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--",
         )
         .await
         .unwrap();
@@ -5449,7 +5449,7 @@ mod test {
             plan,
             "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
   ProjectionExec: expr=[_rowid@1 as _rowid]
-    LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, indexed_filter=--, refine_filter=s = Utf8(\"\")",
+    LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=s = Utf8(\"\"), refine_filter=s = Utf8(\"\")",
         )
         .await
         .unwrap();
@@ -5491,7 +5491,8 @@ mod test {
             |scanner| scanner.filter("contains(ngram, 'test string')"),
             "LanceRead: uri=..., projection=[ngram, exact, no_index], num_fragments=1, \
              range_before=None, range_after=None, row_id=false, row_addr=false, \
-             indexed_filter=[contains(ngram, Utf8(\"test string\"))]@ngram_idx, refine_filter=--",
+             full_filter=contains(ngram, Utf8(\"test string\")), refine_filter=--
+               ScalarIndexQuery: query=[contains(ngram, Utf8(\"test string\"))]@ngram_idx",
         )
         .await
         .unwrap();
@@ -5502,8 +5503,9 @@ mod test {
             |scanner| scanner.filter("contains(ngram, 'test string') and exact < 50"),
             "LanceRead: uri=..., projection=[ngram, exact, no_index], num_fragments=1, \
             range_before=None, range_after=None, row_id=false, row_addr=false, \
-            indexed_filter=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx,[exact < 50]@exact_idx), \
-            refine_filter=--",
+            full_filter=contains(ngram, Utf8(\"test string\")) AND exact < UInt32(50), \
+            refine_filter=--
+              ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx,[exact < 50]@exact_idx)",
         )
         .await
         .unwrap();
@@ -5516,8 +5518,9 @@ mod test {
             },
             "ProjectionExec: expr=[ngram@0 as ngram, exact@1 as exact, no_index@2 as no_index]
   LanceRead: uri=..., projection=[ngram, exact, no_index], num_fragments=1, range_before=None, \
-  range_after=None, row_id=true, row_addr=false, indexed_filter=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx,[exact < 50]@exact_idx), \
-  refine_filter=no_index > UInt32(100)",
+  range_after=None, row_id=true, row_addr=false, full_filter=contains(ngram, Utf8(\"test string\")) AND exact < UInt32(50) AND no_index > UInt32(100), \
+  refine_filter=no_index > UInt32(100)
+    ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx,[exact < 50]@exact_idx)",
         )
         .await
         .unwrap();
@@ -5741,7 +5744,7 @@ mod test {
             "ProjectionExec: expr=[s@2 as s]
   Take: columns=\"i, _rowid, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
-      LanceRead: ..., projection=[i], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, indexed_filter=--, refine_filter=i > Int32(10) AND i < Int32(20)"
+      LanceRead: ..., projection=[i], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10) AND i < Int32(20), refine_filter=i > Int32(10) AND i < Int32(20)"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -5768,7 +5771,7 @@ mod test {
   Take: columns=\"i, s, _rowid, (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: uri=..., projection=[i, s], num_fragments=2, range_before=None, range_after=None, \
-      row_id=true, row_addr=false, indexed_filter=--, refine_filter=s IS NOT NULL"
+      row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -5786,7 +5789,7 @@ mod test {
         } else {
             "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@2 as vec]
   LanceRead: uri=..., projection=[i, s, vec], num_fragments=2, range_before=None, \
-  range_after=None, row_id=true, row_addr=false, indexed_filter=--, refine_filter=s IS NOT NULL"
+  range_after=None, row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -5811,7 +5814,7 @@ mod test {
   Take: columns=\"s, _rowid, (i), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, \
-      range_after=None, row_id=true, row_addr=false, indexed_filter=--, refine_filter=s IS NOT NULL"
+      range_after=None, row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -5836,7 +5839,7 @@ mod test {
   Take: columns=\"s, vec, _rowid, (i)\"
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: uri=..., projection=[s, vec], num_fragments=2, range_before=None, range_after=None, \
-      row_id=true, row_addr=false, indexed_filter=--, refine_filter=s IS NOT NULL"
+      row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -5856,7 +5859,7 @@ mod test {
             "LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, \
-            row_addr=false, indexed_filter=--, refine_filter=--"
+            row_addr=false, full_filter=--, refine_filter=--"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -5885,7 +5888,7 @@ mod test {
         SortExec: TopK(fetch=5), expr=...
           KNNVectorDistance: metric=l2
             LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
-            row_id=true, row_addr=false, indexed_filter=--, refine_filter=--"
+            row_id=true, row_addr=false, full_filter=--, refine_filter=--"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -5916,7 +5919,7 @@ mod test {
           SortExec: TopK(fetch=5), expr=...
             KNNVectorDistance: metric=l2
               LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
-              row_id=true, row_addr=false, indexed_filter=--, refine_filter=--"
+              row_id=true, row_addr=false, full_filter=--, refine_filter=--"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -5981,7 +5984,7 @@ mod test {
         SortExec: TopK(fetch=13), expr=...
           KNNVectorDistance: metric=l2
             LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
-            row_id=true, row_addr=false, indexed_filter=--, refine_filter=--"
+            row_id=true, row_addr=false, full_filter=--, refine_filter=--"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6031,7 +6034,7 @@ mod test {
         ANNSubIndex: name=..., k=17, deltas=1
           ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
           LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, \
-          row_id=true, row_addr=false, indexed_filter=--, refine_filter=i > Int32(10)
+          row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)
 "
         };
         assert_plan_equals(
@@ -6150,7 +6153,7 @@ mod test {
                       ANNSubIndex: name=..., k=5, deltas=1
                         ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
                         LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, \
-                          row_id=true, row_addr=false, indexed_filter=--, refine_filter=i > Int32(10)"
+                          row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6211,7 +6214,7 @@ mod test {
         ANNSubIndex: name=..., k=5, deltas=1
           ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1
           LanceRead: uri=..., projection=[], num_fragments=3, range_before=None, \
-          range_after=None, row_id=true, row_addr=false, indexed_filter=--, refine_filter=i > Int32(10)"
+          range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6308,7 +6311,8 @@ mod test {
       MaterializeIndex: query=[i > 10]@i_idx"
         } else {
             "LanceRead: uri=..., projection=[s], num_fragments=4, range_before=None, \
-            range_after=None, row_id=false, row_addr=false, indexed_filter=[i > 10]@i_idx, refine_filter=--"
+            range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+              ScalarIndexQuery: query=[i > 10]@i_idx"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6332,7 +6336,7 @@ mod test {
   Take: columns=\"i, _rowid, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: uri=..., projection=[i], num_fragments=4, range_before=None, \
-      range_after=None, row_id=true, row_addr=false, indexed_filter=--, refine_filter=i > Int32(10)",
+      range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)",
             )
             .await?;
         }
@@ -6344,7 +6348,8 @@ mod test {
     MaterializeIndex: query=[i > 10]@i_idx"
         } else {
             "LanceRead: uri=..., projection=[], num_fragments=4, range_before=None, \
-            range_after=None, row_id=false, row_addr=true, indexed_filter=[i > 10]@i_idx, refine_filter=--"
+            range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
+              ScalarIndexQuery: query=[i > 10]@i_idx"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6372,7 +6377,8 @@ mod test {
           LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
-            range_after=None, row_id=false, row_addr=false, indexed_filter=[i > 10]@i_idx, refine_filter=--"
+            range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+              ScalarIndexQuery: query=[i > 10]@i_idx"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6393,7 +6399,8 @@ mod test {
           LanceScan: uri=..., projection=[i], row_id=true, row_addr=true, ordered=false, range=None"
         } else {
             "LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, \
-            range_after=None, row_id=false, row_addr=true, indexed_filter=[i > 10]@i_idx, refine_filter=--"
+            range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
+              ScalarIndexQuery: query=[i > 10]@i_idx"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6423,7 +6430,8 @@ mod test {
         } else {
             "ProjectionExec: expr=[regexp_match(s@0, .*) as matches]
   LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
-  range_after=None, row_id=false, row_addr=false, indexed_filter=[i > 10]@i_idx, refine_filter=--"
+  range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+    ScalarIndexQuery: query=[i > 10]@i_idx"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6512,7 +6520,8 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: query=hello
-        LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, indexed_filter=[i > 10]@i_idx, refine_filter=--"#
+        LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+          ScalarIndexQuery: query=[i > 10]@i_idx"#
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -6575,7 +6584,8 @@ mod test {
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
             MatchQuery: query=hello
-              LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, indexed_filter=[i > 10]@i_idx, refine_filter=--
+              LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+                ScalarIndexQuery: query=[i > 10]@i_idx
             FlatMatchQuery: query=hello
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#

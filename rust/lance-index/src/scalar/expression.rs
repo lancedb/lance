@@ -688,6 +688,14 @@ pub enum IndexExprResult {
 }
 
 impl IndexExprResult {
+    pub fn row_id_mask(&self) -> &RowIdMask {
+        match self {
+            IndexExprResult::Exact(mask) => mask,
+            IndexExprResult::AtMost(mask) => mask,
+            IndexExprResult::AtLeast(mask) => mask,
+        }
+    }
+
     pub fn discriminant(&self) -> u32 {
         match self {
             IndexExprResult::Exact(_) => 0,
