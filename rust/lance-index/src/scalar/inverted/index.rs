@@ -1482,8 +1482,8 @@ impl PostingListBuilder {
                 length,
             ));
             for index in 0..length {
-                let positions = positions.get(index);
-                let compressed = compress_positions(positions)?;
+                let positions_in_doc = positions.get(index);
+                let compressed = compress_positions(positions_in_doc)?;
                 let inner_builder = position_builder.values();
                 inner_builder.append_value(compressed.into_iter());
             }

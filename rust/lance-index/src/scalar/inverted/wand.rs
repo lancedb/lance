@@ -337,8 +337,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 continue;
             }
 
-            if params.phrase_slop.is_some()
-                && !self.check_positions(params.phrase_slop.unwrap() as i32)
+            if let Some(slop) = params.phrase_slop
+                && !self.check_positions(slop as i32)
             {
                 self.move_preceding(pivot, doc.doc_id() + 1);
                 continue;
@@ -557,10 +557,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 } else {
                     std::cmp::max(last + 1, next - slop)
                 };
-                max_relative_pos = match max_relative_pos {
-                    Some(max_relative_pos) => Some(std::cmp::max(max_relative_pos, move_to)),
-                    None => Some(move_to),
-                };
+                max_relative_pos = max_relative_pos.max(Some(move_to));
                 if !(last <= next && next <= last + slop) {
                     all_same = false;
                     break;

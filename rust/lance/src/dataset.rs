@@ -5640,6 +5640,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.num_rows(), 1);
+
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new("".to_owned()).into(),
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 0);
     }
 
     #[tokio::test]
