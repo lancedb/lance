@@ -711,7 +711,7 @@ impl DatasetIndexExt for Dataset {
             let index = self
                 .open_frag_reuse_index(&NoOpMetricsCollector)
                 .await?
-                .unwrap();
+                .expect("FragmentReuse index does not exist");
             return serde_json::to_string(&index.statistics()?).map_err(|e| Error::Index {
                 message: format!("Failed to serialize index statistics: {}", e),
                 location: location!(),
@@ -722,7 +722,7 @@ impl DatasetIndexExt for Dataset {
             let index = self
                 .open_mem_wal_index(&NoOpMetricsCollector)
                 .await?
-                .unwrap();
+                .expect("MemWal index does not exist");
             return serde_json::to_string(&index.statistics()?).map_err(|e| Error::Index {
                 message: format!("Failed to serialize index statistics: {}", e),
                 location: location!(),
