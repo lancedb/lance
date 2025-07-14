@@ -4466,6 +4466,7 @@ dependencies = [
  "approx",
  "arrow-arith",
  "arrow-array",
+ "arrow-buffer",
  "arrow-ord",
  "arrow-schema",
  "bitvec",
