@@ -2783,8 +2783,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("indexed_filter=[category = 1]@category_idx, refine_filter=--"),
-            "Expected indexed filter in read: {}",
+            plan.contains("ScalarIndexQuery: query=[category = 1]@category_idx"),
+            "Expected index query in plan: {}",
             plan
         );
     }
@@ -2877,10 +2877,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains(
-                "indexed_filter=AND([id >= 2000]@id_idx,[id < 3000]@id_idx), refine_filter=--"
-            ),
-            "Expected index filter in read: {}",
+            plan.contains("ScalarIndexQuery: query=AND([id >= 2000]@id_idx,[id < 3000]@id_idx)"),
+            "Expected scalar index query in plan: {}",
             plan
         );
     }
@@ -3143,8 +3141,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("indexed_filter=[contains(doc, Utf8"),
-            "Expected indexed filter in read: {}",
+            plan.contains("ScalarIndexQuery: query=[contains(doc, Utf8"),
+            "Expected scalar index query in plan: {}",
             plan
         );
     }
@@ -3241,10 +3239,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains(
-                "indexed_filter=[array_has_any(labels, List([1]))]@labels_idx, refine_filter=--"
-            ),
-            "Expected indexed filter in read: {}",
+            plan.contains("ScalarIndexQuery: query=[array_has_any(labels, List([1]))]@labels_idx"),
+            "Expected scalar index query in plan: {}",
             plan
         );
     }
