@@ -5,15 +5,15 @@ else
 endif
 
 test:
-	pytest $(PYTEST_ARGS) python/tests
+	uv run pytest $(PYTEST_ARGS) python/tests
 .PHONY: test
 
 integtest:
-	pytest --run-integration $(PYTEST_ARGS) python/tests/test_s3_ddb.py
+	uv run pytest --run-integration $(PYTEST_ARGS) python/tests/test_s3_ddb.py
 .PHONY: integtest
 
 doctest:
-	pytest --doctest-modules $(PYTEST_ARGS) python/lance
+	uv run pytest --doctest-modules $(PYTEST_ARGS) python/lance
 .PHONY: doctest
 
 format: format-python
@@ -21,17 +21,17 @@ format: format-python
 .PHONY: format
 
 format-python:
-	ruff format python
-	ruff check --fix python
+	uv run ruff format python
+	uv run ruff check --fix python
 .PHONY: format-python
 
 lint: lint-python lint-rust
 .PHONY: lint
 
 lint-python:
-	ruff format --check python
-	ruff check python
-	pyright
+	uv run ruff format --check python
+	uv run ruff check python
+	uv run pyright
 .PHONY: lint-python
 
 lint-rust:

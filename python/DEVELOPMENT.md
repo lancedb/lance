@@ -7,7 +7,7 @@ This project is built with [maturin](https://github.com/PyO3/maturin).
 It can be built in development mode with:
 
 ```shell
-maturin develop
+uv run maturin develop
 ```
 
 This builds the Rust native module in place. You will need to re-run this
@@ -19,7 +19,7 @@ re-building.
 To run the tests, first install the test packages:
 
 ```shell
-pip install '.[tests]'
+uv pip install -e '.[tests]'
 ```
 
 then:
@@ -59,7 +59,7 @@ then you can use the pre-commit tool. The project includes a pre-commit config
 file already. First, install the pre-commit tool:
 
 ```shell
-pip install pre-commit
+uv pip install pre-commit
 ```
 
 Then install the hooks:
@@ -98,7 +98,7 @@ benchmarks added there should run in less than 5 seconds.
 Before running benchmarks, you should build pylance in release mode:
 
 ```shell
-maturin develop --profile release-with-debug --extras benchmarks --features datagen
+uv run maturin develop --profile release-with-debug --extras benchmarks --features datagen
 ```
 
 (You can also use `--release` or `--profile release`, but `--profile release-with-debug`
@@ -107,7 +107,7 @@ will provide debug symbols for profiling.)
 Then you can run the benchmarks with
 
 ```shell
-pytest python/benchmarks -m "not slow"
+uv run pytest python/benchmarks -m "not slow"
 ```
 
 Note: the first time you run the benchmarks, they may take a while, since they
@@ -118,7 +118,7 @@ Some benchmarks are especially slow, so they are skipped `-m "not slow"`. To run
 the slow benchmarks, use:
 
 ```shell
-pytest python/benchmarks
+uv run pytest python/benchmarks
 ```
 
 ### Run a particular benchmark
@@ -127,7 +127,7 @@ To filter benchmarks by name, use the usual pytest `-k` flag (this can be a
 substring match, so you don't need to type the full name):
 
 ```shell
-pytest python/benchmarks -k test_ivf_pq_index_search
+uv run pytest python/benchmarks -k test_ivf_pq_index_search
 ```
 
 ### Profile a benchmark
@@ -165,12 +165,12 @@ the benchmarks again with `--benchmark-compare`.
 ```shell
 CURRENT_BRANCH=$(git branch --show-current)
 git checkout main
-maturin develop --profile release-with-debug  --features datagen
-pytest --benchmark-save=baseline python/benchmarks -m "not slow"
+uv run maturin develop --profile release-with-debug  --features datagen
+uv run pytest --benchmark-save=baseline python/benchmarks -m "not slow"
 COMPARE_ID=$(ls .benchmarks/*/ | tail -1 | cut -c1-4)
 git checkout $CURRENT_BRANCH
-maturin develop --profile release-with-debug  --features datagen
-pytest --benchmark-compare=$COMPARE_ID python/benchmarks -m "not slow"
+uv run maturin develop --profile release-with-debug  --features datagen
+uv run pytest --benchmark-compare=$COMPARE_ID python/benchmarks -m "not slow"
 ```
 
 ## Tracing
@@ -270,7 +270,7 @@ docker compose up
 Then you can run the tests with
 
 ```shell
-pytest --run-integration python/tests/test_s3_ddb.py
+uv run pytest --run-integration python/tests/test_s3_ddb.py
 ```
 
 ## Building wheels locally
@@ -290,7 +290,7 @@ rustup target add aarch64-unknown-linux-gnu
 For x86 Linux:
 
 ```shell
-maturin build --release --zig \
+uv run maturin build --release --zig \
     --target x86_64-unknown-linux-gnu \
     --compatibility manylinux2014 \
     --out wheels
@@ -299,7 +299,7 @@ maturin build --release --zig \
 For ARM / aarch64 Linux:
 
 ```shell
-maturin build --release --zig \
+uv run maturin build --release --zig \
     --target aarch_64-unknown-linux-gnu \
     --compatibility manylinux2014 \
     --out wheels
@@ -310,13 +310,13 @@ maturin build --release --zig \
 On a Mac, you can build wheels locally for MacOS:
 
 ```shell
-maturin build --release \
+uv run maturin build --release \
     --target aarch64-apple-darwin \
     --out wheels
 ```
 
 ```shell
-maturin build --release \
+uv run maturin build --release \
     --target x86_64-apple-darwin \
     --out wheels
 ```
