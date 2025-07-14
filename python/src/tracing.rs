@@ -24,7 +24,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::thread::JoinHandle;
-
+use chrono::{SecondsFormat, Utc};
 use datafusion_common::HashMap;
 use pyo3::pyclass;
 use pyo3::pyfunction;
@@ -253,6 +253,10 @@ impl tracing_subscriber::Layer<Registry> for LoggingPassthroughRef {
         if let Some(callback_sender) = state.callback_sender.as_ref() {
             let mut args = EventToMap::default();
             event.record(&mut args);
+
+            let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            args.args.insert("timestamp".to_string(), now.to_string());
+
             match callback_sender.try_send(TraceEvent {
                 target: event.metadata().target().to_string(),
                 args: args.args,
