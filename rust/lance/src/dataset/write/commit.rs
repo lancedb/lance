@@ -25,9 +25,7 @@ use crate::{
 };
 
 use super::{resolve_commit_handler, WriteDestination};
-use lance_core::utils::tracing::{
-    DATASET_COMMITTED_EVENT, DATASET_CREATED_EVENT, TRACE_DATASET_EVENTS,
-};
+use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
 
 /// Create a new commit from a [`Transaction`].
@@ -350,7 +348,6 @@ impl<'a> CommitBuilder<'a> {
             )
             .await?;
 
-            info!(target: TRACE_DATASET_EVENTS, event=DATASET_CREATED_EVENT, path=&base_path.to_string());
             info!(
                 target: TRACE_DATASET_EVENTS,
                 event=DATASET_COMMITTED_EVENT,

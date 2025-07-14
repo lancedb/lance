@@ -19,8 +19,7 @@ use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT,
-    DATASET_DROPPING_COLUMN_EVENT, DATASET_OPENING_EVENT, DATASET_WRITING_EVENT,
-    TRACE_DATASET_EVENTS, TRACE_FILE_AUDIT,
+    DATASET_DROPPING_COLUMN_EVENT, DATASET_OPENING_EVENT, TRACE_DATASET_EVENTS, TRACE_FILE_AUDIT,
 };
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
@@ -533,16 +532,9 @@ impl Dataset {
     ///
     pub async fn write(
         batches: impl RecordBatchReader + Send + 'static,
-        dest: impl Into<WriteDestination<'_>> + Clone,
+        dest: impl Into<WriteDestination<'_>>,
         params: Option<WriteParams>,
     ) -> Result<Self> {
-        if let Some(dataset) = dest.clone().into().dataset() {
-            info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, uri=dataset.uri());
-        } else if let WriteDestination::Uri(uri) = dest.clone().into() {
-            info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, uri=uri);
-        } else {
-            info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, uri="unknown");
-        }
         let mut builder = InsertBuilder::new(dest);
         if let Some(params) = &params {
             builder = builder.with_params(params);
