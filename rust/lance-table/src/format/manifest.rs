@@ -207,14 +207,14 @@ impl Manifest {
     }
 
     /// Replaces the schema metadata with the given key-value pairs.
-    pub fn update_schema_metadata(&mut self, new_metadata: HashMap<String, String>) {
+    pub fn replace_schema_metadata(&mut self, new_metadata: HashMap<String, String>) {
         self.schema.metadata = new_metadata;
     }
 
     /// Replaces the metadata of the field with the given id with the given key-value pairs.
     ///
     /// If the field does not exist in the schema, this is a no-op.
-    pub fn update_field_metadata(&mut self, field_id: i32, new_metadata: HashMap<String, String>) {
+    pub fn replace_field_metadata(&mut self, field_id: i32, new_metadata: HashMap<String, String>) {
         if let Some(field) = self.schema.field_by_id_mut(field_id) {
             field.metadata = new_metadata;
         }
