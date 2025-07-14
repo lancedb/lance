@@ -102,21 +102,6 @@ impl CompressedPostingListIterator {
             length,
             blocks.len(),
         );
-        if let Some(positions) = positions.as_ref() {
-            assert_eq!(
-                positions.len(),
-                length,
-                "length: {}, positions: {}",
-                length,
-                positions.len()
-            );
-            assert!(
-                positions.values().as_binary::<i64>().values().len() < i32::MAX as usize,
-                "positions length {} should be less than {}",
-                positions.values().as_binary::<i64>().values().len(),
-                i32::MAX
-            );
-        }
 
         Self {
             remainder: length % BLOCK_SIZE,
