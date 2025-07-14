@@ -33,6 +33,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: 3.11 # Ray does not support 3.12 yet.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -42,19 +44,17 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Build
         run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install maturin duckdb requests pytest pytest-benchmark
+          uv venv
+          source .venv/bin/activate
+          uv pip install maturin duckdb requests pytest pytest-benchmark
           maturin develop --locked --release
       - name: Generate datasets
         run: |
-          python -m venv venv
-          source venv/bin/activate
+          source .venv/bin/activate
           python python/ci_benchmarks/datagen/gen_all.py
       - name: Run benchmarks
         run: |
-          python -m venv venv
-          source venv/bin/activate
+          source .venv/bin/activate
           bencher run --project weston-lancedb --token ${{ secrets.LANCE_BENCHER_TOKEN }} --adapter python_pytest \
                       --branch main --testbed google-genoa --err --file results.json "python -mpytest --benchmark-json \
                       results.json python/ci_benchmarks"

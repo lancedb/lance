@@ -12,18 +12,20 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
     - name: Install dependencies
       working-directory: python
       shell: bash
       run: |
-        pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
+        uv pip install --system $(ls target/wheels/pylance-*.whl)[tests,ray]
     - name: Install torch
       working-directory: python
       shell: bash
       if: inputs.skip-torch == 'false'
       run: |
         # Install cpu only pytorch
-        pip install torch --index-url https://download.pytorch.org/whl/cpu
+        uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
     - name: Run python tests
       shell: bash
       working-directory: python
