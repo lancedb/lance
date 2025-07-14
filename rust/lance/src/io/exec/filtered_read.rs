@@ -1240,6 +1240,10 @@ impl FilteredReadExec {
     pub fn options(&self) -> &FilteredReadOptions {
         &self.options
     }
+
+    pub fn index_input(&self) -> Option<&Arc<dyn ExecutionPlan>> {
+        self.index_input.as_ref()
+    }
 }
 
 impl DisplayAs for FilteredReadExec {
