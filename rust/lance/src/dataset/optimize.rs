@@ -85,12 +85,6 @@ use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
 use std::sync::{Arc, RwLock};
 
-use super::fragment::FileFragment;
-use super::index::DatasetIndexRemapperOptions;
-use super::rowids::load_row_id_sequences;
-use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
-use super::utils::make_rowid_capture_stream;
-use super::{write_fragments_internal, WriteMode, WriteParams};
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Dataset;
 use crate::Result;
@@ -104,6 +98,13 @@ use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
+
+use super::fragment::FileFragment;
+use super::index::DatasetIndexRemapperOptions;
+use super::rowids::load_row_id_sequences;
+use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
+use super::utils::make_rowid_capture_stream;
+use super::{write_fragments_internal, WriteMode, WriteParams};
 use tracing::info;
 
 pub mod remapping;

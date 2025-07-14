@@ -12,7 +12,6 @@ use lance_table::{
 };
 use snafu::location;
 
-use super::{resolve_commit_handler, WriteDestination};
 use crate::{
     dataset::{
         builder::DatasetBuilder,
@@ -25,6 +24,7 @@ use crate::{
     Dataset, Error, Result,
 };
 
+use super::{resolve_commit_handler, WriteDestination};
 use lance_core::utils::tracing::{CREATE_EVENT, NEW_VERSION_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
 
