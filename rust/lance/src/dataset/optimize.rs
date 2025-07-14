@@ -989,7 +989,7 @@ mod tests {
     use lance_index::scalar::{FullTextSearchQuery, ScalarIndexParams};
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
-    use lance_index::IndexType;
+    use lance_index::{Index, IndexType};
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_table::io::manifest::read_manifest_indexes;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
@@ -1958,6 +1958,14 @@ mod tests {
         let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
             .await
             .unwrap();
+        let stats = frag_reuse_index.statistics().unwrap();
+        assert_eq!(
+            serde_json::to_string(&stats).unwrap(),
+            dataset
+                .index_statistics(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+        );
 
         // Verify the index has one version with the correct dataset version
         let compaction_version = &frag_reuse_index.details.versions[0];
