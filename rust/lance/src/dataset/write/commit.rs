@@ -295,7 +295,7 @@ impl<'a> CommitBuilder<'a> {
                     &self.commit_config,
                 )
                 .await?;
-                
+
                 info!(
                     target: TRACE_DATASET_EVENTS,
                     event=DATASET_COMMITTED_EVENT,
@@ -305,7 +305,7 @@ impl<'a> CommitBuilder<'a> {
                     detached=true,
                     operation=&transaction.operation.name()
                 );
-                
+
                 manifest_and_location
             } else {
                 let manifest_and_location = commit_transaction(
