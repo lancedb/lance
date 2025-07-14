@@ -25,7 +25,9 @@ use crate::{
 };
 
 use super::{resolve_commit_handler, WriteDestination};
-use lance_core::utils::tracing::{CREATE_EVENT, NEW_VERSION_EVENT, TRACE_DATASET_EVENTS};
+use lance_core::utils::tracing::{
+    DATASET_COMMITTED_EVENT, DATASET_CREATED_EVENT, TRACE_DATASET_EVENTS,
+};
 use tracing::info;
 
 /// Create a new commit from a [`Transaction`].
@@ -284,15 +286,7 @@ impl<'a> CommitBuilder<'a> {
                         location: location!(),
                     });
                 }
-                info!(
-                    target: TRACE_DATASET_EVENTS,
-                    event=NEW_VERSION_EVENT,
-                    uri=dataset.uri,
-                    version=transaction.read_version + 1,
-                    detached=true,
-                    operation=&transaction.operation.name()
-                );
-                commit_detached_transaction(
+                let manifest_and_location = commit_detached_transaction(
                     dataset,
                     object_store.as_ref(),
                     commit_handler.as_ref(),
@@ -300,17 +294,21 @@ impl<'a> CommitBuilder<'a> {
                     &manifest_config,
                     &self.commit_config,
                 )
-                .await?
-            } else {
+                .await?;
+                
                 info!(
                     target: TRACE_DATASET_EVENTS,
-                    event=NEW_VERSION_EVENT,
+                    event=DATASET_COMMITTED_EVENT,
                     uri=dataset.uri,
-                    version=transaction.read_version + 1,
-                    detached=false,
+                    read_version=transaction.read_version,
+                    committed_version=manifest_and_location.0.version,
+                    detached=true,
                     operation=&transaction.operation.name()
                 );
-                commit_transaction(
+                
+                manifest_and_location
+            } else {
+                let manifest_and_location = commit_transaction(
                     dataset,
                     object_store.as_ref(),
                     commit_handler.as_ref(),
@@ -320,7 +318,19 @@ impl<'a> CommitBuilder<'a> {
                     manifest_naming_scheme,
                     self.affected_rows.as_ref(),
                 )
-                .await?
+                .await?;
+
+                info!(
+                    target: TRACE_DATASET_EVENTS,
+                    event=DATASET_COMMITTED_EVENT,
+                    uri=dataset.uri,
+                    read_version=transaction.read_version,
+                    committed_version=manifest_and_location.0.version,
+                    detached=false,
+                    operation=&transaction.operation.name()
+                );
+
+                manifest_and_location
             }
         } else if self.detached {
             // I think we may eventually want this, and we can probably handle it, but leaving a TODO for now
@@ -329,16 +339,7 @@ impl<'a> CommitBuilder<'a> {
                 location: location!(),
             });
         } else {
-            info!(target: TRACE_DATASET_EVENTS, event=CREATE_EVENT, path=&base_path.to_string());
-            info!(
-                target: TRACE_DATASET_EVENTS,
-                event=NEW_VERSION_EVENT,
-                path=&base_path.to_string(),
-                version=transaction.read_version + 1,
-                detached=false,
-                operation=&transaction.operation.name()
-            );
-            commit_new_dataset(
+            let manifest_and_location = commit_new_dataset(
                 object_store.as_ref(),
                 commit_handler.as_ref(),
                 &base_path,
@@ -347,7 +348,20 @@ impl<'a> CommitBuilder<'a> {
                 manifest_naming_scheme,
                 metadata_cache.as_ref(),
             )
-            .await?
+            .await?;
+
+            info!(target: TRACE_DATASET_EVENTS, event=DATASET_CREATED_EVENT, path=&base_path.to_string());
+            info!(
+                target: TRACE_DATASET_EVENTS,
+                event=DATASET_COMMITTED_EVENT,
+                path=&base_path.to_string(),
+                read_version=transaction.read_version,
+                committed_version=manifest_and_location.0.version,
+                detached=false,
+                operation=&transaction.operation.name()
+            );
+
+            manifest_and_location
         };
 
         let tags = Tags::new(

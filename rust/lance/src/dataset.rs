@@ -18,8 +18,9 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
-    AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, CLEANUP_EVENT, DELETE_EVENT, DROP_COLUMN_EVENT,
-    OPEN_EVENT, TRACE_DATASET_EVENTS, TRACE_FILE_AUDIT, WRITE_EVENT,
+    AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT,
+    DATASET_DROPPING_COLUMN_EVENT, DATASET_OPENING_EVENT, DATASET_WRITING_EVENT,
+    TRACE_DATASET_EVENTS, TRACE_FILE_AUDIT,
 };
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
@@ -332,7 +333,7 @@ impl Dataset {
     /// See also [DatasetBuilder].
     #[instrument]
     pub async fn open(uri: &str) -> Result<Self> {
-        info!(target: TRACE_DATASET_EVENTS, event=OPEN_EVENT, uri=uri);
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_OPENING_EVENT, uri=uri);
         DatasetBuilder::from_uri(uri).load().await
     }
 
@@ -536,11 +537,11 @@ impl Dataset {
         params: Option<WriteParams>,
     ) -> Result<Self> {
         if let Some(dataset) = dest.clone().into().dataset() {
-            info!(target: TRACE_DATASET_EVENTS, event=WRITE_EVENT, uri=dataset.uri());
+            info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, uri=dataset.uri());
         } else if let WriteDestination::Uri(uri) = dest.clone().into() {
-            info!(target: TRACE_DATASET_EVENTS, event=WRITE_EVENT, uri=uri);
+            info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, uri=uri);
         } else {
-            info!(target: TRACE_DATASET_EVENTS, event=WRITE_EVENT, uri="unknown");
+            info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, uri="unknown");
         }
         let mut builder = InsertBuilder::new(dest);
         if let Some(params) = &params {
@@ -719,7 +720,7 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
     ) -> BoxFuture<Result<RemovalStats>> {
-        info!(target: TRACE_DATASET_EVENTS, event=CLEANUP_EVENT, uri=&self.uri);
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
         let before = utc_now() - older_than;
         cleanup::cleanup_old_versions(
             self,
@@ -1030,7 +1031,7 @@ impl Dataset {
 
     /// Delete rows based on a predicate.
     pub async fn delete(&mut self, predicate: &str) -> Result<()> {
-        info!(target: TRACE_DATASET_EVENTS, event=DELETE_EVENT, uri = &self.uri, predicate=predicate);
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_DELETING_EVENT, uri = &self.uri, predicate=predicate);
         write::delete::delete(self, predicate).await
     }
 
@@ -1636,7 +1637,7 @@ impl Dataset {
     /// call [optimize::compact_files()] to rewrite the data without the removed columns and
     /// then call [cleanup::cleanup_old_versions()] to remove the old files.
     pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
-        info!(target: TRACE_DATASET_EVENTS, event=DROP_COLUMN_EVENT, uri = &self.uri, columns = columns.join(","));
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_DROPPING_COLUMN_EVENT, uri = &self.uri, columns = columns.join(","));
         schema_evolution::drop_columns(self, columns).await
     }
 
