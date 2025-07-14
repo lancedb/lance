@@ -4,13 +4,11 @@ description: "Install lance wheel and run integ tests"
 runs:
   using: "composite"
   steps:
-  - name: Install uv
-    uses: astral-sh/setup-uv@v4
   - name: Install dependencies
     working-directory: python
     shell: bash
     run: |
-      uv pip install --system $(ls target/wheels/pylance-*.whl)[tests,ray]
+      pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
   - name: Start localstack
     shell: bash
     run: |

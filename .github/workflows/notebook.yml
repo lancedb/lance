@@ -31,14 +31,12 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: "10"
-    - name: Install uv
-      uses: astral-sh/setup-uv@v4
     - name: Pip install
       working-directory: python
       shell: bash
       run: |
-        uv pip install --system jupyter duckdb>=0.7
-        uv pip install --system $(ls target/wheels/*.whl)
+        pip3 install jupyter duckdb>=0.7
+        pip3 install $(ls target/wheels/*.whl)
     - name: Run python tests
       shell: bash
       working-directory: notebooks

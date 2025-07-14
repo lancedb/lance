@@ -38,8 +38,6 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: 3.${{ matrix.python-minor-version }}
-    - name: Install uv
-      uses: astral-sh/setup-uv@v4
     - name: Handle tag
       id: handle_tag
       run: |
@@ -47,7 +45,7 @@ jobs:
         # and export repo as "fury" instead of "pypi"
         if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
-          uv pip install --system packaging
+          pip install packaging
           python ci/setup_version.py $TAG
           echo "repo=fury" >> $GITHUB_OUTPUT
         else
@@ -87,8 +85,6 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: 3.12
-    - name: Install uv
-      uses: astral-sh/setup-uv@v4
     - name: Handle tag
       id: handle_tag
       run: |
@@ -96,7 +92,7 @@ jobs:
         # and export repo as "fury" instead of "pypi"
         if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
-          uv pip install --system packaging
+          pip install packaging
           python ci/setup_version.py $TAG
           echo "repo=fury" >> $GITHUB_OUTPUT
         else
@@ -127,8 +123,6 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: 3.${{ matrix.python-minor-version }}
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
       - name: Handle tag
         id: handle_tag
         shell: bash
@@ -137,7 +131,7 @@ jobs:
           # and export repo as "fury" instead of "pypi"
           if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
             TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
-            uv pip install --system packaging
+            pip install packaging
             python ci/setup_version.py $TAG
             echo "repo=fury" >> $GITHUB_OUTPUT
           else

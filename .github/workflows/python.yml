@@ -60,12 +60,10 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
       - name: Install linting tools
         run: |
-          uv pip install --system ruff==0.11.2 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas]
-          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          pip install ruff==0.11.2 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas]
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Lint Python
         run: |
           ruff format --check python
@@ -86,14 +84,14 @@ jobs:
           cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
       - name: Build
         run: |
-          uv venv
-          source .venv/bin/activate
-          uv pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
-          uv pip install maturin
+          python -m venv venv
+          source venv/bin/activate
+          pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
+          pip install maturin
           maturin develop --locked --extras tests,ray
       - name: Run doctest
         run: |
-          source .venv/bin/activate
+          source venv/bin/activate
           pytest --doctest-modules python/lance
   linux:
     timeout-minutes: 45
@@ -123,18 +121,16 @@ jobs:
       - uses: ./.github/workflows/run_tests
       - name: Generate forward compatibility files
         run: python python/tests/forward_compat/datagen.py
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
       - name: Run forward compatibility tests (pylance 0.16.0)
         run: |
-          uv venv
-          source .venv/bin/activate
-          uv pip install pytest pylance==0.16.0
+          python -m venv venv
+          source venv/bin/activate
+          pip install pytest pylance==0.16.0
           pytest python/tests/forward_compat --run-forward
       - name: Run forward compatibility tests (pylance 0.29.1.beta2)
         run: |
-          source .venv/bin/activate
-          uv pip install pytest --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==0.29.1.beta2
+          source venv/bin/activate
+          pip install pytest --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==0.29.1.beta2
           pytest python/tests/forward_compat --run-forward
       # Make sure wheels are not included in the Rust cache
       - name: Delete wheels
@@ -239,12 +235,10 @@ jobs:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
       - uses: ./.github/workflows/build_linux_wheel
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
       - name: Install dependencies
         run: |
-          uv pip install --system ray[data]
-          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          pip install ray[data]
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
       - uses: ./.github/workflows/run_integtests
       # Make sure wheels are not included in the Rust cache
       - name: Delete wheels
