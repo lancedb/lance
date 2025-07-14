@@ -1375,7 +1375,7 @@ impl ExecutionPlan for FilteredReadExec {
             let filter = self.options.full_filter.as_ref().unwrap();
 
             // Need to add in filter columns even though they aren't part of the projection
-            let filter_columns = Planner::column_names_in_expr(&filter);
+            let filter_columns = Planner::column_names_in_expr(filter);
             let read_projection = self
                 .options
                 .projection

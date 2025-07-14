@@ -690,25 +690,25 @@ pub enum IndexExprResult {
 impl IndexExprResult {
     pub fn row_id_mask(&self) -> &RowIdMask {
         match self {
-            IndexExprResult::Exact(mask) => mask,
-            IndexExprResult::AtMost(mask) => mask,
-            IndexExprResult::AtLeast(mask) => mask,
+            Self::Exact(mask) => mask,
+            Self::AtMost(mask) => mask,
+            Self::AtLeast(mask) => mask,
         }
     }
 
     pub fn discriminant(&self) -> u32 {
         match self {
-            IndexExprResult::Exact(_) => 0,
-            IndexExprResult::AtMost(_) => 1,
-            IndexExprResult::AtLeast(_) => 2,
+            Self::Exact(_) => 0,
+            Self::AtMost(_) => 1,
+            Self::AtLeast(_) => 2,
         }
     }
 
     pub fn from_parts(mask: RowIdMask, discriminant: u32) -> Result<Self> {
         match discriminant {
-            0 => Ok(IndexExprResult::Exact(mask)),
-            1 => Ok(IndexExprResult::AtMost(mask)),
-            2 => Ok(IndexExprResult::AtLeast(mask)),
+            0 => Ok(Self::Exact(mask)),
+            1 => Ok(Self::AtMost(mask)),
+            2 => Ok(Self::AtLeast(mask)),
             _ => Err(Error::InvalidInput {
                 source: format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
                 location: location!(),
