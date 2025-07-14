@@ -84,4 +84,4 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
             fast_search=True, prefilter=True, filter="meta = 'hello'"
         )
         plan = scanner.explain_plan()
-        assert "indexed_filter=[meta = hello]@meta_idx" in plan
+        assert "ScalarIndexQuery: query=[meta = hello]@meta_idx" in plan

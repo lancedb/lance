@@ -3044,7 +3044,7 @@ mod tests {
         CoalesceBatchesExec...
           HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
             LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
-            row_id=false, row_addr=true, indexed_filter=--, refine_filter=--
+            row_id=false, row_addr=true, full_filter=--, refine_filter=--
             RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
               StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();

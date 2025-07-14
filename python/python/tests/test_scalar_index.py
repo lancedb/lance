@@ -109,7 +109,8 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
         )
 
         assert (
-            f"indexed_filter=[meta = {sample_meta}]@meta_idx" in scanner.explain_plan()
+            f"ScalarIndexQuery: query=[meta = {sample_meta}]@meta_idx"
+            in scanner.explain_plan()
         )
 
         actual_data = scanner.to_table()
@@ -127,7 +128,7 @@ def test_indexed_between(tmp_path):
     scanner = dataset.scanner(filter="val BETWEEN 10 AND 20", prefilter=True)
 
     assert (
-        "indexed_filter=[val >= 10 && val <= 20]@val_idx, refine_filter=--"
+        "ScalarIndexQuery: query=[val >= 10 && val <= 20]@val_idx"
         in scanner.explain_plan()
     )
 
@@ -137,7 +138,7 @@ def test_indexed_between(tmp_path):
     scanner = dataset.scanner(filter="val >= 10 AND val <= 20", prefilter=True)
 
     assert (
-        "indexed_filter=[val >= 10 && val <= 20]@val_idx, refine_filter=--"
+        "ScalarIndexQuery: query=[val >= 10 && val <= 20]@val_idx"
         in scanner.explain_plan()
     )
 
@@ -150,7 +151,7 @@ def test_indexed_between(tmp_path):
     scanner = dataset.scanner(filter="val >= 5000 AND val <= 0", prefilter=True)
 
     assert (
-        "indexed_filter=[val >= 5000 && val <= 0]@val_idx, refine_filter=--"
+        "ScalarIndexQuery: query=[val >= 5000 && val <= 0]@val_idx"
         in scanner.explain_plan()
     )
 
@@ -160,7 +161,7 @@ def test_indexed_between(tmp_path):
     scanner = dataset.scanner(filter="val BETWEEN 5000 AND 0", prefilter=True)
 
     assert (
-        "indexed_filter=[val >= 5000 && val <= 0]@val_idx, refine_filter=--"
+        "ScalarIndexQuery: query=[val >= 5000 && val <= 0]@val_idx"
         in scanner.explain_plan()
     )
 
@@ -189,7 +190,7 @@ def test_temporal_index(tmp_path):
     half_now = now - timedelta(days=50)
     scanner = dataset.scanner(filter=f"ts > timestamp '{half_now}'", scan_in_order=True)
     assert re.search(
-        r"^.*indexed_filter=\[ts > .*\]@ts_idx, refine_filter=--.*$",
+        r"^.*ScalarIndexQuery: query=\[ts > .*\]@ts_idx.*$",
         scanner.explain_plan(True),
         re.MULTILINE,
     )
@@ -199,7 +200,7 @@ def test_temporal_index(tmp_path):
     half_toady = today - timedelta(days=50)
     scanner = dataset.scanner(filter=f"date > date '{half_toady}'", scan_in_order=True)
     assert re.search(
-        r"^.*indexed_filter=\[date > .*\]@date_idx, refine_filter=--.*$",
+        r"^.*ScalarIndexQuery: query=\[date > .*\]@date_idx.*$",
         scanner.explain_plan(True),
         re.MULTILINE,
     )
@@ -239,7 +240,7 @@ def test_indexed_vector_scan(indexed_dataset: lance.LanceDataset, data_table: pa
     )
 
     assert (
-        f"indexed_filter=[meta = {sample_meta}]@meta_idx, refine_filter=price >= Fl"
+        f"ScalarIndexQuery: query=[meta = {sample_meta}]@meta_idx"
         in scanner.explain_plan()
     )
 
@@ -319,14 +320,14 @@ def test_partly_indexed_prefiltered_search(tmp_path):
 
     # Ann search but with combined prefilter, should get 12 results
     plan = make_vec_search(ds).explain_plan()
-    assert "ScalarIndexQuery" not in plan
+    assert "ScalarIndexQuery" in plan
     assert "LanceRead" in plan
     assert "KNNVectorDistance" not in plan
     assert "LanceScan" not in plan
     assert make_vec_search(ds).to_table().num_rows == 12
 
     plan = make_fts_search(ds).explain_plan()
-    assert "ScalarIndexQuery" not in plan
+    assert "ScalarIndexQuery" in plan
     assert "LanceRead" in plan
     assert "FlatMatchQuery" not in plan
     assert "LanceScan" not in plan
@@ -363,7 +364,7 @@ def test_fixed_size_binary(tmp_path):
         "uuid = arrow_cast(0x32333435323334353233343532333435, 'FixedSizeBinary(16)')"
     )
     assert (
-        "indexed_filter=[uuid = 32333435323334353233...]@uuid_idx, refine_filter=--"
+        "ScalarIndexQuery: query=[uuid = 32333435323334353233...]@uuid_idx"
         in ds.scanner(filter=query).explain_plan()
     )
 
@@ -520,7 +521,7 @@ def test_use_multi_index(tmp_path):
     assert results.num_rows == 1
 
     assert (
-        "indexed_filter=[ints = 0]@ints_idx, refine_filter=--"
+        "ScalarIndexQuery: query=[ints = 0]@ints_idx"
         in dataset.scanner(filter="ints = 0", prefilter=True).explain_plan()
     )
 
@@ -540,7 +541,7 @@ def test_ngram_fts(tmp_path):
     assert results.num_rows == 2
 
     assert (
-        'indexed_filter=[contains(text, Utf8("hello"))]@text_ngram_idx, refine_filter=-'
+        'ScalarIndexQuery: query=[contains(text, Utf8("hello"))]@text_ngram_idx'
         in dataset.scanner(
             filter="contains(text, 'hello')", prefilter=True
         ).explain_plan()
@@ -1254,7 +1255,7 @@ def test_ngram_index(tmp_path: Path):
         scan_plan = dataset.scanner(filter="contains(words, 'apple')").explain_plan(
             True
         )
-        assert "indexed_filter=[contains(words" in scan_plan
+        assert "ScalarIndexQuery: query=[contains(words" in scan_plan
 
         assert dataset.to_table(filter="contains(words, 'apple')").num_rows == 50
         assert dataset.to_table(filter="contains(words, 'banana')").num_rows == 25

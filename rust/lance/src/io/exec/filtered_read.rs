@@ -9,7 +9,6 @@ use arrow::array::AsArray;
 use arrow::datatypes::UInt32Type;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use async_recursion::async_recursion;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -38,8 +37,7 @@ use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
     ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
-use lance_index::scalar::expression::{FilterPlan, IndexExprResult, ScalarIndexExpr};
-use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
+use lance_index::scalar::expression::{FilterPlan, IndexExprResult};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
@@ -56,7 +54,7 @@ use crate::dataset::scanner::{
 };
 use crate::Dataset;
 
-use super::utils::{IndexMetrics, IoMetrics};
+use super::utils::IoMetrics;
 
 pub struct EvaluatedIndex {
     index_result: IndexExprResult,
@@ -75,7 +73,7 @@ impl EvaluatedIndex {
                 location: location!(),
             });
         }
-        if batch.num_columns() != 2 {
+        if batch.num_columns() != 3 {
             return Err(Error::InvalidInput {
                 source: format!(
                     "Expected a batch with exactly two columns but there are {} columns",
@@ -909,55 +907,6 @@ impl FilteredReadStream {
             Ok(batch_fut)
         }
     }
-
-    async fn evaluate_index_query(
-        filter: &FilterPlan,
-        dataset: &Dataset,
-        index_metrics: &IndexMetrics,
-    ) -> DataFusionResult<Option<Arc<EvaluatedIndex>>> {
-        if let Some(index_query) = &filter.index_query {
-            let index_result = index_query.evaluate(dataset, index_metrics).await?;
-            let applicable_fragments =
-                Self::fragments_covered_by_index_query(index_query, dataset).await?;
-            Ok(Some(Arc::new(EvaluatedIndex {
-                index_result,
-                applicable_fragments,
-            })))
-        } else {
-            Ok(None)
-        }
-    }
-
-    #[async_recursion]
-    async fn fragments_covered_by_index_query(
-        index_expr: &ScalarIndexExpr,
-        dataset: &Dataset,
-    ) -> Result<RoaringBitmap> {
-        match index_expr {
-            ScalarIndexExpr::And(lhs, rhs) => {
-                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
-                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
-            }
-            ScalarIndexExpr::Or(lhs, rhs) => {
-                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
-                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
-            }
-            ScalarIndexExpr::Not(expr) => {
-                Self::fragments_covered_by_index_query(expr, dataset).await
-            }
-            ScalarIndexExpr::Query(search_key) => {
-                let idx = dataset
-                    .load_scalar_index(
-                        ScalarIndexCriteria::default().with_name(&search_key.index_name),
-                    )
-                    .await?
-                    .expect("Index not found even though it must have been found earlier");
-                Ok(idx
-                    .fragment_bitmap
-                    .expect("scalar indices should always have a fragment bitmap"))
-            }
-        }
-    }
 }
 
 /// Options for a filtered read.
@@ -1351,7 +1300,11 @@ impl ExecutionPlan for FilteredReadExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
+        if let Some(index_input) = &self.index_input {
+            vec![index_input]
+        } else {
+            vec![]
+        }
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1532,7 +1485,7 @@ mod tests {
     use lance_index::{
         optimize::OptimizeOptions,
         scalar::{expression::PlannerIndexExt, ScalarIndexParams},
-        IndexType,
+        DatasetIndexExt, IndexType,
     };
     use tempfile::TempDir;
 
