@@ -1933,6 +1933,7 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
+    use rand::Rng;
     use rstest::rstest;
     use std::cmp::Ordering;
     use tempfile::{tempdir, TempDir};
@@ -5552,6 +5553,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fts_phrase_query() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let uri = tempdir.path().to_str().unwrap().to_owned();
+        tempdir.close().unwrap();
+
+        let words = ["lance", "full", "text", "search"];
+        let mut lance_search_count = 0;
+        let mut full_text_count = 0;
+        let mut doc_array = (0..4096)
+            .map(|_| {
+                let mut rng = rand::thread_rng();
+                let mut text = String::with_capacity(4);
+                for _ in 0..rng.gen_range(127..512) {
+                    text.push_str(words[rng.gen_range(0..words.len())]);
+                }
+                if text.contains("lance search") {
+                    lance_search_count += 1;
+                }
+                if text.contains("full text") {
+                    full_text_count += 1;
+                }
+                text
+            })
+            .collect_vec();
+        doc_array.push("position for phrase query".to_owned());
+
+        let params = InvertedIndexParams::default().with_position(true);
+        let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(doc_array));
+        let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+                arrow_schema::Field::new("id", DataType::UInt64, false),
+            ])
+            .into(),
+            vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+        dataset
+            .create_index(&["doc"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new("lance search".to_owned()).into(),
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), lance_search_count);
+
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new("full text".to_owned()).into(),
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), full_text_count);
+
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new("phrase query".to_owned()).into(),
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new("".to_owned()).into(),
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 0);
     }
 
     #[tokio::test]
