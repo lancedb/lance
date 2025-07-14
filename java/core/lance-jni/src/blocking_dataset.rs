@@ -36,10 +36,10 @@ use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::TagContents;
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
-use lance::dataset::transaction::Operation;
+use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
-    ColumnAlteration, Dataset, NewColumnTransform, ProjectionRequest, ReadParams, Version,
-    WriteParams,
+    ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
+    Version, WriteParams,
 };
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
@@ -237,6 +237,22 @@ impl BlockingDataset {
     pub fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
         RT.block_on(self.inner.delete_config_keys(delete_keys))?;
         Ok(())
+    }
+
+    pub fn commit_transaction(
+        &mut self,
+        transaction: Transaction,
+        write_params: HashMap<String, String>,
+    ) -> Result<Self> {
+        let new_dataset = RT.block_on(
+            CommitBuilder::new(Arc::new(self.clone().inner))
+                .with_store_params(ObjectStoreParams {
+                    storage_options: Some(write_params),
+                    ..Default::default()
+                })
+                .execute(transaction),
+        )?;
+        Ok(BlockingDataset { inner: new_dataset })
     }
 
     pub fn close(&self) {}
