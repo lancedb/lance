@@ -337,8 +337,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 continue;
             }
 
-            if let Some(slop) = params.phrase_slop
-                && !self.check_positions(slop as i32)
+            if params.phrase_slop.is_some()
+                && !self.check_positions(params.phrase_slop.unwrap() as i32)
             {
                 self.move_preceding(pivot, doc.doc_id() + 1);
                 continue;
