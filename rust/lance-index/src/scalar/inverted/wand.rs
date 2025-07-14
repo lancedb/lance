@@ -412,11 +412,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     // this document is a candidate
                     return Ok(Some((pivot, doc)));
                 } else {
-                    // log::warn!("failed to reach the doc id: {}", doc_id);
                     self.move_term(doc_id);
                 }
             } else {
-                // log::warn!("failed to hit the block max score: {}", self.threshold);
                 // the current block max score is less than the threshold,
                 // which means we have to skip at least the current block
                 if let Some(least_id) = self.get_new_candidate(pivot) {

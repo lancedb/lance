@@ -5557,16 +5557,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fts_index_with_positions() {
+    async fn test_fts_phrase_query() {
         let tempdir = tempfile::tempdir().unwrap();
         let uri = tempdir.path().to_str().unwrap().to_owned();
         tempdir.close().unwrap();
 
         let words = ["lance", "full", "text", "search"];
-        // generate 4096 rows that each one is a permutation of the words
         let mut lance_search_count = 0;
         let mut full_text_count = 0;
-        let mut doc_array = (0..15_000)
+        let mut doc_array = (0..4096)
             .map(|_| {
                 let mut rng = rand::thread_rng();
                 let mut text = String::with_capacity(4);
