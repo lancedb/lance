@@ -268,6 +268,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                                     u32::MAX,
                                     1,
                                     FilterExpression::no_filter(),
+                                    None,
                                 )?
                                 .try_collect::<Vec<_>>()
                                 .await?;

@@ -586,6 +586,7 @@ impl IvfShuffler {
                         SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
+                        None,
                     )
                     .unwrap();
 
@@ -660,6 +661,7 @@ impl IvfShuffler {
                         SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
+                        None,
                     )?
                     .boxed()
             };
@@ -831,6 +833,7 @@ impl IvfShuffler {
                     /*batch_size=*/ 1,
                     /*batch_readahead=*/ 32,
                     FilterExpression::no_filter(),
+                    None,
                 )?
                 .and_then(|batch| {
                     let list_array = batch
