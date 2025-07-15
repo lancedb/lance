@@ -1,4 +1,4 @@
-# Lance Format
+# Lance Format Specification
 
 The Lance format contains both a table format and a columnar file format.
 When combined, we refer to it as a data format. 
