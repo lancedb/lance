@@ -2,12 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
+use std::borrow::Cow;
 
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
-use utoipa::ToSchema;
+use utoipa::{ToSchema, PartialSchema};
+use utoipa::openapi::{RefOr, Schema, ObjectBuilder, ArrayBuilder, Ref};
 
 #[derive(Debug, Clone)]
 pub struct FtsSearchParams {
@@ -120,8 +122,7 @@ pub enum FtsQuery {
     // compound queries
     Boost(BoostQuery),
     MultiMatch(MultiMatchQuery),
-    // Openapi generator does not support recursive schema
-    #[schema(value_type = Object)]
+    // Openapi generator does not support recursive schema, manually implemented ToSchema
     Boolean(BooleanQuery),
 }
 
@@ -602,6 +603,48 @@ pub struct BooleanQuery {
     pub should: Vec<FtsQuery>,
     pub must: Vec<FtsQuery>,
     pub must_not: Vec<FtsQuery>,
+}
+
+// First implement PartialSchema (required by ToSchema)
+impl PartialSchema for BooleanQuery {
+    fn schema() -> RefOr<Schema> {
+        RefOr::T(Schema::Object(
+            ObjectBuilder::new()
+                .description(Some("Boolean query with must, should, and must_not clauses"))
+                .property(
+                    "should",
+                    ArrayBuilder::new()
+                        .items(Ref::from_schema_name("FtsQuery"))
+                        .description(Some("Queries that should match (OR)"))
+                )
+                .property(
+                    "must", 
+                    ArrayBuilder::new()
+                        .items(Ref::from_schema_name("FtsQuery"))
+                        .description(Some("Queries that must match (AND)"))
+                )
+                .property(
+                    "must_not",
+                    ArrayBuilder::new()
+                        .items(Ref::from_schema_name("FtsQuery"))
+                        .description(Some("Queries that must not match (NOT)"))
+                )
+                .required("should")
+                .required("must")
+                .required("must_not")
+                .into()
+        ))
+    }
+}
+
+impl ToSchema for BooleanQuery {
+    fn name() -> Cow<'static, str> {
+        Cow::Borrowed("BooleanQuery")
+    }
+
+    fn schemas(_schemas: &mut Vec<(String, RefOr<Schema>)>) {
+        // Don't recursively collect schemas for FtsQuery!
+    }
 }
 
 impl BooleanQuery {
