@@ -848,6 +848,60 @@ impl RepDefBuilder {
         self.len = Some(offsets[offsets.len() - 1] as usize);
     }
 
+    fn do_add_offsets(
+        &mut self,
+        lengths: impl Iterator<Item = i64>,
+        validity: Option<NullBuffer>,
+        capacity: usize,
+    ) -> bool {
+        let mut num_specials = 0;
+        let mut has_empty_lists = false;
+        let mut has_garbage_values = false;
+        let mut last_off: i64 = 0;
+
+        let mut normalized_offsets = Vec::with_capacity(capacity);
+        normalized_offsets.push(0);
+
+        if let Some(ref validity) = validity {
+            for (len, is_valid) in lengths.zip(validity.iter()) {
+                match (is_valid, len == 0) {
+                    (false, is_empty) => {
+                        num_specials += 1;
+                        has_garbage_values |= !is_empty;
+                    }
+                    (true, true) => {
+                        num_specials += 1;
+                        has_empty_lists = true;
+                    }
+                    _ => {
+                        last_off += len;
+                    }
+                }
+                normalized_offsets.push(last_off);
+            }
+        } else {
+            for len in lengths {
+                if len == 0 {
+                    num_specials += 1;
+                    has_empty_lists = true;
+                }
+                last_off += len;
+                normalized_offsets.push(last_off);
+            }
+        }
+
+        self.check_offset_len(&normalized_offsets);
+        self.repdefs.push(RawRepDef::Offsets(OffsetDesc {
+            num_values: normalized_offsets.len() - 1,
+            offsets: normalized_offsets.into(),
+            validity: validity.map(|v| v.into_inner()),
+            has_empty_lists,
+            num_specials: num_specials as usize,
+        }));
+
+        has_garbage_values
+    }
+
     /// Adds a layer of offsets
     ///
     /// Offsets are casted to a common type (i64) and also normalized.  Null lists are
@@ -859,101 +913,17 @@ impl RepDefBuilder {
         offsets: OffsetBuffer<O>,
         validity: Option<NullBuffer>,
     ) -> bool {
-        let mut has_garbage_values = false;
-        let mut num_specials = 0;
+        let inner = offsets.into_inner();
+        let buffer_len = inner.len();
+
         if O::IS_LARGE {
-            let inner = offsets.into_inner();
-            let len = inner.len();
-            let i64_buff = ScalarBuffer::<i64>::new(inner.into_inner(), 0, len);
-            let mut normalized = Vec::with_capacity(len);
-            normalized.push(0_i64);
-            let mut has_empty_lists = false;
-            let mut last_off = 0;
-            if let Some(validity) = validity.as_ref() {
-                for (off, valid) in i64_buff.windows(2).zip(validity.iter()) {
-                    let len: i64 = off[1] - off[0];
-                    match (valid, len == 0) {
-                        (false, is_empty) => {
-                            num_specials += 1;
-                            has_garbage_values |= !is_empty;
-                        }
-                        (true, true) => {
-                            num_specials += 1;
-                            has_empty_lists = true;
-                        }
-                        _ => {
-                            last_off += len;
-                        }
-                    }
-                    normalized.push(last_off);
-                }
-            } else {
-                for off in i64_buff.windows(2) {
-                    let len: i64 = off[1] - off[0];
-                    if len == 0 {
-                        num_specials += 1;
-                        has_empty_lists = true;
-                    }
-                    last_off += len;
-                    normalized.push(last_off);
-                }
-            };
-            self.check_offset_len(&normalized);
-            self.repdefs.push(RawRepDef::Offsets(OffsetDesc {
-                num_values: normalized.len() - 1,
-                offsets: normalized.into(),
-                validity: validity.map(|v| v.into_inner()),
-                has_empty_lists,
-                num_specials,
-            }));
-            has_garbage_values
+            let i64_buff = ScalarBuffer::<i64>::new(inner.into_inner(), 0, buffer_len);
+            let lengths = i64_buff.windows(2).map(|off| off[1] - off[0]);
+            self.do_add_offsets(lengths, validity, buffer_len)
         } else {
-            let inner = offsets.into_inner();
-            let len = inner.len();
-            let scalar_off = ScalarBuffer::<i32>::new(inner.into_inner(), 0, len);
-            let mut casted = Vec::with_capacity(len);
-            casted.push(0);
-            let mut has_empty_lists = false;
-            let mut num_specials = 0;
-            let mut last_off: i64 = 0;
-            if let Some(validity) = validity.as_ref() {
-                for (off, valid) in scalar_off.windows(2).zip(validity.iter()) {
-                    let len = (off[1] - off[0]) as i64;
-                    match (valid, len == 0) {
-                        (false, is_empty) => {
-                            num_specials += 1;
-                            has_garbage_values |= !is_empty;
-                        }
-                        (true, true) => {
-                            num_specials += 1;
-                            has_empty_lists = true;
-                        }
-                        _ => {
-                            last_off += len;
-                        }
-                    }
-                    casted.push(last_off);
-                }
-            } else {
-                for off in scalar_off.windows(2) {
-                    let len = (off[1] - off[0]) as i64;
-                    if len == 0 {
-                        num_specials += 1;
-                        has_empty_lists = true;
-                    }
-                    last_off += len;
-                    casted.push(last_off);
-                }
-            };
-            self.check_offset_len(&casted);
-            self.repdefs.push(RawRepDef::Offsets(OffsetDesc {
-                num_values: casted.len() - 1,
-                offsets: casted.into(),
-                validity: validity.map(|v| v.into_inner()),
-                has_empty_lists,
-                num_specials,
-            }));
-            has_garbage_values
+            let i32_buff = ScalarBuffer::<i32>::new(inner.into_inner(), 0, buffer_len);
+            let lengths = i32_buff.windows(2).map(|off| (off[1] - off[0]) as i64);
+            self.do_add_offsets(lengths, validity, buffer_len)
         }
     }
 

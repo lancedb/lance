@@ -1,10 +1,23 @@
-# Quickstart
+---
+title: Vector Search
+description: High-performance vector search with ANN indexes, including IVF_PQ, IVF_HNSW_PQ, and IVF_HNSW_SQ
+---
 
-This quickstart guide will walk you through the core features of Lance including creating datasets, versioning, and vector search.
+# Vector Indexing and Vector Search With Lance
 
-## Prerequisites
+Lance provides high-performance vector search capabilities with ANN (Approximate Nearest Neighbor) indexes.
 
-First, let's import the necessary libraries:
+By the end of this tutorial, you'll be able to build and use ANN indexes to dramatically speed up vector search operations while maintaining high accuracy. You'll also learn how to tune search parameters for optimal performance and combine vector search with metadata queries in a single operation.
+
+## Install the Python SDK
+
+```bash
+pip install pylance
+```
+
+## Set Up Your Environment
+
+First, import the necessary libraries:
 
 ```python
 import shutil
@@ -12,126 +25,17 @@ import lance
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import duckdb
 ```
 
-## Creating Datasets
+## Prepare Your Vector Embeddings
 
-Via PyArrow it's really easy to create Lance datasets.
-
-### Basic Dataset Creation
-
-Create a simple dataframe:
-
-```python
-df = pd.DataFrame({"a": [5]})
-df
-```
-
-Write it to Lance:
-
-```python
-shutil.rmtree("/tmp/test.lance", ignore_errors=True)
-
-dataset = lance.write_dataset(df, "/tmp/test.lance")
-dataset.to_table().to_pandas()
-```
-
-### Converting from Parquet
-
-You can easily convert existing Parquet files to Lance:
-
-```python
-shutil.rmtree("/tmp/test.parquet", ignore_errors=True)
-shutil.rmtree("/tmp/test.lance", ignore_errors=True)
-
-tbl = pa.Table.from_pandas(df)
-pa.dataset.write_dataset(tbl, "/tmp/test.parquet", format='parquet')
-
-parquet = pa.dataset.dataset("/tmp/test.parquet")
-parquet.to_table().to_pandas()
-```
-
-Write to Lance in 1 line:
-
-```python
-dataset = lance.write_dataset(parquet, "/tmp/test.lance")
-
-# Make sure it's the same
-dataset.to_table().to_pandas()
-```
-
-## Versioning
-
-Lance supports versioning natively, allowing you to track changes over time.
-
-### Appending Data
-
-We can append rows:
-
-```python
-df = pd.DataFrame({"a": [10]})
-tbl = pa.Table.from_pandas(df)
-dataset = lance.write_dataset(tbl, "/tmp/test.lance", mode="append")
-
-dataset.to_table().to_pandas()
-```
-
-### Overwriting Data
-
-We can overwrite the data and create a new version:
-
-```python
-df = pd.DataFrame({"a": [50, 100]})
-tbl = pa.Table.from_pandas(df)
-dataset = lance.write_dataset(tbl, "/tmp/test.lance", mode="overwrite")
-
-dataset.to_table().to_pandas()
-```
-
-### Accessing Previous Versions
-
-The old version is still there:
-
-```python
-dataset.versions()
-```
-
-You can access any version:
-
-```python
-# Version 1
-lance.dataset('/tmp/test.lance', version=1).to_table().to_pandas()
-
-# Version 2
-lance.dataset('/tmp/test.lance', version=2).to_table().to_pandas()
-```
-
-### Tags
-
-We can create tags for important versions:
-
-```python
-dataset.tags.create("stable", 2)
-dataset.tags.create("nightly", 3)
-dataset.tags.list()
-```
-
-Tags can be checked out like versions:
-
-```python
-lance.dataset('/tmp/test.lance', version="stable").to_table().to_pandas()
-```
-
-## Vector Search
-
-Lance provides high-performance vector search capabilities with ANN (Approximate Nearest Neighbor) indexes.
-
-### Data Preparation
-
-For this tutorial, let's use the SIFT 1M dataset:
+For this tutorial, download and prepare the SIFT 1M dataset for vector search experiments.
 
 - Download `ANN_SIFT1M` from: http://corpus-texmex.irisa.fr/
 - Direct link: `ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz`
+
+You can just use `wget`:
 
 ```bash
 rm -rf sift* vec_data.lance
@@ -139,7 +43,9 @@ wget ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
 tar -xzf sift.tar.gz
 ```
 
-### Convert to Lance
+## Convert Your Data to Lance Format
+
+Then, convert the raw vector data into Lance format for efficient storage and querying.
 
 ```python
 from lance.vector import vec_to_table
@@ -156,14 +62,16 @@ table = vec_to_table(dd)
 lance.write_dataset(table, uri, max_rows_per_group=8192, max_rows_per_file=1024*1024)
 ```
 
-Load the dataset:
+Now you can load the dataset:
 
 ```python
 uri = "vec_data.lance"
 sift1m = lance.dataset(uri)
 ```
 
-### KNN Search (No Index)
+## Search Without an Index
+
+You'll perform vector search without an index to see the baseline performance, then compare it with indexed search.
 
 First, let's sample some query vectors:
 
@@ -188,7 +96,7 @@ samples = duckdb.query("SELECT vector FROM sift1m USING SAMPLE 100").to_df().vec
 Name: vector, Length: 100, dtype: object
 ```
 
-Perform nearest neighbor search without an index:
+Now, perform nearest neighbor search without an index:
 
 ```python
 import time
@@ -211,20 +119,22 @@ Time(sec): 0.10735273361206055
 ...
 ```
 
-Without the index, this scans through the whole dataset to compute the distance. For real-time serving, we can do much better with an ANN index.
+Without the index, the search will scan throughout the whole dataset to compute the distance between each data point. For practical real-time performance with, you will get much better performance with an ANN index.
 
-### Building an Index
+## Build the Search Index
 
-Lance supports IVF_PQ, IVF_HNSW_PQ and IVF_HNSW_SQ indexes:
+If you build an ANN index - you can dramatically speed up vector search operations while maintaining high accuracy. In this example, we will build the `IVF_PQ` index: 
 
 ```python
 sift1m.create_index(
     "vector",
-    index_type="IVF_PQ", # IVF_PQ, IVF_HNSW_PQ and IVF_HNSW_SQ are supported
+    index_type="IVF_PQ", # specify the IVF_PQ index type
     num_partitions=256,  # IVF
     num_sub_vectors=16,  # PQ
 )
 ```
+
+The sample response should look like this:
 
 ```
 Building vector index: IVF256,PQ16
@@ -252,9 +162,9 @@ Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
 !!! warning "Index Creation Performance"
     If you're trying this on your own data, make sure your vector (dimensions / num_sub_vectors) % 8 == 0, or else index creation will take much longer than expected due to SIMD misalignment.
 
-### ANN Search with Index
+## Vector Search with the ANN Index
 
-Let's look for nearest neighbors again with the ANN index:
+You can now perform the same search operation using your newly created index and see the dramatic performance improvement.
 
 ```python
 sift1m = lance.dataset(uri)
@@ -291,7 +201,9 @@ Avg(sec): 0.0009334301948547364
 !!! note "Performance Note"
     Your actual numbers will vary by your storage. These numbers are from local disk on an M2 MacBook Air. If you're querying S3 directly, HDD, or network drives, performance will be slower.
 
-### Tuning Search Parameters
+## Tune the Search Parameters
+
+You need to adjust search parameters to balance between speed and accuracy, finding the optimal settings for your use case.
 
 The latency vs recall is tunable via:
 - **nprobes**: how many IVF partitions to search
@@ -320,9 +232,13 @@ sift1m.to_table(
 !!! note "Memory Usage"
     The latencies above include file I/O as Lance currently doesn't hold anything in memory. Along with index building speed, creating a purely in-memory version of the dataset would make the biggest impact on performance.
 
-### Features and Vectors Together
+## Combine Features and Vectors
 
-Usually we have other feature or metadata columns that need to be stored and fetched together. If you're managing data and the index separately, you have to do a bunch of annoying plumbing to put stuff together. With Lance it's a single call:
+You can add metadata columns to your vector dataset and query both vectors and features together in a single operation.
+
+In real-life situations, users have other feature or metadata columns that need to be stored and fetched together. If you're managing data and the index separately, you have to do a bunch of annoying plumbing to put stuff together. 
+
+With Lance it's a single call:
 
 ```python
 tbl = sift1m.to_table()
@@ -340,3 +256,7 @@ result = sift1m.to_table(
 )
 print(result.to_pandas())
 ```
+
+## Next Steps
+
+You should check out **[Versioning Your Datasets with Lance](versioning.md)**. We'll show you how to version your vector datasets and track changes over time.

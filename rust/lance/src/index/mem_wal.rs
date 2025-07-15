@@ -556,7 +556,7 @@ mod tests {
     use lance_datagen::{BatchCount, Dimension, RowCount};
     use lance_index::mem_wal::{MemWalId, MEM_WAL_INDEX_NAME};
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::DatasetIndexExt;
+    use lance_index::{DatasetIndexExt, Index};
     use lance_linalg::distance::MetricType;
 
     #[tokio::test]
@@ -599,6 +599,12 @@ mod tests {
         // Load and verify the MemWAL index details
         let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
         assert_eq!(mem_wal_details.mem_wal_list.len(), 1);
+        let mem_wal_index = open_mem_wal_index(mem_wal_index_meta.clone()).unwrap();
+        let stats = mem_wal_index.statistics().unwrap();
+        assert_eq!(
+            serde_json::to_string(&stats).unwrap(),
+            dataset.index_statistics(MEM_WAL_INDEX_NAME).await.unwrap()
+        );
 
         let mem_wal = &mem_wal_details.mem_wal_list[0];
         assert_eq!(mem_wal.id.region, "GLOBAL");

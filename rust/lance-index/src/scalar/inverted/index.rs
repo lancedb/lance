@@ -1451,30 +1451,17 @@ impl PostingListBuilder {
     }
 
     // assume the posting list is sorted by doc id
-    pub fn to_batch(mut self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
+    pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
         let length = self.len();
-        let mut position_builder = self.positions.as_mut().map(|_| {
-            ListBuilder::new(ListBuilder::with_capacity(
-                LargeBinaryBuilder::new(),
-                length,
-            ))
-        });
         let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
-        for index in 0..length {
-            if let Some(position_builder) = position_builder.as_mut() {
-                let positions = self.positions.as_ref().unwrap().get(index);
-                let compressed = compress_positions(positions)?;
-                let inner_builder = position_builder.values();
-                inner_builder.append_value(compressed.into_iter());
-            }
-        }
+
+        let schema = inverted_list_schema(self.has_positions());
         let compressed = compress_posting_list(
             self.doc_ids.len(),
             self.doc_ids.iter(),
             self.frequencies.iter(),
             block_max_scores.into_iter(),
         )?;
-        let schema = inverted_list_schema(self.has_positions());
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32]));
         let mut columns = vec![
             Arc::new(ListArray::try_new(
@@ -1489,11 +1476,22 @@ impl PostingListBuilder {
             ))) as ArrayRef,
         ];
 
-        if let Some(mut position_builder) = position_builder {
+        if let Some(positions) = self.positions.as_ref() {
+            let mut position_builder = ListBuilder::new(ListBuilder::with_capacity(
+                LargeBinaryBuilder::new(),
+                length,
+            ));
+            for index in 0..length {
+                let positions_in_doc = positions.get(index);
+                let compressed = compress_positions(positions_in_doc)?;
+                let inner_builder = position_builder.values();
+                inner_builder.append_value(compressed.into_iter());
+            }
             position_builder.append(true);
             let position_col = position_builder.finish();
             columns.push(Arc::new(position_col));
         }
+
         let batch = RecordBatch::try_new(schema, columns)?;
         Ok(batch)
     }
@@ -1548,7 +1546,7 @@ impl PositionBuilder {
 
     pub fn size(&self) -> usize {
         std::mem::size_of::<u32>() * self.positions.len()
-            + std::mem::size_of::<i32>() * (self.offsets.len() - 1)
+            + std::mem::size_of::<i32>() * self.offsets.len()
     }
 
     pub fn total_len(&self) -> usize {

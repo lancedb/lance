@@ -3950,6 +3950,7 @@ name = "lance-linalg"
 version = "0.31.2"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-ord",
  "arrow-schema",
  "bitvec",
