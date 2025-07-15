@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use lance_core::utils::mask::RowIdTreeMap;
@@ -44,6 +45,7 @@ pub struct CommitBuilder<'a> {
     detached: bool,
     commit_config: CommitConfig,
     affected_rows: Option<RowIdTreeMap>,
+    properties: Option<HashMap<String, String>>,
 }
 
 impl<'a> CommitBuilder<'a> {
@@ -60,6 +62,7 @@ impl<'a> CommitBuilder<'a> {
             detached: false,
             commit_config: Default::default(),
             affected_rows: None,
+            properties: None,
         }
     }
 
@@ -157,6 +160,13 @@ impl<'a> CommitBuilder<'a> {
     /// used to perform fast conflict resolution.
     pub fn with_affected_rows(mut self, affected_rows: RowIdTreeMap) -> Self {
         self.affected_rows = Some(affected_rows);
+        self
+    }
+
+    /// provide Configuration key-value pairs associated with this transaction.
+    /// This is used to store metadata about the transaction, such as commit messages, engine information, etc.
+    pub fn with_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.properties = Some(properties);
         self
     }
 
@@ -442,6 +452,8 @@ impl<'a> CommitBuilder<'a> {
             read_version,
             blobs_op,
             tag: None,
+            //TODO: handle batch transaction merges in the future
+            properties: None,
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
@@ -502,6 +514,7 @@ mod tests {
             read_version,
             blobs_op: None,
             tag: None,
+            properties: None,
         }
     }
 
@@ -774,6 +787,7 @@ mod tests {
             read_version: 1,
             blobs_op: None,
             tag: None,
+            properties: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])

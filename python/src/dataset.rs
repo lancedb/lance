@@ -116,7 +116,6 @@ pub struct MergeInsertBuilder {
     builder: LanceMergeInsertBuilder,
     dataset: Py<Dataset>,
 }
-
 #[pymethods]
 impl MergeInsertBuilder {
     #[new]
@@ -1734,12 +1733,16 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (transforms, read_columns = None, batch_size = None))]
-    fn add_columns(
+    /// Add helper method to allow pass properties without breaking add_columns
+    /// todo: other add_columns_from_* may need properties
+    /// considering adding add_columns_builder in python in future
+    #[pyo3(signature = (transforms, read_columns = None, batch_size = None, properties = None))]
+    fn add_columns_with_properties(
         &mut self,
         transforms: &Bound<'_, PyAny>,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
+        properties: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
         let transforms = transforms_from_python(transforms)?;
 
@@ -1747,7 +1750,11 @@ impl Dataset {
         let new_self = RT
             .spawn(None, async move {
                 new_self
-                    .add_columns(transforms, read_columns, batch_size)
+                    .add_columns_builder(transforms)
+                    .read_columns(read_columns)
+                    .batch_size(batch_size)
+                    .properties(properties)
+                    .execute()
                     .await?;
                 Ok(new_self)
             })?
@@ -1755,6 +1762,16 @@ impl Dataset {
         self.ds = Arc::new(new_self);
 
         Ok(())
+    }
+
+    #[pyo3(signature = (transforms, read_columns = None, batch_size = None))]
+    fn add_columns(
+        &mut self,
+        transforms: &Bound<'_, PyAny>,
+        read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
+    ) -> PyResult<()> {
+        self.add_columns_with_properties(transforms, read_columns, batch_size, None)
     }
 
     /// Add NULL columns with only ArrowSchema.
@@ -1836,6 +1853,31 @@ impl Dataset {
             }
             Ok(dict.into())
         })
+    }
+
+    /// Read the transaction by specific version
+    ///
+    /// Returns None if the transaction file does not exist.
+    #[pyo3(signature = (version))]
+    fn read_transaction(&mut self, version: u64) -> PyResult<Option<PyLance<Transaction>>> {
+        let new_self = self.ds.as_ref().clone();
+        let transaction = RT
+            .block_on(None, new_self.read_transaction_by_version(version))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(transaction.map(PyLance))
+    }
+
+    #[pyo3(signature = (max_transactions=10))]
+    fn get_transactions(
+        &mut self,
+        max_transactions: usize,
+    ) -> PyResult<Vec<Option<PyLance<Transaction>>>> {
+        let new_self = self.ds.as_ref().clone();
+        let transactions = RT
+            .block_on(None, new_self.get_transactions(max_transactions))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        Ok(transactions.into_iter().map(|t| t.map(PyLance)).collect())
     }
 }
 
@@ -2067,6 +2109,15 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         }
 
         p.commit_handler = get_commit_handler(options)?;
+
+        // Handle properties
+        if let Some(props) = get_dict_opt::<HashMap<String, String>>(options, "properties")? {
+            let mut properties = p.properties.unwrap_or_default();
+            for (key, value) in props {
+                properties.insert(key, value);
+            }
+            p.properties = Some(properties);
+        }
 
         Some(p)
     };

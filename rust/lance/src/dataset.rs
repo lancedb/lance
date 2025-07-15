@@ -78,6 +78,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
+use crate::dataset::schema_evolution::AddColumnsBuilder;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::error::box_error;
@@ -665,6 +666,57 @@ impl Dataset {
         let data = self.object_store.inner.get(&path).await?.bytes().await?;
         let transaction = lance_table::format::pb::Transaction::decode(data)?;
         Transaction::try_from(transaction).map(Some)
+    }
+
+    /// Read the transaction file for this version of the dataset.
+    ///
+    /// If there was no transaction file written for this version of the dataset
+    /// then this will return None.
+    pub async fn read_transaction_by_version(&self, version: u64) -> Result<Option<Transaction>> {
+        let dataset_version = self.checkout_version(version).await?;
+        dataset_version.read_transaction().await
+    }
+
+    /// List transactions for the dataset, up to a maximum number.
+    ///
+    /// This method iterates through dataset versions, starting from the current version,
+    /// and collects the transaction for each version. It stops when either `max_transactions`
+    /// is reached or there are no more versions.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_transactions` - Maximum number of transactions to return
+    ///
+    /// # Returns
+    ///
+    /// A vector of optional transactions. Each element corresponds to a version,
+    /// and may be None if no transaction file exists for that version.
+    pub async fn get_transactions(
+        &self,
+        max_transactions: usize,
+    ) -> Result<Vec<Option<Transaction>>> {
+        let mut transactions = vec![];
+        let mut dataset = self.clone();
+
+        loop {
+            let transaction = dataset.read_transaction().await?;
+            transactions.push(transaction);
+
+            if transactions.len() >= max_transactions {
+                break;
+            } else {
+                match dataset
+                    .checkout_version(dataset.version().version - 1)
+                    .await
+                {
+                    Ok(ds) => dataset = ds,
+                    Err(Error::DatasetNotFound { .. }) => break,
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        Ok(transactions)
     }
 
     /// Restore the currently checked out version of the dataset as the latest version.
@@ -1616,7 +1668,15 @@ impl Dataset {
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> Result<()> {
-        schema_evolution::add_columns(self, transforms, read_columns, batch_size).await
+        schema_evolution::add_columns(self, transforms, read_columns, batch_size, None).await
+    }
+
+    /// add add_columns_builder for optional properties
+    pub fn add_columns_builder(
+        &mut self,
+        transforms: impl Into<NewColumnTransform>,
+    ) -> AddColumnsBuilder<'_> {
+        AddColumnsBuilder::new(self, transforms.into())
     }
 
     /// Modify columns in the dataset, changing their name, type, or nullability.
@@ -5707,6 +5767,116 @@ mod tests {
                 assert!(res1.is_ok() && res2.is_ok());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_transaction_properties() {
+        const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
+        // Create a test dataset
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Create WriteParams with properties
+        let mut properties1 = HashMap::new();
+        properties1.insert(
+            LANCE_COMMIT_MESSAGE_KEY.to_string(),
+            "First commit".to_string(),
+        );
+        properties1.insert("custom_prop".to_string(), "custom_value".to_string());
+
+        let write_params = WriteParams {
+            properties: Some(properties1.clone()),
+            ..Default::default()
+        };
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], schema.clone()),
+            test_uri,
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+        let transaction = dataset.read_transaction_by_version(1).await.unwrap();
+        assert!(transaction.is_some());
+        let props = transaction.unwrap().properties.unwrap();
+        assert_eq!(props.len(), 2);
+        assert_eq!(
+            props.get(LANCE_COMMIT_MESSAGE_KEY),
+            Some(&"First commit".to_string())
+        );
+        assert_eq!(props.get("custom_prop"), Some(&"custom_value".to_string()));
+
+        let mut properties2 = HashMap::new();
+        properties2.insert(
+            LANCE_COMMIT_MESSAGE_KEY.to_string(),
+            "Second commit".to_string(),
+        );
+        properties2.insert("another_prop".to_string(), "another_value".to_string());
+
+        let write_params = WriteParams {
+            properties: Some(properties2.clone()),
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![4, 5])),
+                Arc::new(StringArray::from(vec!["d", "e"])),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = dataset;
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(batch2)], schema.clone()),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
+
+        let transaction = dataset.read_transaction_by_version(2).await.unwrap();
+        assert!(transaction.is_some());
+        let props = transaction.unwrap().properties.unwrap();
+        assert_eq!(props.len(), 2);
+        assert_eq!(
+            props.get(LANCE_COMMIT_MESSAGE_KEY),
+            Some(&"Second commit".to_string())
+        );
+        assert_eq!(
+            props.get("another_prop"),
+            Some(&"another_value".to_string())
+        );
+
+        let transaction = dataset.read_transaction_by_version(1).await.unwrap();
+        assert!(transaction.is_some());
+        let props = transaction.unwrap().properties.unwrap();
+        assert_eq!(props.len(), 2);
+        assert_eq!(
+            props.get(LANCE_COMMIT_MESSAGE_KEY),
+            Some(&"First commit".to_string())
+        );
+        assert_eq!(props.get("custom_prop"), Some(&"custom_value".to_string()));
+
+        let result = dataset.read_transaction_by_version(999).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

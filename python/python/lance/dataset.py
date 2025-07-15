@@ -81,6 +81,7 @@ if TYPE_CHECKING:
         np.ndarray,
         Iterable[float],
     ]
+LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 
 
 class MergeInsertBuilder(_MergeInsertBuilder):
@@ -1172,6 +1173,8 @@ class LanceDataset(pa.dataset.Dataset):
         read_columns: List[str] | None = None,
         reader_schema: Optional[pa.Schema] = None,
         batch_size: Optional[int] = None,
+        commit_message: Optional[str] = None,
+        properties: Optional[Dict[str, str]] = None,
     ):
         """
         Add new columns with defined values.
@@ -1211,7 +1214,15 @@ class LanceDataset(pa.dataset.Dataset):
         batch_size: int, optional
             The number of rows to read at a time from the source dataset when applying
             the transform.  This is ignored if the dataset is a v1 dataset.
-
+        commit_message: str, optional
+            A message to associate with this commit. This message will be stored in the
+            transaction properties and can be retrieved using read_transaction().
+        properties: dict of str to str, optional
+            Custom properties to associate with this commit.
+            These properties will be stored in the dataset's metadata
+            and can be retrieved using read_transaction_properties().
+            If both `commit_message` and `properties` are provided,
+            `commit_message` will override LANCE_COMMIT_MESSAGE_KEY key in `properties`.
         Examples
         --------
         >>> import lance
@@ -1248,6 +1259,10 @@ class LanceDataset(pa.dataset.Dataset):
             and isinstance(transforms[0], pa.Field)
         ):
             transforms = pa.schema(transforms)
+
+        # Merge properties and commit_message with priority to commit_message
+        merged_properties = _merge_message_to_properties(commit_message, properties)
+
         if isinstance(transforms, pa.Schema):
             self._ds.add_columns_with_schema(transforms)
             return
@@ -1257,7 +1272,9 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.add_columns_from_reader(transforms, batch_size)
             return
         else:
-            self._ds.add_columns(transforms, read_columns, batch_size)
+            self._ds.add_columns_with_properties(
+                transforms, read_columns, batch_size, merged_properties
+            )
 
             if isinstance(transforms, BatchUDF):
                 if transforms.cache is not None:
@@ -2732,6 +2749,48 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.config()
 
+    def read_transaction(self, version: int) -> Optional[Transaction]:
+        """Get properties from a Transaction at a specific version.
+
+        Parameters
+        ----------
+        version: int
+            The version number of the dataset to retrieve properties from
+
+        Returns
+        -------
+        Dict[str, str] or None
+            A dictionary containing the properties of the Transaction
+            , or None if the transaction doesn't exist or has no properties.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
+        >>> table1 = pa.table({"a": [1, 2], "b": ["a", "b"]})
+        >>> ds = lance.write_dataset(   \\
+        ... table1, \\
+        ... "properties_example",   \\
+        ... commit_message="initial")
+        >>> table2 = pa.table({"a": [3, 4], "b": ["c", "d"]})
+        >>> properties2 = {LANCE_COMMIT_MESSAGE_KEY: "Second commit", \\
+        ... "another_prop": "another_value"}
+        >>> ds = lance.write_dataset( \\
+        ... table2, \\
+        ... "properties_example",   \\
+        ... mode="append",  \\
+        ... properties=properties2)
+        >>> print(ds.read_transaction(1).properties)
+        {'__lance_commit_message': 'initial'}
+        >>> print(ds.read_transaction(2).properties.get("another_prop"))
+        another_value
+        """
+        return self._ds.read_transaction(version)
+
+    def get_transactions(self) -> Optional[List[Transaction]]:
+        return self._ds.get_transactions()
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -2763,6 +2822,7 @@ class Transaction:
     operation: LanceOperation.BaseOperation
     uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
     blobs_op: Optional[LanceOperation.BaseOperation] = None
+    properties: Optional[Dict[str, str]] = None
 
 
 class Tag(TypedDict):
@@ -4066,6 +4126,8 @@ def write_dataset(
     enable_v2_manifest_paths: bool = False,
     enable_move_stable_row_ids: bool = False,
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
+    commit_message: Optional[str] = None,
+    properties: Optional[Dict[str, str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -4135,6 +4197,15 @@ def write_dataset(
         then no autocleaning will be performed.
         Note: this option only takes effect when creating a new dataset,
         it has no effect on existing datasets.
+    commit_message: str, optional
+        A message to associate with this commit. This message will be stored in the
+        dataset's metadata and can be retrieved using read_transaction().
+    properties: dict of str to str, optional
+        Custom properties to associate with this transaction.
+        Properties will be stored in the dataset's transaction
+        and can be retrieved using read_transaction_properties().
+        If both `commit_message` and `properties` are provided, `commit_message` will
+        override any "lance.commit.message" key in `properties`.
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -4159,6 +4230,9 @@ def write_dataset(
     _validate_schema(reader.schema)
     # TODO add support for passing in LanceDataset and LanceScanner here
 
+    # Merge properties and commit_message with priority to commit_message
+    merged_properties = _merge_message_to_properties(commit_message, properties)
+
     params = {
         "mode": mode,
         "max_rows_per_file": max_rows_per_file,
@@ -4170,6 +4244,7 @@ def write_dataset(
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
         "enable_move_stable_row_ids": enable_move_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
+        "properties": merged_properties,
     }
 
     if commit_lock:
@@ -4271,6 +4346,23 @@ def _validate_metadata(metadata: dict):
                 )
         elif isinstance(v, dict):
             _validate_metadata(v)
+
+
+def _merge_message_to_properties(
+    commit_message: Optional[str],
+    properties: Optional[Dict[str, str]],
+) -> Optional[Dict[str, str]]:
+    """
+    handles merging commit_message into properties,
+    prioritizing the commit_message if properties also has the same key
+    """
+    if properties is None and commit_message is None:
+        return None
+
+    merged_properties = properties.copy() if properties else {}
+    if commit_message is not None:
+        merged_properties[LANCE_COMMIT_MESSAGE_KEY] = commit_message
+    return merged_properties
 
 
 class VectorIndexReader:
