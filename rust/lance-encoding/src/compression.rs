@@ -32,6 +32,7 @@ use crate::{
             },
             bitpack::InlineBitpacking,
             block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
+            byte_stream_split::{ByteStreamSplitDecompressor, ByteStreamSplitEncoder},
             constant::ConstantDecompressor,
             fsst::{
                 FsstMiniBlockDecompressor, FsstMiniBlockEncoder, FsstPerValueDecompressor,
@@ -141,6 +142,21 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     if compression.as_str() == "none" {
                         return Ok(Box::new(ValueEncoder::default()));
                     }
+                }
+
+                // Check if ByteStreamSplit would be beneficial for floating point data
+                if (fixed_width_data.bits_per_value == 32 || fixed_width_data.bits_per_value == 64)
+                    && field.data_type().is_floating()
+                    && fixed_width_data.num_values > 1000
+                {
+                    // Use ByteStreamSplit for floating point data with enough values
+                    return Ok(Box::new(GeneralMiniBlockCompressor::new(
+                        Box::new(ByteStreamSplitEncoder::new(
+                            fixed_width_data.bits_per_value as usize,
+                        )),
+                        // TODO: use zstd can has better compress ratio
+                        CompressionConfig::new(CompressionScheme::Lz4, None),
+                    )));
                 }
 
                 let rle_threshold: f64 = if let Some(value) =
@@ -379,6 +395,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             pb::array_encoding::ArrayEncoding::Rle(rle) => {
                 Ok(Box::new(RleMiniBlockDecompressor::new(rle.bits_per_value)))
             }
+            pb::array_encoding::ArrayEncoding::ByteStreamSplit(bss) => Ok(Box::new(
+                ByteStreamSplitDecompressor::new(bss.bits_per_value as usize),
+            )),
             pb::array_encoding::ArrayEncoding::GeneralMiniBlock(general) => {
                 // Create inner decompressor
                 let inner_decompressor = self.create_miniblock_decompressor(
