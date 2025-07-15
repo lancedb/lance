@@ -707,6 +707,28 @@ impl DatasetIndexExt for Dataset {
             });
         }
 
+        if index_name == FRAG_REUSE_INDEX_NAME {
+            let index = self
+                .open_frag_reuse_index(&NoOpMetricsCollector)
+                .await?
+                .expect("FragmentReuse index does not exist");
+            return serde_json::to_string(&index.statistics()?).map_err(|e| Error::Index {
+                message: format!("Failed to serialize index statistics: {}", e),
+                location: location!(),
+            });
+        }
+
+        if index_name == MEM_WAL_INDEX_NAME {
+            let index = self
+                .open_mem_wal_index(&NoOpMetricsCollector)
+                .await?
+                .expect("MemWal index does not exist");
+            return serde_json::to_string(&index.statistics()?).map_err(|e| Error::Index {
+                message: format!("Failed to serialize index statistics: {}", e),
+                location: location!(),
+            });
+        }
+
         let column = self
             .schema()
             .field_by_id(metadatas[0].fields[0])
