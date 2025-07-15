@@ -153,8 +153,9 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                         Box::new(ByteStreamSplitEncoder::new(
                             fixed_width_data.bits_per_value as usize,
                         )),
-                        // TODO: use zstd can has better compress ratio
-                        CompressionConfig::new(CompressionScheme::Lz4, None),
+                        // TODO: use zstd can has better compress ratio but write speed is slow.
+                        //       we need to be confiurable here.
+                        CompressionConfig::new(CompressionScheme::Zstd, None),
                     )));
                 }
 
