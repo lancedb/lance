@@ -773,7 +773,6 @@ impl BTreeIndex {
             return Ok(cached);
         }
 
-        log::info!("Loading page {}", page_number);
         metrics.record_part_load();
         info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
@@ -939,9 +938,9 @@ impl Index for BTreeIndex {
         let mut pages = stream::iter(0..num_pages)
             .map(|page_idx| {
                 let sub_index = self.sub_index.clone();
-                let range =
-                    page_idx * batch_size..std::cmp::min(num_rows, (page_idx + 1) * batch_size);
-                let page = all_pages.slice(range.start, range.end - range.start);
+                let offset = page_idx * batch_size;
+                let end = std::cmp::min(num_rows, (page_idx + 1) * batch_size);
+                let page = all_pages.slice(offset, end - offset);
                 async move {
                     let sub_idx = sub_index.load_subindex(page).await?;
                     Result::Ok((page_idx as u32, sub_idx))
@@ -950,7 +949,6 @@ impl Index for BTreeIndex {
             .buffer_unordered(get_num_compute_intensive_cpus());
 
         while let Some((page_idx, sub_idx)) = pages.try_next().await? {
-            log::info!("Prewarming page {}", page_idx);
             self.page_cache.0.insert(page_idx, sub_idx);
         }
         Ok(())
