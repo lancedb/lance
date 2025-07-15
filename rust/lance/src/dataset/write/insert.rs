@@ -120,7 +120,6 @@ impl<'a> InsertBuilder<'a> {
     }
 
     async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, path=context.base_path.to_string(), mode=?context.params.mode);
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_move_stable_row_ids(context.params.enable_move_stable_row_ids)
             .with_storage_format(context.storage_version)
@@ -183,6 +182,8 @@ impl<'a> InsertBuilder<'a> {
         schema: Schema,
     ) -> Result<(Transaction, WriteContext<'_>)> {
         let mut context = self.resolve_context().await?;
+
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, path=context.base_path.to_string(), mode=?context.params.mode);
 
         self.validate_write(&mut context, &schema)?;
 
