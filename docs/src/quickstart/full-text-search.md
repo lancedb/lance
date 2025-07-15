@@ -126,19 +126,6 @@ print(table)
 
 This query will return documents that contain either "fox" or "sleepy" (or both). The search is case-insensitive and uses the inverted index for fast retrieval.
 
-## Understanding Search Performance
-
-### Search Without an Index
-
-If you were to search without an index, Lance would need to scan through every document in the dataset, checking each one for the search terms. This approach becomes increasingly slow as your dataset grows.
-
-### Search With an Index
-
-With the inverted index, Lance can:
-- Quickly locate which documents contain specific terms
-- Combine results from multiple search terms efficiently
-- Return results in milliseconds regardless of dataset size
-
 ## Advanced Search Features
 
 ### Boolean Search Operators
