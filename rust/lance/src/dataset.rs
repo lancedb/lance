@@ -17,7 +17,10 @@ use itertools::Itertools;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
+use lance_core::utils::tracing::{
+    AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT,
+    DATASET_DROPPING_COLUMN_EVENT, DATASET_OPENING_EVENT, TRACE_DATASET_EVENTS, TRACE_FILE_AUDIT,
+};
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
@@ -329,6 +332,7 @@ impl Dataset {
     /// See also [DatasetBuilder].
     #[instrument]
     pub async fn open(uri: &str) -> Result<Self> {
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_OPENING_EVENT, uri=uri);
         DatasetBuilder::from_uri(uri).load().await
     }
 
@@ -708,6 +712,7 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
     ) -> BoxFuture<Result<RemovalStats>> {
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
         let before = utc_now() - older_than;
         cleanup::cleanup_old_versions(
             self,
@@ -1018,6 +1023,7 @@ impl Dataset {
 
     /// Delete rows based on a predicate.
     pub async fn delete(&mut self, predicate: &str) -> Result<()> {
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_DELETING_EVENT, uri = &self.uri, predicate=predicate);
         write::delete::delete(self, predicate).await
     }
 
@@ -1623,6 +1629,7 @@ impl Dataset {
     /// call [optimize::compact_files()] to rewrite the data without the removed columns and
     /// then call [cleanup::cleanup_old_versions()] to remove the old files.
     pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_DROPPING_COLUMN_EVENT, uri = &self.uri, columns = columns.join(","));
         schema_evolution::drop_columns(self, columns).await
     }
 
