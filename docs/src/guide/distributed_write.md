@@ -7,7 +7,7 @@
 
 ## Overview
 
-The [Lance format](../format/format.md) is designed to support parallel writing across multiple distributed workers. A distributed write operation can be performed by two phases:
+The [Lance format](../format/index.md) is designed to support parallel writing across multiple distributed workers. A distributed write operation can be performed by two phases:
 
 1. **Parallel Writes**: Generate new `lance.LanceFragment` in parallel across multiple workers.
 2. **Commit**: Collect all the `lance.FragmentMetadata` and commit into a single dataset in a single `lance.LanceOperation`.
@@ -114,7 +114,7 @@ lance.LanceDataset.commit(
 
 ## Add New Columns
 
-[Lance Format excels at operations such as adding columns](../format/format.md). Thanks to its two-dimensional layout ([see this blog post](https://blog.lancedb.com/designing-a-table-format-for-ml-workloads/)), adding new columns is highly efficient since it avoids copying the existing data files. Instead, the process simply creates new data files and links them to the existing dataset using metadata-only operations.
+[Lance Format excels at operations such as adding columns](../format/index.md). Thanks to its two-dimensional layout ([see this blog post](https://blog.lancedb.com/designing-a-table-format-for-ml-workloads/)), adding new columns is highly efficient since it avoids copying the existing data files. Instead, the process simply creates new data files and links them to the existing dataset using metadata-only operations.
 
 ```python
 import lance
