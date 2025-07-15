@@ -1940,6 +1940,31 @@ impl Dataset {
         Py::new(py, PyIvfModel { inner: ivf_model })
     }
 
+    /// Read the transaction by specific version
+    ///
+    /// Returns None if the transaction file does not exist.
+    #[pyo3(signature = (version))]
+    fn read_transaction(&mut self, version: u64) -> PyResult<Option<PyLance<Transaction>>> {
+        let new_self = self.ds.as_ref().clone();
+        let transaction = RT
+            .block_on(None, new_self.read_transaction_by_version(version))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(transaction.map(PyLance))
+    }
+
+    #[pyo3(signature = (max_transactions=10))]
+    fn get_transactions(
+        &mut self,
+        max_transactions: usize,
+    ) -> PyResult<Vec<Option<PyLance<Transaction>>>> {
+        let new_self = self.ds.as_ref().clone();
+        let transactions = RT
+            .block_on(None, new_self.get_transactions(max_transactions))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        Ok(transactions.into_iter().map(|t| t.map(PyLance)).collect())
+    }
+
     #[pyo3(signature=(sql))]
     fn sql(&self, sql: String) -> PyResult<SqlQueryBuilder> {
         let mut ds = self.ds.as_ref().clone();
@@ -2288,6 +2313,21 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         }
 
         p.commit_handler = get_commit_handler(options)?;
+
+        // Handle properties
+        if let Some(props) =
+            get_dict_opt::<HashMap<String, String>>(options, "transaction_properties")?
+        {
+            let mut new_props = p
+                .transaction_properties
+                .as_ref()
+                .map(|arc| (**arc).clone())
+                .unwrap_or_default();
+            for (key, value) in props {
+                new_props.insert(key, value);
+            }
+            p.transaction_properties = Some(Arc::new(new_props));
+        }
 
         Some(p)
     };
