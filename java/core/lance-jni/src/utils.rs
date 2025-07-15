@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use arrow::array::Float32Array;
-use jni::objects::{JMap, JObject, JString};
+use jni::objects::{JMap, JObject, JString, JValue};
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
@@ -294,4 +294,22 @@ pub fn to_rust_map(env: &mut JNIEnv, jmap: &JMap) -> Result<HashMap<String, Stri
 
         Ok::<_, Error>(map)
     })
+}
+
+pub fn to_java_map<'local>(
+    env: &mut JNIEnv<'local>,
+    map: &HashMap<String, String>,
+) -> Result<JObject<'local>> {
+    let java_map = env.new_object("java/util/HashMap", "()V", &[])?;
+    for (k, v) in map {
+        let jkey = env.new_string(k)?;
+        let jval = env.new_string(v)?;
+        env.call_method(
+            &java_map,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&jkey), JValue::Object(&jval)],
+        )?;
+    }
+    Ok(java_map)
 }

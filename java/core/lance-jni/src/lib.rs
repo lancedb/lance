@@ -57,6 +57,7 @@ pub mod ffi;
 mod file_reader;
 mod file_writer;
 mod fragment;
+mod schema;
 pub mod traits;
 pub mod utils;
 
