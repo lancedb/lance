@@ -3,7 +3,7 @@
 
 use crate::datafusion::LanceTableProvider;
 use crate::Dataset;
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch, StringArray};
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct SqlBuilder {
     /// The dataset to run the SQL query
-    pub(crate) dataset: Option<Dataset>,
+    pub(crate) dataset: Dataset,
 
     /// The SQL query to run
     pub(crate) sql: String,
@@ -22,13 +22,23 @@ pub struct SqlBuilder {
     pub(crate) table_name: Option<String>,
 
     /// If true, the query result will include the internal row id
-    pub(crate) row_id: bool,
+    pub(crate) row_id: Option<bool>,
 
     /// If true, the query result will include the internal row address
-    pub(crate) row_addr: bool,
+    pub(crate) row_addr: Option<bool>,
 }
 
 impl SqlBuilder {
+    pub fn new(dataset: Dataset, sql: &str) -> Self {
+        Self {
+            dataset,
+            sql: sql.to_string(),
+            table_name: Some("dataset".to_string()),
+            row_id: None,
+            row_addr: None,
+        }
+    }
+
     /// The table name to register in the datafusion context.
     /// This is used to specify a "table name" for the dataset.
     /// So that you can run SQL queries against it.
@@ -41,49 +51,39 @@ impl SqlBuilder {
     /// Specify if the query result should include the internal row id.
     /// If true, the query result will include an additional column named "_rowid".
     pub fn with_row_id(mut self, row_id: bool) -> Self {
-        self.row_id = row_id;
+        self.row_id = Some(row_id);
         self
     }
 
     /// Specify if the query result should include the internal row address.
     /// If true, the query result will include an additional column named "_rowaddr".
     pub fn with_row_addr(mut self, row_addr: bool) -> Self {
-        self.row_addr = row_addr;
+        self.row_addr = Some(row_addr);
         self
     }
 
-    pub async fn execute(self) -> lance_core::Result<QueryResult> {
+    pub async fn build(self) -> lance_core::Result<SqlQueryBuilder> {
         let ctx = SessionContext::new();
+        let row_id = self.row_id.unwrap_or(false);
+        let row_addr = self.row_addr.unwrap_or(false);
         ctx.register_table(
             self.table_name.unwrap(),
             Arc::new(LanceTableProvider::new(
-                Arc::new(self.dataset.unwrap()),
-                self.row_id,
-                self.row_addr,
+                Arc::new(self.dataset.clone()),
+                row_id,
+                row_addr,
             )),
         )?;
         let df = ctx.sql(&self.sql).await?;
-        Ok(QueryResult::new(df))
+        Ok(SqlQueryBuilder::new(df))
     }
 }
 
-impl Default for SqlBuilder {
-    fn default() -> Self {
-        Self {
-            dataset: None,
-            sql: "".to_string(),
-            table_name: Some("dataset".to_string()),
-            row_id: false,
-            row_addr: false,
-        }
-    }
-}
-
-pub struct QueryResult {
+pub struct SqlQueryBuilder {
     dataframe: DataFrame,
 }
 
-impl QueryResult {
+impl SqlQueryBuilder {
     pub fn new(dataframe: DataFrame) -> Self {
         Self { dataframe }
     }
@@ -92,7 +92,7 @@ impl QueryResult {
         self.dataframe.execute_stream().await.unwrap()
     }
 
-    pub async fn collect(self) -> lance_core::Result<Vec<RecordBatch>> {
+    pub async fn into_batch_records(self) -> lance_core::Result<Vec<RecordBatch>> {
         use futures::TryStreamExt;
         Ok(self
             .dataframe
@@ -103,12 +103,30 @@ impl QueryResult {
             .await?)
     }
 
-    pub fn dataframe(&self) -> &DataFrame {
-        &self.dataframe
+    pub fn into_dataframe(self) -> DataFrame {
+        self.dataframe
     }
 
-    pub async fn explain(&self, verbose: bool, analyze: bool) -> DataFrame {
-        self.dataframe.clone().explain(verbose, analyze).unwrap()
+    pub async fn into_explain_plan(
+        self,
+        verbose: bool,
+        analyze: bool,
+    ) -> lance_core::Result<String> {
+        let explained_df = self.dataframe.explain(verbose, analyze)?;
+        let batches = explained_df.collect().await?;
+        let mut lines = Vec::new();
+        for batch in &batches {
+            let column = batch.column(0);
+            let array = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Expected StringArray in 'plan' column for DataFrame.explain");
+            for i in 0..array.len() {
+                lines.push(array.value(i).to_string());
+            }
+        }
+
+        Ok(lines.join("\n"))
     }
 }
 
@@ -121,7 +139,7 @@ mod tests {
     use lance_datagen::{array, gen};
 
     #[tokio::test]
-    async fn test_sql() {
+    async fn test_sql_execute() {
         let mut ds = gen()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
@@ -136,10 +154,10 @@ mod tests {
         let results = ds
             .sql("SELECT SUM(x) FROM foo WHERE y > 100")
             .table_name("foo")
-            .execute()
+            .build()
             .await
             .unwrap()
-            .collect()
+            .into_batch_records()
             .await
             .unwrap();
         pretty_assertions::assert_eq!(results.len(), 1);
@@ -154,10 +172,10 @@ mod tests {
             .table_name("foo")
             .with_row_id(true)
             .with_row_addr(true)
-            .execute()
+            .build()
             .await
             .unwrap()
-            .collect()
+            .into_batch_records()
             .await
             .unwrap();
         let total_rows: usize = results.iter().map(|batch| batch.num_rows()).sum();
@@ -167,5 +185,31 @@ mod tests {
         pretty_assertions::assert_eq!(results.num_columns(), 4);
         assert_true!(results.column(2).as_primitive::<UInt64Type>().value(0) > 100);
         assert_true!(results.column(3).as_primitive::<UInt64Type>().value(0) > 100);
+    }
+
+    #[tokio::test]
+    async fn test_sql_explain_plan() {
+        let mut ds = gen()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step_custom::<Int32Type>(0, 2))
+            .into_dataset(
+                "memory://test_sql_explain_plan",
+                FragmentCount::from(2),
+                FragmentRowCount::from(5),
+            )
+            .await
+            .unwrap();
+
+        let builder = ds
+            .sql("SELECT SUM(x) FROM foo WHERE y > 2")
+            .table_name("foo")
+            .build()
+            .await
+            .unwrap();
+
+        let plan = builder.into_explain_plan(true, false).await.unwrap();
+
+        // 检查 explain plan 输出包含关键字
+        assert!(plan.contains("Aggregate") || plan.contains("SUM"));
     }
 }

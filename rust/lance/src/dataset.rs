@@ -1456,11 +1456,7 @@ impl Dataset {
     /// The underlying SQL engine is DataFusion.
     /// Please refer to the DataFusion documentation for supported SQL syntax.
     pub fn sql(&mut self, sql: &str) -> SqlBuilder {
-        SqlBuilder {
-            dataset: Some(self.clone()),
-            sql: sql.to_string(),
-            ..Default::default()
-        }
+        SqlBuilder::new(self.clone(), sql)
     }
 }
 
