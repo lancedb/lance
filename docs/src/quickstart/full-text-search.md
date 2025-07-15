@@ -72,7 +72,7 @@ ds.create_scalar_index(
     - **INVERTED**: Traditional inverted index that maps terms to document IDs
     - **FTS**: Full Text Search index with additional linguistic processing capabilities
 
-The index creation process analyzes your text data and builds an efficient lookup structure that maps words to the documents containing them. This enables sub-second search performance even on large datasets.
+The index creation process analyzes your text data and builds an efficient lookup structure that maps words to the documents containing them. This enables high-performance full text search, even on large datasets.
 
 !!! warning "Index Creation Time"
     Index creation time depends on the size of your text data. For large datasets, this process may take several minutes, but the performance benefits are substantial.
@@ -101,6 +101,13 @@ ds.create_scalar_index(
 - **simple**: Splits tokens on whitespace and punctuation
 - **whitespace**: Splits tokens only on whitespace
 - **raw**: No tokenization (useful for exact matching)
+
+LanceDB also supports multilingual tokenization:
+
+- **jieba/default**: Chinese text tokenization using Jieba
+- **lindera/ipadic**: Japanese text tokenization using Lindera with IPAdic dictionary
+- **lindera/ko-dic**: Korean text tokenization using Lindera with Ko-dic dictionary
+- **lindera/unidic**: Japanese text tokenization using Lindera with UniDic dictionary
 
 ### Language Processing Features
 
