@@ -1557,6 +1557,34 @@ def test_index_prewarm(tmp_path: Path):
     assert scan_stats.parts_loaded == 0
 
 
+def test_btree_prewarm(tmp_path: Path):
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table_size = 100
+    test_table = pa.table(
+        {
+            "id": list(range(test_table_size)),
+        }
+    )
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("id", index_type="BTREE")
+    ds.scanner(scan_stats_callback=scan_stats_callback, filter="id>0").to_table()
+    assert scan_stats.parts_loaded > 0
+
+    ds = lance.dataset(tmp_path)
+    ds.scanner(scan_stats_callback=scan_stats_callback, filter="id>0").to_table()
+    assert scan_stats.parts_loaded > 0
+
+    ds = lance.dataset(tmp_path)
+    ds.prewarm_index("id_idx")
+    ds.scanner(scan_stats_callback=scan_stats_callback, filter="id>0").to_table()
+    assert scan_stats.parts_loaded == 0
+
+
 def test_fts_backward_v0_27_0(tmp_path: Path):
     path = (
         Path(__file__).parent.parent.parent.parent
