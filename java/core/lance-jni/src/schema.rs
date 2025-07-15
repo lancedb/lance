@@ -1,6 +1,5 @@
 use crate::error::{Error, Result};
 use crate::utils::to_java_map;
-use arrow::array::Array;
 use arrow::datatypes::DataType;
 use arrow_schema::{TimeUnit, UnionFields};
 use jni::objects::{JObject, JValue};
