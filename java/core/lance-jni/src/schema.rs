@@ -1,14 +1,12 @@
 use crate::error::{Error, Result};
 use crate::utils::to_java_map;
-use arrow::array::{Array, ArrayRef};
+use arrow::array::Array;
 use arrow::datatypes::DataType;
-use arrow::ffi::FFI_ArrowArray;
-use arrow_schema::ffi::FFI_ArrowSchema;
 use arrow_schema::{TimeUnit, UnionFields};
 use jni::objects::{JObject, JValue};
-use jni::sys::{jboolean, jint, jlong};
+use jni::sys::{jboolean, jint};
 use jni::JNIEnv;
-use lance_core::datatypes::{Encoding, Field, StorageClass};
+use lance_core::datatypes::{Field, StorageClass};
 
 pub fn convert_to_java_field<'local>(
     env: &mut JNIEnv<'local>,
