@@ -819,6 +819,12 @@ pub(crate) mod tests {
         #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
     ) {
         for data_type in PRIMITIVE_TYPES {
+            // skip tests for types using byte stream split.
+            //
+            // FIXME: we should have better config to control this.
+            if version == LanceFileVersion::V2_1 && data_type.is_floating() {
+                continue;
+            }
             log::info!("Testing encoding for {:?}", data_type);
             let field = Field::new("", data_type.clone(), false);
             check_round_trip_encoding_random(field, version).await;
