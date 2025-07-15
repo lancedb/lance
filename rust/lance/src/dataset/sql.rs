@@ -209,7 +209,6 @@ mod tests {
 
         let plan = builder.into_explain_plan(true, false).await.unwrap();
 
-        // 检查 explain plan 输出包含关键字
         assert!(plan.contains("Aggregate") || plan.contains("SUM"));
     }
 }
