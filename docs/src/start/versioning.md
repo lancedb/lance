@@ -9,6 +9,12 @@ Lance supports versioning natively, allowing you to track changes over time.
 
 In this tutorial, you'll learn how to append new data to existing datasets while preserving historical versions and access specific versions using version numbers or meaningful tags. You'll also understand how to implement proper data governance practices with Lance's native versioning capabilities.
 
+## Install the Python SDK
+
+```bash
+pip install pylance
+```
+
 ## Set Up Your Environment
 
 First, you should import the necessary libraries:
@@ -85,6 +91,6 @@ lance.dataset('/tmp/test.lance', version="stable").to_table().to_pandas()
 
 ## Next Steps
 
-Now that you've mastered dataset versioning with Lance, check out **[Vector Indexing and Vector Search With Lance](search.md)**. You can learn how to build high-performance vector search capabilities on top of your Lance tables.
+Now that you've mastered dataset versioning with Lance, check out **[Vector Indexing and Vector Search With Lance](vector-search.md)**. You can learn how to build high-performance vector search capabilities on top of your Lance tables.
 
 This will teach you how to build fast, scalable search capabilities for your versioned datasets. 

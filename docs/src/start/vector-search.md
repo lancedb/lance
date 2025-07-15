@@ -9,6 +9,12 @@ Lance provides high-performance vector search capabilities with ANN (Approximate
 
 By the end of this tutorial, you'll be able to build and use ANN indexes to dramatically speed up vector search operations while maintaining high accuracy. You'll also learn how to tune search parameters for optimal performance and combine vector search with metadata queries in a single operation.
 
+## Install the Python SDK
+
+```bash
+pip install pylance
+```
+
 ## Set Up Your Environment
 
 First, import the necessary libraries:
@@ -117,14 +123,12 @@ Without the index, the search will scan throughout the whole dataset to compute 
 
 ## Build the Search Index
 
-You should create an ANN index to dramatically speed up vector search operations while maintaining high accuracy. Lance supports `IVF_PQ`, `IVF_HNSW_PQ` and `IVF_HNSW_SQ` indexes. 
-
-Here is how to create and config the index:
+If you build an ANN index - you can dramatically speed up vector search operations while maintaining high accuracy. In this example, we will build the `IVF_PQ` index: 
 
 ```python
 sift1m.create_index(
     "vector",
-    index_type="IVF_PQ", # IVF_PQ, IVF_HNSW_PQ and IVF_HNSW_SQ are supported
+    index_type="IVF_PQ", # specify the IVF_PQ index type
     num_partitions=256,  # IVF
     num_sub_vectors=16,  # PQ
 )

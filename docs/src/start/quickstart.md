@@ -20,7 +20,7 @@ pip install pylance
 For the latest features and bug fixes, you can install the preview version:
 
 ```bash
-pip install --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance
+pip install --pre --extra-index-url https://pypi.fury.io/lancedb/pylance
 ```
 
 > Note: Preview releases receive the same level of testing as regular releases.
@@ -92,4 +92,4 @@ dataset.to_table().to_pandas()
 Now that you've mastered the basics of creating Lance datasets, here's what you can explore next:
 
 - **[Versioning Your Datasets with Lance](versioning.md)** - Learn how to track changes over time with native versioning
-- **[Vector Indexing and Vector Search With Lance](search.md)** - Build high-performance vector search capabilities with ANN indexes
+- **[Vector Indexing and Vector Search With Lance](vector-search.md)** - Build high-performance vector search capabilities with ANN indexes
