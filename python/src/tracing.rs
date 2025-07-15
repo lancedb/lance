@@ -15,15 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
-use std::sync::mpsc::TryRecvError;
-use std::sync::mpsc::TrySendError;
-use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Mutex;
-use std::sync::RwLock;
-use std::thread::JoinHandle;
 use chrono::{SecondsFormat, Utc};
 use datafusion_common::HashMap;
 use pyo3::pyclass;
@@ -38,6 +29,15 @@ use pyo3::PyErr;
 use pyo3::PyObject;
 use pyo3::PyResult;
 use pyo3::Python;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
+use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::TrySendError;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::sync::RwLock;
+use std::thread::JoinHandle;
 use tracing::field::Field;
 use tracing::field::Visit;
 use tracing::span;
