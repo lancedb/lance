@@ -14,7 +14,7 @@ hide: toc
 
 Lance is designed to be used with images, videos, 3D point clouds, audio and tabular data. It supports any POSIX file systems, and cloud storage like AWS S3 and Google Cloud Storage.
 
-This file format is particularly suited for [**vector search**](quickstart/vector-search.md) and [**LLM training**](examples/python/llm_training.md) on multimodal data. To learn more about how Lance works, [**read the format specification**](format/index.md). 
+This file format is particularly suited for [**vector search**](quickstart/vector-search.md), full-text search and [**LLM training**](examples/python/llm_training.md) on multimodal data. To learn more about how Lance works, [**read the format specification**](format/index.md). 
 
 !!! info "Looking for LanceDB?"
     **This is the Lance table format project** - the open source core that powers LanceDB.

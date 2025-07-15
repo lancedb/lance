@@ -259,4 +259,4 @@ print(result.to_pandas())
 
 ## Next Steps
 
-You should check out **[Versioning Your Datasets with Lance](versioning.md)**. We'll show you how to version your vector datasets and track changes over time.
+You should check out **[Versioning Your Datasets with Lance](../quickstart/versioning.md)**. We'll show you how to version your vector datasets and track changes over time.
