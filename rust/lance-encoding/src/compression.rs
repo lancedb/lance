@@ -147,7 +147,6 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 // Check if ByteStreamSplit would be beneficial for floating point data
                 if (fixed_width_data.bits_per_value == 32 || fixed_width_data.bits_per_value == 64)
                     && field.data_type().is_floating()
-                    && fixed_width_data.num_values > 1000
                 {
                     // Use ByteStreamSplit for floating point data with enough values
                     return Ok(Box::new(GeneralMiniBlockCompressor::new(
