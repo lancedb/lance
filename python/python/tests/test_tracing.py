@@ -101,6 +101,7 @@ assert events[3].args["operation"] == "Overwrite"
     )
     subprocess.run(
         [sys.executable, script],
+        capture_output=True,
         check=True,
         env={
             "LANCE_LOG": "debug",
