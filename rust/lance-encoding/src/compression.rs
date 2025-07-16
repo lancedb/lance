@@ -144,21 +144,6 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     }
                 }
 
-                // Check if ByteStreamSplit would be beneficial for floating point data
-                if (fixed_width_data.bits_per_value == 32 || fixed_width_data.bits_per_value == 64)
-                    && field.data_type().is_floating()
-                {
-                    // Use ByteStreamSplit for floating point data with enough values
-                    return Ok(Box::new(GeneralMiniBlockCompressor::new(
-                        Box::new(ByteStreamSplitEncoder::new(
-                            fixed_width_data.bits_per_value as usize,
-                        )),
-                        // TODO: use zstd can has better compress ratio but write speed is slow.
-                        //       we need to be confiurable here.
-                        CompressionConfig::new(CompressionScheme::Zstd, None),
-                    )));
-                }
-
                 let rle_threshold: f64 = if let Some(value) =
                     field.metadata.get(RLE_THRESHOLD_META_KEY)
                 {
