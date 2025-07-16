@@ -600,10 +600,10 @@ mod tests {
         compressor
             .compress(input_data, &mut compressed_data)
             .unwrap();
-        
+
         // For short strings, Snappy might not compress effectively
         // Just ensure we can round-trip the data
-        
+
         let mut decompressed_data = Vec::new();
         compressor
             .decompress(&compressed_data, &mut decompressed_data)
@@ -620,7 +620,7 @@ mod tests {
         compressor
             .compress(input_data, &mut compressed_data)
             .unwrap();
-        
+
         let mut decompressed_data = Vec::new();
         compressor
             .decompress(&compressed_data, &mut decompressed_data)
@@ -639,10 +639,10 @@ mod tests {
         compressor
             .compress(input_bytes, &mut compressed_data)
             .unwrap();
-        
+
         // Verify significant compression for repetitive data
         assert!(compressed_data.len() < input_bytes.len() / 10);
-        
+
         let mut decompressed_data = Vec::new();
         compressor
             .decompress(&compressed_data, &mut decompressed_data)
