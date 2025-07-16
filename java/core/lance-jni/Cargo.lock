@@ -3075,6 +3075,7 @@ dependencies = [
  "rand 0.8.5",
  "seq-macro",
  "snafu",
+ "snap",
  "tokio",
  "tracing",
  "xxhash-rust",
@@ -3234,6 +3235,7 @@ name = "lance-linalg"
 version = "0.31.2"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-ord",
  "arrow-schema",
  "bitvec",
