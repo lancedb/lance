@@ -92,6 +92,9 @@ pub struct Manifest {
 
     /// Blob dataset version
     pub blob_dataset_version: Option<u64>,
+
+    /* reference to a source dataset*/
+    pub reference: Option<Reference>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -120,6 +123,7 @@ impl Manifest {
         fragments: Arc<Vec<Fragment>>,
         data_storage_format: DataStorageFormat,
         blob_dataset_version: Option<u64>,
+        reference: Option<Reference>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
         let local_schema = schema.retain_storage_class(StorageClass::Default);
@@ -143,6 +147,7 @@ impl Manifest {
             data_storage_format,
             config: HashMap::new(),
             blob_dataset_version,
+            reference,
         }
     }
 
@@ -176,6 +181,37 @@ impl Manifest {
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
             blob_dataset_version,
+            reference: previous.reference.clone(),
+        }
+    }
+
+    pub fn shallow_clone(&self, root_path: &str, ref_name: &str, is_strong_ref: bool) -> Self {
+        Self {
+            schema: self.schema.clone(),
+            local_schema: self.local_schema.clone(),
+            version: self.version,
+            writer_version: self.writer_version.clone(),
+            fragments: Arc::new(self.fragments.as_ref().clone()),
+            version_aux_data: self.version_aux_data,
+            index_section: None,
+            timestamp_nanos: self.timestamp_nanos,
+            reader_feature_flags: self.reader_feature_flags,
+            tag: None,
+            writer_feature_flags: self.writer_feature_flags,
+            max_fragment_id: self.max_fragment_id,
+            transaction_file: self.transaction_file.clone(),
+            fragment_offsets: self.fragment_offsets.clone(),
+            next_row_id: self.next_row_id,
+            data_storage_format: self.data_storage_format.clone(),
+            config: self.config.clone(),
+            blob_dataset_version: self.blob_dataset_version.clone(),
+            reference: Some(Reference {
+                root_path: root_path.to_string(),
+                is_strong_ref,
+                ref_name: ref_name.to_string(),
+                version: self.version,
+                max_fragment_id: self.max_fragment_id.unwrap_or(0),
+            }),
         }
     }
 
@@ -367,6 +403,15 @@ impl Manifest {
     pub fn should_use_legacy_format(&self) -> bool {
         self.data_storage_format.version == LEGACY_FORMAT_VERSION
     }
+}
+
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct Reference {
+    pub root_path: String,
+    pub ref_name: String,
+    pub is_strong_ref: bool,
+    pub version: u64,
+    pub max_fragment_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -569,6 +614,13 @@ impl TryFrom<pb::Manifest> for Manifest {
             } else {
                 Some(p.blob_dataset_version)
             },
+            reference: p.reference.as_ref().map(|reference| Reference {
+                root_path: reference.root_path.clone(),
+                is_strong_ref: reference.is_strong_ref,
+                ref_name: reference.ref_name.clone(),
+                version: reference.version,
+                max_fragment_id: reference.max_fragment_id,
+            }),
         })
     }
 }
@@ -613,6 +665,13 @@ impl From<&Manifest> for pb::Manifest {
             }),
             config: m.config.clone(),
             blob_dataset_version: m.blob_dataset_version.unwrap_or_default(),
+            reference: m.reference.as_ref().map(|reference| pb::Reference {
+                root_path: reference.root_path.clone(),
+                is_strong_ref: reference.is_strong_ref,
+                ref_name: reference.ref_name.clone(),
+                version: reference.version,
+                max_fragment_id: reference.max_fragment_id,
+            }),
         }
     }
 }
@@ -733,6 +792,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
+            /*ref_main_location= */ None,
         );
 
         let actual = manifest.fragments_by_offset_range(0..10);
@@ -800,6 +860,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
+            /*ref_main_location= */ None,
         );
 
         assert_eq!(manifest.max_field_id(), 43);
@@ -823,6 +884,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
+            /*ref_main_location= */ None,
         );
 
         let mut config = manifest.config.clone();

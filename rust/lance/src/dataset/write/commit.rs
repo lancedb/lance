@@ -242,7 +242,11 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
-        if dest.dataset().is_none() && !matches!(transaction.operation, Operation::Overwrite { .. })
+        if dest.dataset().is_none()
+            && !matches!(
+                transaction.operation,
+                Operation::Overwrite { .. } | Operation::Clone { .. }
+            )
         {
             return Err(Error::DatasetNotFound {
                 path: base_path.to_string(),

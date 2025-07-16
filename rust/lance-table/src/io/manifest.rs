@@ -227,6 +227,7 @@ impl ManifestProvider for ManifestDescribing {
             Arc::new(vec![]),
             DataStorageFormat::new(LanceFileVersion::Legacy),
             /*blob_dataset_version= */ None,
+            None,
         );
         let pos = do_write_manifest(object_writer, &mut manifest, None).await?;
         Ok(Some(pos))
@@ -278,6 +279,7 @@ mod test {
             Arc::new(vec![]),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
+            None,
         );
         let pos = write_manifest(&mut writer, &mut manifest, None)
             .await

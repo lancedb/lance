@@ -153,7 +153,16 @@ message Manifest {
   // If this value is 0 then there are no blob fields.
   uint64 blob_dataset_version = 17;
 
+  optional Reference reference = 18;
 } // Manifest
+
+message Reference {
+  string root_path = 1;
+  string ref_name = 2;
+  bool is_strong_ref = 3;
+  uint64 version = 4;
+  uint32 max_fragment_id = 5;
+}
 
 // Auxiliary Data attached to a version.
 // Only load on-demand.

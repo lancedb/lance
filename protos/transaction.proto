@@ -154,6 +154,15 @@ message Transaction {
     uint32 num_fragments = 1;
   }
 
+  // An operation that clones a dataset.
+  message Clone {
+    bool is_shallow = 1;
+    bool is_strong_ref = 2;
+    string ref_name = 3;
+    string source_path = 4;
+    string target_path = 5;
+  }
+
   // An operation that updates rows but does not add or remove rows.
   message Update {
     // The fragments that have been removed. These are fragments where all rows
@@ -217,6 +226,7 @@ message Transaction {
     UpdateConfig update_config = 110;
     DataReplacement data_replacement = 111;
     UpdateMemWalState update_mem_wal_state = 112;
+    Clone clone = 113;
   }
 
   // An operation to apply to the blob dataset

@@ -33,7 +33,8 @@ use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
 use lance_table::format::{
-    DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION,
+    MINOR_VERSION,
 };
 use lance_table::io::commit::{
     migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
@@ -1131,8 +1132,28 @@ impl Dataset {
         &self.object_store
     }
 
-    pub fn data_dir(&self) -> Path {
+    pub(crate) fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
+    }
+
+    pub(crate) fn data_file_dir(&self, fragment: &Fragment) -> Path {
+        let reference = &self.manifest.as_ref().reference;
+        match reference {
+            Some(ref_value) if ref_value.max_fragment_id > fragment.id as u32 => {
+                Path::from(ref_value.root_path.clone()).child(DATA_DIR)
+            }
+            _ => self.base.child(DATA_DIR),
+        }
+    }
+
+    pub(crate) fn deletion_file_root_dir(&self, deletion: &DeletionFile) -> Path {
+        let reference = &self.manifest.as_ref().reference;
+        match reference {
+            Some(ref_value) if deletion.read_version < ref_value.version => {
+                Path::from(ref_value.root_path.clone())
+            }
+            _ => self.base.clone(),
+        }
     }
 
     pub(crate) fn indices_dir(&self) -> Path {
@@ -1543,6 +1564,46 @@ impl Dataset {
         let latest_version = self.latest_version_id().await?;
         *self = self.checkout_version(latest_version).await?;
         Ok(())
+    }
+
+    pub async fn shallow_clone(
+        &mut self,
+        target_path: &str,
+        ref_name: &str,
+        write_params: Option<WriteParams>,
+    ) -> Result<Dataset> {
+        // self.tags.create(ref_name, self.version().version).await?;
+        let clone_op = Operation::Clone {
+            is_shallow: true,
+            is_strong_ref: true,
+            ref_name: ref_name.to_string(),
+            source_path: self.base.to_string(),
+            target_path: target_path.to_string(),
+            source: Some(self.manifest().clone()),
+        };
+        let dataset = self.checkout_version(ref_name).await?;
+        let transaction = Transaction::new(dataset.version().version, clone_op, None, None);
+
+        let mut builder = CommitBuilder::new(WriteDestination::Uri(target_path))
+            .with_object_store(Arc::new(self.object_store().clone()))
+            .with_commit_handler(self.commit_handler.clone())
+            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+
+        match write_params {
+            Some(params) => {
+                if let Some(store_params) = &params.store_params {
+                    builder = builder.with_store_params(store_params.clone())
+                }
+            }
+            None => {
+                builder = builder.with_store_params(ObjectStoreParams {
+                    storage_options: Some(HashMap::new()),
+                    ..Default::default()
+                })
+            }
+        }
+
+        builder.execute(transaction).await
     }
 
     /// Run a SQL query against the dataset.
@@ -2553,6 +2614,99 @@ mod tests {
         Dataset::write(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
+
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(20..40))],
+        )
+        .unwrap()];
+        write_params.mode = WriteMode::Append;
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        let expected_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..40))],
+        )
+        .unwrap();
+
+        let actual_ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(actual_ds.version().version, 2);
+        let actual_schema = ArrowSchema::from(actual_ds.schema());
+        assert_eq!(&actual_schema, schema.as_ref());
+
+        let actual_batches = actual_ds
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        // sort
+        let actual_batch = concat_batches(&schema, &actual_batches).unwrap();
+        let idx_arr = actual_batch.column_by_name("i").unwrap();
+        let sorted_indices = sort_to_indices(idx_arr, None, None).unwrap();
+        let struct_arr: StructArray = actual_batch.into();
+        let sorted_arr = arrow_select::take::take(&struct_arr, &sorted_indices, None).unwrap();
+
+        let expected_struct_arr: StructArray = expected_batch.into();
+        assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
+
+        // Each fragments has different fragment ID
+        assert_eq!(
+            actual_ds
+                .fragments()
+                .iter()
+                .map(|f| f.id)
+                .collect::<Vec<_>>(),
+            (0..2).collect::<Vec<_>>()
+        )
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn clone_dataset(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let mut test_dir = tempdir().unwrap();
+        let clone_path = test_dir.path().join("clone");
+        let cloned_dir = clone_path.to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap()];
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+        dataset.tags.create("tag", 1).await.unwrap();
+        let cloned_dataset = dataset
+            .shallow_clone(cloned_dir, "tag", Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        let fragments = cloned_dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(0));
 
         let batches = vec![RecordBatch::try_new(
             schema.clone(),
