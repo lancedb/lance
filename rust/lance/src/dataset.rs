@@ -63,6 +63,7 @@ pub mod refs;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
+pub mod sql;
 pub mod statistics;
 mod take;
 pub mod transaction;
@@ -77,6 +78,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
+use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{
@@ -1454,6 +1456,13 @@ impl Dataset {
         let latest_version = self.latest_version_id().await?;
         *self = self.checkout_version(latest_version).await?;
         Ok(())
+    }
+
+    /// Run a SQL query against the dataset.
+    /// The underlying SQL engine is DataFusion.
+    /// Please refer to the DataFusion documentation for supported SQL syntax.
+    pub fn sql(&mut self, sql: &str) -> SqlQueryBuilder {
+        SqlQueryBuilder::new(self.clone(), sql)
     }
 }
 
