@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::datatypes::LogicalType;
 use lance_core::error::{Error, Result};
 use std::borrow::Cow;
-use utoipa::{ToSchema, PartialSchema};
-use utoipa::openapi::{RefOr, Schema as OpenApiSchema, ObjectBuilder, ArrayBuilder, Ref};
+use utoipa::openapi::{ArrayBuilder, ObjectBuilder, Ref, RefOr, Schema as OpenApiSchema};
+use utoipa::{PartialSchema, ToSchema};
 
 /// JSON representation of an Apache Arrow [DataType].
 // OpenAPI generator Utoipa does not support recursive types, need to impl PartialSchema to hard-crafted the schema
@@ -35,29 +35,35 @@ impl PartialSchema for JsonDataType {
     fn schema() -> RefOr<OpenApiSchema> {
         RefOr::T(OpenApiSchema::Object(
             ObjectBuilder::new()
-                .description(Some("JSON representation of an Apache Arrow DataType".to_string()))
+                .description(Some(
+                    "JSON representation of an Apache Arrow DataType".to_string(),
+                ))
                 .property(
                     "type",
                     ObjectBuilder::new()
                         .schema_type(utoipa::openapi::schema::Type::String)
-                        .description(Some("The data type name".to_string()))
+                        .description(Some("The data type name".to_string())),
                 )
                 .property(
                     "fields",
                     ArrayBuilder::new()
                         .items(Ref::from_schema_name("JsonField"))
-                        .description(Some("Fields for complex types like Struct, Union, etc.".to_string()))
+                        .description(Some(
+                            "Fields for complex types like Struct, Union, etc.".to_string(),
+                        )),
                 )
                 .property(
                     "length",
                     ObjectBuilder::new()
                         .schema_type(utoipa::openapi::schema::Type::Integer)
-                        .format(Some(utoipa::openapi::SchemaFormat::KnownFormat(utoipa::openapi::schema::KnownFormat::Int64)))
+                        .format(Some(utoipa::openapi::SchemaFormat::KnownFormat(
+                            utoipa::openapi::schema::KnownFormat::Int64,
+                        )))
                         .description(Some("Length for fixed-size types".to_string()))
-                        .minimum(Some(0.0))
+                        .minimum(Some(0.0)),
                 )
                 .required("type")
-                .into()
+                .into(),
         ))
     }
 }

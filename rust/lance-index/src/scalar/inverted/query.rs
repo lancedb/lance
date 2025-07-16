@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
-use utoipa::{ToSchema, PartialSchema};
-use utoipa::openapi::{RefOr, Schema, ObjectBuilder, ArrayBuilder, Ref};
+use utoipa::openapi::{ArrayBuilder, ObjectBuilder, Ref, RefOr, Schema};
+use utoipa::{PartialSchema, ToSchema};
 
 #[derive(Debug, Clone)]
 pub struct FtsSearchParams {
@@ -612,29 +612,31 @@ impl PartialSchema for BooleanQuery {
     fn schema() -> RefOr<Schema> {
         RefOr::T(Schema::Object(
             ObjectBuilder::new()
-                .description(Some("Boolean query with must, should, and must_not clauses"))
+                .description(Some(
+                    "Boolean query with must, should, and must_not clauses",
+                ))
                 .property(
                     "should",
                     ArrayBuilder::new()
                         .items(Ref::from_schema_name("FtsQuery"))
-                        .description(Some("Queries that should match (OR)"))
+                        .description(Some("Queries that should match (OR)")),
                 )
                 .property(
-                    "must", 
+                    "must",
                     ArrayBuilder::new()
                         .items(Ref::from_schema_name("FtsQuery"))
-                        .description(Some("Queries that must match (AND)"))
+                        .description(Some("Queries that must match (AND)")),
                 )
                 .property(
                     "must_not",
                     ArrayBuilder::new()
                         .items(Ref::from_schema_name("FtsQuery"))
-                        .description(Some("Queries that must not match (NOT)"))
+                        .description(Some("Queries that must not match (NOT)")),
                 )
                 .required("should")
                 .required("must")
                 .required("must_not")
-                .into()
+                .into(),
         ))
     }
 }

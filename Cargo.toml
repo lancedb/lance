@@ -164,7 +164,7 @@ url = "2.3"
 uuid = { version = "1.2", features = ["v4", "serde"] }
 pretty_assertions = "1.4.0"
 zstd = "0.13.1"
-utoipa = { version = "5.4.0", features = ["axum_extras", "chrono", "uuid"] }
+utoipa = { version = "5.4.0" }
 
 [profile.bench]
 opt-level = 3
