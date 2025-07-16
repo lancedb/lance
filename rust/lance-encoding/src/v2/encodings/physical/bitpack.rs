@@ -1159,7 +1159,7 @@ pub mod test {
     };
 
     use super::*;
-    use std::{marker::PhantomData, sync::Arc};
+    use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
     use arrow_array::{
         types::{UInt16Type, UInt8Type},
@@ -1686,7 +1686,12 @@ pub mod test {
         ];
 
         for (data_type, array_gen_provider) in bitpacked_test_cases {
-            let field = Field::new("", data_type.clone(), false);
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "lance-encoding:compression".to_string(),
+                "bitpacking".to_string(),
+            );
+            let field = Field::new("", data_type.clone(), false).with_metadata(metadata);
             check_round_trip_encoding_generated(
                 field,
                 array_gen_provider.copy(),

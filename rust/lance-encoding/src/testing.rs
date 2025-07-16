@@ -174,6 +174,7 @@ async fn test_decode(
         io,
         cache,
         &FilterExpression::no_filter(),
+        false, // cache_repetition_index - default to false for tests
     )
     .await
     .unwrap();

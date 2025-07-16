@@ -19,7 +19,7 @@ use std::ops::Range;
 mod bitmap;
 mod encoded_array;
 mod index;
-mod segment;
+pub mod segment;
 mod serde;
 
 use deepsize::DeepSizeOf;
@@ -181,7 +181,7 @@ impl RowIdSequence {
             offset = cutoff;
         }
 
-        self.0.retain(|segment| segment.len() != 0);
+        self.0.retain(|segment| !segment.is_empty());
 
         Ok(())
     }

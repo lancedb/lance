@@ -16,7 +16,7 @@ use crate::utils::accumulation::AccumulationQueue;
 use crate::v2::decoder::{FieldScheduler, LogicalPageDecoder, SchedulingJob};
 use crate::v2::encoder::ArrayEncodingStrategy;
 use crate::{data::DataBlock, v2::encodings::physical::decoder_from_array_encoding};
-use lance_core::{datatypes::Field, Result};
+use lance_core::{datatypes::Field, Error, Result};
 
 use crate::{
     decoder::{
@@ -443,7 +443,14 @@ impl PrimitiveFieldEncoder {
                 row_number: 0, // legacy encoders do not use
             })
         })
-        .map(|res_res| res_res.unwrap())
+        .map(|res_res| {
+            res_res.unwrap_or_else(|err| {
+                Err(Error::Internal {
+                    message: format!("Encoding task failed with error: {:?}", err),
+                    location: location!(),
+                })
+            })
+        })
         .boxed())
     }
 

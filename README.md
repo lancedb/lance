@@ -47,7 +47,7 @@ The key features of Lance include:
 * **Ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Ray, Spark and more on the way.
 
 > [!TIP]
-> Lance is in active development and we welcome contributions. Please see our [contributing guide](docs/contributing.rst) for more information.
+> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lancedb.github.io/lance/community/contributing/) for more information.
 
 ## Quick Start
 
@@ -197,11 +197,11 @@ We used the SIFT dataset to benchmark our results with 1M vectors of 128D
 
 1. For 100 randomly sampled query vectors, we get <1ms average response time (on a 2023 m2 MacBook Air)
 
-![avg_latency.png](docs/avg_latency.png)
+![avg_latency.png](docs/src/images/avg_latency.png)
 
 2. ANNs are always a trade-off between recall and performance
 
-![avg_latency.png](docs/recall_vs_latency.png)
+![avg_latency.png](docs/src/images/recall_vs_latency.png)
 
 ### Vs. parquet
 

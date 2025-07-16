@@ -772,6 +772,7 @@ impl BTreeIndex {
         if let Some(cached) = self.page_cache.0.get(&page_number) {
             return Ok(cached);
         }
+
         metrics.record_part_load();
         info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
@@ -927,7 +928,29 @@ impl Index for BTreeIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        // TODO: BTree can (and should) support pre-warming by loading the pages into memory
+        let reader = LazyIndexReader::new(self.store.clone());
+        let reader = reader.get().await?;
+        let num_rows = reader.num_rows();
+        let all_pages = reader.read_range(0..reader.num_rows(), None).await?;
+
+        let batch_size = self.batch_size as usize;
+        let num_pages = num_rows.div_ceil(batch_size);
+        let mut pages = stream::iter(0..num_pages)
+            .map(|page_idx| {
+                let sub_index = self.sub_index.clone();
+                let offset = page_idx * batch_size;
+                let end = std::cmp::min(num_rows, (page_idx + 1) * batch_size);
+                let page = all_pages.slice(offset, end - offset);
+                async move {
+                    let sub_idx = sub_index.load_subindex(page).await?;
+                    Result::Ok((page_idx as u32, sub_idx))
+                }
+            })
+            .buffer_unordered(get_num_compute_intensive_cpus());
+
+        while let Some((page_idx, sub_idx)) = pages.try_next().await? {
+            self.page_cache.0.insert(page_idx, sub_idx);
+        }
         Ok(())
     }
 

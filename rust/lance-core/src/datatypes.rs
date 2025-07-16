@@ -26,6 +26,7 @@ pub use schema::{OnMissing, Projectable, Projection, Schema};
 
 pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";
 pub const COMPRESSION_LEVEL_META_KEY: &str = "lance-encoding:compression-level";
+pub const RLE_THRESHOLD_META_KEY: &str = "lance-encoding:rle-threshold";
 pub const BLOB_META_KEY: &str = "lance-encoding:blob";
 pub const PACKED_STRUCT_LEGACY_META_KEY: &str = "packed";
 pub const PACKED_STRUCT_META_KEY: &str = "lance-encoding:packed";
