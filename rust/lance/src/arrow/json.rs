@@ -13,18 +13,65 @@ use serde::{Deserialize, Serialize};
 
 use crate::datatypes::LogicalType;
 use lance_core::error::{Error, Result};
-use utoipa::ToSchema;
+use std::borrow::Cow;
+
+use utoipa::{ToSchema, PartialSchema};
+use utoipa::openapi::{RefOr, Schema as OpenApiSchema, ObjectBuilder, ArrayBuilder, Ref, OneOfBuilder};
+use utoipa::openapi::schema::{Type, AnyOfBuilder};
 
 /// JSON representation of an Apache Arrow [DataType].
-#[derive(Serialize, Deserialize, Debug, ToSchema)]
+// OpenAPI generator Utoipa does not support recursive types, need to impl PartialSchema to hard-crafted the schema
+// If you modify this, please also update the PartialSchema impl below
+#[derive(Serialize, Deserialize, Debug)]
 pub struct JsonDataType {
     #[serde(rename = "type")]
+    #[schema(rename = "type")]
     type_: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Object)]
+    #[schema(nullable)]
     fields: Option<Vec<JsonField>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable)]
     length: Option<usize>,
+}
+
+// Manually implement PartialSchema for JsonDataType
+impl PartialSchema for JsonDataType {
+    fn schema() -> RefOr<OpenApiSchema> {
+        RefOr::T(OpenApiSchema::Object(
+            ObjectBuilder::new()
+                .description(Some("JSON representation of an Apache Arrow DataType".to_string()))
+                .property(
+                    "type",
+                    ObjectBuilder::new()
+                        .schema_type(Type::String)
+                        .description(Some("The data type name".to_string()))
+                )
+                .property(
+                    "fields",
+                    ArrayBuilder::new()
+                        .items(Ref::from_schema_name("JsonField"))
+                )
+                .property(
+                    "length",
+                    ObjectBuilder::new()
+                        .schema_type(Type::Integer)
+                        .minimum(Some(0.0))
+                )
+                .required("type")
+                .into()
+        ))
+    }
+}
+
+impl ToSchema for JsonDataType {
+    fn name() -> Cow<'static, str> {
+        Cow::Borrowed("JsonDataType")
+    }
+
+    fn schemas(_schemas: &mut Vec<(String, RefOr<OpenApiSchema>)>) {
+        // Don't recursively collect schemas - let the parent types handle it
+    }
 }
 
 impl JsonDataType {

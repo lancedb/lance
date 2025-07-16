@@ -598,6 +598,8 @@ impl From<Occur> for &'static str {
     }
 }
 
+// OpenAPI generator Utoipa does not support recursive types, need to impl PartialSchema to hard-crafted the schema
+// If you modify this struct, please also update the PartialSchema impl below
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BooleanQuery {
     pub should: Vec<FtsQuery>,
