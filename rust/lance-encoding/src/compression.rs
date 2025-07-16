@@ -32,7 +32,7 @@ use crate::{
             },
             bitpack::InlineBitpacking,
             block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
-            byte_stream_split::{ByteStreamSplitDecompressor, ByteStreamSplitEncoder},
+            byte_stream_split::ByteStreamSplitDecompressor,
             constant::ConstantDecompressor,
             fsst::{
                 FsstMiniBlockDecompressor, FsstMiniBlockEncoder, FsstPerValueDecompressor,
