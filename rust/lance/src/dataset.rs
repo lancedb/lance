@@ -75,7 +75,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
-use crate::dataset::sql::SqlBuilder;
+use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{
@@ -1455,8 +1455,8 @@ impl Dataset {
     /// Run a SQL query against the dataset.
     /// The underlying SQL engine is DataFusion.
     /// Please refer to the DataFusion documentation for supported SQL syntax.
-    pub fn sql(&mut self, sql: &str) -> SqlBuilder {
-        SqlBuilder::new(self.clone(), sql)
+    pub fn sql(&mut self, sql: &str) -> SqlQueryBuilder {
+        SqlQueryBuilder::new(self.clone(), sql)
     }
 }
 

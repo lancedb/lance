@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 /// A SQL builder to prepare options for running SQL queries against a Lance dataset.
 #[derive(Clone, Debug)]
-pub struct SqlBuilder {
+pub struct SqlQueryBuilder {
     /// The dataset to run the SQL query
     pub(crate) dataset: Dataset,
 
@@ -19,23 +19,23 @@ pub struct SqlBuilder {
     pub(crate) sql: String,
 
     /// the name of the table to register in the datafusion context
-    pub(crate) table_name: Option<String>,
+    pub(crate) table_name: String,
 
     /// If true, the query result will include the internal row id
-    pub(crate) row_id: Option<bool>,
+    pub(crate) with_row_id: bool,
 
     /// If true, the query result will include the internal row address
-    pub(crate) row_addr: Option<bool>,
+    pub(crate) with_row_addr: bool,
 }
 
-impl SqlBuilder {
+impl SqlQueryBuilder {
     pub fn new(dataset: Dataset, sql: &str) -> Self {
         Self {
             dataset,
             sql: sql.to_string(),
-            table_name: Some("dataset".to_string()),
-            row_id: None,
-            row_addr: None,
+            table_name: "dataset".to_string(),
+            with_row_id: false,
+            with_row_addr: false,
         }
     }
 
@@ -44,30 +44,30 @@ impl SqlBuilder {
     /// So that you can run SQL queries against it.
     /// If not set, the default table name is "dataset".
     pub fn table_name(mut self, table_name: &str) -> Self {
-        self.table_name = Some(table_name.to_string());
+        self.table_name = table_name.to_string();
         self
     }
 
     /// Specify if the query result should include the internal row id.
     /// If true, the query result will include an additional column named "_rowid".
     pub fn with_row_id(mut self, row_id: bool) -> Self {
-        self.row_id = Some(row_id);
+        self.with_row_id = row_id;
         self
     }
 
     /// Specify if the query result should include the internal row address.
     /// If true, the query result will include an additional column named "_rowaddr".
     pub fn with_row_addr(mut self, row_addr: bool) -> Self {
-        self.row_addr = Some(row_addr);
+        self.with_row_addr = row_addr;
         self
     }
 
-    pub async fn build(self) -> lance_core::Result<SqlQueryBuilder> {
+    pub async fn build(self) -> lance_core::Result<SqlQuery> {
         let ctx = SessionContext::new();
-        let row_id = self.row_id.unwrap_or(false);
-        let row_addr = self.row_addr.unwrap_or(false);
+        let row_id = self.with_row_id;
+        let row_addr = self.with_row_addr;
         ctx.register_table(
-            self.table_name.unwrap(),
+            self.table_name,
             Arc::new(LanceTableProvider::new(
                 Arc::new(self.dataset.clone()),
                 row_id,
@@ -75,15 +75,15 @@ impl SqlBuilder {
             )),
         )?;
         let df = ctx.sql(&self.sql).await?;
-        Ok(SqlQueryBuilder::new(df))
+        Ok(SqlQuery::new(df))
     }
 }
 
-pub struct SqlQueryBuilder {
+pub struct SqlQuery {
     dataframe: DataFrame,
 }
 
-impl SqlQueryBuilder {
+impl SqlQuery {
     pub fn new(dataframe: DataFrame) -> Self {
         Self { dataframe }
     }
