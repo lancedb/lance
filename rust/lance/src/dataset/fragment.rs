@@ -895,7 +895,10 @@ impl FileFragment {
         if data_file.is_legacy_file() {
             let max_field_id = data_file.fields.iter().max().unwrap();
             if !schema_per_file.fields.is_empty() {
-                let path = self.dataset.data_dir().child(data_file.path.as_str());
+                let path = self
+                    .dataset
+                    .data_file_dir(&self.metadata)
+                    .child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
                 let reader = FileReader::try_new_with_fragment_id(
                     &self.dataset.object_store,
@@ -920,7 +923,10 @@ impl FileFragment {
         } else if schema_per_file.fields.is_empty() {
             Ok(None)
         } else {
-            let path = self.dataset.data_dir().child(data_file.path.as_str());
+            let path = self
+                .dataset
+                .data_file_dir(&self.metadata)
+                .child(data_file.path.as_str());
             let (store_scheduler, reader_priority) =
                 if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
                     (
@@ -1114,8 +1120,8 @@ impl FileFragment {
                 if *field_id <= last {
                     return Err(Error::corrupt_file(
                         self.dataset
-                            .data_dir()
-                            .child(self.metadata.files[0].path.as_str()),
+                            .data_file_dir(&self.metadata)
+                            .child(data_file.path.as_str()),
                         format!(
                             "Field id {} is not in increasing order in fragment {:#?}",
                             field_id, self
@@ -1127,8 +1133,8 @@ impl FileFragment {
                 if !seen_fields.insert(field_id) {
                     return Err(Error::corrupt_file(
                         self.dataset
-                            .data_dir()
-                            .child(self.metadata.files[0].path.as_str()),
+                            .data_file_dir(&self.metadata)
+                            .child(data_file.path.as_str()),
                         format!(
                             "Field id {} is duplicated in fragment {:#?}",
                             field_id, self
@@ -1144,7 +1150,7 @@ impl FileFragment {
         {
             return Err(Error::corrupt_file(
                 self.dataset
-                    .data_dir()
+                    .data_file_dir(&self.metadata)
                     .child(self.metadata.files[0].path.as_str()),
                 "Fragment contains a mix of v1 and v2 data files".to_string(),
                 location!(),
@@ -1152,7 +1158,7 @@ impl FileFragment {
         }
 
         for data_file in &self.metadata.files {
-            data_file.validate(&self.dataset.data_dir())?;
+            data_file.validate(&self.dataset.data_file_dir(&self.metadata))?;
         }
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
@@ -1161,7 +1167,9 @@ impl FileFragment {
                 .await?
                 .ok_or_else(|| {
                     Error::corrupt_file(
-                        self.dataset.data_dir().child(data_file.path.clone()),
+                        self.dataset
+                            .data_file_dir(&self.metadata)
+                            .child(data_file.path.as_str()),
                         "did not have any fields in common with the dataset schema",
                         location!(),
                     )
@@ -1178,7 +1186,10 @@ impl FileFragment {
         let expected_length = get_lengths.first().unwrap_or(&0);
         for (length, data_file) in get_lengths.iter().zip(self.metadata.files.iter()) {
             if length != expected_length {
-                let path = self.dataset.data_dir().child(data_file.path.as_str());
+                let path = self
+                    .dataset
+                    .data_file_dir(&self.metadata)
+                    .child(data_file.path.as_str());
                 return Err(Error::corrupt_file(
                     path,
                     format!(
@@ -1193,7 +1204,7 @@ impl FileFragment {
             if physical_rows != *expected_length {
                 return Err(Error::corrupt_file(
                     self.dataset
-                        .data_dir()
+                        .data_file_dir(&self.metadata)
                         .child(self.metadata.files[0].path.as_str()),
                     format!(
                         "Fragment metadata has incorrect physical_rows. Actual: {} Metadata: {}",
