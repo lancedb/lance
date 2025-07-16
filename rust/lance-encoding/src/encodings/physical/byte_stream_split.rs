@@ -126,46 +126,36 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
 
                 let mut chunks = Vec::new();
                 let data_slice = data.data.as_ref();
-                let mut value_offset = 0usize;
-                let mut values_remaining = num_values as usize;
+                let mut processed_values = 0usize;
                 let max_chunk_size = self.max_chunk_size();
-                let mut global_offset = 0usize;
 
-                while values_remaining > 0 {
-                    let chunk_size = if values_remaining <= max_chunk_size {
-                        values_remaining
-                    } else {
-                        max_chunk_size
-                    };
+                while processed_values < num_values as usize {
+                    let chunk_size = (num_values as usize - processed_values).min(max_chunk_size);
+                    let chunk_offset = processed_values * bytes_per_value;
 
                     // Create chunk-local byte streams
                     for i in 0..chunk_size {
-                        let src_value_offset = (value_offset + i) * bytes_per_value;
+                        let src_offset = (processed_values + i) * bytes_per_value;
                         for j in 0..bytes_per_value {
                             // Store in chunk-local byte stream format
-                            let dst_offset = global_offset + j * chunk_size + i;
-                            global_buffer[dst_offset] = data_slice[src_value_offset + j];
+                            let dst_offset = chunk_offset + j * chunk_size + i;
+                            global_buffer[dst_offset] = data_slice[src_offset + j];
                         }
                     }
 
                     let chunk_bytes = chunk_size * bytes_per_value;
-                    let buffer_sizes: Vec<u16> = vec![chunk_bytes as u16];
-
-                    let is_last_chunk = chunk_size == values_remaining;
-                    let log_num_values = if is_last_chunk {
-                        0
+                    let log_num_values = if processed_values + chunk_size == num_values as usize {
+                        0 // Last chunk
                     } else {
                         chunk_size.ilog2() as u8
                     };
 
                     chunks.push(MiniBlockChunk {
-                        buffer_sizes,
+                        buffer_sizes: vec![chunk_bytes as u16],
                         log_num_values,
                     });
 
-                    global_offset += chunk_bytes;
-                    value_offset += chunk_size;
-                    values_remaining -= chunk_size;
+                    processed_values += chunk_size;
                 }
 
                 let data_buffers = vec![LanceBuffer::from(global_buffer)];
