@@ -65,6 +65,7 @@ pub enum CompressionScheme {
     Fsst,
     Zstd,
     Lz4,
+    Snappy,
 }
 
 impl std::fmt::Display for CompressionScheme {
@@ -74,6 +75,7 @@ impl std::fmt::Display for CompressionScheme {
             Self::Zstd => "zstd",
             Self::None => "none",
             Self::Lz4 => "lz4",
+            Self::Snappy => "snappy",
         };
         write!(f, "{}", scheme_str)
     }
@@ -87,6 +89,7 @@ impl FromStr for CompressionScheme {
             "none" => Ok(Self::None),
             "zstd" => Ok(Self::Zstd),
             "lz4" => Ok(Self::Lz4),
+            "snappy" => Ok(Self::Snappy),
             _ => Err(Error::invalid_input(
                 format!("Unknown compression scheme: {}", s),
                 location!(),
@@ -283,6 +286,37 @@ impl BufferCompressor for NoopBufferCompressor {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct SnappyBufferCompressor {}
+
+impl BufferCompressor for SnappyBufferCompressor {
+    fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(input_buf)
+            .map_err(|e| Error::Internal {
+                message: format!("Snappy compression error: {}", e),
+                location: location!(),
+            })?;
+        output_buf.extend_from_slice(&compressed);
+        Ok(())
+    }
+
+    fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+        let decompressed = snap::raw::Decoder::new()
+            .decompress_vec(input_buf)
+            .map_err(|e| Error::Internal {
+                message: format!("Snappy decompression error: {}", e),
+                location: location!(),
+            })?;
+        output_buf.extend_from_slice(&decompressed);
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "snappy"
+    }
+}
+
 pub struct GeneralBufferCompressor {}
 
 impl GeneralBufferCompressor {
@@ -294,6 +328,7 @@ impl GeneralBufferCompressor {
                 compression_config.level.unwrap_or(0),
             )),
             CompressionScheme::Lz4 => Box::new(Lz4BufferCompressor::default()),
+            CompressionScheme::Snappy => Box::new(SnappyBufferCompressor::default()),
             CompressionScheme::None => Box::new(NoopBufferCompressor {}),
         }
     }
@@ -459,6 +494,14 @@ mod tests {
             CompressionScheme::from_str("zstd").unwrap(),
             CompressionScheme::Zstd
         );
+        assert_eq!(
+            CompressionScheme::from_str("lz4").unwrap(),
+            CompressionScheme::Lz4
+        );
+        assert_eq!(
+            CompressionScheme::from_str("snappy").unwrap(),
+            CompressionScheme::Snappy
+        );
     }
 
     #[test]
@@ -546,5 +589,64 @@ mod tests {
             .decompress(&compressed_data, &mut decompressed_data)
             .unwrap();
         assert_eq!(input_data, decompressed_data.as_slice());
+    }
+
+    #[test]
+    fn test_snappy_compress_decompress() {
+        let compressor = SnappyBufferCompressor::default();
+        let input_data = b"Hello, Snappy compression! This is a longer text to ensure compression actually happens.";
+        let mut compressed_data = Vec::new();
+
+        compressor
+            .compress(input_data, &mut compressed_data)
+            .unwrap();
+        
+        // For short strings, Snappy might not compress effectively
+        // Just ensure we can round-trip the data
+        
+        let mut decompressed_data = Vec::new();
+        compressor
+            .decompress(&compressed_data, &mut decompressed_data)
+            .unwrap();
+        assert_eq!(input_data, decompressed_data.as_slice());
+    }
+
+    #[test]
+    fn test_snappy_compress_decompress_empty() {
+        let compressor = SnappyBufferCompressor::default();
+        let input_data = b"";
+        let mut compressed_data = Vec::new();
+
+        compressor
+            .compress(input_data, &mut compressed_data)
+            .unwrap();
+        
+        let mut decompressed_data = Vec::new();
+        compressor
+            .decompress(&compressed_data, &mut decompressed_data)
+            .unwrap();
+        assert_eq!(input_data, decompressed_data.as_slice());
+    }
+
+    #[test]
+    fn test_snappy_compress_decompress_large() {
+        let compressor = SnappyBufferCompressor::default();
+        // Create a large repetitive string that compresses well
+        let input_data = "Hello, Snappy! ".repeat(1000);
+        let input_bytes = input_data.as_bytes();
+        let mut compressed_data = Vec::new();
+
+        compressor
+            .compress(input_bytes, &mut compressed_data)
+            .unwrap();
+        
+        // Verify significant compression for repetitive data
+        assert!(compressed_data.len() < input_bytes.len() / 10);
+        
+        let mut decompressed_data = Vec::new();
+        compressor
+            .decompress(&compressed_data, &mut decompressed_data)
+            .unwrap();
+        assert_eq!(input_bytes, decompressed_data.as_slice());
     }
 }

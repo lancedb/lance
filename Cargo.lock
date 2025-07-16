@@ -4270,6 +4270,7 @@ dependencies = [
  "rstest",
  "seq-macro",
  "snafu",
+ "snap",
  "tempfile",
  "test-log",
  "tokio",
