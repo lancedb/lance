@@ -60,7 +60,7 @@ pub mod refs;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
-mod sql;
+pub mod sql;
 pub mod statistics;
 mod take;
 pub mod transaction;
