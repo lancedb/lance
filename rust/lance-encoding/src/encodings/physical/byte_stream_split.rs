@@ -129,6 +129,7 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
                 let mut value_offset = 0usize;
                 let mut values_remaining = num_values as usize;
                 let max_chunk_size = self.max_chunk_size();
+                let mut global_offset = 0usize;
 
                 while values_remaining > 0 {
                     let chunk_size = if values_remaining <= max_chunk_size {
@@ -137,10 +138,12 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
                         max_chunk_size
                     };
 
+                    // Create chunk-local byte streams
                     for i in 0..chunk_size {
                         let src_value_offset = (value_offset + i) * bytes_per_value;
                         for j in 0..bytes_per_value {
-                            let dst_offset = j * num_values as usize + value_offset + i;
+                            // Store in chunk-local byte stream format
+                            let dst_offset = global_offset + j * chunk_size + i;
                             global_buffer[dst_offset] = data_slice[src_value_offset + j];
                         }
                     }
@@ -160,6 +163,7 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
                         log_num_values,
                     });
 
+                    global_offset += chunk_bytes;
                     value_offset += chunk_size;
                     values_remaining -= chunk_size;
                 }
@@ -246,6 +250,7 @@ impl MiniBlockDecompressor for ByteStreamSplitDecompressor {
 
         let mut output = vec![0u8; total_bytes];
 
+        // Input buffer contains chunk-local byte streams
         for i in 0..num_values as usize {
             for j in 0..bytes_per_value {
                 let src_offset = j * num_values as usize + i;
