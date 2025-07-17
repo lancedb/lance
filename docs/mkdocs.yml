@@ -76,6 +76,7 @@ nav:
       - Getting Started with Lance: quickstart/index.md
       - Versioning: quickstart/versioning.md
       - Vector Search: quickstart/vector-search.md
+      - Full Text Search: quickstart/full-text-search.md
     - Format Specification: format/index.md
     - User Guide:
       - Read and Write: guide/read_and_write.md
