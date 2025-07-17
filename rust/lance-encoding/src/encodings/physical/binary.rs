@@ -277,21 +277,10 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
                 .map(|offset| offset - offsets[0])
                 .collect::<Vec<u32>>();
 
-            // Bounds checking to prevent crashes
-            let start_offset = offsets[0] as usize;
-            let end_offset = offsets[num_values as usize] as usize;
-            if start_offset > data.len() || end_offset > data.len() || start_offset > end_offset {
-                return Err(lance_core::Error::InvalidInput {
-                    source: format!(
-                        "Invalid offset range: start={}, end={}, data_len={}, offsets[0]={}, offsets[{}]={}",
-                        start_offset, end_offset, data.len(), offsets[0], num_values, offsets[num_values as usize]
-                    ).into(),
-                    location: location!(),
-                });
-            }
-
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::Owned(data[start_offset..end_offset].to_vec()),
+                data: LanceBuffer::Owned(
+                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
+                ),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 32,
                 num_values,
@@ -306,7 +295,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
 /// ----------------------------------------------------------------------------------------
 /// | bits_per_offset | number of values  | bytes_start_offset | offsets data | bytes data
 /// ----------------------------------------------------------------------------------------
-/// |       1 byte    | bits_per_offset/8 | bits_per_offset/8  |  offsets_len | dat_len
+/// |       1 byte    |<bits_per_offset>/8|<bits_per_offset>/8 |  offsets_len | dat_len
 /// ----------------------------------------------------------------------------------------
 /// It's used in VariableEncoder and BinaryBlockDecompressor
 ///
@@ -317,7 +306,7 @@ impl BlockCompressor for VariableEncoder {
     fn compress(&self, mut data: DataBlock) -> Result<LanceBuffer> {
         match data {
             DataBlock::VariableWidth(ref mut variable_width_data) => {
-                let num_values = variable_width_data.num_values;
+                let num_values: u64 = variable_width_data.num_values;
                 match variable_width_data.bits_per_offset {
                     32 => {
                         let num_values: u32 = num_values
@@ -367,10 +356,10 @@ impl BlockCompressor for VariableEncoder {
                         // Store bit_per_offset info
                         output.push(64_u8);
 
-                        // store `num_values` in the first 4 bytes of output buffer
+                        // store `num_values` in the first 8 bytes of output buffer
                         output.extend_from_slice(&(num_values).to_le_bytes());
 
-                        // store `bytes_start_offset` in the next 4 bytes of output buffer
+                        // store `bytes_start_offset` in the next 8 bytes of output buffer
                         output.extend_from_slice(&(bytes_start_offset).to_le_bytes());
 
                         // store offsets
@@ -556,6 +545,24 @@ pub mod tests {
         field_metadata.insert(
             STRUCTURAL_ENCODING_META_KEY.to_string(),
             structural_encoding.into(),
+        );
+        field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
+        let field = Field::new("", data_type, true).with_metadata(field_metadata);
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_large_binary_fsst_with_dict(
+        #[values(DataType::LargeBinary, DataType::LargeUtf8)] data_type: DataType,
+    ) {
+        // A workaround to test the dictionary encoding with large data. see issue #4249
+        // Set the environment variable for this test
+        std::env::set_var("LANCE_ENCODING_DICT_DIVISOR", "1");
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
         );
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
         let field = Field::new("", data_type, true).with_metadata(field_metadata);

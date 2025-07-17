@@ -393,6 +393,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     general.inner.as_ref().ok_or_else(|| {
                         Error::invalid_input("GeneralMiniBlock missing inner encoding", location!())
                     })?,
+                    decompression_strategy,
                 )?;
 
                 // Parse compression config
