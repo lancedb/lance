@@ -184,7 +184,9 @@ impl IVFIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
         let cache_key = LegacyIVFPartitionKey::new(partition_id);
-        let part_index = if let Some(part_idx) = self.index_cache.get_unsized_with_key(&cache_key) {
+        let part_index = if let Some(part_idx) =
+            self.index_cache.get_unsized_with_key(&cache_key).await
+        {
             part_idx
         } else {
             metrics.record_part_load();
@@ -194,7 +196,7 @@ impl IVFIndex {
             let _guard = mtx.lock().await;
             // check the cache again, as the partition may have been loaded by another
             // thread that held the lock on loading the partition
-            if let Some(part_idx) = self.index_cache.get_unsized_with_key(&cache_key) {
+            if let Some(part_idx) = self.index_cache.get_unsized_with_key(&cache_key).await {
                 part_idx
             } else {
                 if partition_id >= self.ivf.num_partitions() {
@@ -221,7 +223,8 @@ impl IVFIndex {
                 let idx: Arc<dyn VectorIndex> = idx.into();
                 if write_cache {
                     self.index_cache
-                        .insert_unsized_with_key(&cache_key, idx.clone());
+                        .insert_unsized_with_key(&cache_key, idx.clone())
+                        .await;
                 }
                 idx
             }

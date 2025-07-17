@@ -240,7 +240,7 @@ impl FileReader {
     ) -> Result<Arc<T>>
     where
         F: Fn(&str) -> Fut,
-        Fut: Future<Output = Result<T>>,
+        Fut: Future<Output = Result<T>> + Send,
     {
         if let Some(cache) = cache {
             let cache_key = StringCacheKey::<T>::new(key.as_str());

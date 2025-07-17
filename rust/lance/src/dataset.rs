@@ -502,7 +502,9 @@ impl Dataset {
                 let metadata_key = crate::session::index_caches::IndexMetadataKey {
                     version: manifest_location.version,
                 };
-                ds_index_cache.insert_with_key(&metadata_key, Arc::new(indices));
+                ds_index_cache
+                    .insert_with_key(&metadata_key, Arc::new(indices))
+                    .await;
             }
         }
 
@@ -650,7 +652,7 @@ impl Dataset {
             version: location.version,
             e_tag: location.e_tag.as_deref(),
         };
-        let cached_manifest = self.metadata_cache.get_with_key(&manifest_key);
+        let cached_manifest = self.metadata_cache.get_with_key(&manifest_key).await;
         if let Some(cached_manifest) = cached_manifest {
             return Ok((cached_manifest, location));
         }
@@ -1077,13 +1079,13 @@ impl Dataset {
     }
 
     /// Get the number of entries currently in the index cache.
-    pub fn index_cache_entry_count(&self) -> usize {
-        self.session.index_cache.size()
+    pub async fn index_cache_entry_count(&self) -> usize {
+        self.session.index_cache.size().await
     }
 
     /// Get cache hit ratio.
-    pub fn index_cache_hit_rate(&self) -> f32 {
-        let stats = self.session.index_cache_stats();
+    pub async fn index_cache_hit_rate(&self) -> f32 {
+        let stats = self.session.index_cache_stats().await;
         stats.hit_ratio()
     }
 
@@ -1511,24 +1513,26 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                     version: location.version,
                     e_tag: location.e_tag.as_deref(),
                 };
-                let manifest =
-                    if let Some(cached) = dataset.metadata_cache.get_with_key(&manifest_key) {
-                        cached
-                    } else {
-                        let loaded = Arc::new(
-                            Dataset::load_manifest(
-                                dataset.object_store(),
-                                &location,
-                                &dataset.uri,
-                                dataset.session.as_ref(),
-                            )
-                            .await?,
-                        );
-                        dataset
-                            .metadata_cache
-                            .insert_with_key(&manifest_key, loaded.clone());
-                        loaded
-                    };
+                let manifest = if let Some(cached) =
+                    dataset.metadata_cache.get_with_key(&manifest_key).await
+                {
+                    cached
+                } else {
+                    let loaded = Arc::new(
+                        Dataset::load_manifest(
+                            dataset.object_store(),
+                            &location,
+                            &dataset.uri,
+                            dataset.session.as_ref(),
+                        )
+                        .await?,
+                    );
+                    dataset
+                        .metadata_cache
+                        .insert_with_key(&manifest_key, loaded.clone())
+                        .await;
+                    loaded
+                };
 
                 if let Some(latest_tx) = latest_tx {
                     // We ignore the error, since we don't care if the receiver is dropped.
@@ -1545,37 +1549,39 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
             let tx_key = TransactionKey {
                 version: manifest.version,
             };
-            let transaction = if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key) {
-                cached
-            } else {
-                let dataset_version = Dataset::checkout_manifest(
-                    dataset.object_store.clone(),
-                    dataset.base.clone(),
-                    dataset.uri.clone(),
-                    manifest_copy.clone(),
-                    location,
-                    dataset.session(),
-                    dataset.commit_handler.clone(),
-                )?;
-                let object_store = dataset_version.object_store();
-                let path = dataset_version
-                    .manifest
-                    .transaction_file
-                    .as_ref()
-                    .ok_or_else(|| Error::Internal {
-                        message: format!(
-                            "Dataset version {} does not have a transaction file",
-                            manifest_copy.version
-                        ),
-                        location: location!(),
-                    })?;
-                let loaded =
-                    Arc::new(read_transaction_file(object_store, &dataset.base, path).await?);
-                dataset
-                    .metadata_cache
-                    .insert_with_key(&tx_key, loaded.clone());
-                loaded
-            };
+            let transaction =
+                if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
+                    cached
+                } else {
+                    let dataset_version = Dataset::checkout_manifest(
+                        dataset.object_store.clone(),
+                        dataset.base.clone(),
+                        dataset.uri.clone(),
+                        manifest_copy.clone(),
+                        location,
+                        dataset.session(),
+                        dataset.commit_handler.clone(),
+                    )?;
+                    let object_store = dataset_version.object_store();
+                    let path = dataset_version
+                        .manifest
+                        .transaction_file
+                        .as_ref()
+                        .ok_or_else(|| Error::Internal {
+                            message: format!(
+                                "Dataset version {} does not have a transaction file",
+                                manifest_copy.version
+                            ),
+                            location: location!(),
+                        })?;
+                    let loaded =
+                        Arc::new(read_transaction_file(object_store, &dataset.base, path).await?);
+                    dataset
+                        .metadata_cache
+                        .insert_with_key(&tx_key, loaded.clone())
+                        .await;
+                    loaded
+                };
             Ok((manifest.version, transaction))
         })
         .try_buffer_unordered(io_parallelism / 2);

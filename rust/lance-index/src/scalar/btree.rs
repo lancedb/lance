@@ -782,7 +782,7 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        self.index_cache.get_or_insert_with_key(BTreePageKey { page_number }, move || async move {
+        self.index_cache.get_or_insert_with_key(dbg!(BTreePageKey { page_number }), move || async move {
             metrics.record_part_load();
             info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
             let index_reader = index_reader.get().await?;
@@ -972,12 +972,14 @@ impl Index for BTreeIndex {
             .buffer_unordered(get_num_compute_intensive_cpus());
 
         while let Some((page_idx, sub_idx)) = pages.try_next().await? {
-            self.index_cache.insert_with_key(
-                &BTreePageKey {
-                    page_number: page_idx,
-                },
-                Arc::new(CachedScalarIndex::new(sub_idx)),
-            );
+            self.index_cache
+                .insert_with_key(
+                    &BTreePageKey {
+                        page_number: page_idx,
+                    },
+                    Arc::new(CachedScalarIndex::new(sub_idx)),
+                )
+                .await;
         }
         Ok(())
     }
@@ -1642,9 +1644,13 @@ mod tests {
             .await
             .unwrap();
 
-        let index = BTreeIndex::load(test_store, None, LanceCache::no_cache())
-            .await
-            .unwrap();
+        let index = BTreeIndex::load(
+            test_store,
+            None,
+            LanceCache::with_capacity(100 * 1024 * 1024),
+        )
+        .await
+        .unwrap();
 
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(0.0)));
         let metrics = LocalMetricsCollector::default();
