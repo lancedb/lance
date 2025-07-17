@@ -782,7 +782,7 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        self.index_cache.get_or_insert_with_key(dbg!(BTreePageKey { page_number }), move || async move {
+        self.index_cache.get_or_insert_with_key(BTreePageKey { page_number }, move || async move {
             metrics.record_part_load();
             info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
             let index_reader = index_reader.get().await?;
