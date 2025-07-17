@@ -1240,8 +1240,13 @@ impl MergeInsertJob {
         let source_df = session_ctx.read_one_shot(source)?;
         let source_df_aliased = source_df.alias("source")?;
         let scan_aliased = scan.alias("target")?;
+        let join_type = if self.params.insert_not_matched {
+            JoinType::Right
+        } else {
+            JoinType::Inner
+        };
         let df = scan_aliased
-            .join(source_df_aliased, JoinType::Right, &on_cols, &on_cols, None)?
+            .join(source_df_aliased, join_type, &on_cols, &on_cols, None)?
             .with_column("action", merge_insert_action(&self.params)?)?;
 
         let (session_state, logical_plan) = df.into_parts();
@@ -1352,8 +1357,7 @@ impl MergeInsertJob {
         // We are migrating a new plan-based code path. For now, only using this
         // for select supported queries: upsert with full schema, no scalar index, and keeping unmatched rows.
         let has_scalar_index = self.join_key_as_scalar_index().await?.is_some();
-        let can_use_fast_path = self.params.insert_not_matched
-            && matches!(self.params.when_matched, WhenMatched::UpdateAll)
+        let can_use_fast_path = matches!(self.params.when_matched, WhenMatched::UpdateAll)
             && !has_scalar_index
             && is_full_schema
             && matches!(
@@ -3052,5 +3056,101 @@ mod tests {
                 RepartitionExec...
                   StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_update_only() {
+        let data = lance_datagen::gen()
+            .with_seed(Seed::from(1))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(32));
+
+        // Create dataset with initial data
+        let ds = Dataset::write(data, "memory://", None).await.unwrap();
+
+        // Create update-only job (insert_not_matched = false)
+        let merge_insert_job =
+            crate::dataset::MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(crate::dataset::WhenMatched::UpdateAll)
+                .when_not_matched(crate::dataset::WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+
+        // Create new data for update
+        let new_data = lance_datagen::gen()
+            .with_seed(Seed::from(2))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let new_data = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
+        let new_data_stream = reader_to_stream(Box::new(new_data));
+
+        // This should use the fast path (execute_uncommitted_v2)
+        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+
+        // The optimized plan should use Inner join instead of Right join
+        // since we're not inserting unmatched rows
+        assert_plan_node_equals(
+            plan,
+            "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=DoNothing, when_not_matched_by_source=Keep
+  CoalescePartitionsExec
+    ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN key@2 IS NOT NULL AND _rowaddr@0 IS NOT NULL THEN 1 ELSE 0 END as action]
+      CoalesceBatchesExec...
+        HashJoinExec: mode=Partitioned, join_type=Inner, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
+          CoalesceBatchesExec...
+            RepartitionExec...
+              RepartitionExec...
+                LanceScan: uri=data, projection=[key], row_id=false, row_addr=true, ordered=false
+          CoalesceBatchesExec...
+            RepartitionExec...
+              RepartitionExec...
+                StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        ).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_conditional_update() {
+        let data = lance_datagen::gen()
+            .with_seed(Seed::from(1))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(32));
+
+        // Create dataset with initial data
+        let ds = Dataset::write(data, "memory://", None).await.unwrap();
+
+        // Create conditional update job (WhenMatched::UpdateIf)
+        let merge_insert_job = crate::dataset::MergeInsertBuilder::try_new(
+            Arc::new(ds.clone()),
+            vec!["key".to_string()],
+        )
+        .unwrap()
+        .when_matched(crate::dataset::WhenMatched::update_if(&ds, "true").unwrap())
+        .try_build()
+        .unwrap();
+
+        // Create new data for conditional update
+        let new_data = lance_datagen::gen()
+            .with_seed(Seed::from(2))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let new_data = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
+        let new_data_stream = reader_to_stream(Box::new(new_data));
+
+        // This should use the fast path (execute_uncommitted_v2)
+        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+
+        // The optimized plan should include the condition in the action expression
+        // Note: The exact condition expression will vary based on the optimizer
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            plan_str.contains("UpdateIf"),
+            "Plan should indicate conditional update"
+        );
+        assert!(
+            plan_str.contains("HashJoinExec"),
+            "Plan should use hash join"
+        );
     }
 }
