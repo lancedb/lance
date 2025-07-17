@@ -316,7 +316,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None))]
     fn new(
         py: Python,
         uri: String,
@@ -328,6 +328,7 @@ impl Dataset {
         storage_options: Option<HashMap<String, String>>,
         manifest: Option<&[u8]>,
         metadata_cache_size_bytes: Option<usize>,
+        index_cache_size_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -336,7 +337,9 @@ impl Dataset {
             #[allow(deprecated)]
             params.metadata_cache_size(metadata_cache_size);
         }
-        if let Some(index_cache_size) = index_cache_size {
+        if let Some(index_cache_size_bytes) = index_cache_size_bytes {
+            params.index_cache_size_bytes(index_cache_size_bytes);
+        } else if let Some(index_cache_size) = index_cache_size {
             // Convert from number of entries to bytes (assuming 20 MiB per entry)
             // This matches the Rust deprecated method's behavior
             let index_cache_size_bytes = index_cache_size * 20 * 1024 * 1024;

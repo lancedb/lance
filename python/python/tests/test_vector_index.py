@@ -947,11 +947,7 @@ def test_index_cache_size(tmp_path):
     dataset = lance.write_dataset(tbl, tmp_path / "test")
 
     dataset.create_index(
-        "vector",
-        index_type="IVF_PQ",
-        num_partitions=128,
-        num_sub_vectors=2,
-        index_cache_size=10,
+        "vector", index_type="IVF_PQ", num_partitions=128, num_sub_vectors=2
     )
 
     indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=0)
@@ -961,15 +957,13 @@ def test_index_cache_size(tmp_path):
     # index cache is size=0, there should be no hit
     assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
 
-    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=1)
+    indexed_dataset = lance.dataset(tmp_path / "test")
     # query using the same vector, we should get a very high hit rate
     # it isn't always exactly 199/200 perhaps because the stats counter
     # is a relaxed atomic counter and may lag behind the true value or perhaps
     # because the cache takes some time to get populated by background threads
     query_index(indexed_dataset, 200, q=rng.standard_normal(16))
-    # With the new cache size calculation (1 entry = 20 MiB), the hit rate
-    # might be lower than before but should still show caching is working
-    assert indexed_dataset._ds.index_cache_hit_rate() > 0.8
+    assert indexed_dataset._ds.index_cache_hit_rate() > 0.95
 
     last_hit_rate = indexed_dataset._ds.index_cache_hit_rate()
 
@@ -977,6 +971,65 @@ def test_index_cache_size(tmp_path):
     query_index(indexed_dataset, 128)
 
     assert last_hit_rate > indexed_dataset._ds.index_cache_hit_rate()
+
+
+def test_index_cache_size_bytes(tmp_path):
+    """Test the new index_cache_size_bytes parameter."""
+    rng = np.random.default_rng(seed=42)
+
+    def query_index(ds, ntimes, q=None):
+        ndim = ds.schema[0].type.list_size
+        for _ in range(ntimes):
+            ds.to_table(
+                nearest={
+                    "column": "vector",
+                    "q": q if q is not None else rng.standard_normal(ndim),
+                    "minimum_nprobes": 1,
+                },
+            )
+
+    tbl = create_table(nvec=1024, ndim=16)
+    dataset = lance.write_dataset(tbl, tmp_path / "test")
+
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=128, num_sub_vectors=2
+    )
+
+    # Test with index_cache_size_bytes=0 (no cache)
+    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size_bytes=0)
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
+    query_index(indexed_dataset, 1)
+    # No cache, so hit rate should be 0
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
+
+    # Test with index_cache_size_bytes=20MB (1 entry equivalent)
+    indexed_dataset = lance.dataset(
+        tmp_path / "test", index_cache_size_bytes=20 * 1024 * 1024
+    )
+    # Query using the same vector, we should get a good hit rate
+    query_index(indexed_dataset, 200, q=rng.standard_normal(16))
+    assert indexed_dataset._ds.index_cache_hit_rate() > 0.8
+
+
+def test_index_cache_size_deprecation(tmp_path):
+    """Test that index_cache_size shows deprecation warning."""
+    import warnings
+
+    tbl = create_table(nvec=100, ndim=16)
+    lance.write_dataset(tbl, tmp_path / "test")
+
+    # Test deprecation warning
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+
+        # This should trigger the deprecation warning
+        lance.dataset(tmp_path / "test", index_cache_size=256)
+
+        # Check that a deprecation warning was issued
+        assert len(w) == 1
+        assert issubclass(w[0].category, DeprecationWarning)
+        assert "index_cache_size" in str(w[0].message)
+        assert "index_cache_size_bytes" in str(w[0].message)
 
 
 def test_f16_index(tmp_path: Path):
