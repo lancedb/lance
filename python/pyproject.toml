@@ -80,7 +80,11 @@ include = [
     "python/lance/dependencies.py",
     "python/lance/schema.py",
     "python/lance/file.py",
-    "python/lance/util.py",
+    "python/lance/types.py",
+    "python/lance/log.py",
+    "python/lance/commit.py",
+    "python/lance/optimize.py",
+    "python/lance/_datagen.py",
 ]
 # Dependencies like pyarrow make this difficult to enforce strictly.
 reportMissingTypeStubs = "warning"
@@ -88,6 +92,8 @@ reportImportCycles = "error"
 reportUnusedImport = "error"
 reportPropertyTypeMismatch = "error"
 reportUnnecessaryCast = "error"
+# Allow missing imports for optional dependencies
+reportMissingImports = "warning"
 
 
 [tool.pytest.ini_options]
