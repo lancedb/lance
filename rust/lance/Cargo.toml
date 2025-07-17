@@ -124,6 +124,7 @@ protoc = [
 aws = ["lance-io/aws"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
+oss = ["lance-io/oss"]
 
 [[bin]]
 name = "lq"
