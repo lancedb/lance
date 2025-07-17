@@ -5393,9 +5393,9 @@ dependencies = [
 
 [[package]]
 name = "object_store_opendal"
-version = "0.52.1"
+version = "0.54.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28eaaf0a67714fa27acb7771668c1eba78fa9b01494704fde05faa5f3e1d3d89"
+checksum = "5ce697ee723fdc3eaf6c457abf4059034be15167022b18b619993802cd1443d5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5454,12 +5454,11 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "opendal"
-version = "0.53.3"
+version = "0.54.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f947c4efbca344c1a125753366033c8107f552b2e3f8251815ed1908f116ca3e"
+checksum = "ffb9838d0575c6dbaf3fcec7255af8d5771996d4af900bbb6fa9a314dec00a1a"
 dependencies = [
  "anyhow",
- "async-trait",
  "backon",
  "base64 0.22.1",
  "bytes",
