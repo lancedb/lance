@@ -44,6 +44,7 @@ paste = "1.0.15"
 seq-macro = "0.3.5"
 byteorder.workspace = true
 lz4 = "1.28.1"
+snap = "1.1"
 
 [dev-dependencies]
 lance-testing.workspace = true
