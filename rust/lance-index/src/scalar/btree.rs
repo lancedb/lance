@@ -44,7 +44,7 @@ use lance_datafusion::{
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
 };
 use log::debug;
-use moka::sync::Cache;
+use moka::future::Cache;
 use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
 use snafu::location;
@@ -769,10 +769,25 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        if let Some(cached) = self.page_cache.0.get(&page_number) {
-            return Ok(cached);
-        }
+        self.page_cache
+            .0
+            .try_get_with(
+                page_number,
+                self.load_page(page_number, index_reader, metrics),
+            )
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("Failed to load page {page_number}: {e}"),
+                location: location!(),
+            })
+    }
 
+    async fn load_page(
+        &self,
+        page_number: u32,
+        index_reader: LazyIndexReader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
         metrics.record_part_load();
         info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
@@ -783,7 +798,6 @@ impl BTreeIndex {
             serialized_page = fri_ref.remap_row_ids_record_batch(serialized_page, 1)?;
         }
         let subindex = self.sub_index.load_subindex(serialized_page).await?;
-        self.page_cache.0.insert(page_number, subindex.clone());
         Ok(subindex)
     }
 
