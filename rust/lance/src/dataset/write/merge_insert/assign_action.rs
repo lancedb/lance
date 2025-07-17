@@ -50,7 +50,10 @@ impl Action {
 
 /// Transforms merge insert parameters into a logical expression. The output
 /// is a single "action" column, that describes what to do with each row.
-pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
+pub fn merge_insert_action(
+    params: &MergeInsertParams,
+    schema: Option<&arrow_schema::Schema>,
+) -> Result<Expr> {
     // Check that at least one key column is non-null in the source
     // This ensures we only process rows that have valid join keys
     let source_has_key: Expr = if params.on.len() == 1 {
@@ -92,8 +95,14 @@ pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
             cases.push((matched, Action::UpdateAll.as_literal_expr()));
         }
         WhenMatched::UpdateIf(condition) => {
+            // Transform struct field access to qualified column reference
+            let transformed_condition =
+                crate::dataset::write::merge_insert::transform_struct_to_qualified_expr_with_schema(
+                    condition.clone(),
+                    schema,
+                );
             cases.push((
-                matched.and(condition.clone()),
+                matched.and(transformed_condition),
                 Action::UpdateAll.as_literal_expr(),
             ));
         }

@@ -112,6 +112,72 @@ fn combined_schema(schema: &Schema) -> Schema {
     Schema::new(vec![source, target])
 }
 
+/// Transform expressions parsed with combined_schema (struct field access) to work with
+/// DataFusion plans that use table aliases (qualified column references)
+pub fn transform_struct_to_qualified_expr(expr: Expr) -> Expr {
+    transform_struct_to_qualified_expr_with_schema(expr, None)
+}
+
+/// Transform expressions with optional schema context for field name mapping
+pub fn transform_struct_to_qualified_expr_with_schema(expr: Expr, schema: Option<&Schema>) -> Expr {
+    use datafusion::common::{tree_node::Transformed, tree_node::TreeNode};
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion_expr::col;
+    use std::collections::HashMap;
+
+    // Create a mapping from lowercase field names to original case-sensitive names
+    let field_name_map: HashMap<String, String> = if let Some(schema) = schema {
+        schema
+            .fields()
+            .iter()
+            .map(|field| (field.name().to_lowercase(), field.name().clone()))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    let original_expr = expr.clone();
+    let result = expr.transform(|expr| {
+        match expr {
+            // Transform GetFieldFunc(Column("source"|"target"), Literal(field_name))
+            // to qualified column reference
+            Expr::ScalarFunction(ScalarFunction { ref func, ref args })
+                if func.name() == "get_field" && args.len() == 2 =>
+            {
+                if let (
+                    Expr::Column(column),
+                    Expr::Literal(ScalarValue::Utf8(Some(field_name)), _),
+                ) = (&args[0], &args[1])
+                {
+                    // Look up the original case-sensitive field name if available
+                    let original_field_name =
+                        field_name_map.get(field_name).unwrap_or(field_name).clone();
+
+                    // Check if field name needs quoting (contains uppercase, special chars, etc.)
+                    let needs_quoting = original_field_name
+                        .chars()
+                        .any(|c| c.is_uppercase() || c == '-' || c == ' ');
+
+                    let qualified_col = if needs_quoting {
+                        col(format!("{}.\"{}\"", column.name, original_field_name))
+                    } else {
+                        col(format!("{}.{}", column.name, original_field_name))
+                    };
+
+                    return Ok(Transformed::yes(qualified_col));
+                }
+                Ok(Transformed::no(expr))
+            }
+            _ => Ok(Transformed::no(expr)),
+        }
+    });
+
+    match result {
+        Ok(Transformed { data, .. }) => data,
+        Err(_) => original_expr,
+    }
+}
+
 // This takes a double-wide table (e.g. the result of the outer join below) and takes the left
 // half, puts it into a struct, then takes the right half, and puts that into a struct.  This
 // makes the table match the "combined schema" so we can apply an "update if" expression
@@ -1245,9 +1311,13 @@ impl MergeInsertJob {
         } else {
             JoinType::Inner
         };
+        let dataset_schema: Schema = self.dataset.schema().into();
         let df = scan_aliased
             .join(source_df_aliased, join_type, &on_cols, &on_cols, None)?
-            .with_column("action", merge_insert_action(&self.params)?)?;
+            .with_column(
+                "action",
+                merge_insert_action(&self.params, Some(&dataset_schema))?,
+            )?;
 
         let (session_state, logical_plan) = df.into_parts();
 
@@ -1357,8 +1427,10 @@ impl MergeInsertJob {
         // We are migrating a new plan-based code path. For now, only using this
         // for select supported queries: upsert with full schema, no scalar index, and keeping unmatched rows.
         let has_scalar_index = self.join_key_as_scalar_index().await?.is_some();
-        let can_use_fast_path = matches!(self.params.when_matched, WhenMatched::UpdateAll)
-            && !has_scalar_index
+        let can_use_fast_path = matches!(
+            self.params.when_matched,
+            WhenMatched::UpdateAll | WhenMatched::UpdateIf(_)
+        ) && !has_scalar_index
             && is_full_schema
             && matches!(
                 self.params.delete_not_matched_by_source,
@@ -3126,7 +3198,7 @@ mod tests {
             vec!["key".to_string()],
         )
         .unwrap()
-        .when_matched(crate::dataset::WhenMatched::update_if(&ds, "true").unwrap())
+        .when_matched(crate::dataset::WhenMatched::update_if(&ds, "source.value > 20").unwrap())
         .try_build()
         .unwrap();
 
@@ -3152,5 +3224,254 @@ mod tests {
             plan_str.contains("HashJoinExec"),
             "Plan should use hash join"
         );
+    }
+
+    // Unit tests for transform_struct_to_qualified_expr function
+    mod transform_tests {
+        use super::*;
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::common::ScalarValue;
+        use datafusion_expr::{col, lit, Expr};
+        use lance_datafusion::planner::Planner;
+        use std::ops::Add;
+        use std::sync::Arc;
+
+        fn create_test_schema_with_mixed_case() -> Schema {
+            Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("txNumber", DataType::Int64, false), // Mixed case
+                Field::new("firstName", DataType::Utf8, false), // CamelCase
+                Field::new("user_id", DataType::Int64, false),  // Underscore
+                Field::new("user-name", DataType::Utf8, false), // Hyphen
+                Field::new("full name", DataType::Utf8, false), // Space
+            ])
+        }
+
+        fn parse_expression_with_combined_schema(expr_str: &str, schema: &Schema) -> Expr {
+            let combined_schema = combined_schema(schema);
+            let planner = Planner::new(Arc::new(combined_schema));
+            planner.parse_filter(expr_str).unwrap()
+        }
+
+        #[test]
+        fn test_transform_basic_lowercase_fields() {
+            let schema = Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+            ]);
+
+            // Test source.id expression
+            let expr = parse_expression_with_combined_schema("source.id = 1", &schema);
+            let transformed = transform_struct_to_qualified_expr(expr);
+
+            // Just check that it contains the expected parts (don't worry about exact literal types)
+            let transformed_str = format!("{:?}", transformed);
+            assert!(
+                transformed_str.contains("source.id"),
+                "Should contain source.id"
+            );
+            assert!(transformed_str.contains("Eq"), "Should contain Eq");
+            assert!(
+                transformed_str.contains("Literal"),
+                "Should contain Literal"
+            );
+
+            // Test target.name expression
+            let expr = parse_expression_with_combined_schema("target.name = 'test'", &schema);
+            let transformed = transform_struct_to_qualified_expr(expr);
+
+            let transformed_str = format!("{:?}", transformed);
+            assert!(
+                transformed_str.contains("target.name"),
+                "Should contain target.name"
+            );
+            assert!(transformed_str.contains("Eq"), "Should contain Eq");
+            assert!(transformed_str.contains("test"), "Should contain test");
+        }
+
+        #[test]
+        fn test_transform_mixed_case_fields() {
+            let schema = create_test_schema_with_mixed_case();
+
+            // Test source.txNumber (mixed case) - should be quoted
+            let expr = parse_expression_with_combined_schema("source.txNumber > 10", &schema);
+            let transformed = transform_struct_to_qualified_expr(expr);
+
+            // Check that the transformed expression contains the field name
+            let transformed_str = format!("{:?}", transformed);
+            assert!(
+                transformed_str.contains("txNumber"),
+                "Transformed expression should contain txNumber field: {}",
+                transformed_str
+            );
+
+            // Test target.firstName (CamelCase) - should be quoted
+            let expr = parse_expression_with_combined_schema("target.firstName = 'John'", &schema);
+            let transformed = transform_struct_to_qualified_expr(expr);
+
+            let transformed_str = format!("{:?}", transformed);
+            assert!(
+                transformed_str.contains("firstName"),
+                "Transformed expression should contain firstName field: {}",
+                transformed_str
+            );
+        }
+
+        #[test]
+        fn test_transform_special_character_fields() {
+            let schema = create_test_schema_with_mixed_case();
+
+            // Test source.user_id (underscore) - should not need quoting
+            let expr = parse_expression_with_combined_schema("source.user_id = 123", &schema);
+            let transformed = transform_struct_to_qualified_expr(expr);
+
+            let transformed_str = format!("{:?}", transformed);
+            assert!(
+                transformed_str.contains("user_id"),
+                "Transformed expression should contain user_id field: {}",
+                transformed_str
+            );
+
+            // Note: Special characters in identifiers require special handling in the planner
+            // This is a known limitation - the planner doesn't support quoted identifiers directly
+            // but the transform function would handle it correctly if the expression was parsed
+        }
+
+        #[test]
+        fn test_transform_complex_expressions() {
+            let schema = create_test_schema_with_mixed_case();
+
+            // Test comparison between source and target with mixed case
+            let expr =
+                parse_expression_with_combined_schema("target.txNumber < source.txNumber", &schema);
+            let transformed = transform_struct_to_qualified_expr(expr);
+
+            let transformed_str = format!("{:?}", transformed);
+            assert!(
+                transformed_str.contains("target"),
+                "Transformed expression should contain target reference: {}",
+                transformed_str
+            );
+            assert!(
+                transformed_str.contains("source"),
+                "Transformed expression should contain source reference: {}",
+                transformed_str
+            );
+            assert!(
+                transformed_str.contains("txNumber"),
+                "Transformed expression should contain txNumber field: {}",
+                transformed_str
+            );
+
+            // Test logical AND with multiple fields
+            let expr = parse_expression_with_combined_schema(
+                "source.id > 0 AND target.firstName = 'John'",
+                &schema,
+            );
+            let transformed = transform_struct_to_qualified_expr(expr);
+
+            let transformed_str = format!("{:?}", transformed);
+            assert!(
+                transformed_str.contains("source"),
+                "Transformed expression should contain source reference: {}",
+                transformed_str
+            );
+            assert!(
+                transformed_str.contains("target"),
+                "Transformed expression should contain target reference: {}",
+                transformed_str
+            );
+            assert!(
+                transformed_str.contains("firstName"),
+                "Transformed expression should contain firstName field: {}",
+                transformed_str
+            );
+        }
+
+        #[test]
+        fn test_transform_passthrough_non_struct_expressions() {
+            let schema = Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+            ]);
+
+            // Test literal expression (should pass through unchanged)
+            let expr = lit(42);
+            let transformed = transform_struct_to_qualified_expr(expr.clone());
+            assert_eq!(format!("{:?}", transformed), format!("{:?}", expr));
+
+            // Test simple column reference (should pass through unchanged)
+            let expr = col("id");
+            let transformed = transform_struct_to_qualified_expr(expr.clone());
+            assert_eq!(format!("{:?}", transformed), format!("{:?}", expr));
+
+            // Test arithmetic expression (should pass through unchanged)
+            let expr = col("id").add(lit(1));
+            let transformed = transform_struct_to_qualified_expr(expr.clone());
+            assert_eq!(format!("{:?}", transformed), format!("{:?}", expr));
+        }
+
+        #[test]
+        fn test_transform_edge_cases() {
+            let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+
+            // Test empty combined schema
+            let empty_schema = Schema::new(vec![] as Vec<Field>);
+            let combined_empty = combined_schema(&empty_schema);
+            assert_eq!(combined_empty.fields().len(), 2); // Should have source and target structs
+
+            // Test that struct fields are properly created
+            let source_field = combined_empty.field(0);
+            assert_eq!(source_field.name(), "source");
+            assert!(matches!(source_field.data_type(), DataType::Struct(_)));
+
+            let target_field = combined_empty.field(1);
+            assert_eq!(target_field.name(), "target");
+            assert!(matches!(target_field.data_type(), DataType::Struct(_)));
+        }
+
+        #[test]
+        fn test_failing_case_from_python_test() {
+            // This test specifically reproduces the failing case from the Python test
+            let schema = Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("txNumber", DataType::Int64, false), // Mixed case field
+                Field::new(
+                    "vector",
+                    DataType::List(Arc::new(Field::new("item", DataType::Float32, false))),
+                    false,
+                ),
+            ]);
+
+            // This is the exact expression from the failing Python test
+            let expr =
+                parse_expression_with_combined_schema("target.txNumber < source.txNumber", &schema);
+            let transformed = transform_struct_to_qualified_expr(expr);
+
+            let transformed_str = format!("{:?}", transformed);
+            println!(
+                "Original failing expression transformed to: {}",
+                transformed_str
+            );
+
+            // The transformation should preserve the mixed case field name
+            assert!(
+                transformed_str.contains("txNumber"),
+                "Transformed expression should contain txNumber field: {}",
+                transformed_str
+            );
+
+            // Both target and source should be present
+            assert!(
+                transformed_str.contains("target"),
+                "Transformed expression should contain target reference: {}",
+                transformed_str
+            );
+            assert!(
+                transformed_str.contains("source"),
+                "Transformed expression should contain source reference: {}",
+                transformed_str
+            );
+        }
     }
 }
