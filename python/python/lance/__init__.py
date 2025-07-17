@@ -78,6 +78,7 @@ def dataset(
     storage_options: Optional[Dict[str, str]] = None,
     default_scan_options: Optional[Dict[str, str]] = None,
     metadata_cache_size_bytes: Optional[int] = None,
+    index_cache_size_bytes: Optional[int] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -137,6 +138,7 @@ def dataset(
         storage_options=storage_options,
         default_scan_options=default_scan_options,
         metadata_cache_size_bytes=metadata_cache_size_bytes,
+        index_cache_size_bytes=index_cache_size_bytes,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -156,6 +158,7 @@ def dataset(
                 commit_lock=commit_lock,
                 index_cache_size=index_cache_size,
                 metadata_cache_size_bytes=metadata_cache_size_bytes,
+                index_cache_size_bytes=index_cache_size_bytes,
             )
     else:
         return ds
