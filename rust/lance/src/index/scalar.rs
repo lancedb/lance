@@ -455,13 +455,14 @@ pub async fn detect_scalar_index_type(
     } else {
         let uuid = index.uuid.to_string();
         let type_key = crate::session::index_caches::ScalarIndexTypeKey { uuid: &uuid };
-        if let Some(index_type) = dataset.index_cache.get_with_key(&type_key) {
+        if let Some(index_type) = dataset.index_cache.get_with_key(&type_key).await {
             return Ok(*index_type.as_ref());
         }
         let index_type = infer_scalar_index_type(dataset, &index.uuid.to_string(), column).await?;
         dataset
             .index_cache
-            .insert_with_key(&type_key, Arc::new(index_type));
+            .insert_with_key(&type_key, Arc::new(index_type))
+            .await;
         Ok(index_type)
     }
 }

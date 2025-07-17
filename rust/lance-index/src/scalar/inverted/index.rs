@@ -1018,12 +1018,14 @@ impl PostingListReader {
             let posting_range = self.posting_list_range(token_id as u32);
             let batch = batch.slice(posting_range.start, posting_range.end - posting_range.start);
             let posting_list = self.posting_list_from_batch(&batch, token_id as u32)?;
-            self.index_cache.insert_with_key(
-                &PostingListKey {
-                    token_id: token_id as u32,
-                },
-                Arc::new(posting_list),
-            );
+            self.index_cache
+                .insert_with_key(
+                    &PostingListKey {
+                        token_id: token_id as u32,
+                    },
+                    Arc::new(posting_list),
+                )
+                .await;
         }
 
         Ok(())

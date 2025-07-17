@@ -238,7 +238,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndexCacheEntry>> {
         let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
-        let part_entry = if let Some(part_idx) = self.index_cache.get_with_key(&cache_key) {
+        let part_entry = if let Some(part_idx) = self.index_cache.get_with_key(&cache_key).await {
             part_idx
         } else {
             info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key.key().as_ref());
@@ -259,7 +259,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
             // check the cache again, as the partition may have been loaded by another
             // thread that held the lock on loading the partition
-            if let Some(part_idx) = self.index_cache.get_with_key(&cache_key) {
+            if let Some(part_idx) = self.index_cache.get_with_key(&cache_key).await {
                 part_idx
             } else {
                 let schema = Arc::new(self.reader.schema().as_ref().into());
@@ -296,7 +296,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 });
                 if write_cache {
                     self.index_cache
-                        .insert_with_key(&cache_key, partition_entry.clone());
+                        .insert_with_key(&cache_key, partition_entry.clone())
+                        .await;
                 }
 
                 partition_entry

@@ -576,7 +576,7 @@ impl DatasetIndexExt for Dataset {
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
         };
-        let indices = match self.index_cache.get_with_key(&metadata_key) {
+        let indices = match self.index_cache.get_with_key(&metadata_key).await {
             Some(indices) => indices,
             None => {
                 let mut loaded_indices = read_manifest_indexes(
@@ -588,7 +588,8 @@ impl DatasetIndexExt for Dataset {
                 retain_supported_indices(&mut loaded_indices);
                 let loaded_indices = Arc::new(loaded_indices);
                 self.index_cache
-                    .insert_with_key(&metadata_key, loaded_indices.clone());
+                    .insert_with_key(&metadata_key, loaded_indices.clone())
+                    .await;
                 loaded_indices
             }
         };
@@ -1048,17 +1049,21 @@ impl DatasetIndexInternalExt for Dataset {
         // Checking for cache existence is cheap so we just check both scalar and vector caches
         let frag_reuse_uuid = self.frag_reuse_index_uuid();
         let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key) {
+        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
             return Ok(index.as_index());
         }
 
         let vector_cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self.index_cache.get_unsized_with_key(&vector_cache_key) {
+        if let Some(index) = self
+            .index_cache
+            .get_unsized_with_key(&vector_cache_key)
+            .await
+        {
             return Ok(index.as_index());
         }
 
         let frag_reuse_cache_key = FragReuseIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self.index_cache.get_with_key(&frag_reuse_cache_key) {
+        if let Some(index) = self.index_cache.get_with_key(&frag_reuse_cache_key).await {
             return Ok(index.as_index());
         }
 
@@ -1089,7 +1094,7 @@ impl DatasetIndexInternalExt for Dataset {
     ) -> Result<Arc<dyn ScalarIndex>> {
         let frag_reuse_uuid = self.frag_reuse_index_uuid();
         let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key) {
+        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
             return Ok(index);
         }
 
@@ -1104,7 +1109,8 @@ impl DatasetIndexInternalExt for Dataset {
         metrics.record_index_load();
 
         self.index_cache
-            .insert_unsized_with_key(&cache_key, index.clone());
+            .insert_unsized_with_key(&cache_key, index.clone())
+            .await;
         Ok(index)
     }
 
@@ -1117,7 +1123,7 @@ impl DatasetIndexInternalExt for Dataset {
         let frag_reuse_uuid = self.frag_reuse_index_uuid();
         let cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
 
-        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key) {
+        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
             log::debug!("Found vector index in cache uuid: {}", uuid);
             return Ok(index);
         }
@@ -1316,7 +1322,8 @@ impl DatasetIndexInternalExt for Dataset {
         let index = index?;
         metrics.record_index_load();
         self.index_cache
-            .insert_unsized_with_key(&cache_key, index.clone());
+            .insert_unsized_with_key(&cache_key, index.clone())
+            .await;
         Ok(index)
     }
 
@@ -1363,7 +1370,7 @@ impl DatasetIndexInternalExt for Dataset {
 
         let frag_reuse_uuid = self.frag_reuse_index_uuid();
         let cache_key = MemWalCacheKey::new(&mem_wal_meta.uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self.index_cache.get_with_key(&cache_key) {
+        if let Some(index) = self.index_cache.get_with_key(&cache_key).await {
             log::debug!("Found MemWAL index in cache uuid: {}", mem_wal_meta.uuid);
             return Ok(Some(index));
         }
@@ -1379,7 +1386,9 @@ impl DatasetIndexInternalExt for Dataset {
         info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_MEM_WAL);
         metrics.record_index_load();
 
-        self.index_cache.insert_with_key(&cache_key, index.clone());
+        self.index_cache
+            .insert_with_key(&cache_key, index.clone())
+            .await;
         Ok(Some(index))
     }
 
@@ -2334,7 +2343,7 @@ mod tests {
         assert_eq!(stats.read_bytes, 0);
         assert_eq!(indices.len(), 1);
 
-        session.index_cache.clear(); // Clear the cache
+        session.index_cache.clear().await; // Clear the cache
 
         let dataset2 = DatasetBuilder::from_uri(test_uri)
             .with_session(session.clone())

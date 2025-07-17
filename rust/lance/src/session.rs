@@ -68,7 +68,7 @@ impl std::fmt::Debug for Session {
                 &format!(
                     "LanceCache(items={}, size_bytes={})",
                     self.metadata_cache.0.approx_size(),
-                    self.metadata_cache.0.size_bytes(),
+                    self.metadata_cache.0.approx_size_bytes(),
                 ),
             )
             .field(
@@ -169,12 +169,12 @@ impl Session {
         self.store_registry.clone()
     }
 
-    pub fn metadata_cache_stats(&self) -> lance_core::cache::CacheStats {
-        self.metadata_cache.0.stats()
+    pub async fn metadata_cache_stats(&self) -> lance_core::cache::CacheStats {
+        self.metadata_cache.0.stats().await
     }
 
-    pub fn index_cache_stats(&self) -> lance_core::cache::CacheStats {
-        self.index_cache.0.stats()
+    pub async fn index_cache_stats(&self) -> lance_core::cache::CacheStats {
+        self.index_cache.0.stats().await
     }
 }
 
@@ -196,12 +196,13 @@ mod tests {
     use super::*;
     use lance_index::vector::VectorIndex;
 
-    #[test]
-    fn test_disable_index_cache() {
+    #[tokio::test]
+    async fn test_disable_index_cache() {
         let no_cache = Session::new(0, 0, Default::default());
         assert!(no_cache
             .index_cache
             .get_unsized::<dyn VectorIndex>("abc")
+            .await
             .is_none());
     }
 }

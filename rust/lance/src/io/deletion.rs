@@ -18,7 +18,7 @@ pub async fn read_dataset_deletion_file(
         deletion_file,
     };
 
-    if let Some(cached) = dataset.metadata_cache.get_with_key(&key) {
+    if let Some(cached) = dataset.metadata_cache.get_with_key(&key).await {
         Ok(cached)
     } else {
         let deletion_vector = Arc::new(
@@ -33,7 +33,8 @@ pub async fn read_dataset_deletion_file(
 
         dataset
             .metadata_cache
-            .insert_with_key(&key, deletion_vector.clone());
+            .insert_with_key(&key, deletion_vector.clone())
+            .await;
 
         Ok(deletion_vector)
     }

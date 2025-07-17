@@ -138,13 +138,17 @@ async fn do_commit_new_dataset(
             let tx_key = crate::session::caches::TransactionKey {
                 version: manifest.version,
             };
-            metadata_cache.insert_with_key(&tx_key, Arc::new(transaction.clone()));
+            metadata_cache
+                .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+                .await;
 
             let manifest_key = crate::session::caches::ManifestKey {
                 version: manifest_location.version,
                 e_tag: manifest_location.e_tag.as_deref(),
             };
-            metadata_cache.insert_with_key(&manifest_key, Arc::new(manifest.clone()));
+            metadata_cache
+                .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
+                .await;
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
@@ -837,7 +841,8 @@ pub(crate) async fn commit_transaction(
                 };
                 dataset
                     .metadata_cache
-                    .insert_with_key(&tx_key, Arc::new(transaction.clone()));
+                    .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+                    .await;
 
                 let manifest_key = crate::session::caches::ManifestKey {
                     version: manifest_location.version,
@@ -845,12 +850,16 @@ pub(crate) async fn commit_transaction(
                 };
                 dataset
                     .metadata_cache
-                    .insert_with_key(&manifest_key, Arc::new(manifest.clone()));
+                    .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
+                    .await;
                 if !indices.is_empty() {
                     let key = IndexMetadataKey {
                         version: target_version,
                     };
-                    dataset.index_cache.insert_with_key(&key, Arc::new(indices));
+                    dataset
+                        .index_cache
+                        .insert_with_key(&key, Arc::new(indices))
+                        .await;
                 }
 
                 match auto_cleanup_hook(&dataset, &manifest).await {
