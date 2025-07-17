@@ -1165,7 +1165,6 @@ pub fn apply_scalar_indices(
     expr: Expr,
     index_info: &dyn IndexInformationProvider,
 ) -> IndexedExpression {
-    log::warn!("apply_scalar_indices: {expr:?}");
     visit_node(&expr, index_info).unwrap_or(IndexedExpression::refine_only(expr))
 }
 
