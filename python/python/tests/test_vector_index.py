@@ -950,8 +950,8 @@ def test_index_cache_size(tmp_path):
         "vector", index_type="IVF_PQ", num_partitions=128, num_sub_vectors=2
     )
 
-    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=0)
-    # when there are no accesses, the hit rate is 0.0
+    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size_bytes=0)
+    # Zero size index cache means all queries should miss the cache
     assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
     query_index(indexed_dataset, 1)
     # index cache is size=0, there should be no hit
