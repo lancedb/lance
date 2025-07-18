@@ -1571,7 +1571,7 @@ impl Dataset {
         target_path: &str,
         ref_name: &str,
         write_params: Option<WriteParams>,
-    ) -> Result<Dataset> {
+    ) -> Result<Self> {
         // self.tags.create(ref_name, self.version().version).await?;
         let clone_op = Operation::Clone {
             is_shallow: true,
