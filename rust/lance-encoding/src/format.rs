@@ -194,6 +194,14 @@ impl ProtobufUtils {
         }
     }
 
+    pub fn byte_stream_split(bits_per_value: u64) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::ByteStreamSplit(pb::ByteStreamSplit {
+                bits_per_value,
+            })),
+        }
+    }
+
     pub fn general_mini_block(
         inner: ArrayEncoding,
         compression: CompressionConfig,
