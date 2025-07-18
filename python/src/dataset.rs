@@ -1515,11 +1515,11 @@ impl Dataset {
     }
 
     fn index_cache_entry_count(&self) -> PyResult<usize> {
-        Ok(self.ds.index_cache_entry_count())
+        RT.block_on(None, self.ds.index_cache_entry_count())
     }
 
     fn index_cache_hit_rate(&self) -> PyResult<f32> {
-        Ok(self.ds.index_cache_hit_rate())
+        RT.block_on(None, self.ds.index_cache_hit_rate())
     }
 
     fn session(&self) -> Session {
