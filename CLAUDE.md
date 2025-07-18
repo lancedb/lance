@@ -43,64 +43,22 @@ The project is organized as a Rust workspace with Python and Java bindings:
 
 ### Rust Development
 
-```bash
-# Building
-cargo build                          # Debug build
-cargo build --release               # Release build
-cargo build --features <features>   # Build with specific features
-
-# Testing
-cargo test                          # Run all tests
-cargo test <test_name>             # Run specific test
-cargo test --package <package>     # Test specific crate
-cargo test -- --nocapture          # Show println! output
-
-# Formatting & Linting
-cargo fmt                          # Format code
-cargo fmt -- --check              # Check formatting
-cargo clippy -- -D warnings       # Run linter
-
-# Dependency Checking
-cargo deny check                   # Audit dependencies
-```
+* Check for build errors: `cargo check --all --tests --benches`
+* Run tests: `cargo test`
+* Run specific test: `cargo test -p <package> <test_name>`
+* Lint: `cargo clippy --all --tests --benches -- -D warnings`
+* Format: `cargo fmt --all`
 
 ### Python Development
 
-```bash
-# Building Extension
-maturin develop                    # Build and install in dev mode
-maturin develop --release          # Build optimized version
-maturin develop --profile release-with-debug  # Release with debug symbols
+Use the makefile for most actions:
 
-# Testing
-pip install -e python[tests]       # Install test dependencies
-pytest python/tests               # Run all tests
-pytest -vvv -s python/tests      # Verbose output
-pytest --doctest-modules python/lance  # Run doctests
-pytest -k "test_pattern"         # Run tests matching pattern
-pytest --run-integration python/tests/test_s3_ddb.py  # Integration tests
-
-# Formatting & Linting
-ruff format python               # Format Python code
-ruff check python                # Run linter
-ruff check --fix python          # Auto-fix issues
-pyright                          # Type checking
-
-# Benchmarking
-pip install -e python[benchmarks]
-pytest python/benchmarks         # Run quick benchmarks
-pytest python/benchmarks -m "not slow"  # Skip slow benchmarks
-```
-
-### Building Wheels
-
-```bash
-# Linux x86_64 (requires Docker)
-docker run -v $(pwd):/io ghcr.io/pyo3/maturin:latest build --release -m python/Cargo.toml --features <features>
-
-# macOS
-maturin build --release -m python/Cargo.toml
-```
+* Build: `maturin develop`
+* Test: `make test`
+* Run single test: `pytest python/tests/<test_file>.py::<test_name>`
+* Doctest: `make doctest`
+* Lint: `make lint`
+* Format: `make format`
 
 ### Integration Testing
 
@@ -132,3 +90,25 @@ python python/benchmarks/test_knn.py --iterations 100
 - Always rebuild Python extension after Rust changes using `maturin develop`
 - Integration tests require Docker for local S3/DynamoDB emulation
 - Use feature flags to control dependencies (e.g., `datafusion` for SQL support)
+
+## Development tips
+
+Code standards:
+* Be mindful of memory use:
+  * When dealing with streams of `RecordBatch`, avoid collecting all data into
+    memory whenever possible.
+  * Use `RoaringBitmap` instead `HashSet<u32>`.
+
+Tests:
+* When writing unit tests, prefer using the `memory://` URI instead of creating
+  a temporary directory.
+* Use rstest to generate parameterized tests to cover more cases with fewer lines
+  of code.
+    * Use syntax `#[case::{name}(...)]` to provide human-readable names for each case.
+* For backwards compatibility, use the `test_data` directory to check in datasets
+  written with older library version.
+    * Check in a `datagen.py` that creates the test data. It should assert the
+      version of Lance used as part of the script.
+    * Use `pip install pylance=={version}` and then run `python datagen.py` to
+      create the dataset. The data files should be checked into git.
+    * Use `copy_test_data_to_tmp` to read this data in Lance
