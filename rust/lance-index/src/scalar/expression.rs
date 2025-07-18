@@ -61,8 +61,8 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     fn visit_between(
         &self,
         column: &str,
-        low: &ScalarValue,
-        high: &ScalarValue,
+        low: &Bound<ScalarValue>,
+        high: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression>;
     fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression>;
     fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression>;
@@ -108,8 +108,8 @@ impl ScalarQueryParser for MultiQueryParser {
     fn visit_between(
         &self,
         column: &str,
-        low: &ScalarValue,
-        high: &ScalarValue,
+        low: &Bound<ScalarValue>,
+        high: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
         self.parsers
             .iter()
@@ -169,11 +169,10 @@ impl ScalarQueryParser for SargableQueryParser {
     fn visit_between(
         &self,
         column: &str,
-        low: &ScalarValue,
-        high: &ScalarValue,
+        low: &Bound<ScalarValue>,
+        high: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
-        let query =
-            SargableQuery::Range(Bound::Included(low.clone()), Bound::Included(high.clone()));
+        let query = SargableQuery::Range(low.clone(), high.clone());
         Some(IndexedExpression::index_query(
             column.to_string(),
             self.index_name.clone(),
@@ -260,8 +259,8 @@ impl ScalarQueryParser for LabelListQueryParser {
     fn visit_between(
         &self,
         _: &str,
-        _: &ScalarValue,
-        _: &ScalarValue,
+        _: &Bound<ScalarValue>,
+        _: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
         None
     }
@@ -343,8 +342,8 @@ impl ScalarQueryParser for TextQueryParser {
     fn visit_between(
         &self,
         _: &str,
-        _: &ScalarValue,
-        _: &ScalarValue,
+        _: &Bound<ScalarValue>,
+        _: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
         None
     }
@@ -418,8 +417,8 @@ impl ScalarQueryParser for FtsQueryParser {
     fn visit_between(
         &self,
         _: &str,
-        _: &ScalarValue,
-        _: &ScalarValue,
+        _: &Bound<ScalarValue>,
+        _: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
         None
     }
@@ -922,7 +921,8 @@ fn visit_between(
     let low = maybe_scalar(&between.low, col_type)?;
     let high = maybe_scalar(&between.high, col_type)?;
 
-    let indexed_expr = query_parser.visit_between(column, &low, &high)?;
+    let indexed_expr =
+        query_parser.visit_between(column, &Bound::Included(low), &Bound::Included(high))?;
 
     if between.negated {
         indexed_expr.maybe_not()
@@ -1007,61 +1007,62 @@ fn visit_comparison(
     }
 }
 
-fn maybe_between(expr: &BinaryExpr) -> Option<Between> {
-    let left_comparison = match expr.left.as_ref() {
+fn maybe_range(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<IndexedExpression> {
+    let left_expr = match expr.left.as_ref() {
         Expr::BinaryExpr(binary_expr) => Some(binary_expr),
         _ => None,
     }?;
-    let right_comparison = match expr.right.as_ref() {
+    let right_expr = match expr.right.as_ref() {
         Expr::BinaryExpr(binary_expr) => Some(binary_expr),
         _ => None,
     }?;
 
-    match (left_comparison.op, right_comparison.op) {
-        (Operator::GtEq, Operator::LtEq) => {
-            // We have x >= y && a <= b.
-            // If x == a then it is a between query
-            // if y == b then it is a between query
-            if left_comparison.left == right_comparison.left {
-                Some(Between {
-                    expr: left_comparison.left.clone(),
-                    low: left_comparison.right.clone(),
-                    high: right_comparison.right.clone(),
-                    negated: false,
-                })
-            } else if left_comparison.right == right_comparison.right {
-                Some(Between {
-                    expr: left_comparison.right.clone(),
-                    low: right_comparison.left.clone(),
-                    high: left_comparison.left.clone(),
-                    negated: false,
-                })
-            } else {
-                None
-            }
-        }
-        (Operator::LtEq, Operator::GtEq) => {
-            // Same logic as above we just switch the low/high
-            if left_comparison.left == right_comparison.left {
-                Some(Between {
-                    expr: left_comparison.left.clone(),
-                    low: right_comparison.right.clone(),
-                    high: left_comparison.right.clone(),
-                    negated: false,
-                })
-            } else if left_comparison.right == right_comparison.right {
-                Some(Between {
-                    expr: left_comparison.right.clone(),
-                    low: left_comparison.left.clone(),
-                    high: right_comparison.left.clone(),
-                    negated: false,
-                })
-            } else {
-                None
-            }
-        }
-        _ => None,
+    let (left_col, dt, parser) = maybe_indexed_column(&left_expr.left, index_info)?;
+    let right_col = maybe_column(&right_expr.left)?;
+
+    if left_col != right_col {
+        return None;
     }
+
+    let left_value = maybe_scalar(&left_expr.right, dt)?;
+    let right_value = maybe_scalar(&right_expr.right, dt)?;
+
+    let (low, high) = match (left_expr.op, right_expr.op) {
+        // x >= a && x <= b
+        (Operator::GtEq, Operator::LtEq) => {
+            (Bound::Included(left_value), Bound::Included(right_value))
+        }
+        // x >= a && x < b
+        (Operator::GtEq, Operator::Lt) => {
+            (Bound::Included(left_value), Bound::Excluded(right_value))
+        }
+        // x > a && x <= b
+        (Operator::Gt, Operator::LtEq) => {
+            (Bound::Excluded(left_value), Bound::Included(right_value))
+        }
+        // x > a && x < b
+        (Operator::Gt, Operator::Lt) => (Bound::Excluded(left_value), Bound::Excluded(right_value)),
+        // x <= a && x >= b
+        (Operator::LtEq, Operator::GtEq) => {
+            (Bound::Included(right_value), Bound::Included(left_value))
+        }
+        // x <= a && x > b
+        (Operator::LtEq, Operator::Gt) => {
+            (Bound::Included(right_value), Bound::Excluded(left_value))
+        }
+        // x < a && x >= b
+        (Operator::Lt, Operator::GtEq) => {
+            (Bound::Excluded(right_value), Bound::Included(left_value))
+        }
+        // x < a && x > b
+        (Operator::Lt, Operator::Gt) => (Bound::Excluded(right_value), Bound::Excluded(left_value)),
+        _ => return None,
+    };
+
+    parser.visit_between(left_col, &low, &high)
 }
 
 fn visit_and(
@@ -1075,8 +1076,8 @@ fn visit_and(
     // Note: We can't rely on users writing the SQL BETWEEN operator because:
     //   * Some users won't realize it's an option or a good idea
     //   * Datafusion's simplifier will rewrite the BETWEEN operator into two separate range queries
-    if let Some(between) = maybe_between(expr) {
-        return visit_between(&between, index_info);
+    if let Some(range_expr) = maybe_range(expr, index_info) {
+        return Some(range_expr);
     }
 
     let left = visit_node(&expr.left, index_info);
@@ -1261,6 +1262,8 @@ mod tests {
     use arrow_schema::{Field, Schema};
     use datafusion::prelude::SessionContext;
     use datafusion_common::{Column, DFSchema};
+    use datafusion_expr::execution_props::ExecutionProps;
+    use datafusion_expr::simplify::SimplifyContext;
 
     use super::*;
 
@@ -1303,6 +1306,7 @@ mod tests {
         index_info: &dyn IndexInformationProvider,
         expr: &str,
         expected: Option<IndexedExpression>,
+        optimize: bool,
     ) {
         let schema = Schema::new(vec![
             Field::new("color", DataType::Utf8, false),
@@ -1315,7 +1319,14 @@ mod tests {
 
         let ctx = SessionContext::default();
         let state = ctx.state();
-        let expr = state.create_logical_expr(expr, &df_schema).unwrap();
+        let mut expr = state.create_logical_expr(expr, &df_schema).unwrap();
+        if optimize {
+            let props = ExecutionProps::default();
+            let simplify_context = SimplifyContext::new(&props).with_schema(Arc::new(df_schema));
+            let simplifier =
+                datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
+            expr = simplifier.simplify(expr).unwrap();
+        }
 
         let actual = apply_scalar_indices(expr.clone(), index_info);
         if let Some(expected) = expected {
@@ -1327,7 +1338,7 @@ mod tests {
     }
 
     fn check_no_index(index_info: &dyn IndexInformationProvider, expr: &str) {
-        check(index_info, expr, None)
+        check(index_info, expr, None, false)
     }
 
     fn check_simple(
@@ -1344,6 +1355,25 @@ mod tests {
                 format!("{}_idx", col),
                 Arc::new(query),
             )),
+            false,
+        )
+    }
+
+    fn check_range(
+        index_info: &dyn IndexInformationProvider,
+        expr: &str,
+        col: &str,
+        query: SargableQuery,
+    ) {
+        check(
+            index_info,
+            expr,
+            Some(IndexedExpression::index_query(
+                col.to_string(),
+                format!("{}_idx", col),
+                Arc::new(query),
+            )),
+            true,
         )
     }
 
@@ -1365,6 +1395,7 @@ mod tests {
                 .maybe_not()
                 .unwrap(),
             ),
+            false,
         )
     }
 
@@ -1410,7 +1441,7 @@ mod tests {
             SargableQuery::Equals(ScalarValue::UInt32(Some(5))),
         );
         // 5 different ways of writing BETWEEN (all should be recognized)
-        check_simple(
+        check_range(
             &index_info,
             "aisle BETWEEN 5 AND 10",
             "aisle",
@@ -1419,7 +1450,7 @@ mod tests {
                 Bound::Included(ScalarValue::UInt32(Some(10))),
             ),
         );
-        check_simple(
+        check_range(
             &index_info,
             "aisle >= 5 AND aisle <= 10",
             "aisle",
@@ -1429,7 +1460,7 @@ mod tests {
             ),
         );
 
-        check_simple(
+        check_range(
             &index_info,
             "aisle <= 10 AND aisle >= 5",
             "aisle",
@@ -1439,7 +1470,7 @@ mod tests {
             ),
         );
 
-        check_simple(
+        check_range(
             &index_info,
             "5 <= aisle AND 10 >= aisle",
             "aisle",
@@ -1449,7 +1480,7 @@ mod tests {
             ),
         );
 
-        check_simple(
+        check_range(
             &index_info,
             "10 >= aisle AND 5 <= aisle",
             "aisle",
@@ -1605,6 +1636,7 @@ mod tests {
                 scalar_query: Some(ScalarIndexExpr::And(left.clone(), right.clone())),
                 refine_expr: None,
             }),
+            false,
         );
         // Compound AND's and not all of them are indexed columns
         let refine = Expr::Column(Column::new_unqualified("size")).gt(datafusion_expr::lit(30_i64));
@@ -1615,6 +1647,7 @@ mod tests {
                 scalar_query: Some(ScalarIndexExpr::And(left.clone(), right.clone())),
                 refine_expr: Some(refine.clone()),
             }),
+            false,
         );
         // Compounded OR's where ALL columns are indexed
         check(
@@ -1624,6 +1657,7 @@ mod tests {
                 scalar_query: Some(ScalarIndexExpr::Or(left.clone(), right.clone())),
                 refine_expr: None,
             }),
+            false,
         );
         // Compounded OR's with one or more unindexed columns
         check_no_index(&index_info, "aisle = 10 OR color = 'blue' OR size > 30");
@@ -1635,6 +1669,7 @@ mod tests {
                 scalar_query: Some(ScalarIndexExpr::Or(left, right)),
                 refine_expr: Some(refine),
             }),
+            false,
         );
         // Examples of things that are not yet supported but should be supportable someday
 

@@ -129,6 +129,8 @@ mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = { version = "0.12", features = ["future", "sync"] }
 num-traits = "0.2"
 object_store = { version = "0.12.2" }
+opendal = { version = "0.54" }
+object_store_opendal = { version = "0.54" }
 pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.14.0", features = ["flamegraph", "criterion"] }

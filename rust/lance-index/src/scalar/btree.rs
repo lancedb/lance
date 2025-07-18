@@ -44,7 +44,7 @@ use lance_datafusion::{
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
 };
 use log::debug;
-use moka::sync::Cache;
+use moka::future::Cache;
 use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
 use snafu::location;
@@ -769,10 +769,25 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        if let Some(cached) = self.page_cache.0.get(&page_number) {
-            return Ok(cached);
-        }
+        self.page_cache
+            .0
+            .try_get_with(
+                page_number,
+                self.load_page(page_number, index_reader, metrics),
+            )
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("Failed to load page {page_number}: {e}"),
+                location: location!(),
+            })
+    }
 
+    async fn load_page(
+        &self,
+        page_number: u32,
+        index_reader: LazyIndexReader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
         metrics.record_part_load();
         info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
@@ -783,7 +798,6 @@ impl BTreeIndex {
             serialized_page = fri_ref.remap_row_ids_record_batch(serialized_page, 1)?;
         }
         let subindex = self.sub_index.load_subindex(serialized_page).await?;
-        self.page_cache.0.insert(page_number, subindex.clone());
         Ok(subindex)
     }
 
@@ -949,7 +963,7 @@ impl Index for BTreeIndex {
             .buffer_unordered(get_num_compute_intensive_cpus());
 
         while let Some((page_idx, sub_idx)) = pages.try_next().await? {
-            self.page_cache.0.insert(page_idx, sub_idx);
+            self.page_cache.0.insert(page_idx, sub_idx).await;
         }
         Ok(())
     }
@@ -1407,6 +1421,7 @@ impl Stream for IndexReaderStream {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
@@ -1427,6 +1442,7 @@ mod tests {
     use object_store::path::Path;
     use tempfile::tempdir;
 
+    use crate::metrics::LocalMetricsCollector;
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
@@ -1574,5 +1590,43 @@ mod tests {
                 SearchResult::Exact(RowIdTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_page_cache() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data = gen()
+            .col("value", array::step::<Float32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(1000), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new(LexOrdering::new(vec![sort_expr]), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+        let data_source = Box::new(MockTrainingSource::from(stream));
+        let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
+
+        train_btree_index(data_source, &sub_index_trainer, test_store.as_ref(), 64)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store, None).await.unwrap();
+
+        let query = SargableQuery::Equals(ScalarValue::Float32(Some(0.0)));
+        let metrics = LocalMetricsCollector::default();
+        let query1 = index.search(&query, &metrics);
+        let query2 = index.search(&query, &metrics);
+        tokio::join!(query1, query2).0.unwrap();
+        assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
     }
 }
