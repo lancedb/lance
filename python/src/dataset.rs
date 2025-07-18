@@ -1099,17 +1099,27 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature=(updates, predicate=None))]
+    #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None))]
     fn update(
         &mut self,
         updates: &Bound<'_, PyDict>,
         predicate: Option<&str>,
+        conflict_retries: Option<u32>,
+        retry_timeout: Option<std::time::Duration>,
     ) -> PyResult<PyObject> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
             builder = builder
                 .update_where(predicate)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+
+        if let Some(retries) = conflict_retries {
+            builder = builder.conflict_retries(retries);
+        }
+
+        if let Some(timeout) = retry_timeout {
+            builder = builder.retry_timeout(timeout);
         }
 
         for (key, value) in updates {
