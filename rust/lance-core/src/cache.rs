@@ -10,7 +10,7 @@ use std::sync::{
     Arc,
 };
 
-use futures::Future;
+use futures::{Future, FutureExt};
 use moka::future::Cache;
 use snafu::location;
 
@@ -207,12 +207,6 @@ impl LanceCache {
         let full_key = self.get_key(&key);
         let cache_key = (full_key, TypeId::of::<T>());
 
-        // First check if it's already in cache
-        if let Some(metadata) = self.cache.get(&cache_key).await {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(metadata.record.clone().downcast::<T>().unwrap());
-        }
-
         // Use optionally_get_with to handle concurrent requests
         let hits = self.hits.clone();
         let misses = self.misses.clone();
@@ -283,7 +277,7 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.insert(&cache_key.key(), metadata).await
+        self.insert(&cache_key.key(), metadata).boxed().await
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -291,7 +285,7 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.get::<K::ValueType>(&cache_key.key()).await
+        self.get::<K::ValueType>(&cache_key.key()).boxed().await
     }
 
     pub async fn get_or_insert_with_key<K, F, Fut>(
@@ -306,7 +300,7 @@ impl LanceCache {
         Fut: Future<Output = Result<K::ValueType>> + Send,
     {
         let key_str = cache_key.key().into_owned();
-        self.get_or_insert(key_str, |_| loader()).await
+        Box::pin(self.get_or_insert(key_str, |_| loader())).await
     }
 
     pub async fn insert_unsized_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
@@ -314,7 +308,9 @@ impl LanceCache {
         K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.insert_unsized(&cache_key.key(), metadata).await
+        self.insert_unsized(&cache_key.key(), metadata)
+            .boxed()
+            .await
     }
 
     pub async fn get_unsized_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -322,7 +318,9 @@ impl LanceCache {
         K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.get_unsized::<K::ValueType>(&cache_key.key()).await
+        self.get_unsized::<K::ValueType>(&cache_key.key())
+            .boxed()
+            .await
     }
 }
 
