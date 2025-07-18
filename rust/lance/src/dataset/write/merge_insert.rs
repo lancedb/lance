@@ -112,11 +112,6 @@ fn combined_schema(schema: &Schema) -> Schema {
     Schema::new(vec![source, target])
 }
 
-// TODO: Remove these old transform functions - they're no longer needed with deferred parsing
-// The deferred parsing approach parses expressions directly with the appropriate schema
-// (dataset schema for fast path, combined schema for slow path) instead of transforming
-// already-parsed expressions.
-
 // This takes a double-wide table (e.g. the result of the outer join below) and takes the left
 // half, puts it into a struct, then takes the right half, and puts that into a struct.  This
 // makes the table match the "combined schema" so we can apply an "update if" expression
@@ -3119,7 +3114,6 @@ mod tests {
         let ds = Dataset::write(data, "memory://", None).await.unwrap();
 
         // Create conditional update job (WhenMatched::UpdateIf)
-        // This should now use the fast path with the improved expression parsing
         let merge_insert_job = crate::dataset::MergeInsertBuilder::try_new(
             Arc::new(ds.clone()),
             vec!["key".to_string()],
@@ -3137,7 +3131,6 @@ mod tests {
         let new_data_reader = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
         let new_data_stream = reader_to_stream(Box::new(new_data_reader));
 
-        // This should use the fast path (execute_uncommitted_v2) with UpdateIf support
         let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
 
         // The optimized plan should include the condition in the action expression

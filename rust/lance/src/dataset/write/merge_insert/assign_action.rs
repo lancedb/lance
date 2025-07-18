@@ -107,9 +107,6 @@ pub fn merge_insert_action(
                         location: location!(),
                     }
                 })?;
-                // Skip optimization for qualified column references since the schema doesn't have the relations
-                // The DataFusion execution engine will handle the resolution properly at runtime
-
                 cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
             } else {
                 // Fallback - this shouldn't happen in the fast path

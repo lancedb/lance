@@ -272,14 +272,10 @@ impl Planner {
         }
 
         if self.enable_relations && idents.len() > 1 {
-            // Treat the first identifier as a relation/table name and second as the column name
+            // Create qualified column reference (relation.column)
             let relation = &idents[0].value;
             let column_name = &idents[1].value;
-
-            // Directly construct the Column struct to preserve casing
             let column = Expr::Column(Column::new(Some(relation.clone()), column_name.clone()));
-
-            // Handle any additional field access (for nested fields)
             let mut result = column;
             handle_remaining_idents(&mut result, &idents[2..]);
             result
