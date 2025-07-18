@@ -11,12 +11,9 @@ use humantime::format_duration;
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::datatypes::Schema;
 use lance_core::datatypes::SchemaCompareOptions;
-<<<<<<< HEAD
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
-=======
 use lance_core::ROW_ADDR;
 use lance_core::ROW_ID;
->>>>>>> d43eec607 (Fixing python bugs)
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
