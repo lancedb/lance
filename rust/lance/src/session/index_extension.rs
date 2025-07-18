@@ -94,7 +94,7 @@ mod test {
 
     impl DeepSizeOf for MockIndex {
         fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-            todo!()
+            0
         }
     }
 

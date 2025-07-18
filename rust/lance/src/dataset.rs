@@ -12,7 +12,8 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 
-use crate::session::caches::{ManifestKey, TransactionKey};
+use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
+use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
@@ -85,7 +86,6 @@ use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
     detect_overlapping_fragments, read_transaction_file,
 };
-use crate::session::caches::DSMetadataCache;
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
@@ -112,11 +112,13 @@ const INDICES_DIR: &str = "_indices";
 
 pub const DATA_DIR: &str = "data";
 pub const BLOB_DIR: &str = "_blobs";
-pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
+// We default to 6GB for the index cache, since indices are often large but
+// worth caching.
+pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
 // Default to 1 GiB for the metadata cache. Column metadata can be like 40MB,
 // so this should be enough for a few hundred columns. Other metadata is much
 // smaller.
-pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
+pub const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Lance Dataset
 #[derive(Clone)]
@@ -137,6 +139,7 @@ pub struct Dataset {
     pub tags: Tags,
 
     // These are references to session caches, but with the dataset URI as a prefix.
+    pub(crate) index_cache: Arc<DSIndexCache>,
     pub(crate) metadata_cache: Arc<DSMetadataCache>,
 }
 
@@ -178,9 +181,9 @@ impl From<&Manifest> for Version {
 /// Customize read behavior of a dataset.
 #[derive(Clone, Debug)]
 pub struct ReadParams {
-    /// Cache size for index cache. If it is zero, index cache is disabled.
-    ///
-    pub index_cache_size: usize,
+    /// Size of the index cache in bytes. This cache stores index data in memory
+    /// for faster lookups. The default is 6 GiB.
+    pub index_cache_size_bytes: usize,
 
     /// Size of the metadata cache in bytes. This cache stores metadata in memory
     /// for faster open table and scans. The default is 1 GiB.
@@ -214,8 +217,18 @@ pub struct ReadParams {
 
 impl ReadParams {
     /// Set the cache size for indices. Set to zero, to disable the cache.
+    #[deprecated(
+        since = "0.30.0",
+        note = "Use `index_cache_size_bytes` instead, which accepts a size in bytes."
+    )]
     pub fn index_cache_size(&mut self, cache_size: usize) -> &mut Self {
-        self.index_cache_size = cache_size;
+        let assumed_entry_size = 20 * 1024 * 1024; // 20 MiB per entry
+        self.index_cache_size_bytes = cache_size * assumed_entry_size;
+        self
+    }
+
+    pub fn index_cache_size_bytes(&mut self, cache_size: usize) -> &mut Self {
+        self.index_cache_size_bytes = cache_size;
         self
     }
 
@@ -251,7 +264,7 @@ impl ReadParams {
 impl Default for ReadParams {
     fn default() -> Self {
         Self {
-            index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
+            index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             session: None,
             store_options: None,
@@ -382,7 +395,7 @@ impl Dataset {
         let manifest = Self::load_manifest(
             self.object_store.as_ref(),
             &manifest_location,
-            &base_path,
+            &self.uri,
             self.session.as_ref(),
         )
         .await?;
@@ -405,7 +418,7 @@ impl Dataset {
     async fn load_manifest(
         object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
-        base_path: &Path,
+        uri: &str,
         session: &Session,
     ) -> Result<Manifest> {
         let object_reader = if let Some(size) = manifest_location.size {
@@ -476,16 +489,19 @@ impl Dataset {
                 let message_data =
                     &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
                 let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-                let indices = section
+                let indices: Vec<Index> = section
                     .indices
                     .into_iter()
                     .map(Index::try_from)
                     .collect::<Result<Vec<_>>>()?;
-                session.index_cache.insert_metadata(
-                    base_path.as_ref(),
-                    manifest_location.version,
-                    Arc::new(indices),
-                );
+
+                let ds_index_cache = session.index_cache.for_dataset(uri);
+                let metadata_key = crate::session::index_caches::IndexMetadataKey {
+                    version: manifest_location.version,
+                };
+                ds_index_cache
+                    .insert_with_key(&metadata_key, Arc::new(indices))
+                    .await;
             }
         }
 
@@ -512,6 +528,7 @@ impl Dataset {
             base_path.clone(),
         );
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
+        let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
         Ok(Self {
             object_store,
             base: base_path,
@@ -522,6 +539,7 @@ impl Dataset {
             session,
             tags,
             metadata_cache,
+            index_cache,
         })
     }
 
@@ -631,7 +649,7 @@ impl Dataset {
             version: location.version,
             e_tag: location.e_tag.as_deref(),
         };
-        let cached_manifest = self.metadata_cache.get_with_key(&manifest_key);
+        let cached_manifest = self.metadata_cache.get_with_key(&manifest_key).await;
         if let Some(cached_manifest) = cached_manifest {
             return Ok((cached_manifest, location));
         }
@@ -1058,13 +1076,14 @@ impl Dataset {
     }
 
     /// Get the number of entries currently in the index cache.
-    pub fn index_cache_entry_count(&self) -> usize {
-        self.session.index_cache.get_size()
+    pub async fn index_cache_entry_count(&self) -> usize {
+        self.session.index_cache.size().await
     }
 
     /// Get cache hit ratio.
-    pub fn index_cache_hit_rate(&self) -> f32 {
-        self.session.index_cache.hit_rate()
+    pub async fn index_cache_hit_rate(&self) -> f32 {
+        let stats = self.session.index_cache_stats().await;
+        stats.hit_ratio()
     }
 
     pub fn cache_size_bytes(&self) -> u64 {
@@ -1495,24 +1514,26 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                     version: location.version,
                     e_tag: location.e_tag.as_deref(),
                 };
-                let manifest =
-                    if let Some(cached) = dataset.metadata_cache.get_with_key(&manifest_key) {
-                        cached
-                    } else {
-                        let loaded = Arc::new(
-                            Dataset::load_manifest(
-                                dataset.object_store(),
-                                &location,
-                                &dataset.base,
-                                dataset.session.as_ref(),
-                            )
-                            .await?,
-                        );
-                        dataset
-                            .metadata_cache
-                            .insert_with_key(&manifest_key, loaded.clone());
-                        loaded
-                    };
+                let manifest = if let Some(cached) =
+                    dataset.metadata_cache.get_with_key(&manifest_key).await
+                {
+                    cached
+                } else {
+                    let loaded = Arc::new(
+                        Dataset::load_manifest(
+                            dataset.object_store(),
+                            &location,
+                            &dataset.uri,
+                            dataset.session.as_ref(),
+                        )
+                        .await?,
+                    );
+                    dataset
+                        .metadata_cache
+                        .insert_with_key(&manifest_key, loaded.clone())
+                        .await;
+                    loaded
+                };
 
                 if let Some(latest_tx) = latest_tx {
                     // We ignore the error, since we don't care if the receiver is dropped.
@@ -1529,37 +1550,39 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
             let tx_key = TransactionKey {
                 version: manifest.version,
             };
-            let transaction = if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key) {
-                cached
-            } else {
-                let dataset_version = Dataset::checkout_manifest(
-                    dataset.object_store.clone(),
-                    dataset.base.clone(),
-                    dataset.uri.clone(),
-                    manifest_copy.clone(),
-                    location,
-                    dataset.session(),
-                    dataset.commit_handler.clone(),
-                )?;
-                let object_store = dataset_version.object_store();
-                let path = dataset_version
-                    .manifest
-                    .transaction_file
-                    .as_ref()
-                    .ok_or_else(|| Error::Internal {
-                        message: format!(
-                            "Dataset version {} does not have a transaction file",
-                            manifest_copy.version
-                        ),
-                        location: location!(),
-                    })?;
-                let loaded =
-                    Arc::new(read_transaction_file(object_store, &dataset.base, path).await?);
-                dataset
-                    .metadata_cache
-                    .insert_with_key(&tx_key, loaded.clone());
-                loaded
-            };
+            let transaction =
+                if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
+                    cached
+                } else {
+                    let dataset_version = Dataset::checkout_manifest(
+                        dataset.object_store.clone(),
+                        dataset.base.clone(),
+                        dataset.uri.clone(),
+                        manifest_copy.clone(),
+                        location,
+                        dataset.session(),
+                        dataset.commit_handler.clone(),
+                    )?;
+                    let object_store = dataset_version.object_store();
+                    let path = dataset_version
+                        .manifest
+                        .transaction_file
+                        .as_ref()
+                        .ok_or_else(|| Error::Internal {
+                            message: format!(
+                                "Dataset version {} does not have a transaction file",
+                                manifest_copy.version
+                            ),
+                            location: location!(),
+                        })?;
+                    let loaded =
+                        Arc::new(read_transaction_file(object_store, &dataset.base, path).await?);
+                    dataset
+                        .metadata_cache
+                        .insert_with_key(&tx_key, loaded.clone())
+                        .await;
+                    loaded
+                };
             Ok((manifest.version, transaction))
         })
         .try_buffer_unordered(io_parallelism / 2);

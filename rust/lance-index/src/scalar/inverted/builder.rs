@@ -218,7 +218,9 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         for part in self.partitions.iter() {
-            let part = InvertedPartition::load(src_store.clone(), *part, None).await?;
+            let part =
+                InvertedPartition::load(src_store.clone(), *part, None, LanceCache::no_cache())
+                    .await?;
             let mut builder = part.into_builder().await?;
             builder.remap(mapping).await?;
             builder.write(dest_store).await?;
@@ -240,16 +242,27 @@ impl InvertedIndexBuilder {
     }
 
     async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
-        let partitions =
-            futures::future::try_join_all(
-                self.partitions
-                    .iter()
-                    .map(|part| InvertedPartition::load(self.src_store.clone(), *part, None))
-                    .chain(self.new_partitions.iter().map(|part| {
-                        InvertedPartition::load(self.local_store.clone(), *part, None)
-                    })),
-            )
-            .await?;
+        let partitions = futures::future::try_join_all(
+            self.partitions
+                .iter()
+                .map(|part| {
+                    InvertedPartition::load(
+                        self.src_store.clone(),
+                        *part,
+                        None,
+                        LanceCache::no_cache(),
+                    )
+                })
+                .chain(self.new_partitions.iter().map(|part| {
+                    InvertedPartition::load(
+                        self.local_store.clone(),
+                        *part,
+                        None,
+                        LanceCache::no_cache(),
+                    )
+                })),
+        )
+        .await?;
         let mut merger = SizeBasedMerger::new(dest_store, partitions, *LANCE_FTS_TARGET_SIZE << 20);
         let partitions = merger.merge().await?;
         self.write_metadata(dest_store, &partitions).await?;

@@ -1958,9 +1958,10 @@ mod tests {
         let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
-        let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
-            .await
-            .unwrap();
+        let frag_reuse_index =
+            open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
+                .await
+                .unwrap();
         let stats = frag_reuse_index.statistics().unwrap();
         assert_eq!(
             serde_json::to_string(&stats).unwrap(),
@@ -2072,9 +2073,10 @@ mod tests {
                 load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
                     .await
                     .unwrap();
-            let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
-                .await
-                .unwrap();
+            let frag_reuse_index =
+                open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
+                    .await
+                    .unwrap();
 
             // Verify the index has one version with the correct dataset version
             assert_eq!(
@@ -2165,9 +2167,10 @@ mod tests {
         let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
-        let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
-            .await
-            .unwrap();
+        let frag_reuse_index =
+            open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
+                .await
+                .unwrap();
 
         assert_eq!(frag_reuse_index.details.versions.len(), plan.tasks().len());
 
