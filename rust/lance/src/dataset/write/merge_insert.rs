@@ -3120,6 +3120,7 @@ mod tests {
         )
         .unwrap()
         .when_matched(crate::dataset::WhenMatched::update_if(&ds, "source.value > 20").unwrap())
+        .when_not_matched(crate::dataset::WhenNotMatched::DoNothing)
         .try_build()
         .unwrap();
 
