@@ -3133,14 +3133,22 @@ mod tests {
 
         let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
 
-        // The optimized plan should include the condition in the action expression
-        let plan_str = format!("{:?}", plan);
-        assert!(
-            plan_str.contains("HashJoinExec"),
-            "Plan should use hash join"
-        );
+        // The optimized plan should use Inner join and include the UpdateIf condition
+        assert_plan_node_equals(
+            plan,
+            "MergeInsert: on=[key], when_matched=UpdateIf(source.value > 20), when_not_matched=DoNothing, when_not_matched_by_source=Keep
+  CoalescePartitionsExec
+    ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN key@2 IS NOT NULL AND _rowaddr@0 IS NOT NULL AND value@1 > 20 THEN 1 ELSE 0 END as action]
+      CoalesceBatchesExec...
+        HashJoinExec: mode=Partitioned, join_type=Inner, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
+          CoalesceBatchesExec...
+            RepartitionExec...
+              RepartitionExec...
+                LanceScan: uri=data, projection=[key], row_id=false, row_addr=true, ordered=false
+          CoalesceBatchesExec...
+            RepartitionExec...
+              RepartitionExec...
+                StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        ).await.unwrap();
     }
-
-    // Note: The old transform function tests have been removed as we now use
-    // deferred parsing with path-specific schemas instead of transforming expressions.
 }
