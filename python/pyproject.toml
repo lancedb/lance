@@ -97,6 +97,7 @@ markers = [
     "gpu: tests which rely on pytorch and some kind of gpu",
     "slow",
     "torch: tests which rely on pytorch being installed",
+    "weekly: marks tests as weekly tests",
 ]
 filterwarnings = [
     'error::FutureWarning',
