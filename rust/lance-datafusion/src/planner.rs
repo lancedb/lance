@@ -250,6 +250,11 @@ impl Planner {
         }
     }
 
+    /// If passed with `true`, then the first identifier in column reference
+    /// is parsed as the relation. For example, `table.field.inner` will be
+    /// read as the nested field `field.inner` (`inner` on struct field `field`)
+    /// on the `table` relation. If `false` (the default), then no relations
+    /// are used and all identifiers are assumed to be a nested column path.
     pub fn with_enable_relations(mut self, enable_relations: bool) -> Self {
         self.enable_relations = enable_relations;
         self
