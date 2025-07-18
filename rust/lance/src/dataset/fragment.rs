@@ -23,7 +23,6 @@ use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::utils::StreamingWriteSource;
@@ -2116,10 +2115,6 @@ impl FragmentReader {
                         })
                         .boxed()
                 })
-                .stream_in_span(tracing::debug_span!(
-                    "ReadBatchFutStream",
-                    id = self.fragment_id,
-                ))
                 .boxed(),
         )
     }
@@ -2269,10 +2264,6 @@ impl FragmentReader {
                         })
                         .boxed()
                 })
-                .stream_in_span(tracing::debug_span!(
-                    "ReadBatchFutStream",
-                    id = self.fragment_id,
-                ))
                 .boxed(),
         )
     }
@@ -3075,16 +3066,23 @@ mod tests {
             let batches = stream.try_collect::<Vec<_>>().await.unwrap();
 
             assert_eq!(batches[1].schema().as_ref(), &(&new_projection).into());
-            let max_value_in_batch = if with_delete { 15 } else { 20 };
+            let expected_i = match (with_delete, data_storage_version) {
+                // Legacy format uses old scan node which deletes after read and
+                // so the batch is truncated
+                (true, LanceFileVersion::Legacy) => vec![10, 11, 12, 13, 14],
+                // Newer formats delete before read and so we get a full batch of 10
+                (true, _) => vec![10, 11, 12, 13, 14, 20, 21, 22, 23, 24],
+                (false, _) => vec![10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+            };
             let expected_batch = RecordBatch::try_new(
                 Arc::new(ArrowSchema::new(vec![
                     ArrowField::new("i", DataType::Int32, true),
                     ArrowField::new("double_i", DataType::Int32, true),
                 ])),
                 vec![
-                    Arc::new(Int32Array::from_iter_values(10..max_value_in_batch)),
+                    Arc::new(Int32Array::from_iter_values(expected_i.iter().copied())),
                     Arc::new(Int32Array::from_iter_values(
-                        (20..(2 * max_value_in_batch)).step_by(2),
+                        expected_i.iter().map(|i| 2 * i),
                     )),
                 ],
             )

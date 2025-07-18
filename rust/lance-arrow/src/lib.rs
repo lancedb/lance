@@ -561,6 +561,9 @@ pub trait RecordBatchExt {
         column: Arc<dyn Array>,
     ) -> Result<RecordBatch>;
 
+    /// Rename a column at a given index.
+    fn rename_column(&self, index: usize, new_name: &str) -> Result<RecordBatch>;
+
     /// Get (potentially nested) column by qualified name.
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef>;
 
@@ -653,6 +656,28 @@ impl RecordBatchExt for RecordBatch {
                 self.schema().metadata().clone(),
             )),
             columns,
+        )
+    }
+
+    fn rename_column(&self, index: usize, new_name: &str) -> Result<RecordBatch> {
+        let mut fields = self.schema().fields().to_vec();
+        if index >= fields.len() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Index out of bounds: {}",
+                index
+            )));
+        }
+        fields[index] = Arc::new(Field::new(
+            new_name,
+            fields[index].data_type().clone(),
+            fields[index].is_nullable(),
+        ));
+        Self::try_new(
+            Arc::new(Schema::new_with_metadata(
+                fields,
+                self.schema().metadata().clone(),
+            )),
+            self.columns().to_vec(),
         )
     }
 

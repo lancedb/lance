@@ -26,8 +26,8 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility, WindowUDF,
+    AggregateUDF, ColumnarValue, ExprSchemable, GetFieldAccess, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
@@ -787,7 +787,20 @@ impl Planner {
                 location!(),
             )
         })?;
-        Ok(coerce_filter_type_to_boolean(resolved))
+
+        let coerced = coerce_filter_type_to_boolean(resolved);
+
+        // Verify filter returns boolean
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let (ret_type, _) = coerced.data_type_and_nullable(&df_schema)?;
+        if ret_type != ArrowDataType::Boolean {
+            Err(Error::InvalidInput {
+                source: format!("The filter {} does not return a boolean", filter).into(),
+                location: location!(),
+            })
+        } else {
+            Ok(coerced)
+        }
     }
 
     /// Create Logical [Expr] from a SQL expression.
@@ -858,7 +871,6 @@ impl Planner {
     /// Create the [`PhysicalExpr`] from a logical [`Expr`]
     pub fn create_physical_expr(&self, expr: &Expr) -> Result<Arc<dyn PhysicalExpr>> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
-
         Ok(datafusion::physical_expr::create_physical_expr(
             expr,
             df_schema.as_ref(),
@@ -869,6 +881,9 @@ impl Planner {
     /// Collect the columns in the expression.
     ///
     /// The columns are returned in sorted order.
+    ///
+    /// If the expr refers to nested columns these will be returned
+    /// as dotted paths (x.y.z)
     pub fn column_names_in_expr(expr: &Expr) -> Vec<String> {
         let mut visitor = ColumnCapturingVisitor {
             current_path: VecDeque::new(),

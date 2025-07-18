@@ -3,6 +3,7 @@
 
 import os
 import random
+import re
 import shutil
 import string
 import zipfile
@@ -107,7 +108,10 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
             columns=["price"], filter=filter, prefilter=True
         )
 
-        assert "MaterializeIndex" in scanner.explain_plan()
+        assert (
+            f"ScalarIndexQuery: query=[meta = {sample_meta}]@meta_idx"
+            in scanner.explain_plan()
+        )
 
         actual_data = scanner.to_table()
         assert actual_data.num_rows == 1
@@ -123,14 +127,20 @@ def test_indexed_between(tmp_path):
 
     scanner = dataset.scanner(filter="val BETWEEN 10 AND 20", prefilter=True)
 
-    assert "MaterializeIndex" in scanner.explain_plan()
+    assert (
+        "ScalarIndexQuery: query=[val >= 10 && val <= 20]@val_idx"
+        in scanner.explain_plan()
+    )
 
     actual_data = scanner.to_table()
     assert actual_data.num_rows == 11
 
     scanner = dataset.scanner(filter="val >= 10 AND val <= 20", prefilter=True)
 
-    assert "MaterializeIndex" in scanner.explain_plan()
+    assert (
+        "ScalarIndexQuery: query=[val >= 10 && val <= 20]@val_idx"
+        in scanner.explain_plan()
+    )
 
     actual_data = scanner.to_table()
     assert actual_data.num_rows == 11
@@ -140,14 +150,20 @@ def test_indexed_between(tmp_path):
     # (previously we panicked here)
     scanner = dataset.scanner(filter="val >= 5000 AND val <= 0", prefilter=True)
 
-    assert "MaterializeIndex" in scanner.explain_plan()
+    assert (
+        "ScalarIndexQuery: query=[val >= 5000 && val <= 0]@val_idx"
+        in scanner.explain_plan()
+    )
 
     actual_data = scanner.to_table()
     assert actual_data.num_rows == 0
 
     scanner = dataset.scanner(filter="val BETWEEN 5000 AND 0", prefilter=True)
 
-    assert "MaterializeIndex" in scanner.explain_plan()
+    assert (
+        "ScalarIndexQuery: query=[val >= 5000 && val <= 0]@val_idx"
+        in scanner.explain_plan()
+    )
 
     actual_data = scanner.to_table()
     assert actual_data.num_rows == 0
@@ -173,13 +189,21 @@ def test_temporal_index(tmp_path):
     # Timestamp
     half_now = now - timedelta(days=50)
     scanner = dataset.scanner(filter=f"ts > timestamp '{half_now}'", scan_in_order=True)
-    assert "MaterializeIndex" in scanner.explain_plan(True)
+    assert re.search(
+        r"^.*ScalarIndexQuery: query=\[ts > .*\]@ts_idx.*$",
+        scanner.explain_plan(True),
+        re.MULTILINE,
+    )
     assert scanner.to_table() == table.slice(0, 50)
 
     # Date
     half_toady = today - timedelta(days=50)
     scanner = dataset.scanner(filter=f"date > date '{half_toady}'", scan_in_order=True)
-    assert "MaterializeIndex" in scanner.explain_plan(True)
+    assert re.search(
+        r"^.*ScalarIndexQuery: query=\[date > .*\]@date_idx.*$",
+        scanner.explain_plan(True),
+        re.MULTILINE,
+    )
     assert scanner.to_table() == table.slice(0, 50)
 
 
@@ -204,7 +228,7 @@ def test_indexed_vector_scan(indexed_dataset: lance.LanceDataset, data_table: pa
         filter=f"meta='{sample_meta}'",
     )
 
-    assert "ScalarIndexQuery" in scanner.explain_plan()
+    assert "ScalarIndexQuery" in scanner.analyze_plan()
 
     check_result(scanner.to_table())
 
@@ -215,7 +239,10 @@ def test_indexed_vector_scan(indexed_dataset: lance.LanceDataset, data_table: pa
         filter=f"price >= 0 AND meta='{sample_meta}'",
     )
 
-    assert "MaterializeIndex" in scanner.explain_plan()
+    assert (
+        f"ScalarIndexQuery: query=[meta = {sample_meta}]@meta_idx"
+        in scanner.explain_plan()
+    )
 
     check_result(scanner.to_table())
 
@@ -261,13 +288,13 @@ def test_partly_indexed_prefiltered_search(tmp_path):
     plan = make_vec_search(ds).explain_plan()
     assert "ScalarIndexQuery" in plan
     assert "KNNVectorDistance" not in plan
-    assert "LanceScan" not in plan
+    assert "LanceRead" not in plan
     assert make_vec_search(ds).to_table().num_rows == 6
 
     plan = make_fts_search(ds).explain_plan()
     assert "ScalarIndexQuery" in plan
     assert "KNNVectorDistance" not in plan
-    assert "LanceScan" not in plan
+    assert "LanceRead" not in plan
     assert make_fts_search(ds).to_table().num_rows == 6
 
     # Add new data (including 6 more results)
@@ -293,17 +320,17 @@ def test_partly_indexed_prefiltered_search(tmp_path):
 
     # Ann search but with combined prefilter, should get 12 results
     plan = make_vec_search(ds).explain_plan()
-    assert "ScalarIndexQuery" not in plan
-    assert "MaterializeIndex" in plan
+    assert "ScalarIndexQuery" in plan
+    assert "LanceRead" in plan
     assert "KNNVectorDistance" not in plan
-    assert "LanceScan" in plan
+    assert "LanceScan" not in plan
     assert make_vec_search(ds).to_table().num_rows == 12
 
     plan = make_fts_search(ds).explain_plan()
-    assert "ScalarIndexQuery" not in plan
-    assert "MaterializeIndex" in plan
+    assert "ScalarIndexQuery" in plan
+    assert "LanceRead" in plan
     assert "FlatMatchQuery" not in plan
-    assert "LanceScan" in plan
+    assert "LanceScan" not in plan
     assert make_fts_search(ds).to_table().num_rows == 12
 
 
@@ -336,7 +363,10 @@ def test_fixed_size_binary(tmp_path):
     query = (
         "uuid = arrow_cast(0x32333435323334353233343532333435, 'FixedSizeBinary(16)')"
     )
-    assert "MaterializeIndex" in ds.scanner(filter=query).explain_plan()
+    assert (
+        "ScalarIndexQuery: query=[uuid = 32333435323334353233...]@uuid_idx"
+        in ds.scanner(filter=query).explain_plan()
+    )
 
     table = ds.scanner(filter=query).to_table()
     assert table.num_rows == 1
@@ -485,15 +515,13 @@ def test_use_multi_index(tmp_path):
     dataset.create_scalar_index("ints", index_type="BTREE")
     dataset.create_scalar_index("ints", index_type="BITMAP", name="ints_bitmap_idx")
 
-    print(dataset.scanner(filter="ints = 0", prefilter=True).explain_plan())
-
     # Test that we can use the index.  Multiple indices can be applied here.
     # One of them will be chosen (it is not deterministic which one is chosen)
     results = dataset.to_table(filter="ints = 0", prefilter=True)
     assert results.num_rows == 1
 
     assert (
-        "MaterializeIndex"
+        "ScalarIndexQuery: query=[ints = 0]@ints_idx"
         in dataset.scanner(filter="ints = 0", prefilter=True).explain_plan()
     )
 
@@ -513,7 +541,7 @@ def test_ngram_fts(tmp_path):
     assert results.num_rows == 2
 
     assert (
-        "MaterializeIndex"
+        'ScalarIndexQuery: query=[contains(text, Utf8("hello"))]@text_ngram_idx'
         in dataset.scanner(
             filter="contains(text, 'hello')", prefilter=True
         ).explain_plan()
@@ -1227,7 +1255,7 @@ def test_ngram_index(tmp_path: Path):
         scan_plan = dataset.scanner(filter="contains(words, 'apple')").explain_plan(
             True
         )
-        assert "MaterializeIndex" in scan_plan
+        assert "ScalarIndexQuery: query=[contains(words" in scan_plan
 
         assert dataset.to_table(filter="contains(words, 'apple')").num_rows == 50
         assert dataset.to_table(filter="contains(words, 'banana')").num_rows == 25

@@ -27,7 +27,10 @@ use super::{
     schema::{compare_fields, explain_fields_difference},
     Dictionary, LogicalType, Projection,
 };
-use crate::{Error, Result};
+use crate::{
+    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_META_KEY},
+    Error, Result,
+};
 
 pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
 
@@ -271,10 +274,9 @@ impl Field {
         if children.is_empty() && !projection.contains_field_id(self.id) {
             None
         } else {
-            Some(Self {
-                children,
-                ..self.clone()
-            })
+            let mut new_field = self.clone();
+            new_field.children = children;
+            Some(projection.blob_handling.unload_if_needed(new_field))
         }
     }
 
@@ -492,6 +494,25 @@ impl Field {
                 .find(|c| c.name == first)
                 .and_then(|c| c.sub_field_mut(&path_components[1..]))
         }
+    }
+
+    /// Check if the user has labeled the field as a blob
+    ///
+    /// Blob fields will load descriptions by default
+    pub fn is_blob(&self) -> bool {
+        self.metadata.contains_key(BLOB_META_KEY)
+    }
+
+    /// If the field is a blob, return a new field with the same name and id
+    /// but with the data type set to a struct of the blob description fields.
+    ///
+    /// If the field is not a blob, return the field itself.
+    pub fn into_unloaded(mut self) -> Self {
+        if self.data_type().is_binary_like() && self.is_blob() {
+            self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
+            self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+        }
+        self
     }
 
     pub fn project(&self, path_components: &[&str]) -> Result<Self> {

@@ -299,18 +299,21 @@ impl ProjectionRequest {
         )
     }
 
-    pub fn into_projection_plan(self, dataset_schema: &Schema) -> Result<ProjectionPlan> {
+    pub fn into_projection_plan(self, dataset: Arc<Dataset>) -> Result<ProjectionPlan> {
+        let mut projection_plan = ProjectionPlan::new(dataset.clone());
         match self {
-            Self::Schema(schema) => Ok(ProjectionPlan::new_empty(
-                Arc::new(dataset_schema.project_by_schema(
+            Self::Schema(schema) => {
+                let projection = dataset.schema().project_by_schema(
                     schema.as_ref(),
                     OnMissing::Error,
                     OnTypeMismatch::Error,
-                )?),
-                /*load_blobs=*/ false,
-            )),
+                )?;
+                projection_plan.project_from_schema(&projection);
+                Ok(projection_plan)
+            }
             Self::Sql(columns) => {
-                ProjectionPlan::try_new(dataset_schema, &columns, /*load_blobs=*/ false)
+                projection_plan.project_from_expressions(&columns)?;
+                Ok(projection_plan)
             }
         }
     }
@@ -1148,7 +1151,7 @@ impl Dataset {
         Some(FileFragment::new(dataset, fragment.clone()))
     }
 
-    pub(crate) fn fragments(&self) -> &Arc<Vec<Fragment>> {
+    pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
         &self.manifest.fragments
     }
 
@@ -1295,10 +1298,6 @@ impl Dataset {
             .zip(filtered_sorted_ids)
             .filter_map(|(addr_or_id, maybe_addr)| maybe_addr.map(|_| *addr_or_id))
             .collect())
-    }
-
-    pub(crate) async fn filter_deleted_addresses(&self, addrs: &[u64]) -> Result<Vec<u64>> {
-        self.filter_addr_or_ids(addrs, addrs).await
     }
 
     pub(crate) async fn filter_deleted_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {

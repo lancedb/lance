@@ -14,8 +14,9 @@ use datafusion_expr::{
 };
 
 use futures::join;
-use lance_core::{utils::mask::RowIdMask, Result};
+use lance_core::{utils::mask::RowIdMask, Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
+use snafu::location;
 use tracing::instrument;
 
 use super::{
@@ -686,6 +687,36 @@ pub enum IndexExprResult {
     AtLeast(RowIdMask),
 }
 
+impl IndexExprResult {
+    pub fn row_id_mask(&self) -> &RowIdMask {
+        match self {
+            Self::Exact(mask) => mask,
+            Self::AtMost(mask) => mask,
+            Self::AtLeast(mask) => mask,
+        }
+    }
+
+    pub fn discriminant(&self) -> u32 {
+        match self {
+            Self::Exact(_) => 0,
+            Self::AtMost(_) => 1,
+            Self::AtLeast(_) => 2,
+        }
+    }
+
+    pub fn from_parts(mask: RowIdMask, discriminant: u32) -> Result<Self> {
+        match discriminant {
+            0 => Ok(Self::Exact(mask)),
+            1 => Ok(Self::AtMost(mask)),
+            2 => Ok(Self::AtLeast(mask)),
+            _ => Err(Error::InvalidInput {
+                source: format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
+                location: location!(),
+            }),
+        }
+    }
+}
+
 impl ScalarIndexExpr {
     /// Evaluates the scalar index expression
     ///
@@ -1187,6 +1218,17 @@ impl FilterPlan {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.refine_expr.is_none() && self.index_query.is_none()
+    }
+
+    pub fn all_columns(&self) -> Vec<String> {
+        self.full_expr
+            .as_ref()
+            .map(Planner::column_names_in_expr)
+            .unwrap_or_default()
+    }
+
     pub fn refine_columns(&self) -> Vec<String> {
         self.refine_expr
             .as_ref()
@@ -1199,6 +1241,11 @@ impl FilterPlan {
         self.refine_expr.is_some()
     }
 
+    /// Return true if this has a scalar index query
+    pub fn has_index_query(&self) -> bool {
+        self.index_query.is_some()
+    }
+
     pub fn has_any_filter(&self) -> bool {
         self.refine_expr.is_some() || self.index_query.is_some()
     }
@@ -1206,6 +1253,11 @@ impl FilterPlan {
     pub fn make_refine_only(&mut self) {
         self.index_query = None;
         self.refine_expr = self.full_expr.clone();
+    }
+
+    /// Return true if there is no refine or recheck of any kind and there is an index query
+    pub fn is_exact_index_search(&self) -> bool {
+        self.index_query.is_some() && self.refine_expr.is_none() && self.skip_recheck
     }
 }
 

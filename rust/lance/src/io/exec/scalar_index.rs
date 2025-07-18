@@ -9,8 +9,10 @@ use crate::{
     index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
     Dataset,
 };
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow::array::BinaryBuilder;
+use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
     common::{stats::Precision, Statistics},
@@ -31,7 +33,12 @@ use lance_core::{
     },
     Error, Result, ROW_ID_FIELD,
 };
-use lance_datafusion::chunker::break_stream;
+use lance_datafusion::{
+    chunker::break_stream,
+    utils::{
+        ExecutionPlanMetricsSetExt, SCALAR_INDEX_SEARCH_TIME_METRIC, SCALAR_INDEX_SER_TIME_METRIC,
+    },
+};
 use lance_index::{
     metrics::MetricsCollector,
     scalar::{
@@ -45,12 +52,17 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{debug_span, instrument};
 
+/// When we evaluate a scalar index query we return a batch with three columns and two rows
+///
+/// The first column has the block list and allow list
+/// The second column tells if the result is least/exact/more (we repeat the discriminant twice)
+/// The third column has the fragments covered bitmap in the first row and null in the second row
 pub static SCALAR_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(Schema::new(vec![Field::new(
-        "result".to_string(),
-        DataType::Binary,
-        true,
-    )]))
+    Arc::new(Schema::new(vec![
+        Field::new("result".to_string(), DataType::Binary, true),
+        Field::new("discriminant".to_string(), DataType::UInt32, true),
+        Field::new("fragments_covered".to_string(), DataType::Binary, true),
+    ]))
 });
 
 #[async_trait]
@@ -117,20 +129,82 @@ impl ScalarIndexExec {
         }
     }
 
+    #[async_recursion]
+    async fn fragments_covered_by_index_query(
+        index_expr: &ScalarIndexExpr,
+        dataset: &Dataset,
+    ) -> Result<RoaringBitmap> {
+        match index_expr {
+            ScalarIndexExpr::And(lhs, rhs) => {
+                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
+                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
+            }
+            ScalarIndexExpr::Or(lhs, rhs) => {
+                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
+                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
+            }
+            ScalarIndexExpr::Not(expr) => {
+                Self::fragments_covered_by_index_query(expr, dataset).await
+            }
+            ScalarIndexExpr::Query(search_key) => {
+                let idx = dataset
+                    .load_scalar_index(
+                        ScalarIndexCriteria::default().with_name(&search_key.index_name),
+                    )
+                    .await?
+                    .expect("Index not found even though it must have been found earlier");
+                Ok(idx
+                    .fragment_bitmap
+                    .expect("scalar indices should always have a fragment bitmap"))
+            }
+        }
+    }
+
+    #[instrument(skip_all)]
+    fn serialize_to_arrow(
+        query_result: IndexExprResult,
+        fragments_covered_by_result: RoaringBitmap,
+    ) -> Result<RecordBatch> {
+        let row_id_mask = query_result.row_id_mask();
+        let row_id_mask_arr = row_id_mask.into_arrow()?;
+        let discriminant = query_result.discriminant();
+        let discriminant_arr =
+            Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
+        let mut fragments_covered_builder = BinaryBuilder::new();
+        let fragments_covered_bytes_len = fragments_covered_by_result.serialized_size();
+        let mut fragments_covered_bytes = Vec::with_capacity(fragments_covered_bytes_len);
+        fragments_covered_by_result.serialize_into(&mut fragments_covered_bytes)?;
+        fragments_covered_builder.append_value(fragments_covered_bytes);
+        fragments_covered_builder.append_null();
+        let fragments_covered_arr = Arc::new(fragments_covered_builder.finish()) as Arc<dyn Array>;
+        Ok(RecordBatch::try_new(
+            SCALAR_INDEX_SCHEMA.clone(),
+            vec![
+                Arc::new(row_id_mask_arr),
+                Arc::new(discriminant_arr),
+                Arc::new(fragments_covered_arr),
+            ],
+        )?)
+    }
+
     async fn do_execute(
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
-        metrics: IndexMetrics,
+        plan_metrics: ExecutionPlanMetricsSet,
     ) -> Result<RecordBatch> {
-        let query_result = expr.evaluate(dataset.as_ref(), &metrics).await?;
-        let IndexExprResult::Exact(row_id_mask) = query_result else {
-            todo!("Support for non-exact query results as pre-filter for vector search")
+        let metrics = IndexMetrics::new(&plan_metrics, 0);
+        let query_result = {
+            let search_time = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
+            let _timer = search_time.timer();
+            expr.evaluate(dataset.as_ref(), &metrics).await?
         };
-        let row_id_mask_arr = row_id_mask.into_arrow()?;
-        Ok(RecordBatch::try_new(
-            SCALAR_INDEX_SCHEMA.clone(),
-            vec![Arc::new(row_id_mask_arr)],
-        )?)
+        let fragments_covered_by_result =
+            Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
+        {
+            let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
+            let _timer = ser_time.timer();
+            Self::serialize_to_arrow(query_result, fragments_covered_by_result)
+        }
     }
 }
 
@@ -169,8 +243,11 @@ impl ExecutionPlan for ScalarIndexExec {
         partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        let metrics = IndexMetrics::new(&self.metrics, partition);
-        let batch_fut = Self::do_execute(self.expr.clone(), self.dataset.clone(), metrics);
+        let batch_fut = Self::do_execute(
+            self.expr.clone(),
+            self.dataset.clone(),
+            self.metrics.clone(),
+        );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
