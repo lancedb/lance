@@ -1262,6 +1262,8 @@ mod tests {
     use arrow_schema::{Field, Schema};
     use datafusion::prelude::SessionContext;
     use datafusion_common::{Column, DFSchema};
+    use datafusion_expr::execution_props::ExecutionProps;
+    use datafusion_expr::simplify::SimplifyContext;
 
     use super::*;
 
@@ -1304,6 +1306,7 @@ mod tests {
         index_info: &dyn IndexInformationProvider,
         expr: &str,
         expected: Option<IndexedExpression>,
+        optimize: bool,
     ) {
         let schema = Schema::new(vec![
             Field::new("color", DataType::Utf8, false),
@@ -1316,7 +1319,14 @@ mod tests {
 
         let ctx = SessionContext::default();
         let state = ctx.state();
-        let expr = state.create_logical_expr(expr, &df_schema).unwrap();
+        let mut expr = state.create_logical_expr(expr, &df_schema).unwrap();
+        if optimize {
+            let props = ExecutionProps::default();
+            let simplify_context = SimplifyContext::new(&props).with_schema(Arc::new(df_schema));
+            let simplifier =
+                datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
+            expr = simplifier.simplify(expr).unwrap();
+        }
 
         let actual = apply_scalar_indices(expr.clone(), index_info);
         if let Some(expected) = expected {
@@ -1328,7 +1338,7 @@ mod tests {
     }
 
     fn check_no_index(index_info: &dyn IndexInformationProvider, expr: &str) {
-        check(index_info, expr, None)
+        check(index_info, expr, None, false)
     }
 
     fn check_simple(
@@ -1345,6 +1355,25 @@ mod tests {
                 format!("{}_idx", col),
                 Arc::new(query),
             )),
+            false,
+        )
+    }
+
+    fn check_range(
+        index_info: &dyn IndexInformationProvider,
+        expr: &str,
+        col: &str,
+        query: SargableQuery,
+    ) {
+        check(
+            index_info,
+            expr,
+            Some(IndexedExpression::index_query(
+                col.to_string(),
+                format!("{}_idx", col),
+                Arc::new(query),
+            )),
+            true,
         )
     }
 
@@ -1366,6 +1395,7 @@ mod tests {
                 .maybe_not()
                 .unwrap(),
             ),
+            false,
         )
     }
 
@@ -1411,7 +1441,7 @@ mod tests {
             SargableQuery::Equals(ScalarValue::UInt32(Some(5))),
         );
         // 5 different ways of writing BETWEEN (all should be recognized)
-        check_simple(
+        check_range(
             &index_info,
             "aisle BETWEEN 5 AND 10",
             "aisle",
@@ -1420,7 +1450,7 @@ mod tests {
                 Bound::Included(ScalarValue::UInt32(Some(10))),
             ),
         );
-        check_simple(
+        check_range(
             &index_info,
             "aisle >= 5 AND aisle <= 10",
             "aisle",
@@ -1430,7 +1460,7 @@ mod tests {
             ),
         );
 
-        check_simple(
+        check_range(
             &index_info,
             "aisle <= 10 AND aisle >= 5",
             "aisle",
@@ -1440,7 +1470,7 @@ mod tests {
             ),
         );
 
-        check_simple(
+        check_range(
             &index_info,
             "5 <= aisle AND 10 >= aisle",
             "aisle",
@@ -1450,7 +1480,7 @@ mod tests {
             ),
         );
 
-        check_simple(
+        check_range(
             &index_info,
             "10 >= aisle AND 5 <= aisle",
             "aisle",
@@ -1606,6 +1636,7 @@ mod tests {
                 scalar_query: Some(ScalarIndexExpr::And(left.clone(), right.clone())),
                 refine_expr: None,
             }),
+            false,
         );
         // Compound AND's and not all of them are indexed columns
         let refine = Expr::Column(Column::new_unqualified("size")).gt(datafusion_expr::lit(30_i64));
@@ -1616,6 +1647,7 @@ mod tests {
                 scalar_query: Some(ScalarIndexExpr::And(left.clone(), right.clone())),
                 refine_expr: Some(refine.clone()),
             }),
+            false,
         );
         // Compounded OR's where ALL columns are indexed
         check(
@@ -1625,6 +1657,7 @@ mod tests {
                 scalar_query: Some(ScalarIndexExpr::Or(left.clone(), right.clone())),
                 refine_expr: None,
             }),
+            false,
         );
         // Compounded OR's with one or more unindexed columns
         check_no_index(&index_info, "aisle = 10 OR color = 'blue' OR size > 30");
@@ -1636,6 +1669,7 @@ mod tests {
                 scalar_query: Some(ScalarIndexExpr::Or(left, right)),
                 refine_expr: Some(refine),
             }),
+            false,
         );
         // Examples of things that are not yet supported but should be supportable someday
 
