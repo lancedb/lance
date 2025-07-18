@@ -20,9 +20,9 @@ use std::sync::{Arc, RwLock};
 /// Returns the set of modified fragments and removed fragments, if any.
 async fn apply_deletions(
     dataset: &Dataset,
-    removed_row_ids: &RoaringTreemap,
+    removed_row_addrs: &RoaringTreemap,
 ) -> Result<(Vec<Fragment>, Vec<u64>)> {
-    let bitmaps = Arc::new(removed_row_ids.bitmaps().collect::<BTreeMap<_, _>>());
+    let bitmaps = Arc::new(removed_row_addrs.bitmaps().collect::<BTreeMap<_, _>>());
 
     enum FragmentChange {
         Unchanged,
