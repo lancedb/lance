@@ -1851,7 +1851,7 @@ mod tests {
         let new_reader = Box::new(RecordBatchIterator::new([Ok(new_data)], schema.clone()));
         let new_stream = reader_to_stream(new_reader);
 
-        let (merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
+        let (merged_dataset, merge_stats) = job.execute(new_stream).boxed().await.unwrap();
 
         let batches = merged_dataset
             .scan()
