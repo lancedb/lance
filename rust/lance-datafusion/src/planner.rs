@@ -238,6 +238,7 @@ impl ContextProvider for LanceContextProvider {
 pub struct Planner {
     schema: SchemaRef,
     context_provider: LanceContextProvider,
+    enable_relations: bool,
 }
 
 impl Planner {
@@ -245,21 +246,49 @@ impl Planner {
         Self {
             schema,
             context_provider: LanceContextProvider::default(),
+            enable_relations: false,
         }
     }
 
-    fn column(idents: &[Ident]) -> Expr {
-        let mut column = col(&idents[0].value);
-        for ident in &idents[1..] {
-            column = Expr::ScalarFunction(ScalarFunction {
-                args: vec![
-                    column,
-                    Expr::Literal(ScalarValue::Utf8(Some(ident.value.clone())), None),
-                ],
-                func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
-            });
+    pub fn with_enable_relations(schema: SchemaRef, enable_relations: bool) -> Self {
+        Self {
+            schema,
+            context_provider: LanceContextProvider::default(),
+            enable_relations,
         }
-        column
+    }
+
+    fn column(&self, idents: &[Ident]) -> Expr {
+        fn handle_remaining_idents(expr: &mut Expr, idents: &[Ident]) {
+            for ident in idents {
+                *expr = Expr::ScalarFunction(ScalarFunction {
+                    args: vec![
+                        std::mem::take(expr),
+                        Expr::Literal(ScalarValue::Utf8(Some(ident.value.clone())), None),
+                    ],
+                    func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
+                });
+            }
+        }
+
+        if self.enable_relations && idents.len() > 1 {
+            // Treat the first identifier as a relation/table name and second as the column name
+            let relation = &idents[0].value;
+            let column_name = &idents[1].value;
+
+            // Directly construct the Column struct to preserve casing
+            let column = Expr::Column(Column::new(Some(relation.clone()), column_name.clone()));
+
+            // Handle any additional field access (for nested fields)
+            let mut result = column;
+            handle_remaining_idents(&mut result, &idents[2..]);
+            result
+        } else {
+            // Default behavior - treat as struct field access
+            let mut column = col(&idents[0].value);
+            handle_remaining_idents(&mut column, &idents[1..]);
+            column
+        }
     }
 
     fn binary_op(&self, op: &BinaryOperator) -> Result<Operator> {
@@ -555,10 +584,10 @@ impl Planner {
                 } else if id.quote_style == Some('`') {
                     Ok(Expr::Column(Column::from_name(id.value.clone())))
                 } else {
-                    Ok(Self::column(vec![id.clone()].as_slice()))
+                    Ok(self.column(vec![id.clone()].as_slice()))
                 }
             }
-            SQLExpr::CompoundIdentifier(ids) => Ok(Self::column(ids.as_slice())),
+            SQLExpr::CompoundIdentifier(ids) => Ok(self.column(ids.as_slice())),
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
             SQLExpr::Value(value) => self.value(&value.value),

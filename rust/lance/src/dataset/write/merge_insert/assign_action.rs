@@ -94,17 +94,30 @@ pub fn merge_insert_action(
         WhenMatched::UpdateAll => {
             cases.push((matched, Action::UpdateAll.as_literal_expr()));
         }
-        WhenMatched::UpdateIf(condition) => {
-            // Transform struct field access to qualified column reference
-            let transformed_condition =
-                crate::dataset::write::merge_insert::transform_struct_to_qualified_expr_with_schema(
-                    condition.clone(),
-                    schema,
+        WhenMatched::UpdateIf(condition_str) => {
+            // Parse the condition with qualified column references enabled for fast path
+            if let Some(dataset_schema) = schema {
+                let planner = lance_datafusion::planner::Planner::with_enable_relations(
+                    std::sync::Arc::new(dataset_schema.clone()),
+                    true,
                 );
-            cases.push((
-                matched.and(transformed_condition),
-                Action::UpdateAll.as_literal_expr(),
-            ));
+                let condition = planner.parse_filter(condition_str).map_err(|e| {
+                    crate::Error::InvalidInput {
+                        source: format!("Failed to parse UpdateIf condition: {}", e).into(),
+                        location: location!(),
+                    }
+                })?;
+                // Skip optimization for qualified column references since the schema doesn't have the relations
+                // The DataFusion execution engine will handle the resolution properly at runtime
+
+                cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
+            } else {
+                // Fallback - this shouldn't happen in the fast path
+                return Err(crate::Error::InvalidInput {
+                    source: "Schema required for UpdateIf parsing".into(),
+                    location: location!(),
+                });
+            }
         }
         WhenMatched::DoNothing => {}
     }
