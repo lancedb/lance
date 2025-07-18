@@ -97,10 +97,10 @@ pub fn merge_insert_action(
         WhenMatched::UpdateIf(condition_str) => {
             // Parse the condition with qualified column references enabled for fast path
             if let Some(dataset_schema) = schema {
-                let planner = lance_datafusion::planner::Planner::with_enable_relations(
-                    std::sync::Arc::new(dataset_schema.clone()),
-                    true,
-                );
+                let planner = lance_datafusion::planner::Planner::new(std::sync::Arc::new(
+                    dataset_schema.clone(),
+                ))
+                .with_enable_relations(true);
                 let condition = planner.parse_filter(condition_str).map_err(|e| {
                     crate::Error::InvalidInput {
                         source: format!("Failed to parse UpdateIf condition: {}", e).into(),
@@ -110,8 +110,8 @@ pub fn merge_insert_action(
                 cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
             } else {
                 // Fallback - this shouldn't happen in the fast path
-                return Err(crate::Error::InvalidInput {
-                    source: "Schema required for UpdateIf parsing".into(),
+                return Err(crate::Error::Internal {
+                    message: "Schema required for UpdateIf parsing".into(),
                     location: location!(),
                 });
             }

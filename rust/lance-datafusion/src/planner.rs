@@ -250,12 +250,9 @@ impl Planner {
         }
     }
 
-    pub fn with_enable_relations(schema: SchemaRef, enable_relations: bool) -> Self {
-        Self {
-            schema,
-            context_provider: LanceContextProvider::default(),
-            enable_relations,
-        }
+    pub fn with_enable_relations(mut self, enable_relations: bool) -> Self {
+        self.enable_relations = enable_relations;
+        self
     }
 
     fn column(&self, idents: &[Ident]) -> Expr {
