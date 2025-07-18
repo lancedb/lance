@@ -204,7 +204,7 @@ impl Manifest {
             next_row_id: self.next_row_id,
             data_storage_format: self.data_storage_format.clone(),
             config: self.config.clone(),
-            blob_dataset_version: self.blob_dataset_version.clone(),
+            blob_dataset_version: self.blob_dataset_version,
             reference: Some(Reference {
                 root_path: root_path.to_string(),
                 is_strong_ref,
