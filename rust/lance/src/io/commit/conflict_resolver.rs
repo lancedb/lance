@@ -14,6 +14,7 @@ use lance_core::{
 };
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::MemWal;
+use lance_index::DatasetIndexExt;
 use lance_table::format::Index;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use snafu::{location, Location};
@@ -33,9 +34,55 @@ pub struct TransactionRebase<'a> {
     modified_fragment_ids: HashSet<u64>,
     affected_rows: Option<&'a RowIdTreeMap>,
     conflicting_frag_reuse_indices: Vec<Index>,
+    /// Accumulated row address mappings from FragReuseIndex for conflict resolution.
+    /// These are applied to affected_rows during finish_delete_update.
+    frag_reuse_mappings: Vec<HashMap<u64, Option<u64>>>,
 }
 
 impl<'a> TransactionRebase<'a> {
+    /// Load FragReuseIndex mappings for a specific dataset version
+    async fn accumulate_frag_reuse_mapping(
+        &mut self,
+        dataset: &Dataset,
+        dataset_version: u64,
+    ) -> Result<bool> {
+        // Try to load the FragReuseIndex from the current dataset
+        if let Some(frag_reuse_index_meta) =
+            dataset.load_index_by_name(FRAG_REUSE_INDEX_NAME).await?
+        {
+            let details = load_frag_reuse_index_details(dataset, &frag_reuse_index_meta).await?;
+
+            // Find the specific version in the FragReuseIndex that corresponds to this dataset version
+            for version in &details.versions {
+                if version.dataset_version == dataset_version {
+                    // Reconstruct the row mapping for this specific version
+                    let mut row_id_map = HashMap::<u64, Option<u64>>::new();
+                    for group in &version.groups {
+                        let cursor = std::io::Cursor::new(&group.changed_row_addrs);
+                        let changed_row_addrs = roaring::RoaringTreemap::deserialize_from(cursor)
+                            .map_err(|e| Error::Internal {
+                            message: format!("Failed to deserialize changed_row_addrs: {}", e),
+                            location: location!(),
+                        })?;
+                        let group_row_id_map =
+                            crate::dataset::optimize::remapping::transpose_row_ids_from_digest(
+                                changed_row_addrs,
+                                &group.old_frags,
+                                &group.new_frags,
+                            );
+                        row_id_map.extend(group_row_id_map);
+                    }
+
+                    // Add this mapping to our accumulated mappings
+                    self.frag_reuse_mappings.push(row_id_map);
+                    return Ok(true); // Successfully found and loaded mappings
+                }
+            }
+        }
+        // If no FragReuseIndex is available, we cannot do automatic conflict resolution
+        // This is fine per the requirement - we'll fall back to existing conflict behavior
+        Ok(false) // No mappings found
+    }
     pub async fn try_new(
         dataset: &Dataset,
         transaction: Transaction,
@@ -56,6 +103,7 @@ impl<'a> TransactionRebase<'a> {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::new(),
                 conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_mappings: Vec::new(),
             }),
             Operation::Delete {
                 updated_fragments,
@@ -83,6 +131,7 @@ impl<'a> TransactionRebase<'a> {
                         modified_fragment_ids,
                         affected_rows: None,
                         conflicting_frag_reuse_indices: Vec::new(),
+                        frag_reuse_mappings: Vec::new(),
                     });
                 }
 
@@ -95,6 +144,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
+                    frag_reuse_mappings: Vec::new(),
                 })
             }
             Operation::Rewrite { groups, .. } => {
@@ -112,6 +162,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
+                    frag_reuse_mappings: Vec::new(),
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -126,6 +177,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
+                    frag_reuse_mappings: Vec::new(),
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -139,6 +191,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
+                    frag_reuse_mappings: Vec::new(),
                 })
             }
         }
@@ -182,11 +235,22 @@ impl<'a> TransactionRebase<'a> {
     ///
     /// Will return an error if the transaction is not valid. Otherwise, it will
     /// return Ok(()).
-    pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
+    pub async fn check_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+        dataset: &Dataset,
+    ) -> Result<()> {
         let op = &self.transaction.operation;
         match op {
-            Operation::Delete { .. } => self.check_delete_txn(other_transaction, other_version),
-            Operation::Update { .. } => self.check_update_txn(other_transaction, other_version),
+            Operation::Delete { .. } => {
+                self.check_delete_txn(other_transaction, other_version, dataset)
+                    .await
+            }
+            Operation::Update { .. } => {
+                self.check_update_txn(other_transaction, other_version, dataset)
+                    .await
+            }
             Operation::CreateIndex { .. } => {
                 self.check_create_index_txn(other_transaction, other_version)
             }
@@ -213,10 +277,11 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 
-    fn check_delete_txn(
+    async fn check_delete_txn(
         &mut self,
         other_transaction: &Transaction,
         other_version: u64,
+        dataset: &Dataset,
     ) -> Result<()> {
         if let Operation::Delete { .. } = &self.transaction.operation {
             match &other_transaction.operation {
@@ -231,11 +296,21 @@ impl<'a> TransactionRebase<'a> {
                         .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
-                        Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        // Try automatic conflict resolution using FragReuseIndex
+                        let found_mappings = self
+                            .accumulate_frag_reuse_mapping(dataset, other_version)
+                            .await?;
+                        if found_mappings {
+                            // Successfully loaded mappings, conflict can be automatically resolved
+                            Ok(())
+                        } else {
+                            // No FragReuseIndex available, fall back to retryable conflict
+                            Err(self.retryable_conflict_err(
+                                other_transaction,
+                                other_version,
+                                location!(),
+                            ))
+                        }
                     } else {
                         Ok(())
                     }
@@ -329,10 +404,11 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 
-    fn check_update_txn(
+    async fn check_update_txn(
         &mut self,
         other_transaction: &Transaction,
         other_version: u64,
+        dataset: &Dataset,
     ) -> Result<()> {
         if let Operation::Update {
             mem_wal_to_flush, ..
@@ -350,11 +426,21 @@ impl<'a> TransactionRebase<'a> {
                         .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
-                        Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        // Try automatic conflict resolution using FragReuseIndex
+                        let found_mappings = self
+                            .accumulate_frag_reuse_mapping(dataset, other_version)
+                            .await?;
+                        if found_mappings {
+                            // Successfully loaded mappings, conflict can be automatically resolved
+                            Ok(())
+                        } else {
+                            // No FragReuseIndex available, fall back to retryable conflict
+                            Err(self.retryable_conflict_err(
+                                other_transaction,
+                                other_version,
+                                location!(),
+                            ))
+                        }
                     } else {
                         Ok(())
                     }
@@ -1174,6 +1260,32 @@ impl<'a> TransactionRebase<'a> {
             .any(|(_, (_, needs_rewrite))| *needs_rewrite)
         {
             if let Some(affected_rows) = self.affected_rows {
+                // Apply accumulated FragReuseIndex mappings to affected_rows
+                let mut remapped_affected_rows = affected_rows.clone();
+                for mapping in &self.frag_reuse_mappings {
+                    let current_row_ids: Vec<u64> = remapped_affected_rows
+                        .row_ids()
+                        .unwrap()
+                        .map(u64::from)
+                        .collect();
+
+                    let mut new_row_ids = Vec::new();
+                    for old_row_id in current_row_ids {
+                        if let Some(new_row_id_opt) = mapping.get(&old_row_id) {
+                            if let Some(new_row_id) = new_row_id_opt {
+                                new_row_ids.push(*new_row_id);
+                            }
+                            // If new_row_id is None, the row was deleted during compaction,
+                            // so we don't include it in the new set
+                        } else {
+                            // Row was not affected by this mapping, keep original address
+                            new_row_ids.push(old_row_id);
+                        }
+                    }
+                    remapped_affected_rows = RowIdTreeMap::from_iter(new_row_ids);
+                }
+                let affected_rows = &remapped_affected_rows;
+
                 // Then we do the rebase
 
                 // 1. Load the deletion files that need a rewrite.
@@ -1602,7 +1714,8 @@ mod tests {
         io_tracker.incremental_stats(); // reset
         for (other_version, other_transaction) in other_transactions.iter().enumerate() {
             rebase
-                .check_txn(other_transaction, other_version as u64)
+                .check_txn(other_transaction, other_version as u64 + 2, &dataset)
+                .await
                 .unwrap();
             let io_stats = io_tracker.incremental_stats();
             assert_eq!(io_stats.read_iops, 0);
@@ -1718,7 +1831,8 @@ mod tests {
             io_tracker.incremental_stats(); // reset
             for (other_version, other_transaction) in previous_transactions.iter().enumerate() {
                 rebase
-                    .check_txn(other_transaction, other_version as u64)
+                    .check_txn(other_transaction, other_version as u64 + 2, &dataset)
+                    .await
                     .unwrap();
                 let io_stats = io_tracker.incremental_stats();
                 assert_eq!(io_stats.read_iops, 0);
@@ -1883,7 +1997,7 @@ mod tests {
         assert_eq!(io_stats.read_iops, 0);
         assert_eq!(io_stats.write_iops, 0);
 
-        let res = rebase.check_txn(&other_txn, 1);
+        let res = rebase.check_txn(&other_txn, 1, &dataset).await;
         if other.ends_with("full") || ours.ends_with("full") {
             // If the other transaction fully deleted a fragment, we can error early.
             assert!(matches!(
@@ -1926,9 +2040,12 @@ mod tests {
         Retryable,
     }
 
-    #[test]
-    fn test_conflicts() {
+    #[tokio::test]
+    async fn test_conflicts() {
         use io::commit::conflict_resolver::tests::{modified_fragment_ids, ConflictResult::*};
+
+        // Create minimal dataset for testing
+        let (dataset, _) = test_dataset(10, 1).await;
 
         let index0 = Index {
             uuid: uuid::Uuid::new_v4(),
@@ -2365,12 +2482,13 @@ mod tests {
                 modified_fragment_ids: modified_fragment_ids(operation).collect::<HashSet<_>>(),
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_mappings: Vec::new(),
             };
 
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
                 match expected_conflict {
                     Compatible => {
-                        let result = rebase.check_txn(other, 1);
+                        let result = rebase.check_txn(other, 1, &dataset).await;
                         assert!(
                             result.is_ok(),
                             "Transaction {:?} should {:?} with {:?}, but was {:?}",
@@ -2381,7 +2499,7 @@ mod tests {
                         )
                     }
                     NotCompatible => {
-                        let result = rebase.check_txn(other, 1);
+                        let result = rebase.check_txn(other, 1, &dataset).await;
                         assert!(
                             matches!(result, Err(Error::CommitConflict { .. })),
                             "Transaction {:?} should be {:?} with {:?}, but was: {:?}",
@@ -2392,7 +2510,7 @@ mod tests {
                         )
                     }
                     Retryable => {
-                        let result = rebase.check_txn(other, 1);
+                        let result = rebase.check_txn(other, 1, &dataset).await;
                         assert!(
                             matches!(result, Err(Error::RetryableCommitConflict { .. })),
                             "Transaction {:?} should be {:?} with {:?}, but was {:?}",
