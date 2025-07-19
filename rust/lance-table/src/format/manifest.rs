@@ -223,7 +223,7 @@ impl Manifest {
             field.metadata = new_metadata;
             Ok(())
         } else {
-            Err(Error::FieldNotFound {
+            Err(Error::FieldNotExists {
                 field_desc: format!("ID<{}>", field_id),
                 location: location!(),
             })
