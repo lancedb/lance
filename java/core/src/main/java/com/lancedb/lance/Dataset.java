@@ -787,6 +787,38 @@ public class Dataset implements Closeable {
     return new Tags();
   }
 
+  /**
+   * Replace the schema metadata of the dataset.
+   *
+   * @param metadata the new table metadata
+   */
+  public void replaceSchemaMetadata(Map<String, String> metadata) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeReplaceSchemaMetadata(metadata);
+    }
+  }
+
+  private native void nativeReplaceSchemaMetadata(Map<String, String> metadata);
+
+  /**
+   * Replace target field metadata of the dataset. This method won't affect fields not in the map
+   *
+   * @param fieldMetadataMap field id to metadata map
+   */
+  public void replaceFieldMetadata(Map<Integer, Map<String, String>> fieldMetadataMap) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      for (Integer fieldId : fieldMetadataMap.keySet()) {
+        Preconditions.checkArgument(fieldId >= 0, "Field id must be greater than 0");
+      }
+      nativeReplaceFieldMetadata(fieldMetadataMap);
+    }
+  }
+
+  private native void nativeReplaceFieldMetadata(
+      Map<Integer, Map<String, String>> fieldMetadataMap);
+
   /** Tag operations of the dataset. */
   public class Tags {
 
