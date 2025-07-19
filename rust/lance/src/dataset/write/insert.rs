@@ -21,8 +21,8 @@ use object_store::path::Path;
 use snafu::location;
 
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::transaction::Operation;
 use crate::dataset::transaction::Transaction;
+use crate::dataset::transaction::{Operation, TransactionBuilder};
 use crate::dataset::write::write_fragments_internal;
 use crate::dataset::ReadParams;
 use crate::Dataset;
@@ -265,16 +265,19 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments: blob.0 },
         });
 
-        Ok(Transaction::new(
+        let transaction = TransactionBuilder::new(
             context
                 .dest
                 .dataset()
                 .map(|ds| ds.manifest.version)
                 .unwrap_or(0),
             operation,
-            blobs_op,
-            None,
-        ))
+        )
+        .blobs_op(blobs_op)
+        .properties(context.params.properties.clone())
+        .build();
+
+        Ok(transaction)
     }
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {

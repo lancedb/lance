@@ -12,6 +12,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{intern, prelude::*};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::schema::LanceSchema;
@@ -241,7 +242,128 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get DataReplacement class");
                 cls.call1((replacements,))
             }
-            _ => todo!(),
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                predicate,
+            } => {
+                let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
+                let deleted_fragment_ids = deleted_fragment_ids.into_pyobject(py)?;
+                let cls = namespace
+                    .getattr("Delete")
+                    .expect("Failed to get Delete class");
+                cls.call1((updated_fragments, deleted_fragment_ids, predicate))
+            }
+            Operation::Merge {
+                ref fragments,
+                ref schema,
+            } => {
+                let fragments_py = export_vec(py, fragments.as_slice())?;
+                let schema_py = LanceSchema(schema.clone());
+                let cls = namespace
+                    .getattr("Merge")
+                    .expect("Failed to get Merge class");
+                cls.call1((fragments_py, schema_py))
+            }
+            Operation::Restore { version } => {
+                let cls = namespace
+                    .getattr("Restore")
+                    .expect("Failed to get Restore class");
+                cls.call1((version,))
+            }
+            Operation::Rewrite {
+                ref groups,
+                ref rewritten_indices,
+                ..
+            } => {
+                let groups_py = export_vec(py, groups.as_slice())?;
+                let rewritten_indices_py = export_vec(py, rewritten_indices.as_slice())?;
+                let cls = namespace
+                    .getattr("Rewrite")
+                    .expect("Failed to get Rewrite class");
+                cls.call1((groups_py, rewritten_indices_py))
+            }
+            Operation::CreateIndex {
+                ref new_indices, ..
+            } => {
+                if let Some(index) = new_indices.first() {
+                    let uuid = index.uuid.to_string();
+                    let name = &index.name;
+                    let fields = &index.fields;
+                    let dataset_version = index.dataset_version;
+                    let index_version = index.index_version;
+                    let fragment_ids = index.fragment_bitmap.as_ref().map_or_else(
+                        || PySet::empty(py).unwrap(),
+                        |bitmap| {
+                            let set = PySet::empty(py).unwrap();
+                            for id in bitmap.iter() {
+                                set.add(id).unwrap();
+                            }
+                            set
+                        },
+                    );
+                    let created_at = index.created_at;
+
+                    let cls = namespace
+                        .getattr("CreateIndex")
+                        .expect("Failed to get CreateIndex class");
+                    cls.call1((
+                        uuid,
+                        name,
+                        fields,
+                        dataset_version,
+                        fragment_ids,
+                        index_version,
+                        created_at,
+                    ))
+                } else {
+                    let cls = namespace
+                        .getattr("CreateIndex")
+                        .expect("Failed to get CreateIndex class");
+                    cls.call1((
+                        "",
+                        "",
+                        Vec::<i32>::new(),
+                        0,
+                        PySet::empty(py).unwrap(),
+                        0,
+                        None::<Option<i64>>,
+                    ))
+                }
+            }
+            Operation::Project { ref schema } => {
+                let schema_py = LanceSchema(schema.clone());
+                let cls = namespace
+                    .getattr("Project")
+                    .expect("Failed to get Project class");
+                cls.call1((schema_py,))
+            }
+            Operation::ReserveFragments { num_fragments } => {
+                if let Ok(cls) = namespace.getattr("ReserveFragments") {
+                    cls.call1((num_fragments,))
+                } else {
+                    let base_op = namespace.getattr("BaseOperation")?;
+                    base_op.call0()
+                }
+            }
+            Operation::UpdateConfig {
+                ref upsert_values,
+                ref delete_keys,
+                ref schema_metadata,
+                ref field_metadata,
+            } => {
+                if let Ok(cls) = namespace.getattr("UpdateConfig") {
+                    cls.call1((upsert_values, delete_keys, schema_metadata, field_metadata))
+                } else {
+                    let base_op = namespace.getattr("BaseOperation")?;
+                    base_op.call0()
+                }
+            }
+            _ => {
+                //use BaseOperation as a fallback
+                let base_op = namespace.getattr("BaseOperation")?;
+                base_op.call0()
+            }
         }
     }
 }
@@ -255,12 +377,24 @@ impl FromPyObject<'_> for PyLance<Transaction> {
             .getattr("blobs_op")?
             .extract::<Option<PyLance<Operation>>>()?
             .map(|op| op.0);
+        let properties = match ob.hasattr("properties") {
+            Ok(true) => {
+                let props = ob.getattr("properties")?;
+                if props.is_none() {
+                    None
+                } else {
+                    Some(props.extract::<HashMap<String, String>>()?)
+                }
+            }
+            _ => None,
+        };
         Ok(Self(Transaction {
             read_version,
             uuid,
             operation,
             blobs_op,
             tag: None,
+            properties,
         }))
     }
 }
@@ -288,11 +422,18 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         let cls = namespace
             .getattr("Transaction")
             .expect("Failed to get Transaction class");
+
+        let py_transaction = cls.call1((read_version, operation, uuid, blobs_op))?;
+
+        if let Some(properties) = &self.0.properties {
+            if py_transaction.hasattr("properties")? {
+                let py_dict = properties.into_pyobject(py)?;
+                py_transaction.setattr("properties", py_dict)?;
+            }
+        }
+
         // Unwrap due to infallible
-        Ok(cls
-            .call1((read_version, operation, uuid, blobs_op))?
-            .into_pyobject(py)
-            .unwrap())
+        Ok(py_transaction.into_pyobject(py).unwrap())
     }
 }
 

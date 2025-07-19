@@ -29,7 +29,7 @@ import pytest
 from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
-from lance.dataset import AutoCleanupConfig
+from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
 from lance.debug import format_fragment
 from lance.schema import LanceSchema
 from lance.util import validate_vector_index
@@ -3688,3 +3688,135 @@ def test_metadata_cache_size(tmp_path):
     # With zero cache size, session should be smaller than default
     # (it won't be exactly 0 due to struct overhead)
     assert zero_cache_size < default_size
+
+
+def test_commit_messages_and_list(tmp_path):
+    """Test that commit_message is correctly stored as a property."""
+    table = pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    dataset = lance.write_dataset(
+        table, tmp_path, commit_message="Initial dataset creation"
+    )
+    # Add a column with commit_message
+    dataset.add_columns({"c": "a * 2"}, commit_message="Added column c")
+
+    # Add a column with commit_message
+    dataset.add_columns({"d": "a * 3"}, commit_message="Added column d")
+    assert len(dataset.get_transactions()) == 3
+
+    # extract messages from get_transactions
+    transactions = dataset.get_transactions()
+    expected_messages = []
+    for txn in transactions:
+        message = None
+        if txn.properties:
+            message = txn.properties.get(LANCE_COMMIT_MESSAGE_KEY)
+        expected_messages.append(message)
+
+    assert expected_messages == [
+        "Added column d",
+        "Added column c",
+        "Initial dataset creation",
+    ]
+
+
+def test_read_transaction_properties(tmp_path):
+    """Test retrieving properties from transactions at different versions."""
+    # Create schema and data for the dataset
+    schema = pa.schema([pa.field("id", pa.int32()), pa.field("value", pa.string())])
+
+    # First batch with properties
+    batch1 = pa.RecordBatch.from_arrays(
+        [pa.array([1, 2, 3]), pa.array(["a", "b", "c"])], schema=schema
+    )
+
+    # Create the first version with properties
+    properties1 = {
+        LANCE_COMMIT_MESSAGE_KEY: "First commit",
+        "custom_prop": "custom_value",
+    }
+
+    dataset = lance.write_dataset(batch1, tmp_path, properties=properties1)
+    mytrans = dataset.read_transaction(1)
+    print(mytrans)
+
+    # Test retrieving properties from the first version
+    transaction = dataset.read_transaction(1)
+    props = transaction.properties
+    assert props.get(LANCE_COMMIT_MESSAGE_KEY) == "First commit"
+    assert props.get("custom_prop") == "custom_value"
+
+    # Create a second batch with different properties
+    batch2 = pa.RecordBatch.from_arrays(
+        [pa.array([4, 5]), pa.array(["d", "e"])], schema=schema
+    )
+
+    # Add the second batch with different properties
+    properties2 = {
+        LANCE_COMMIT_MESSAGE_KEY: "Second commit",
+        "another_prop": "another_value",
+    }
+
+    dataset = lance.write_dataset(
+        batch2, tmp_path, mode="append", properties=properties2
+    )
+
+    # Test retrieving properties from the second version
+    transaction = dataset.read_transaction(2)
+    props = transaction.properties
+    assert props.get(LANCE_COMMIT_MESSAGE_KEY) == "Second commit"
+    assert props.get("another_prop") == "another_value"
+
+    # Test retrieving properties from the first version again
+    # to ensure old versions' properties are still accessible
+    transaction = dataset.read_transaction(1)
+    props = transaction.properties
+    assert props.get(LANCE_COMMIT_MESSAGE_KEY) == "First commit"
+    assert props.get("custom_prop") == "custom_value"
+
+
+def test_get_properties_with_no_properties(tmp_path):
+    """Test retrieving properties when none were set."""
+    # Create a test dataset without properties
+
+    # Create schema and data for the dataset
+    schema = pa.schema([pa.field("id", pa.int32())])
+    batch = pa.RecordBatch.from_arrays([pa.array([1, 2, 3])], schema=schema)
+
+    # Create the dataset without properties
+    dataset = lance.write_dataset(batch, tmp_path)
+
+    # Test retrieving properties - should return None
+    transaction = dataset.read_transaction(1)
+    assert transaction.properties is None
+
+
+def test_get_transactions_properties(tmp_path):
+    """Test accessing commit messages via get_transactions."""
+    table = pa.table({"a": [1]})
+
+    # 1. Test case: Commit with a message
+    dataset = lance.write_dataset(table, tmp_path, commit_message="first commit")
+    transactions = dataset.get_transactions()
+    assert len(transactions) == 1
+    assert transactions[0].properties.get(LANCE_COMMIT_MESSAGE_KEY) == "first commit"
+    # 2. Test case: Commit without a message
+    lance.write_dataset(table, tmp_path, mode="append")
+    dataset = lance.dataset(tmp_path)
+    transactions = dataset.get_transactions()
+    # Transactions are listed in reverse chronological order
+    assert len(transactions) == 2
+    # The latest transaction has no message,
+    # so the key should be missing or properties is None
+    assert (
+        transactions[0].properties is None
+        or LANCE_COMMIT_MESSAGE_KEY not in transactions[0].properties
+    )
+    # The first transaction should still have the message
+    assert transactions[1].properties.get(LANCE_COMMIT_MESSAGE_KEY) == "first commit"
+    # 3. Test case: Transaction with no properties at all
+    # A delete operation creates a new version that may have no properties.
+    dataset.delete("a > 100")  # A no-op delete
+    transactions = dataset.get_transactions()
+    assert len(transactions) == 3
+    # The latest transaction from delete should have no properties.
+    assert transactions[0].properties is None

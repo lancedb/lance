@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashSet, sync::Arc};
-
 use crate::{io::exec::Planner, Error, Result};
 use arrow::compute::CastOptions;
 use arrow_array::{RecordBatch, RecordBatchReader};
@@ -14,6 +12,8 @@ use lance_core::datatypes::{Field, Schema};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_table::format::Fragment;
 use snafu::location;
+use std::collections::HashMap;
+use std::{collections::HashSet, sync::Arc};
 
 use super::fragment::FileFragment;
 use super::{
@@ -23,6 +23,7 @@ use super::{
 
 mod optimize;
 
+use crate::dataset::transaction::TransactionBuilder;
 use optimize::{
     ChainedNewColumnTransformOptimizer, NewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
@@ -104,6 +105,69 @@ impl ColumnAlteration {
     pub fn cast_to(mut self, data_type: DataType) -> Self {
         self.data_type = Some(data_type);
         self
+    }
+}
+
+/// Builder for adding columns to a dataset.
+///
+/// This builder allows for a more fluent API when adding columns to a dataset.
+pub struct AddColumnsBuilder<'a> {
+    dataset: &'a mut Dataset,
+    transforms: NewColumnTransform,
+    read_columns: Option<Vec<String>>,
+    batch_size: Option<u32>,
+    properties: Option<HashMap<String, String>>,
+}
+
+impl<'a> AddColumnsBuilder<'a> {
+    /// Create a new `AddColumnsBuilder`.
+    pub(crate) fn new(dataset: &'a mut Dataset, transforms: NewColumnTransform) -> Self {
+        Self {
+            dataset,
+            transforms,
+            read_columns: None,
+            batch_size: None,
+            properties: None,
+        }
+    }
+
+    /// Set the columns to read from the dataset.
+    ///
+    /// These columns will be used as input to the transform.
+    pub fn read_columns(mut self, read_columns: Option<Vec<String>>) -> Self {
+        self.read_columns = read_columns;
+        self
+    }
+
+    /// Set the batch size for reading from the dataset.
+    ///
+    /// This is the number of rows to read at a time when applying the transform.
+    pub fn batch_size(mut self, batch_size: Option<u32>) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    /// Set the properties for this operation.
+    ///
+    /// Properties are key-value pairs that will be stored with the transaction.
+    /// This can include commit messages, engine information, etc.
+    pub fn properties(mut self, properties: Option<HashMap<String, String>>) -> Self {
+        self.properties = properties;
+        self
+    }
+
+    /// Execute internal add_columns
+    ///
+    /// This will add the columns to the dataset and return the result.
+    pub async fn execute(self) -> Result<()> {
+        add_columns(
+            self.dataset,
+            self.transforms,
+            self.read_columns,
+            self.batch_size,
+            self.properties,
+        )
+        .await
     }
 }
 
@@ -296,6 +360,7 @@ pub(super) async fn add_columns(
     transforms: NewColumnTransform,
     read_columns: Option<Vec<String>>,
     batch_size: Option<u32>,
+    properties: Option<HashMap<String, String>>,
 ) -> Result<()> {
     let (fragments, schema) = add_columns_to_fragments(
         dataset,
@@ -307,13 +372,11 @@ pub(super) async fn add_columns(
     .await?;
 
     let operation = Operation::Merge { fragments, schema };
-    let transaction = Transaction::new(
-        dataset.manifest.version,
-        operation,
-        // TODO: Make it possible to add new blob columns
-        /*blob_op= */ None,
-        None,
-    );
+
+    let transaction = TransactionBuilder::new(dataset.manifest.version, operation)
+        .properties(properties)
+        .build();
+
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await?;
