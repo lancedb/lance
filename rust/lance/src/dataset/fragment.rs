@@ -6,9 +6,10 @@
 pub mod write;
 
 use std::borrow::Cow;
+use std::cmp::min;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
@@ -43,6 +44,8 @@ use lance_table::utils::stream::{
     wrap_with_row_id_and_delete, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
     RowIdAndDeletesConfig,
 };
+use moka::sync::Cache;
+use object_store::path::Path;
 use snafu::location;
 
 use self::write::FragmentCreateBuilder;
@@ -57,6 +60,13 @@ use crate::arrow::*;
 use crate::dataset::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
 
+pub static FILE_READER_CACHE_SIZE: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("FILE_READER_CACHE_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+});
+
 /// A Fragment of a Lance [`Dataset`].
 ///
 /// The interface is modeled after `pyarrow.dataset.Fragment`.
@@ -65,6 +75,8 @@ pub struct FileFragment {
     dataset: Arc<Dataset>,
 
     pub(super) metadata: Fragment,
+
+    reader_cache: Option<Arc<Cache<String, Arc<dyn GenericFileReader>>>>,
 }
 
 const DEFAULT_BATCH_READ_SIZE: u32 = 1024;
@@ -641,7 +653,21 @@ impl FragReadConfig {
 impl FileFragment {
     /// Creates a new FileFragment.
     pub fn new(dataset: Arc<Dataset>, metadata: Fragment) -> Self {
-        Self { dataset, metadata }
+        let reader_cache_size: u64 = min(metadata.files.len() as u64, *FILE_READER_CACHE_SIZE);
+        let reader_cache = match reader_cache_size {
+            0 => None,
+            reader_cache_size => Some(Arc::new(
+                Cache::builder()
+                    .max_capacity(reader_cache_size)
+                    .support_invalidation_closures()
+                    .build(),
+            )),
+        };
+        Self {
+            dataset,
+            reader_cache,
+            metadata,
+        }
     }
 
     /// Create a new [`FileFragment`] from a [`StreamingWriteSource`].
@@ -761,13 +787,9 @@ impl FileFragment {
         &self,
         field_stats: &mut HashMap<u32, FieldStatistics>,
         dataset_schema: &Schema,
-        scan_scheduler: Arc<ScanScheduler>,
     ) -> Result<()> {
         for reader in self
-            .open_readers(
-                dataset_schema,
-                &FragReadConfig::default().with_scan_scheduler(scan_scheduler),
-            )
+            .open_readers(dataset_schema, &FragReadConfig::default())
             .await?
         {
             reader.update_storage_stats(field_stats);
@@ -884,15 +906,15 @@ impl FileFragment {
         data_file: &DataFile,
         projection: Option<&Schema>,
         read_config: &FragReadConfig,
-    ) -> Result<Option<Box<dyn GenericFileReader>>> {
-        let full_schema = self.dataset.schema();
-        // The data file may contain fields that are not part of the dataset any longer, remove those
-        let data_file_schema = data_file.schema(full_schema);
-        let projection = projection.unwrap_or(full_schema);
-        // Also remove any fields that are not part of the user's provided projection
-        let schema_per_file = Arc::new(projection.intersection_ignore_types(&data_file_schema)?);
+    ) -> Result<Option<Arc<dyn GenericFileReader>>> {
+        let path = self.dataset.data_dir().child(data_file.path.as_str());
 
         if data_file.is_legacy_file() {
+            let schema_per_file = self.schema_per_file(data_file, projection).await?;
+            if schema_per_file.fields.is_empty() {
+                return Ok(None);
+            }
+
             let max_field_id = data_file.fields.iter().max().unwrap();
             if !schema_per_file.fields.is_empty() {
                 let path = self.dataset.data_dir().child(data_file.path.as_str());
@@ -913,77 +935,145 @@ impl FileFragment {
                     OnTypeMismatch::Error,
                 )?;
                 let reader = V1Reader::new(reader, Arc::new(initialized_schema));
-                Ok(Some(Box::new(reader)))
+                Ok(Some(Arc::new(reader)))
             } else {
                 Ok(None)
             }
-        } else if schema_per_file.fields.is_empty() {
-            Ok(None)
-        } else {
-            let path = self.dataset.data_dir().child(data_file.path.as_str());
-            let (store_scheduler, reader_priority) =
-                if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
-                    (
-                        scan_scheduler.clone(),
-                        read_config.reader_priority.unwrap_or(0),
-                    )
-                } else {
-                    (
-                        ScanScheduler::new(
-                            self.dataset.object_store.clone(),
-                            SchedulerConfig::max_bandwidth(&self.dataset.object_store),
-                        ),
-                        0,
-                    )
-                };
-            let file_scheduler = store_scheduler
-                .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
-                .await?;
-            let file_metadata = self.get_file_metadata(&file_scheduler).await?;
-            let path = file_scheduler.reader().path().clone();
-            let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
-            let reader = Arc::new(
-                v2::reader::FileReader::try_open_with_file_metadata(
-                    Arc::new(LanceEncodingsIo(file_scheduler.clone())),
-                    path,
-                    None,
-                    Arc::<DecoderPlugins>::default(),
-                    file_metadata,
-                    &metadata_cache,
-                    FileReaderOptions::default(),
-                )
-                .await?,
-            );
-            let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
-                data_file
-                    .fields
-                    .iter()
-                    .copied()
-                    .zip(data_file.column_indices.iter().copied())
-                    .filter_map(|(field_id, column_index)| {
-                        if column_index < 0 {
-                            None
-                        } else {
-                            Some((field_id as u32, column_index as u32))
-                        }
-                    }),
-            ));
-            let reader = v2_adapter::Reader::new(
-                reader,
-                schema_per_file,
-                field_id_to_column_idx,
+        } else if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
+            let store_scheduler = scan_scheduler.clone();
+            let reader_priority = read_config.reader_priority.unwrap_or(0);
+            self.open_reader_v2(
+                data_file,
+                projection,
+                &path,
+                store_scheduler,
                 reader_priority,
-                file_scheduler,
+            )
+            .await
+        } else if let Some(reader_cache) = &self.reader_cache {
+            if let Some(reader) = reader_cache.get(path.as_ref()) {
+                return Ok(Some(reader));
+            }
+
+            let store_scheduler = ScanScheduler::new(
+                self.dataset.object_store.clone(),
+                SchedulerConfig::max_bandwidth(&self.dataset.object_store),
             );
-            Ok(Some(Box::new(reader)))
+            let reader_priority = 0;
+
+            match self
+                .open_reader_v2(
+                    data_file,
+                    projection,
+                    &path,
+                    store_scheduler,
+                    reader_priority,
+                )
+                .await?
+            {
+                Some(reader) => {
+                    reader_cache.insert(path.to_string(), reader.clone());
+                    return Ok(Some(reader));
+                }
+                None => Ok(None),
+            }
+        } else {
+            let schema_per_file = self.schema_per_file(data_file, projection).await?;
+            if schema_per_file.fields.is_empty() {
+                return Ok(None);
+            }
+
+            let store_scheduler = ScanScheduler::new(
+                self.dataset.object_store.clone(),
+                SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+            );
+            let reader_priority = 0;
+            self.open_reader_v2(
+                data_file,
+                projection,
+                &path,
+                store_scheduler,
+                reader_priority,
+            )
+            .await
         }
+    }
+
+    async fn schema_per_file(
+        &self,
+        data_file: &DataFile,
+        projection: Option<&Schema>,
+    ) -> Result<Arc<Schema>> {
+        let full_schema = self.dataset.schema();
+        // The data file may contain fields that are not part of the dataset any longer, remove those
+        let data_file_schema = data_file.schema(full_schema);
+        let projection = projection.unwrap_or(full_schema);
+        // Also remove any fields that are not part of the user's provided projection
+        Ok(Arc::new(
+            projection.intersection_ignore_types(&data_file_schema)?,
+        ))
+    }
+
+    async fn open_reader_v2(
+        &self,
+        data_file: &DataFile,
+        projection: Option<&Schema>,
+        path: &Path,
+        store_scheduler: Arc<ScanScheduler>,
+        reader_priority: u32,
+    ) -> Result<Option<Arc<dyn GenericFileReader>>> {
+        let schema_per_file = self.schema_per_file(data_file, projection).await?;
+        if schema_per_file.fields.is_empty() {
+            return Ok(None);
+        }
+
+        let file_scheduler = store_scheduler
+            .open_file_with_priority(path, reader_priority as u64, &data_file.file_size_bytes)
+            .await?;
+        let file_metadata = self.get_file_metadata(&file_scheduler).await?;
+        let path = file_scheduler.reader().path().clone();
+        let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
+        let reader = Arc::new(
+            v2::reader::FileReader::try_open_with_file_metadata(
+                Arc::new(LanceEncodingsIo(file_scheduler.clone())),
+                path,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                file_metadata,
+                &metadata_cache,
+                FileReaderOptions::default(),
+            )
+            .await?,
+        );
+        let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
+            data_file
+                .fields
+                .iter()
+                .copied()
+                .zip(data_file.column_indices.iter().copied())
+                .filter_map(|(field_id, column_index)| {
+                    if column_index < 0 {
+                        None
+                    } else {
+                        Some((field_id as u32, column_index as u32))
+                    }
+                }),
+        ));
+        let reader = v2_adapter::Reader::new(
+            reader,
+            schema_per_file,
+            field_id_to_column_idx,
+            reader_priority,
+            file_scheduler,
+        );
+        Ok(Some(Arc::new(reader)))
     }
 
     async fn open_readers(
         &self,
         projection: &Schema,
         read_config: &FragReadConfig,
-    ) -> Result<Vec<Box<dyn GenericFileReader>>> {
+    ) -> Result<Vec<Arc<dyn GenericFileReader>>> {
         let mut opened_files = vec![];
         for data_file in &self.metadata.files {
             if let Some(reader) = self
@@ -1009,7 +1099,7 @@ impl FileFragment {
         if !missing_fields.is_empty() {
             let missing_projection = projection.project_by_ids(&missing_fields, true);
             let null_reader = NullReader::new(Arc::new(missing_projection), num_rows as u32);
-            opened_files.push(Box::new(null_reader));
+            opened_files.push(Arc::new(null_reader));
         }
 
         Ok(opened_files)
@@ -1693,7 +1783,7 @@ impl From<FileFragment> for Fragment {
 #[derive(Debug)]
 pub struct FragmentReader {
     /// Readers and schema of each opened data file.
-    readers: Vec<Box<dyn GenericFileReader>>,
+    readers: Vec<Arc<dyn GenericFileReader>>,
 
     /// The output schema. The defines the order in which the columns are returned.
     output_schema: ArrowSchema,
@@ -1733,11 +1823,7 @@ pub struct FragmentReader {
 impl Clone for FragmentReader {
     fn clone(&self) -> Self {
         Self {
-            readers: self
-                .readers
-                .iter()
-                .map(|reader| reader.clone_box())
-                .collect::<Vec<_>>(),
+            readers: self.readers.to_vec(),
             output_schema: self.output_schema.clone(),
             deletion_vec: self.deletion_vec.clone(),
             row_id_sequence: self.row_id_sequence.clone(),
@@ -1777,7 +1863,7 @@ impl FragmentReader {
         fragment_id: usize,
         deletion_vec: Option<Arc<DeletionVector>>,
         row_id_sequence: Option<Arc<RowIdSequence>>,
-        readers: Vec<Box<dyn GenericFileReader>>,
+        readers: Vec<Arc<dyn GenericFileReader>>,
         output_schema: ArrowSchema,
         num_rows: usize,
         num_physical_rows: usize,
