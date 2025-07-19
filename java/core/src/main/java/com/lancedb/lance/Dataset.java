@@ -267,6 +267,16 @@ public class Dataset implements Closeable {
       Map<String, String> storageOptions);
 
   /**
+   * Create a new transaction builder at current version for the dataset. The dataset itself will
+   * not refresh after the transaction committed.
+   *
+   * @return A new instance of {@link Transaction.Builder} linked to the opened dataset.
+   */
+  public Transaction.Builder newTransactionBuilder() {
+    return new Transaction.Builder(this).readVersion(version());
+  }
+
+  /**
    * Drop a Dataset.
    *
    * @param path The file path of the dataset

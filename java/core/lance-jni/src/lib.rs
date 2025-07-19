@@ -59,6 +59,7 @@ mod file_writer;
 mod fragment;
 mod schema;
 pub mod traits;
+mod transaction;
 pub mod utils;
 
 pub use error::Error;
