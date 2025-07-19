@@ -248,3 +248,34 @@ def test_io_counters(tmp_path):
     dataset.to_table()
     assert lance.iops_counter() > starting_iops
     assert lance.bytes_read_counter() > starting_bytes
+
+
+@pytest.mark.parametrize(
+    "row_param, column_name",
+    [("with_row_id", "_rowid"), ("with_row_address", "_rowaddr")],
+)
+def test_with_row_id(tmp_path, row_param, column_name):
+    path = tmp_path / "test_with_inner_column.lance"
+    data = pa.table(
+        {
+            "data_item_id": pa.array([1001, 1002, 1003]),
+            "a": pa.array([1, 2, 3]),
+        }
+    )
+
+    lance.write_dataset(data, path)
+    lance_ds = lance.dataset(path)
+
+    scanner_args = {row_param: True, "columns": ["data_item_id", column_name]}
+    table = lance_ds.scanner(**scanner_args).to_table()
+    assert table.column(column_name).type == pa.uint64()
+
+    scanner_args = {row_param: True, "columns": ["data_item_id"]}
+    table = lance_ds.scanner(**scanner_args).to_table()
+    assert column_name in table.column_names
+    assert table.column(column_name).type == pa.uint64()
+
+    with pytest.raises((ValueError, OSError), match="without enabling"):
+        lance_ds.scanner(
+            **{row_param: False, "columns": ["data_item_id", column_name]}
+        ).to_table()
