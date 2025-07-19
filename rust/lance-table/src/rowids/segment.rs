@@ -631,6 +631,27 @@ impl U64Segment {
         });
         *self = Self::from_stats_and_sequence(stats, sequence)
     }
+
+    /// Converts a `RangeWithBitmap` segment to a `SortedArray` segment.
+    ///
+    /// This function is useful when you want to force the representation to be
+    /// a `SortedArray`, for example, before a merge operation.
+    ///
+    /// # Errors
+    ///
+    /// Return an error if the input segment is not a `RangeWithBitmap`.
+    pub fn rwb_to_sorted_array(segment: &Self) -> ::lance_core::Result<Self> {
+        match segment {
+            Self::RangeWithBitmap { .. } => {
+                let values = segment.iter().collect::<Vec<_>>();
+                Ok(Self::SortedArray(EncodedU64Array::from(values)))
+            }
+            _ => Err(lance_core::Error::invalid_input(
+                "Only supports changing from RangeWithBitmap segments",
+                location!(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

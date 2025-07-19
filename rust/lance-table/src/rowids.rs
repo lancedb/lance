@@ -439,6 +439,17 @@ impl RowIdSequence {
         }
         ranges
     }
+
+    /// Convert a range with bitmap segment to sorted array
+    /// so that we can exclude invalid row ids.
+    pub fn convert_rwb_to_sorted_array(&mut self) -> Result<()> {
+        for segment in &mut self.0 {
+            if let U64Segment::RangeWithBitmap { .. } = segment {
+                *segment = U64Segment::rwb_to_sorted_array(segment)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// An iterator that groups row ids into ranges
