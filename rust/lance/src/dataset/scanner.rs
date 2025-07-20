@@ -459,12 +459,37 @@ impl Scanner {
     ///
     /// Only select the specified columns. If not specified, all columns will be scanned.
     pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
-        self.project_with_transform(
-            &columns
-                .iter()
-                .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
-                .collect::<Vec<_>>(),
-        )
+        let mut transformed_columns: Vec<(&str, String)> = columns
+            .iter()
+            .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
+            .collect();
+
+        for (col, _) in &transformed_columns {
+            if *col == ROW_ID && !self.with_row_id {
+                return Err(Error::invalid_input(
+                    format!("Cannot project {} without enabling with_row_id", ROW_ID),
+                    location!(),
+                ));
+            }
+            if *col == ROW_ADDR && !self.with_row_address {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Cannot project {} without enabling with_row_address",
+                        ROW_ADDR
+                    ),
+                    location!(),
+                ));
+            }
+        }
+
+        if self.with_row_id && !transformed_columns.iter().any(|(c, _)| *c == ROW_ID) {
+            transformed_columns.push((ROW_ID, ROW_ID.to_string()));
+        }
+        if self.with_row_address && !transformed_columns.iter().any(|(c, _)| *c == ROW_ADDR) {
+            transformed_columns.push((ROW_ADDR, ROW_ADDR.to_string()));
+        }
+
+        self.project_with_transform(&transformed_columns)
     }
 
     /// Projection with transform
@@ -474,9 +499,19 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
+        let filtered_columns: Vec<_> = columns
+            .iter()
+            .filter(|(col, _)| {
+                let col_name = col.as_ref();
+                self.nearest.is_some()
+                    || !(self.with_row_id && col_name == ROW_ID
+                        || self.with_row_address && col_name == ROW_ADDR)
+            })
+            .map(|(c, t)| (c.as_ref(), t.as_ref()))
+            .collect();
         let base_schema = self.scan_output_schema(self.dataset.schema(), true)?;
         self.projection_plan =
-            ProjectionPlan::try_new(&base_schema, columns, /*load_blobs=*/ false)?;
+            ProjectionPlan::try_new(&base_schema, &filtered_columns, /*load_blobs=*/ false)?;
         if self.projection_plan.sibling_schema.is_some() {
             return Err(Error::NotSupported {
                 source: "Scanning columns with non-default storage class is not yet supported"
@@ -908,6 +943,7 @@ impl Scanner {
             q.use_index = true;
         }
         self.fast_search = true;
+        self.with_row_id = true; // fast search requires _rowid
         self
     }
 
@@ -2972,8 +3008,10 @@ pub mod test_dataset {
 
     use std::vec;
 
-    use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
-    use arrow_schema::ArrowError;
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
+    };
+    use arrow_schema::{ArrowError, DataType};
     use lance_file::version::LanceFileVersion;
     use lance_index::{
         scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams},
@@ -6392,5 +6430,90 @@ mod test {
             .unwrap();
 
         assert_eq!(tracker.new_iops(), 0);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    pub async fn test_row_meta_columns(
+        #[values(
+            (true, false),  // Test row_id only
+            (false, true),  // Test row_address only
+            (true, true)    // Test both
+        )]
+        columns: (bool, bool),
+    ) {
+        let (with_row_id, with_row_address) = columns;
+        let test_dir = tempdir().unwrap();
+        let uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("data_item_id", arrow_schema::DataType::Int32, false),
+            arrow_schema::Field::new("a", arrow_schema::DataType::Int32, false),
+        ]));
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1001, 1002, 1003])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data)], schema.clone()),
+            uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Test explicit projection
+        let mut scanner = dataset.scan();
+        scanner.with_row_id = with_row_id;
+        scanner.with_row_address = with_row_address;
+
+        let mut projection = vec!["data_item_id".to_string()];
+        if with_row_id {
+            projection.push(ROW_ID.to_string());
+        }
+        if with_row_address {
+            projection.push(ROW_ADDR.to_string());
+        }
+
+        scanner.project(&projection).unwrap();
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batch = stream.try_collect::<Vec<_>>().await.unwrap().pop().unwrap();
+
+        // Verify column existence and data type
+        if with_row_id {
+            let column = batch.column_by_name(ROW_ID).unwrap();
+            assert_eq!(column.data_type(), &DataType::UInt64);
+        }
+        if with_row_address {
+            let column = batch.column_by_name(ROW_ADDR).unwrap();
+            assert_eq!(column.data_type(), &DataType::UInt64);
+        }
+
+        // Test implicit inclusion
+        let mut scanner = dataset.scan();
+        scanner.with_row_id = with_row_id;
+        scanner.with_row_address = with_row_address;
+        scanner.project(&["data_item_id"]).unwrap();
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batch = stream.try_collect::<Vec<_>>().await.unwrap().pop().unwrap();
+        let meta_column = batch.column_by_name(if with_row_id { ROW_ID } else { ROW_ADDR });
+        assert!(meta_column.is_some());
+
+        // Test error case
+        let mut scanner = dataset.scan();
+        scanner.with_row_id = false;
+        scanner.with_row_address = false;
+        let result = if with_row_id {
+            scanner.project(&[ROW_ID])
+        } else {
+            scanner.project(&[ROW_ADDR])
+        };
+        assert!(result.is_err());
     }
 }

@@ -192,7 +192,7 @@ impl Schema {
                 } else {
                     candidates.push(projected_field)
                 }
-            } else if err_on_missing {
+            } else if err_on_missing && first != ROW_ID && first != ROW_ADDR {
                 return Err(Error::Schema {
                     message: format!("Column {} does not exist", col.as_ref()),
                     location: location!(),
