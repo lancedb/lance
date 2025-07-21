@@ -2888,7 +2888,7 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("ScalarIndexQuery: query=AND([id >= 2000]@id_idx,[id < 3000]@id_idx)"),
+            plan.contains("ScalarIndexQuery: query=[id >= 2000 && id < 3000]@id_idx"),
             "Expected scalar index query in plan: {}",
             plan
         );
