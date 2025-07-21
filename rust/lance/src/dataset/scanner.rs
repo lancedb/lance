@@ -31,6 +31,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::ExprSchemable;
 use datafusion_physical_expr::{aggregate::AggregateExprBuilder, expressions::Column};
 use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
@@ -239,8 +240,18 @@ impl LanceFilter {
         match self {
             Self::Sql(sql) => {
                 let schema = Arc::new(ArrowSchema::from(full_schema));
-                let planner = Planner::new(schema);
+                let planner = Planner::new(schema.clone());
                 let filter = planner.parse_filter(sql)?;
+
+                let df_schema = DFSchema::try_from(schema)?;
+                let (ret_type, _) = filter.data_type_and_nullable(&df_schema)?;
+                if ret_type != DataType::Boolean {
+                    return Err(Error::InvalidInput {
+                        source: format!("The filter {} does not return a boolean", filter).into(),
+                        location: location!(),
+                    });
+                }
+
                 planner.optimize_expr(filter).map_err(|e| {
                     Error::invalid_input(
                         format!("Error optimizing sql filter: {sql} ({e})"),

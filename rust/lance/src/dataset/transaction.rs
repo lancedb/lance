@@ -1553,7 +1553,7 @@ impl Transaction {
                 }
                 if let Some(field_metadata) = field_metadata {
                     for (field_id, metadata) in field_metadata {
-                        manifest.replace_field_metadata(*field_id as i32, metadata.clone());
+                        manifest.replace_field_metadata(*field_id as i32, metadata.clone())?;
                     }
                 }
             }

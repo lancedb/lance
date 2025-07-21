@@ -12,6 +12,7 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arrow-array.workspace = true
 rand.workspace = true
 
 # this should be put in dev-dependencies, TODO: remove it from here

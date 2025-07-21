@@ -239,6 +239,19 @@ impl BlockingDataset {
         Ok(())
     }
 
+    pub fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
+        RT.block_on(self.inner.replace_schema_metadata(metadata))?;
+        Ok(())
+    }
+
+    pub fn replace_field_metadata(
+        &mut self,
+        metadata_map: HashMap<u32, HashMap<String, String>>,
+    ) -> Result<()> {
+        RT.block_on(self.inner.replace_field_metadata(metadata_map))?;
+        Ok(())
+    }
+
     pub fn close(&self) {}
 }
 
@@ -1602,4 +1615,62 @@ fn inner_get_version_by_tag(
     let dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
     dataset_guard.get_version(tag.as_str())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceSchemaMetadata(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jschema_metadata: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_replace_schema_metadata(&mut env, java_dataset, jschema_metadata)
+    )
+}
+
+fn inner_replace_schema_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jschema_metadata: JObject,
+) -> Result<()> {
+    let jmap = JMap::from_env(env, &jschema_metadata)?;
+    let schema_metadata = to_rust_map(env, &jmap)?;
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.replace_schema_metadata(schema_metadata)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceFieldMetadata(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jfield_metadata_map: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_replace_field_metadata(&mut env, java_dataset, jfield_metadata_map)
+    )
+}
+
+fn inner_replace_field_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jfield_metadata_map: JObject,
+) -> Result<()> {
+    let jmap = JMap::from_env(env, &jfield_metadata_map)?;
+    let mut field_metadata_map = HashMap::new();
+    let mut iter = jmap.iter(env)?;
+    env.with_local_frame(16, |env| {
+        while let Some((key, value)) = iter.next(env)? {
+            let field_id = env.call_method(&key, "intValue", "()I", &[])?.i()? as u32;
+            let inner_map = JMap::from_env(env, &value)?;
+            let value_map = to_rust_map(env, &inner_map)?;
+            field_metadata_map.insert(field_id, value_map);
+        }
+        Ok::<(), Error>(())
+    })?;
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.replace_field_metadata(field_metadata_map)
 }
