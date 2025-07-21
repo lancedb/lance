@@ -121,16 +121,20 @@ async fn do_commit_new_dataset(
         ..
     } = transaction.operation
     {
-        let source_manifest_location =
-                commit_handler
-                    .resolve_version_location(&Path::from(source_path.as_str()), ref_version, &object_store.inner)
-                    .await?;
+        let source_manifest_location = commit_handler
+            .resolve_version_location(
+                &Path::from(source_path.as_str()),
+                ref_version,
+                &object_store.inner,
+            )
+            .await?;
         let source_manifest = Dataset::load_manifest(
             &object_store,
             &source_manifest_location,
             &base_path,
             &Session::default(),
-        ).await?;
+        )
+        .await?;
         let new_manifest = source_manifest.shallow_clone(source_path, ref_name, is_strong_ref);
         (new_manifest, Vec::new())
     } else {
