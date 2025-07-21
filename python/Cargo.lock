@@ -2740,6 +2740,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 name = "fsst"
 version = "0.31.2"
 dependencies = [
+ "arrow-array",
  "rand 0.8.5",
 ]
 
