@@ -469,14 +469,17 @@ impl Scanner {
             .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
             .collect();
 
+        let with_row_id = self.projection_plan.physical_projection.with_row_id;
+        let with_row_addr = self.projection_plan.physical_projection.with_row_addr;
+
         for (col, _) in &transformed_columns {
-            if *col == ROW_ID && !self.with_row_id {
+            if *col == ROW_ID && !with_row_id {
                 return Err(Error::invalid_input(
                     format!("Cannot project {} without enabling with_row_id", ROW_ID),
                     location!(),
                 ));
             }
-            if *col == ROW_ADDR && !self.with_row_address {
+            if *col == ROW_ADDR && !with_row_addr {
                 return Err(Error::invalid_input(
                     format!(
                         "Cannot project {} without enabling with_row_address",
@@ -487,10 +490,10 @@ impl Scanner {
             }
         }
 
-        if self.with_row_id && !transformed_columns.iter().any(|(c, _)| *c == ROW_ID) {
+        if with_row_id && !transformed_columns.iter().any(|(c, _)| *c == ROW_ID) {
             transformed_columns.push((ROW_ID, ROW_ID.to_string()));
         }
-        if self.with_row_address && !transformed_columns.iter().any(|(c, _)| *c == ROW_ADDR) {
+        if with_row_addr && !transformed_columns.iter().any(|(c, _)| *c == ROW_ADDR) {
             transformed_columns.push((ROW_ADDR, ROW_ADDR.to_string()));
         }
 
@@ -504,18 +507,19 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
+        let with_row_id = self.projection_plan.physical_projection.with_row_id;
+        let with_row_addr = self.projection_plan.physical_projection.with_row_addr;
         let filtered_columns: Vec<_> = columns
             .iter()
             .filter(|(col, _)| {
                 let col_name = col.as_ref();
                 self.nearest.is_some()
-                    || !(self.with_row_id && col_name == ROW_ID
-                        || self.with_row_address && col_name == ROW_ADDR)
+                    || !(with_row_id && col_name == ROW_ID || with_row_addr && col_name == ROW_ADDR)
             })
             .map(|(c, t)| (c.as_ref(), t.as_ref()))
             .collect();
         self.projection_plan
-            .project_from_expressions(filtered_columns)?;
+            .project_from_expressions(&filtered_columns)?;
         Ok(self)
     }
 
@@ -940,7 +944,7 @@ impl Scanner {
             q.use_index = true;
         }
         self.fast_search = true;
-        self.with_row_id = true; // fast search requires _rowid
+        self.projection_plan.include_row_id(); // fast search requires _rowid
         self
     }
 
@@ -6883,8 +6887,8 @@ mod test {
 
         // Test explicit projection
         let mut scanner = dataset.scan();
-        scanner.with_row_id = with_row_id;
-        scanner.with_row_address = with_row_address;
+        scanner.projection_plan.physical_projection.with_row_id = with_row_id;
+        scanner.projection_plan.physical_projection.with_row_addr = with_row_address;
 
         let mut projection = vec!["data_item_id".to_string()];
         if with_row_id {
@@ -6910,8 +6914,8 @@ mod test {
 
         // Test implicit inclusion
         let mut scanner = dataset.scan();
-        scanner.with_row_id = with_row_id;
-        scanner.with_row_address = with_row_address;
+        scanner.projection_plan.physical_projection.with_row_id = with_row_id;
+        scanner.projection_plan.physical_projection.with_row_addr = with_row_address;
         scanner.project(&["data_item_id"]).unwrap();
         let stream = scanner.try_into_stream().await.unwrap();
         let batch = stream.try_collect::<Vec<_>>().await.unwrap().pop().unwrap();
@@ -6920,8 +6924,8 @@ mod test {
 
         // Test error case
         let mut scanner = dataset.scan();
-        scanner.with_row_id = false;
-        scanner.with_row_address = false;
+        scanner.projection_plan.physical_projection.with_row_id = false;
+        scanner.projection_plan.physical_projection.with_row_addr = false;
         let result = if with_row_id {
             scanner.project(&[ROW_ID])
         } else {
