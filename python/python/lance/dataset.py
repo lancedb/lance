@@ -2761,6 +2761,23 @@ class LanceDataset(pa.dataset.Dataset):
     ) -> None:
         _Dataset.drop(str(base_uri), storage_options, ignore_not_found=ignore_not_found)
 
+    # ---------------------------------------------------------------------
+    #  IVF helpers (added for centroids exposure)
+    # ---------------------------------------------------------------------
+
+    def get_ivf_model(self, index_name: str):
+        """Return the IVF model for a vector index.
+
+        This directly forwards to the underlying Rust Dataset implementation
+        and returns a ``PyIvfModel`` instance (see ``lance.indices``).
+
+        Parameters
+        ----------
+        index_name : str
+            The name of the vector index (e.g. ``"vector_idx"``).
+        """
+        return self._ds.get_ivf_model(index_name)
+
 
 class BulkCommitResult(TypedDict):
     dataset: LanceDataset

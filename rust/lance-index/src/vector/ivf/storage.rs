@@ -132,6 +132,14 @@ impl IvfModel {
         self.lengths.push(len);
     }
 
+    /// Get a reference to all centroids as a [`FixedSizeListArray`].
+    ///
+    /// Returns `None` if the model does not contain centroids (e.g. in sub-index
+    /// tracking scenarios).
+    pub fn centroids_array(&self) -> Option<&FixedSizeListArray> {
+        self.centroids.as_ref()
+    }
+
     pub fn row_range(&self, partition: usize) -> Range<usize> {
         let start = self.offsets[partition];
         let end = start + self.lengths[partition] as usize;

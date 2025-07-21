@@ -1848,6 +1848,43 @@ impl Dataset {
             Ok(dict.into())
         })
     }
+
+    #[pyo3(signature = (index_name))]
+    fn get_ivf_model(&self, py: Python<'_>, index_name: &str) -> PyResult<Py<crate::indices::PyIvfModel>> {
+        use crate::indices::PyIvfModel;
+        let ivf_model = crate::RT
+            .block_on(Some(py), async {
+                use lance_index::metrics::NoOpMetricsCollector;
+                use lance::index::DatasetIndexInternalExt;
+
+                // Load index metadata and find the requested index
+                let idx_metas = self.ds.load_indices().await.infer_error()?;
+                let idx_meta = idx_metas
+                    .iter()
+                    .find(|idx| idx.name == index_name)
+                    .ok_or_else(|| PyValueError::new_err(format!("Index \"{}\" not found", index_name)))?;
+
+                if idx_meta.fields.is_empty() {
+                    return Err(PyValueError::new_err("Index has no fields"));
+                }
+
+                let schema = self.ds.schema();
+                let field = schema
+                    .field_by_id(idx_meta.fields[0])
+                    .ok_or_else(|| PyValueError::new_err("Failed to resolve index field"))?;
+                let column_name = &field.name;
+
+                let vindex = self
+                    .ds
+                    .open_vector_index(column_name, &idx_meta.uuid.to_string(), &NoOpMetricsCollector)
+                    .await
+                    .infer_error()?;
+
+                Ok::<lance_index::vector::ivf::storage::IvfModel, pyo3::PyErr>(vindex.ivf_model().clone())
+            })??;
+
+        Py::new(py, PyIvfModel { inner: ivf_model })
+    }
 }
 
 #[derive(FromPyObject)]
