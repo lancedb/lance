@@ -354,7 +354,7 @@ mod tests {
 
             // Create a decompressor for this chunk
             let decompressor = decompression_strategy
-                .create_miniblock_decompressor(encoding)
+                .create_miniblock_decompressor(encoding, &decompression_strategy)
                 .unwrap();
 
             // Decompress the chunk
@@ -608,7 +608,7 @@ mod tests {
             // Create a decompressor for this chunk
             let decompression_strategy = DefaultDecompressionStrategy::default();
             let decompressor = decompression_strategy
-                .create_miniblock_decompressor(&encoding)
+                .create_miniblock_decompressor(&encoding, &decompression_strategy)
                 .unwrap();
 
             // Decompress the chunk
