@@ -223,10 +223,13 @@ impl Manifest {
             field.metadata = new_metadata;
             Ok(())
         } else {
-            Err(Error::FieldNotExists {
-                field_desc: format!("ID<{}>", field_id),
-                location: location!(),
-            })
+            Err(Error::invalid_input(
+                format!(
+                    "Field with id {} does not exist for replace_field_metadata",
+                    field_id
+                ),
+                location!(),
+            ))
         }
     }
 

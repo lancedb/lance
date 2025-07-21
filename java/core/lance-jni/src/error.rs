@@ -107,7 +107,6 @@ impl From<LanceError> for Error {
             LanceError::DatasetNotFound { .. }
             | LanceError::DatasetAlreadyExists { .. }
             | LanceError::CommitConflict { .. }
-            | LanceError::FieldNotExists { .. }
             | LanceError::InvalidInput { .. } => Self::input_error(err.to_string()),
             LanceError::IO { .. } => Self::io_error(err.to_string()),
             LanceError::NotSupported { .. } => Self::unsupported_error(err.to_string()),
