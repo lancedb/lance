@@ -364,11 +364,9 @@ impl DisplayAs for FullSchemaMergeInsertExec {
             | datafusion::physical_plan::DisplayFormatType::Verbose => {
                 let on_keys = self.params.on.join(", ");
                 let when_matched = match &self.params.when_matched {
-                    crate::dataset::WhenMatched::DoNothing => "DoNothing".to_string(),
-                    crate::dataset::WhenMatched::UpdateAll => "UpdateAll".to_string(),
-                    crate::dataset::WhenMatched::UpdateIf(condition) => {
-                        format!("UpdateIf({})", condition)
-                    }
+                    crate::dataset::WhenMatched::DoNothing => "DoNothing",
+                    crate::dataset::WhenMatched::UpdateAll => "UpdateAll",
+                    crate::dataset::WhenMatched::UpdateIf(_) => "UpdateIf",
                 };
                 let when_not_matched = if self.params.insert_not_matched {
                     "InsertAll"
