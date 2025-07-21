@@ -39,9 +39,11 @@ pub struct LanceReader {
 
 impl LanceReader {
     pub async fn try_new(scanner: Arc<LanceScanner>) -> ::lance::error::Result<Self> {
+        let stream = scanner.try_into_stream().await?;
+        let schema = stream.schema();
         Ok(Self {
-            schema: scanner.schema().await?,
-            stream: Arc::new(Mutex::new(scanner.try_into_stream().await?)), // needs tokio Runtime
+            schema,
+            stream: Arc::new(Mutex::new(stream)), // needs tokio Runtime
         })
     }
 

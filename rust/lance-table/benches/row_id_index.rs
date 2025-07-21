@@ -18,10 +18,16 @@
 
 use std::{collections::HashMap, io::Write, ops::Range, sync::Arc};
 
+use arrow_array::{RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use lance_core::utils::address::RowAddress;
-use lance_table::rowids::{write_row_ids, RowIdIndex, RowIdSequence};
+use lance_io::ReadBatchParams;
+use lance_table::{
+    rowids::{write_row_ids, RowIdIndex, RowIdSequence},
+    utils::stream::{apply_row_id_and_deletes, RowIdAndDeletesConfig},
+};
 
 fn make_sequence(row_id_range: Range<u64>, deletions: usize) -> RowIdSequence {
     let mut sequence = RowIdSequence::from(row_id_range);
@@ -241,11 +247,51 @@ fn bench_get_single(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_apply_row_id(c: &mut Criterion) {
+    let mut group = c.benchmark_group("apply_row_id");
+
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::UInt64,
+            false,
+        )])),
+        vec![Arc::new(UInt64Array::from(
+            (0..num_rows()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+
+    let config = RowIdAndDeletesConfig {
+        params: ReadBatchParams::default(),
+        with_row_id: true,
+        with_row_addr: false,
+        deletion_vector: None,
+        row_id_sequence: None,
+        make_deletions_null: false,
+        total_num_rows: num_rows() as u32,
+    };
+
+    group.bench_function("ApplyRowId", |b| {
+        let batch = batch.clone();
+        b.iter(|| {
+            let _ = apply_row_id_and_deletes(batch.clone(), 0, 0, &config);
+        });
+    });
+
+    group.finish();
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name = benches;
     config=Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
-    targets=bench_creation, bench_get_single);
+    targets=bench_creation, bench_get_single, bench_apply_row_id);
 #[cfg(not(target_os = "linux"))]
-criterion_group!(benches, bench_creation, bench_get_single);
+criterion_group!(
+    benches,
+    bench_creation,
+    bench_get_single,
+    bench_apply_row_id
+);
 criterion_main!(benches);
