@@ -39,6 +39,7 @@ import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -73,7 +74,7 @@ public class Dataset implements Closeable {
    * @param path dataset uri
    * @param schema dataset schema
    * @param params write params
-   * @return Dataset
+   * @return Datase
    */
   public static Dataset create(
       BufferAllocator allocator, String path, Schema schema, WriteParams params) {
@@ -104,7 +105,7 @@ public class Dataset implements Closeable {
    * @param stream arrow stream
    * @param path dataset uri
    * @param params write parameters
-   * @return Dataset
+   * @return Datase
    */
   public static Dataset create(
       BufferAllocator allocator, ArrowArrayStream stream, String path, WriteParams params) {
@@ -147,7 +148,7 @@ public class Dataset implements Closeable {
    * Open a dataset from the specified path.
    *
    * @param path file path
-   * @return Dataset
+   * @return Datase
    */
   public static Dataset open(String path) {
     return open(new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build());
@@ -158,7 +159,7 @@ public class Dataset implements Closeable {
    *
    * @param path file path
    * @param options the open options
-   * @return Dataset
+   * @return Datase
    */
   public static Dataset open(String path, ReadOptions options) {
     return open(new RootAllocator(Long.MAX_VALUE), true, path, options);
@@ -169,7 +170,7 @@ public class Dataset implements Closeable {
    *
    * @param path file path
    * @param allocator Arrow buffer allocator
-   * @return Dataset
+   * @return Datase
    */
   public static Dataset open(String path, BufferAllocator allocator) {
     return open(allocator, path, new ReadOptions.Builder().build());
@@ -181,7 +182,7 @@ public class Dataset implements Closeable {
    * @param allocator Arrow buffer allocator
    * @param path file path
    * @param options the open options
-   * @return Dataset
+   * @return Datase
    */
   public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
     return open(allocator, false, path, options);
@@ -192,7 +193,7 @@ public class Dataset implements Closeable {
    *
    * @param path file path
    * @param options the open options
-   * @return Dataset
+   * @return Datase
    */
   private static Dataset open(
       BufferAllocator allocator, boolean selfManagedAllocator, String path, ReadOptions options) {
@@ -269,7 +270,7 @@ public class Dataset implements Closeable {
   /**
    * Drop a Dataset.
    *
-   * @param path The file path of the dataset
+   * @param path The file path of the datase
    * @param storageOptions Storage options
    */
   public static native void drop(String path, Map<String, String> storageOptions);
@@ -376,7 +377,7 @@ public class Dataset implements Closeable {
   /**
    * Create a new Dataset Scanner.
    *
-   * @param batchSize the scan options with batch size, columns filter, and substrait
+   * @param batchSize the scan options with batch size, columns filter, and substrai
    * @return a dataset scanner
    */
   public LanceScanner newScan(long batchSize) {
@@ -440,7 +441,7 @@ public class Dataset implements Closeable {
   /**
    * Gets the URI of the dataset.
    *
-   * @return the URI of the dataset
+   * @return the URI of the datase
    */
   public String uri() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -452,9 +453,9 @@ public class Dataset implements Closeable {
   private native String nativeUri();
 
   /**
-   * Get the currently checked out version id of the dataset
+   * Get the currently checked out version id of the datase
    *
-   * @return the version id of the dataset
+   * @return the version id of the datase
    */
   public long version() {
     return getVersion().getId();
@@ -463,7 +464,7 @@ public class Dataset implements Closeable {
   /**
    * Gets the currently checked out version of the dataset.
    *
-   * @return the version of the dataset
+   * @return the version of the datase
    */
   public Version getVersion() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -477,7 +478,7 @@ public class Dataset implements Closeable {
   /**
    * Get the version history of the dataset.
    *
-   * @return the version history of the dataset
+   * @return the version history of the datase
    */
   public List<Version> listVersions() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -510,10 +511,10 @@ public class Dataset implements Closeable {
 
   /**
    * Checks out a specific version of the dataset. If the version is already checked out, it returns
-   * a new Java Dataset object pointing to the same underlying Rust Dataset object
+   * a new Java Dataset object pointing to the same underlying Rust Dataset objec
    *
-   * @param version the version to check out
-   * @return a new Dataset instance with the specified version checked out
+   * @param version the version to check ou
+   * @return a new Dataset instance with the specified version checked ou
    */
   public Dataset checkoutVersion(long version) {
     Preconditions.checkArgument(version > 0, "version number must be greater than 0");
@@ -526,11 +527,11 @@ public class Dataset implements Closeable {
   private native Dataset nativeCheckoutVersion(long version);
 
   /**
-   * Checks out a specific tag of the dataset. If the underlying version is already checked out, it
-   * returns a new Java Dataset object pointing to the same underlying Rust Dataset object
+   * Checks out a specific tag of the dataset. If the underlying version is already checked out, i
+   * returns a new Java Dataset object pointing to the same underlying Rust Dataset objec
    *
-   * @param tag the tag to check out
-   * @return a new Dataset instance with the specified tag checked out
+   * @param tag the tag to check ou
+   * @return a new Dataset instance with the specified tag checked ou
    */
   public Dataset checkoutTag(String tag) {
     Preconditions.checkArgument(tag != null, "Tag can not be null");
@@ -615,7 +616,7 @@ public class Dataset implements Closeable {
   /**
    * Calculate the size of the dataset.
    *
-   * @return the size of the dataset
+   * @return the size of the datase
    */
   public long calculateDataSize() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -627,7 +628,7 @@ public class Dataset implements Closeable {
   /**
    * Calculate the statistics of the dataset.
    *
-   * @return the statistics of the dataset
+   * @return the statistics of the datase
    */
   private native DataStatistics nativeGetDataStatistics();
 
@@ -770,6 +771,18 @@ public class Dataset implements Closeable {
     }
   }
 
+  /**
+   * Get the native handle of the dataset.
+   *
+   * @return the native handle
+   */
+  public long getNativeHandle() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDatasetHandle;
+    }
+  }
+
   public Fragment getFragment(int fragmentId) {
     FragmentMetadata metadata = getFragmentNative(fragmentId);
     return new Fragment(this, metadata);
@@ -884,6 +897,30 @@ public class Dataset implements Closeable {
         return nativeGetVersionByTag(tag);
       }
     }
+  }
+
+  /**
+   * 创建 merge insert 操作构建器
+   *
+   * @param onColumns 用于匹配的列名列表
+   * @return MergeInsertBuilder 实例
+   */
+  public MergeInsertBuilder mergeInsert(List<String> onColumns) {
+    return new MergeInsertBuilder(this, onColumns);
+  }
+
+  /**
+   * 创建 merge insert 操作构建器（单列版本）
+   *
+   * @param onColumn 用于匹配的列名
+   * @return MergeInsertBuilder 实例
+   */
+  public MergeInsertBuilder mergeInsert(String onColumn) {
+    return new MergeInsertBuilder(this, Arrays.asList(onColumn));
+  }
+
+  BufferAllocator getAllocator() {
+    return allocator;
   }
 
   private native void nativeCreateTag(String tag, long version);

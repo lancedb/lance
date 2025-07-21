@@ -171,6 +171,7 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 | [java](./java)     | Java bindings (JNI)      |
 | [docs](./docs)     | Documentation source     |
 
+
 ## What makes Lance different
 
 Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://lancedb.github.io/lance/format.html).

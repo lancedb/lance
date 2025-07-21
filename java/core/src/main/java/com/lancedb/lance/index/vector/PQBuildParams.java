@@ -1,7 +1,7 @@
 /*
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * You may obtain a copy of the License a
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -20,7 +20,7 @@ import org.apache.commons.lang3.builder.ToStringBuilder;
  *
  * <p>This will run k-means clustering on each subvector to determine the centroids that will be
  * used to quantize the subvectors. This step runs against a randomly chosen sample of the data. The
- * sample size is typically quite small and PQ training is relatively fast regardless of dataset
+ * sample size is typically quite small and PQ training is relatively fast regardless of datase
  * scale. As a result, accelerators are not needed here.
  */
 public class PQBuildParams {
