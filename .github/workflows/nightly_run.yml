@@ -8,6 +8,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-24.04
+    if: github.repository == 'lancedb/lance'
     steps:
       - name: Nightly Run File Verification Workflow
         uses: benc-uk/workflow-dispatch@v1
