@@ -22,11 +22,11 @@ use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
     cache::{Context, DeepSizeOf},
     datatypes::{
-        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+        DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+        STRUCTURAL_ENCODING_MINIBLOCK,
     },
     error::Error,
-    utils::bit::pad_bytes,
-    utils::hash::U8SliceKey,
+    utils::{bit::pad_bytes, hash::U8SliceKey},
 };
 use log::trace;
 use snafu::location;
@@ -4065,7 +4065,7 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
-    fn should_dictionary_encode(data_block: &DataBlock) -> bool {
+    fn should_dictionary_encode(data_block: &DataBlock, field: &Field) -> bool {
         // Don't dictionary encode tiny arrays
         let too_small = env::var("LANCE_ENCODING_DICT_TOO_SMALL")
             .ok()
@@ -4077,9 +4077,15 @@ impl PrimitiveStructuralEncoder {
 
         // Somewhat arbitrary threshold rule.  Apply dictionary encoding if the number of unique
         // values is less than 1/2 the total number of values.
-        let divisor = env::var("LANCE_ENCODING_DICT_DIVISOR")
-            .ok()
-            .and_then(|val| val.parse().ok())
+        let divisor: u64 = field
+            .metadata
+            .get(DICT_DIVISOR_META_KEY)
+            .map(|val| val.parse().ok())
+            .unwrap_or_else(|| {
+                env::var("LANCE_ENCODING_DICT_DIVISOR")
+                    .ok()
+                    .and_then(|val| val.parse().ok())
+            })
             .unwrap_or(2);
 
         // Cap on cardinality.  This should be pushed into the cardinality estimation to avoid
@@ -4158,7 +4164,7 @@ impl PrimitiveStructuralEncoder {
             let data_block = data_block.remove_outer_validity();
 
 
-            if Self::should_dictionary_encode(&data_block) {
+            if Self::should_dictionary_encode(&data_block, &field) {
                 log::debug!(
                     "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
                     column_idx,

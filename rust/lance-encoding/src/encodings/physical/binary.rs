@@ -556,14 +556,15 @@ pub mod tests {
     async fn test_large_binary_fsst_with_dict(
         #[values(DataType::LargeBinary, DataType::LargeUtf8)] data_type: DataType,
     ) {
-        // A workaround to test the dictionary encoding with large data. see issue #4249
-        // Set the environment variable for this test
-        std::env::set_var("LANCE_ENCODING_DICT_DIVISOR", "1");
+        use lance_core::datatypes::DICT_DIVISOR_META_KEY;
+
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
             STRUCTURAL_ENCODING_META_KEY.to_string(),
             STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
         );
+        // Force it to use dictionary encoding
+        field_metadata.insert(DICT_DIVISOR_META_KEY.to_string(), "1".into());
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
         check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
