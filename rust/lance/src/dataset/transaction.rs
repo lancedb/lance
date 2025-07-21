@@ -235,9 +235,8 @@ pub enum Operation {
         is_shallow: bool,
         is_strong_ref: bool,
         ref_name: String,
+        ref_version: u64,
         source_path: String,
-        target_path: String,
-        source: Option<Manifest>,
     },
 }
 
@@ -279,24 +278,22 @@ impl PartialEq for Operation {
                     is_shallow: a_is_shallow,
                     is_strong_ref: a_is_strong_ref,
                     ref_name: a_ref_name,
+                    ref_version: a_ref_version,
                     source_path: a_source_path,
-                    target_path: a_target_path,
-                    source: _,
                 },
                 Self::Clone {
                     is_shallow: b_is_shallow,
                     is_strong_ref: b_is_strong_ref,
                     ref_name: b_ref_name,
+                    ref_version: b_ref_version,
                     source_path: b_source_path,
-                    target_path: b_target_path,
-                    source: _,
                 },
             ) => {
                 a_is_shallow == b_is_shallow
                     && a_is_strong_ref == b_is_strong_ref
                     && a_ref_name == b_ref_name
+                    && a_ref_version == b_ref_version
                     && a_source_path == b_source_path
-                    && a_target_path == b_target_path
             }
             (
                 Self::Delete {
@@ -1978,15 +1975,14 @@ impl TryFrom<pb::Transaction> for Transaction {
                 is_shallow,
                 is_strong_ref,
                 ref_name,
+                ref_version,
                 source_path,
-                target_path,
             })) => Operation::Clone {
                 is_shallow,
                 is_strong_ref,
                 ref_name,
+                ref_version,
                 source_path,
-                target_path,
-                source: None,
             },
             Some(pb::transaction::Operation::Delete(pb::transaction::Delete {
                 updated_fragments,
@@ -2293,15 +2289,14 @@ impl From<&Transaction> for pb::Transaction {
                 is_shallow,
                 is_strong_ref,
                 ref_name,
+                ref_version,
                 source_path,
-                target_path,
-                source: _,
             } => pb::transaction::Operation::Clone(pb::transaction::Clone {
                 is_shallow: *is_shallow,
                 is_strong_ref: *is_strong_ref,
                 ref_name: ref_name.clone(),
+                ref_version: *ref_version,
                 source_path: source_path.clone(),
-                target_path: target_path.clone(),
             }),
             Operation::Delete {
                 updated_fragments,

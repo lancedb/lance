@@ -1570,39 +1570,25 @@ impl Dataset {
         &mut self,
         target_path: &str,
         ref_name: &str,
-        write_params: Option<WriteParams>,
+        store_params: ObjectStoreParams,
     ) -> Result<Self> {
         // self.tags.create(ref_name, self.version().version).await?;
+        let version = self.tags.get_version(ref_name).await?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             is_strong_ref: true,
             ref_name: ref_name.to_string(),
+            ref_version: version,
             source_path: self.base.to_string(),
-            target_path: target_path.to_string(),
-            source: Some(self.manifest().clone()),
+            // source_path: self.uri.clone(),
         };
-        let dataset = self.checkout_version(ref_name).await?;
-        let transaction = Transaction::new(dataset.version().version, clone_op, None, None);
+        let transaction = Transaction::new(version, clone_op, None, None);
 
         let mut builder = CommitBuilder::new(WriteDestination::Uri(target_path))
+            .with_store_params(store_params)
             .with_object_store(Arc::new(self.object_store().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
-
-        match write_params {
-            Some(params) => {
-                if let Some(store_params) = &params.store_params {
-                    builder = builder.with_store_params(store_params.clone())
-                }
-            }
-            None => {
-                builder = builder.with_store_params(ObjectStoreParams {
-                    storage_options: Some(HashMap::new()),
-                    ..Default::default()
-                })
-            }
-        }
-
         builder.execute(transaction).await
     }
 
@@ -2700,7 +2686,7 @@ mod tests {
             .unwrap();
         dataset.tags.create("tag", 1).await.unwrap();
         let cloned_dataset = dataset
-            .shallow_clone(cloned_dir, "tag", Some(write_params.clone()))
+            .shallow_clone(cloned_dir, "tag", Some(ObjectStoreParams::default()))
             .await
             .unwrap();
 

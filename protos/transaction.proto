@@ -159,8 +159,8 @@ message Transaction {
     bool is_shallow = 1;
     bool is_strong_ref = 2;
     string ref_name = 3;
-    string source_path = 4;
-    string target_path = 5;
+    uint64 ref_version = 4;
+    string source_path = 5;
   }
 
   // An operation that updates rows but does not add or remove rows.

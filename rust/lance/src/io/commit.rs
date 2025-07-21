@@ -60,6 +60,7 @@ use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::caches::DSMetadataCache;
 use crate::session::index_caches::IndexMetadataKey;
+use crate::session::Session;
 use crate::Dataset;
 
 mod conflict_resolver;
@@ -116,11 +117,20 @@ async fn do_commit_new_dataset(
         ref source_path,
         ref ref_name,
         is_strong_ref,
-        ref source,
+        ref_version,
         ..
     } = transaction.operation
     {
-        let source_manifest = source.as_ref().unwrap();
+        let source_manifest_location =
+                commit_handler
+                    .resolve_version_location(&Path::from(source_path.as_str()), ref_version, &object_store.inner)
+                    .await?;
+        let source_manifest = Dataset::load_manifest(
+            &object_store,
+            &source_manifest_location,
+            &base_path,
+            &Session::default(),
+        ).await?;
         let new_manifest = source_manifest.shallow_clone(source_path, ref_name, is_strong_ref);
         (new_manifest, Vec::new())
     } else {
