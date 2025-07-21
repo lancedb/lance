@@ -26,8 +26,8 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, ExprSchemable, GetFieldAccess, ScalarFunctionArgs, ScalarUDF,
-    ScalarUDFImpl, Signature, Volatility, WindowUDF,
+    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
@@ -815,19 +815,7 @@ impl Planner {
             )
         })?;
 
-        let coerced = coerce_filter_type_to_boolean(resolved);
-
-        // Verify filter returns boolean
-        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
-        let (ret_type, _) = coerced.data_type_and_nullable(&df_schema)?;
-        if ret_type != ArrowDataType::Boolean {
-            Err(Error::InvalidInput {
-                source: format!("The filter {} does not return a boolean", filter).into(),
-                location: location!(),
-            })
-        } else {
-            Ok(coerced)
-        }
+        Ok(coerce_filter_type_to_boolean(resolved))
     }
 
     /// Create Logical [Expr] from a SQL expression.
