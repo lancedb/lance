@@ -230,6 +230,11 @@ struct MergeInsertParams {
     // If set, this MemWAL should be marked as flushed, and will be committed to replace the
     // MemWAL that is currently in the index with the same ID.
     mem_wal_to_flush: Option<MemWal>,
+    // If true, skip auto cleanup during commits. This should be set to true
+    // for high frequency writes to improve performance. This is also useful
+    // if the writer does not have delete permissions and the clean up would
+    // just try and log a failure anyway.
+    skip_auto_cleanup: bool,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -309,6 +314,7 @@ impl MergeInsertBuilder {
                 conflict_retries: 10,
                 retry_timeout: Duration::from_secs(30),
                 mem_wal_to_flush: None,
+                skip_auto_cleanup: false,
             },
         })
     }
@@ -361,6 +367,11 @@ impl MergeInsertBuilder {
     /// The default is 30 seconds.
     pub fn retry_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.params.retry_timeout = timeout;
+        self
+    }
+
+    pub fn skip_auto_cleanup(&mut self, skip: bool) -> &mut Self {
+        self.params.skip_auto_cleanup = skip;
         self
     }
 
@@ -1144,7 +1155,8 @@ impl MergeInsertJob {
             } = execute_fut.await??;
             stats.num_attempts = backoff.attempt() + 1;
 
-            let mut commit_builder = CommitBuilder::new(ds.clone());
+            let mut commit_builder = CommitBuilder::new(ds.clone())
+                .with_skip_auto_cleanup(self.params.skip_auto_cleanup);
             if let Some(affected_rows) = affected_rows {
                 commit_builder = commit_builder.with_affected_rows(affected_rows);
             }
@@ -1800,7 +1812,6 @@ impl Merger {
 
 #[cfg(test)]
 mod tests {
-
     use arrow_array::{
         types::UInt32Type, Int64Array, RecordBatchIterator, RecordBatchReader, StringArray,
         UInt32Array,
@@ -1814,6 +1825,7 @@ mod tests {
     use lance_io::object_store::ObjectStoreParams;
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
+    use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::sync::{Barrier, Notify};
 
@@ -3137,5 +3149,138 @@ mod tests {
           RepartitionExec...
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_skip_auto_cleanup() {
+        use lance_core::utils::testing::MockClock;
+        let clock = MockClock::new();
+
+        let tmpdir = tempdir().unwrap();
+        let dataset_uri = tmpdir.path().join("test_dataset");
+        let dataset_path = dataset_uri.to_str().unwrap();
+
+        // Create initial dataset with auto cleanup interval of 1 version
+        let data = lance_datagen::gen()
+            .with_seed(Seed::from(1))
+            .col("id", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let mut auto_cleanup_params = HashMap::new();
+        auto_cleanup_params.insert("lance.auto_cleanup.interval".to_string(), "1".to_string());
+        auto_cleanup_params.insert(
+            "lance.auto_cleanup.older_than".to_string(),
+            "0ms".to_string(),
+        );
+
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            auto_cleanup: Some(crate::dataset::AutoCleanupParams {
+                interval: 1,
+                older_than: chrono::TimeDelta::try_milliseconds(0).unwrap(),
+            }),
+            ..Default::default()
+        };
+
+        // Start at 1 second after epoch
+        clock.set_system_time(chrono::Duration::seconds(1));
+
+        let dataset = Dataset::write(data, dataset_path, Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.version().version, 1);
+
+        // Advance time
+        clock.set_system_time(chrono::Duration::seconds(2));
+
+        // First merge insert WITHOUT skip_auto_cleanup - should trigger cleanup
+        let new_data = lance_datagen::gen()
+            .with_seed(Seed::from(2))
+            .col("id", array::step::<UInt32Type>())
+            .into_df_stream(RowCount::from(50), BatchCount::from(1));
+
+        let (dataset2, _) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute(new_data)
+            .await
+            .unwrap();
+
+        assert_eq!(dataset2.version().version, 2);
+
+        // Advance time
+        clock.set_system_time(chrono::Duration::seconds(3));
+
+        // Need to do another merge insert for cleanup to take effect since cleanup runs on the old dataset
+        let new_data_extra = lance_datagen::gen()
+            .with_seed(Seed::from(4))
+            .col("id", array::step::<UInt32Type>())
+            .into_df_stream(RowCount::from(10), BatchCount::from(1));
+
+        let (dataset2_extra, _) =
+            MergeInsertBuilder::try_new(dataset2.clone(), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute(new_data_extra)
+                .await
+                .unwrap();
+
+        assert_eq!(dataset2_extra.version().version, 3);
+
+        // Load the dataset from disk to check versions
+        let ds_check1 = DatasetBuilder::from_uri(dataset_path).load().await.unwrap();
+
+        // Version 1 should be cleaned up due to auto cleanup (cleanup runs every version)
+        assert!(
+            ds_check1.checkout_version(1).await.is_err(),
+            "Version 1 should have been cleaned up"
+        );
+        // Version 2 should still exist
+        assert!(
+            ds_check1.checkout_version(2).await.is_ok(),
+            "Version 2 should still exist"
+        );
+
+        // Advance time
+        clock.set_system_time(chrono::Duration::seconds(4));
+
+        // Second merge insert WITH skip_auto_cleanup - should NOT trigger cleanup
+        let new_data2 = lance_datagen::gen()
+            .with_seed(Seed::from(3))
+            .col("id", array::step::<UInt32Type>())
+            .into_df_stream(RowCount::from(30), BatchCount::from(1));
+
+        let (dataset3, _) = MergeInsertBuilder::try_new(dataset2_extra, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .skip_auto_cleanup(true) // Skip auto cleanup
+            .try_build()
+            .unwrap()
+            .execute(new_data2)
+            .await
+            .unwrap();
+
+        assert_eq!(dataset3.version().version, 4);
+
+        // Load the dataset from disk to check versions
+        let ds_check2 = DatasetBuilder::from_uri(dataset_path).load().await.unwrap();
+
+        // Version 2 should still exist because skip_auto_cleanup was enabled
+        assert!(
+            ds_check2.checkout_version(2).await.is_ok(),
+            "Version 2 should still exist because skip_auto_cleanup was enabled"
+        );
+        // Version 3 should also still exist
+        assert!(
+            ds_check2.checkout_version(3).await.is_ok(),
+            "Version 3 should still exist"
+        );
     }
 }
