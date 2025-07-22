@@ -64,6 +64,45 @@ Setting up a DDP-aware data loader with `SafeLanceDataset` involves four main st
             # ... train on batch
     ```
 
+
+### Handling binary data
+
+In the map-style (`SafeLanceDataset`), the DataLoader's workers fetch the raw data, and the transformation happens later in the `collate_fn`
+
+```
+def collate_fn(batch_of_dicts):
+    """
+    Collates a list of dictionaries from SafeLanceDataset into a single batch.
+    This function handles decoding the image bytes and applying transforms.
+    """
+    images = []
+    labels = []
+    
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+
+    for item in batch_of_dicts:
+        image_bytes = item["image"]
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img_tensor = transform(img)
+        images.append(img_tensor)
+        labels.append(item["label"])
+        
+    return {
+        "image": torch.stack(images),
+        "label": torch.tensor(labels, dtype=torch.long)
+    }
+
+loader = get_safe_loader(
+        dataset,
+        sampler=sampler,
+        collate_fn=collate_fn,
+    )
+```
+
+
 ## Complete Example
 
 For a complete, runnable script demonstrating this pattern, please see the [map-style DDP example](https://github.com/lancedb/lance-distributed-training/blob/main/lance_map_style.py) in our examples repository.

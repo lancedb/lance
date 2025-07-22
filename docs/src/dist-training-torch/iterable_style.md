@@ -4,6 +4,11 @@ The basic iterable-style pattern is for use cases where you need to stream data 
 
 **Important:** This simple pattern requires setting `num_workers=0` in the `DataLoader`, which means data will be loaded serially. This is significantly slower than the map-style approach and should only be used when the flexibility of iterable datasets is a requirement.
 
+
+!!! Note
+    You can implement an iterable style dataloader with many workers, but it involves sharding at two levels:
+    Global Sharding (DDP Rank) - at the GPU rank level, and local sharding withing Dataloaders the same global rank.
+
 ## Implementation Guide
 
 1.  **Instantiate `LanceDataset`**: This is the iterable-style counterpart to `SafeLanceDataset`.
@@ -12,7 +17,7 @@ The basic iterable-style pattern is for use cases where you need to stream data 
     import lance
     from lance.torch.data import LanceDataset
 
-    uri = "s3://my-bucket/path/to/my_dataset.lance"
+    uri = "path/to/my_dataset.lance"
     dataset = LanceDataset(uri, batch_size=32)
     ```
 
@@ -44,6 +49,30 @@ The basic iterable-style pattern is for use cases where you need to stream data 
             images, labels = batch
             # ... train on batch
     ```
+
+### Handling binary data
+
+A key difference from the map-style pattern is that data transformations are typically applied before the data reaches the DataLoader, via a `to_tensor_fn` callable.
+
+Since the DataLoader doesn't manage batching or decoding for iterable datasets, you must pass a `to_tensor_fn` when constructing LanceDataset handle/decode binary data. This function is called on each raw row (dictionary) as it’s streamed from disk.
+
+```python
+# Runs inside the main thread for each row
+def decode_tensor_image(row):
+    image = Image.open(io.BytesIO(row['image'])).convert("RGB")
+    image_tensor = transforms.ToTensor()(image)
+    label = torch.tensor(row['label'], dtype=torch.long)
+    return {'image': image_tensor, 'label': label}
+
+# Example setup
+
+dataset = LanceDataset(
+    uri="data/FOOD101.lance",
+    batch_size=512,
+    sampler=sampler,
+    to_tensor_fn=decode_tensor_image
+)
+```
 
 ## Complete Example
 

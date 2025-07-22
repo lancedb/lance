@@ -2,15 +2,14 @@
 
 ## Introduction to DDP Training with Lance
 
-In multi-GPU distributed training, data loading can become a bottleneck, causing expensive GPUs to sit idle. This limits training throughput, making it bound by I/O performance rather than computation.
 
-Lance is a modern columnar format designed for high-performance ML workloads that addresses this challenge. Its architecture enables fast random access and efficient scans. LanceDB's ecosystem provides tools that integrate this storage format with training frameworks, supporting the AI workflow from data storage to optimized training pipelines. 
+Lance is a modern columnar format designed for high-performance ML workloads. Its architecture enables fast random access and efficient scans. LanceDB's ecosystem provides tools that integrate this storage format with training frameworks, supporting the AI workflow from data storage to optimized training pipelines. 
 
 This guide focuses on the PyTorch integration and demonstrates how to use Lance to build efficient data loaders for Distributed Data Parallel (DDP) training.
 
 ## Data Loading Strategies: Map-Style vs. Iterable-Style
 
-PyTorch offers two paradigms for creating datasets: map-style and iterable-style. Lance provides a corresponding class for each. Understanding their differences is key to building an effective data pipeline.
+PyTorch offers two paradigms for creating datasets: map-style and iterable-style. Lance provides a corresponding class for each.
 
 ### Map-Style: `torch.utils.data.Dataset`
 A map-style dataset is one that can be indexed and has a known length. It must implement the `__getitem__(self, index)` and `__len__(self)` methods. This design allows the `DataLoader` to fetch any specific item from the dataset by its index, enabling features like random shuffling and straightforward parallel loading across multiple workers. 
@@ -39,4 +38,4 @@ For most projects, the choice is between the high-performance map-style pattern 
 | **PyTorch `num_workers`** | `> 0` (Recommended for performance). | `0` (Required for this pattern). |
 | **Sampler** | PyTorch `DistributedSampler`. | Lance `ShardedBatchSampler`.  |
 
-For users who need the flexibility of an iterable dataset but require higher throughput, an advanced multi-worker pattern is available. This is covered in a separate section.
+You should use map‑style datasets when possible. Map‑style give you their size ahead of time, easier to shuffle, and allow for easy parallel loading. But if you're reading from a massive data source remotely and/or you need to use custom sampling logic, you should use iterable style dataloader.
