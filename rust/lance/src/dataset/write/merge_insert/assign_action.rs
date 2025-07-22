@@ -50,7 +50,10 @@ impl Action {
 
 /// Transforms merge insert parameters into a logical expression. The output
 /// is a single "action" column, that describes what to do with each row.
-pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
+pub fn merge_insert_action(
+    params: &MergeInsertParams,
+    schema: Option<&arrow_schema::Schema>,
+) -> Result<Expr> {
     // Check that at least one key column is non-null in the source
     // This ensures we only process rows that have valid join keys
     let source_has_key: Expr = if params.on.len() == 1 {
@@ -91,11 +94,27 @@ pub fn merge_insert_action(params: &MergeInsertParams) -> Result<Expr> {
         WhenMatched::UpdateAll => {
             cases.push((matched, Action::UpdateAll.as_literal_expr()));
         }
-        WhenMatched::UpdateIf(condition) => {
-            cases.push((
-                matched.and(condition.clone()),
-                Action::UpdateAll.as_literal_expr(),
-            ));
+        WhenMatched::UpdateIf(condition_str) => {
+            // Parse the condition with qualified column references enabled for fast path
+            if let Some(dataset_schema) = schema {
+                let planner = lance_datafusion::planner::Planner::new(std::sync::Arc::new(
+                    dataset_schema.clone(),
+                ))
+                .with_enable_relations(true);
+                let condition = planner.parse_filter(condition_str).map_err(|e| {
+                    crate::Error::InvalidInput {
+                        source: format!("Failed to parse UpdateIf condition: {}", e).into(),
+                        location: location!(),
+                    }
+                })?;
+                cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
+            } else {
+                // Fallback - this shouldn't happen in the fast path
+                return Err(crate::Error::Internal {
+                    message: "Schema required for UpdateIf parsing".into(),
+                    location: location!(),
+                });
+            }
         }
         WhenMatched::DoNothing => {}
     }

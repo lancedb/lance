@@ -31,10 +31,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class FragmentTest {
-  @TempDir private static Path tempDir; // Temporary directory for the tests
-
   @Test
-  void testFragmentCreateFfiArray() {
+  void testFragmentCreateFfiArray(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("new_fragment_array").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -45,7 +43,7 @@ public class FragmentTest {
   }
 
   @Test
-  void testFragmentCreate() throws Exception {
+  void testFragmentCreate(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("new_fragment").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -71,7 +69,7 @@ public class FragmentTest {
   }
 
   @Test
-  void commitWithoutVersion() {
+  void commitWithoutVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("commit_without_version").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -88,7 +86,7 @@ public class FragmentTest {
   }
 
   @Test
-  void appendWithoutFragment() {
+  void appendWithoutFragment(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("append_without_fragment").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -103,7 +101,7 @@ public class FragmentTest {
   }
 
   @Test
-  void testOverwriteCommit() throws Exception {
+  void testOverwriteCommit(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("testOverwriteCommit").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -149,7 +147,7 @@ public class FragmentTest {
   }
 
   @Test
-  void testEmptyFragments() {
+  void testEmptyFragments(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("testEmptyFragments").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -161,7 +159,7 @@ public class FragmentTest {
   }
 
   @Test
-  void testMultiFragments() {
+  void testMultiFragments(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("testMultiFragments").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =

@@ -7,6 +7,7 @@ use std::{collections::HashMap, pin::Pin};
 use arrow::datatypes;
 use arrow::{array::AsArray, datatypes::UInt64Type};
 use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::Fields;
 use futures::stream;
 use futures::{
     prelude::stream::{StreamExt, TryStreamExt},
@@ -409,6 +410,37 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(quantizer)
     }
 
+    fn rename_row_id(
+        stream: impl RecordBatchStream + Unpin + 'static,
+        row_id_idx: usize,
+    ) -> impl RecordBatchStream + Unpin + 'static {
+        let new_schema = Arc::new(arrow_schema::Schema::new(
+            stream
+                .schema()
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(field_idx, field)| {
+                    if field_idx == row_id_idx {
+                        arrow_schema::Field::new(
+                            ROW_ID,
+                            field.data_type().clone(),
+                            field.is_nullable(),
+                        )
+                    } else {
+                        field.as_ref().clone()
+                    }
+                })
+                .collect::<Fields>(),
+        ));
+        RecordBatchStreamAdapter::new(
+            new_schema.clone(),
+            stream.map_ok(move |batch| {
+                RecordBatch::try_new(new_schema.clone(), batch.columns().to_vec()).unwrap()
+            }),
+        )
+    }
+
     async fn shuffle_dataset(&mut self) -> Result<()> {
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
@@ -448,7 +480,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         };
 
-        self.shuffle_data(Some(stream)).await?;
+        if let Some((row_id_idx, _)) = stream.schema().column_with_name("row_id") {
+            // When using precomputed shuffle buffers we can't use the column name _rowid
+            // since it is reserved.  So we tolerate `row_id` as well here (and rename it
+            // to _rowid to match the non-precomputed path)
+            self.shuffle_data(Some(Self::rename_row_id(stream, row_id_idx)))
+                .await?;
+        } else {
+            self.shuffle_data(Some(stream)).await?;
+        }
         Ok(())
     }
 

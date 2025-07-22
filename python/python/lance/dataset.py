@@ -1469,6 +1469,8 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         updates: Dict[str, str],
         where: Optional[str] = None,
+        conflict_retries: int = 10,
+        retry_timeout: timedelta = timedelta(seconds=30),
     ) -> UpdateResult:
         """
         Update column values for rows matching where.
@@ -1479,6 +1481,14 @@ class LanceDataset(pa.dataset.Dataset):
             A mapping of column names to a SQL expression.
         where : str, optional
             A SQL predicate indicating which rows should be updated.
+        conflict_retries : int, optional
+            Number of times to retry the operation if there is contention.
+            Default is 10.
+        retry_timeout : timedelta, optional
+            The timeout used to limit retries. This is the maximum time to spend on
+            the operation before giving up. At least one attempt will be made,
+            regardless of how long it takes to complete. Subsequent attempts will be
+            cancelled once this timeout is reached. Default is 30 seconds.
 
         Returns
         -------
@@ -1501,7 +1511,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(where, pa.compute.Expression):
             where = str(where)
-        return self._ds.update(updates, where)
+        return self._ds.update(updates, where, conflict_retries, retry_timeout)
 
     def versions(self):
         """
@@ -2732,6 +2742,32 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.config()
 
+    def sql(self, sql: str) -> "SqlQueryBuilder":
+        """Execute SQL query on the dataset.
+
+        Parameters
+        ----------
+        sql : str
+            SQL SELECT statement to execute. The query must reference the dataset
+            as the FROM clause or omit the FROM clause to query the current dataset.
+
+        Returns
+        -------
+        SqlQueryBuilder
+            A builder that can be used to configure and build the query.
+
+        Examples
+        --------
+         .. code-block:: python
+
+            import lance
+            dataset = lance.dataset("/tmp/data.lance")
+            query = dataset.sql("SELECT id, name FROM dataset WHERE age > 30").build()
+            query.to_list()
+
+        """
+        return SqlQueryBuilder(self._ds.sql(sql))
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -2750,6 +2786,118 @@ class LanceDataset(pa.dataset.Dataset):
         ignore_not_found: Optional[bool] = None,
     ) -> None:
         _Dataset.drop(str(base_uri), storage_options, ignore_not_found=ignore_not_found)
+
+
+class SqlQuery:
+    """
+    An executable SQL query.
+
+    This is created by calling :meth:`SqlQueryBuilder.build`.
+    """
+
+    def __init__(self, query):
+        self._query = query
+
+    def to_batch_records(self) -> list[pa.RecordBatch]:
+        """
+        Execute the query and return a list of RecordBatches.
+
+        This is an eager operation that will load all results into memory.
+
+        Returns
+        -------
+        list[pyarrow.RecordBatch]
+        """
+        return self._query.to_batch_records()
+
+    def to_stream_reader(self) -> pa.RecordBatchReader:
+        """
+        Execute the query and return a RecordBatchReader.
+
+        This is a lazy operation that will stream results.
+
+        Returns
+        -------
+        pyarrow.RecordBatchReader
+        """
+        return self._query.to_stream_reader()
+
+    def explain_plan(self, verbose: bool = False, analyze: bool = False) -> str:
+        """
+        Explain the query plan.
+
+        Parameters
+        ----------
+        verbose: bool, default False
+            If True, print the verbose plan.
+        analyze: bool, default False
+            If True, analyze the query and print the statistics.
+
+        Returns
+        -------
+        str
+            The query plan.
+        """
+        return self._query.explain_plan(verbose, analyze)
+
+
+class SqlQueryBuilder:
+    """
+    A builder for SQL queries on a Lance dataset.
+
+    This builder allows for chaining of options to configure the SQL query.
+    It is returned by :meth:`LanceDataset.sql`.
+    """
+
+    def __init__(self, builder):
+        self._builder = builder
+
+    def table_name(self, table_name: str) -> "SqlQueryBuilder":
+        """
+        Set the table name for the query.
+
+        Parameters
+        ----------
+        table_name: str
+            The name of the table to query.
+        """
+        self._builder = self._builder.table_name(table_name)
+        return self
+
+    def with_row_id(self, with_row_id: bool = True) -> "SqlQueryBuilder":
+        """
+        Include the row ID in the query result.
+
+        Parameters
+        ----------
+        with_row_id: bool, default True
+            Whether to include the row ID column (`_rowid`).
+        """
+        self._builder = self._builder.with_row_id(with_row_id)
+        return self
+
+    def with_row_addr(self, with_row_addr: bool = True) -> "SqlQueryBuilder":
+        """
+        Include the row address in the query result.
+
+        Parameters
+        ----------
+        with_row_addr: bool, default True
+            Whether to include the row address column (`_rowaddr`).
+        """
+        self._builder = self._builder.with_row_addr(with_row_addr)
+        return self
+
+    def build(self) -> SqlQuery:
+        """
+        Build the query.
+
+        Returns
+        -------
+        SqlQuery
+            An executable query object.
+        """
+        return SqlQuery(self._builder.build())
 
 
 class BulkCommitResult(TypedDict):

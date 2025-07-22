@@ -559,6 +559,15 @@ impl Dataset {
         strict_batch_size: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
+
+        if with_row_id.unwrap_or(false) {
+            scanner.with_row_id();
+        }
+
+        if with_row_address.unwrap_or(false) {
+            scanner.with_row_address();
+        }
+
         match (columns, columns_with_transform) {
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
@@ -675,14 +684,6 @@ impl Dataset {
         }
 
         scanner.scan_in_order(scan_in_order.unwrap_or(true));
-
-        if with_row_id.unwrap_or(false) {
-            scanner.with_row_id();
-        }
-
-        if with_row_address.unwrap_or(false) {
-            scanner.with_row_address();
-        }
 
         if let Some(use_stats) = use_stats {
             scanner.use_stats(use_stats);
@@ -1099,17 +1100,27 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature=(updates, predicate=None))]
+    #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None))]
     fn update(
         &mut self,
         updates: &Bound<'_, PyDict>,
         predicate: Option<&str>,
+        conflict_retries: Option<u32>,
+        retry_timeout: Option<std::time::Duration>,
     ) -> PyResult<PyObject> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
             builder = builder
                 .update_where(predicate)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+
+        if let Some(retries) = conflict_retries {
+            builder = builder.conflict_retries(retries);
+        }
+
+        if let Some(timeout) = retry_timeout {
+            builder = builder.retry_timeout(timeout);
         }
 
         for (key, value) in updates {
@@ -1835,6 +1846,125 @@ impl Dataset {
                 dict.set_item(k, v)?;
             }
             Ok(dict.into())
+        })
+    }
+
+    #[pyo3(signature=(sql))]
+    fn sql(&self, sql: String) -> PyResult<SqlQueryBuilder> {
+        let mut ds = self.ds.as_ref().clone();
+        let builder = ds.sql(&sql);
+        Ok(SqlQueryBuilder { builder })
+    }
+}
+
+#[pyclass(name = "SqlQuery", module = "_lib", subclass)]
+#[derive(Clone)]
+pub struct SqlQuery {
+    builder: lance::dataset::sql::SqlQueryBuilder,
+}
+
+#[pymethods]
+impl SqlQuery {
+    /// Execute the query and return a list of RecordBatches.
+    ///
+    /// This is an eager operation that will load all results into memory.
+    /// This corresponds to `into_batch_records` in Rust.
+    fn to_batch_records(&self) -> PyResult<Vec<PyObject>> {
+        use arrow::pyarrow::ToPyArrow;
+
+        let builder = self.builder.clone();
+        let batches = RT
+            .block_on(None, async move {
+                let query = builder.build().await?;
+                query.into_batch_records().await
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))? // Handles tokio::JoinError
+            .map_err(|e| PyValueError::new_err(e.to_string()))?; // Handles lance::Error
+
+        Python::with_gil(|py| {
+            batches
+                .iter()
+                .map(|rb| rb.to_pyarrow(py))
+                .collect::<PyResult<Vec<PyObject>>>()
+        })
+    }
+
+    /// Execute the query and return a RecordBatchReader.
+    ///
+    /// This is a lazy operation that will stream results.
+    fn to_stream_reader(&self) -> PyResult<PyObject> {
+        use crate::reader::LanceReader;
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        use std::pin::Pin;
+
+        let builder = self.builder.clone();
+        let fut = Box::pin(async move {
+            let query = builder.build().await?;
+            let stream = query.into_stream().await;
+            Ok::<Pin<Box<dyn datafusion::execution::RecordBatchStream + Send>>, lance::Error>(
+                stream,
+            )
+        });
+
+        let stream = RT
+            .block_on(None, fut)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?
+            .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))?;
+
+        let dataset_stream = DatasetRecordBatchStream::new(stream);
+        let reader: Box<dyn RecordBatchReader + Send> =
+            Box::new(LanceReader::from_stream(dataset_stream));
+        Python::with_gil(|py| reader.into_pyarrow(py))
+    }
+
+    #[pyo3(signature = (verbose=false, analyze=false))]
+    fn explain_plan(&self, verbose: bool, analyze: bool) -> PyResult<String> {
+        let builder = self.builder.clone();
+        let plan = RT
+            .block_on(None, async move {
+                let query = builder.build().await?;
+                query.into_explain_plan(verbose, analyze).await
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(plan)
+    }
+}
+
+#[pyclass(name = "SqlQueryBuilder", module = "_lib", subclass)]
+#[derive(Clone)]
+pub struct SqlQueryBuilder {
+    builder: lance::dataset::sql::SqlQueryBuilder,
+}
+
+#[pymethods]
+impl SqlQueryBuilder {
+    #[pyo3(signature = (table_name))]
+    fn table_name(&self, table_name: &str) -> Self {
+        Self {
+            builder: self.builder.clone().table_name(table_name),
+        }
+    }
+
+    #[pyo3(signature = (with_row_id))]
+    fn with_row_id(&self, with_row_id: bool) -> Self {
+        Self {
+            builder: self.builder.clone().with_row_id(with_row_id),
+        }
+    }
+
+    #[pyo3(signature = (with_row_addr))]
+    fn with_row_addr(&self, with_row_addr: bool) -> Self {
+        Self {
+            builder: self.builder.clone().with_row_addr(with_row_addr),
+        }
+    }
+
+    /// Build the SQL query.
+    fn build(&self) -> PyResult<SqlQuery> {
+        Ok(SqlQuery {
+            builder: self.builder.clone(),
         })
     }
 }
