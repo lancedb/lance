@@ -431,7 +431,7 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
     visit_node(plan, &mut counts);
     tracing::info!(
         target: TRACE_EXECUTION,
-        type = EXECUTION_PLAN_RUN,
+        r#type = EXECUTION_PLAN_RUN,
         output_rows,
         iops = counts.iops,
         requests = counts.requests,

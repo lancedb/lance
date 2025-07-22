@@ -2954,6 +2954,118 @@ class SqlQueryBuilder:
         return SqlQuery(self._builder.build())
 
 
+class SqlQuery:
+    """
+    An executable SQL query.
+
+    This is created by calling :meth:`SqlQueryBuilder.build`.
+    """
+
+    def __init__(self, query):
+        self._query = query
+
+    def to_batch_records(self) -> list[pa.RecordBatch]:
+        """
+        Execute the query and return a list of RecordBatches.
+
+        This is an eager operation that will load all results into memory.
+
+        Returns
+        -------
+        list[pyarrow.RecordBatch]
+        """
+        return self._query.to_batch_records()
+
+    def to_stream_reader(self) -> pa.RecordBatchReader:
+        """
+        Execute the query and return a RecordBatchReader.
+
+        This is a lazy operation that will stream results.
+
+        Returns
+        -------
+        pyarrow.RecordBatchReader
+        """
+        return self._query.to_stream_reader()
+
+    def explain_plan(self, verbose: bool = False, analyze: bool = False) -> str:
+        """
+        Explain the query plan.
+
+        Parameters
+        ----------
+        verbose: bool, default False
+            If True, print the verbose plan.
+        analyze: bool, default False
+            If True, analyze the query and print the statistics.
+
+        Returns
+        -------
+        str
+            The query plan.
+        """
+        return self._query.explain_plan(verbose, analyze)
+
+
+class SqlQueryBuilder:
+    """
+    A builder for SQL queries on a Lance dataset.
+
+    This builder allows for chaining of options to configure the SQL query.
+    It is returned by :meth:`LanceDataset.sql`.
+    """
+
+    def __init__(self, builder):
+        self._builder = builder
+
+    def table_name(self, table_name: str) -> "SqlQueryBuilder":
+        """
+        Set the table name for the query.
+
+        Parameters
+        ----------
+        table_name: str
+            The name of the table to query.
+        """
+        self._builder = self._builder.table_name(table_name)
+        return self
+
+    def with_row_id(self, with_row_id: bool = True) -> "SqlQueryBuilder":
+        """
+        Include the row ID in the query result.
+
+        Parameters
+        ----------
+        with_row_id: bool, default True
+            Whether to include the row ID column (`_rowid`).
+        """
+        self._builder = self._builder.with_row_id(with_row_id)
+        return self
+
+    def with_row_addr(self, with_row_addr: bool = True) -> "SqlQueryBuilder":
+        """
+        Include the row address in the query result.
+
+        Parameters
+        ----------
+        with_row_addr: bool, default True
+            Whether to include the row address column (`_rowaddr`).
+        """
+        self._builder = self._builder.with_row_addr(with_row_addr)
+        return self
+
+    def build(self) -> SqlQuery:
+        """
+        Build the query.
+
+        Returns
+        -------
+        SqlQuery
+            An executable query object.
+        """
+        return SqlQuery(self._builder.build())
+
+
 class BulkCommitResult(TypedDict):
     dataset: LanceDataset
     merged: Transaction
