@@ -23,6 +23,7 @@ use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
+    intern,
     pybacked::PyBackedStr,
     pyclass,
     types::{IntoPyDict, PyDict},
@@ -33,7 +34,7 @@ use snafu::location;
 
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
-    DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
+    ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::AutoCleanupParams;
@@ -302,6 +303,37 @@ pub fn transforms_from_python(transforms: &Bound<'_, PyAny>) -> PyResult<NewColu
         }))
     }
 }
+impl FromPyObject<'_> for PyLance<ColumnOrdering> {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let ascending: bool = ob.getattr("ascending")?.extract()?;
+        let nulls_first: bool = ob.getattr("nulls_first")?.extract()?;
+        let column_name: String = ob.getattr("column_name")?.extract()?;
+        Ok(Self(ColumnOrdering {
+            ascending,
+            nulls_first,
+            column_name,
+        }))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<&ColumnOrdering> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let cls = py
+            .import(intern!(py, "lance"))
+            .and_then(|module| module.getattr(intern!(py, "LanceScanner")))
+            .and_then(|cls| cls.getattr(intern!(py, "ColumnOrdering")))
+            .expect("Failed to get RewrittenIndex class");
+
+        let column_name = self.0.column_name.to_string();
+        let ascending = self.0.ascending;
+        let nulls_first = self.0.nulls_first;
+        cls.call1((column_name, ascending, nulls_first))
+    }
+}
 
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
@@ -536,7 +568,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -563,6 +595,7 @@ impl Dataset {
         include_deleted_rows: Option<bool>,
         scan_stats_callback: Option<&Bound<'_, PyAny>>,
         strict_batch_size: Option<bool>,
+        order_by: Option<Vec<PyLance<ColumnOrdering>>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -880,7 +913,11 @@ impl Dataset {
                 })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
-
+        if let Some(orderings) = order_by {
+            scanner
+                .order_by(Some(orderings.into_iter().map(|o| o.0).collect()))
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
         let scan = Arc::new(scanner);
         Ok(Scanner::new(scan))
     }
