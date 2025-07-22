@@ -171,10 +171,10 @@ impl ScalarIndex for LabelListIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: LanceCache,
     ) -> Result<Arc<Self>> {
-        BitmapIndex::load(store, fri, index_cache)
+        BitmapIndex::load(store, frag_reuse_index, index_cache)
             .await
             .map(|index| Arc::new(Self::new(index)))
     }

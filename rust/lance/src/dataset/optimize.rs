@@ -2495,7 +2495,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Concurrently commit a FRI cleanup operation.
+        // Concurrently commit a frag_reuse_index cleanup operation.
         // Because there is no index, it should remove the first version.
         // but after rebase it should contain the new compaction versions.
         cleanup_frag_reuse_index(&mut dataset_clone).await.unwrap();
@@ -2575,7 +2575,7 @@ mod tests {
             .unwrap();
         assert_eq!(frag_reuse_details.versions.len(), 1);
 
-        // First commit the FRI cleanup
+        // First commit the frag_reuse_index cleanup
         // Because there is no index, it should remove the first version.
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
 

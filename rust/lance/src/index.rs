@@ -379,7 +379,7 @@ impl DatasetIndexExt for Dataset {
 
         // Load indices from the disk.
         let indices = self.load_indices().await?;
-        let fri = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+        let frag_reuse_index = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
         let index_name = name.unwrap_or(format!("{column}_idx"));
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
             if idx.fields == [field.id] && !replace {
@@ -456,7 +456,7 @@ impl DatasetIndexExt for Dataset {
                     &index_name,
                     &index_id.to_string(),
                     vec_params,
-                    fri,
+                    frag_reuse_index,
                 ))
                 .await?;
                 vector_index_details()
@@ -594,20 +594,23 @@ impl DatasetIndexExt for Dataset {
             }
         };
 
-        if let Some(fri_meta) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-            let uuid = fri_meta.uuid.to_string();
+        if let Some(frag_reuse_index_meta) =
+            indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        {
+            let uuid = frag_reuse_index_meta.uuid.to_string();
             let fri_key = FragReuseIndexKey { uuid: &uuid };
-            let fri = self
+            let frag_reuse_index = self
                 .index_cache
                 .get_or_insert_with_key(fri_key, || async move {
-                    let index_details = load_frag_reuse_index_details(self, fri_meta).await?;
-                    open_frag_reuse_index(fri_meta.uuid, index_details.as_ref()).await
+                    let index_details =
+                        load_frag_reuse_index_details(self, frag_reuse_index_meta).await?;
+                    open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
                 })
                 .await?;
             let mut indices = indices.as_ref().clone();
             indices.iter_mut().for_each(|idx| {
                 if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
-                    fri.remap_fragment_bitmap(bitmap).unwrap();
+                    frag_reuse_index.remap_fragment_bitmap(bitmap).unwrap();
                 }
             });
             Ok(Arc::new(indices))
@@ -1128,7 +1131,7 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(index);
         }
 
-        let fri = self.open_frag_reuse_index(metrics).await?;
+        let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
         let index_dir = self.indices_dir().child(uuid);
         let index_file = index_dir.child(INDEX_FILE_NAME);
         let reader: Arc<dyn Reader> = self.object_store.open(&index_file).await?.into();
@@ -1148,7 +1151,14 @@ impl DatasetIndexInternalExt for Dataset {
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
                         let dataset = Arc::new(self.clone());
-                        vector::open_vector_index(dataset, uuid, vector_index, reader, fri).await
+                        vector::open_vector_index(
+                            dataset,
+                            uuid,
+                            vector_index,
+                            reader,
+                            frag_reuse_index,
+                        )
+                        .await
                     }
                     None => Err(Error::Internal {
                         message: "Index proto was missing implementation field".into(),
@@ -1164,8 +1174,14 @@ impl DatasetIndexInternalExt for Dataset {
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )
                 .await?;
-                vector::open_vector_index_v2(Arc::new(self.clone()), column, uuid, reader, fri)
-                    .await
+                vector::open_vector_index_v2(
+                    Arc::new(self.clone()),
+                    column,
+                    uuid,
+                    reader,
+                    frag_reuse_index,
+                )
+                .await
             }
 
             (0, 3) => {
@@ -1210,7 +1226,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.object_store.clone(),
                                 self.indices_dir(),
                                 uuid.to_owned(),
-                                fri,
+                                frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                             )
@@ -1222,7 +1238,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.object_store.clone(),
                                 self.indices_dir(),
                                 uuid.to_owned(),
-                                fri,
+                                frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                             )
@@ -1243,7 +1259,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
-                            fri,
+                            frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
                         )
@@ -1256,7 +1272,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
-                            fri,
+                            frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
                         )
@@ -1272,7 +1288,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
-                            fri,
+                            frag_reuse_index,
                             &file_metadata_cache,
                             index_cache,
                         )
@@ -1285,7 +1301,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
-                            fri,
+                            frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
                         )
@@ -1298,7 +1314,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
-                            fri,
+                            frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
                         )
@@ -1331,9 +1347,9 @@ impl DatasetIndexInternalExt for Dataset {
         &self,
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<Arc<FragReuseIndex>>> {
-        if let Some(fri_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
-            let uuid = fri_meta.uuid.to_string();
-            let frag_reuse_key = crate::session::index_caches::FragReuseIndexKey { uuid: &uuid };
+        if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
+            let uuid = frag_reuse_index_meta.uuid.to_string();
+            let frag_reuse_key = FragReuseIndexKey { uuid: &uuid };
             let uuid_clone = uuid.clone();
 
             let index = self
@@ -1345,7 +1361,7 @@ impl DatasetIndexInternalExt for Dataset {
                     })?;
                     let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
                     let index =
-                        open_frag_reuse_index(fri_meta.uuid, index_details.as_ref()).await?;
+                        open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await?;
 
                     info!(target: TRACE_IO_EVENTS, index_uuid=uuid_clone, r#type=IO_TYPE_OPEN_FRAG_REUSE);
                     metrics.record_index_load();

@@ -313,14 +313,14 @@ impl ScalarIndex for FlatIndex {
     // data as a single batch named data.lance
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
         _index_cache: LanceCache,
     ) -> Result<Arc<Self>> {
         let batches = store.open_index_file("data.lance").await?;
         let num_rows = batches.num_rows();
         let mut batch = batches.read_range(0..num_rows, None).await?;
-        if let Some(fri_ref) = fri.as_ref() {
-            batch = fri_ref.remap_row_ids_record_batch(batch, 1)?;
+        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+            batch = frag_reuse_index_ref.remap_row_ids_record_batch(batch, 1)?;
         }
         let has_nulls = batch.column(0).null_count() > 0;
         Ok(Arc::new(Self {
