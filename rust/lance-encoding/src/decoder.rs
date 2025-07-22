@@ -493,6 +493,15 @@ impl CoreFieldDecoderStrategy {
         self
     }
 
+    /// Create a new strategy from decoder config
+    pub fn from_decoder_config(config: &DecoderConfig) -> Self {
+        Self {
+            validate_data: config.validate_on_decode,
+            decompressor_strategy: Arc::new(DefaultDecompressionStrategy {}),
+            cache_repetition_index: config.cache_repetition_index,
+        }
+    }
+
     /// This is just a sanity check to ensure there is no "wrapped encodings"
     /// that haven't been handled.
     fn ensure_values_encoded(column_info: &ColumnInfo, field_name: &str) -> Result<()> {
@@ -953,8 +962,11 @@ impl DecodeBatchScheduler {
         if column_infos[0].is_structural() {
             let mut column_iter = ColumnInfoIter::new(column_infos.to_vec(), column_indices);
 
-            let strategy = CoreFieldDecoderStrategy::default()
-                .with_cache_repetition_index(cache_repetition_index);
+            let decoder_config = DecoderConfig {
+                cache_repetition_index,
+                validate_on_decode: false,
+            };
+            let strategy = CoreFieldDecoderStrategy::from_decoder_config(&decoder_config);
             let mut root_scheduler =
                 strategy.create_structural_field_scheduler(&root_field, &mut column_iter)?;
 
@@ -978,8 +990,11 @@ impl DecodeBatchScheduler {
                 .chain(column_indices.iter().map(|i| i.saturating_add(1)))
                 .collect::<Vec<_>>();
             let mut column_iter = ColumnInfoIter::new(columns, &adjusted_column_indices);
-            let strategy = CoreFieldDecoderStrategy::default()
-                .with_cache_repetition_index(cache_repetition_index);
+            let decoder_config = DecoderConfig {
+                cache_repetition_index,
+                validate_on_decode: false,
+            };
+            let strategy = CoreFieldDecoderStrategy::from_decoder_config(&decoder_config);
             let root_scheduler =
                 strategy.create_legacy_field_scheduler(&root_field, &mut column_iter, buffers)?;
 
@@ -1746,15 +1761,23 @@ impl RequestedRows {
     }
 }
 
+/// Configuration for decoder behavior
+#[derive(Debug, Clone, Default)]
+pub struct DecoderConfig {
+    /// Whether to cache repetition indices for better performance
+    pub cache_repetition_index: bool,
+    /// Whether to validate decoded data
+    pub validate_on_decode: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct SchedulerDecoderConfig {
     pub decoder_plugins: Arc<DecoderPlugins>,
     pub batch_size: u32,
     pub io: Arc<dyn EncodingsIo>,
     pub cache: Arc<LanceCache>,
-    pub should_validate: bool,
-    /// Whether to cache repetition indices for better performance
-    pub cache_repetition_index: bool,
+    /// Decoder configuration
+    pub decoder_config: DecoderConfig,
 }
 
 fn check_scheduler_on_drop(
@@ -1856,7 +1879,7 @@ fn create_scheduler_decoder(
         num_rows,
         config.batch_size,
         is_structural,
-        config.should_validate,
+        config.decoder_config.validate_on_decode,
         rx,
     );
 
@@ -1871,7 +1894,7 @@ fn create_scheduler_decoder(
             config.io.clone(),
             config.cache,
             &filter,
-            config.cache_repetition_index,
+            config.decoder_config.cache_repetition_index,
         )
         .await
         {
@@ -1982,7 +2005,7 @@ pub fn schedule_and_decode_blocking(
         config.io.clone(),
         config.cache,
         &filter,
-        config.cache_repetition_index,
+        config.decoder_config.cache_repetition_index,
     ))?;
 
     // Schedule the requested rows
@@ -2009,7 +2032,7 @@ pub fn schedule_and_decode_blocking(
         &target_schema,
         num_rows,
         config.batch_size,
-        config.should_validate,
+        config.decoder_config.validate_on_decode,
         is_structural,
         messages.into(),
     );

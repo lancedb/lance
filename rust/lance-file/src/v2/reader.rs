@@ -313,10 +313,7 @@ impl ReaderProjection {
 
 #[derive(Clone, Debug, Default)]
 pub struct FileReaderOptions {
-    pub validate_on_decode: bool,
-    /// Whether to cache repetition indices for better performance
-    /// Default is false for backward compatibility
-    pub cache_repetition_index: bool,
+    pub decoder_config: lance_encoding::decoder::DecoderConfig,
 }
 
 #[derive(Debug)]
@@ -850,13 +847,16 @@ impl FileReader {
             projection.schema.fields.len(),
         );
 
+        let decoder_config = lance_encoding::decoder::DecoderConfig {
+            cache_repetition_index,
+            validate_on_decode: should_validate,
+        };
         let config = SchedulerDecoderConfig {
             batch_size,
             cache,
             decoder_plugins,
             io,
-            should_validate,
-            cache_repetition_index,
+            decoder_config,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
@@ -889,8 +889,8 @@ impl FileReader {
             batch_size,
             projection,
             filter,
-            self.options.validate_on_decode,
-            self.options.cache_repetition_index,
+            self.options.decoder_config.validate_on_decode,
+            self.options.decoder_config.cache_repetition_index,
         )
     }
 
@@ -916,13 +916,16 @@ impl FileReader {
             column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
         );
 
+        let decoder_config = lance_encoding::decoder::DecoderConfig {
+            cache_repetition_index,
+            validate_on_decode: should_validate,
+        };
         let config = SchedulerDecoderConfig {
             batch_size,
             cache,
             decoder_plugins,
             io,
-            should_validate,
-            cache_repetition_index,
+            decoder_config,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -953,8 +956,8 @@ impl FileReader {
             batch_size,
             projection,
             FilterExpression::no_filter(),
-            self.options.validate_on_decode,
-            self.options.cache_repetition_index,
+            self.options.decoder_config.validate_on_decode,
+            self.options.decoder_config.cache_repetition_index,
         )
     }
 
@@ -982,13 +985,16 @@ impl FileReader {
             column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
         );
 
+        let decoder_config = lance_encoding::decoder::DecoderConfig {
+            cache_repetition_index,
+            validate_on_decode: should_validate,
+        };
         let config = SchedulerDecoderConfig {
             batch_size,
             cache,
             decoder_plugins,
             io,
-            should_validate,
-            cache_repetition_index,
+            decoder_config,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1019,8 +1025,8 @@ impl FileReader {
             batch_size,
             projection,
             filter,
-            self.options.validate_on_decode,
-            self.options.cache_repetition_index,
+            self.options.decoder_config.validate_on_decode,
+            self.options.decoder_config.cache_repetition_index,
         )
     }
 
@@ -1173,8 +1179,7 @@ impl FileReader {
             cache: self.cache.clone(),
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
-            should_validate: self.options.validate_on_decode,
-            cache_repetition_index: self.options.cache_repetition_index,
+            decoder_config: self.options.decoder_config.clone(),
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -1213,8 +1218,7 @@ impl FileReader {
             cache: self.cache.clone(),
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
-            should_validate: self.options.validate_on_decode,
-            cache_repetition_index: self.options.cache_repetition_index,
+            decoder_config: self.options.decoder_config.clone(),
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1253,8 +1257,7 @@ impl FileReader {
             cache: self.cache.clone(),
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
-            should_validate: self.options.validate_on_decode,
-            cache_repetition_index: self.options.cache_repetition_index,
+            decoder_config: self.options.decoder_config.clone(),
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
