@@ -3907,7 +3907,6 @@ dependencies = [
  "lindera",
  "lindera-tantivy",
  "log",
- "moka",
  "num-traits",
  "object_store",
  "prost 0.13.5",

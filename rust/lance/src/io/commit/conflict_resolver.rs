@@ -1286,7 +1286,10 @@ impl<'a> TransactionRebase<'a> {
                         fragment_id: *fragment_id,
                         deletion_file,
                     };
-                    dataset.metadata_cache.insert_with_key(&key, Arc::new(dv));
+                    dataset
+                        .metadata_cache
+                        .insert_with_key(&key, Arc::new(dv))
+                        .await;
 
                     // TODO: also cleanup the old deletion file.
                     new_deletion_files.insert(*fragment_id, new_deletion_file);
@@ -1660,7 +1663,8 @@ mod tests {
         };
         dataset
             .metadata_cache
-            .insert_with_key(&key, Arc::new(current_deletions));
+            .insert_with_key(&key, Arc::new(current_deletions))
+            .await;
 
         fragment.clone()
     }

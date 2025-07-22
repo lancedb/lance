@@ -1856,13 +1856,8 @@ impl Scanner {
                     )
                     .await?;
                 if let Some(index) = index {
-                    let index_type = detect_scalar_index_type(
-                        &self.dataset,
-                        &index,
-                        column,
-                        &self.dataset.session,
-                    )
-                    .await?;
+                    let index_type =
+                        detect_scalar_index_type(&self.dataset, &index, column).await?;
                     if matches!(index_type, ScalarIndexType::Inverted) {
                         indexed_columns.push(column.clone());
                     }
@@ -4408,7 +4403,7 @@ mod test {
             .await
             .unwrap();
 
-            assert_eq!(dataset.index_cache_entry_count(), 0);
+            assert_eq!(dataset.index_cache_entry_count().await, 0);
             dataset
                 .create_index(
                     &["vec"],
@@ -4428,7 +4423,7 @@ mod test {
             scan.minimum_nprobes(100);
 
             assert_eq!(
-                dataset.index_cache_entry_count(),
+                dataset.index_cache_entry_count().await,
                 2, // 2 for index metadata at version 1 and 2.
             );
             let results = scan
@@ -4440,7 +4435,7 @@ mod test {
                 .unwrap();
 
             assert_eq!(
-                dataset.index_cache_entry_count(),
+                dataset.index_cache_entry_count().await,
                 5 + dataset.versions().await.unwrap().len()
             );
             assert_eq!(results.len(), 1);
