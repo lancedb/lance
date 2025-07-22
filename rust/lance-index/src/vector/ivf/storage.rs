@@ -134,8 +134,7 @@ impl IvfModel {
 
     /// Get a reference to all centroids as a [`FixedSizeListArray`].
     ///
-    /// Returns `None` if the model does not contain centroids (e.g. in sub-index
-    /// tracking scenarios).
+    /// Returns `None` if the model does not contain centroids
     pub fn centroids_array(&self) -> Option<&FixedSizeListArray> {
         self.centroids.as_ref()
     }

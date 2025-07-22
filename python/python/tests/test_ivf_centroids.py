@@ -1,6 +1,6 @@
+import lance
 import numpy as np
 import pyarrow as pa
-import lance
 
 
 def test_ivf_centroids_exposed(tmp_path):
@@ -9,11 +9,19 @@ def test_ivf_centroids_exposed(tmp_path):
     """
 
     dim, rows, parts = 4, 256, 8
-    vecs = pa.array(np.random.randn(rows, dim).tolist(), type=pa.list_(pa.float32(), dim))
-    ds = lance.write_dataset(pa.Table.from_pylist([{"vector": v} for v in vecs]), tmp_path / "ds")
+    vecs = pa.array(
+        np.random.randn(rows, dim).tolist(),
+        type=pa.list_(pa.float32(), dim),
+    )
+    ds = lance.write_dataset(
+        pa.Table.from_pylist([{"vector": v} for v in vecs]),
+        tmp_path / "ds",
+    )
 
     # build small IVF_PQ index so centroids exist
-    ds.create_index("vector", index_type="IVF_PQ", num_partitions=parts, num_sub_vectors=2)
+    ds.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=parts, num_sub_vectors=2
+    )
 
     # ---- Arrow view via explicit index name ----
     arrow_centroids = ds.centroids(index_name="vector_idx")
