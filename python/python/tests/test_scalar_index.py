@@ -463,6 +463,19 @@ def test_full_text_search(dataset, with_position):
         )
 
 
+def test_rowid_order(dataset):
+    dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
+    results = dataset.scanner(
+        columns=["doc"],
+        full_text_query="hello",
+        with_row_id=True,
+    ).to_table()
+
+    assert results.schema[0].name == "doc"
+    assert results.schema[1].name == "_score"
+    assert results.schema[2].name == "_rowid"
+
+
 def test_filter_with_fts_index(dataset):
     dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
     row = dataset.take(indices=[0], columns=["doc"])
