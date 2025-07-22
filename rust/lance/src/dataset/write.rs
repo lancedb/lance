@@ -44,9 +44,11 @@ mod commit;
 pub mod delete;
 mod insert;
 pub mod merge_insert;
+mod retry;
 pub mod update;
 
 pub use commit::CommitBuilder;
+pub use delete::DeleteBuilder;
 pub use insert::InsertBuilder;
 
 /// The destination to write data to.
