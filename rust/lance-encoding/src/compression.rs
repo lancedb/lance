@@ -32,6 +32,7 @@ use crate::{
             },
             bitpack::InlineBitpacking,
             block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
+            byte_stream_split::ByteStreamSplitDecompressor,
             constant::ConstantDecompressor,
             fsst::{
                 FsstMiniBlockDecompressor, FsstMiniBlockEncoder, FsstPerValueDecompressor,
@@ -387,6 +388,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             pb::array_encoding::ArrayEncoding::Rle(rle) => {
                 Ok(Box::new(RleMiniBlockDecompressor::new(rle.bits_per_value)))
             }
+            pb::array_encoding::ArrayEncoding::ByteStreamSplit(bss) => Ok(Box::new(
+                ByteStreamSplitDecompressor::new(bss.bits_per_value as usize),
+            )),
             pb::array_encoding::ArrayEncoding::GeneralMiniBlock(general) => {
                 // Create inner decompressor
                 let inner_decompressor = self.create_miniblock_decompressor(
