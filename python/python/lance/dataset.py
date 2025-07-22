@@ -2835,11 +2835,7 @@ class LanceDataset(pa.dataset.Dataset):
         if ivf is None:
             return None
 
-        pa_arr = ivf.centroids  # pyarrow array or None
-        if pa_arr is None:
-            return None
-
-        return pa_arr
+        return ivf.centroids
 
 
 class SqlQuery:

@@ -13,6 +13,7 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 use pyo3::types::PyModuleMethods;
 use pyo3::Bound;
 use pyo3::{
@@ -20,7 +21,6 @@ use pyo3::{
     types::{PyList, PyModule},
     wrap_pyfunction, PyObject, PyResult, Python,
 };
-use pyo3::prelude::*;
 
 use lance::index::DatasetIndexInternalExt;
 
@@ -56,11 +56,7 @@ async fn do_get_ivf_model(dataset: &Dataset, index_name: &str) -> PyResult<IvfMo
     use lance_index::metrics::NoOpMetricsCollector;
 
     // Load index metadata list
-    let idx_metas = dataset
-        .ds
-        .load_indices()
-        .await
-        .infer_error()?; // Convert Lance error to PyErr
+    let idx_metas = dataset.ds.load_indices().await.infer_error()?; // Convert Lance error to PyErr
 
     // Find the index by name
     let idx_meta = idx_metas
@@ -81,7 +77,11 @@ async fn do_get_ivf_model(dataset: &Dataset, index_name: &str) -> PyResult<IvfMo
     // Open the vector index
     let vindex = dataset
         .ds
-        .open_vector_index(column_name, &idx_meta.uuid.to_string(), &NoOpMetricsCollector)
+        .open_vector_index(
+            column_name,
+            &idx_meta.uuid.to_string(),
+            &NoOpMetricsCollector,
+        )
         .await
         .infer_error()?;
 

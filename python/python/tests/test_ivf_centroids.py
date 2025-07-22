@@ -1,12 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 import lance
 import numpy as np
 import pyarrow as pa
 
 
 def test_ivf_centroids_exposed(tmp_path):
-    """Verify that centroids for an IVF-based index are exposed via both
-    Arrow and NumPy helpers.
-    """
+    """Verify that centroids for an IVF-based index are exposed via both"""
 
     dim, rows, parts = 4, 256, 8
     vecs = pa.array(
@@ -23,7 +23,7 @@ def test_ivf_centroids_exposed(tmp_path):
         "vector", index_type="IVF_PQ", num_partitions=parts, num_sub_vectors=2
     )
 
-    # ---- Arrow view via explicit index name ----
+    # arrow view via explicit index name
     arrow_centroids = ds.centroids(index_name="vector_idx")
     assert arrow_centroids is not None
     assert len(arrow_centroids) == parts

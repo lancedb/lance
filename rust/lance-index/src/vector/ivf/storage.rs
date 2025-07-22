@@ -333,7 +333,7 @@ mod tests {
         use arrow_array::Float32Array;
         // two centroids, dim = 2
         let values = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
-        let centroids = FixedSizeListArray::try_new_from_values(values.clone(), 2).unwrap();
+        let centroids = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
         let ivf = IvfModel::new(centroids.clone(), None);
         let out = ivf.centroids_array().unwrap();
 
