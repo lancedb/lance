@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use deepsize::DeepSizeOf;
+use lance_core::cache::LanceCache;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
@@ -313,6 +314,7 @@ impl ScalarIndex for FlatIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<FragReuseIndex>>,
+        _index_cache: LanceCache,
     ) -> Result<Arc<Self>> {
         let batches = store.open_index_file("data.lance").await?;
         let num_rows = batches.num_rows();
