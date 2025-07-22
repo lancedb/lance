@@ -1,0 +1,42 @@
+# Overview and Core Recommendations
+
+## Introduction to DDP Training with Lance
+
+In multi-GPU distributed training, data loading can become a bottleneck, causing expensive GPUs to sit idle. This limits training throughput, making it bound by I/O performance rather than computation.
+
+Lance is a modern columnar format designed for high-performance ML workloads that addresses this challenge. Its architecture enables fast random access and efficient scans. LanceDB's ecosystem provides tools that integrate this storage format with training frameworks, supporting the AI workflow from data storage to optimized training pipelines. 
+
+This guide focuses on the PyTorch integration and demonstrates how to use Lance to build efficient data loaders for Distributed Data Parallel (DDP) training.
+
+## Data Loading Strategies: Map-Style vs. Iterable-Style
+
+PyTorch offers two paradigms for creating datasets: map-style and iterable-style. Lance provides a corresponding class for each. Understanding their differences is key to building an effective data pipeline.
+
+### Map-Style: `torch.utils.data.Dataset`
+A map-style dataset is one that can be indexed and has a known length. It must implement the `__getitem__(self, index)` and `__len__(self)` methods. This design allows the `DataLoader` to fetch any specific item from the dataset by its index, enabling features like random shuffling and straightforward parallel loading across multiple workers. 
+
+*   **Lance Integration:** `lance.torch.data.SafeLanceDataset`
+*   **Best For:** Finite, indexable datasets. This covers the vast majority of standard use cases, such as image classification (ImageNet, FOOD101), text classification, or any scenario where the dataset is a discrete collection of samples.
+
+### Iterable-Style: `torch.utils.data.IterableDataset`
+An iterable-style dataset works like a Python generator. It implements the `__iter__(self)` method, which yields data items sequentially as a stream. It often has no known length and does not support random access to a specific index. This makes it ideal for handling data that doesn't fit the indexed collection model.
+
+*   **Lance Integration:** `lance.torch.data.LanceDataset`
+*   **Best For:** True streaming data sources (e.g., from a database cursor or real-time log), extremely large datasets where building a full index is impractical, or when implementing complex, custom sampling logic that goes beyond what standard PyTorch samplers offer. 
+
+## Choosing Your Data Loading Strategy
+
+For most projects, the choice is between the high-performance map-style pattern and the flexible but slower simple iterable-style pattern. The table below provides a detailed comparison to help beginners select the best approach for their needs.
+
+| Feature | Map-Style (`SafeLanceDataset`) | Simple Iterable-Style (`LanceDataset`) |
+| :--- | :--- | :--- |
+| **Primary Use Case** | Standard, indexable datasets (e.g., image classification) | Streaming data, very large datasets, or custom sampling logic. |
+| **Performance** | **Highest**. The recommended default for throughput. | **Lower**. I/O is serialized in a single process. |
+| **Parallelism** | **High**. Data decoding is parallelized across multiple workers. | **Low**. Data is fetched and decoded sequentially in a single stream. |
+| **Shuffling** | Natively supported via PyTorch samplers (e.g., `DistributedSampler`).  | Requires custom implementation (e.g., buffering data). |
+| **Epoch Length** | Deterministic. The dataset has a known length (`__len__`).  | Not deterministic by default. Requires manual loop control. |
+| **Complexity** | **Low**. Integrates directly with standard PyTorch components. | **Low**. Simple to set up for streaming. |
+| **PyTorch `num_workers`** | `> 0` (Recommended for performance). | `0` (Required for this pattern). |
+| **Sampler** | PyTorch `DistributedSampler`. | Lance `ShardedBatchSampler`.  |
+
+For users who need the flexibility of an iterable dataset but require higher throughput, an advanced multi-worker pattern is available. This is covered in a separate section.
