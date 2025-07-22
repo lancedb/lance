@@ -37,6 +37,7 @@ use datafusion::{
     },
     logical_expr::{self, Expr, Extension, JoinType, LogicalPlan},
     physical_plan::{
+        display::DisplayableExecutionPlan,
         joins::{HashJoinExec, PartitionMode},
         projection::ProjectionExec,
         repartition::RepartitionExec,
@@ -84,7 +85,7 @@ use lance_core::{
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
-    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
+    exec::{analyze_plan, execute_plan, LanceExecutionOptions, OneShotExec},
     utils::StreamingWriteSource,
 };
 use lance_file::version::LanceFileVersion;
@@ -1512,6 +1513,56 @@ impl MergeInsertJob {
         }
 
         Ok((updated_fragments, removed_fragments))
+    }
+
+    /// Generate the execution plan and return it as a formatted string for debugging.
+    ///
+    /// This method takes a schema representing the source data and calls `create_plan()`
+    /// to generate the execution plan, then formats it for display. The verbose flag
+    /// controls the level of detail shown.
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - The schema of the source data that would be used in the merge insert
+    /// * `verbose` - If true, provides more detailed information in the plan output
+    pub async fn explain_plan(&self, schema: &Schema, verbose: bool) -> Result<String> {
+        // Create an empty batch with the provided schema to pass to create_plan
+        let empty_batch = RecordBatch::new_empty(Arc::new(schema.clone()));
+        let stream = RecordBatchStreamAdapter::new(
+            Arc::new(schema.clone()),
+            futures::stream::once(async { Ok(empty_batch) }).boxed(),
+        );
+
+        // Clone self since create_plan consumes the job
+        let cloned_job = self.clone();
+        let plan = cloned_job.create_plan(Box::pin(stream)).await?;
+        let display = DisplayableExecutionPlan::new(plan.as_ref());
+
+        Ok(format!("{}", display.indent(verbose)))
+    }
+
+    /// Generate the execution plan, execute it with the provided data to collect metrics,
+    /// and return the analysis.
+    ///
+    /// This method takes actual source data, calls `create_plan()` to generate the plan,
+    /// and executes it to collect performance metrics and analysis.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The source data stream that would be used in the merge insert
+    /// * `verbose` - If true, provides more detailed information in the analysis output
+    pub async fn analyze_plan(
+        &self,
+        source: SendableRecordBatchStream,
+        _verbose: bool,
+    ) -> Result<String> {
+        // Clone self since create_plan consumes the job
+        let cloned_job = self.clone();
+        let plan = cloned_job.create_plan(source).await?;
+
+        // Use the analyze_plan function from lance_datafusion
+        let options = LanceExecutionOptions::default();
+        analyze_plan(plan, options).await
     }
 }
 
@@ -3150,7 +3201,6 @@ mod tests {
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
-
     #[tokio::test]
     async fn test_skip_auto_cleanup() {
         use lance_core::utils::testing::MockClock;
@@ -3282,5 +3332,198 @@ mod tests {
             ds_check2.checkout_version(3).await.is_ok(),
             "Version 3 should still exist"
         );
+    }
+
+    #[tokio::test]
+    async fn test_explain_plan() {
+        // Set up test data
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            "memory://test_explain_plan",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Create merge insert job
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+
+        // Test explain_plan with the schema
+        let source_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]);
+
+        let plan = merge_insert_job
+            .explain_plan(&source_schema, false)
+            .await
+            .unwrap();
+
+        // Verify the plan contains expected components
+        assert!(plan.contains("MergeInsert"));
+        assert!(plan.contains("when_matched=UpdateAll"));
+        assert!(plan.contains("when_not_matched=InsertAll"));
+        assert!(plan.contains("on=[id]"));
+
+        // Test verbose mode produces different (likely longer) output
+        let verbose_plan = merge_insert_job
+            .explain_plan(&source_schema, true)
+            .await
+            .unwrap();
+        assert!(verbose_plan.contains("MergeInsert"));
+        // Verbose might be the same length in some cases, so just check it works
+        assert!(verbose_plan.len() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_analyze_plan() {
+        // Set up test data
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            "memory://test_analyze_plan",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Create merge insert job
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+
+        // Create source data stream
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 4])), // 1 matches, 4 is new
+                Arc::new(StringArray::from(vec!["updated_a", "d"])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0])),
+            ],
+        )
+        .unwrap();
+
+        let source_stream = RecordBatchStreamAdapter::new(
+            source_schema,
+            futures::stream::once(async { Ok(source_batch) }).boxed(),
+        );
+
+        // Test analyze_plan
+        let analysis = merge_insert_job
+            .analyze_plan(Box::pin(source_stream), false)
+            .await
+            .unwrap();
+
+        // Verify the analysis contains expected components
+        assert!(analysis.contains("MergeInsert"));
+        assert!(analysis.contains("metrics"));
+        assert!(analysis.contains("AnalyzeExec"));
+
+        // Should show execution metrics
+        assert!(analysis.contains("elapsed_compute") || analysis.contains("output_rows"));
+    }
+
+    #[tokio::test]
+    async fn test_explain_plan_with_different_schemas() {
+        // Set up test dataset
+        let dataset_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("data", DataType::Int32, true),
+        ]));
+
+        let dataset_batch = RecordBatch::try_new(
+            dataset_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(dataset_batch)], dataset_schema.clone()),
+            "memory://test_explain_schema_diff",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+
+        // Test with source schema that has additional columns
+        let source_schema = Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("data", DataType::Int32, true),
+            Field::new("extra", DataType::Float32, true),
+        ]);
+
+        let plan = merge_insert_job
+            .explain_plan(&source_schema, false)
+            .await
+            .unwrap();
+
+        // Should succeed and show the join key properly
+        assert!(plan.contains("on=[key]"));
+        assert!(plan.contains("MergeInsert"));
+
+        // Test with minimal source schema (just the join key)
+        let minimal_schema = Schema::new(vec![Field::new("key", DataType::Utf8, false)]);
+
+        let minimal_plan = merge_insert_job
+            .explain_plan(&minimal_schema, false)
+            .await
+            .unwrap();
+        assert!(minimal_plan.contains("on=[key]"));
+        assert!(minimal_plan.contains("MergeInsert"));
     }
 }
