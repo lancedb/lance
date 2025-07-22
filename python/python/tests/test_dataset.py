@@ -2152,6 +2152,60 @@ def test_merge_insert_empty_index():
     empty_ds.merge_insert("id").when_not_matched_insert_all().execute(df)
 
 
+def test_merge_insert_explain_analyze_plan():
+    """Test that explain_plan and analyze_plan work on merge insert operations."""
+    # Create a simple test dataset
+    data = pa.table([
+        pa.array([1, 2, 3, 4]),
+        pa.array(["a", "b", "c", "d"])
+    ], names=["id", "value"])
+    
+    dataset = lance.write_dataset(data, "memory://test-merge-explain")
+    
+    # Create merge insert builder
+    builder = dataset.merge_insert("id") \
+        .when_matched_update_all() \
+        .when_not_matched_insert_all()
+    
+    # Define source schema for explain_plan
+    source_schema = pa.schema([
+        pa.field("id", pa.int64()),
+        pa.field("value", pa.string()),
+        pa.field("extra", pa.float64())
+    ])
+    
+    # Test explain_plan
+    plan = builder.explain_plan(source_schema, verbose=False)
+    assert isinstance(plan, str)
+    assert len(plan) > 0
+    assert "MergeInsert" in plan
+    
+    plan_verbose = builder.explain_plan(source_schema, verbose=True)
+    assert isinstance(plan_verbose, str)
+    assert len(plan_verbose) > 0
+    assert "MergeInsert" in plan_verbose
+    
+    # Create test source data for analyze_plan
+    source_data = pa.table([
+        pa.array([1, 5]), # 1 matches existing, 5 is new
+        pa.array(["updated_a", "e"]),
+        pa.array([10.0, 50.0])
+    ], names=["id", "value", "extra"])
+    
+    # Test analyze_plan
+    analysis = builder.analyze_plan(source_data, verbose=False)
+    assert isinstance(analysis, str)
+    assert len(analysis) > 0
+    assert "MergeInsert" in analysis
+    assert "metrics" in analysis
+    
+    analysis_verbose = builder.analyze_plan(source_data, verbose=True)
+    assert isinstance(analysis_verbose, str)
+    assert len(analysis_verbose) > 0
+    assert "MergeInsert" in analysis_verbose
+    assert "metrics" in analysis_verbose
+
+
 def test_add_null_columns(tmp_path: Path):
     data = pa.table({"id": [1, 2, 4]})
     ds = lance.write_dataset(data, tmp_path)

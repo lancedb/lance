@@ -206,6 +206,87 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).retry_timeout(timeout)
 
+    def explain_plan(self, schema: pa.Schema, verbose: bool = False) -> str:
+        """
+        Generate the execution plan for the merge insert operation.
+
+        This method creates the execution plan that would be used for the given
+        source schema and returns it as a formatted string for debugging and 
+        analysis purposes.
+
+        Parameters
+        ----------
+        schema : pa.Schema
+            The schema of the source data that would be merged into the dataset.
+            This determines the columns available and their types, which affects
+            the generated execution plan.
+        verbose : bool, default False
+            If True, provides more detailed information in the plan output.
+
+        Returns
+        -------
+        str
+            A formatted string representation of the execution plan.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.dataset("/tmp/my_dataset")
+        >>> source_schema = pa.schema([
+        ...     pa.field("id", pa.int64()),
+        ...     pa.field("name", pa.string()),
+        ...     pa.field("value", pa.float64())
+        ... ])
+        >>> builder = dataset.merge_insert("id").when_matched_update_all().when_not_matched_insert_all()
+        >>> plan = builder.explain_plan(source_schema, verbose=True)
+        >>> print(plan)
+        """
+        return super(MergeInsertBuilder, self).explain_plan(schema, verbose)
+
+    def analyze_plan(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None, verbose: bool = False) -> str:
+        """
+        Generate the execution plan and analyze its performance with real data.
+
+        This method creates the execution plan using the provided source data,
+        executes it to collect performance metrics, and returns the analysis 
+        as a formatted string. This is useful for understanding the actual 
+        performance characteristics of the merge insert operation with your data.
+
+        Parameters
+        ----------
+        data_obj : ReaderLike
+            The source data that would be merged into the dataset. This parameter
+            can be any source of data (e.g. table / dataset) that
+            :func:`~lance.write_dataset` accepts.
+        schema : Optional[pa.Schema], default None
+            The schema of the data. This only needs to be supplied whenever the data
+            source is some kind of generator.
+        verbose : bool, default False
+            If True, provides more detailed information in the analysis output.
+
+        Returns
+        -------
+        str
+            A formatted string representation of the plan analysis with metrics.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.dataset("/tmp/my_dataset")
+        >>> new_data = pa.table([
+        ...     pa.array([1, 4]),
+        ...     pa.array(["updated_a", "d"]),
+        ...     pa.array([10.0, 20.0])
+        ... ], names=["id", "name", "value"])
+        >>> builder = dataset.merge_insert("id").when_matched_update_all().when_not_matched_insert_all()
+        >>> analysis = builder.analyze_plan(new_data, verbose=True)
+        >>> print(analysis)
+        """
+        reader = _coerce_reader(data_obj, schema)
+        return super(MergeInsertBuilder, self).analyze_plan(reader, verbose)
+
 
 class LanceDataset(pa.dataset.Dataset):
     """A Lance Dataset in Lance format where the data is stored at the given uri."""
