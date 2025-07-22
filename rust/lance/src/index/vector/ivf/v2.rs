@@ -141,7 +141,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         object_store: Arc<ObjectStore>,
         index_dir: Path,
         uuid: String,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
     ) -> Result<Self> {
@@ -213,7 +213,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             FileReaderOptions::default(),
         )
         .await?;
-        let storage = IvfQuantizationStorage::try_new(storage_reader, fri.clone()).await?;
+        let storage =
+            IvfQuantizationStorage::try_new(storage_reader, frag_reuse_index.clone()).await?;
 
         let num_partitions = ivf.num_partitions();
         Ok(Self {
