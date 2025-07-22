@@ -5,11 +5,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 Lance is a modern columnar data format optimized for ML workflows and datasets. It provides:
-- 100x faster random access than Parquet
-- Native vector search capabilities (IVF, HNSW, PQ)
-- Zero-copy automatic versioning
-- Deep integration with Apache Arrow, Pandas, Polars, DuckDB, Ray
-- Cloud-native with S3, Azure, GCS support
+
+- High-performance random access
+- Vector search
+- Zero-copy, automatic versioning
+- Ecosystem integrations
 
 ## Project Vision
 
