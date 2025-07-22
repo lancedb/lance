@@ -642,9 +642,9 @@ impl<'a> TransactionRebase<'a> {
                             location!(),
                         ))
                     } else if committed_fri.is_some() && frag_reuse_index.is_some() {
-                        // Do not commit concurrent rewrites that could produce conflicting frag_reuse_indexs.
+                        // Do not commit concurrent rewrites that could produce conflicting frag_reuse_indexes.
                         // The other rewrite must retry.
-                        // TODO: could potentially rebase to combine both frag_reuse_indexs,
+                        // TODO: could potentially rebase to combine both frag_reuse_indexes,
                         //   but today it is already rare to run concurrent rewrites.
                         Err(self.retryable_conflict_err(
                             other_transaction,
