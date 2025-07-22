@@ -395,7 +395,7 @@ class LanceDataset(pa.dataset.Dataset):
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
-        order_by: Optional[List[ColumnOrdering]] = None,
+        order_by: Optional[List[Union[ColumnOrdering, str]]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -501,10 +501,11 @@ class LanceDataset(pa.dataset.Dataset):
 
             Note: if this is a search operation, or a take operation (including scalar
             indexed scans) then deleted rows cannot be returned.
-        order_by: list of ColumnOrdering, default None
+        order_by: list of ColumnOrdering or str, default None
             If not specified, the rows will be returned as the file order
             if scan_in_order is true. Otherwise it will fellow as a random order.
-            If specified, the return rows will follow the orderings.
+            If specified, the return rows will follow the orderings. If a string is
+            specified, it will assume ascending and nulls last ordering.
 
 
         .. note::
@@ -532,6 +533,11 @@ class LanceDataset(pa.dataset.Dataset):
         """
         builder = ScannerBuilder(self)
         builder = self._apply_default_scan_options(builder)
+
+        if order_by is not None:
+            order_by = [
+                ColumnOrdering(o) if isinstance(o, str) else o for o in order_by
+            ]
 
         # Calls the setter if the user provided a non-None value
         # We need to avoid calling the setter with a None value so
@@ -722,7 +728,8 @@ class LanceDataset(pa.dataset.Dataset):
         order_by: list of ColumnOrdering, default None
             If not specified, the rows will be returned as the file order
             if scan_in_order is true. Otherwise it will fellow as a random order.
-            If specified, the return rows will follow the orderings.
+            If specified, the return rows will follow the orderings. If a string is
+            specified, it will assume ascending and nulls last ordering.
 
         Notes
         -----

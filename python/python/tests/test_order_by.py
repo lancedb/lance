@@ -78,6 +78,9 @@ def test_two_column_order_by(tmp_path: Path):
     )
     assert dataset.scanner(order_by=[ordering1, ordering2]).to_table() == true_value
 
+    ## Can also pass just column name for default behavior
+    assert dataset.to_table(order_by=["int_col", ordering2]) == true_value
+
 
 def test_all_order_by_support_functions(tmp_path: Path):
     base_dir = tmp_path / "dataset"
