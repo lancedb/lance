@@ -49,6 +49,7 @@ use object_store::path::Path;
 use prost::Message;
 
 use super::ObjectStore;
+use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
@@ -58,6 +59,7 @@ use crate::dataset::{
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::caches::DSMetadataCache;
+use crate::session::Session;
 use crate::Dataset;
 
 mod conflict_resolver;
@@ -110,8 +112,40 @@ async fn do_commit_new_dataset(
 ) -> Result<(Manifest, ManifestLocation)> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
-    let (mut manifest, indices) =
-        transaction.build_manifest(None, vec![], &transaction_file, write_config, blob_version)?;
+    let (mut manifest, indices) = if let Operation::Clone {
+        ref source_path,
+        ref ref_name,
+        is_strong_ref,
+        ref_version,
+        ..
+    } = transaction.operation
+    {
+        let source_manifest_location = commit_handler
+            .resolve_version_location(
+                &Path::from(source_path.as_str()),
+                ref_version,
+                &object_store.inner,
+            )
+            .await?;
+        let source_manifest = Dataset::load_manifest(
+            &object_store,
+            &source_manifest_location,
+            &base_path,
+            &Session::default(),
+        )
+        .await?;
+        let new_manifest = source_manifest.shallow_clone(source_path, ref_name, is_strong_ref);
+        (new_manifest, Vec::new())
+    } else {
+        let (manifest, indices) = transaction.build_manifest(
+            None,
+            vec![],
+            &transaction_file,
+            write_config,
+            blob_version,
+        )?;
+        (manifest, indices)
+    };
 
     manifest.blob_dataset_version = blob_version;
 
@@ -1403,6 +1437,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version=*/ None,
+            None,
         );
 
         fix_schema(&mut manifest).unwrap();
