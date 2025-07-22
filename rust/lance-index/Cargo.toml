@@ -41,7 +41,6 @@ lance-io.workspace = true
 lance-linalg.workspace = true
 lance-table.workspace = true
 log.workspace = true
-moka.workspace = true
 num-traits.workspace = true
 object_store.workspace = true
 prost.workspace = true

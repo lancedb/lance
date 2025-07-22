@@ -221,10 +221,24 @@ class LanceDataset(pa.dataset.Dataset):
         serialized_manifest: Optional[bytes] = None,
         default_scan_options: Optional[Dict[str, Any]] = None,
         metadata_cache_size_bytes: Optional[int] = None,
+        index_cache_size_bytes: Optional[int] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._storage_options = storage_options
+
+        # Handle deprecation warning for index_cache_size
+        if index_cache_size is not None:
+            import warnings
+
+            warnings.warn(
+                "The 'index_cache_size' parameter is deprecated. "
+                "Use 'index_cache_size_bytes' instead. "
+                "The old parameter will be converted to bytes using 20 MiB per entry.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         self._ds = _Dataset(
             uri,
             version,
@@ -235,6 +249,7 @@ class LanceDataset(pa.dataset.Dataset):
             storage_options,
             serialized_manifest,
             metadata_cache_size_bytes=metadata_cache_size_bytes,
+            index_cache_size_bytes=index_cache_size_bytes,
         )
         self._default_scan_options = default_scan_options
 
