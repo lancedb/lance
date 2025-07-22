@@ -3,6 +3,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_file::datatypes::populate_schema_dictionary;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptions, DEFAULT_CLOUD_IO_PARALLELISM,
 };
@@ -38,6 +39,7 @@ pub struct DatasetBuilder {
     options: ObjectStoreParams,
     version: Option<Ref>,
     table_uri: String,
+    file_reader_options: Option<FileReaderOptions>,
 }
 
 impl DatasetBuilder {
@@ -51,6 +53,7 @@ impl DatasetBuilder {
             session: None,
             version: None,
             manifest: None,
+            file_reader_options: None,
         }
     }
 }
@@ -190,6 +193,10 @@ impl DatasetBuilder {
             self.commit_handler = Some(commit_handler);
         }
 
+        if let Some(file_reader_options) = read_params.file_reader_options {
+            self.file_reader_options = Some(file_reader_options);
+        }
+
         self
     }
 
@@ -288,6 +295,7 @@ impl DatasetBuilder {
 
         let manifest = self.manifest.take();
 
+        let file_reader_options = self.file_reader_options.clone();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
         if let Some(r) = cloned_ref {
@@ -348,6 +356,7 @@ impl DatasetBuilder {
             location,
             session,
             commit_handler,
+            file_reader_options,
         )
     }
 }

@@ -384,6 +384,7 @@ impl<'a> CommitBuilder<'a> {
                 commit_handler,
                 tags,
                 metadata_cache,
+                file_reader_options: None,
             }),
         }
     }

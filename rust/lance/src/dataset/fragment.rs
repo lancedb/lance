@@ -613,6 +613,8 @@ pub struct FragReadConfig {
     ///
     /// operation_priority: u32 | reader_priority: u32 | file_position: u64
     pub reader_priority: Option<u32>,
+    /// File reader options to use when reading data files.
+    pub file_reader_options: Option<FileReaderOptions>,
 }
 
 impl FragReadConfig {
@@ -633,6 +635,11 @@ impl FragReadConfig {
 
     pub fn with_reader_priority(mut self, value: u32) -> Self {
         self.reader_priority = Some(value);
+        self
+    }
+
+    pub fn with_file_reader_options(mut self, value: FileReaderOptions) -> Self {
+        self.file_reader_options = Some(value);
         self
     }
 }
@@ -724,7 +731,7 @@ impl FileFragment {
                 None,
                 Arc::<DecoderPlugins>::default(),
                 &dataset.metadata_cache.file_metadata_cache(&filepath),
-                FileReaderOptions::default(),
+                dataset.file_reader_options.clone().unwrap_or_default(),
             )
             .await?;
             // If the schemas are not compatible we can't calculate field id offsets
@@ -949,7 +956,11 @@ impl FileFragment {
                     Arc::<DecoderPlugins>::default(),
                     file_metadata,
                     &metadata_cache,
-                    FileReaderOptions::default(),
+                    read_config
+                        .file_reader_options
+                        .clone()
+                        .or_else(|| self.dataset.file_reader_options.clone())
+                        .unwrap_or_default(),
                 )
                 .await?,
             );
