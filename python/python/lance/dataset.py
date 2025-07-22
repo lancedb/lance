@@ -395,7 +395,7 @@ class LanceDataset(pa.dataset.Dataset):
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
-        orderings: Optional[List[ColumnOrdering]] = None,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -501,7 +501,7 @@ class LanceDataset(pa.dataset.Dataset):
 
             Note: if this is a search operation, or a take operation (including scalar
             indexed scans) then deleted rows cannot be returned.
-        orderings: list of ColumnOrdering, default None
+        order_by: list of ColumnOrdering, default None
             If not specified, the rows will be returned as the file order
             if scan_in_order is true. Otherwise it will fellow as a random order.
             If specified, the return rows will follow the orderings.
@@ -559,7 +559,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.include_deleted_rows, include_deleted_rows)
         setopt(builder.scan_stats_callback, scan_stats_callback)
         setopt(builder.strict_batch_size, strict_batch_size)
-        setopt(builder.order_by, orderings)
+        setopt(builder.order_by, order_by)
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
             # No defaults, use user-provided, if any
@@ -640,7 +640,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
-        orderings: Optional[List[ColumnOrdering]] = None,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> pa.Table:
         """Read the data into memory as a :py:class:`pyarrow.Table`
 
@@ -719,7 +719,7 @@ class LanceDataset(pa.dataset.Dataset):
 
             Note: if this is a search operation, or a take operation (including scalar
             indexed scans) then deleted rows cannot be returned.
-        orderings: list of ColumnOrdering, default None
+        order_by: list of ColumnOrdering, default None
             If not specified, the rows will be returned as the file order
             if scan_in_order is true. Otherwise it will fellow as a random order.
             If specified, the return rows will follow the orderings.
@@ -751,7 +751,7 @@ class LanceDataset(pa.dataset.Dataset):
             fast_search=fast_search,
             full_text_query=full_text_query,
             include_deleted_rows=include_deleted_rows,
-            orderings=orderings,
+            order_by=order_by,
         ).to_table()
 
     @property
@@ -837,7 +837,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
         strict_batch_size: Optional[bool] = None,
-        orderings: Optional[List[ColumnOrdering]] = None,
+        order_by: Optional[List[ColumnOrdering]] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -870,7 +870,7 @@ class LanceDataset(pa.dataset.Dataset):
             use_stats=use_stats,
             full_text_query=full_text_query,
             strict_batch_size=strict_batch_size,
-            orderings=orderings,
+            order_by=order_by,
         ).to_batches()
 
     def sample(

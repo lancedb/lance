@@ -23,7 +23,7 @@ def test_one_column_order_by(tmp_path: Path):
     true_value = pa.table(
         {"int_col": [1, 2, 3, 4, None], "str_col": [None, "a", "d", "c", "b"]}
     )
-    assert dataset.scanner(orderings=[ordering]).to_table() == true_value
+    assert dataset.scanner(order_by=[ordering]).to_table() == true_value
 
     ## asc null_first
     ordering = ColumnOrdering("int_col", nulls_first=True)
@@ -33,7 +33,7 @@ def test_one_column_order_by(tmp_path: Path):
             "str_col": ["b", None, "a", "d", "c"],
         }
     )
-    assert dataset.scanner(orderings=[ordering]).to_table() == true_value
+    assert dataset.scanner(order_by=[ordering]).to_table() == true_value
 
     ## desc null_last
     ordering = ColumnOrdering("int_col", ascending=False)
@@ -43,7 +43,7 @@ def test_one_column_order_by(tmp_path: Path):
             "str_col": ["c", "d", "a", None, "b"],
         }
     )
-    assert dataset.scanner(orderings=[ordering]).to_table() == true_value
+    assert dataset.scanner(order_by=[ordering]).to_table() == true_value
 
     ## desc null_first
     ordering = ColumnOrdering("int_col", ascending=False, nulls_first=True)
@@ -53,7 +53,7 @@ def test_one_column_order_by(tmp_path: Path):
             "str_col": ["b", "c", "d", "a", None],
         }
     )
-    assert dataset.scanner(orderings=[ordering]).to_table() == true_value
+    assert dataset.scanner(order_by=[ordering]).to_table() == true_value
 
 
 def test_two_column_order_by(tmp_path: Path):
@@ -76,7 +76,7 @@ def test_two_column_order_by(tmp_path: Path):
             "str_col": [None, "a", None, "e", "d", "c", "b"],
         }
     )
-    assert dataset.scanner(orderings=[ordering1, ordering2]).to_table() == true_value
+    assert dataset.scanner(order_by=[ordering1, ordering2]).to_table() == true_value
 
 
 def test_all_order_by_support_functions(tmp_path: Path):
@@ -92,13 +92,11 @@ def test_all_order_by_support_functions(tmp_path: Path):
         {"int_col": [1, 2, 3, 4, None], "str_col": [None, "a", "d", "c", "b"]}
     )
 
-    assert dataset.to_table(orderings=[ordering]) == true_value
-    assert pa.Table.from_batches(dataset.to_batches(orderings=[ordering])) == true_value
-    assert dataset.scanner(orderings=[ordering]).to_table() == true_value
+    assert dataset.to_table(order_by=[ordering]) == true_value
+    assert pa.Table.from_batches(dataset.to_batches(order_by=[ordering])) == true_value
+    assert dataset.scanner(order_by=[ordering]).to_table() == true_value
 
     fragment = dataset.get_fragment(0)
-    assert fragment.to_table(orderings=[ordering]) == true_value
-    assert (
-        pa.Table.from_batches(fragment.to_batches(orderings=[ordering])) == true_value
-    )
-    assert fragment.scanner(orderings=[ordering]).to_table() == true_value
+    assert fragment.to_table(order_by=[ordering]) == true_value
+    assert pa.Table.from_batches(fragment.to_batches(order_by=[ordering])) == true_value
+    assert fragment.scanner(order_by=[ordering]).to_table() == true_value
