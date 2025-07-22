@@ -17,8 +17,8 @@ use deepsize::{Context, DeepSizeOf};
 use futures::{stream::BoxStream, Stream, StreamExt};
 use lance_encoding::{
     decoder::{
-        schedule_and_decode, schedule_and_decode_blocking, ColumnInfo, DecoderPlugins,
-        FilterExpression, PageEncoding, PageInfo, ReadBatchTask, RequestedRows,
+        schedule_and_decode, schedule_and_decode_blocking, ColumnInfo, DecoderConfig,
+        DecoderPlugins, FilterExpression, PageEncoding, PageInfo, ReadBatchTask, RequestedRows,
         SchedulerDecoderConfig,
     },
     encoder::EncodedBatch,
@@ -313,7 +313,7 @@ impl ReaderProjection {
 
 #[derive(Clone, Debug, Default)]
 pub struct FileReaderOptions {
-    pub decoder_config: lance_encoding::decoder::DecoderConfig,
+    pub decoder_config: DecoderConfig,
 }
 
 #[derive(Debug)]
@@ -835,8 +835,7 @@ impl FileReader {
         batch_size: u32,
         projection: ReaderProjection,
         filter: FilterExpression,
-        should_validate: bool,
-        cache_repetition_index: bool,
+        decoder_config: DecoderConfig,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Reading range {:?} with batch_size {} from file with {} rows and {} columns into schema with {} columns",
@@ -847,10 +846,6 @@ impl FileReader {
             projection.schema.fields.len(),
         );
 
-        let decoder_config = lance_encoding::decoder::DecoderConfig {
-            cache_repetition_index,
-            validate_on_decode: should_validate,
-        };
         let config = SchedulerDecoderConfig {
             batch_size,
             cache,
@@ -889,8 +884,7 @@ impl FileReader {
             batch_size,
             projection,
             filter,
-            self.options.decoder_config.validate_on_decode,
-            self.options.decoder_config.cache_repetition_index,
+            self.options.decoder_config.clone(),
         )
     }
 
@@ -904,8 +898,7 @@ impl FileReader {
         batch_size: u32,
         projection: ReaderProjection,
         filter: FilterExpression,
-        should_validate: bool,
-        cache_repetition_index: bool,
+        decoder_config: DecoderConfig,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
@@ -916,10 +909,6 @@ impl FileReader {
             column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
         );
 
-        let decoder_config = lance_encoding::decoder::DecoderConfig {
-            cache_repetition_index,
-            validate_on_decode: should_validate,
-        };
         let config = SchedulerDecoderConfig {
             batch_size,
             cache,
@@ -956,8 +945,7 @@ impl FileReader {
             batch_size,
             projection,
             FilterExpression::no_filter(),
-            self.options.decoder_config.validate_on_decode,
-            self.options.decoder_config.cache_repetition_index,
+            self.options.decoder_config.clone(),
         )
     }
 
@@ -971,8 +959,7 @@ impl FileReader {
         batch_size: u32,
         projection: ReaderProjection,
         filter: FilterExpression,
-        should_validate: bool,
-        cache_repetition_index: bool,
+        decoder_config: DecoderConfig,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         debug!(
@@ -985,10 +972,6 @@ impl FileReader {
             column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
         );
 
-        let decoder_config = lance_encoding::decoder::DecoderConfig {
-            cache_repetition_index,
-            validate_on_decode: should_validate,
-        };
         let config = SchedulerDecoderConfig {
             batch_size,
             cache,
@@ -1025,8 +1008,7 @@ impl FileReader {
             batch_size,
             projection,
             filter,
-            self.options.decoder_config.validate_on_decode,
-            self.options.decoder_config.cache_repetition_index,
+            self.options.decoder_config.clone(),
         )
     }
 
@@ -1566,6 +1548,7 @@ pub mod tests {
         testing::{test_cache, write_lance_file, FsFixture, WrittenFile},
         writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions},
     };
+    use lance_encoding::decoder::DecoderConfig;
 
     async fn create_some_file(fs: &FsFixture, version: LanceFileVersion) -> WrittenFile {
         let location_type = DataType::Struct(Fields::from(vec![
@@ -2138,7 +2121,7 @@ pub mod tests {
             file_reader.scheduler.clone(),
             test_cache(),
             &FilterExpression::no_filter(),
-            false,
+            &DecoderConfig::default(),
         )
         .await
         .unwrap();

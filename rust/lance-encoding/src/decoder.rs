@@ -941,7 +941,7 @@ impl DecodeBatchScheduler {
         io: Arc<dyn EncodingsIo>,
         cache: Arc<LanceCache>,
         filter: &FilterExpression,
-        cache_repetition_index: bool,
+        decoder_config: &DecoderConfig,
     ) -> Result<Self> {
         assert!(num_rows > 0);
         let buffers = FileBuffers {
@@ -962,11 +962,7 @@ impl DecodeBatchScheduler {
         if column_infos[0].is_structural() {
             let mut column_iter = ColumnInfoIter::new(column_infos.to_vec(), column_indices);
 
-            let decoder_config = DecoderConfig {
-                cache_repetition_index,
-                validate_on_decode: false,
-            };
-            let strategy = CoreFieldDecoderStrategy::from_decoder_config(&decoder_config);
+            let strategy = CoreFieldDecoderStrategy::from_decoder_config(decoder_config);
             let mut root_scheduler =
                 strategy.create_structural_field_scheduler(&root_field, &mut column_iter)?;
 
@@ -990,11 +986,7 @@ impl DecodeBatchScheduler {
                 .chain(column_indices.iter().map(|i| i.saturating_add(1)))
                 .collect::<Vec<_>>();
             let mut column_iter = ColumnInfoIter::new(columns, &adjusted_column_indices);
-            let decoder_config = DecoderConfig {
-                cache_repetition_index,
-                validate_on_decode: false,
-            };
-            let strategy = CoreFieldDecoderStrategy::from_decoder_config(&decoder_config);
+            let strategy = CoreFieldDecoderStrategy::from_decoder_config(decoder_config);
             let root_scheduler =
                 strategy.create_legacy_field_scheduler(&root_field, &mut column_iter, buffers)?;
 
@@ -1894,7 +1886,7 @@ fn create_scheduler_decoder(
             config.io.clone(),
             config.cache,
             &filter,
-            config.decoder_config.cache_repetition_index,
+            &config.decoder_config,
         )
         .await
         {
@@ -2005,7 +1997,7 @@ pub fn schedule_and_decode_blocking(
         config.io.clone(),
         config.cache,
         &filter,
-        config.decoder_config.cache_repetition_index,
+        &config.decoder_config,
     ))?;
 
     // Schedule the requested rows
@@ -2556,7 +2548,7 @@ pub async fn decode_batch(
         io_scheduler.clone(),
         cache,
         filter,
-        false, // cache_repetition_index - default to false for decode_batch
+        &DecoderConfig::default(),
     )
     .await?;
     let (tx, rx) = unbounded_channel();
