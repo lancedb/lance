@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::prelude::*;
+use deepsize::DeepSizeOf;
 use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
 use lance_file::reader::FileReader;
 use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
@@ -18,7 +19,7 @@ use prost_types::Timestamp;
 use super::Fragment;
 use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_MOVE_STABLE_ROW_IDS};
 use crate::format::pb;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Schema, StorageClass};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
@@ -31,7 +32,7 @@ use snafu::location;
 ///  * Version
 ///  * Fragments.
 ///  * Indices.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
@@ -69,8 +70,9 @@ pub struct Manifest {
     /// The writer flags
     pub writer_feature_flags: u64,
 
-    /// The max fragment id used so far
-    pub max_fragment_id: u32,
+    /// The max fragment id used so far  
+    /// None means never set, Some(0) means max ID used so far is 0
+    pub max_fragment_id: Option<u32>,
 
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
@@ -134,7 +136,7 @@ impl Manifest {
             tag: None,
             reader_feature_flags: 0,
             writer_feature_flags: 0,
-            max_fragment_id: 0,
+            max_fragment_id: None,
             transaction_file: None,
             fragment_offsets,
             next_row_id: 0,
@@ -205,46 +207,74 @@ impl Manifest {
     }
 
     /// Replaces the schema metadata with the given key-value pairs.
-    pub fn update_schema_metadata(&mut self, new_metadata: HashMap<String, String>) {
+    pub fn replace_schema_metadata(&mut self, new_metadata: HashMap<String, String>) {
         self.schema.metadata = new_metadata;
     }
 
     /// Replaces the metadata of the field with the given id with the given key-value pairs.
     ///
     /// If the field does not exist in the schema, this is a no-op.
-    pub fn update_field_metadata(&mut self, field_id: i32, new_metadata: HashMap<String, String>) {
+    pub fn replace_field_metadata(
+        &mut self,
+        field_id: i32,
+        new_metadata: HashMap<String, String>,
+    ) -> Result<()> {
         if let Some(field) = self.schema.field_by_id_mut(field_id) {
             field.metadata = new_metadata;
+            Ok(())
+        } else {
+            Err(Error::invalid_input(
+                format!(
+                    "Field with id {} does not exist for replace_field_metadata",
+                    field_id
+                ),
+                location!(),
+            ))
         }
     }
 
     /// Check the current fragment list and update the high water mark
     pub fn update_max_fragment_id(&mut self) {
+        // If there are no fragments, don't update max_fragment_id
+        if self.fragments.is_empty() {
+            return;
+        }
+
         let max_fragment_id = self
             .fragments
             .iter()
             .map(|f| f.id)
             .max()
-            .unwrap_or_default()
+            .unwrap() // Safe because we checked fragments is not empty
             .try_into()
             .unwrap();
 
-        if max_fragment_id > self.max_fragment_id {
-            self.max_fragment_id = max_fragment_id;
+        match self.max_fragment_id {
+            None => {
+                // First time being set
+                self.max_fragment_id = Some(max_fragment_id);
+            }
+            Some(current_max) => {
+                // Only update if the computed max is greater than current
+                // This preserves the high water mark even when fragments are deleted
+                if max_fragment_id > current_max {
+                    self.max_fragment_id = Some(max_fragment_id);
+                }
+            }
         }
     }
 
     /// Return the max fragment id.
     /// Note this does not support recycling of fragment ids.
     ///
-    /// This will return None if there are no fragments.
+    /// This will return None if there are no fragments and max_fragment_id was never set.
     pub fn max_fragment_id(&self) -> Option<u64> {
-        if self.max_fragment_id == 0 {
-            // It might not have been updated, so the best we can do is recompute
-            // it from the fragment list.
-            self.fragments.iter().map(|f| f.id).max()
+        if let Some(max_id) = self.max_fragment_id {
+            // Return the stored high water mark
+            Some(max_id.into())
         } else {
-            Some(self.max_fragment_id.into())
+            // Not yet set, compute from fragment list
+            self.fragments.iter().map(|f| f.id).max()
         }
     }
 
@@ -339,13 +369,13 @@ impl Manifest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct WriterVersion {
     pub library: String,
     pub version: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DataStorageFormat {
     pub file_format: String,
     pub version: String,
@@ -517,7 +547,6 @@ impl TryFrom<pb::Manifest> for Manifest {
             local_schema,
             version: p.version,
             writer_version,
-            fragments,
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
             timestamp_nanos: timestamp_nanos.unwrap_or(0),
@@ -525,6 +554,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             reader_feature_flags: p.reader_feature_flags,
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
+            fragments,
             transaction_file: if p.transaction_file.is_empty() {
                 None
             } else {
@@ -599,7 +629,7 @@ pub trait SelfDescribingFileReader {
     async fn try_new_self_described(
         object_store: &ObjectStore,
         path: &Path,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Self>
     where
         Self: Sized,
@@ -610,7 +640,7 @@ pub trait SelfDescribingFileReader {
 
     async fn try_new_self_described_from_reader(
         reader: Arc<dyn Reader>,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Self>
     where
         Self: Sized;
@@ -620,7 +650,7 @@ pub trait SelfDescribingFileReader {
 impl SelfDescribingFileReader for FileReader {
     async fn try_new_self_described_from_reader(
         reader: Arc<dyn Reader>,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Self> {
         let metadata = Self::read_metadata(reader.as_ref(), cache).await?;
         let manifest_position = metadata.manifest_position.ok_or(Error::Internal {
@@ -631,7 +661,9 @@ impl SelfDescribingFileReader for FileReader {
             location: location!(),
         })?;
         let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
-        populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
+        if manifest.should_use_legacy_format() {
+            populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
+        }
         let schema = manifest.schema;
         let max_field_id = schema.max_field_id().unwrap_or_default();
         Self::try_new_from_reader(

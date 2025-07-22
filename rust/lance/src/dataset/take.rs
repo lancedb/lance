@@ -25,24 +25,15 @@ use snafu::location;
 use super::ProjectionRequest;
 use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
 
-pub async fn take(
+/// Convert A list of ROW ids to a list of row addresses.
+pub(super) async fn row_indices_to_row_addresses(
     dataset: &Dataset,
-    offsets: &[u64],
-    projection: ProjectionRequest,
-) -> Result<RecordBatch> {
-    let projection = projection.into_projection_plan(dataset.schema())?;
-
-    if offsets.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::new(
-            projection.output_schema()?,
-        )));
-    }
-
-    // First, convert the dataset offsets into row addresses
+    row_indices: &[u64],
+) -> Result<Vec<u64>> {
     let fragments = dataset.get_fragments();
 
-    let mut perm = permutation::sort(offsets);
-    let sorted_offsets = perm.apply_slice(offsets);
+    let mut perm = permutation::sort(row_indices);
+    let sorted_offsets = perm.apply_slice(row_indices);
 
     let mut frag_iter = fragments.iter();
     let mut cur_frag = frag_iter.next();
@@ -91,6 +82,24 @@ pub async fn take(
 
     // Restore the original order
     perm.apply_inv_slice_in_place(&mut addrs);
+    Ok(addrs)
+}
+
+pub async fn take(
+    dataset: &Dataset,
+    offsets: &[u64],
+    projection: ProjectionRequest,
+) -> Result<RecordBatch> {
+    let projection = projection.into_projection_plan(Arc::new(dataset.clone()))?;
+
+    if offsets.is_empty() {
+        return Ok(RecordBatch::new_empty(Arc::new(
+            projection.output_schema()?,
+        )));
+    }
+
+    // First, convert the dataset offsets into row addresses
+    let addrs = row_indices_to_row_addresses(dataset, offsets).await?;
 
     let builder = TakeBuilder::try_new_from_addresses(
         Arc::new(dataset.clone()),
@@ -134,6 +143,8 @@ async fn do_take_rows(
         }
     }
 
+    let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
+
     let batch = if row_addr_stats.contiguous {
         // Fastest path: Can use `read_range` directly
         let start = row_addrs.first().expect("empty range passed to take_rows");
@@ -150,7 +161,7 @@ async fn do_take_rows(
         })?;
 
         let reader = fragment
-            .open(&projection.physical_schema, FragReadConfig::default())
+            .open(&physical_schema, FragReadConfig::default())
             .await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_addr_stats.sorted {
@@ -193,12 +204,7 @@ async fn do_take_rows(
                 })?;
             let row_offsets: Vec<u32> = row_addrs[range].iter().map(|x| *x as u32).collect();
 
-            let batch_fut = do_take(
-                fragment,
-                row_offsets,
-                projection.physical_schema.clone(),
-                false,
-            );
+            let batch_fut = do_take(fragment, row_offsets, physical_schema.clone(), false);
             batches.push(batch_fut);
         }
         let batches: Vec<RecordBatch> = futures::stream::iter(batches)
@@ -208,7 +214,7 @@ async fn do_take_rows(
         Ok(concat_batches(&batches[0].schema(), &batches)?)
     } else {
         let projection_with_row_addr = Schema::merge(
-            projection.physical_schema.as_ref(),
+            physical_schema.as_ref(),
             &ArrowSchema::new(vec![ArrowField::new(
                 ROW_ADDR,
                 arrow::datatypes::DataType::UInt64,
@@ -241,9 +247,7 @@ async fn do_take_rows(
         });
 
         let mut batches = futures::stream::iter(fragment_and_indices)
-            .map(|(fragment, indices)| {
-                do_take(fragment, indices, projection.physical_schema.clone(), true)
-            })
+            .map(|(fragment, indices)| do_take(fragment, indices, physical_schema.clone(), true))
             .buffered(builder.dataset.object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
@@ -315,25 +319,6 @@ async fn do_take_rows(
     }
 }
 
-// Given a local take and a sibling take this function zips the results together
-async fn zip_takes(
-    local: RecordBatch,
-    sibling: RecordBatch,
-    orig_projection_plan: &ProjectionPlan,
-) -> Result<RecordBatch> {
-    let mut all_cols = Vec::with_capacity(local.num_columns() + sibling.num_columns());
-    all_cols.extend(local.columns().iter().cloned());
-    all_cols.extend(sibling.columns().iter().cloned());
-
-    let mut all_fields = Vec::with_capacity(local.num_columns() + sibling.num_columns());
-    all_fields.extend(local.schema().fields().iter().cloned());
-    all_fields.extend(sibling.schema().fields().iter().cloned());
-
-    let all_batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(all_fields)), all_cols).unwrap();
-
-    orig_projection_plan.project_batch(all_batch).await
-}
-
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
     if builder.is_empty() {
         return Ok(RecordBatch::new_empty(Arc::new(
@@ -342,61 +327,8 @@ async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
     }
 
     let projection = builder.projection.clone();
-    let sibling_ds: Arc<Dataset>;
 
-    // If we have sibling columns then we load those in parallel to the local
-    // columns and zip the results together.
-    let sibling_take = if let Some(sibling_schema) = projection.sibling_schema.as_ref() {
-        let filtered_row_ids = builder.get_filtered_ids().await?;
-        if filtered_row_ids.is_empty() {
-            return Ok(RecordBatch::new_empty(Arc::new(
-                builder.projection.output_schema()?,
-            )));
-        }
-        sibling_ds = builder
-            .dataset
-            .blobs_dataset()
-            .await?
-            .ok_or_else(|| Error::Internal {
-                message: "schema referenced sibling columns but there was no blob dataset".into(),
-                location: location!(),
-            })?;
-        // The sibling take only takes valid row ids and sibling columns
-        let mut builder = builder.clone();
-        builder.dataset = sibling_ds;
-        builder.row_ids = Some(filtered_row_ids);
-        builder.row_addrs = None;
-        let blobs_projection = Arc::new(ProjectionPlan::inner_new(
-            sibling_schema.clone(),
-            false,
-            None,
-        ));
-        Some(async move { do_take_rows(builder, blobs_projection).await })
-    } else {
-        None
-    };
-
-    if let Some(sibling_take) = sibling_take {
-        if projection.physical_schema.fields.is_empty() {
-            // Nothing we need from local dataset, just take from blob dataset
-            sibling_take.await
-        } else {
-            // Need to take from both and zip together
-            let local_projection = ProjectionPlan {
-                physical_df_schema: projection.physical_df_schema.clone(),
-                physical_schema: projection.physical_schema.clone(),
-                sibling_schema: None,
-                // These will be applied in zip_takes
-                requested_output_expr: None,
-            };
-            let local_take = do_take_rows(builder, Arc::new(local_projection));
-            let (local, blobs) = futures::join!(local_take, sibling_take);
-
-            zip_takes(local?, blobs?, &projection).await
-        }
-    } else {
-        do_take_rows(builder, projection).await
-    }
+    do_take_rows(builder, projection).await
 }
 
 /// Get a stream of batches based on iterator of ranges of row numbers.
@@ -479,7 +411,7 @@ impl TakeBuilder {
         Ok(Self {
             row_ids: Some(row_ids),
             row_addrs: None,
-            projection: Arc::new(projection.into_projection_plan(dataset.schema())?),
+            projection: Arc::new(projection.into_projection_plan(dataset.clone())?),
             dataset,
             with_row_address: false,
         })
@@ -515,24 +447,6 @@ impl TakeBuilder {
         match (self.row_ids.as_ref(), self.row_addrs.as_ref()) {
             (Some(ids), _) => ids.is_empty(),
             (_, Some(addrs)) => addrs.is_empty(),
-            _ => unreachable!(),
-        }
-    }
-
-    async fn get_filtered_ids(&self) -> Result<Vec<u64>> {
-        match (self.row_ids.as_ref(), self.row_addrs.as_ref()) {
-            (Some(ids), _) => self.dataset.filter_deleted_ids(ids).await,
-            (_, Some(addrs)) => {
-                let _filtered_addresses = self.dataset.filter_deleted_addresses(addrs).await?;
-                // TODO: Create an inverse mapping from addresses to ids
-                // This path is currently encountered in the "take by dataset offsets" case.
-                // Another solution could be to translate dataset offsets into row ids instead
-                // of translating them into row addresses.
-                Err(Error::NotSupported {
-                    source: "mapping from row addresses to row ids".into(),
-                    location: location!(),
-                })
-            }
             _ => unreachable!(),
         }
     }

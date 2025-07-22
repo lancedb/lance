@@ -31,6 +31,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
 use snafu::location;
+use tracing::Instrument;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::scanner::{
@@ -79,6 +80,41 @@ impl ScanMetrics {
             baseline_metrics: BaselineMetrics::new(metrics, partition),
             io_metrics: IoMetrics::new(metrics, partition),
         }
+    }
+}
+
+/// Default behavior
+/// polling method for non-strict batch size mode.
+///
+/// # Use Case
+/// When strict batch size is disabled, this method allows natural batch sizes from storage,
+/// concatenating residuals across fragments. Ideal for streaming scenarios prioritizing throughput
+/// over consistent batch sizes.
+///
+/// # Example
+/// With batch_size=5 and a fragment containing 7 rows:
+/// Output batches: [5 rows], [2 rows]
+/// Next fragment with 4 rows won't combine residuals with the next fragment.:
+/// Output batches: [4 rows]
+impl Stream for LanceStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let timer = this.scan_metrics.baseline_metrics.elapsed_compute().timer();
+
+        let poll_result = match this.inner_stream.poll_next_unpin(cx) {
+            Poll::Ready(None) => {
+                if let Some(scheduler) = &this.scan_scheduler {
+                    this.scan_metrics.io_metrics.record_final(scheduler);
+                }
+                Poll::Ready(None)
+            }
+            other => other,
+        };
+
+        timer.done();
+        this.scan_metrics.baseline_metrics.record_poll(poll_result)
     }
 }
 
@@ -246,33 +282,36 @@ impl LanceStream {
                 #[allow(clippy::type_complexity)]
                 let frag_task: BoxFuture<
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
-                > = tokio::spawn(async move {
-                    let reader = open_file(
-                        file_fragment.fragment,
-                        project_schema,
-                        FragReadConfig::default()
-                            .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address),
-                        config.with_make_deletions_null,
-                        Some((scan_scheduler, priority as u32)),
-                    )
-                    .await?;
-                    let batch_stream = if let Some(range) = file_fragment.range {
-                        reader.read_range(range, config.batch_size as u32)?.boxed()
-                    } else {
-                        reader.read_all(config.batch_size as u32)?.boxed()
-                    };
-                    let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
-                        batch_stream
-                            .map(|fut| {
-                                Result::Ok(
-                                    fut.map_err(|e| DataFusionError::External(Box::new(e)))
-                                        .boxed(),
-                                )
-                            })
-                            .boxed();
-                    Result::Ok(batch_stream)
-                })
+                > = tokio::spawn(
+                    (async move {
+                        let reader = open_file(
+                            file_fragment.fragment,
+                            project_schema,
+                            FragReadConfig::default()
+                                .with_row_id(config.with_row_id)
+                                .with_row_address(config.with_row_address),
+                            config.with_make_deletions_null,
+                            Some((scan_scheduler, priority as u32)),
+                        )
+                        .await?;
+                        let batch_stream = if let Some(range) = file_fragment.range {
+                            reader.read_range(range, config.batch_size as u32)?.boxed()
+                        } else {
+                            reader.read_all(config.batch_size as u32)?.boxed()
+                        };
+                        let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
+                            batch_stream
+                                .map(|fut| {
+                                    Result::Ok(
+                                        fut.map_err(|e| DataFusionError::External(Box::new(e)))
+                                            .boxed(),
+                                    )
+                                })
+                                .boxed();
+                        Result::Ok(batch_stream)
+                    })
+                    .in_current_span(),
+                )
                 .map(|res_res| res_res.unwrap())
                 .boxed();
                 Ok(frag_task)
@@ -283,7 +322,7 @@ impl LanceStream {
             // files we have.  It's not going to have much affect on how much RAM we are using.
             .try_buffered(frag_parallelism)
             .boxed();
-        let batches = batches
+        let inner_stream = batches
             .try_flatten()
             // The second try_buffered controls how many CPU decode tasks we kick off in parallel.
             //
@@ -296,7 +335,7 @@ impl LanceStream {
 
         timer.done();
         Ok(Self {
-            inner_stream: batches,
+            inner_stream,
             projection,
             config,
             scan_metrics,
@@ -329,7 +368,7 @@ impl LanceStream {
             .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
             .collect::<Vec<_>>();
 
-        let inner_stream = if config.ordered_output {
+        let batches = if config.ordered_output {
             let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
                     Ok(open_file(
@@ -390,9 +429,8 @@ impl LanceStream {
                 .boxed()
         };
 
-        let inner_stream = inner_stream
-            .map(|batch| batch.map_err(DataFusionError::from))
-            .boxed();
+        let inner_stream = Box::pin(batches.map_err(|e| DataFusionError::External(Box::new(e))))
+            as Pin<Box<dyn Stream<Item = Result<_, _>> + Send>>;
 
         timer.done();
         Ok(Self {
@@ -425,23 +463,6 @@ impl RecordBatchStream for LanceStream {
             schema = schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
         }
         Arc::new(schema)
-    }
-}
-
-impl Stream for LanceStream {
-    type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        let timer = this.scan_metrics.baseline_metrics.elapsed_compute().timer();
-        let poll = Pin::new(&mut this.inner_stream).poll_next(cx);
-        timer.done();
-        if matches!(poll, Poll::Ready(None)) {
-            if let Some(scan_scheduler) = this.scan_scheduler.as_ref() {
-                this.scan_metrics.io_metrics.record_final(scan_scheduler);
-            }
-        }
-        this.scan_metrics.baseline_metrics.record_poll(poll)
     }
 }
 
@@ -489,23 +510,36 @@ pub struct LanceScanExec {
 
 impl DisplayAs for LanceScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let columns = self
+            .projection
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let columns = self
-                    .projection
-                    .fields
-                    .iter()
-                    .map(|f| f.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 write!(
                     f,
-                    "LanceScan: uri={}, projection=[{}], row_id={}, row_addr={}, ordered={}",
+                    "LanceScan: uri={}, projection=[{}], row_id={}, row_addr={}, ordered={}, range={:?}",
                     self.dataset.data_dir(),
                     columns,
                     self.config.with_row_id,
                     self.config.with_row_address,
-                    self.config.ordered_output
+                    self.config.ordered_output,
+                    self.range
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "LanceScan\nuri={}\nprojection=[{}]\nrow_id={}\nrow_addr={}\nordered={}\nrange={:?}",
+                    self.dataset.data_dir(),
+                    columns,
+                    self.config.with_row_id,
+                    self.config.with_row_address,
+                    self.config.ordered_output,
+                    self.range
                 )
             }
         }
@@ -549,6 +583,31 @@ impl LanceScanExec {
             config,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Get the dataset for this scan.
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    /// Get the fragments for this scan.
+    pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
+        &self.fragments
+    }
+
+    /// Get the range for this scan.
+    pub fn range(&self) -> &Option<Range<u64>> {
+        &self.range
+    }
+
+    /// Get the projection for this scan.
+    pub fn projection(&self) -> &Arc<Schema> {
+        &self.projection
+    }
+
+    // Get the scan config for this scan.
+    pub fn config(&self) -> &LanceScanConfig {
+        &self.config
     }
 }
 

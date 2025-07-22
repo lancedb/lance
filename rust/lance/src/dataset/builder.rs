@@ -27,10 +27,10 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct DatasetBuilder {
     /// Cache size for index cache. If it is zero, index cache is disabled.
-    index_cache_size: usize,
+    index_cache_size_bytes: usize,
     /// Metadata cache size for the fragment metadata. If it is zero, metadata
     /// cache is disabled.
-    metadata_cache_size: usize,
+    metadata_cache_size_bytes: usize,
     /// Optional pre-loaded manifest to avoid loading it again.
     manifest: Option<Manifest>,
     session: Option<Arc<Session>>,
@@ -43,8 +43,8 @@ pub struct DatasetBuilder {
 impl DatasetBuilder {
     pub fn from_uri<T: AsRef<str>>(table_uri: T) -> Self {
         Self {
-            index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
-            metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
+            index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
+            metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             table_uri: table_uri.as_ref().to_string(),
             options: ObjectStoreParams::default(),
             commit_handler: None,
@@ -59,14 +59,34 @@ impl DatasetBuilder {
 // https://github.com/delta-io/delta-rs/main/crates/deltalake-core/src/table/builder.rs
 impl DatasetBuilder {
     /// Set the cache size for indices. Set to zero, to disable the cache.
+    pub fn with_index_cache_size_bytes(mut self, cache_size: usize) -> Self {
+        self.index_cache_size_bytes = cache_size;
+        self
+    }
+
+    /// Set the cache size for indices. Set to zero, to disable the cache.
+    #[deprecated(since = "0.30.0", note = "Use `with_index_cache_size_bytes` instead")]
     pub fn with_index_cache_size(mut self, cache_size: usize) -> Self {
-        self.index_cache_size = cache_size;
+        let assumed_entry_size = 20 * 1024 * 1024; // 20 MiB per entry
+        self.index_cache_size_bytes = cache_size * assumed_entry_size;
+        self
+    }
+
+    /// Size of the metadata cache in bytes. This cache stores metadata in memory
+    /// for faster open table and scans. The default is 1 GiB.
+    pub fn with_metadata_cache_size_bytes(mut self, cache_size: usize) -> Self {
+        self.metadata_cache_size_bytes = cache_size;
         self
     }
 
     /// Set the cache size for the file metadata. Set to zero to disable this cache.
+    #[deprecated(
+        since = "0.30.0",
+        note = "Use `with_metadata_cache_size_bytes` instead"
+    )]
     pub fn with_metadata_cache_size(mut self, cache_size: usize) -> Self {
-        self.metadata_cache_size = cache_size;
+        let assumed_entry_size = 4 * 1024 * 1024; // 4MB per entry
+        self.metadata_cache_size_bytes = cache_size * assumed_entry_size;
         self
     }
 
@@ -163,8 +183,8 @@ impl DatasetBuilder {
     /// Set options based on [ReadParams].
     pub fn with_read_params(mut self, read_params: ReadParams) -> Self {
         self = self
-            .with_index_cache_size(read_params.index_cache_size)
-            .with_metadata_cache_size(read_params.metadata_cache_size);
+            .with_index_cache_size_bytes(read_params.index_cache_size_bytes)
+            .with_metadata_cache_size_bytes(read_params.metadata_cache_size_bytes);
 
         if let Some(options) = read_params.store_options {
             self.options = options;
@@ -262,8 +282,8 @@ impl DatasetBuilder {
         let session = match self.session.as_ref() {
             Some(session) => session.clone(),
             None => Arc::new(Session::new(
-                self.index_cache_size,
-                self.metadata_cache_size,
+                self.index_cache_size_bytes,
+                self.metadata_cache_size_bytes,
                 Default::default(),
             )),
         };
@@ -296,7 +316,7 @@ impl DatasetBuilder {
             let location = commit_handler
                 .resolve_version_location(&base_path, manifest.version, &object_store.inner)
                 .await?;
-            if manifest.schema.has_dictionary_types() {
+            if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
                 let reader = object_store.open(&location.path).await?;
                 populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
             }
@@ -318,7 +338,13 @@ impl DatasetBuilder {
                     })?,
             };
 
-            let manifest = Dataset::load_manifest(&object_store, &manifest_location).await?;
+            let manifest = Dataset::load_manifest(
+                &object_store,
+                &manifest_location,
+                &table_uri,
+                session.as_ref(),
+            )
+            .await?;
             (manifest, manifest_location)
         };
 
@@ -326,13 +352,10 @@ impl DatasetBuilder {
             object_store,
             base_path,
             table_uri,
-            manifest,
-            location.path,
+            Arc::new(manifest),
+            location,
             session,
             commit_handler,
-            location.naming_scheme,
-            location.e_tag,
         )
-        .await
     }
 }

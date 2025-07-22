@@ -19,6 +19,7 @@ use lance_file::{
 use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
+    utils::CachedFileSize,
 };
 use rand::seq::SliceRandom;
 
@@ -66,7 +67,10 @@ fn bench_reader(c: &mut Criterion) {
                         object_store.clone(),
                         SchedulerConfig::default_for_testing(),
                     );
-                    let scheduler = store_scheduler.open_file(file_path).await.unwrap();
+                    let scheduler = store_scheduler
+                        .open_file(file_path, &CachedFileSize::unknown())
+                        .await
+                        .unwrap();
                     let reader = FileReader::try_open(
                         scheduler.clone(),
                         None,
@@ -159,7 +163,10 @@ fn bench_random_access(c: &mut Criterion) {
         let reader = rt.block_on(async move {
             let store_scheduler =
                 ScanScheduler::new(object_store.clone(), SchedulerConfig::default_for_testing());
-            let scheduler = store_scheduler.open_file(file_path).await.unwrap();
+            let scheduler = store_scheduler
+                .open_file(file_path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
             Arc::new(
                 FileReader::try_open(
                     scheduler.clone(),

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::fmt::Debug;
+use std::sync::LazyLock;
 
 use lance_table::io::commit::{CommitError, CommitLease, CommitLock};
 use snafu::location;
@@ -21,16 +22,14 @@ use lance_core::Error;
 
 use pyo3::{exceptions::PyIOError, prelude::*};
 
-lazy_static! {
-    static ref PY_CONFLICT_ERROR: PyResult<PyObject> = {
-        Python::with_gil(|py| {
-            py.import("lance")
-                .and_then(|lance| lance.getattr("commit"))
-                .and_then(|commit| commit.getattr("CommitConflictError"))
-                .map(|err| err.unbind())
-        })
-    };
-}
+static PY_CONFLICT_ERROR: LazyLock<PyResult<PyObject>> = LazyLock::new(|| {
+    Python::with_gil(|py| {
+        py.import("lance")
+            .and_then(|lance| lance.getattr("commit"))
+            .and_then(|commit| commit.getattr("CommitConflictError"))
+            .map(|err| err.unbind())
+    })
+});
 
 fn handle_error(py_err: PyErr, py: Python) -> CommitError {
     let conflict_err_type = match &*PY_CONFLICT_ERROR {

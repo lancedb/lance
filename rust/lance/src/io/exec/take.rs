@@ -165,8 +165,13 @@ impl TakeStream {
         let row_addrs_arr = self.get_row_addrs(&batch).await?;
         let row_addrs = row_addrs_arr.as_primitive::<UInt64Type>();
 
+        debug_assert!(
+            row_addrs.null_count() == 0,
+            "{} nulls in row addresses",
+            row_addrs.null_count()
+        );
         // Check if the row addresses are already sorted to avoid unnecessary reorders
-        let is_sorted = row_addrs.values().windows(2).all(|w| w[0] <= w[1]);
+        let is_sorted = row_addrs.values().is_sorted();
 
         let sorted_addrs: Arc<dyn Array>;
         let (sorted_addrs, permutation) = if is_sorted {
@@ -304,23 +309,26 @@ impl DisplayAs for TakeExec {
             .iter()
             .map(|f| f.name.clone())
             .collect::<HashSet<_>>();
+        let columns = self
+            .output_schema
+            .fields
+            .iter()
+            .map(|f| {
+                let name = f.name();
+                if extra_fields.contains(name) {
+                    format!("({})", name)
+                } else {
+                    name.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let columns = self
-                    .output_schema
-                    .fields
-                    .iter()
-                    .map(|f| {
-                        let name = f.name();
-                        if extra_fields.contains(name) {
-                            format!("({})", name)
-                        } else {
-                            name.to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 write!(f, "Take: columns={:?}", columns)
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "Take\ncolumns={:?}", columns)
             }
         }
     }
@@ -342,7 +350,7 @@ impl TakeExec {
         let original_projection = projection.clone();
         let projection =
             projection.subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
-        if projection.is_empty() {
+        if !projection.has_data_fields() {
             return Ok(None);
         }
 
@@ -439,8 +447,6 @@ impl TakeExec {
     }
 
     /// Get the dataset.
-    ///
-    /// WARNING: Internal API with no stability guarantees.
     pub fn dataset(&self) -> &Arc<Dataset> {
         &self.dataset
     }
@@ -461,6 +467,14 @@ impl ExecutionPlan for TakeExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // This is an I/O bound operation and wouldn't really benefit from partitioning
+        //
+        // Plus, if we did that, we would be creating multiple schedulers which could use
+        // a lot of RAM.
+        vec![false]
     }
 
     /// This preserves the output schema.
@@ -526,9 +540,12 @@ impl ExecutionPlan for TakeExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Result<datafusion::physical_plan::Statistics> {
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<datafusion::physical_plan::Statistics> {
         Ok(Statistics {
-            num_rows: self.input.statistics()?.num_rows,
+            num_rows: self.input.partition_statistics(partition)?.num_rows,
             ..Statistics::new_unknown(self.schema().as_ref())
         })
     }
@@ -783,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_struct() {
         // When taking fields into an existing struct, the field order should be maintained
-        // according the the schema of the struct.
+        // according to the schema of the struct.
         let TestFixture {
             dataset,
             _tmp_dir_guard,

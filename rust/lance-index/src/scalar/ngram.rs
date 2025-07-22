@@ -7,6 +7,16 @@ use std::iter::once;
 use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
 
+use super::btree::TrainingSource;
+use super::lance_format::LanceIndexStore;
+use super::{
+    AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector, ScalarIndex, SearchResult,
+    TextQuery,
+};
+use crate::frag_reuse::FragReuseIndex;
+use crate::metrics::NoOpMetricsCollector;
+use crate::vector::VectorIndex;
+use crate::{Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
 use arrow::datatypes::{UInt32Type, UInt64Type};
 use arrow_array::{BinaryArray, RecordBatch, UInt32Array};
@@ -15,7 +25,8 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
-use lance_core::cache::FileMetadataCache;
+use lance_arrow::iter_str_array;
+use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -24,7 +35,6 @@ use lance_core::Result;
 use lance_core::{utils::mask::RowIdTreeMap, Error};
 use lance_io::object_store::ObjectStore;
 use log::info;
-use moka::future::Cache;
 use object_store::path::Path;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::Serialize;
@@ -33,35 +43,34 @@ use tantivy::tokenizer::TextAnalyzer;
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
-use crate::metrics::NoOpMetricsCollector;
-use crate::scalar::inverted::CACHE_SIZE;
-use crate::vector::VectorIndex;
-use crate::{Index, IndexType};
-
-use super::btree::TrainingSource;
-use super::lance_format::LanceIndexStore;
-use super::{
-    AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector, ScalarIndex, SearchResult,
-    TextQuery,
-};
-
 const TOKENS_COL: &str = "tokens";
 const POSTING_LIST_COL: &str = "posting_list";
 const POSTINGS_FILENAME: &str = "ngram_postings.lance";
 
-lazy_static::lazy_static! {
-    pub static ref TOKENS_FIELD: Field = Field::new(TOKENS_COL, DataType::UInt32, true);
-    pub static ref POSTINGS_FIELD: Field = Field::new(POSTING_LIST_COL, DataType::Binary, false);
-    pub static ref POSTINGS_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![TOKENS_FIELD.clone(), POSTINGS_FIELD.clone()]));
-    pub static ref TEXT_PREPPER: TextAnalyzer = TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
+use std::sync::LazyLock;
+
+pub static TOKENS_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::new(TOKENS_COL, DataType::UInt32, true));
+pub static POSTINGS_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::new(POSTING_LIST_COL, DataType::Binary, false));
+pub static POSTINGS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        TOKENS_FIELD.clone(),
+        POSTINGS_FIELD.clone(),
+    ]))
+});
+pub static TEXT_PREPPER: LazyLock<TextAnalyzer> = LazyLock::new(|| {
+    TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
         .filter(tantivy::tokenizer::LowerCaser)
         .filter(tantivy::tokenizer::AsciiFoldingFilter)
-        .build();
-    /// Currently we ALWAYS use trigrams with ascii folding and lower casing.  We may want to make this configurable in the future.
-    pub static ref NGRAM_TOKENIZER: TextAnalyzer = TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::all_ngrams(3, 3).unwrap())
+        .build()
+});
+/// Currently we ALWAYS use trigrams with ascii folding and lower casing.  We may want to make this configurable in the future.
+pub static NGRAM_TOKENIZER: LazyLock<TextAnalyzer> = LazyLock::new(|| {
+    TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::all_ngrams(3, 3).unwrap())
         .filter(tantivy::tokenizer::AlphaNumOnlyFilter)
-        .build();
-}
+        .build()
+});
 
 // Helper function to apply a function to each token in a text
 fn tokenize_visitor(tokenizer: &TextAnalyzer, text: &str, mut visitor: impl FnMut(&String)) {
@@ -134,7 +143,7 @@ struct NGramStatistics {
 
 /// The row ids that contain a given ngram
 #[derive(Debug)]
-struct NGramPostingList {
+pub struct NGramPostingList {
     bitmap: RoaringTreemap,
 }
 
@@ -144,14 +153,31 @@ impl DeepSizeOf for NGramPostingList {
     }
 }
 
+// Cache key implementation for type-safe cache access
+#[derive(Debug, Clone)]
+pub struct NGramPostingListKey {
+    pub row_offset: u32,
+}
+
+impl CacheKey for NGramPostingListKey {
+    type ValueType = NGramPostingList;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("posting-list-{}", self.row_offset).into()
+    }
+}
+
 impl NGramPostingList {
-    fn try_from_batch(batch: RecordBatch) -> Result<Self> {
+    fn try_from_batch(batch: RecordBatch, fri: Option<Arc<FragReuseIndex>>) -> Result<Self> {
         let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
-        let bitmap =
+        let mut bitmap =
             RoaringTreemap::deserialize_from(bitmap_bytes).map_err(|e| Error::Internal {
                 message: format!("Error deserializing ngram list: {}", e),
                 location: location!(),
             })?;
+        if let Some(fri_ref) = fri.as_ref() {
+            bitmap = fri_ref.remap_row_ids_roaring_tree_map(&bitmap);
+        }
         Ok(Self { bitmap })
     }
 
@@ -171,21 +197,19 @@ impl NGramPostingList {
 /// Reads on-demand ngram posting lists from storage (and stores them in a cache)
 struct NGramPostingListReader {
     reader: Arc<dyn IndexReader>,
-    /// The cache key is the row_offset
-    cache: Cache<u32, Arc<NGramPostingList>>,
+    fri: Option<Arc<FragReuseIndex>>,
+    index_cache: LanceCache,
 }
 
 impl DeepSizeOf for NGramPostingListReader {
     fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        self.cache.weighted_size() as usize
+        0
     }
 }
 
 impl std::fmt::Debug for NGramPostingListReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NGramListReader")
-            .field("cache_entry_count", &self.cache.entry_count())
-            .finish()
+        f.debug_struct("NGramListReader").finish()
     }
 }
 
@@ -196,10 +220,9 @@ impl NGramPostingListReader {
         row_offset: u32,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<NGramPostingList>> {
-        self.cache
-            .try_get_with(row_offset, async move {
-                metrics.record_part_load();
-                tracing::info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="ngram", part_id=row_offset);
+        self.index_cache.get_or_insert_with_key(NGramPostingListKey { row_offset }, || async move {
+            metrics.record_part_load();
+                tracing::info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="ngram", part_id=row_offset);
                 let batch = self
                     .reader
                     .read_range(
@@ -207,10 +230,8 @@ impl NGramPostingListReader {
                         Some(&[POSTING_LIST_COL]),
                     )
                     .await?;
-                Result::Ok(Arc::new(NGramPostingList::try_from_batch(batch)?))
-            })
-            .await
-            .map_err(|e| Error::io(e.to_string(), location!()))
+                NGramPostingList::try_from_batch(batch, self.fri.clone())
+        }).await.map_err(|e| Error::io(e.to_string(), location!()))
     }
 }
 
@@ -254,12 +275,16 @@ impl std::fmt::Debug for NGramIndex {
 
 impl DeepSizeOf for NGramIndex {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.tokens.deep_size_of_children(context) + self.list_reader.deep_size_of_children(context)
+        self.tokens.deep_size_of_children(context)
     }
 }
 
 impl NGramIndex {
-    async fn from_store(store: Arc<dyn IndexStore>) -> Result<Self> {
+    async fn from_store(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+        index_cache: LanceCache,
+    ) -> Result<Self> {
         let tokens = store.open_index_file(POSTINGS_FILENAME).await?;
         let tokens = tokens
             .read_range(0..tokens.num_rows(), Some(&[TOKENS_COL]))
@@ -278,10 +303,8 @@ impl NGramIndex {
 
         let posting_reader = Arc::new(NGramPostingListReader {
             reader: store.open_index_file(POSTINGS_FILENAME).await?,
-            cache: Cache::builder()
-                .max_capacity(*CACHE_SIZE as u64)
-                .weigher(|_, posting: &Arc<NGramPostingList>| posting.deep_size_of() as u32)
-                .build(),
+            fri,
+            index_cache,
         });
 
         Ok(Self {
@@ -443,11 +466,15 @@ impl ScalarIndex for NGramIndex {
         false
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+        index_cache: LanceCache,
+    ) -> Result<Arc<Self>>
     where
         Self: Sized,
     {
-        Ok(Arc::new(Self::from_store(store).await?))
+        Ok(Arc::new(Self::from_store(store, fri, index_cache).await?))
     }
 
     async fn remap(
@@ -494,21 +521,32 @@ pub struct NGramIndexBuilderOptions {
     tokens_per_spill: usize,
 }
 
-lazy_static::lazy_static! {
-    // A higher value will use more RAM.  A lower value will have to do more spilling
-    static ref DEFAULT_TOKENS_PER_SPILL: usize = std::env::var("LANCE_NGRAM_TOKENS_PER_SPILL")
+// A higher value will use more RAM.  A lower value will have to do more spilling
+static DEFAULT_TOKENS_PER_SPILL: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_NGRAM_TOKENS_PER_SPILL")
         .unwrap_or_else(|_| "1000000000".to_string())
         .parse()
-        .expect("failed to parse LANCE_NGRAM_TOKENS_PER_SPILL");
-    // How many partitions to use for shuffling out the work.  We slightly
-    // over-allocate this since the amount of work per-partition is not uniform.
-    //
-    // Increasing this may increase the performance but it could increase RAM (since we will spill less often)
-    // and could hurt performance (since there will be more files at the end for the final spill)
-    static ref DEFAULT_NUM_PARTITIONS: usize = std::env::var("LANCE_NGRAM_NUM_PARTITIONS").map(|s| s.parse().expect("failed to parse LANCE_NGRAM_PARALLELISM")).unwrap_or((get_num_compute_intensive_cpus() * 4).max(128));
-    // Just enough so that tokenizing is faster than I/O
-    static ref DEFAULT_TOKENIZE_PARALLELISM: usize = std::env::var("LANCE_NGRAM_TOKENIZE_PARALLELISM").map(|s| s.parse().expect("failed to parse LANCE_NGRAM_TOKENIZE_PARALLELISM")).unwrap_or(8);
-}
+        .expect("failed to parse LANCE_NGRAM_TOKENS_PER_SPILL")
+});
+// How many partitions to use for shuffling out the work.  We slightly
+// over-allocate this since the amount of work per-partition is not uniform.
+//
+// Increasing this may increase the performance but it could increase RAM (since we will spill less often)
+// and could hurt performance (since there will be more files at the end for the final spill)
+static DEFAULT_NUM_PARTITIONS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_NGRAM_NUM_PARTITIONS")
+        .map(|s| s.parse().expect("failed to parse LANCE_NGRAM_PARALLELISM"))
+        .unwrap_or((get_num_compute_intensive_cpus() * 4).max(128))
+});
+// Just enough so that tokenizing is faster than I/O
+static DEFAULT_TOKENIZE_PARALLELISM: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_NGRAM_TOKENIZE_PARALLELISM")
+        .map(|s| {
+            s.parse()
+                .expect("failed to parse LANCE_NGRAM_TOKENIZE_PARALLELISM")
+        })
+        .unwrap_or(8)
+});
 
 impl Default for NGramIndexBuilderOptions {
     fn default() -> Self {
@@ -645,7 +683,7 @@ impl NGramIndexBuilder {
         let spill_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(tmpdir.path())?,
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
 
         Ok(Self {
@@ -667,9 +705,11 @@ impl NGramIndexBuilder {
                 location: location!(),
             });
         }
-        if *schema.field(0).data_type() != DataType::Utf8 {
+        if *schema.field(0).data_type() != DataType::Utf8
+            && *schema.field(0).data_type() != DataType::LargeUtf8
+        {
             return Err(Error::InvalidInput {
-                source: "First field in ngram index schema must be of type Utf8".into(),
+                source: "First field in ngram index schema must be of type Utf8/LargeUtf8".into(),
                 location: location!(),
             });
         }
@@ -771,12 +811,12 @@ impl NGramIndexBuilder {
         batch: RecordBatch,
         num_workers: usize,
     ) -> Vec<Vec<(u32, u64)>> {
-        let text_col = batch.column(0).as_string::<i32>();
+        let text_iter = iter_str_array(batch.column(0));
         let row_id_col = batch.column(1).as_primitive::<UInt64Type>();
         // Guessing 1000 tokens per row to at least avoid some of the earlier allocations
         let mut partitions = vec![Vec::with_capacity(batch.num_rows() * 1000); num_workers];
         let divisor = (MAX_TOKEN - MIN_TOKEN) / num_workers;
-        for (text, row_id) in text_col.iter().zip(row_id_col.values()) {
+        for (text, row_id) in text_iter.zip(row_id_col.values()) {
             if let Some(text) = text {
                 tokenize_visitor(tokenizer, text, |token| {
                     let token = ngram_to_token(token, NGRAM_N);
@@ -1181,7 +1221,7 @@ mod tests {
     use datafusion_common::DataFusionError;
     use futures::{stream, TryStreamExt};
     use itertools::Itertools;
-    use lance_core::{cache::FileMetadataCache, utils::mask::RowIdTreeMap};
+    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
@@ -1251,7 +1291,7 @@ mod tests {
         let test_store = LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         );
 
         builder
@@ -1260,7 +1300,9 @@ mod tests {
             .unwrap();
 
         (
-            NGramIndex::from_store(Arc::new(test_store)).await.unwrap(),
+            NGramIndex::from_store(Arc::new(test_store), None, LanceCache::no_cache())
+                .await
+                .unwrap(),
             tmpdir,
         )
     }
@@ -1455,12 +1497,14 @@ mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
 
         index.update(data, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let index = NGramIndex::from_store(test_store, None, LanceCache::no_cache())
+            .await
+            .unwrap();
         assert_eq!(index.tokens.len(), 3);
     }
 
@@ -1490,13 +1534,15 @@ mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
 
         let remapping = HashMap::from([(2, Some(100)), (3, None), (4, Some(101))]);
         index.remap(&remapping, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let index = NGramIndex::from_store(test_store, None, LanceCache::no_cache())
+            .await
+            .unwrap();
         let row_ids = row_ids_in_index(&index).await;
         assert_eq!(row_ids, vec![0, 1, 100, 101]);
 
@@ -1530,12 +1576,14 @@ mod tests {
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ));
 
         index.update(data, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let index = NGramIndex::from_store(test_store, None, LanceCache::no_cache())
+            .await
+            .unwrap();
         let row_ids = row_ids_in_index(&index).await;
         assert_eq!(row_ids, vec![0, 1, 2, 3, 4, 100, 101, 102]);
 

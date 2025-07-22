@@ -111,13 +111,9 @@ where
 impl Transformer for KeepFiniteVectors {
     #[instrument(name = "KeepFiniteVectors::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let arr = batch.column_by_name(&self.column).ok_or(Error::Index {
-            message: format!(
-                "KeepFiniteVectors: column {} not found in RecordBatch",
-                self.column
-            ),
-            location: location!(),
-        })?;
+        let Some(arr) = batch.column_by_name(&self.column) else {
+            return Ok(batch.clone());
+        };
 
         let data = match arr.data_type() {
             DataType::FixedSizeList(_, _) => arr.as_fixed_size_list(),
@@ -193,15 +189,13 @@ impl Flatten {
 
 impl Transformer for Flatten {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let arr = batch.column_by_name(&self.column).ok_or(Error::Index {
-            message: format!("Flatten: column {} not found in RecordBatch", self.column),
-            location: location!(),
-        })?;
+        let Some(arr) = batch.column_by_name(&self.column) else {
+            // this case is that we have precomputed buffers,
+            // so we don't need to flatten the original vectors.
+            return Ok(batch.clone());
+        };
         match arr.data_type() {
-            DataType::FixedSizeList(_, _) => {
-                // do nothing
-                Ok(batch.clone())
-            }
+            DataType::FixedSizeList(_, _) => Ok(batch.clone()),
             DataType::List(_) => {
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
                 let vectors = arr.as_list::<i32>();

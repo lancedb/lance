@@ -27,9 +27,20 @@ use super::{
     schema::{compare_fields, explain_fields_difference},
     Dictionary, LogicalType, Projection,
 };
-use crate::{Error, Result};
+use crate::{
+    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_META_KEY},
+    Error, Result,
+};
 
 pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
+
+/// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
+/// The value can be any true values like `true`, `1`, `yes` (case-insensitive).
+/// A primary key column must satisfy:
+/// (1) The field, and all its ancestors must not be nullable.
+/// (2) The field must be a leaf without child (i.e. it is a primitive data type).
+/// (3) The field must not be within a list type.
+pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-key";
 
 #[derive(Debug, Default)]
 pub enum NullabilityComparison {
@@ -133,6 +144,7 @@ pub struct Field {
     /// Dictionary value array if this field is dictionary.
     pub dictionary: Option<Dictionary>,
     pub storage_class: StorageClass,
+    pub unenforced_primary_key: bool,
 }
 
 impl Field {
@@ -262,10 +274,9 @@ impl Field {
         if children.is_empty() && !projection.contains_field_id(self.id) {
             None
         } else {
-            Some(Self {
-                children,
-                ..self.clone()
-            })
+            let mut new_field = self.clone();
+            new_field.children = children;
+            Some(projection.blob_handling.unload_if_needed(new_field))
         }
     }
 
@@ -473,6 +484,37 @@ impl Field {
         }
     }
 
+    pub fn sub_field_mut(&mut self, path_components: &[&str]) -> Option<&mut Self> {
+        if path_components.is_empty() {
+            Some(self)
+        } else {
+            let first = path_components[0];
+            self.children
+                .iter_mut()
+                .find(|c| c.name == first)
+                .and_then(|c| c.sub_field_mut(&path_components[1..]))
+        }
+    }
+
+    /// Check if the user has labeled the field as a blob
+    ///
+    /// Blob fields will load descriptions by default
+    pub fn is_blob(&self) -> bool {
+        self.metadata.contains_key(BLOB_META_KEY)
+    }
+
+    /// If the field is a blob, return a new field with the same name and id
+    /// but with the data type set to a struct of the blob description fields.
+    ///
+    /// If the field is not a blob, return the field itself.
+    pub fn into_unloaded(mut self) -> Self {
+        if self.data_type().is_binary_like() && self.is_blob() {
+            self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
+            self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+        }
+        self
+    }
+
     pub fn project(&self, path_components: &[&str]) -> Result<Self> {
         let mut f = Self {
             name: self.name.clone(),
@@ -485,6 +527,7 @@ impl Field {
             children: vec![],
             dictionary: self.dictionary.clone(),
             storage_class: self.storage_class,
+            unenforced_primary_key: self.unenforced_primary_key,
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
@@ -702,6 +745,7 @@ impl Field {
                 children,
                 dictionary: self.dictionary.clone(),
                 storage_class: self.storage_class,
+                unenforced_primary_key: self.unenforced_primary_key,
             };
             return Ok(f);
         }
@@ -765,6 +809,7 @@ impl Field {
                 children,
                 dictionary: self.dictionary.clone(),
                 storage_class: self.storage_class,
+                unenforced_primary_key: self.unenforced_primary_key,
             })
         }
     }
@@ -885,6 +930,13 @@ impl Field {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false)
     }
+
+    /// Return true if the field is a leaf field.
+    ///
+    /// A leaf field is a field that is not a struct or a list.
+    pub fn is_leaf(&self) -> bool {
+        self.children.is_empty()
+    }
 }
 
 impl fmt::Display for Field {
@@ -930,6 +982,12 @@ impl TryFrom<&ArrowField> for Field {
             .map(|s| StorageClass::from_str(s))
             .unwrap_or(Ok(StorageClass::Default))?;
 
+        let unenforced_primary_key = field
+            .metadata()
+            .get(LANCE_UNENFORCED_PRIMARY_KEY)
+            .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+
         Ok(Self {
             id: -1,
             parent_id: -1,
@@ -948,6 +1006,7 @@ impl TryFrom<&ArrowField> for Field {
             children,
             dictionary: None,
             storage_class,
+            unenforced_primary_key,
         })
     }
 }

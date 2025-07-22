@@ -19,6 +19,7 @@ import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.schema.ColumnAlteration;
+import com.lancedb.lance.schema.LanceSchema;
 import com.lancedb.lance.schema.SqlExpressions;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -29,6 +30,7 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.ByteArrayInputStream;
@@ -36,10 +38,12 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -200,8 +204,8 @@ public class Dataset implements Closeable {
             path,
             options.getVersion(),
             options.getBlockSize(),
-            options.getIndexCacheSize(),
-            options.getMetadataCacheSize(),
+            options.getIndexCacheSizeBytes(),
+            options.getMetadataCacheSizeBytes(),
             options.getStorageOptions());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
@@ -212,8 +216,8 @@ public class Dataset implements Closeable {
       String path,
       Optional<Integer> version,
       Optional<Integer> blockSize,
-      int indexCacheSize,
-      int metadataCacheSize,
+      long indexCacheSize,
+      long metadataCacheSizeBytes,
       Map<String, String> storageOptions);
 
   /**
@@ -303,6 +307,34 @@ public class Dataset implements Closeable {
 
   private native void nativeAddColumnsByReader(
       long arrowStreamMemoryAddress, Optional<Long> batchSize);
+
+  /**
+   * Add columns to the dataset.
+   *
+   * @param schema The Arrow schema definitions to add columns.
+   */
+  public void addColumns(Schema schema) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(schema != null, "Schema is empty");
+      try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportSchema(allocator, schema, null, arrowSchema);
+        nativeAddColumnsBySchema(arrowSchema.memoryAddress());
+      }
+    }
+  }
+
+  /**
+   * Add columns to the dataset.
+   *
+   * @param fields The Arrow field definitions to add columns.
+   */
+  public void addColumns(List<Field> fields) {
+    Preconditions.checkArgument(fields != null && !fields.isEmpty(), "Fields are empty");
+    addColumns(new Schema(fields));
+  }
+
+  private native void nativeAddColumnsBySchema(long schemaPtr);
 
   /**
    * Drop columns from the dataset.
@@ -420,28 +452,108 @@ public class Dataset implements Closeable {
   private native String nativeUri();
 
   /**
+   * Get the currently checked out version id of the dataset
+   *
+   * @return the version id of the dataset
+   */
+  public long version() {
+    return getVersion().getId();
+  }
+
+  /**
    * Gets the currently checked out version of the dataset.
    *
    * @return the version of the dataset
    */
-  public long version() {
+  public Version getVersion() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeVersion();
+      return nativeGetVersion();
     }
   }
 
-  private native long nativeVersion();
+  private native Version nativeGetVersion();
+
+  /**
+   * Get the version history of the dataset.
+   *
+   * @return the version history of the dataset
+   */
+  public List<Version> listVersions() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeListVersions();
+    }
+  }
+
+  private native List<Version> nativeListVersions();
 
   /** @return the latest version of the dataset. */
   public long latestVersion() {
-    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeLatestVersion();
+      return nativeGetLatestVersionId();
     }
   }
 
-  private native long nativeLatestVersion();
+  private native long nativeGetLatestVersionId();
+
+  /** Checkout the dataset to the latest version. */
+  public void checkoutLatest() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeCheckoutLatest();
+    }
+  }
+
+  private native void nativeCheckoutLatest();
+
+  /**
+   * Checks out a specific version of the dataset. If the version is already checked out, it returns
+   * a new Java Dataset object pointing to the same underlying Rust Dataset object
+   *
+   * @param version the version to check out
+   * @return a new Dataset instance with the specified version checked out
+   */
+  public Dataset checkoutVersion(long version) {
+    Preconditions.checkArgument(version > 0, "version number must be greater than 0");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCheckoutVersion(version);
+    }
+  }
+
+  private native Dataset nativeCheckoutVersion(long version);
+
+  /**
+   * Checks out a specific tag of the dataset. If the underlying version is already checked out, it
+   * returns a new Java Dataset object pointing to the same underlying Rust Dataset object
+   *
+   * @param tag the tag to check out
+   * @return a new Dataset instance with the specified tag checked out
+   */
+  public Dataset checkoutTag(String tag) {
+    Preconditions.checkArgument(tag != null, "Tag can not be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCheckoutTag(tag);
+    }
+  }
+
+  private native Dataset nativeCheckoutTag(String tag);
+
+  /**
+   * Restore the currently checked out version of the dataset as the latest version. This operation
+   * produces a new version and doesn't influence any old versions and tags.
+   */
+  public void restore() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeRestore();
+    }
+  }
+
+  private native void nativeRestore();
 
   /**
    * Creates a new index on the dataset. Only vector indexes are supported.
@@ -540,7 +652,7 @@ public class Dataset implements Closeable {
   private native List<FragmentMetadata> getFragmentsNative();
 
   /**
-   * Gets the schema of the dataset.
+   * Gets the arrow schema of the dataset.
    *
    * @return the arrow schema
    */
@@ -556,6 +668,20 @@ public class Dataset implements Closeable {
 
   private native void importFfiSchema(long arrowSchemaMemoryAddress);
 
+  /**
+   * Get the {@link com.lancedb.lance.schema.LanceSchema} of the dataset with field ids.
+   *
+   * @return the LanceSchema
+   */
+  public LanceSchema getLanceSchema() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetLanceSchema();
+    }
+  }
+
+  private native LanceSchema nativeGetLanceSchema();
+
   /** @return all the created indexes names */
   public List<String> listIndexes() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -565,6 +691,49 @@ public class Dataset implements Closeable {
   }
 
   private native List<String> nativeListIndexes();
+
+  /**
+   * Get the table config of the dataset.
+   *
+   * @return the table config
+   */
+  public Map<String, String> getConfig() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetConfig();
+    }
+  }
+
+  private native Map<String, String> nativeGetConfig();
+
+  /**
+   * Update the config of the dataset. This operation will only overwrite and NOT delete the
+   * existing config.
+   *
+   * @param tableConfig the config to update
+   */
+  public void updateConfig(Map<String, String> tableConfig) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeUpdateConfig(tableConfig);
+    }
+  }
+
+  private native void nativeUpdateConfig(Map<String, String> config);
+
+  /**
+   * Delete the config keys of the dataset.
+   *
+   * @param deleteKeys the config keys to delete
+   */
+  public void deleteConfigKeys(Set<String> deleteKeys) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeDeleteConfigKeys(new ArrayList<>(deleteKeys));
+    }
+  }
+
+  private native void nativeDeleteConfigKeys(List<String> deleteKeys);
 
   /**
    * Closes this dataset and releases any system resources associated with it. If the dataset is
@@ -607,4 +776,123 @@ public class Dataset implements Closeable {
   }
 
   private native FragmentMetadata getFragmentNative(int fragmentId);
+
+  /**
+   * Returns a {@link Tags} instance for performing tag-related operations on the dataset.
+   *
+   * @return new {@code Tags} instance for dataset tag operations
+   * @see Tags
+   */
+  public Tags tags() {
+    return new Tags();
+  }
+
+  /**
+   * Replace the schema metadata of the dataset.
+   *
+   * @param metadata the new table metadata
+   */
+  public void replaceSchemaMetadata(Map<String, String> metadata) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeReplaceSchemaMetadata(metadata);
+    }
+  }
+
+  private native void nativeReplaceSchemaMetadata(Map<String, String> metadata);
+
+  /**
+   * Replace target field metadata of the dataset. This method won't affect fields not in the map
+   *
+   * @param fieldMetadataMap field id to metadata map
+   */
+  public void replaceFieldMetadata(Map<Integer, Map<String, String>> fieldMetadataMap) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      for (Integer fieldId : fieldMetadataMap.keySet()) {
+        Preconditions.checkArgument(fieldId >= 0, "Field id must be greater than 0");
+      }
+      nativeReplaceFieldMetadata(fieldMetadataMap);
+    }
+  }
+
+  private native void nativeReplaceFieldMetadata(
+      Map<Integer, Map<String, String>> fieldMetadataMap);
+
+  /** Tag operations of the dataset. */
+  public class Tags {
+
+    /**
+     * Create a new tag for this dataset.
+     *
+     * @param tag the tag name
+     * @param version the version to tag
+     */
+    public void create(String tag, long version) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeCreateTag(tag, version);
+      }
+    }
+
+    /**
+     * Delete a tag from this dataset.
+     *
+     * @param tag the tag name
+     */
+    public void delete(String tag) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeDeleteTag(tag);
+      }
+    }
+
+    /**
+     * Update a tag to a new version for the dataset.
+     *
+     * @param tag the tag name
+     * @param version the version to tag
+     */
+    public void update(String tag, long version) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeUpdateTag(tag, version);
+      }
+    }
+
+    /**
+     * List all tags of the dataset.
+     *
+     * @return a list of tags
+     */
+    public List<Tag> list() {
+      try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        return nativeListTags();
+      }
+    }
+
+    /**
+     * Get the version of a tag in the dataset.
+     *
+     * @param tag the tag name
+     * @return the version of the tag
+     */
+    public long getVersion(String tag) {
+      try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        return nativeGetVersionByTag(tag);
+      }
+    }
+  }
+
+  private native void nativeCreateTag(String tag, long version);
+
+  private native void nativeDeleteTag(String tag);
+
+  private native void nativeUpdateTag(String tag, long version);
+
+  private native List<Tag> nativeListTags();
+
+  private native long nativeGetVersionByTag(String tag);
 }

@@ -47,7 +47,7 @@ The key features of Lance include:
 * **Ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Ray, Spark and more on the way.
 
 > [!TIP]
-> Lance is in active development and we welcome contributions. Please see our [contributing guide](docs/contributing.rst) for more information.
+> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lancedb.github.io/lance/community/contributing/) for more information.
 
 ## Quick Start
 
@@ -164,12 +164,12 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 
 ## Directory structure
 
-| Directory          | Description                               |
-|--------------------|-------------------------------------------|
-| [rust](./rust)     | Core Rust implementation                  |
-| [python](./python) | Python bindings (PyO3)                    |
-| [java](./java)     | Java bindings (JNI) and Spark integration |
-| [docs](./docs)     | Documentation source                      |
+| Directory          | Description              |
+|--------------------|--------------------------|
+| [rust](./rust)     | Core Rust implementation |
+| [python](./python) | Python bindings (PyO3)   |
+| [java](./java)     | Java bindings (JNI)      |
+| [docs](./docs)     | Documentation source     |
 
 ## What makes Lance different
 
@@ -182,7 +182,7 @@ Support both CPUs (``x86_64`` and ``arm``) and GPU (``Nvidia (cuda)`` and ``Appl
 
 **Nested fields**: Lance stores each subfield as a separate column to support efficient filters like “find images where detected objects include cats”.
 
-**Versioning**: A Manifest can be used to record snapshots. Currently we support creating new versions automatically via appends, overwrites, and index creation .
+**Versioning**: A Manifest can be used to record snapshots. Currently we support creating new versions automatically via appends, overwrites, and index creation.
 
 **Fast updates** (ROADMAP): Updates will be supported via write-ahead logs.
 
@@ -197,11 +197,11 @@ We used the SIFT dataset to benchmark our results with 1M vectors of 128D
 
 1. For 100 randomly sampled query vectors, we get <1ms average response time (on a 2023 m2 MacBook Air)
 
-![avg_latency.png](docs/avg_latency.png)
+![avg_latency.png](docs/src/images/avg_latency.png)
 
 2. ANNs are always a trade-off between recall and performance
 
-![avg_latency.png](docs/recall_vs_latency.png)
+![avg_latency.png](docs/src/images/recall_vs_latency.png)
 
 ### Vs. parquet
 
@@ -228,7 +228,7 @@ graph LR
 
 People use different data representations to varying stages for the performance or limited by the tooling available.
 Academia mainly uses XML / JSON for annotations and zipped images/sensors data for deep learning, which
-is difficult to integrated into data infrastructure and slow to train over cloud storage.
+is difficult to integrate into data infrastructure and slow to train over cloud storage.
 While industry uses data lakes (Parquet-based techniques, i.e., Delta Lake, Iceberg) or data warehouses (AWS Redshift
 or Google BigQuery) to collect and analyze data, they have to convert the data into training-friendly formats, such
 as [Rikai](https://github.com/eto-ai/rikai)/[Petastorm](https://github.com/uber/petastorm)

@@ -292,10 +292,11 @@ def test_blob_api(tmp_path: Path):
     )
     tbl = pa.Table.from_arrays([ints, vals], schema=schema)
 
-    ds = lance.write_dataset(tbl, tmp_path / "data.lance")
+    uri = tmp_path / "data.lance"
+    dataset = lance.write_dataset(tbl, uri)
+
     torch_ds = LanceDataset(
-        ds,
-        batch_size=4,
+        uri, batch_size=4, dataset_options={"version": dataset.version}
     )
     with pytest.raises(NotImplementedError):
         next(iter(torch_ds))
@@ -314,7 +315,7 @@ def test_blob_api(tmp_path: Path):
         return {"int": ints, "val": vals}
 
     torch_ds = LanceDataset(
-        ds,
+        dataset,
         batch_size=4,
         to_tensor_fn=to_tensor_fn,
     )

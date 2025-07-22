@@ -16,6 +16,7 @@ use lance_core::{
     Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_io::ReadBatchParams;
+use tracing::{instrument, Instrument};
 
 use crate::rowids::RowIdSequence;
 
@@ -112,7 +113,11 @@ pub fn merge_streams(streams: Vec<ReadBatchTaskStream>) -> ReadBatchTaskStream {
 }
 
 /// Apply a mask to the batch, where rows are "deleted" by the _rowid column null.
-/// This is used as a performance optimization to avoid copying data.
+///
+/// This is used partly as a performance optimization (cheaper to null than to filter)
+/// but also because there are cases where we want to load the physical rows.  For example,
+/// we may be replacing a column based on some UDF and we want to provide a value for the
+/// deleted rows to ensure the fragments are aligned.
 fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<RecordBatch> {
     // Transform mask into null buffer. Null means deleted, though note that
     // null buffers are actually validity buffers, so True means not null
@@ -120,8 +125,6 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
     let mask_buffer = NullBuffer::new(mask.values().clone());
 
     match mask_buffer.null_count() {
-        // All rows are deleted
-        n if n == mask_buffer.len() => return Ok(RecordBatch::new_empty(batch.schema())),
         // No rows are deleted
         0 => return Ok(batch),
         _ => {}
@@ -159,6 +162,7 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
 }
 
 /// Configuration needed to apply row ids and deletions to a batch
+#[derive(Debug)]
 pub struct RowIdAndDeletesConfig {
     /// The row ids that were requested
     pub params: ReadBatchParams,
@@ -178,6 +182,7 @@ pub struct RowIdAndDeletesConfig {
     pub total_num_rows: u32,
 }
 
+#[instrument(level = "debug", skip_all)]
 pub fn apply_row_id_and_deletes(
     batch: RecordBatch,
     batch_offset: u32,
@@ -203,29 +208,41 @@ pub fn apply_row_id_and_deletes(
 
     let num_rows = batch.num_rows() as u32;
 
-    let row_addrs = if should_fetch_row_addr {
-        let ids_in_batch = config
-            .params
-            .slice(batch_offset as usize, num_rows as usize)
-            .unwrap()
-            .to_offsets()
-            .unwrap();
-        let row_addrs: UInt64Array = ids_in_batch
-            .values()
-            .iter()
-            .map(|row_id| u64::from(RowAddress::new_from_parts(fragment_id, *row_id)))
-            .collect();
+    let row_addrs =
+        if should_fetch_row_addr {
+            let _rowaddrs = tracing::span!(tracing::Level::DEBUG, "fetch_row_addrs").entered();
+            let mut row_addrs = Vec::with_capacity(num_rows as usize);
+            for offset_range in config
+                .params
+                .slice(batch_offset as usize, num_rows as usize)
+                .unwrap()
+                .iter_offset_ranges()?
+            {
+                row_addrs.extend(offset_range.map(|row_offset| {
+                    u64::from(RowAddress::new_from_parts(fragment_id, row_offset))
+                }));
+            }
 
-        Some(Arc::new(row_addrs))
-    } else {
-        None
-    };
+            Some(Arc::new(UInt64Array::from(row_addrs)))
+        } else {
+            None
+        };
 
     let row_ids = if config.with_row_id {
+        let _rowids = tracing::span!(tracing::Level::DEBUG, "fetch_row_ids").entered();
         if let Some(row_id_sequence) = &config.row_id_sequence {
-            let row_ids = row_id_sequence
+            let selection = config
+                .params
                 .slice(batch_offset as usize, num_rows as usize)
-                .iter()
+                .unwrap()
+                .to_ranges()
+                .unwrap();
+            let row_ids = row_id_sequence
+                .select(
+                    selection
+                        .iter()
+                        .flat_map(|r| r.start as usize..r.end as usize),
+                )
                 .collect::<UInt64Array>();
             Some(Arc::new(row_ids))
         } else {
@@ -237,12 +254,6 @@ pub fn apply_row_id_and_deletes(
         None
     };
 
-    // TODO: This is a minor cop out. Pushing deletion vector in to the decoders is hard
-    // so I'm going to just leave deletion filter at this layer for now.
-    // We should push this down futurther when we get to statistics-based predicate pushdown
-
-    // This function is meant to be IO bound, but we are doing CPU-bound work here
-    // We should try to move this to later.
     let span = tracing::span!(tracing::Level::DEBUG, "apply_deletions");
     let _enter = span.enter();
     let deletion_mask = deletion_vector.and_then(|v| {
@@ -290,10 +301,14 @@ pub fn wrap_with_row_id_and_delete(
             let num_rows = batch_task.num_rows;
             offset += num_rows;
             let task = batch_task.task;
-            async move {
-                let batch = task.await?;
-                apply_row_id_and_deletes(batch, this_offset, fragment_id, config.as_ref())
-            }
+            tokio::spawn(
+                async move {
+                    let batch = task.await?;
+                    apply_row_id_and_deletes(batch, this_offset, fragment_id, config.as_ref())
+                }
+                .in_current_span(),
+            )
+            .map(|join_wrapper| join_wrapper.unwrap())
             .boxed()
         })
         .boxed()
@@ -525,11 +540,15 @@ mod tests {
                             assert_eq!(total_actually_deleted, expected_deletions);
                             if expected_deletions > 0 && with_row_id {
                                 if make_deletions_null {
+                                    // If we make deletions null we get 3 batches of all-null and then
+                                    // a batch of half-null
                                     assert_eq!(
-                                        batches[0][ROW_ID].as_primitive::<UInt64Type>().value(0),
+                                        batches[3][ROW_ID].as_primitive::<UInt64Type>().value(0),
                                         u64::from(RowAddress::new_from_parts(frag_id, 30))
                                     );
+                                    assert_eq!(batches[3][ROW_ID].null_count(), 5);
                                 } else {
+                                    // If we materialize deletions the first row will be 35
                                     assert_eq!(
                                         batches[0][ROW_ID].as_primitive::<UInt64Type>().value(0),
                                         u64::from(RowAddress::new_from_parts(frag_id, 35))

@@ -3,4 +3,5 @@
 
 //! Miscellaneous utility functions that don't have a home elsewhere.
 
+pub mod accumulation;
 pub mod bytepack;

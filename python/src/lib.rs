@@ -23,14 +23,20 @@
 #![allow(clippy::useless_conversion)]
 
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+use std::ffi::CString;
 
 use ::arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
+use ::lance::datafusion::LanceTableProvider;
+
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::ArrowError;
+use datafusion::error::Result;
+use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
 use dataset::blob::LanceBlobFile;
@@ -49,11 +55,9 @@ use lance_index::DatasetIndexExt;
 use log::Level;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
 use session::Session;
-
-#[macro_use]
-extern crate lazy_static;
 
 pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
@@ -75,6 +79,7 @@ pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::fragment::{write_fragments, write_fragments_transaction};
+use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
@@ -103,9 +108,7 @@ fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 // TODO: make this runtime configurable (e.g. num threads)
-lazy_static! {
-    static ref RT: BackgroundExecutor = BackgroundExecutor::new();
-}
+static RT: LazyLock<BackgroundExecutor> = LazyLock::new(BackgroundExecutor::new);
 
 pub fn init_logging(mut log_builder: Builder) {
     let logger = log_builder.build();
@@ -127,6 +130,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let log_builder = env_logger::Builder::from_env(env);
     init_logging(log_builder);
 
+    m.add_class::<FFILanceTableProvider>()?;
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_class::<FileFragment>()?;
@@ -152,6 +156,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
+    m.add_class::<PyTraceEvent>()?;
     m.add_class::<TraceGuard>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
@@ -164,6 +169,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(infer_tfrecord_schema))?;
     m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
+    m.add_wrapped(wrap_pyfunction!(capture_trace_events))?;
+    m.add_wrapped(wrap_pyfunction!(shutdown_tracing))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
@@ -359,4 +366,47 @@ fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(::lance::io::commit::manifest_needs_migration(
         &manifest, &indices,
     ))
+}
+
+#[pyclass(name = "FFILanceTableProvider", module = "lance", subclass)]
+#[derive(Clone)]
+struct FFILanceTableProvider {
+    dataset: Arc<::lance::Dataset>,
+    with_row_id: bool,
+    with_row_addr: bool,
+}
+
+#[pymethods]
+impl FFILanceTableProvider {
+    #[new]
+    #[pyo3(signature = (dataset, *, with_row_id = false, with_row_addr = false))]
+    fn new(dataset: &Bound<'_, PyAny>, with_row_id: bool, with_row_addr: bool) -> PyResult<Self> {
+        let py = dataset.py();
+        let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
+        let dataset_ref = &dataset.bind(py).borrow().ds;
+        // TODO: https://github.com/lancedb/lance/issues/3966 remove this workaround
+        let _ = RT.block_on(Some(py), dataset_ref.load_indices())?;
+        Ok(Self {
+            dataset: dataset_ref.clone(),
+            with_row_id,
+            with_row_addr,
+        })
+    }
+
+    fn __datafusion_table_provider__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let name = CString::new("datafusion_table_provider").unwrap();
+        let a_lance_table_provider = Arc::new(LanceTableProvider::new(
+            self.dataset.clone(),
+            self.with_row_id,
+            self.with_row_addr,
+        ));
+
+        let ffi_provider =
+            FFI_TableProvider::new(a_lance_table_provider, true, RT.get_runtime_handle());
+        let capsule = PyCapsule::new(py, ffi_provider, Some(name.clone()));
+        capsule
+    }
 }

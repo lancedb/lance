@@ -81,11 +81,11 @@ class BFloat16Array(pa.ExtensionArray):
 
 
 class BFloat16Scalar(pa.ExtensionScalar):
-    def as_py(self) -> Optional[BFloat16]:
+    def as_py(self, **kwargs) -> Optional[BFloat16]:
         if self.value is None:
             return None
         else:
-            return BFloat16.from_bytes(self.value.as_py())
+            return BFloat16.from_bytes(self.value.as_py(**kwargs))
 
     def __eq__(self, other: Any):
         from ml_dtypes import bfloat16

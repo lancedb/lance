@@ -12,18 +12,19 @@ use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecord
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
+use lance_core::cache::LanceCache;
 use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
-
-use crate::{Index, IndexType};
 
 use super::{bitmap::train_bitmap_index, SargableQuery};
 use super::{
     bitmap::BitmapIndex, btree::TrainingSource, AnyQuery, IndexStore, LabelListQuery, ScalarIndex,
 };
 use super::{MetricsCollector, SearchResult};
+use crate::frag_reuse::FragReuseIndex;
+use crate::{Index, IndexType};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
@@ -134,7 +135,7 @@ impl LabelListIndex {
             return Ok(intersect_bitmap);
         }
         while let Some(next) = sets.try_next().await? {
-            intersect_bitmap &= next;
+            intersect_bitmap &= &next;
         }
         Ok(intersect_bitmap)
     }
@@ -168,8 +169,12 @@ impl ScalarIndex for LabelListIndex {
         true
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
-        BitmapIndex::load(store)
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+        index_cache: LanceCache,
+    ) -> Result<Arc<Self>> {
+        BitmapIndex::load(store, fri, index_cache)
             .await
             .map(|index| Arc::new(Self::new(index)))
     }

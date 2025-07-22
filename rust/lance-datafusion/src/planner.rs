@@ -26,15 +26,15 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
-    WindowUDF,
+    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
 use datafusion::sql::sqlparser::ast::{
     AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
-    Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Subscript,
-    TimezoneInfo, UnaryOperator, Value,
+    Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+    ObjectNamePart, Subscript, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
 };
 use datafusion::{
     common::Column,
@@ -47,6 +47,7 @@ use datafusion::{
 use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::cast::cast_with_options;
 use lance_core::datatypes::Schema;
+use lance_core::error::LanceOptionExt;
 use snafu::location;
 
 use lance_core::{Error, Result};
@@ -117,8 +118,8 @@ impl ScalarUDFImpl for CastListF16Udf {
         }
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
-        let ColumnarValue::Array(arr) = &args[0] else {
+    fn invoke_with_args(&self, func_args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let ColumnarValue::Array(arr) = &func_args.args[0] else {
             return Err(datafusion::error::DataFusionError::Execution(
                 "cast_list_f16 only supports array arguments".to_string(),
             ));
@@ -237,6 +238,7 @@ impl ContextProvider for LanceContextProvider {
 pub struct Planner {
     schema: SchemaRef,
     context_provider: LanceContextProvider,
+    enable_relations: bool,
 }
 
 impl Planner {
@@ -244,21 +246,47 @@ impl Planner {
         Self {
             schema,
             context_provider: LanceContextProvider::default(),
+            enable_relations: false,
         }
     }
 
-    fn column(idents: &[Ident]) -> Expr {
-        let mut column = col(&idents[0].value);
-        for ident in &idents[1..] {
-            column = Expr::ScalarFunction(ScalarFunction {
-                args: vec![
-                    column,
-                    Expr::Literal(ScalarValue::Utf8(Some(ident.value.clone()))),
-                ],
-                func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
-            });
+    /// If passed with `true`, then the first identifier in column reference
+    /// is parsed as the relation. For example, `table.field.inner` will be
+    /// read as the nested field `field.inner` (`inner` on struct field `field`)
+    /// on the `table` relation. If `false` (the default), then no relations
+    /// are used and all identifiers are assumed to be a nested column path.
+    pub fn with_enable_relations(mut self, enable_relations: bool) -> Self {
+        self.enable_relations = enable_relations;
+        self
+    }
+
+    fn column(&self, idents: &[Ident]) -> Expr {
+        fn handle_remaining_idents(expr: &mut Expr, idents: &[Ident]) {
+            for ident in idents {
+                *expr = Expr::ScalarFunction(ScalarFunction {
+                    args: vec![
+                        std::mem::take(expr),
+                        Expr::Literal(ScalarValue::Utf8(Some(ident.value.clone())), None),
+                    ],
+                    func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
+                });
+            }
         }
-        column
+
+        if self.enable_relations && idents.len() > 1 {
+            // Create qualified column reference (relation.column)
+            let relation = &idents[0].value;
+            let column_name = &idents[1].value;
+            let column = Expr::Column(Column::new(Some(relation.clone()), column_name.clone()));
+            let mut result = column;
+            handle_remaining_idents(&mut result, &idents[2..]);
+            result
+        } else {
+            // Default behavior - treat as struct field access
+            let mut column = col(&idents[0].value);
+            handle_remaining_idents(&mut column, &idents[1..]);
+            column
+        }
     }
 
     fn binary_op(&self, op: &BinaryOperator) -> Result<Operator> {
@@ -303,7 +331,7 @@ impl Planner {
             UnaryOperator::Minus => {
                 use datafusion::logical_expr::lit;
                 match expr {
-                    SQLExpr::Value(Value::Number(n, _)) => match n.parse::<i64>() {
+                    SQLExpr::Value(ValueWithSpan { value: Value::Number(n, _), ..}) => match n.parse::<i64>() {
                         Ok(n) => lit(-n),
                         Err(_) => lit(-n
                             .parse::<f64>()
@@ -352,13 +380,13 @@ impl Planner {
     fn value(&self, value: &Value) -> Result<Expr> {
         Ok(match value {
             Value::Number(v, _) => self.number(v.as_str(), false)?,
-            Value::SingleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone()))),
+            Value::SingleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone())), None),
             Value::HexStringLiteral(hsl) => {
-                Expr::Literal(ScalarValue::Binary(Self::try_decode_hex_literal(hsl)))
+                Expr::Literal(ScalarValue::Binary(Self::try_decode_hex_literal(hsl)), None)
             }
-            Value::DoubleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone()))),
-            Value::Boolean(v) => Expr::Literal(ScalarValue::Boolean(Some(*v))),
-            Value::Null => Expr::Literal(ScalarValue::Null),
+            Value::DoubleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone())), None),
+            Value::Boolean(v) => Expr::Literal(ScalarValue::Boolean(Some(*v)), None),
+            Value::Null => Expr::Literal(ScalarValue::Null, None),
             _ => todo!(),
         })
     }
@@ -401,8 +429,10 @@ impl Planner {
 
     fn parse_function(&self, function: SQLExpr) -> Result<Expr> {
         if let SQLExpr::Function(function) = &function {
-            if !function.name.0.is_empty() && function.name.0[0].value == "is_valid" {
-                return self.legacy_parse_function(function);
+            if let Some(ObjectNamePart::Identifier(name)) = &function.name.0.first() {
+                if &name.value == "is_valid" {
+                    return self.legacy_parse_function(function);
+                }
             }
         }
         let sql_to_rel = SqlToRel::new_with_options(
@@ -413,12 +443,15 @@ impl Planner {
                 support_varchar_with_length: false,
                 enable_options_value_normalization: false,
                 collect_spans: false,
+                map_varchar_to_utf8view: false,
             },
         );
 
         let mut planner_context = PlannerContext::default();
         let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
-        Ok(sql_to_rel.sql_to_expr(function, &schema, &mut planner_context)?)
+        sql_to_rel
+            .sql_to_expr(function, &schema, &mut planner_context)
+            .map_err(|e| Error::invalid_input(format!("Error parsing function: {e}"), location!()))
     }
 
     fn parse_type(&self, data_type: &SQLDataType) -> Result<ArrowDataType> {
@@ -447,12 +480,12 @@ impl Planner {
             SQLDataType::SmallInt(_) => Ok(ArrowDataType::Int16),
             SQLDataType::Int(_) | SQLDataType::Integer(_) => Ok(ArrowDataType::Int32),
             SQLDataType::BigInt(_) => Ok(ArrowDataType::Int64),
-            SQLDataType::UnsignedTinyInt(_) => Ok(ArrowDataType::UInt8),
-            SQLDataType::UnsignedSmallInt(_) => Ok(ArrowDataType::UInt16),
-            SQLDataType::UnsignedInt(_) | SQLDataType::UnsignedInteger(_) => {
+            SQLDataType::TinyIntUnsigned(_) => Ok(ArrowDataType::UInt8),
+            SQLDataType::SmallIntUnsigned(_) => Ok(ArrowDataType::UInt16),
+            SQLDataType::IntUnsigned(_) | SQLDataType::IntegerUnsigned(_) => {
                 Ok(ArrowDataType::UInt32)
             }
-            SQLDataType::UnsignedBigInt(_) => Ok(ArrowDataType::UInt64),
+            SQLDataType::BigIntUnsigned(_) => Ok(ArrowDataType::UInt64),
             SQLDataType::Date => Ok(ArrowDataType::Date32),
             SQLDataType::Timestamp(resolution, tz) => {
                 match tz {
@@ -540,19 +573,22 @@ impl Planner {
                 // Users can pass string literals wrapped in `"`.
                 // (Normally SQL only allows single quotes.)
                 if id.quote_style == Some('"') {
-                    Ok(Expr::Literal(ScalarValue::Utf8(Some(id.value.clone()))))
+                    Ok(Expr::Literal(
+                        ScalarValue::Utf8(Some(id.value.clone())),
+                        None,
+                    ))
                 // Users can wrap identifiers with ` to reference non-standard
                 // names, such as uppercase or spaces.
                 } else if id.quote_style == Some('`') {
                     Ok(Expr::Column(Column::from_name(id.value.clone())))
                 } else {
-                    Ok(Self::column(vec![id.clone()].as_slice()))
+                    Ok(self.column(vec![id.clone()].as_slice()))
                 }
             }
-            SQLExpr::CompoundIdentifier(ids) => Ok(Self::column(ids.as_slice())),
+            SQLExpr::CompoundIdentifier(ids) => Ok(self.column(ids.as_slice())),
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
-            SQLExpr::Value(value) => self.value(value),
+            SQLExpr::Value(value) => self.value(&value.value),
             SQLExpr::Array(SQLArray { elem, .. }) => {
                 let mut values = vec![];
 
@@ -569,7 +605,7 @@ impl Planner {
                 for (pos, expr) in elem.iter().enumerate() {
                     match expr {
                         SQLExpr::Value(value) => {
-                            if let Expr::Literal(value) = self.value(value)? {
+                            if let Expr::Literal(value, _) = self.value(&value.value)? {
                                 values.push(value);
                             } else {
                                 return array_literal_error(pos, expr);
@@ -579,8 +615,12 @@ impl Planner {
                             op: UnaryOperator::Minus,
                             expr,
                         } => {
-                            if let SQLExpr::Value(Value::Number(number, _)) = expr.as_ref() {
-                                if let Expr::Literal(value) = self.number(number, true)? {
+                            if let SQLExpr::Value(ValueWithSpan {
+                                value: Value::Number(number, _),
+                                ..
+                            }) = expr.as_ref()
+                            {
+                                if let Expr::Literal(value, _) = self.number(number, true)? {
                                     values.push(value);
                                 } else {
                                     return array_literal_error(pos, expr);
@@ -624,12 +664,13 @@ impl Planner {
                     None,
                 )?;
 
-                Ok(Expr::Literal(ScalarValue::List(Arc::new(values))))
+                Ok(Expr::Literal(ScalarValue::List(Arc::new(values)), None))
             }
             // For example, DATE '2020-01-01'
             SQLExpr::TypedString { data_type, value } => {
+                let value = value.clone().into_string().expect_ok()?;
                 Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value.clone())))),
+                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
                     data_type: self.parse_type(data_type)?,
                 }))
             }
@@ -698,9 +739,11 @@ impl Planner {
                         AccessExpr::Dot(SQLExpr::Identifier(Ident { value: s, .. }))
                         | AccessExpr::Subscript(Subscript::Index {
                             index:
-                                SQLExpr::Value(
-                                    Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
-                                ),
+                                SQLExpr::Value(ValueWithSpan {
+                                    value:
+                                        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+                                    ..
+                                }),
                         }) => GetFieldAccess::NamedStructField {
                             name: ScalarValue::from(s.as_str()),
                         },
@@ -765,8 +808,14 @@ impl Planner {
         let ast_expr = parse_sql_filter(filter)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
-        let resolved = resolve_expr(&expr, &schema)?;
-        coerce_filter_type_to_boolean(resolved)
+        let resolved = resolve_expr(&expr, &schema).map_err(|e| {
+            Error::invalid_input(
+                format!("Error resolving filter expression {filter}: {e}"),
+                location!(),
+            )
+        })?;
+
+        Ok(coerce_filter_type_to_boolean(resolved))
     }
 
     /// Create Logical [Expr] from a SQL expression.
@@ -837,7 +886,6 @@ impl Planner {
     /// Create the [`PhysicalExpr`] from a logical [`Expr`]
     pub fn create_physical_expr(&self, expr: &Expr) -> Result<Arc<dyn PhysicalExpr>> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
-
         Ok(datafusion::physical_expr::create_physical_expr(
             expr,
             df_schema.as_ref(),
@@ -848,6 +896,9 @@ impl Planner {
     /// Collect the columns in the expression.
     ///
     /// The columns are returned in sorted order.
+    ///
+    /// If the expr refers to nested columns these will be returned
+    /// as dotted paths (x.y.z)
     pub fn column_names_in_expr(expr: &Expr) -> Vec<String> {
         let mut visitor = ColumnCapturingVisitor {
             current_path: VecDeque::new(),
@@ -1036,7 +1087,7 @@ mod tests {
             func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
             args: vec![
                 Expr::Column(Column::new_unqualified("st")),
-                Expr::Literal(ScalarValue::Utf8(Some("s1".to_string()))),
+                Expr::Literal(ScalarValue::Utf8(Some("s1".to_string())), None),
             ],
         });
         assert_column_eq(&planner, "st.s1", &expected);
@@ -1050,10 +1101,10 @@ mod tests {
                     func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
                     args: vec![
                         Expr::Column(Column::new_unqualified("st")),
-                        Expr::Literal(ScalarValue::Utf8(Some("st".to_string()))),
+                        Expr::Literal(ScalarValue::Utf8(Some("st".to_string())), None),
                     ],
                 }),
-                Expr::Literal(ScalarValue::Utf8(Some("s2".to_string()))),
+                Expr::Literal(ScalarValue::Utf8(Some("s2".to_string())), None),
             ],
         });
 
@@ -1127,11 +1178,14 @@ mod tests {
 
         let planner = Planner::new(schema);
 
-        let expected = Expr::Literal(ScalarValue::List(Arc::new(
-            ListArray::from_iter_primitive::<Float64Type, _, _>(vec![Some(
-                [-1_f64, -2.0, -3.0, -4.0, -5.0].map(Some),
-            )]),
-        )));
+        let expected = Expr::Literal(
+            ScalarValue::List(Arc::new(
+                ListArray::from_iter_primitive::<Float64Type, _, _>(vec![Some(
+                    [-1_f64, -2.0, -3.0, -4.0, -5.0].map(Some),
+                )]),
+            )),
+            None,
+        );
 
         let expr = planner
             .parse_expr("[-1.0, -2.0, -3.0, -4.0, -5.0]")
@@ -1354,10 +1408,10 @@ mod tests {
                 Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
                     Expr::Cast(Cast { expr, data_type }) => {
                         match expr.as_ref() {
-                            Expr::Literal(ScalarValue::Utf8(Some(value_str))) => {
+                            Expr::Literal(ScalarValue::Utf8(Some(value_str)), _) => {
                                 assert_eq!(value_str, expected_value_str);
                             }
-                            Expr::Literal(ScalarValue::Int64(Some(value))) => {
+                            Expr::Literal(ScalarValue::Int64(Some(value)), _) => {
                                 assert_eq!(*value, 1);
                             }
                             _ => panic!("Expected cast to be applied to literal"),
@@ -1405,7 +1459,7 @@ mod tests {
                 Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
                     Expr::Cast(Cast { expr, data_type }) => {
                         match expr.as_ref() {
-                            Expr::Literal(ScalarValue::Utf8(Some(value_str))) => {
+                            Expr::Literal(ScalarValue::Utf8(Some(value_str)), _) => {
                                 assert_eq!(value_str, expected_value_str);
                             }
                             _ => panic!("Expected cast to be applied to literal"),
@@ -1447,7 +1501,7 @@ mod tests {
 
             match expr {
                 Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
-                    Expr::Literal(value) => {
+                    Expr::Literal(value, _) => {
                         assert_eq!(&value.data_type(), &expected_data_type);
                     }
                     _ => panic!("Expected right to be a literal"),
@@ -1627,7 +1681,7 @@ mod tests {
         let expr = planner.parse_expr(bin_str).unwrap();
         assert_eq!(
             expr,
-            Expr::Literal(ScalarValue::Binary(Some(vec![b'a', b'b', b'c'])))
+            Expr::Literal(ScalarValue::Binary(Some(vec![b'a', b'b', b'c'])), None)
         );
     }
 

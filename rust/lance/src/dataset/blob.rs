@@ -8,8 +8,14 @@ use arrow::datatypes::UInt64Type;
 use arrow_schema::DataType;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
+use object_store::path::Path;
+use snafu::location;
+use tokio::sync::Mutex;
+
+use super::Dataset;
+use crate::io::exec::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};
 use lance_core::{
-    datatypes::{Schema, StorageClass, BLOB_META_KEY},
+    datatypes::{Schema, StorageClass},
     error::CloneableResult,
     utils::{
         address::RowAddress,
@@ -18,13 +24,6 @@ use lance_core::{
     Error, Result,
 };
 use lance_io::traits::Reader;
-use object_store::path::Path;
-use snafu::location;
-use tokio::sync::Mutex;
-
-use crate::io::exec::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};
-
-use super::Dataset;
 
 /// Current state of the reader.  Held in a mutex for easy sharing
 ///
@@ -190,9 +189,7 @@ pub(super) async fn take_blobs(
     let projection = dataset.schema().project(&[column])?;
     let blob_field = &projection.fields[0];
     let blob_field_id = blob_field.id;
-    if blob_field.data_type() != DataType::LargeBinary
-        || !projection.fields[0].metadata.contains_key(BLOB_META_KEY)
-    {
+    if blob_field.data_type() != DataType::LargeBinary || !projection.fields[0].is_blob() {
         return Err(Error::InvalidInput {
             location: location!(),
             source: format!("the column '{}' is not a blob column", column).into(),
@@ -292,10 +289,14 @@ mod tests {
 
     use arrow::{array::AsArray, datatypes::UInt64Type};
     use arrow_array::RecordBatch;
+    use futures::TryStreamExt;
+    use lance_arrow::DataTypeExt;
+    use lance_io::stream::RecordBatchStream;
+    use tempfile::{tempdir, TempDir};
+
     use lance_core::{Error, Result};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_file::version::LanceFileVersion;
-    use tempfile::{tempdir, TempDir};
 
     use crate::{utils::test::TestDatasetGenerator, Dataset};
 
@@ -366,6 +367,43 @@ mod tests {
     }
 
     #[tokio::test]
+    pub async fn test_take_blobs_by_indices() {
+        let fixture = BlobTestFixture::new().await;
+
+        let fragments = fixture.dataset.fragments();
+        assert!(fragments.len() >= 2);
+        let mut indices = Vec::with_capacity(fragments.len());
+        let mut last = 2;
+
+        for frag in fragments.iter() {
+            indices.push(last as u64);
+            last += frag.num_rows().unwrap_or(0);
+        }
+        indices.pop();
+
+        // Row indices
+        assert_eq!(indices, [2, 12, 22, 32, 42, 52, 62, 72, 82]);
+        let blobs = fixture
+            .dataset
+            .take_blobs_by_indices(&indices, "blobs")
+            .await
+            .unwrap();
+
+        // Row IDs
+        let row_ids = fragments
+            .iter()
+            .map(|frag| (frag.id << 32) + 2)
+            .collect::<Vec<_>>();
+        let blobs2 = fixture.dataset.take_blobs(&row_ids, "blobs").await.unwrap();
+
+        for (blob1, blob2) in blobs.iter().zip(blobs2.iter()) {
+            assert_eq!(blob1.position, blob2.position);
+            assert_eq!(blob1.size, blob2.size);
+            assert_eq!(blob1.data_file, blob2.data_file);
+        }
+    }
+
+    #[tokio::test]
     pub async fn test_take_blob_id_not_exist() {
         let fixture = BlobTestFixture::new().await;
 
@@ -382,5 +420,56 @@ mod tests {
 
         assert!(matches!(err, Err(Error::InvalidInput { .. })));
         assert!(err.unwrap_err().to_string().contains("not a blob column"));
+    }
+
+    #[tokio::test]
+    pub async fn test_scan_blobs() {
+        let fixture = BlobTestFixture::new().await;
+
+        // By default, scanning a blob column will load descriptions
+        let batches = fixture
+            .dataset
+            .scan()
+            .project(&["blobs"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+
+        let schema = batches.schema();
+
+        assert!(schema.fields[0].data_type().is_struct());
+
+        let batches = batches.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches.len(), 10);
+        for batch in batches.iter() {
+            assert_eq!(batch.num_columns(), 1);
+            assert!(batch.column(0).data_type().is_struct());
+        }
+
+        // Should also be able to scan with filter
+        let batches = fixture
+            .dataset
+            .scan()
+            .project(&["blobs"])
+            .unwrap()
+            .filter("filterme = 50")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+
+        let schema = batches.schema();
+
+        assert!(schema.fields[0].data_type().is_struct());
+
+        let batches = batches.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        for batch in batches.iter() {
+            assert_eq!(batch.num_columns(), 1);
+            assert!(batch.column(0).data_type().is_struct());
+        }
     }
 }

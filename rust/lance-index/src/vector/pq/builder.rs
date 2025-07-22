@@ -16,8 +16,6 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::{Dot, Normalize, L2};
-use rand::SeedableRng;
-use rayon::prelude::*;
 use snafu::location;
 
 use super::utils::divide_to_subvectors;
@@ -109,10 +107,9 @@ impl PQBuildParams {
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
         let d = sub_vectors
-            .into_par_iter()
+            .into_iter()
             .enumerate()
             .map(|(sub_vec_idx, sub_vec)| {
-                let rng = rand::rngs::SmallRng::from_entropy();
                 train_kmeans::<T>(
                     self.codebook.as_ref().map(|cb| {
                         let sub_vec_centroids = FixedSizeListArray::try_new_from_values(
@@ -130,7 +127,6 @@ impl PQBuildParams {
                     num_centroids,
                     self.max_iters as u32,
                     self.kmeans_redos,
-                    rng,
                     distance_type,
                     self.sample_rate,
                 )

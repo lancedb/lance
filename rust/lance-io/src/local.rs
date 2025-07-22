@@ -49,6 +49,28 @@ pub fn remove_dir_all(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Copy a file from one location to another, supporting cross-filesystem copies.
+///
+/// Unlike hard links, this function works across filesystem boundaries.
+pub fn copy_file(from: &Path, to: &Path) -> Result<()> {
+    let from_path = to_local_path(from);
+    let to_path = to_local_path(to);
+
+    // Ensure the parent directory exists
+    if let Some(parent) = std::path::Path::new(&to_path).parent() {
+        std::fs::create_dir_all(parent).map_err(Error::from)?;
+    }
+
+    std::fs::copy(&from_path, &to_path).map_err(|err| match err.kind() {
+        ErrorKind::NotFound => Error::NotFound {
+            uri: from.to_string(),
+            location: location!(),
+        },
+        _ => Error::from(err),
+    })?;
+    Ok(())
+}
+
 /// [ObjectReader] for local file system.
 #[derive(Debug)]
 pub struct LocalObjectReader {

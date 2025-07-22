@@ -20,7 +20,7 @@ use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
-use inverted::TokenizerConfig;
+use lance_core::cache::LanceCache;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use snafu::location;
@@ -37,9 +37,12 @@ pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
 
+use crate::frag_reuse::FragReuseIndex;
+pub use inverted::tokenizer::InvertedIndexParams;
+
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, DeepSizeOf)]
 pub enum ScalarIndexType {
     BTree,
     Bitmap,
@@ -62,6 +65,18 @@ impl TryFrom<IndexType> for ScalarIndexType {
                 source: format!("Index type {:?} is not a scalar index", value).into(),
                 location: location!(),
             }),
+        }
+    }
+}
+
+impl From<ScalarIndexType> for IndexType {
+    fn from(val: ScalarIndexType) -> Self {
+        match val {
+            ScalarIndexType::BTree => Self::BTree,
+            ScalarIndexType::Bitmap => Self::Bitmap,
+            ScalarIndexType::LabelList => Self::LabelList,
+            ScalarIndexType::NGram => Self::NGram,
+            ScalarIndexType::Inverted => Self::Inverted,
         }
     }
 }
@@ -97,47 +112,6 @@ impl IndexParams for ScalarIndexParams {
 
     fn index_name(&self) -> &str {
         LANCE_SCALAR_INDEX
-    }
-}
-
-#[derive(Clone)]
-pub struct InvertedIndexParams {
-    /// If true, store the position of the term in the document
-    /// This can significantly increase the size of the index
-    /// If false, only store the frequency of the term in the document
-    /// Default is true
-    pub with_position: bool,
-
-    pub tokenizer_config: TokenizerConfig,
-}
-
-impl Debug for InvertedIndexParams {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InvertedIndexParams")
-            .field("with_position", &self.with_position)
-            .finish()
-    }
-}
-
-impl DeepSizeOf for InvertedIndexParams {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        0
-    }
-}
-
-impl Default for InvertedIndexParams {
-    fn default() -> Self {
-        Self {
-            with_position: true,
-            tokenizer_config: TokenizerConfig::default(),
-        }
-    }
-}
-
-impl InvertedIndexParams {
-    pub fn with_position(mut self, with_position: bool) -> Self {
-        self.with_position = with_position;
-        self
     }
 }
 
@@ -327,9 +301,12 @@ impl FullTextSearchQuery {
     }
 
     pub fn params(&self) -> FtsSearchParams {
-        FtsSearchParams {
-            limit: self.limit.map(|limit| limit as usize),
-            wand_factor: self.wand_factor.unwrap_or(1.0),
+        let params = FtsSearchParams::new()
+            .with_limit(self.limit.map(|limit| limit as usize))
+            .with_wand_factor(self.wand_factor.unwrap_or(1.0));
+        match self.query {
+            FtsQuery::Phrase(ref query) => params.with_phrase_slop(Some(query.slop)),
+            _ => params,
         }
     }
 }
@@ -411,44 +388,50 @@ impl AnyQuery for SargableQuery {
         match self {
             Self::Range(lower, upper) => match (lower, upper) {
                 (Bound::Unbounded, Bound::Unbounded) => {
-                    Expr::Literal(ScalarValue::Boolean(Some(true)))
+                    Expr::Literal(ScalarValue::Boolean(Some(true)), None)
                 }
                 (Bound::Unbounded, Bound::Included(rhs)) => {
-                    col_expr.lt_eq(Expr::Literal(rhs.clone()))
+                    col_expr.lt_eq(Expr::Literal(rhs.clone(), None))
                 }
-                (Bound::Unbounded, Bound::Excluded(rhs)) => col_expr.lt(Expr::Literal(rhs.clone())),
+                (Bound::Unbounded, Bound::Excluded(rhs)) => {
+                    col_expr.lt(Expr::Literal(rhs.clone(), None))
+                }
                 (Bound::Included(lhs), Bound::Unbounded) => {
-                    col_expr.gt_eq(Expr::Literal(lhs.clone()))
+                    col_expr.gt_eq(Expr::Literal(lhs.clone(), None))
                 }
-                (Bound::Included(lhs), Bound::Included(rhs)) => {
-                    col_expr.between(Expr::Literal(lhs.clone()), Expr::Literal(rhs.clone()))
-                }
+                (Bound::Included(lhs), Bound::Included(rhs)) => col_expr.between(
+                    Expr::Literal(lhs.clone(), None),
+                    Expr::Literal(rhs.clone(), None),
+                ),
                 (Bound::Included(lhs), Bound::Excluded(rhs)) => col_expr
                     .clone()
-                    .gt_eq(Expr::Literal(lhs.clone()))
-                    .and(col_expr.lt(Expr::Literal(rhs.clone()))),
-                (Bound::Excluded(lhs), Bound::Unbounded) => col_expr.gt(Expr::Literal(lhs.clone())),
+                    .gt_eq(Expr::Literal(lhs.clone(), None))
+                    .and(col_expr.lt(Expr::Literal(rhs.clone(), None))),
+                (Bound::Excluded(lhs), Bound::Unbounded) => {
+                    col_expr.gt(Expr::Literal(lhs.clone(), None))
+                }
                 (Bound::Excluded(lhs), Bound::Included(rhs)) => col_expr
                     .clone()
-                    .gt(Expr::Literal(lhs.clone()))
-                    .and(col_expr.lt_eq(Expr::Literal(rhs.clone()))),
+                    .gt(Expr::Literal(lhs.clone(), None))
+                    .and(col_expr.lt_eq(Expr::Literal(rhs.clone(), None))),
                 (Bound::Excluded(lhs), Bound::Excluded(rhs)) => col_expr
                     .clone()
-                    .gt(Expr::Literal(lhs.clone()))
-                    .and(col_expr.lt(Expr::Literal(rhs.clone()))),
+                    .gt(Expr::Literal(lhs.clone(), None))
+                    .and(col_expr.lt(Expr::Literal(rhs.clone(), None))),
             },
             Self::IsIn(values) => col_expr.in_list(
                 values
                     .iter()
-                    .map(|val| Expr::Literal(val.clone()))
+                    .map(|val| Expr::Literal(val.clone(), None))
                     .collect::<Vec<_>>(),
                 false,
             ),
-            Self::FullTextSearch(query) => col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(
-                query.query.to_string(),
-            )))),
+            Self::FullTextSearch(query) => col_expr.like(Expr::Literal(
+                ScalarValue::Utf8(Some(query.query.to_string())),
+                None,
+            )),
             Self::IsNull() => col_expr.is_null(),
-            Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone())),
+            Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone(), None)),
         }
     }
 
@@ -496,7 +479,7 @@ impl AnyQuery for LabelListQuery {
                     func: Arc::new(array_has::ArrayHasAll::new().into()),
                     args: vec![
                         Expr::Column(Column::new_unqualified(col)),
-                        Expr::Literal(ScalarValue::List(labels_arr)),
+                        Expr::Literal(ScalarValue::List(labels_arr), None),
                     ],
                 })
             }
@@ -516,7 +499,7 @@ impl AnyQuery for LabelListQuery {
                     func: Arc::new(array_has::ArrayHasAny::new().into()),
                     args: vec![
                         Expr::Column(Column::new_unqualified(col)),
-                        Expr::Literal(ScalarValue::List(labels_arr)),
+                        Expr::Literal(ScalarValue::List(labels_arr), None),
                     ],
                 })
             }
@@ -556,7 +539,7 @@ impl AnyQuery for TextQuery {
                 func: Arc::new(ContainsFunc::new().into()),
                 args: vec![
                     Expr::Column(Column::new_unqualified(col)),
-                    Expr::Literal(ScalarValue::Utf8(Some(substr.clone()))),
+                    Expr::Literal(ScalarValue::Utf8(Some(substr.clone())), None),
                 ],
             }),
         }
@@ -623,7 +606,11 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     fn can_answer_exact(&self, query: &dyn AnyQuery) -> bool;
 
     /// Load the scalar index from storage
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+        index_cache: LanceCache,
+    ) -> Result<Arc<Self>>
     where
         Self: Sized;
 

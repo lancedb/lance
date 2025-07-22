@@ -6,14 +6,12 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::ArrowError;
 use futures::TryStreamExt;
-use lance_core::{
-    cache::{CapacityMode, FileMetadataCache},
-    datatypes::Schema,
-};
+use lance_core::{cache::LanceCache, datatypes::Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
+    utils::CachedFileSize,
     ReadBatchParams,
 };
 use object_store::path::Path;
@@ -82,11 +80,8 @@ pub async fn write_lance_file(
     }
 }
 
-pub fn test_cache() -> Arc<FileMetadataCache> {
-    Arc::new(FileMetadataCache::with_capacity(
-        128 * 1024 * 1024,
-        CapacityMode::Bytes,
-    ))
+pub fn test_cache() -> Arc<LanceCache> {
+    Arc::new(LanceCache::with_capacity(128 * 1024 * 1024))
 }
 
 pub async fn read_lance_file(
@@ -94,7 +89,11 @@ pub async fn read_lance_file(
     decoder_middleware: Arc<DecoderPlugins>,
     filter: FilterExpression,
 ) -> Vec<RecordBatch> {
-    let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+    let file_scheduler = fs
+        .scheduler
+        .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+        .await
+        .unwrap();
     let file_reader = FileReader::try_open(
         file_scheduler,
         None,

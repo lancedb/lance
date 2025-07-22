@@ -46,6 +46,7 @@ impl From<&pb::Field> for Field {
             children: vec![],
             dictionary: field.dictionary.as_ref().map(Dictionary::from),
             storage_class: field.storage_class.parse().unwrap(),
+            unenforced_primary_key: field.unenforced_primary_key,
         }
     }
 }
@@ -79,6 +80,7 @@ impl From<&Field> for pb::Field {
                 .unwrap_or_default(),
             r#type: 0,
             storage_class: field.storage_class.to_string(),
+            unenforced_primary_key: field.unenforced_primary_key,
         }
     }
 }

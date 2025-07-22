@@ -24,7 +24,6 @@ datafusion-common = { workspace = true, optional = true }
 datafusion-sql = { workspace = true, optional = true }
 deepsize.workspace = true
 futures.workspace = true
-lazy_static.workspace = true
 mock_instant.workspace = true
 moka.workspace = true
 num_cpus = "1.0"

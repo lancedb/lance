@@ -248,7 +248,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     (size, e_tag)
                 } else {
                     let meta = object_store.inner.head(&path).await?;
-                    (meta.size as u64, meta.e_tag)
+                    (meta.size, meta.e_tag)
                 };
 
                 let final_location = self
@@ -301,7 +301,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                                 base_path.as_ref(),
                                 version,
                                 path.as_ref(),
-                                size as u64,
+                                size,
                                 e_tag.clone(),
                             )
                             .await;
@@ -316,7 +316,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         return Ok(ManifestLocation {
                             version,
                             path,
-                            size: Some(size as u64),
+                            size: Some(size),
                             naming_scheme,
                             e_tag,
                         });

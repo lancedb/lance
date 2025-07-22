@@ -35,6 +35,7 @@ use super::local::LocalObjectReader;
 mod list_retry;
 pub mod providers;
 mod tracing;
+use crate::object_reader::SmallReader;
 use crate::object_writer::WriteResult;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
@@ -51,6 +52,12 @@ const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
 #[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
 const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
 
+pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::env::var("LANCE_MAX_IOP_SIZE")
+        .map(|val| val.parse().unwrap())
+        .unwrap_or(16 * 1024 * 1024)
+});
+
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
@@ -63,27 +70,28 @@ pub trait ObjectStoreExt {
     /// Read all files (start from base directory) recursively
     ///
     /// unmodified_since can be specified to only return files that have not been modified since the given time.
-    async fn read_dir_all<'a>(
+    fn read_dir_all<'a, 'b>(
         &'a self,
-        dir_path: impl Into<&Path> + Send,
+        dir_path: impl Into<&'b Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<'a, Result<ObjectMeta>>>;
+    ) -> BoxStream<'a, Result<ObjectMeta>>;
 }
 
 #[async_trait]
 impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
-    async fn read_dir_all<'a>(
+    fn read_dir_all<'a, 'b>(
         &'a self,
-        dir_path: impl Into<&Path> + Send,
+        dir_path: impl Into<&'b Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<'a, Result<ObjectMeta>>> {
-        let mut output = self.list(Some(dir_path.into()));
+    ) -> BoxStream<'a, Result<ObjectMeta>> {
+        let output = self.list(Some(dir_path.into())).map_err(|e| e.into());
         if let Some(unmodified_since_val) = unmodified_since {
-            output = output
+            output
                 .try_filter(move |file| future::ready(file.last_modified < unmodified_since_val))
-                .boxed();
+                .boxed()
+        } else {
+            output.boxed()
         }
-        Ok(output.map_err(|e| e.into()).boxed())
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {
@@ -102,6 +110,7 @@ pub struct ObjectStore {
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
     block_size: usize,
+    max_iop_size: u64,
     /// Whether to use constant size upload parts for multipart uploads. This
     /// is only necessary for Cloudflare R2.
     pub use_constant_size_upload_parts: bool,
@@ -131,6 +140,29 @@ impl std::fmt::Display for ObjectStore {
 
 pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ChainedWrappingObjectStore {
+    wrappers: Vec<Arc<dyn WrappingObjectStore>>,
+}
+
+impl ChainedWrappingObjectStore {
+    pub fn new(wrappers: Vec<Arc<dyn WrappingObjectStore>>) -> Self {
+        Self { wrappers }
+    }
+
+    pub fn add_wrapper(&mut self, wrapper: Arc<dyn WrappingObjectStore>) {
+        self.wrappers.push(wrapper);
+    }
+}
+
+impl WrappingObjectStore for ChainedWrappingObjectStore {
+    fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+        self.wrappers
+            .iter()
+            .fold(original, |acc, wrapper| wrapper.wrap(acc))
+    }
 }
 
 /// Parameters to create an [ObjectStore]
@@ -294,6 +326,7 @@ impl ObjectStore {
                 inner,
                 scheme: path.scheme().to_string(),
                 block_size: params.block_size.unwrap_or(64 * 1024),
+                max_iop_size: *DEFAULT_MAX_IOP_SIZE,
                 use_constant_size_upload_parts: params.use_constant_size_upload_parts,
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
@@ -351,8 +384,16 @@ impl ObjectStore {
         self.scheme != "file" && self.scheme != "memory"
     }
 
+    pub fn scheme(&self) -> &str {
+        &self.scheme
+    }
+
     pub fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    pub fn max_iop_size(&self) -> u64 {
+        self.max_iop_size
     }
 
     pub fn io_parallelism(&self) -> usize {
@@ -384,6 +425,17 @@ impl ObjectStore {
     /// cached metadata. By passing in the known size, we can skip a HEAD / metadata
     /// call.
     pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Box<dyn Reader>> {
+        // If we know the file is really small, we can read the whole thing
+        // as a single request.
+        if known_size <= self.block_size {
+            return Ok(Box::new(SmallReader::new(
+                self.inner.clone(),
+                path.clone(),
+                self.download_retry_count,
+                known_size,
+            )));
+        }
+
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(path, self.block_size, Some(known_size)).await,
             _ => Ok(Box::new(CloudObjectReader::new(
@@ -430,6 +482,10 @@ impl ObjectStore {
     }
 
     pub async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+        if self.is_local() {
+            // Use std::fs::copy for local filesystem to support cross-filesystem copies
+            return super::local::copy_file(from, to);
+        }
         Ok(self.inner.copy(from, to).await?)
     }
 
@@ -456,12 +512,12 @@ impl ObjectStore {
     /// Read all files (start from base directory) recursively
     ///
     /// unmodified_since can be specified to only return files that have not been modified since the given time.
-    pub async fn read_dir_all(
-        &self,
-        dir_path: impl Into<&Path> + Send,
+    pub fn read_dir_all<'a, 'b>(
+        &'a self,
+        dir_path: impl Into<&'b Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<Result<ObjectMeta>>> {
-        self.inner.read_dir_all(dir_path, unmodified_since).await
+    ) -> BoxStream<'a, Result<ObjectMeta>> {
+        self.inner.read_dir_all(dir_path, unmodified_since)
     }
 
     /// Remove a directory recursively.
@@ -505,7 +561,7 @@ impl ObjectStore {
     }
 
     /// Get file size.
-    pub async fn size(&self, path: &Path) -> Result<usize> {
+    pub async fn size(&self, path: &Path) -> Result<u64> {
         Ok(self.inner.head(path).await?.size)
     }
 
@@ -640,6 +696,7 @@ impl ObjectStore {
             inner: store,
             scheme: scheme.into(),
             block_size,
+            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
             list_is_lexically_ordered,
             io_parallelism,
@@ -662,7 +719,6 @@ fn infer_block_size(scheme: &str) -> usize {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
-    use parquet::data_type::AsBytes;
     use rstest::rstest;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
@@ -927,7 +983,7 @@ mod tests {
 
         let reader = ObjectStore::open_local(file_path.as_path()).await.unwrap();
         let buf = reader.get_range(0..5).await.unwrap();
-        assert_eq!(buf.as_bytes(), b"LOCAL");
+        assert_eq!(buf.as_ref(), b"LOCAL");
     }
 
     #[tokio::test]
@@ -944,10 +1000,10 @@ mod tests {
         let file_path_os = object_store::path::Path::parse(file_path.to_str().unwrap()).unwrap();
         let obj_store = ObjectStore::local();
         let buf = obj_store.read_one_all(&file_path_os).await.unwrap();
-        assert_eq!(buf.as_bytes(), b"LOCAL");
+        assert_eq!(buf.as_ref(), b"LOCAL");
 
         let buf = obj_store.read_one_range(&file_path_os, 0..5).await.unwrap();
-        assert_eq!(buf.as_bytes(), b"LOCAL");
+        assert_eq!(buf.as_ref(), b"LOCAL");
     }
 
     #[tokio::test]
@@ -992,5 +1048,75 @@ mod tests {
                 .unwrap();
             assert_eq!(contents, "WINDOWS");
         }
+    }
+
+    #[tokio::test]
+    async fn test_cross_filesystem_copy() {
+        // Create two temporary directories that simulate different filesystems
+        let source_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+
+        // Create a test file in the source directory
+        let source_file_name = "test_file.txt";
+        let source_file = source_dir.path().join(source_file_name);
+        std::fs::write(&source_file, b"test content").unwrap();
+
+        // Create ObjectStore for local filesystem
+        let (store, base_path) = ObjectStore::from_uri(source_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Create paths relative to the ObjectStore base
+        let from_path = base_path.child(source_file_name);
+
+        // Use object_store::Path::parse for the destination
+        let dest_file = dest_dir.path().join("copied_file.txt");
+        let dest_str = dest_file.to_str().unwrap();
+        let to_path = object_store::path::Path::parse(dest_str).unwrap();
+
+        // Perform the copy operation
+        store.copy(&from_path, &to_path).await.unwrap();
+
+        // Verify the file was copied correctly
+        assert!(dest_file.exists());
+        let copied_content = std::fs::read(&dest_file).unwrap();
+        assert_eq!(copied_content, b"test content");
+    }
+
+    #[tokio::test]
+    async fn test_copy_creates_parent_directories() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+
+        // Create a test file in the source directory
+        let source_file_name = "test_file.txt";
+        let source_file = source_dir.path().join(source_file_name);
+        std::fs::write(&source_file, b"test content").unwrap();
+
+        // Create ObjectStore for local filesystem
+        let (store, base_path) = ObjectStore::from_uri(source_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Create paths
+        let from_path = base_path.child(source_file_name);
+
+        // Create destination with nested directories that don't exist yet
+        let dest_file = dest_dir
+            .path()
+            .join("nested")
+            .join("dirs")
+            .join("copied_file.txt");
+        let dest_str = dest_file.to_str().unwrap();
+        let to_path = object_store::path::Path::parse(dest_str).unwrap();
+
+        // Perform the copy operation - should create parent directories
+        store.copy(&from_path, &to_path).await.unwrap();
+
+        // Verify the file was copied correctly and directories were created
+        assert!(dest_file.exists());
+        assert!(dest_file.parent().unwrap().exists());
+        let copied_content = std::fs::read(&dest_file).unwrap();
+        assert_eq!(copied_content, b"test content");
     }
 }

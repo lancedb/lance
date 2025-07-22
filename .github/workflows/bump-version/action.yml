@@ -29,6 +29,16 @@ runs:
       shell: bash
       run: |
         cargo update -p lance
+    - name: Bump lance-jni version
+      working-directory: java/core/lance-jni
+      shell: bash
+      run: |
+        cargo bump ${{ inputs.part }}
+    - name: Update lance-jni lockfile
+      working-directory: java/core/lance-jni
+      shell: bash
+      run: |
+        cargo update -p lance
     - name: Bump java version
       working-directory: java
       shell: bash

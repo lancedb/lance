@@ -10,6 +10,16 @@ import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
 
+def test_file_read_projection(tmp_path):
+    table = pa.table({"a": [1, 2, 3], "b": [4, 5, 6]})
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(table)
+
+    reader = LanceFileReader(str(path), columns=["a"])
+    assert reader.read_all().to_table() == table.select("a")
+
+
 def test_file_writer(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
@@ -44,6 +54,15 @@ def test_schema_only(tmp_path):
         pass
     reader = LanceFileReader(str(path))
     assert reader.metadata().schema == schema
+
+
+def test_write_with_max_page_bytes(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    with LanceFileWriter(str(path), schema, max_page_bytes=1) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    reader = LanceFileReader(str(path))
+    assert len(reader.metadata().columns[0].pages) == 3
 
 
 def test_aborted_write(tmp_path):
@@ -98,6 +117,17 @@ def test_take(tmp_path):
 
     table = reader.take_rows([0, 77, 83]).to_table()
     assert table == pa.table({"a": [0, 77, 83]})
+
+
+def test_num_rows(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    writer = LanceFileWriter(str(path), schema)
+    writer.write_batch(pa.table({"a": [i for i in range(100)]}))
+    writer.close()
+
+    reader = LanceFileReader(str(path))
+    assert reader.num_rows() == 100
 
 
 def check_round_trip(tmp_path, table):
@@ -474,4 +504,13 @@ def test_blob(tmp_path):
 
     reader = LanceFileReader(str(path))
     assert len(reader.metadata().columns[0].pages) == 1
-    assert reader.read_all().to_table() == pa.table({"val": vals})
+
+    actual = reader.read_all().to_table()
+    expected = pa.table({"val": vals})
+
+    assert actual.num_rows == expected.num_rows
+    for row_num in range(expected.num_rows):
+        actual_bytes = actual.column("val").chunk(0)[row_num].as_py()
+        expected_bytes = expected.column("val").chunk(0)[row_num].as_py()
+        assert len(actual_bytes) == len(expected_bytes)
+        assert actual_bytes == expected_bytes

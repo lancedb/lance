@@ -186,4 +186,6 @@ message Field {
   /// Fields that have non-default storage classes are stored in different
   /// datasets (e.g. blob fields are stored in the nested "_blobs" dataset)
   string storage_class = 11;
+
+  bool unenforced_primary_key = 12;
 }

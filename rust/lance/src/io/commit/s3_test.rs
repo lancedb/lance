@@ -341,7 +341,9 @@ async fn test_ddb_open_iops() {
     let stats = incremental_stats();
     // Append: 5 IOPS: data file, transaction file, 3x manifest file
     assert_eq!(stats.write_iops, 5);
-    assert_eq!(stats.read_iops, 0);
+    // TODO: we can reduce this by implementing a specialized CommitHandler::list_manifest_locations()
+    // for the DDB commit handler.
+    assert_eq!(stats.read_iops, 1);
 
     // Checkout original version
     dataset.checkout_version(1).await.unwrap();

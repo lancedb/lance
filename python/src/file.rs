@@ -19,8 +19,10 @@ use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::v2::reader::ReaderProjection;
+use lance_file::v2::LanceEncodingsIo;
 use lance_file::{
     v2::{
         reader::{
@@ -33,6 +35,7 @@ use lance_file::{
 use lance_io::object_store::ObjectStoreParams;
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
+    utils::CachedFileSize,
     ReadBatchParams,
 };
 use object_store::path::Path;
@@ -242,6 +245,7 @@ impl LanceFileWriter {
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
         keep_original_array: Option<bool>,
+        max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
         let (object_store, path) =
             object_store_from_uri_or_path(uri_or_path, storage_options).await?;
@@ -249,6 +253,7 @@ impl LanceFileWriter {
         let options = FileWriterOptions {
             data_cache_bytes,
             keep_original_array,
+            max_page_bytes,
             format_version: version
                 .map(|v| v.parse::<LanceFileVersion>())
                 .transpose()
@@ -276,7 +281,7 @@ impl LanceFileWriter {
 #[pymethods]
 impl LanceFileWriter {
     #[new]
-    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, keep_original_array=None))]
+    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, keep_original_array=None, max_page_bytes=None))]
     pub fn new(
         path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
@@ -284,6 +289,7 @@ impl LanceFileWriter {
         version: Option<String>,
         storage_options: Option<HashMap<String, String>>,
         keep_original_array: Option<bool>,
+        max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
         RT.runtime.block_on(Self::open(
             path,
@@ -292,6 +298,7 @@ impl LanceFileWriter {
             version,
             storage_options,
             keep_original_array,
+            max_page_bytes,
         ))
     }
 
@@ -389,6 +396,7 @@ impl LanceFileReader {
     async fn open(
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
+        columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let (object_store, path) =
             object_store_from_uri_or_path(uri_or_path, storage_options).await?;
@@ -398,12 +406,33 @@ impl LanceFileReader {
                 io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
             },
         );
-        let file = scheduler.open_file(&path).await.infer_error()?;
-        let inner = FileReader::try_open(
-            file,
-            None,
+        let file = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .infer_error()?;
+        let file_metadata = FileReader::read_all_metadata(&file)
+            .await
+            .map_err(|e| PyIOError::new_err(format!("Error reading file metadata: {}", e)))?;
+
+        let mut base_projection = None;
+        if let Some(columns) = columns {
+            base_projection = Some(
+                ReaderProjection::from_column_names(
+                    file_metadata.version(),
+                    &file_metadata.file_schema,
+                    &columns.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
+                )
+                .map_err(|e| PyIOError::new_err(format!("Error creating projection: {}", e)))?,
+            );
+        }
+
+        let inner = FileReader::try_open_with_file_metadata(
+            Arc::new(LanceEncodingsIo(file.clone())),
+            path,
+            base_projection,
             Arc::<DecoderPlugins>::default(),
-            &FileMetadataCache::no_cache(),
+            Arc::new(file_metadata),
+            &LanceCache::no_cache(),
             FileReaderOptions::default(),
         )
         .await
@@ -457,9 +486,14 @@ impl LanceFileReader {
 #[pymethods]
 impl LanceFileReader {
     #[new]
-    #[pyo3(signature=(path, storage_options=None))]
-    pub fn new(path: String, storage_options: Option<HashMap<String, String>>) -> PyResult<Self> {
-        RT.runtime.block_on(Self::open(path, storage_options))
+    #[pyo3(signature=(path, storage_options=None, columns=None))]
+    pub fn new(
+        path: String,
+        storage_options: Option<HashMap<String, String>>,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<Self> {
+        RT.runtime
+            .block_on(Self::open(path, storage_options, columns))
     }
 
     pub fn read_all(
@@ -522,6 +556,10 @@ impl LanceFileReader {
             .block_on(self.inner.read_global_buffer(index))
             .infer_error()?;
         Ok(buffer_bytes.to_vec())
+    }
+
+    pub fn num_rows(&mut self) -> u64 {
+        self.inner.num_rows()
     }
 }
 

@@ -11,7 +11,7 @@ import logging
 import math
 import warnings
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Union
 
 import pyarrow as pa
 
@@ -29,7 +29,7 @@ from ..sampler import (
 )
 from .dist import get_global_rank, get_global_world_size
 
-__all__ = ["LanceDataset"]
+__all__ = ["LanceDataset", "SafeLanceDataset", "get_safe_loader"]
 
 
 # Convert an Arrow FSL array into a 2D torch tensor
@@ -182,6 +182,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         dataset: Union[torch.utils.data.Dataset, str, Path],
         batch_size: int,
         *args,
+        dataset_options: Optional[Dict[str, Any]] = None,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[str] = None,
         samples: Optional[int] = 0,
@@ -195,6 +196,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
             Callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
         ] = _to_tensor,
         sampler: Optional[Sampler] = None,
+        auto_detect_rank: bool = True,
         **kwargs,
     ):
         """Use PyTorch Dataset API to read Lance dataset.
@@ -234,10 +236,13 @@ class LanceDataset(torch.utils.data.IterableDataset):
             A function that samples the dataset.
         to_tensor_fn : callable, optional
             A function that converts a pyarrow RecordBatch to torch.Tensor.
+        auto_detect_rank: bool = True, optional
+            If set true, the rank and world_size will be detected automatically.
         """
         super().__init__()
         if isinstance(dataset, (str, Path)):
-            dataset = lance.dataset(dataset)
+            dataset_options = dataset_options or {}
+            dataset = lance.dataset(dataset, **dataset_options)
         self.dataset = dataset
         self.columns = columns
         self.batch_size = batch_size
@@ -272,6 +277,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
 
         self.cache = cache
         self.cached_ds: Optional[CachedDataset] = None
+        self._auto_detect_rank = auto_detect_rank
 
     def __repr__(self) -> str:
         return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})"
@@ -285,12 +291,19 @@ class LanceDataset(torch.utils.data.IterableDataset):
 
     def __iter__(self):
         if self.sampler is None:
-            if self.rank is not None and self.world_size is not None:
+            if self.rank is not None:
                 rank = self.rank
-                world_size = self.world_size
-            else:
+            elif self._auto_detect_rank:
                 rank = get_global_rank()
+            else:
+                rank = None
+
+            if self.world_size is not None:
+                world_size = self.world_size
+            elif self._auto_detect_rank:
                 world_size = get_global_world_size()
+            else:
+                world_size = None
             if self.shard_granularity is None:
                 if rank is not None and world_size is not None:
                     sampler = ShardedFragmentSampler(rank=rank, world_size=world_size)
@@ -349,7 +362,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     dict_batch[col] = batch[col]
                 for col in self._blob_columns:
                     dict_batch[col] = self.dataset.take_blobs(
-                        row_ids=row_ids.to_pylist(), blob_column=col
+                        ids=row_ids.to_pylist(), blob_column=col
                     )
                 batch = dict_batch
             if self._to_tensor_fn is not None:
@@ -375,3 +388,78 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 logging.debug("Column %s is a Large Blob column", col)
                 blob_cols.append(col)
         return blob_cols
+
+
+class SafeLanceDataset(torch.utils.data.Dataset):
+    def __init__(self, uri, *, dataset_options=None, **kwargs):
+        super().__init__(**kwargs)
+        self.uri = uri
+        self.dataset_options = dataset_options or {}
+        self._len = self._safe_preload()
+        self._ds = None
+
+    def _safe_preload(self):
+        """Main-process safe metadata loading"""
+        ds = lance.dataset(self.uri, **self.dataset_options)
+        length = ds.count_rows()
+        del ds
+        return length
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx):
+        return self.__getitems__([idx])[0]
+
+    def __getitems__(self, indices):
+        """Batch data fetching with worker-safe initialization
+
+        Args:
+            indices: List[int] - batch indices to retrieve
+
+        Returns:
+            List[dict] - samples in original data format
+        """
+        if self._ds is None:
+            # Worker-process initialization
+            import os
+
+            self._ds = lance.dataset(self.uri)
+            print(f"Worker {os.getpid()} initialized dataset")
+
+        # Leverage native batch reading
+        batch = self._ds.take(indices)
+
+        # Convert to python-native format
+        return batch.to_pylist()
+
+
+def get_safe_loader(dataset, batch_size=32, num_workers=4, **kwargs):
+    """Create a DataLoader with safe multiprocessing defaults
+
+    Args:
+        dataset: Input dataset object
+        batch_size: Number of samples per batch (default=32)
+        num_workers: Number of parallel data workers (default=4)
+        **kwargs: Additional DataLoader arguments. Note:
+                 - Forces 'spawn' context for Windows compatibility
+                 - Sets persistent_workers=True by default
+                 - User-provided args override defaults
+
+    Returns:
+        Configured DataLoader instance with process-safe settings
+    """
+
+    # Force spawn context for Windows/multiprocessing compatibility
+    ctx = torch.multiprocessing.get_context("spawn")
+
+    # Configure default parameters with process safety
+    loader_args = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "persistent_workers": kwargs.pop("persistent_workers", True),
+        "multiprocessing_context": ctx,
+        **kwargs,  # User-provided arguments take priority
+    }
+
+    return torch.utils.data.DataLoader(dataset, **loader_args)

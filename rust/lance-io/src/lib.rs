@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
+use std::{
+    ops::{Range, RangeFrom, RangeFull, RangeTo},
+    sync::Arc,
+};
 
 use arrow::datatypes::UInt32Type;
 use arrow_array::{PrimitiveArray, UInt32Array};
@@ -24,10 +27,12 @@ pub mod utils;
 pub use scheduler::{bytes_read_counter, iops_counter};
 
 /// Defines a selection of rows to read from a file/batch
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ReadBatchParams {
     /// Select a contiguous range of rows
     Range(Range<usize>),
+    /// Select multiple contiguous ranges of rows
+    Ranges(Arc<[Range<u64>]>),
     /// Select all rows (this is the default)
     RangeFull,
     /// Select all rows up to a given index
@@ -42,6 +47,18 @@ impl std::fmt::Display for ReadBatchParams {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::Range(r) => write!(f, "Range({}..{})", r.start, r.end),
+            Self::Ranges(ranges) => {
+                let mut ranges_str = ranges.iter().fold(String::new(), |mut acc, r| {
+                    acc.push_str(&format!("{}..{}", r.start, r.end));
+                    acc.push(',');
+                    acc
+                });
+                // Remove the trailing comma
+                if !ranges_str.is_empty() {
+                    ranges_str.pop();
+                }
+                write!(f, "Ranges({})", ranges_str)
+            }
             Self::RangeFull => write!(f, "RangeFull"),
             Self::RangeTo(r) => write!(f, "RangeTo({})", r.end),
             Self::RangeFrom(r) => write!(f, "RangeFrom({})", r.start),
@@ -115,6 +132,7 @@ impl ReadBatchParams {
         match self {
             Self::Indices(indices) => indices.iter().all(|i| i.unwrap_or(0) < len as u32),
             Self::Range(r) => r.start < len && r.end <= len,
+            Self::Ranges(ranges) => ranges.iter().all(|r| r.end <= len as u64),
             Self::RangeFull => true,
             Self::RangeTo(r) => r.end <= len,
             Self::RangeFrom(r) => r.start < len,
@@ -165,6 +183,33 @@ impl ReadBatchParams {
                 }
                 Ok(Self::Range((r.start + start)..(r.start + start + length)))
             }
+            Self::Ranges(ranges) => {
+                let mut new_ranges = Vec::with_capacity(ranges.len());
+                let mut to_skip = start as u64;
+                let mut to_take = length as u64;
+                let mut total_num_rows = 0;
+                for r in ranges.as_ref() {
+                    let num_rows = r.end - r.start;
+                    total_num_rows += num_rows;
+                    if to_skip > num_rows {
+                        to_skip -= num_rows;
+                        continue;
+                    }
+                    let new_start = r.start + to_skip;
+                    let to_take_this_range = (num_rows - to_skip).min(to_take);
+                    new_ranges.push(new_start..(new_start + to_take_this_range));
+                    to_skip = 0;
+                    to_take -= to_take_this_range;
+                    if to_take == 0 {
+                        break;
+                    }
+                }
+                if to_take > 0 {
+                    out_of_bounds(total_num_rows as usize)
+                } else {
+                    Ok(Self::Ranges(new_ranges.into()))
+                }
+            }
             Self::RangeFull => Ok(Self::Range(start..(start + length))),
             Self::RangeTo(range) => {
                 if start + length > range.end {
@@ -189,6 +234,17 @@ impl ReadBatchParams {
             Self::Range(r) => Ok(UInt32Array::from(Vec::from_iter(
                 r.start as u32..r.end as u32,
             ))),
+            Self::Ranges(ranges) => {
+                let num_rows = ranges
+                    .iter()
+                    .map(|r| (r.end - r.start) as usize)
+                    .sum::<usize>();
+                let mut offsets = Vec::with_capacity(num_rows);
+                for r in ranges.as_ref() {
+                    offsets.extend(r.start as u32..r.end as u32);
+                }
+                Ok(UInt32Array::from(offsets))
+            }
             Self::RangeFull => Err(Error::invalid_input(
                 "cannot materialize RangeFull",
                 location!(),
@@ -201,10 +257,67 @@ impl ReadBatchParams {
         }
     }
 
+    pub fn iter_offset_ranges<'a>(
+        &'a self,
+    ) -> Result<Box<dyn Iterator<Item = Range<u32>> + Send + 'a>> {
+        match self {
+            Self::Indices(indices) => Ok(Box::new(indices.values().iter().map(|i| *i..(*i + 1)))),
+            Self::Range(r) => Ok(Box::new(std::iter::once(r.start as u32..r.end as u32))),
+            Self::Ranges(ranges) => Ok(Box::new(
+                ranges.iter().map(|r| r.start as u32..r.end as u32),
+            )),
+            Self::RangeFull => Err(Error::invalid_input(
+                "cannot materialize RangeFull",
+                location!(),
+            )),
+            Self::RangeTo(r) => Ok(Box::new(std::iter::once(0..r.end as u32))),
+            Self::RangeFrom(_) => Err(Error::invalid_input(
+                "cannot materialize RangeFrom",
+                location!(),
+            )),
+        }
+    }
+
+    /// Convert a read range into a vector of row ranges
+    pub fn to_ranges(&self) -> Result<Vec<Range<u64>>> {
+        match self {
+            Self::Indices(indices) => Ok(indices
+                .values()
+                .iter()
+                .map(|i| *i as u64..(*i + 1) as u64)
+                .collect()),
+            Self::Range(r) => Ok(vec![r.start as u64..r.end as u64]),
+            Self::Ranges(ranges) => Ok(ranges.to_vec()),
+            Self::RangeFull => Err(Error::invalid_input(
+                "cannot materialize RangeFull",
+                location!(),
+            )),
+            Self::RangeTo(r) => Ok(vec![0..r.end as u64]),
+            Self::RangeFrom(_) => Err(Error::invalid_input(
+                "cannot materialize RangeFrom",
+                location!(),
+            )),
+        }
+    }
+
+    /// Same thing as to_offsets but the caller knows the total number of rows in the file
+    ///
+    /// This makes it possible to materialize RangeFull / RangeFrom
     pub fn to_offsets_total(&self, total: u32) -> PrimitiveArray<UInt32Type> {
         match self {
             Self::Indices(indices) => indices.clone(),
             Self::Range(r) => UInt32Array::from_iter_values(r.start as u32..r.end as u32),
+            Self::Ranges(ranges) => {
+                let num_rows = ranges
+                    .iter()
+                    .map(|r| (r.end - r.start) as usize)
+                    .sum::<usize>();
+                let mut offsets = Vec::with_capacity(num_rows);
+                for r in ranges.as_ref() {
+                    offsets.extend(r.start as u32..r.end as u32);
+                }
+                UInt32Array::from(offsets)
+            }
             Self::RangeFull => UInt32Array::from_iter_values(0_u32..total),
             Self::RangeTo(r) => UInt32Array::from_iter_values(0..r.end as u32),
             Self::RangeFrom(r) => UInt32Array::from_iter_values(r.start as u32..total),
@@ -219,6 +332,13 @@ mod test {
     use arrow_array::UInt32Array;
 
     use crate::ReadBatchParams;
+
+    #[test]
+    fn test_params_slice() {
+        let params = ReadBatchParams::Ranges(vec![0..15, 20..40].into());
+        let sliced = params.slice(10, 10).unwrap();
+        assert_eq!(sliced, ReadBatchParams::Ranges(vec![10..15, 20..25].into()));
+    }
 
     #[test]
     fn test_params_to_offsets() {

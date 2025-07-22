@@ -5,7 +5,7 @@
 //!
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::error::SdkError;
@@ -138,9 +138,8 @@ impl DynamoDBExternalManifestStore {
         table_name: &str,
         committer_name: &str,
     ) -> Result<Arc<dyn ExternalManifestStore>> {
-        lazy_static::lazy_static! {
-            static ref SANITY_CHECK_CACHE: RwLock<HashSet<String>> = RwLock::new(HashSet::new());
-        }
+        static SANITY_CHECK_CACHE: LazyLock<RwLock<HashSet<String>>> =
+            LazyLock::new(|| RwLock::new(HashSet::new()));
 
         let store = Arc::new(Self {
             client: client.clone(),

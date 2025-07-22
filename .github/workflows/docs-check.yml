@@ -6,7 +6,6 @@ on:
   pull_request:
     paths:
       - docs/**
-      - python/python/**
       - .github/workflows/docs-check.yml
 
 env:
@@ -22,39 +21,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: 3.11
           cache: 'pip'
           cache-dependency-path: "docs/requirements.txt"
-      - name: Install dependencies
-        run: |
-          sudo apt install -y -qq doxygen pandoc
-      - name: Build python wheel
-        uses: ./.github/workflows/build_linux_wheel
-      - name: Free disk space
-        working-directory: python
-        run: |
-          sudo chown 1001:118 -R target
-          mv target/wheels/*.whl ./
-          cargo clean
-      - name: Build Python
-        working-directory: docs
-        run: |
-          python -m pip install ../python/*.whl
-          python -m pip install -r requirements.txt
-      - name: Run test
-        working-directory: docs
-        run: |
-          make doctest
-      - name: Build docs
-        working-directory: docs
-        run: |
-          make nbconvert
-          make html
+      - run: pip install -r docs/requirements.txt
       - name: Check links
         working-directory: docs
         run: |
-          make linkcheck
+          mkdocs-linkcheck src
 

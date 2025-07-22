@@ -213,7 +213,7 @@
 //!    relation to the way the data is stored.
 
 use std::collections::VecDeque;
-use std::sync::Once;
+use std::sync::{LazyLock, Once};
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
@@ -224,7 +224,7 @@ use futures::future::{maybe_done, BoxFuture, MaybeDone};
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
-use lance_core::cache::{CapacityMode, FileMetadataCache};
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
 use log::{debug, trace, warn};
 use snafu::location;
@@ -234,31 +234,21 @@ use tokio::sync::mpsc::{self, unbounded_channel};
 use lance_core::{ArrowResult, Error, Result};
 use tracing::instrument;
 
-use crate::buffer::LanceBuffer;
-use crate::data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock};
-use crate::encoder::{values_column_encoding, EncodedBatch};
-use crate::encodings::logical::binary::BinaryFieldScheduler;
-use crate::encodings::logical::blob::BlobFieldScheduler;
-use crate::encodings::logical::list::{
-    ListFieldScheduler, OffsetPageInfo, StructuralListScheduler,
-};
-use crate::encodings::logical::primitive::{
-    PrimitiveFieldScheduler, StructuralPrimitiveFieldScheduler,
-};
-use crate::encodings::logical::r#struct::{
-    SimpleStructDecoder, SimpleStructScheduler, StructuralStructDecoder, StructuralStructScheduler,
-};
-use crate::encodings::physical::binary::{
-    BinaryBlockDecompressor, BinaryMiniBlockDecompressor, VariableDecoder,
-};
-use crate::encodings::physical::bitpack_fastlanes::InlineBitpacking;
-use crate::encodings::physical::block_compress::CompressedBufferEncoder;
-use crate::encodings::physical::fsst::{FsstMiniBlockDecompressor, FsstPerValueDecompressor};
-use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockDecompressor;
-use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor};
-use crate::encodings::physical::{ColumnBuffers, FileBuffers};
+use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
+use crate::data::DataBlock;
+use crate::encoder::EncodedBatch;
+use crate::encodings::logical::list::StructuralListScheduler;
+use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
+use crate::encodings::logical::r#struct::{StructuralStructDecoder, StructuralStructScheduler};
 use crate::format::pb::{self, column_encoding};
 use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
+use crate::v2::decoder::LogicalPageDecoder;
+use crate::v2::encodings::logical::list::OffsetPageInfo;
+use crate::v2::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
+use crate::v2::encodings::logical::{
+    binary::BinaryFieldScheduler, blob::BlobFieldScheduler, list::ListFieldScheduler,
+    primitive::PrimitiveFieldScheduler,
+};
 use crate::version::LanceFileVersion;
 use crate::{BufferScheduler, EncodingsIo};
 
@@ -355,11 +345,11 @@ impl ColumnInfo {
 
 enum RootScheduler {
     Structural(Box<dyn StructuralFieldScheduler>),
-    Legacy(Arc<dyn FieldScheduler>),
+    Legacy(Arc<dyn crate::v2::decoder::FieldScheduler>),
 }
 
 impl RootScheduler {
-    fn as_legacy(&self) -> &Arc<dyn FieldScheduler> {
+    fn as_legacy(&self) -> &Arc<dyn crate::v2::decoder::FieldScheduler> {
         match self {
             Self::Structural(_) => panic!("Expected a legacy scheduler"),
             Self::Legacy(s) => s,
@@ -398,7 +388,7 @@ impl RootScheduler {
 pub struct DecodeBatchScheduler {
     root_scheduler: RootScheduler,
     pub root_fields: Fields,
-    cache: Arc<FileMetadataCache>,
+    cache: Arc<LanceCache>,
 }
 
 pub struct ColumnInfoIter<'a> {
@@ -458,159 +448,51 @@ impl<'a> ColumnInfoIter<'a> {
     }
 }
 
-pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
-    fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+/// These contain the file buffers shared across the entire file
+#[derive(Clone, Copy, Debug)]
+pub struct FileBuffers<'a> {
+    pub positions_and_sizes: &'a [(u64, u64)],
 }
 
-pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
-    /// Decompress one or more values
-    fn decompress(&self, data: FixedWidthDataBlock, num_values: u64) -> Result<DataBlock>;
-    /// The number of bits in each value
-    ///
-    /// Currently (and probably long term) this must be a multiple of 8
-    fn bits_per_value(&self) -> u64;
+/// These contain the file buffers and also buffers specific to a column
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnBuffers<'a, 'b> {
+    pub file_buffers: FileBuffers<'a>,
+    pub positions_and_sizes: &'b [(u64, u64)],
 }
 
-pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
-    /// Decompress one or more values
-    fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
-}
-
-pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock>;
-}
-
-pub trait DecompressorStrategy: std::fmt::Debug + Send + Sync {
-    fn create_miniblock_decompressor(
-        &self,
-        description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn MiniBlockDecompressor>>;
-
-    fn create_fixed_per_value_decompressor(
-        &self,
-        description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn FixedPerValueDecompressor>>;
-
-    fn create_variable_per_value_decompressor(
-        &self,
-        description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn VariablePerValueDecompressor>>;
-
-    fn create_block_decompressor(
-        &self,
-        description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn BlockDecompressor>>;
-}
-
-#[derive(Debug, Default)]
-pub struct CoreDecompressorStrategy {}
-
-impl DecompressorStrategy for CoreDecompressorStrategy {
-    fn create_miniblock_decompressor(
-        &self,
-        description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn MiniBlockDecompressor>> {
-        match description.array_encoding.as_ref().unwrap() {
-            pb::array_encoding::ArrayEncoding::Flat(flat) => {
-                Ok(Box::new(ValueDecompressor::from_flat(flat)))
-            }
-            pb::array_encoding::ArrayEncoding::InlineBitpacking(description) => {
-                Ok(Box::new(InlineBitpacking::from_description(description)))
-            }
-            pb::array_encoding::ArrayEncoding::Variable(_) => {
-                Ok(Box::new(BinaryMiniBlockDecompressor::default()))
-            }
-            pb::array_encoding::ArrayEncoding::Fsst(description) => {
-                Ok(Box::new(FsstMiniBlockDecompressor::new(description)))
-            }
-            pb::array_encoding::ArrayEncoding::PackedStructFixedWidthMiniBlock(description) => {
-                Ok(Box::new(PackedStructFixedWidthMiniBlockDecompressor::new(
-                    description,
-                )))
-            }
-            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => {
-                // In the future, we might need to do something more complex here if FSL supports
-                // compression.
-                Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
-            }
-            _ => todo!(),
-        }
-    }
-
-    fn create_fixed_per_value_decompressor(
-        &self,
-        description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn FixedPerValueDecompressor>> {
-        match description.array_encoding.as_ref().unwrap() {
-            pb::array_encoding::ArrayEncoding::Flat(flat) => {
-                Ok(Box::new(ValueDecompressor::from_flat(flat)))
-            }
-            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => {
-                Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
-            }
-            _ => todo!("fixed-per-value decompressor for {:?}", description),
-        }
-    }
-
-    fn create_variable_per_value_decompressor(
-        &self,
-        description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn VariablePerValueDecompressor>> {
-        match *description.array_encoding.as_ref().unwrap() {
-            pb::array_encoding::ArrayEncoding::Variable(variable) => {
-                assert!(variable.bits_per_offset < u8::MAX as u32);
-                Ok(Box::new(VariableDecoder::default()))
-            }
-            pb::array_encoding::ArrayEncoding::Fsst(ref fsst) => {
-                Ok(Box::new(FsstPerValueDecompressor::new(
-                    LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
-                    Box::new(VariableDecoder::default()),
-                )))
-            }
-            pb::array_encoding::ArrayEncoding::Block(ref block) => Ok(Box::new(
-                CompressedBufferEncoder::from_scheme(&block.scheme)?,
-            )),
-            _ => todo!("variable-per-value decompressor for {:?}", description),
-        }
-    }
-
-    fn create_block_decompressor(
-        &self,
-        description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn BlockDecompressor>> {
-        match description.array_encoding.as_ref().unwrap() {
-            pb::array_encoding::ArrayEncoding::Flat(flat) => {
-                Ok(Box::new(ValueDecompressor::from_flat(flat)))
-            }
-            pb::array_encoding::ArrayEncoding::Constant(constant) => {
-                let scalar = LanceBuffer::from_bytes(constant.value.clone(), 1);
-                Ok(Box::new(ConstantDecompressor::new(scalar)))
-            }
-            pb::array_encoding::ArrayEncoding::Variable(_) => {
-                Ok(Box::new(BinaryBlockDecompressor::default()))
-            }
-            _ => todo!(),
-        }
-    }
+/// These contain the file & column buffers and also buffers specific to a page
+#[derive(Clone, Copy, Debug)]
+pub struct PageBuffers<'a, 'b, 'c> {
+    pub column_buffers: ColumnBuffers<'a, 'b>,
+    pub positions_and_sizes: &'c [(u64, u64)],
 }
 
 /// The core decoder strategy handles all the various Arrow types
 #[derive(Debug)]
 pub struct CoreFieldDecoderStrategy {
     pub validate_data: bool,
-    pub decompressor_strategy: Arc<dyn DecompressorStrategy>,
+    pub decompressor_strategy: Arc<dyn DecompressionStrategy>,
+    pub cache_repetition_index: bool,
 }
 
 impl Default for CoreFieldDecoderStrategy {
     fn default() -> Self {
         Self {
             validate_data: false,
-            decompressor_strategy: Arc::new(CoreDecompressorStrategy {}),
+            decompressor_strategy: Arc::new(DefaultDecompressionStrategy {}),
+            cache_repetition_index: false,
         }
     }
 }
 
 impl CoreFieldDecoderStrategy {
+    /// Create a new strategy with cache_repetition_index enabled
+    pub fn with_cache_repetition_index(mut self, cache_repetition_index: bool) -> Self {
+        self.cache_repetition_index = cache_repetition_index;
+        self
+    }
+
     /// This is just a sanity check to ensure there is no "wrapped encodings"
     /// that haven't been handled.
     fn ensure_values_encoded(column_info: &ColumnInfo, field_name: &str) -> Result<()> {
@@ -655,7 +537,7 @@ impl CoreFieldDecoderStrategy {
         field: &Field,
         column: &ColumnInfo,
         buffers: FileBuffers,
-    ) -> Result<Box<dyn FieldScheduler>> {
+    ) -> Result<Box<dyn crate::v2::decoder::FieldScheduler>> {
         Self::ensure_values_encoded(column, &field.name)?;
         // Primitive fields map to a single column
         let column_buffers = ColumnBuffers {
@@ -698,7 +580,7 @@ impl CoreFieldDecoderStrategy {
         column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
         offsets_column: &ColumnInfo,
-    ) -> Result<Box<dyn FieldScheduler>> {
+    ) -> Result<Box<dyn crate::v2::decoder::FieldScheduler>> {
         Self::ensure_values_encoded(offsets_column, &list_field.name)?;
         let offsets_column_buffers = ColumnBuffers {
             file_buffers: buffers,
@@ -743,7 +625,7 @@ impl CoreFieldDecoderStrategy {
             Arc::from(inner_infos.into_boxed_slice()),
             offsets_column_buffers,
             self.validate_data,
-        )) as Arc<dyn FieldScheduler>;
+        )) as Arc<dyn crate::v2::decoder::FieldScheduler>;
         let items_field = match list_field.data_type() {
             DataType::List(inner) => inner,
             DataType::LargeList(inner) => inner,
@@ -786,6 +668,7 @@ impl CoreFieldDecoderStrategy {
             let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                 column_info.as_ref(),
                 self.decompressor_strategy.as_ref(),
+                self.cache_repetition_index,
             )?);
 
             // advance to the next top level column
@@ -800,6 +683,7 @@ impl CoreFieldDecoderStrategy {
                     let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                         column_info.as_ref(),
                         self.decompressor_strategy.as_ref(),
+                        self.cache_repetition_index,
                     )?);
 
                     // advance to the next top level column
@@ -820,11 +704,12 @@ impl CoreFieldDecoderStrategy {
                         as Box<dyn StructuralFieldScheduler>,
                 )
             }
-            DataType::Binary | DataType::Utf8 => {
+            DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
                 let column_info = column_infos.expect_next()?;
                 let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                     column_info.as_ref(),
                     self.decompressor_strategy.as_ref(),
+                    self.cache_repetition_index,
                 )?);
                 column_infos.next_top_level();
                 Ok(scheduler)
@@ -848,7 +733,7 @@ impl CoreFieldDecoderStrategy {
         field: &Field,
         column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
-    ) -> Result<Box<dyn FieldScheduler>> {
+    ) -> Result<Box<dyn crate::v2::decoder::FieldScheduler>> {
         let data_type = field.data_type();
         if Self::is_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
@@ -1004,7 +889,9 @@ fn root_column(num_rows: u64) -> ColumnInfo {
         .collect::<Vec<_>>();
     ColumnInfo {
         buffer_offsets_and_sizes: Arc::new([]),
-        encoding: values_column_encoding(),
+        encoding: pb::ColumnEncoding {
+            column_encoding: Some(pb::column_encoding::ColumnEncoding::Values(())),
+        },
         index: u32::MAX,
         page_infos: Arc::from(root_pages),
     }
@@ -1043,8 +930,9 @@ impl DecodeBatchScheduler {
         num_rows: u64,
         _decoder_plugins: Arc<DecoderPlugins>,
         io: Arc<dyn EncodingsIo>,
-        cache: Arc<FileMetadataCache>,
+        cache: Arc<LanceCache>,
         filter: &FilterExpression,
+        cache_repetition_index: bool,
     ) -> Result<Self> {
         assert!(num_rows > 0);
         let buffers = FileBuffers {
@@ -1065,8 +953,10 @@ impl DecodeBatchScheduler {
         if column_infos[0].is_structural() {
             let mut column_iter = ColumnInfoIter::new(column_infos.to_vec(), column_indices);
 
-            let mut root_scheduler = CoreFieldDecoderStrategy::default()
-                .create_structural_field_scheduler(&root_field, &mut column_iter)?;
+            let strategy = CoreFieldDecoderStrategy::default()
+                .with_cache_repetition_index(cache_repetition_index);
+            let mut root_scheduler =
+                strategy.create_structural_field_scheduler(&root_field, &mut column_iter)?;
 
             let context = SchedulerContext::new(io, cache.clone());
             root_scheduler.initialize(filter, &context).await?;
@@ -1088,8 +978,10 @@ impl DecodeBatchScheduler {
                 .chain(column_indices.iter().map(|i| i.saturating_add(1)))
                 .collect::<Vec<_>>();
             let mut column_iter = ColumnInfoIter::new(columns, &adjusted_column_indices);
-            let root_scheduler = CoreFieldDecoderStrategy::default()
-                .create_legacy_field_scheduler(&root_field, &mut column_iter, buffers)?;
+            let strategy = CoreFieldDecoderStrategy::default()
+                .with_cache_repetition_index(cache_repetition_index);
+            let root_scheduler =
+                strategy.create_legacy_field_scheduler(&root_field, &mut column_iter, buffers)?;
 
             let context = SchedulerContext::new(io, cache.clone());
             root_scheduler.initialize(filter, &context).await?;
@@ -1102,10 +994,11 @@ impl DecodeBatchScheduler {
         }
     }
 
+    #[deprecated(since = "0.29.1", note = "This is for legacy 2.0 paths")]
     pub fn from_scheduler(
-        root_scheduler: Arc<dyn FieldScheduler>,
+        root_scheduler: Arc<dyn crate::v2::decoder::FieldScheduler>,
         root_fields: Fields,
-        cache: Arc<FileMetadataCache>,
+        cache: Arc<LanceCache>,
     ) -> Self {
         Self {
             root_scheduler: RootScheduler::Legacy(root_scheduler),
@@ -1407,7 +1300,7 @@ impl BatchDecodeStream {
         }
     }
 
-    fn accept_decoder(&mut self, decoder: DecoderReady) -> Result<()> {
+    fn accept_decoder(&mut self, decoder: crate::v2::decoder::DecoderReady) -> Result<()> {
         if decoder.path.is_empty() {
             // The root decoder we can ignore
             Ok(())
@@ -1495,18 +1388,17 @@ impl BatchDecodeStream {
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
-                let task = tokio::spawn(async move {
+                let task = async move {
                     let next_task = next_task?;
                     next_task.into_batch(emitted_batch_size_warning)
-                });
+                };
                 (task, num_rows)
             });
             next_task.map(|(task, num_rows)| {
-                let task = task.map(|join_wrapper| join_wrapper.unwrap()).boxed();
                 // This should be true since batch size is u32
                 debug_assert!(num_rows <= u32::MAX as u64);
                 let next_task = ReadBatchTask {
-                    task,
+                    task: task.boxed(),
                     num_rows: num_rows as u32,
                 };
                 (next_task, slf)
@@ -1520,7 +1412,7 @@ impl BatchDecodeStream {
 // we can have a single implementation of the batch decode iterator
 enum RootDecoderMessage {
     LoadedPage(LoadedPage),
-    LegacyPage(DecoderReady),
+    LegacyPage(crate::v2::decoder::DecoderReady),
 }
 trait RootDecoderType {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()>;
@@ -1819,18 +1711,17 @@ impl StructuralBatchDecodeStream {
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
-                let task = tokio::spawn(async move {
+                let task = async move {
                     let next_task = next_task?;
                     next_task.into_batch(emitted_batch_size_warning)
-                });
+                };
                 (task, num_rows)
             });
             next_task.map(|(task, num_rows)| {
-                let task = task.map(|join_wrapper| join_wrapper.unwrap()).boxed();
                 // This should be true since batch size is u32
                 debug_assert!(num_rows <= u32::MAX as u64);
                 let next_task = ReadBatchTask {
-                    task,
+                    task: task.boxed(),
                     num_rows: num_rows as u32,
                 };
                 (next_task, slf)
@@ -1860,8 +1751,10 @@ pub struct SchedulerDecoderConfig {
     pub decoder_plugins: Arc<DecoderPlugins>,
     pub batch_size: u32,
     pub io: Arc<dyn EncodingsIo>,
-    pub cache: Arc<FileMetadataCache>,
+    pub cache: Arc<LanceCache>,
     pub should_validate: bool,
+    /// Whether to cache repetition indices for better performance
+    pub cache_repetition_index: bool,
 }
 
 fn check_scheduler_on_drop(
@@ -1978,6 +1871,7 @@ fn create_scheduler_decoder(
             config.io.clone(),
             config.cache,
             &filter,
+            config.cache_repetition_index,
         )
         .await
         {
@@ -2038,11 +1932,11 @@ pub fn schedule_and_decode(
     }
 }
 
-lazy_static::lazy_static! {
-    pub static ref WAITER_RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+pub static WAITER_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_current_thread()
         .build()
-        .unwrap();
-}
+        .unwrap()
+});
 
 /// Schedules and decodes the requested data in a blocking fashion
 ///
@@ -2088,6 +1982,7 @@ pub fn schedule_and_decode_blocking(
         config.io.clone(),
         config.cache,
         &filter,
+        config.cache_repetition_index,
     ))?;
 
     // Schedule the requested rows
@@ -2307,7 +2202,7 @@ impl PriorityRange for ListPriorityRange {
 pub struct SchedulerContext {
     recv: Option<mpsc::UnboundedReceiver<DecoderMessage>>,
     io: Arc<dyn EncodingsIo>,
-    cache: Arc<FileMetadataCache>,
+    cache: Arc<LanceCache>,
     name: String,
     path: Vec<u32>,
     path_names: Vec<String>,
@@ -2325,7 +2220,7 @@ impl<'a> ScopedSchedulerContext<'a> {
 }
 
 impl SchedulerContext {
-    pub fn new(io: Arc<dyn EncodingsIo>, cache: Arc<FileMetadataCache>) -> Self {
+    pub fn new(io: Arc<dyn EncodingsIo>, cache: Arc<LanceCache>) -> Self {
         Self {
             io,
             cache,
@@ -2340,7 +2235,7 @@ impl SchedulerContext {
         &self.io
     }
 
-    pub fn cache(&self) -> &Arc<FileMetadataCache> {
+    pub fn cache(&self) -> &Arc<LanceCache> {
         &self.cache
     }
 
@@ -2368,13 +2263,17 @@ impl SchedulerContext {
         VecDeque::from_iter(self.path.iter().copied())
     }
 
-    pub fn locate_decoder(&mut self, decoder: Box<dyn LogicalPageDecoder>) -> DecoderReady {
+    #[deprecated(since = "0.29.1", note = "This is for legacy 2.0 paths")]
+    pub fn locate_decoder(
+        &mut self,
+        decoder: Box<dyn crate::v2::decoder::LogicalPageDecoder>,
+    ) -> crate::v2::decoder::DecoderReady {
         trace!(
             "Scheduling decoder of type {:?} for {:?}",
             decoder.data_type(),
             self.path,
         );
-        DecoderReady {
+        crate::v2::decoder::DecoderReady {
             decoder,
             path: self.current_path(),
         }
@@ -2393,16 +2292,6 @@ impl std::fmt::Debug for UnloadedPage {
 pub struct ScheduledScanLine {
     pub rows_scheduled: u64,
     pub decoders: Vec<MessageType>,
-}
-
-pub trait SchedulingJob: std::fmt::Debug {
-    fn schedule_next(
-        &mut self,
-        context: &mut SchedulerContext,
-        priority: &dyn PriorityRange,
-    ) -> Result<ScheduledScanLine>;
-
-    fn num_rows(&self) -> u64;
 }
 
 pub trait StructuralSchedulingJob: std::fmt::Debug {
@@ -2434,50 +2323,6 @@ impl FilterExpression {
     pub fn is_noop(&self) -> bool {
         self.0.is_empty()
     }
-}
-
-/// A scheduler for a field's worth of data
-///
-/// Each field in a reader's output schema maps to one field scheduler.  This scheduler may
-/// map to more than one column.  For example, one field of struct data may
-/// cover many columns of child data.  In fact, the entire file is treated as one
-/// top-level struct field.
-///
-/// The scheduler is responsible for calculating the necessary I/O.  One schedule_range
-/// request could trigger multiple batches of I/O across multiple columns.  The scheduler
-/// should emit decoders into the sink as quickly as possible.
-///
-/// As soon as the scheduler encounters a batch of data that can decoded then the scheduler
-/// should emit a decoder in the "unloaded" state.  The decode stream will pull the decoder
-/// and start decoding.
-///
-/// The order in which decoders are emitted is important.  Pages should be emitted in
-/// row-major order allowing decode of complete rows as quickly as possible.
-///
-/// The `FieldScheduler` should be stateless and `Send` and `Sync`.  This is
-/// because it might need to be shared.  For example, a list page has a reference to
-/// the field schedulers for its items column.  This is shared with the follow-up I/O
-/// task created when the offsets are loaded.
-///
-/// See [`crate::decoder`] for more information
-pub trait FieldScheduler: Send + Sync + std::fmt::Debug {
-    /// Called at the beginning of scheduling to initialize the scheduler
-    fn initialize<'a>(
-        &'a self,
-        filter: &'a FilterExpression,
-        context: &'a SchedulerContext,
-    ) -> BoxFuture<'a, Result<()>>;
-    /// Schedules I/O for the requested portions of the field.
-    ///
-    /// Note: `ranges` must be ordered and non-overlapping
-    /// TODO: Support unordered or overlapping ranges in file scheduler
-    fn schedule_ranges<'a>(
-        &'a self,
-        ranges: &[Range<u64>],
-        filter: &FilterExpression,
-    ) -> Result<Box<dyn SchedulingJob + 'a>>;
-    /// The number of rows in this field
-    fn num_rows(&self) -> u64;
 }
 
 pub trait StructuralFieldScheduler: Send + std::fmt::Debug {
@@ -2547,31 +2392,6 @@ impl NextDecodeTask {
     }
 }
 
-#[derive(Debug)]
-pub struct DecoderReady {
-    // The decoder that is ready to be decoded
-    pub decoder: Box<dyn LogicalPageDecoder>,
-    // The path to the decoder, the first value is the column index
-    // following values, if present, are nested child indices
-    //
-    // For example, a path of [1, 1, 0] would mean to grab the second
-    // column, then the second child, and then the first child.
-    //
-    // It could represent x in the following schema:
-    //
-    // score: float64
-    // points: struct
-    //   color: string
-    //   location: struct
-    //     x: float64
-    //
-    // Currently, only struct decoders have "children" although other
-    // decoders may at some point as well.  List children are only
-    // handled through indirect I/O at the moment and so they don't
-    // need to be represented (yet)
-    pub path: VecDeque<u32>,
-}
-
 // An envelope to wrap both 2.0 style messages and 2.1 style messages so we can
 // share some code paths between the two.  Decoders can safely unwrap into whatever
 // style they expect since a file will be either all-2.0 or all-2.1
@@ -2581,7 +2401,7 @@ pub enum MessageType {
     // decoder itself.  The messages were not sent in priority order and the decoder
     // had to wait for I/O, figuring out the correct priority.  This was a lot of
     // complexity.
-    DecoderReady(DecoderReady),
+    DecoderReady(crate::v2::decoder::DecoderReady),
     // Starting in 2.1 we use a simpler scheme where the scheduling happens in priority
     // order and the message is an unloaded decoder.  These can be awaited, in order, and
     // the decoder does not have to worry about waiting for I/O.
@@ -2589,7 +2409,7 @@ pub enum MessageType {
 }
 
 impl MessageType {
-    pub fn into_legacy(self) -> DecoderReady {
+    pub fn into_legacy(self) -> crate::v2::decoder::DecoderReady {
         match self {
             Self::DecoderReady(decoder) => decoder,
             Self::UnloadedPage(_) => {
@@ -2621,50 +2441,6 @@ impl DecoderContext {
     pub fn new(source: mpsc::UnboundedReceiver<Result<DecoderMessage>>) -> Self {
         Self { source }
     }
-}
-
-/// A decoder for a field's worth of data
-///
-/// The decoder is initially "unloaded" (doesn't have all its data).  The [`Self::wait`]
-/// method should be called to wait for the needed I/O data before attempting to decode
-/// any further.
-///
-/// Unlike the other decoder types it is assumed that `LogicalPageDecoder` is stateful
-/// and only `Send`.  This is why we don't need a `rows_to_skip` argument in [`Self::drain`]
-pub trait LogicalPageDecoder: std::fmt::Debug + Send {
-    /// Add a newly scheduled child decoder
-    ///
-    /// The default implementation does not expect children and returns
-    /// an error.
-    fn accept_child(&mut self, _child: DecoderReady) -> Result<()> {
-        Err(Error::Internal {
-            message: format!(
-                "The decoder {:?} does not expect children but received a child",
-                self
-            ),
-            location: location!(),
-        })
-    }
-    /// Waits until at least `num_rows` have been loaded
-    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>>;
-    /// The number of rows loaded so far
-    fn rows_loaded(&self) -> u64;
-    /// The number of rows that still need loading
-    fn rows_unloaded(&self) -> u64 {
-        self.num_rows() - self.rows_loaded()
-    }
-    /// The total number of rows in the field
-    fn num_rows(&self) -> u64;
-    /// The number of rows that have been drained so far
-    fn rows_drained(&self) -> u64;
-    /// The number of rows that are still available to drain
-    fn rows_left(&self) -> u64 {
-        self.num_rows() - self.rows_drained()
-    }
-    /// Creates a task to decode `num_rows` of data into an array
-    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
-    /// The data type of the decoded data
-    fn data_type(&self) -> &DataType;
 }
 
 pub struct DecodedPage {
@@ -2739,19 +2515,14 @@ pub async fn decode_batch(
     decoder_plugins: Arc<DecoderPlugins>,
     should_validate: bool,
     version: LanceFileVersion,
-    cache: Option<Arc<FileMetadataCache>>,
+    cache: Option<Arc<LanceCache>>,
 ) -> Result<RecordBatch> {
     // The io is synchronous so it shouldn't be possible for any async stuff to still be in progress
     // Still, if we just use now_or_never we hit misfires because some futures (channels) need to be
     // polled twice.
 
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
-    let cache = cache.unwrap_or_else(|| {
-        Arc::new(FileMetadataCache::with_capacity(
-            128 * 1024 * 1024,
-            CapacityMode::Bytes,
-        ))
-    });
+    let cache = cache.unwrap_or_else(|| Arc::new(LanceCache::with_capacity(128 * 1024 * 1024)));
     let mut decode_scheduler = DecodeBatchScheduler::try_new(
         batch.schema.as_ref(),
         &batch.top_level_columns,
@@ -2762,6 +2533,7 @@ pub async fn decode_batch(
         io_scheduler.clone(),
         cache,
         filter,
+        false, // cache_repetition_index - default to false for decode_batch
     )
     .await?;
     let (tx, rx) = unbounded_channel();

@@ -78,9 +78,10 @@ impl FilterLoader for FilteredRowIdsToPrefilter {
         let mut allow_list = RowIdTreeMap::new();
         while let Some(batch) = self.0.next().await {
             let batch = batch?;
-            let row_ids = batch.column_by_name(ROW_ID).expect(
-                "input batch missing row id column even though it is in the schema for the stream",
-            );
+            let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::Internal {
+                message: "input batch missing row id column even though it is in the schema for the stream".into(),
+                location: location!(),
+            })?;
             let row_ids = row_ids
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -169,6 +170,9 @@ impl DisplayAs for ReplayExec {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "Replay: capacity={:?}", self.capacity)
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "Replay\ncapacity={:?}", self.capacity)
             }
         }
     }
@@ -324,6 +328,12 @@ impl ExecutionPlan for ReplayExec {
         _: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         unimplemented!()
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // We aren't doing any work here, and it would be a little confusing
+        // to have multiple replay queues.
+        vec![false]
     }
 
     fn execute(

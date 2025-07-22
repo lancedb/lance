@@ -62,7 +62,7 @@ impl DatasetPreFilter {
     ) -> Self {
         let mut fragments = RoaringBitmap::new();
         if indices.iter().any(|idx| idx.fragment_bitmap.is_none()) {
-            fragments.insert_range(0..dataset.manifest.max_fragment_id);
+            fragments.insert_range(0..dataset.manifest.max_fragment_id.unwrap_or(0));
         } else {
             indices.iter().for_each(|idx| {
                 fragments |= idx.fragment_bitmap.as_ref().unwrap();
@@ -122,13 +122,6 @@ impl DatasetPreFilter {
     async fn do_create_deletion_mask_row_id(dataset: Arc<Dataset>) -> Result<Arc<RowIdMask>> {
         // This can only be computed as an allow list, since we have no idea
         // what the row ids were in the missing fragments.
-
-        let path = dataset
-            .base
-            .child(format!("row_id_mask{}", dataset.manifest().version));
-
-        let session = dataset.session();
-
         async fn load_row_ids_and_deletions(
             dataset: &Dataset,
         ) -> Result<Vec<(Arc<RowIdSequence>, Option<Arc<DeletionVector>>)>> {
@@ -144,12 +137,16 @@ impl DatasetPreFilter {
                 .await
         }
 
-        session
-            .file_metadata_cache
-            .get_or_insert(&path, move |_| {
-                let dataset = dataset.clone();
+        let dataset_clone = dataset.clone();
+        let key = crate::session::caches::RowIdMaskKey {
+            version: dataset.manifest().version,
+        };
+        dataset
+            .metadata_cache
+            .as_ref()
+            .get_or_insert_with_key(key, move || {
                 async move {
-                    let row_ids_and_deletions = load_row_ids_and_deletions(&dataset).await?;
+                    let row_ids_and_deletions = load_row_ids_and_deletions(&dataset_clone).await?;
 
                     // The process of computing the final mask is CPU-bound, so we spawn it
                     // on a blocking thread.

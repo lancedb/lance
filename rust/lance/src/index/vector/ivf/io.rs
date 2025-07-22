@@ -2,10 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::BinaryHeap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
 
+use super::IVFIndex;
+use crate::dataset::ROW_ID;
+use crate::index::vector::pq::{build_pq_storage, PQIndex};
 use arrow::compute::concat;
 use arrow_array::UInt64Array;
 use arrow_array::{
@@ -43,16 +46,11 @@ use snafu::location;
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
-use super::IVFIndex;
-use crate::dataset::ROW_ID;
-use crate::index::vector::pq::{build_pq_storage, PQIndex};
-
 use crate::Result;
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
-lazy_static::lazy_static! {
-    static ref HNSW_PARTITIONS_BUILD_PARALLEL: usize = get_num_compute_intensive_cpus();
-}
+static HNSW_PARTITIONS_BUILD_PARALLEL: LazyLock<usize> =
+    LazyLock::new(get_num_compute_intensive_cpus);
 
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
 async fn merge_streams(

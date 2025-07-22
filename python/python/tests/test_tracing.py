@@ -8,9 +8,12 @@ import sys
 import uuid
 
 import pytest
-from lance.tracing import trace_to_chrome
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="test fails in CI on Windows but passes locally on Windows",
+)
 def test_tracing():
     trace_files_before = set(glob.glob("trace-*.json"))
     subprocess.run(
@@ -20,6 +23,9 @@ def test_tracing():
             "from lance.tracing import trace_to_chrome; trace_to_chrome()",
         ],
         check=True,
+        env={
+            "LANCE_LOG": "debug",
+        },
     )
     trace_files_after = set(glob.glob("trace-*.json"))
     assert len(trace_files_before) + 1 == len(trace_files_after)
@@ -39,12 +45,65 @@ def test_tracing():
             + f"trace_to_chrome(file='{trace_name}')",
         ],
         check=True,
+        env={
+            "LANCE_LOG": "debug",
+        },
     )
 
     assert os.path.exists(trace_name)
     os.remove(trace_name)
 
 
-def test_tracing_invalid_level():
-    with pytest.raises(ValueError):
-        trace_to_chrome(level="invalid")
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="test fails in CI on Windows but passes locally on Windows",
+)
+def test_tracing_callback(tmp_path):
+    script = tmp_path / "script.py"
+    script.write_text(
+        """import lance
+import pyarrow as pa
+
+from lance.tracing import capture_trace_events
+
+events = []
+def callback(evt):
+    events.append(evt)
+
+capture_trace_events(callback)
+
+lance.write_dataset(pa.table({"x": range(100)}), "memory://test")
+assert len(events) == 4
+
+assert events[0].target == "lance::dataset_events"
+assert events[0].args["event"] == "writing"
+assert events[0].args["path"] == "test"
+assert events[0].args["mode"] == "Create"
+assert events[0].args["timestamp"] is not None
+
+assert events[1].target == "lance::file_audit"
+assert events[1].args["mode"] == "create"
+assert events[1].args["type"] == "data"
+assert events[1].args["timestamp"] is not None
+
+assert events[2].target == "lance::file_audit"
+assert events[2].args["mode"] == "create"
+assert events[2].args["type"] == "manifest"
+
+assert events[3].target == "lance::dataset_events"
+assert events[3].args["event"] == "committed"
+assert events[3].args["path"] == "test"
+assert events[3].args["read_version"] == "0"
+assert events[3].args["committed_version"] == "1"
+assert events[3].args["detached"] == "false"
+assert events[3].args["operation"] == "Overwrite"
+"""
+    )
+    subprocess.run(
+        [sys.executable, script],
+        capture_output=True,
+        check=True,
+        env={
+            "LANCE_LOG": "debug",
+        },
+    )

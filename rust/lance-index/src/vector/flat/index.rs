@@ -37,12 +37,15 @@ use super::storage::{FlatBinStorage, FlatFloatStorage, FLAT_COLUMN};
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct FlatIndex {}
 
-lazy_static::lazy_static! {
-    static ref ANN_SEARCH_SCHEMA: SchemaRef = Schema::new(vec![
+use std::sync::LazyLock;
+
+static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Schema::new(vec![
         Field::new(DIST_COL, DataType::Float32, true),
         ROW_ID_FIELD.clone(),
-    ]).into();
-}
+    ])
+    .into()
+});
 
 #[derive(Default)]
 pub struct FlatQueryParams {
@@ -208,12 +211,8 @@ impl Quantization for FlatQuantizer {
         }))
     }
 
-    fn metadata(
-        &self,
-        _: Option<crate::vector::quantizer::QuantizationMetadata>,
-    ) -> Result<serde_json::Value> {
-        let metadata = FlatMetadata { dim: self.dim };
-        Ok(serde_json::to_value(metadata)?)
+    fn metadata(&self, _: Option<crate::vector::quantizer::QuantizationMetadata>) -> FlatMetadata {
+        FlatMetadata { dim: self.dim }
     }
 
     fn metadata_key() -> &'static str {
@@ -226,6 +225,17 @@ impl Quantization for FlatQuantizer {
 
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
         Ok(vectors.slice(0, vectors.len()))
+    }
+
+    fn field(&self) -> Field {
+        Field::new(
+            FLAT_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                self.dim as i32,
+            ),
+            true,
+        )
     }
 }
 
@@ -290,12 +300,8 @@ impl Quantization for FlatBinQuantizer {
         }))
     }
 
-    fn metadata(
-        &self,
-        _: Option<crate::vector::quantizer::QuantizationMetadata>,
-    ) -> Result<serde_json::Value> {
-        let metadata = FlatMetadata { dim: self.dim };
-        Ok(serde_json::to_value(metadata)?)
+    fn metadata(&self, _: Option<crate::vector::quantizer::QuantizationMetadata>) -> FlatMetadata {
+        FlatMetadata { dim: self.dim }
     }
 
     fn metadata_key() -> &'static str {
@@ -308,6 +314,17 @@ impl Quantization for FlatBinQuantizer {
 
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
         Ok(vectors.slice(0, vectors.len()))
+    }
+
+    fn field(&self) -> Field {
+        Field::new(
+            FLAT_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                self.dim as i32,
+            ),
+            true,
+        )
     }
 }
 

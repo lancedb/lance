@@ -55,8 +55,9 @@ pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
     } else {
         None
     };
-    let expr = selection
-        .ok_or_else(|| Error::io(format!("Filter is not valid: {filter}"), location!()))?;
+    let expr = selection.ok_or_else(|| {
+        Error::invalid_input(format!("Filter is not valid: {filter}"), location!())
+    })?;
     Ok(expr.clone())
 }
 
@@ -92,7 +93,15 @@ fn parse_statement(statement: &str) -> Result<Statement> {
     // See: https://github.com/sqlparser-rs/sqlparser-rs/pull/815#issuecomment-1450714278
     let mut tokenizer = Tokenizer::new(&dialect, statement);
     let mut tokens = Vec::new();
-    let mut token_iter = tokenizer.tokenize()?.into_iter();
+    let mut token_iter = tokenizer
+        .tokenize()
+        .map_err(|e| {
+            Error::invalid_input(
+                format!("Error tokenizing statement: {statement} ({e})"),
+                location!(),
+            )
+        })?
+        .into_iter();
     let mut prev_token = token_iter.next().unwrap();
     for next_token in token_iter {
         if let (Token::Eq, Token::Eq) = (&prev_token, &next_token) {
@@ -103,16 +112,25 @@ fn parse_statement(statement: &str) -> Result<Statement> {
     }
     tokens.push(prev_token);
 
-    Ok(Parser::new(&dialect)
+    Parser::new(&dialect)
         .with_tokens(tokens)
-        .parse_statement()?)
+        .parse_statement()
+        .map_err(|e| {
+            Error::invalid_input(
+                format!("Error parsing statement: {statement} ({e})"),
+                location!(),
+            )
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use datafusion::sql::sqlparser::ast::{BinaryOperator, Ident, Value};
+    use datafusion::sql::sqlparser::{
+        ast::{BinaryOperator, Ident, Value, ValueWithSpan},
+        tokenizer::Span,
+    };
 
     #[test]
     fn test_double_equal() {
@@ -134,7 +152,10 @@ mod tests {
             Expr::Like {
                 negated: false,
                 expr: Box::new(Expr::Identifier(Ident::new("a"))),
-                pattern: Box::new(Expr::Value(Value::SingleQuotedString("abc%".to_string()))),
+                pattern: Box::new(Expr::Value(ValueWithSpan {
+                    value: Value::SingleQuotedString("abc%".to_string()),
+                    span: Span::empty(),
+                })),
                 escape_char: None,
                 any: false,
             },
@@ -163,7 +184,10 @@ mod tests {
                     Ident::with_quote('`', "inner field")
                 ])),
                 op: BinaryOperator::Eq,
-                right: Box::new(Expr::Value(Value::Number("1".to_string(), false))),
+                right: Box::new(Expr::Value(ValueWithSpan {
+                    value: Value::Number("1".to_string(), false),
+                    span: Span::empty(),
+                })),
             },
             expr
         );

@@ -42,10 +42,8 @@ impl TestingExec {
 }
 
 impl DisplayAs for TestingExec {
-    fn fmt_as(&self, t: DisplayFormatType, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => todo!(),
-        }
+    fn fmt_as(&self, _t: DisplayFormatType, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        todo!()
     }
 }
 

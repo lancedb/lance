@@ -5,17 +5,26 @@ inputs:
   python-minor-version:
     required: true
     description: "9 10 11 12"
+  skip-torch:
+    required: false
+    description: "Skip pytorch tests"
+    default: "false"
 runs:
   using: "composite"
   steps:
-  - name: Install dependencies
-    working-directory: python
-    shell: bash
-    run: |
-      # Install cpu only pytorch
-      pip install torch --index-url https://download.pytorch.org/whl/cpu
-      pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
-  - name: Run python tests
-    shell: bash
-    working-directory: python
-    run: make test
+    - name: Install dependencies
+      working-directory: python
+      shell: bash
+      run: |
+        pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
+    - name: Install torch
+      working-directory: python
+      shell: bash
+      if: inputs.skip-torch == 'false'
+      run: |
+        # Install cpu only pytorch
+        pip install torch --index-url https://download.pytorch.org/whl/cpu
+    - name: Run python tests
+      shell: bash
+      working-directory: python
+      run: make test

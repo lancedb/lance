@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use arrow::array::Float32Array;
-use jni::objects::{JMap, JObject, JString};
+use jni::objects::{JMap, JObject, JString, JValue};
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
@@ -39,18 +39,7 @@ pub fn extract_storage_options(
     storage_options_obj: &JObject,
 ) -> Result<HashMap<String, String>> {
     let jmap = JMap::from_env(env, storage_options_obj)?;
-    let storage_options: HashMap<String, String> = env.with_local_frame(16, |env| {
-        let mut map = HashMap::new();
-        let mut iter = jmap.iter(env)?;
-        while let Some((key, value)) = iter.next(env)? {
-            let key_jstring = JString::from(key);
-            let value_jstring = JString::from(value);
-            let key_string: String = env.get_string(&key_jstring)?.into();
-            let value_string: String = env.get_string(&value_jstring)?.into();
-            map.insert(key_string, value_string);
-        }
-        Ok::<_, Error>(map)
-    })?;
+    let storage_options: HashMap<String, String> = to_rust_map(env, &jmap)?;
     Ok(storage_options)
 }
 
@@ -99,7 +88,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let key = Arc::new(Float32Array::from(key_array));
 
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
-        let nprobes = env.get_int_as_usize_from_method(&java_obj, "getNprobes")?;
+        let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
+        let maximum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMaximumNprobes")?;
 
         let ef = env.get_optional_usize_from_method(&java_obj, "getEf")?;
 
@@ -120,7 +110,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             k,
             lower_bound: None,
             upper_bound: None,
-            nprobes,
+            minimum_nprobes,
+            maximum_nprobes,
             ef,
             refine_factor,
             metric_type: distance_type,
@@ -286,4 +277,39 @@ pub fn get_index_params(
             "VectorIndexParams not present".to_string(),
         )),
     }
+}
+
+pub fn to_rust_map(env: &mut JNIEnv, jmap: &JMap) -> Result<HashMap<String, String>> {
+    env.with_local_frame(16, |env| {
+        let mut map = HashMap::new();
+        let mut iter = jmap.iter(env)?;
+
+        while let Some((key, value)) = iter.next(env)? {
+            let key_jstring = JString::from(key);
+            let value_jstring = JString::from(value);
+            let key_string: String = env.get_string(&key_jstring)?.into();
+            let value_string: String = env.get_string(&value_jstring)?.into();
+            map.insert(key_string, value_string);
+        }
+
+        Ok::<_, Error>(map)
+    })
+}
+
+pub fn to_java_map<'local>(
+    env: &mut JNIEnv<'local>,
+    map: &HashMap<String, String>,
+) -> Result<JObject<'local>> {
+    let java_map = env.new_object("java/util/HashMap", "()V", &[])?;
+    for (k, v) in map {
+        let jkey = env.new_string(k)?;
+        let jval = env.new_string(v)?;
+        env.call_method(
+            &java_map,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&jkey), JValue::Object(&jval)],
+        )?;
+    }
+    Ok(java_map)
 }

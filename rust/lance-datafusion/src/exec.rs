@@ -3,7 +3,10 @@
 
 //! Utilities for working with datafusion execution plans
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex},
+};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
@@ -12,7 +15,7 @@ use datafusion::{
     dataframe::DataFrame,
     execution::{
         context::{SessionConfig, SessionContext},
-        disk_manager::DiskManagerConfig,
+        disk_manager::DiskManagerBuilder,
         memory_pool::FairSpillPool,
         runtime_env::RuntimeEnvBuilder,
         TaskContext,
@@ -20,7 +23,7 @@ use datafusion::{
     physical_plan::{
         analyze::AnalyzeExec,
         display::DisplayableExecutionPlan,
-        execution_plan::{Boundedness, EmissionType},
+        execution_plan::{Boundedness, CardinalityEffect, EmissionType},
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -28,23 +31,26 @@ use datafusion::{
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
-use lazy_static::lazy_static;
 
 use futures::{stream, StreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::{
     utils::{
         futures::FinallyStreamExt,
-        tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION},
+        tracing::{StreamTracingExt, EXECUTION_PLAN_RUN, TRACE_EXECUTION},
     },
     Error, Result,
 };
 use log::{debug, info, warn};
 use snafu::location;
+use tracing::Span;
 
-use crate::utils::{
-    MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
-    PARTS_LOADED_METRIC, REQUESTS_METRIC,
+use crate::{
+    chunker::StrictBatchSizeStream,
+    utils::{
+        MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
+        IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+    },
 };
 
 /// An source execution node created from an existing stream
@@ -105,18 +111,26 @@ impl DisplayAs for OneShotExec {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         let stream = self.stream.lock().unwrap();
+        let exhausted = if stream.is_some() { "" } else { "EXHAUSTED" };
+        let columns = self
+            .schema
+            .field_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let exhausted = if stream.is_some() { "" } else { "EXHAUSTED" };
-                let columns = self
-                    .schema
-                    .field_names()
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>();
                 write!(
                     f,
                     "OneShotStream: {}columns=[{}]",
+                    exhausted,
+                    columns.join(",")
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "OneShotStream\nexhausted={}\ncolumns=[{}]",
                     exhausted,
                     columns.join(",")
                 )
@@ -174,6 +188,84 @@ impl ExecutionPlan for OneShotExec {
 
     fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
         &self.properties
+    }
+}
+
+struct TracedExec {
+    input: Arc<dyn ExecutionPlan>,
+    properties: PlanProperties,
+    span: Span,
+}
+
+impl TracedExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, span: Span) -> Self {
+        Self {
+            properties: input.properties().clone(),
+            input,
+            span,
+        }
+    }
+}
+
+impl DisplayAs for TracedExec {
+    fn fmt_as(
+        &self,
+        t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
+                write!(f, "TracedExec")
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for TracedExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "TracedExec")
+    }
+}
+impl ExecutionPlan for TracedExec {
+    fn name(&self) -> &str {
+        "TracedExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            input: children[0].clone(),
+            properties: self.properties.clone(),
+            span: self.span.clone(),
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let _guard = self.span.enter();
+        let stream = self.input.execute(partition, context)?;
+        let schema = stream.schema();
+        let stream = stream.stream_in_span(self.span.clone());
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
@@ -242,7 +334,7 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     }
     if options.use_spilling() {
         runtime_env_builder = runtime_env_builder
-            .with_disk_manager(DiskManagerConfig::new())
+            .with_disk_manager_builder(DiskManagerBuilder::default())
             .with_memory_pool(Arc::new(FairSpillPool::new(
                 options.mem_pool_size() as usize
             )));
@@ -251,16 +343,15 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     SessionContext::new_with_config_rt(session_config, runtime_env)
 }
 
-lazy_static! {
-    static ref DEFAULT_SESSION_CONTEXT: SessionContext =
-        new_session_context(&LanceExecutionOptions::default());
-    static ref DEFAULT_SESSION_CONTEXT_WITH_SPILLING: SessionContext = {
-        new_session_context(&LanceExecutionOptions {
-            use_spilling: true,
-            ..Default::default()
-        })
-    };
-}
+static DEFAULT_SESSION_CONTEXT: LazyLock<SessionContext> =
+    LazyLock::new(|| new_session_context(&LanceExecutionOptions::default()));
+
+static DEFAULT_SESSION_CONTEXT_WITH_SPILLING: LazyLock<SessionContext> = LazyLock::new(|| {
+    new_session_context(&LanceExecutionOptions {
+        use_spilling: true,
+        ..Default::default()
+    })
+});
 
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE && options.target_partition.is_none()
@@ -286,42 +377,45 @@ fn get_task_context(
     state.task_ctx()
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionSummaryCounts {
+    /// The number of I/O operations performed
     pub iops: usize,
+    /// The number of requests made to the storage layer (may be larger or smaller than iops
+    /// depending on coalescing configuration)
     pub requests: usize,
+    /// The number of bytes read during the execution of the plan
     pub bytes_read: usize,
+    /// The number of top-level indices loaded
     pub indices_loaded: usize,
+    /// The number of index partitions loaded
     pub parts_loaded: usize,
+    /// The number of index comparisons performed (the exact meaning depends on the index type)
     pub index_comparisons: usize,
+    /// Additional metrics for more detailed statistics.  These are subject to change in the future
+    /// and should only be used for debugging purposes.
+    pub all_counts: HashMap<String, usize>,
 }
 
 fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
-        counts.iops += metrics
-            .find_count(IOPS_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.requests += metrics
-            .find_count(REQUESTS_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.bytes_read += metrics
-            .find_count(BYTES_READ_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.indices_loaded += metrics
-            .find_count(INDICES_LOADED_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.parts_loaded += metrics
-            .find_count(PARTS_LOADED_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
-        counts.index_comparisons += metrics
-            .find_count(INDEX_COMPARISONS_METRIC)
-            .map(|c| c.value())
-            .unwrap_or(0);
+        for (metric_name, count) in metrics.iter_counts() {
+            match metric_name.as_ref() {
+                IOPS_METRIC => counts.iops += count.value(),
+                REQUESTS_METRIC => counts.requests += count.value(),
+                BYTES_READ_METRIC => counts.bytes_read += count.value(),
+                INDICES_LOADED_METRIC => counts.indices_loaded += count.value(),
+                PARTS_LOADED_METRIC => counts.parts_loaded += count.value(),
+                INDEX_COMPARISONS_METRIC => counts.index_comparisons += count.value(),
+                _ => {
+                    let existing = counts
+                        .all_counts
+                        .entry(metric_name.as_ref().to_string())
+                        .or_insert(0);
+                    *existing += count.value();
+                }
+            }
+        }
     }
     for child in node.children() {
         visit_node(child.as_ref(), counts);
@@ -337,7 +431,7 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
     visit_node(plan, &mut counts);
     tracing::info!(
         target: TRACE_EXECUTION,
-        type = EXECUTION_PLAN_RUN,
+        r#type = EXECUTION_PLAN_RUN,
         output_rows,
         iops = counts.iops,
         requests = counts.requests,
@@ -381,6 +475,10 @@ pub async fn analyze_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<String> {
+    // This is needed as AnalyzeExec launches a thread task per
+    // partition, and we want these to be connected to the parent span
+    let plan = Arc::new(TracedExec::new(plan, Span::current()));
+
     let schema = plan.schema();
     let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
 
@@ -459,5 +557,85 @@ impl SessionContextExt for SessionContext {
         let part_stream = Arc::new(OneShotPartitionStream::new(data));
         let provider = StreamingTable::try_new(schema, vec![part_stream])?;
         self.read_table(Arc::new(provider))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StrictBatchSizeExec {
+    input: Arc<dyn ExecutionPlan>,
+    batch_size: usize,
+}
+
+impl StrictBatchSizeExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, batch_size: usize) -> Self {
+        Self { input, batch_size }
+    }
+}
+
+impl DisplayAs for StrictBatchSizeExec {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "StrictBatchSizeExec")
+    }
+}
+
+impl ExecutionPlan for StrictBatchSizeExec {
+    fn name(&self) -> &str {
+        "StrictBatchSizeExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            input: children[0].clone(),
+            batch_size: self.batch_size,
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let stream = self.input.execute(partition, context)?;
+        let schema = stream.schema();
+        let stream = StrictBatchSizeStream::new(stream, self.batch_size);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion_common::Result<Statistics> {
+        self.input.partition_statistics(partition)
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
     }
 }

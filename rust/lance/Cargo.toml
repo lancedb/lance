@@ -28,6 +28,7 @@ lance-table = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
+arrow-ipc = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
@@ -60,7 +61,9 @@ arrow.workspace = true
 datafusion.workspace = true
 datafusion-functions.workspace = true
 datafusion-physical-expr.workspace = true
+datafusion-physical-plan.workspace = true
 datafusion-expr.workspace = true
+either.workspace = true
 lapack = { version = "0.19.0", optional = true }
 snafu = { workspace = true }
 log = { workspace = true }
@@ -74,7 +77,6 @@ prost_old = { version = "0.12.6", package = "prost", optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 tempfile.workspace = true
 tracing.workspace = true
-lazy_static = { workspace = true }
 humantime = { workspace = true }
 async_cell = "0.2.2"
 
@@ -96,16 +98,16 @@ mock_instant.workspace = true
 lance-testing = { workspace = true }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 env_logger = "0.11.7"
+test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
-random_word = { version = "0.4.3", features = ["en"] }
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 
 
 [features]
-default = ["aws", "azure", "gcp"]
+default = ["aws", "azure", "gcp", "oss"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["clap", "lzma-sys/static"]
@@ -122,6 +124,7 @@ protoc = [
 aws = ["lance-io/aws"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
+oss = ["lance-io/oss"]
 
 [[bin]]
 name = "lq"

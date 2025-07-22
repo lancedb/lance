@@ -94,7 +94,7 @@ mod test {
 
     impl DeepSizeOf for MockIndex {
         fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-            todo!()
+            0
         }
     }
 
@@ -144,6 +144,10 @@ mod test {
             unimplemented!()
         }
 
+        fn total_partitions(&self) -> usize {
+            unimplemented!()
+        }
+
         async fn search_in_partition(
             &self,
             _: usize,
@@ -160,10 +164,6 @@ mod test {
 
         fn use_residual(&self) -> bool {
             true
-        }
-
-        fn check_can_remap(&self) -> Result<()> {
-            Ok(())
         }
 
         async fn load(

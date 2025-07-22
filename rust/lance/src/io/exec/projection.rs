@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field, FieldRef, Fields, Schema as ArrowSchema};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -94,13 +94,13 @@ fn selection_as_expr(
                 make_struct.name(),
                 make_struct.clone(),
                 sub_exprs,
-                project_field(field.data_type(), selection),
+                project_field(field, selection),
             ))
         }
     }
 }
 
-fn sub_field(parent_expr: Arc<dyn PhysicalExpr>, field: &Field) -> Arc<dyn PhysicalExpr> {
+fn sub_field(parent_expr: Arc<dyn PhysicalExpr>, field: &FieldRef) -> Arc<dyn PhysicalExpr> {
     let func = get_field_func();
     Arc::new(ScalarFunctionExpr::new(
         func.name(),
@@ -109,24 +109,30 @@ fn sub_field(parent_expr: Arc<dyn PhysicalExpr>, field: &Field) -> Arc<dyn Physi
             parent_expr,
             Arc::new(Literal::new(ScalarValue::Utf8(Some(field.name().clone())))),
         ],
-        field.data_type().clone(),
+        field.clone(),
     ))
 }
 
-fn project_field(field_type: &DataType, selection: &Selection) -> DataType {
+fn project_field(field: &FieldRef, selection: &Selection) -> FieldRef {
     match selection {
-        Selection::FullField(_) => field_type.clone(),
+        Selection::FullField(_) => {
+            // If we project, it's always null (for some reason).
+            Arc::new(Field::new(field.name(), field.data_type().clone(), true))
+        }
         Selection::StructProjection(_, sub_selections) => {
-            if let DataType::Struct(fields) = field_type {
+            if let DataType::Struct(fields) = field.data_type() {
                 let mut projected_fields = Vec::with_capacity(sub_selections.len());
                 for sub_selection in sub_selections {
                     let field_name = sub_selection.name();
                     let field = fields.iter().find(|f| f.name() == field_name).unwrap();
-                    let projected_field_type = project_field(field.data_type(), sub_selection);
-                    // If we project, it's always null (for some reason).
-                    projected_fields.push(Field::new(field_name, projected_field_type, true));
+                    let projected_field = project_field(field, sub_selection);
+                    projected_fields.push(projected_field);
                 }
-                DataType::Struct(projected_fields.into())
+                Arc::new(Field::new(
+                    field.name(),
+                    DataType::Struct(projected_fields.into()),
+                    true,
+                ))
             } else {
                 panic!("Expected struct")
             }
@@ -172,24 +178,35 @@ pub fn compute_projection<'a>(
                             schema
                         ))
                     })?;
-                let DataType::Struct(input_fields) = original_field.data_type() else {
-                    return Err(DataFusionError::Internal(
-                        "compute_projection: expected struct".to_string(),
-                    ));
-                };
+                match original_field.data_type() {
+                    DataType::Struct(input_fields) => {
+                        let sub_selections = compute_projection(input_fields, fields)?;
 
-                let sub_selections = compute_projection(input_fields, fields)?;
-                if fields.len() == input_fields.len()
-                    && sub_selections
-                        .iter()
-                        .all(|s| matches!(s, Selection::FullField(_)))
-                {
-                    selections.push(Selection::FullField(projected_field.name()));
-                } else {
-                    selections.push(Selection::StructProjection(
-                        projected_field.name(),
-                        sub_selections,
-                    ));
+                        if fields.len() == input_fields.len()
+                            && sub_selections
+                                .iter()
+                                .all(|s| matches!(s, Selection::FullField(_)))
+                        {
+                            selections.push(Selection::FullField(projected_field.name()));
+                        } else {
+                            selections.push(Selection::StructProjection(
+                                projected_field.name(),
+                                sub_selections,
+                            ));
+                        }
+                    }
+                    DataType::LargeBinary => {
+                        // This can happen when loading blob fields.  The projection we load from disk
+                        // is the blob description (struct) but the actual result / schema field is large_binary
+                        selections.push(Selection::FullField(projected_field.name()));
+                    }
+                    _ => {
+                        return Err(DataFusionError::Internal(format!(
+                            "Field '{}' expected struct or LargeBinary, found {:?}",
+                            original_field.name(),
+                            original_field.data_type()
+                        )));
+                    }
                 }
             }
             _ => {

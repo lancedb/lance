@@ -5,6 +5,8 @@
 //!
 //! WARNING: Internal API with no stability guarantees.
 
+mod filter;
+pub mod filtered_read;
 pub mod fts;
 pub(crate) mod knn;
 mod optimizer;
@@ -18,6 +20,7 @@ mod take;
 pub mod testing;
 pub mod utils;
 
+pub use filter::LanceFilterExec;
 pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec};
 pub use lance_datafusion::planner::Planner;
 pub use lance_index::scalar::expression::FilterPlan;

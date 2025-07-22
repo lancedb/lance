@@ -22,7 +22,7 @@ use async_recursion::async_recursion;
 use deepsize::DeepSizeOf;
 use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::*;
-use lance_core::cache::FileMetadataCache;
+use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
 use lance_io::encodings::dictionary::DictionaryDecoder;
@@ -33,6 +33,7 @@ use lance_io::utils::{
     read_fixed_stride_array, read_metadata_offset, read_struct, read_struct_from_buf,
 };
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
+use std::borrow::Cow;
 
 use object_store::path::Path;
 use snafu::location;
@@ -68,6 +69,29 @@ impl std::fmt::Debug for FileReader {
     }
 }
 
+// Generic cache key for string-based keys
+struct StringCacheKey<'a, T> {
+    key: &'a str,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<'a, T> StringCacheKey<'a, T> {
+    fn new(key: &'a str) -> Self {
+        Self {
+            key,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> CacheKey for StringCacheKey<'_, T> {
+    type ValueType = T;
+
+    fn key(&self) -> Cow<'_, str> {
+        self.key.into()
+    }
+}
+
 impl FileReader {
     /// Open file reader
     ///
@@ -89,7 +113,7 @@ impl FileReader {
         fragment_id: u32,
         field_id_offset: i32,
         max_field_id: i32,
-        session: Option<&FileMetadataCache>,
+        session: Option<&LanceCache>,
     ) -> Result<Self> {
         let object_reader = object_store.open(path).await?;
 
@@ -117,7 +141,7 @@ impl FileReader {
         fragment_id: u32,
         field_id_offset: i32,
         max_field_id: i32,
-        session: Option<&FileMetadataCache>,
+        session: Option<&LanceCache>,
     ) -> Result<Self> {
         let metadata = match metadata {
             Some(metadata) => metadata,
@@ -125,7 +149,7 @@ impl FileReader {
         };
 
         let page_table = async {
-            Self::load_from_cache(session, path, |_| async {
+            Self::load_from_cache(session, path.to_string(), |_| async {
                 PageTable::load(
                     object_reader.as_ref(),
                     metadata.page_table_position,
@@ -155,9 +179,9 @@ impl FileReader {
 
     pub async fn read_metadata(
         object_reader: &dyn Reader,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Arc<Metadata>> {
-        Self::load_from_cache(cache, object_reader.path(), |_| async {
+        Self::load_from_cache(cache, object_reader.path().to_string(), |_| async {
             let file_size = object_reader.size().await?;
             let begin = if file_size < object_reader.block_size() {
                 0
@@ -184,10 +208,10 @@ impl FileReader {
     /// The page table is cached.
     async fn read_stats_page_table(
         reader: &dyn Reader,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
     ) -> Result<Arc<Option<PageTable>>> {
         // To prevent collisions, we cache this at a child path
-        Self::load_from_cache(cache, &reader.path().child("stats"), |_| async {
+        Self::load_from_cache(cache, reader.path().child("stats").to_string(), |_| async {
             let metadata = Self::read_metadata(reader, cache).await?;
 
             if let Some(stats_meta) = metadata.stats_metadata.as_ref() {
@@ -210,18 +234,21 @@ impl FileReader {
 
     /// Load some metadata about the fragment from the cache, if there is one.
     async fn load_from_cache<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
-        cache: Option<&FileMetadataCache>,
-        path: &Path,
+        cache: Option<&LanceCache>,
+        key: String,
         loader: F,
     ) -> Result<Arc<T>>
     where
-        F: Fn(&Path) -> Fut,
-        Fut: Future<Output = Result<T>>,
+        F: Fn(&str) -> Fut,
+        Fut: Future<Output = Result<T>> + Send,
     {
         if let Some(cache) = cache {
-            cache.get_or_insert(path, loader).await
+            let cache_key = StringCacheKey::<T>::new(key.as_str());
+            cache
+                .get_or_insert_with_key(cache_key, || loader(key.as_str()))
+                .await
         } else {
-            Ok(Arc::new(loader(path).await?))
+            Ok(Arc::new(loader(key.as_str()).await?))
         }
     }
 
@@ -724,6 +751,12 @@ where
         ReadBatchParams::Range(range) => ReadBatchParams::from(
             positions.value(0).as_usize()..positions.value(range.end - range.start).as_usize(),
         ),
+        ReadBatchParams::Ranges(_) => {
+            return Err(Error::Internal {
+                message: "ReadBatchParams::Ranges should not be used in v1 files".to_string(),
+                location: location!(),
+            })
+        }
         ReadBatchParams::RangeTo(RangeTo { end }) => {
             ReadBatchParams::from(..positions.value(*end).as_usize())
         }

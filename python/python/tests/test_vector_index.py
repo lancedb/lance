@@ -14,8 +14,7 @@ import pyarrow.compute as pc
 import pytest
 from lance import LanceFragment
 from lance.dataset import VectorIndexReader
-
-torch = pytest.importorskip("torch")
+from lance.indices import IndexFileVersion
 from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
@@ -240,7 +239,10 @@ def test_f16_cuda(tmp_path):
     validate_vector_index(dataset, "vector")
 
 
-def test_index_with_nans(tmp_path):
+@pytest.mark.parametrize(
+    "index_file_version", [IndexFileVersion.V3, IndexFileVersion.LEGACY]
+)
+def test_index_with_nans(tmp_path, index_file_version):
     # 1024 rows, the entire table should be sampled
     tbl = create_table(nvec=1000, nans=24)
 
@@ -250,11 +252,19 @@ def test_index_with_nans(tmp_path):
         index_type="IVF_PQ",
         num_partitions=4,
         num_sub_vectors=16,
+        index_file_version=index_file_version,
     )
+    idx_stats = dataset.stats.index_stats("vector_idx")
+    assert idx_stats["indices"][0]["index_file_version"] == index_file_version
     validate_vector_index(dataset, "vector")
 
 
-def test_torch_index_with_nans(tmp_path):
+@pytest.mark.parametrize(
+    "index_file_version", [IndexFileVersion.V3, IndexFileVersion.LEGACY]
+)
+def test_torch_index_with_nans(tmp_path, index_file_version):
+    torch = pytest.importorskip("torch")
+
     # 1024 rows, the entire table should be sampled
     tbl = create_table(nvec=1000, nans=24)
 
@@ -266,11 +276,16 @@ def test_torch_index_with_nans(tmp_path):
         num_sub_vectors=16,
         accelerator=torch.device("cpu"),
         one_pass_ivfpq=True,
+        index_file_version=index_file_version,
     )
+    idx_stats = dataset.stats.index_stats("vector_idx")
+    assert idx_stats["indices"][0]["index_file_version"] == index_file_version
     validate_vector_index(dataset, "vector")
 
 
 def test_index_with_no_centroid_movement(tmp_path):
+    torch = pytest.importorskip("torch")
+
     # this test makes the centroids essentially [1..]
     # this makes sure the early stop condition in the index building code
     # doesn't do divide by zero
@@ -343,6 +358,10 @@ def test_create_index_using_cuda(tmp_path, nullify):
 
 
 def test_create_index_unsupported_accelerator(tmp_path):
+    # Even attempting to use an accelerator will trigger torch import
+    # so make sure it's available
+    pytest.importorskip("torch")
+
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
     with pytest.raises(ValueError):
@@ -531,6 +550,17 @@ def test_ivf_flat_over_binary_vector(tmp_path):
     )
 
 
+def test_create_ivf_sq_index(dataset, tmp_path):
+    assert not dataset.has_index
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_SQ",
+        num_partitions=4,
+    )
+    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
@@ -549,6 +579,18 @@ def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
     ann_ds = ann_ds.create_index(
         "vector",
         index_type="IVF_HNSW_SQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+    )
+    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
+def test_create_ivf_hnsw_flat_index(dataset, tmp_path):
+    assert not dataset.has_index
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_FLAT",
         num_partitions=4,
         num_sub_vectors=16,
     )
@@ -640,6 +682,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             "num_sub_vectors": 8,
             "transposed": True,
         },
+        "index_file_version": IndexFileVersion.V3,
     }
 
     with pytest.raises(KeyError, match='Index "non-existent_idx" not found'):
@@ -896,6 +939,7 @@ def test_index_cache_size(tmp_path):
                 nearest={
                     "column": "vector",
                     "q": q if q is not None else rng.standard_normal(ndim),
+                    "minimum_nprobes": 1,
                 },
             )
 
@@ -903,21 +947,17 @@ def test_index_cache_size(tmp_path):
     dataset = lance.write_dataset(tbl, tmp_path / "test")
 
     dataset.create_index(
-        "vector",
-        index_type="IVF_PQ",
-        num_partitions=128,
-        num_sub_vectors=2,
-        index_cache_size=10,
+        "vector", index_type="IVF_PQ", num_partitions=128, num_sub_vectors=2
     )
 
-    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=0)
-    # when there is no hit, the hit rate is hard coded to 1.0
-    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 1.0)
+    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size_bytes=0)
+    # Zero size index cache means all queries should miss the cache
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
     query_index(indexed_dataset, 1)
     # index cache is size=0, there should be no hit
     assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
 
-    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=1)
+    indexed_dataset = lance.dataset(tmp_path / "test")
     # query using the same vector, we should get a very high hit rate
     # it isn't always exactly 199/200 perhaps because the stats counter
     # is a relaxed atomic counter and may lag behind the true value or perhaps
@@ -931,6 +971,65 @@ def test_index_cache_size(tmp_path):
     query_index(indexed_dataset, 128)
 
     assert last_hit_rate > indexed_dataset._ds.index_cache_hit_rate()
+
+
+def test_index_cache_size_bytes(tmp_path):
+    """Test the new index_cache_size_bytes parameter."""
+    rng = np.random.default_rng(seed=42)
+
+    def query_index(ds, ntimes, q=None):
+        ndim = ds.schema[0].type.list_size
+        for _ in range(ntimes):
+            ds.to_table(
+                nearest={
+                    "column": "vector",
+                    "q": q if q is not None else rng.standard_normal(ndim),
+                    "minimum_nprobes": 1,
+                },
+            )
+
+    tbl = create_table(nvec=1024, ndim=16)
+    dataset = lance.write_dataset(tbl, tmp_path / "test")
+
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=128, num_sub_vectors=2
+    )
+
+    # Test with index_cache_size_bytes=0 (no cache)
+    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size_bytes=0)
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
+    query_index(indexed_dataset, 1)
+    # No cache, so hit rate should be 0
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
+
+    # Test with index_cache_size_bytes=20MB (1 entry equivalent)
+    indexed_dataset = lance.dataset(
+        tmp_path / "test", index_cache_size_bytes=20 * 1024 * 1024
+    )
+    # Query using the same vector, we should get a good hit rate
+    query_index(indexed_dataset, 200, q=rng.standard_normal(16))
+    assert indexed_dataset._ds.index_cache_hit_rate() > 0.8
+
+
+def test_index_cache_size_deprecation(tmp_path):
+    """Test that index_cache_size shows deprecation warning."""
+    import warnings
+
+    tbl = create_table(nvec=100, ndim=16)
+    lance.write_dataset(tbl, tmp_path / "test")
+
+    # Test deprecation warning
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+
+        # This should trigger the deprecation warning
+        lance.dataset(tmp_path / "test", index_cache_size=256)
+
+        # Check that a deprecation warning was issued
+        assert len(w) == 1
+        assert issubclass(w[0].category, DeprecationWarning)
+        assert "index_cache_size" in str(w[0].message)
+        assert "index_cache_size_bytes" in str(w[0].message)
 
 
 def test_f16_index(tmp_path: Path):
@@ -1033,6 +1132,8 @@ def test_dynamic_projection_with_vectors_index(tmp_path: Path):
 
 
 def test_index_cast_centroids(tmp_path):
+    torch = pytest.importorskip("torch")
+
     tbl = create_table(nvec=1000)
 
     dataset = lance.write_dataset(tbl, tmp_path)
@@ -1097,24 +1198,33 @@ def test_fragment_scan_allowed_on_ann_with_file_scan_prefilter(dataset):
 
 def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
     tbl = create_table()
-    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = lance.write_dataset(tbl, tmp_path, max_rows_per_file=250)
     dataset.create_index(
         "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
     dataset.create_scalar_index("id", index_type="BTREE")
 
+    assert len(dataset.get_fragments()) == 4
+
     q = np.random.randn(128)
-    with pytest.raises(
-        ValueError, match="This operation is not supported for fragment scan"
-    ):
-        scanner = dataset.scanner(
-            prefilter=True,
-            filter="id=1234",
-            columns=["id"],
-            nearest={"column": "vector", "q": q, "use_index": True},
-            fragments=[LanceFragment(dataset, 0)],
-        )
-        scanner.explain_plan(True)
+    results = dataset.scanner(
+        prefilter=True,
+        filter="id > 50",
+        columns=["id"],
+        nearest={"column": "vector", "q": q, "use_index": True},
+        fragments=[dataset.get_fragment(1)],
+    ).to_table()
+
+    results_no_scalar_index = dataset.scanner(
+        prefilter=True,
+        filter="id > 50",
+        columns=["id"],
+        nearest={"column": "vector", "q": q, "use_index": True},
+        fragments=[dataset.get_fragment(1)],
+        use_scalar_index=False,
+    ).to_table()
+
+    assert results == results_no_scalar_index
 
 
 def test_load_indices(dataset):
@@ -1227,3 +1337,98 @@ def test_read_partition(indexed_dataset):
     with pytest.raises(ValueError, match="not vector index"):
         indexed_dataset.create_scalar_index("id", index_type="BTREE")
         VectorIndexReader(indexed_dataset, "id_idx")
+
+
+def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
+    uri = indexed_dataset.uri
+    new_table = create_table()
+    ds = lance.write_dataset(new_table, uri, mode="append")
+    ds.optimize.optimize_indices(num_indices_to_merge=0)
+    ds.create_scalar_index("id", index_type="BTREE")
+
+    raw_table = create_table()
+    ds = lance.write_dataset(raw_table, uri, mode="append")
+    ds.optimize.optimize_indices(num_indices_to_merge=0, index_names=["vector_idx"])
+
+    res = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+        },
+        filter="id > 0",
+        with_row_id=True,
+        prefilter=True,
+    )
+    assert len(res) == 10
+
+
+def test_vector_index_with_nprobes(indexed_dataset):
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "nprobes": 7,
+        }
+    ).explain_plan()
+
+    assert "minimum_nprobes=7" in res
+    assert "maximum_nprobes=Some(7)" in res
+
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "minimum_nprobes": 7,
+        }
+    ).explain_plan()
+
+    assert "minimum_nprobes=7" in res
+    assert "maximum_nprobes=None" in res
+
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "minimum_nprobes": 7,
+            "maximum_nprobes": 10,
+        }
+    ).explain_plan()
+
+    assert "minimum_nprobes=7" in res
+    assert "maximum_nprobes=Some(10)" in res
+
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "maximum_nprobes": 30,
+        }
+    ).analyze_plan()
+
+    print(res)
+
+
+def test_knn_deleted_rows(tmp_path):
+    data = create_table()
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="cosine",
+        num_partitions=4,
+        num_sub_vectors=4,
+    )
+    ds.insert(create_table())
+
+    ds.delete("id = 0")
+    assert ds.count_rows() == data.num_rows * 2 - 2
+    results = ds.to_table(
+        nearest={"column": "vector", "q": data["vector"][0], "k": ds.count_rows()}
+    )
+    assert 0 not in results["id"]
+    assert results.num_rows == ds.count_rows()

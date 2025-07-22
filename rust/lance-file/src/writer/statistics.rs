@@ -190,7 +190,7 @@ fn truncate_utf8(data: &str, length: usize) -> Option<&str> {
     None
 }
 
-/// Try and increment the the string's bytes from right to left, returning when the result is a valid UTF8 string.
+/// Try and increment the string's bytes from right to left, returning when the result is a valid UTF8 string.
 /// Returns `None` when it can't increment any byte.
 fn increment_utf8(mut data: Vec<u8>) -> Option<Vec<u8>> {
     for idx in (0..data.len()).rev() {

@@ -11,7 +11,7 @@ pub fn deep_copy_buffer(buffer: &Buffer) -> Buffer {
     Buffer::from(buffer.as_slice())
 }
 
-fn deep_copy_nulls(nulls: Option<&NullBuffer>) -> Option<NullBuffer> {
+pub fn deep_copy_nulls(nulls: Option<&NullBuffer>) -> Option<NullBuffer> {
     let nulls = nulls?;
     let bit_buffer = deep_copy_buffer(nulls.inner().inner());
     Some(unsafe {

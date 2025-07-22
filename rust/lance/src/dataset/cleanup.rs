@@ -138,7 +138,10 @@ impl<'a> CleanupTask<'a> {
         // or clean around the manifest
 
         let tags = self.dataset.tags.list().await?;
-        let tagged_versions: HashSet<u64> = tags.values().map(|v| v.version).collect();
+        let tagged_versions: HashSet<u64> = tags
+            .values()
+            .map(|tag_content| tag_content.version)
+            .collect();
 
         let inspection = self.process_manifests(&tagged_versions).await?;
 
@@ -160,8 +163,7 @@ impl<'a> CleanupTask<'a> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
             .commit_handler
-            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store.inner)
-            .await?
+            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                 self.process_manifest_file(location, &inspection, tagged_versions)
             })
@@ -192,7 +194,7 @@ impl<'a> CleanupTask<'a> {
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || manifest.timestamp() >= self.before || is_tagged;
         let indexes =
-            read_manifest_indexes(&self.dataset.object_store, &location.path, &manifest).await?;
+            read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
 
         let mut inspection = inspection.lock().unwrap();
 
@@ -263,7 +265,6 @@ impl<'a> CleanupTask<'a> {
             .dataset
             .object_store
             .read_dir_all(&self.dataset.base, Some(self.before))
-            .await?
             .try_filter_map(|obj_meta| {
                 // If a file is new-ish then it might be part of an ongoing operation and so we only
                 // delete it if we can verify it is part of an old version.
@@ -272,7 +273,7 @@ impl<'a> CleanupTask<'a> {
                 let path_to_remove =
                     self.path_if_not_referenced(obj_meta.location, maybe_in_progress, &inspection);
                 if matches!(path_to_remove, Ok(Some(..))) {
-                    removal_stats.lock().unwrap().bytes_removed += obj_meta.size as u64;
+                    removal_stats.lock().unwrap().bytes_removed += obj_meta.size;
                 }
                 future::ready(path_to_remove)
             })
@@ -289,12 +290,12 @@ impl<'a> CleanupTask<'a> {
             .await;
         let manifest_bytes_removed = stream::iter(manifest_bytes_removed)
             .buffer_unordered(self.dataset.object_store.io_parallelism())
-            .try_fold(0, |acc, size| async move { Ok(acc + (size as u64)) })
+            .try_fold(0, |acc, size| async move { Ok(acc + (size)) })
             .await;
 
         let old_manifests_stream = stream::iter(old_manifests)
             .map(|path| {
-                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, type=AUDIT_TYPE_MANIFEST, path = path.to_string());
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
                 Ok(path)
             })
             .boxed();
@@ -348,14 +349,14 @@ impl<'a> CleanupTask<'a> {
                 {
                     return Ok(None);
                 } else if !maybe_in_progress {
-                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, type=AUDIT_TYPE_INDEX, path = path.to_string());
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_INDEX, path = path.to_string());
                     return Ok(Some(path));
                 } else if inspection
                     .verified_files
                     .index_uuids
                     .contains(uuid.as_ref())
                 {
-                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, type=AUDIT_TYPE_INDEX, path = path.to_string());
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_INDEX, path = path.to_string());
                     return Ok(Some(path));
                 }
             } else {
@@ -372,14 +373,14 @@ impl<'a> CleanupTask<'a> {
                     {
                         Ok(None)
                     } else if !maybe_in_progress {
-                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, type=AUDIT_TYPE_DATA, path = path.to_string());
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_DATA, path = path.to_string());
                         Ok(Some(path))
                     } else if inspection
                         .verified_files
                         .data_paths
                         .contains(&relative_path)
                     {
-                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, type=AUDIT_TYPE_DATA, path = path.to_string());
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DATA, path = path.to_string());
                         Ok(Some(path))
                     } else {
                         Ok(None)
@@ -402,14 +403,14 @@ impl<'a> CleanupTask<'a> {
                     {
                         Ok(None)
                     } else if !maybe_in_progress {
-                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, type=AUDIT_TYPE_DELETION, path = path.to_string());
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
                         Ok(Some(path))
                     } else if inspection
                         .verified_files
                         .delete_paths
                         .contains(&relative_path)
                     {
-                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, type=AUDIT_TYPE_DELETION, path = path.to_string());
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
                         Ok(Some(path))
                     } else {
                         Ok(None)
@@ -797,7 +798,7 @@ mod tests {
             let (os, path) =
                 ObjectStore::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
                     .await?;
-            let mut file_stream = os.read_dir_all(&path, None).await?;
+            let mut file_stream = os.read_dir_all(&path, None);
             let mut file_count = FileCounts {
                 num_data_files: 0,
                 num_delete_files: 0,
@@ -807,7 +808,7 @@ mod tests {
                 num_bytes: 0,
             };
             while let Some(path) = file_stream.try_next().await? {
-                file_count.num_bytes += path.size as u64;
+                file_count.num_bytes += path.size;
                 match path.location.extension() {
                     Some("lance") => file_count.num_data_files += 1,
                     Some("manifest") => file_count.num_manifest_files += 1,

@@ -3,11 +3,13 @@
 
 use std::fmt::{Display, Formatter};
 use std::ops::Range;
+use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
+use datafusion_physical_plan::ExecutionPlan;
 use futures::stream::BoxStream;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
@@ -17,8 +19,8 @@ use lance_io::object_store::WrappingObjectStore;
 use lance_table::format::Fragment;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
+    GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -28,6 +30,10 @@ use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
 use crate::dataset::WriteParams;
 use crate::Dataset;
+
+mod throttle_store;
+
+pub use throttle_store::ThrottledStoreWrapper;
 
 /// A dataset generator that can generate random layouts. This is used to test
 /// dataset operations are robust to different layouts.
@@ -273,6 +279,19 @@ pub struct IoStats {
     pub read_bytes: u64,
     pub write_iops: u64,
     pub write_bytes: u64,
+    /// Number of disjoint periods where at least one IO is in-flight.
+    pub num_hops: u64,
+    pub requests: Vec<IoRequestRecord>,
+}
+
+// These fields are "dead code" because we just use them right now to display
+// in test failure messages through Debug. (The lint ignores Debug impls.)
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct IoRequestRecord {
+    pub method: &'static str,
+    pub path: Path,
+    pub range: Option<Range<u64>>,
 }
 
 impl Display for IoStats {
@@ -285,6 +304,7 @@ impl Display for IoStats {
 pub struct IoTrackingStore {
     target: Arc<dyn ObjectStore>,
     stats: Arc<Mutex<IoStats>>,
+    active_requests: Arc<AtomicU16>,
 }
 
 impl Display for IoTrackingStore {
@@ -293,14 +313,21 @@ impl Display for IoTrackingStore {
     }
 }
 
-#[derive(Debug)]
-struct StatsHolder(Arc<Mutex<IoStats>>);
+#[derive(Debug, Default, Clone)]
+pub struct StatsHolder(Arc<Mutex<IoStats>>);
+
+impl StatsHolder {
+    pub fn incremental_stats(&self) -> IoStats {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
 
 impl WrappingObjectStore for StatsHolder {
     fn wrap(&self, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         Arc::new(IoTrackingStore {
             target,
             stats: self.0.clone(),
+            active_requests: Arc::new(AtomicU16::new(0)),
         })
     }
 }
@@ -311,10 +338,21 @@ impl IoTrackingStore {
         (Arc::new(StatsHolder(stats.clone())), stats)
     }
 
-    fn record_read(&self, num_bytes: u64) {
+    fn record_read(
+        &self,
+        method: &'static str,
+        path: Path,
+        num_bytes: u64,
+        range: Option<Range<u64>>,
+    ) {
         let mut stats = self.stats.lock().unwrap();
         stats.read_iops += 1;
         stats.read_bytes += num_bytes;
+        stats.requests.push(IoRequestRecord {
+            method,
+            path,
+            range,
+        });
     }
 
     fn record_write(&self, num_bytes: u64) {
@@ -322,12 +360,17 @@ impl IoTrackingStore {
         stats.write_iops += 1;
         stats.write_bytes += num_bytes;
     }
+
+    fn hop_guard(&self) -> HopGuard {
+        HopGuard::new(self.active_requests.clone(), self.stats.clone())
+    }
 }
 
 #[async_trait::async_trait]
 #[deny(clippy::missing_trait_methods)]
 impl ObjectStore for IoTrackingStore {
     async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
+        let _guard = self.hop_guard();
         self.record_write(bytes.content_length() as u64);
         self.target.put(location, bytes).await
     }
@@ -338,15 +381,18 @@ impl ObjectStore for IoTrackingStore {
         bytes: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
+        let _guard = self.hop_guard();
         self.record_write(bytes.content_length() as u64);
         self.target.put_opts(location, bytes, opts).await
     }
 
     async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
+        let _guard = self.hop_guard();
         let target = self.target.put_multipart(location).await?;
         Ok(Box::new(IoTrackingMultipartUpload {
             target,
             stats: self.stats.clone(),
+            _guard,
         }))
     }
 
@@ -355,53 +401,76 @@ impl ObjectStore for IoTrackingStore {
         location: &Path,
         opts: PutMultipartOpts,
     ) -> OSResult<Box<dyn MultipartUpload>> {
+        let _guard = self.hop_guard();
         let target = self.target.put_multipart_opts(location, opts).await?;
         Ok(Box::new(IoTrackingMultipartUpload {
             target,
             stats: self.stats.clone(),
+            _guard,
         }))
     }
 
     async fn get(&self, location: &Path) -> OSResult<GetResult> {
+        let _guard = self.hop_guard();
         let result = self.target.get(location).await;
         if let Ok(result) = &result {
             let num_bytes = result.range.end - result.range.start;
-            self.record_read(num_bytes as u64);
+            self.record_read("get", location.to_owned(), num_bytes, None);
         }
         result
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        let _guard = self.hop_guard();
+        let range = match &options.range {
+            Some(GetRange::Bounded(range)) => Some(range.clone()),
+            _ => None, // TODO: fill in other options.
+        };
         let result = self.target.get_opts(location, options).await;
         if let Ok(result) = &result {
             let num_bytes = result.range.end - result.range.start;
-            self.record_read(num_bytes as u64);
+
+            self.record_read("get_opts", location.to_owned(), num_bytes, range);
         }
         result
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
-        let result = self.target.get_range(location, range).await;
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
+        let _guard = self.hop_guard();
+        let result = self.target.get_range(location, range.clone()).await;
         if let Ok(result) = &result {
-            self.record_read(result.len() as u64);
+            self.record_read(
+                "get_range",
+                location.to_owned(),
+                result.len() as u64,
+                Some(range),
+            );
         }
         result
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+        let _guard = self.hop_guard();
         let result = self.target.get_ranges(location, ranges).await;
         if let Ok(result) = &result {
-            self.record_read(result.iter().map(|b| b.len() as u64).sum());
+            self.record_read(
+                "get_ranges",
+                location.to_owned(),
+                result.iter().map(|b| b.len() as u64).sum(),
+                None,
+            );
         }
         result
     }
 
     async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-        self.record_read(0);
+        let _guard = self.hop_guard();
+        self.record_read("head", location.to_owned(), 0, None);
         self.target.head(location).await
     }
 
     async fn delete(&self, location: &Path) -> OSResult<()> {
+        let _guard = self.hop_guard();
         self.record_write(0);
         self.target.delete(location).await
     }
@@ -413,8 +482,9 @@ impl ObjectStore for IoTrackingStore {
         self.target.delete_stream(locations)
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
-        self.record_read(0);
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        let _guard = self.hop_guard();
+        self.record_read("list", prefix.cloned().unwrap_or_default(), 0, None);
         self.target.list(prefix)
     }
 
@@ -422,32 +492,47 @@ impl ObjectStore for IoTrackingStore {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> BoxStream<'_, OSResult<ObjectMeta>> {
-        self.record_read(0);
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.record_read(
+            "list_with_offset",
+            prefix.cloned().unwrap_or_default(),
+            0,
+            None,
+        );
         self.target.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
-        self.record_read(0);
+        let _guard = self.hop_guard();
+        self.record_read(
+            "list_with_delimiter",
+            prefix.cloned().unwrap_or_default(),
+            0,
+            None,
+        );
         self.target.list_with_delimiter(prefix).await
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+        let _guard = self.hop_guard();
         self.record_write(0);
         self.target.copy(from, to).await
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+        let _guard = self.hop_guard();
         self.record_write(0);
         self.target.rename(from, to).await
     }
 
     async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+        let _guard = self.hop_guard();
         self.record_write(0);
         self.target.rename_if_not_exists(from, to).await
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+        let _guard = self.hop_guard();
         self.record_write(0);
         self.target.copy_if_not_exists(from, to).await
     }
@@ -457,6 +542,7 @@ impl ObjectStore for IoTrackingStore {
 struct IoTrackingMultipartUpload {
     target: Box<dyn MultipartUpload>,
     stats: Arc<Mutex<IoStats>>,
+    _guard: HopGuard,
 }
 
 #[async_trait::async_trait]
@@ -476,6 +562,35 @@ impl MultipartUpload for IoTrackingMultipartUpload {
             stats.write_bytes += payload.content_length() as u64;
         }
         self.target.put_part(payload)
+    }
+}
+
+#[derive(Debug)]
+struct HopGuard {
+    active_requests: Arc<AtomicU16>,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+impl HopGuard {
+    fn new(active_requests: Arc<AtomicU16>, stats: Arc<Mutex<IoStats>>) -> Self {
+        active_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            active_requests,
+            stats,
+        }
+    }
+}
+
+impl Drop for HopGuard {
+    fn drop(&mut self) {
+        if self
+            .active_requests
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            let mut stats = self.stats.lock().unwrap();
+            stats.num_hops += 1;
+        }
     }
 }
 
@@ -503,6 +618,18 @@ pub trait DatagenExt {
         frag_count: FragmentCount,
         rows_per_fragment: FragmentRowCount,
     ) -> crate::Result<Dataset>;
+
+    async fn into_ram_dataset(
+        self,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+    ) -> crate::Result<Dataset>
+    where
+        Self: Sized,
+    {
+        self.into_dataset("memory://", frag_count, rows_per_fragment)
+            .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -557,6 +684,96 @@ impl NoContextTestFixture {
             }
         })
     }
+}
+
+pub fn copy_dir_all(
+    src: impl AsRef<std::path::Path>,
+    dst: impl AsRef<std::path::Path>,
+) -> std::io::Result<()> {
+    use std::fs;
+    fs::create_dir_all(&dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Copies a test dataset into a temporary directory, returning the tmpdir.
+///
+/// The `table_path` should be relative to `test_data/` at the root of the
+/// repo.
+pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
+    use std::path::PathBuf;
+
+    let mut src = PathBuf::new();
+    src.push(env!("CARGO_MANIFEST_DIR"));
+    src.push("../../test_data");
+    src.push(table_path);
+
+    let test_dir = tempdir().unwrap();
+
+    copy_dir_all(src.as_path(), test_dir.path())?;
+
+    Ok(test_dir)
+}
+
+/// Trims whitespace from the start and end of each line in the string.
+fn trim_whitespace(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for line in s.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    if !result.is_empty() {
+        // Remove the last newline
+        result.pop();
+    }
+    result
+}
+
+pub async fn assert_plan_node_equals(
+    plan_node: Arc<dyn ExecutionPlan>,
+    raw_expected: &str,
+) -> lance_core::Result<()> {
+    let raw_plan_desc = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
+    );
+    let plan_desc = trim_whitespace(&raw_plan_desc);
+
+    let expected = trim_whitespace(raw_expected);
+
+    let to_match = expected.split("...").collect::<Vec<_>>();
+    let num_pieces = to_match.len();
+    let mut remainder = plan_desc.as_str().trim_end_matches('\n');
+    for (i, piece) in to_match.into_iter().enumerate() {
+        let res = match i {
+            0 => remainder.starts_with(piece),
+            _ if i == num_pieces - 1 => remainder.ends_with(piece),
+            _ => remainder.contains(piece),
+        };
+        if !res {
+            break;
+        }
+        let idx = remainder.find(piece).unwrap();
+        remainder = &remainder[idx + piece.len()..];
+    }
+    if !remainder.is_empty() {
+        panic!(
+            "Expected plan to match:\nExpected: {}\nActual: {}",
+            raw_expected, raw_plan_desc
+        )
+    }
+    Ok(())
 }
 
 #[cfg(test)]

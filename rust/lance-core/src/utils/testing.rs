@@ -148,12 +148,12 @@ impl ObjectStore for ProxyObjectStore {
         self.target.get_opts(location, options).await
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
         self.before_method("get_range", location)?;
         self.target.get_range(location, range).await
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
         self.before_method("get_ranges", location)?;
         self.target.get_ranges(location, ranges).await
     }
@@ -169,10 +169,20 @@ impl ObjectStore for ProxyObjectStore {
         self.target.delete(location).await
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
-        self.target
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        let target = self.target.clone();
+        let policy = Arc::clone(&self.policy);
+
+        target
             .list(prefix)
-            .and_then(|meta| future::ready(self.transform_meta("list", meta)))
+            .and_then(move |meta| {
+                let policy = policy.lock().unwrap();
+                let mut meta = meta;
+                for p in policy.object_meta_policies.values() {
+                    meta = p("list", meta).map_err(OSError::from).unwrap();
+                }
+                future::ready(Ok(meta))
+            })
             .boxed()
     }
 

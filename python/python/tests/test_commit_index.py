@@ -62,6 +62,7 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
         [field_idx],
         dataset_without_index.version,
         set([f.fragment_id for f in dataset_without_index.get_fragments()]),
+        0,
     )
     dataset_without_index = lance.LanceDataset.commit(
         dataset_without_index.uri,
@@ -83,4 +84,4 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
             fast_search=True, prefilter=True, filter="meta = 'hello'"
         )
         plan = scanner.explain_plan()
-        assert "MaterializeIndex" in plan
+        assert "ScalarIndexQuery: query=[meta = hello]@meta_idx" in plan

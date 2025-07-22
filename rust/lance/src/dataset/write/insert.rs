@@ -11,6 +11,9 @@ use humantime::format_duration;
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::datatypes::Schema;
 use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
+use lance_core::ROW_ADDR;
+use lance_core::ROW_ID;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
@@ -26,6 +29,7 @@ use crate::dataset::write::write_fragments_internal;
 use crate::dataset::ReadParams;
 use crate::Dataset;
 use crate::{Error, Result};
+use tracing::info;
 
 use super::commit::CommitBuilder;
 use super::resolve_commit_handler;
@@ -181,6 +185,8 @@ impl<'a> InsertBuilder<'a> {
     ) -> Result<(Transaction, WriteContext<'_>)> {
         let mut context = self.resolve_context().await?;
 
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, path=context.base_path.to_string(), mode=?context.params.mode);
+
         self.validate_write(&mut context, &schema)?;
 
         let written_frags = write_fragments_internal(
@@ -307,7 +313,12 @@ impl<'a> InsertBuilder<'a> {
                 }
                 let m = dataset.manifest.as_ref();
                 let mut schema_cmp_opts = SchemaCompareOptions {
-                    compare_dictionary: true,
+                    // In the legacy format we stored the dictionary in the manifest and
+                    // all files must have identical dictionaries.
+                    //
+                    // In 2.0+ the dictionary is stored in the files and dictionaries may
+                    // fluctuate between files.
+                    compare_dictionary: m.should_use_legacy_format(),
                     // array nullability is checked later, using actual data instead
                     // of the schema
                     compare_nullability: NullabilityComparison::Ignore,
@@ -320,6 +331,20 @@ impl<'a> InsertBuilder<'a> {
                 }
 
                 data_schema.check_compatible(&m.schema, &schema_cmp_opts)?;
+            }
+        }
+
+        // Make sure we aren't using any reserved column names
+        for field in data_schema.fields.iter() {
+            if field.name == ROW_ID || field.name == ROW_ADDR {
+                return Err(Error::InvalidInput {
+                    source: format!(
+                        "The column {} is a reserved name and cannot be used in a Lance dataset",
+                        field.name
+                    )
+                    .into(),
+                    location: location!(),
+                });
             }
         }
 

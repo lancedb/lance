@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::iter;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
+use std::{iter, ops::MulAssign};
 
+use crate::vector::kmeans::{compute_partitions, KMeansAlgoFloat};
 use arrow_array::ArrowNumericType;
 use arrow_array::{
     cast::AsArray,
@@ -15,13 +16,12 @@ use arrow_schema::DataType;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
-use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::{Float, FromPrimitive, Num};
 use snafu::location;
 use tracing::instrument;
 
-use super::transform::Transformer;
+use super::{transform::Transformer, PQ_CODE_COLUMN};
 
 pub const RESIDUAL_COLUMN: &str = "__residual_vector";
 
@@ -64,7 +64,8 @@ fn do_compute_residual<T: ArrowNumericType>(
     partitions: Option<&UInt32Array>,
 ) -> Result<FixedSizeListArray>
 where
-    T::Native: Num + Float + L2 + Dot + DivAssign + AddAssign + FromPrimitive,
+    T::Native: Num + Float + L2 + Dot + MulAssign + DivAssign + AddAssign + FromPrimitive,
+    PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     let dimension = centroids.value_length() as usize;
     let centroids = centroids.values().as_primitive::<T>();
@@ -160,6 +161,11 @@ impl Transformer for ResidualTransform {
     /// The new [`RecordBatch`] will have a new column named [`RESIDUAL_COLUMN`].
     #[instrument(name = "ResidualTransform::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        if batch.column_by_name(PQ_CODE_COLUMN).is_some() {
+            // If the PQ code column is present, we don't need to compute residual vectors.
+            return Ok(batch.clone());
+        }
+
         let part_ids = batch.column_by_name(&self.part_col).ok_or(Error::Index {
             message: format!(
                 "Compute residual vector: partition id column not found: {}",

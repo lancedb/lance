@@ -9,6 +9,7 @@ use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 use lance_core::Result;
 
 pub mod buffer;
+pub mod compression;
 pub mod compression_algo;
 pub mod data;
 pub mod decoder;
@@ -20,6 +21,7 @@ pub mod statistics;
 #[cfg(test)]
 pub mod testing;
 pub mod utils;
+pub mod v2;
 pub mod version;
 
 // We can definitely add support for big-endian machines someday.  However, it's not a priority and

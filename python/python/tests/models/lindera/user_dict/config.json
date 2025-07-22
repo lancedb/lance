@@ -1,5 +1,0 @@
-{
-    "main": "../ipadic/main",
-    "user": "userdic.csv",
-    "user_kind": "ipadic"
-}

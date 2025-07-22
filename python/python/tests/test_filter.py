@@ -109,10 +109,19 @@ def test_sql_predicates(dataset):
 
 
 def test_illegal_predicates(dataset):
-    predicates_nrows = ["str BETWEEN 10 AND 20", "str > 10"]
-    for expr in predicates_nrows:
+    bad_parse = [
+        "str BETWEEN 10 AND 20",
+        "str > 10",
+        "str AN",
+        "🥞",
+    ]
+    for expr in bad_parse:
         with pytest.raises(ValueError, match="Invalid user input: *"):
             dataset.to_table(filter=expr)
+    with pytest.raises(ValueError, match="No field named foo"):
+        dataset.to_table(filter="foo = 7")
+    with pytest.raises(ValueError, match="does not return a boolean"):
+        dataset.to_table(filter="int")
 
 
 def test_compound(dataset):
@@ -238,6 +247,24 @@ def create_table_for_duckdb(nvec=10000, ndim=768):
         .append_column("id", pa.array(range(nvec)))
     )
     return tbl
+
+
+def test_datatypes(tmp_path):
+    table = pa.table(
+        {
+            "binary": pa.array([b"abc", None], type=pa.binary()),
+            "largebin": pa.array([b"abc", None], type=pa.large_binary()),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path)
+
+    for filter, expected_matches in [
+        ("binary = X'616263'", 1),
+        ("binary is NULL", 1),
+        ("largebin = X'616263'", 1),
+        ("largebin is NULL", 1),
+    ]:
+        assert dataset.count_rows(filter=filter) == expected_matches
 
 
 def test_duckdb(tmp_path):

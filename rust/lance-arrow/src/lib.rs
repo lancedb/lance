@@ -30,6 +30,7 @@ pub mod floats;
 pub use floats::*;
 pub mod cast;
 pub mod list;
+pub mod memory;
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
@@ -139,7 +140,10 @@ impl DataTypeExt for DataType {
                 IntervalUnit::MonthDayNano => Some(16),
             },
             Self::FixedSizeBinary(s) => Some(*s as usize),
-            Self::FixedSizeList(dt, s) => Some(*s as usize * dt.data_type().byte_width()),
+            Self::FixedSizeList(dt, s) => dt
+                .data_type()
+                .byte_width_opt()
+                .map(|width| width * *s as usize),
             _ => None,
         }
     }
@@ -435,7 +439,7 @@ pub fn as_fixed_size_binary_array(arr: &dyn Array) -> &FixedSizeBinaryArray {
     arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap()
 }
 
-pub fn iter_str_array(arr: &dyn Array) -> Box<dyn Iterator<Item = Option<&str>> + '_> {
+pub fn iter_str_array(arr: &dyn Array) -> Box<dyn Iterator<Item = Option<&str>> + Send + '_> {
     match arr.data_type() {
         DataType::Utf8 => Box::new(arr.as_string::<i32>().iter()),
         DataType::LargeUtf8 => Box::new(arr.as_string::<i64>().iter()),
@@ -557,6 +561,9 @@ pub trait RecordBatchExt {
         column: Arc<dyn Array>,
     ) -> Result<RecordBatch>;
 
+    /// Rename a column at a given index.
+    fn rename_column(&self, index: usize, new_name: &str) -> Result<RecordBatch>;
+
     /// Get (potentially nested) column by qualified name.
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef>;
 
@@ -649,6 +656,28 @@ impl RecordBatchExt for RecordBatch {
                 self.schema().metadata().clone(),
             )),
             columns,
+        )
+    }
+
+    fn rename_column(&self, index: usize, new_name: &str) -> Result<RecordBatch> {
+        let mut fields = self.schema().fields().to_vec();
+        if index >= fields.len() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Index out of bounds: {}",
+                index
+            )));
+        }
+        fields[index] = Arc::new(Field::new(
+            new_name,
+            fields[index].data_type().clone(),
+            fields[index].is_nullable(),
+        ));
+        Self::try_new(
+            Arc::new(Schema::new_with_metadata(
+                fields,
+                self.schema().metadata().clone(),
+            )),
+            self.columns().to_vec(),
         )
     }
 
@@ -1389,6 +1418,35 @@ mod tests {
             RecordBatch::try_new(Arc::new(both_schema), vec![Arc::new(both_null_list)]).unwrap();
         let merged = x_batch.merge(&y_null_batch).unwrap();
         assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn test_byte_width_opt() {
+        assert_eq!(DataType::Int32.byte_width_opt(), Some(4));
+        assert_eq!(DataType::Int64.byte_width_opt(), Some(8));
+        assert_eq!(DataType::Float32.byte_width_opt(), Some(4));
+        assert_eq!(DataType::Float64.byte_width_opt(), Some(8));
+        assert_eq!(DataType::Utf8.byte_width_opt(), None);
+        assert_eq!(DataType::Binary.byte_width_opt(), None);
+        assert_eq!(
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))).byte_width_opt(),
+            None
+        );
+        assert_eq!(
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 3)
+                .byte_width_opt(),
+            Some(12)
+        );
+        assert_eq!(
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 4)
+                .byte_width_opt(),
+            Some(16)
+        );
+        assert_eq!(
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Utf8, true)), 5)
+                .byte_width_opt(),
+            None
+        );
     }
 
     #[test]

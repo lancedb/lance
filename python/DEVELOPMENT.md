@@ -80,6 +80,12 @@ ruff.....................................................................Passed
  1 file changed, 1 insertion(+), 1 deletion(-)
 ```
 
+## Cleaning build artifacts
+To clean up build artifacts, run:
+```shell
+make clean
+```
+
 ## Benchmarks
 
 The benchmarks in `python/benchmarks` can be used to identify and diagnose

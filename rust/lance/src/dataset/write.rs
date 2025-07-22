@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::num::NonZero;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use chrono::TimeDelta;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions, StorageClass,
 };
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
+use lance_datafusion::spill::{create_replay_spill, SpillReceiver, SpillSender};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
@@ -36,6 +40,7 @@ use super::transaction::Transaction;
 use super::DATA_DIR;
 
 mod commit;
+pub mod delete;
 mod insert;
 pub mod merge_insert;
 pub mod update;
@@ -303,7 +308,7 @@ pub async fn do_write_fragments(
             || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
         {
             let (num_rows, data_file) = writer.take().unwrap().finish().await?;
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_DATA, path = &data_file.path);
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
             debug_assert_eq!(num_rows, num_rows_in_current_file);
             params.progress.complete(fragments.last().unwrap()).await?;
             let last_fragment = fragments.last_mut().unwrap();
@@ -316,7 +321,7 @@ pub async fn do_write_fragments(
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
         let (num_rows, data_file) = writer.finish().await?;
-        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_DATA, path = &data_file.path);
+        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
         let last_fragment = fragments.last_mut().unwrap();
         last_fragment.physical_rows = Some(num_rows as usize);
         last_fragment.files.push(data_file);
@@ -365,7 +370,7 @@ pub async fn write_fragments_internal(
                         compare_nullability: NullabilityComparison::Ignore,
                         allow_missing_if_nullable: true,
                         ignore_field_order: true,
-                        compare_dictionary: true,
+                        compare_dictionary: dataset.is_legacy_storage(),
                         ..Default::default()
                     },
                 )?;
@@ -484,9 +489,14 @@ impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String
         Ok(self.0.tell().await? as u64)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        let size_bytes = self.0.tell().await?;
         Ok((
             self.0.finish().await? as u32,
-            DataFile::new_legacy(self.1.clone(), self.0.schema()),
+            DataFile::new_legacy(
+                self.1.clone(),
+                self.0.schema(),
+                NonZero::new(size_bytes as u64),
+            ),
         ))
     }
 }
@@ -521,14 +531,15 @@ impl GenericWriter for V2WriterAdapter {
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
         let (major, minor) = self.writer.version().to_numbers();
+        let num_rows = self.writer.finish().await? as u32;
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
             column_indices,
             major,
             minor,
+            NonZero::new(self.writer.tell().await?),
         );
-        let num_rows = self.writer.finish().await? as u32;
         Ok((num_rows, data_file))
     }
 }
@@ -641,6 +652,112 @@ async fn resolve_commit_handler(
                 Ok(commit_handler)
             }
         }
+    }
+}
+
+/// Create an iterator of record batch streams from the given source.
+///
+/// If `enable_retries` is true, then the source will be saved either in memory
+/// or spilled to disk to allow replaying the source in case of a failure. The
+/// source will be kept in memory if either (1) the size hint shows that
+/// there is only one batch or (2) the stream contains less than 100MB of
+/// data. Otherwise, the source will be spilled to a temporary file on disk.
+///
+/// This is used to support retries on write operations.
+async fn new_source_iter(
+    source: SendableRecordBatchStream,
+    enable_retries: bool,
+) -> Result<Box<dyn Iterator<Item = SendableRecordBatchStream> + Send + 'static>> {
+    if enable_retries {
+        let schema = source.schema();
+
+        // If size hint shows there is only one batch, spilling has no benefit, just keep that
+        // in memory. (This is a pretty common case.)
+        let size_hint = source.size_hint();
+        if size_hint.0 == 1 && size_hint.1 == Some(1) {
+            let batches: Vec<RecordBatch> = source.try_collect().await?;
+            Ok(Box::new(std::iter::repeat_with(move || {
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(batches.clone().into_iter().map(Ok)),
+                )) as SendableRecordBatchStream
+            })))
+        } else {
+            // Allow buffering up to 100MB in memory before spilling to disk.
+            Ok(Box::new(
+                SpillStreamIter::try_new(source, 100 * 1024 * 1024).await?,
+            ))
+        }
+    } else {
+        Ok(Box::new(std::iter::once(source)))
+    }
+}
+
+struct SpillStreamIter {
+    receiver: SpillReceiver,
+    #[allow(dead_code)] // Exists to keep the SpillSender alive
+    sender_handle: tokio::task::JoinHandle<SpillSender>,
+    // This temp dir is used to store the spilled data. It is kept alive by
+    // this struct. When this struct is dropped, the Drop implementation of
+    // tempfile::TempDir will delete the temp dir.
+    #[allow(dead_code)] // Exists to keep the temp dir alive
+    tmp_dir: tempfile::TempDir,
+}
+
+impl SpillStreamIter {
+    pub async fn try_new(
+        mut source: SendableRecordBatchStream,
+        memory_limit: usize,
+    ) -> Result<Self> {
+        let tmp_dir = tokio::task::spawn_blocking(|| {
+            tempfile::tempdir().map_err(|e| Error::InvalidInput {
+                source: format!("Failed to create temp dir: {}", e).into(),
+                location: location!(),
+            })
+        })
+        .await
+        .ok()
+        .expect_ok()??;
+
+        let tmp_path = tmp_dir.path().join("spill.arrows");
+        let (mut sender, receiver) = create_replay_spill(tmp_path, source.schema(), memory_limit);
+
+        let sender_handle = tokio::task::spawn(async move {
+            while let Some(res) = source.next().await {
+                match res {
+                    Ok(batch) => match sender.write(batch).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            sender.send_error(e);
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        sender.send_error(e);
+                        break;
+                    }
+                }
+            }
+
+            if let Err(err) = sender.finish().await {
+                sender.send_error(err);
+            }
+            sender
+        });
+
+        Ok(Self {
+            receiver,
+            tmp_dir,
+            sender_handle,
+        })
+    }
+}
+
+impl Iterator for SpillStreamIter {
+    type Item = SendableRecordBatchStream;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.receiver.read())
     }
 }
 

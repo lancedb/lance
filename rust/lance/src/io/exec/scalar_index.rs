@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use arrow_array::{RecordBatch, UInt64Array};
+use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
+use crate::{
+    dataset::rowids::load_row_id_sequences,
+    index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
+    Dataset,
+};
+use arrow::array::BinaryBuilder;
+use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
     common::{stats::Precision, Statistics},
@@ -25,47 +33,54 @@ use lance_core::{
     },
     Error, Result, ROW_ID_FIELD,
 };
-use lance_datafusion::chunker::break_stream;
+use lance_datafusion::{
+    chunker::break_stream,
+    utils::{
+        ExecutionPlanMetricsSetExt, SCALAR_INDEX_SEARCH_TIME_METRIC, SCALAR_INDEX_SER_TIME_METRIC,
+    },
+};
 use lance_index::{
     metrics::MetricsCollector,
     scalar::{
-        expression::{IndexExprResult, ScalarIndexExpr, ScalarIndexLoader},
+        expression::{IndexExprResult, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
         SargableQuery, ScalarIndex,
     },
-    DatasetIndexExt,
+    DatasetIndexExt, ScalarIndexCriteria,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{debug_span, instrument};
 
-use crate::{
-    dataset::rowids::load_row_id_sequences,
-    index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
-    Dataset,
-};
-
-use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
-
-lazy_static::lazy_static! {
-    pub static ref SCALAR_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![Field::new("result".to_string(), DataType::Binary, true)]));
-}
+/// When we evaluate a scalar index query we return a batch with three columns and two rows
+///
+/// The first column has the block list and allow list
+/// The second column tells if the result is least/exact/more (we repeat the discriminant twice)
+/// The third column has the fragments covered bitmap in the first row and null in the second row
+pub static SCALAR_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("result".to_string(), DataType::Binary, true),
+        Field::new("discriminant".to_string(), DataType::UInt32, true),
+        Field::new("fragments_covered".to_string(), DataType::Binary, true),
+    ]))
+});
 
 #[async_trait]
 impl ScalarIndexLoader for Dataset {
     async fn load_index(
         &self,
-        name: &str,
+        column: &str,
+        index_name: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let idx = self
-            .load_scalar_index_for_column(name)
+            .load_scalar_index(ScalarIndexCriteria::default().with_name(index_name))
             .await?
             .ok_or_else(|| Error::Internal {
-                message: format!("Scanner created plan for index query on {} but no index on dataset for that column", name),
+                message: format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column),
                 location: location!()
             })?;
-        self.open_scalar_index(name, &idx.uuid.to_string(), metrics)
+        self.open_scalar_index(column, &idx.uuid.to_string(), metrics)
             .await
     }
 }
@@ -91,6 +106,9 @@ impl DisplayAs for ScalarIndexExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "ScalarIndexQuery: query={}", self.expr)
             }
+            DisplayFormatType::TreeRender => {
+                write!(f, "ScalarIndexQuery\nquery={}", self.expr)
+            }
         }
     }
 }
@@ -111,20 +129,82 @@ impl ScalarIndexExec {
         }
     }
 
+    #[async_recursion]
+    async fn fragments_covered_by_index_query(
+        index_expr: &ScalarIndexExpr,
+        dataset: &Dataset,
+    ) -> Result<RoaringBitmap> {
+        match index_expr {
+            ScalarIndexExpr::And(lhs, rhs) => {
+                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
+                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
+            }
+            ScalarIndexExpr::Or(lhs, rhs) => {
+                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
+                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
+            }
+            ScalarIndexExpr::Not(expr) => {
+                Self::fragments_covered_by_index_query(expr, dataset).await
+            }
+            ScalarIndexExpr::Query(search_key) => {
+                let idx = dataset
+                    .load_scalar_index(
+                        ScalarIndexCriteria::default().with_name(&search_key.index_name),
+                    )
+                    .await?
+                    .expect("Index not found even though it must have been found earlier");
+                Ok(idx
+                    .fragment_bitmap
+                    .expect("scalar indices should always have a fragment bitmap"))
+            }
+        }
+    }
+
+    #[instrument(skip_all)]
+    fn serialize_to_arrow(
+        query_result: IndexExprResult,
+        fragments_covered_by_result: RoaringBitmap,
+    ) -> Result<RecordBatch> {
+        let row_id_mask = query_result.row_id_mask();
+        let row_id_mask_arr = row_id_mask.into_arrow()?;
+        let discriminant = query_result.discriminant();
+        let discriminant_arr =
+            Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
+        let mut fragments_covered_builder = BinaryBuilder::new();
+        let fragments_covered_bytes_len = fragments_covered_by_result.serialized_size();
+        let mut fragments_covered_bytes = Vec::with_capacity(fragments_covered_bytes_len);
+        fragments_covered_by_result.serialize_into(&mut fragments_covered_bytes)?;
+        fragments_covered_builder.append_value(fragments_covered_bytes);
+        fragments_covered_builder.append_null();
+        let fragments_covered_arr = Arc::new(fragments_covered_builder.finish()) as Arc<dyn Array>;
+        Ok(RecordBatch::try_new(
+            SCALAR_INDEX_SCHEMA.clone(),
+            vec![
+                Arc::new(row_id_mask_arr),
+                Arc::new(discriminant_arr),
+                Arc::new(fragments_covered_arr),
+            ],
+        )?)
+    }
+
     async fn do_execute(
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
-        metrics: IndexMetrics,
+        plan_metrics: ExecutionPlanMetricsSet,
     ) -> Result<RecordBatch> {
-        let query_result = expr.evaluate(dataset.as_ref(), &metrics).await?;
-        let IndexExprResult::Exact(row_id_mask) = query_result else {
-            todo!("Support for non-exact query results as pre-filter for vector search")
+        let metrics = IndexMetrics::new(&plan_metrics, 0);
+        let query_result = {
+            let search_time = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
+            let _timer = search_time.timer();
+            expr.evaluate(dataset.as_ref(), &metrics).await?
         };
-        let row_id_mask_arr = row_id_mask.into_arrow()?;
-        Ok(RecordBatch::try_new(
-            SCALAR_INDEX_SCHEMA.clone(),
-            vec![Arc::new(row_id_mask_arr)],
-        )?)
+        let fragments_covered_by_result =
+            Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
+        {
+            let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
+            let _timer = ser_time.timer();
+            Self::serialize_to_arrow(query_result, fragments_covered_by_result)
+        }
     }
 }
 
@@ -163,8 +243,11 @@ impl ExecutionPlan for ScalarIndexExec {
         partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        let metrics = IndexMetrics::new(&self.metrics, partition);
-        let batch_fut = Self::do_execute(self.expr.clone(), self.dataset.clone(), metrics);
+        let batch_fut = Self::do_execute(
+            self.expr.clone(),
+            self.dataset.clone(),
+            self.metrics.clone(),
+        );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
@@ -193,9 +276,8 @@ impl ExecutionPlan for ScalarIndexExec {
     }
 }
 
-lazy_static::lazy_static! {
-    pub static ref INDEX_LOOKUP_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
-}
+pub static INDEX_LOOKUP_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
 /// An execution node that translates index values into row addresses
 ///
@@ -204,6 +286,7 @@ lazy_static::lazy_static! {
 pub struct MapIndexExec {
     dataset: Arc<Dataset>,
     column_name: String,
+    index_name: String,
     input: Arc<dyn ExecutionPlan>,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -212,7 +295,9 @@ pub struct MapIndexExec {
 impl DisplayAs for MapIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "IndexedLookup")
             }
         }
@@ -220,7 +305,12 @@ impl DisplayAs for MapIndexExec {
 }
 
 impl MapIndexExec {
-    pub fn new(dataset: Arc<Dataset>, column_name: String, input: Arc<dyn ExecutionPlan>) -> Self {
+    pub fn new(
+        dataset: Arc<Dataset>,
+        column_name: String,
+        index_name: String,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(INDEX_LOOKUP_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -230,6 +320,7 @@ impl MapIndexExec {
         Self {
             dataset,
             column_name,
+            index_name,
             input,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -238,6 +329,7 @@ impl MapIndexExec {
 
     async fn map_batch(
         column_name: String,
+        index_name: String,
         dataset: Arc<Dataset>,
         deletion_mask: Option<Arc<RowIdMask>>,
         batch: RecordBatch,
@@ -247,10 +339,11 @@ impl MapIndexExec {
         let index_vals = (0..index_vals.len())
             .map(|idx| ScalarValue::try_from_array(index_vals, idx))
             .collect::<datafusion::error::Result<Vec<_>>>()?;
-        let query = ScalarIndexExpr::Query(
-            column_name.clone(),
-            Arc::new(SargableQuery::IsIn(index_vals)),
-        );
+        let query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: column_name,
+            index_name,
+            query: Arc::new(SargableQuery::IsIn(index_vals)),
+        });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
         let IndexExprResult::Exact(mut row_id_mask) = query_result else {
             todo!("Support for non-exact query results as input for merge_insert")
@@ -289,12 +382,13 @@ impl MapIndexExec {
         input: datafusion::physical_plan::SendableRecordBatchStream,
         dataset: Arc<Dataset>,
         column_name: String,
+        index_name: String,
         metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<
         impl Stream<Item = datafusion::error::Result<RecordBatch>> + Send + 'static,
     > {
         let index = dataset
-            .load_scalar_index_for_column(&column_name)
+            .load_scalar_index(ScalarIndexCriteria::default().with_name(&index_name))
             .await?
             .unwrap();
         let deletion_mask_fut =
@@ -306,10 +400,18 @@ impl MapIndexExec {
         };
         Ok(input.and_then(move |res| {
             let column_name = column_name.clone();
+            let index_name = index_name.clone();
             let dataset = dataset.clone();
             let deletion_mask = deletion_mask.clone();
             let metrics = metrics.clone();
-            Self::map_batch(column_name, dataset, deletion_mask, res, metrics)
+            Self::map_batch(
+                column_name,
+                index_name,
+                dataset,
+                deletion_mask,
+                res,
+                metrics,
+            )
         }))
     }
 }
@@ -343,6 +445,7 @@ impl ExecutionPlan for MapIndexExec {
             Ok(Arc::new(Self::new(
                 self.dataset.clone(),
                 self.column_name.clone(),
+                self.index_name.clone(),
                 children.into_iter().next().unwrap(),
             )))
         }
@@ -359,6 +462,7 @@ impl ExecutionPlan for MapIndexExec {
             index_vals,
             self.dataset.clone(),
             self.column_name.clone(),
+            self.index_name.clone(),
             metrics,
         );
         let stream = futures::stream::iter(vec![stream_fut])
@@ -378,9 +482,8 @@ impl ExecutionPlan for MapIndexExec {
     }
 }
 
-lazy_static::lazy_static! {
-    pub static ref MATERIALIZE_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
-}
+pub static MATERIALIZE_INDEX_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
 /// An execution node that performs a scalar index search and materializes the mask into row ids
 ///
@@ -401,6 +504,9 @@ impl DisplayAs for MaterializeIndexExec {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "MaterializeIndex: query={}", self.expr)
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "MaterializeIndex\nquery={}", self.expr)
             }
         }
     }
@@ -609,7 +715,7 @@ async fn retain_fragments(
                 Ok(acc)
             })
             .await?;
-        *allow_list &= fragment_ids;
+        *allow_list &= &fragment_ids;
     } else {
         // Assume row ids are addresses, so we can filter out fragments by their ids.
         allow_list.retain_fragments(fragments.iter().map(|frag| frag.id as u32));
@@ -701,7 +807,10 @@ mod tests {
     use futures::TryStreamExt;
     use lance_datagen::gen;
     use lance_index::{
-        scalar::{expression::ScalarIndexExpr, SargableQuery, ScalarIndexParams},
+        scalar::{
+            expression::{ScalarIndexExpr, ScalarIndexSearch},
+            SargableQuery, ScalarIndexParams,
+        },
         DatasetIndexExt, IndexType,
     };
     use tempfile::{tempdir, TempDir};
@@ -757,13 +866,14 @@ mod tests {
             _tmp_dir_guard,
         } = test_fixture().await;
 
-        let query = ScalarIndexExpr::Query(
-            "ordered".to_string(),
-            Arc::new(SargableQuery::Range(
+        let query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "ordered".to_string(),
+            index_name: "ordered_idx".to_string(),
+            query: Arc::new(SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
-        );
+        });
 
         let fragments = dataset.fragments().clone();
 
@@ -793,20 +903,26 @@ mod tests {
         let fixture = NoContextTestFixture::new();
         let arc_dasaset = Arc::new(fixture.dataset);
 
-        let query = ScalarIndexExpr::Query(
-            "ordered".to_string(),
-            Arc::new(SargableQuery::Range(
+        let query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "ordered".to_string(),
+            index_name: "ordered_idx".to_string(),
+            query: Arc::new(SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
-        );
+        });
 
         // These plans aren't even valid but it appears we defer all work (even validation) until
         // read time.
         let plan = ScalarIndexExec::new(arc_dasaset.clone(), query.clone());
         plan.execute(0, Arc::new(TaskContext::default())).unwrap();
 
-        let plan = MapIndexExec::new(arc_dasaset.clone(), "ordered".to_string(), Arc::new(plan));
+        let plan = MapIndexExec::new(
+            arc_dasaset.clone(),
+            "ordered".to_string(),
+            "ordered_idx".to_string(),
+            Arc::new(plan),
+        );
         plan.execute(0, Arc::new(TaskContext::default())).unwrap();
 
         let plan =

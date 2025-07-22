@@ -9,13 +9,12 @@ use std::sync::Arc;
 use arrow::datatypes::{self, ArrowPrimitiveType};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use deepsize::DeepSizeOf;
 use distance::build_distance_table_dot;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
-use lance_linalg::kmeans::compute_partition;
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::Float;
 use prost::Message;
@@ -35,6 +34,7 @@ use super::quantizer::{
     Quantization, QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
 };
 use super::{pb, PQ_CODE_COLUMN};
+use crate::vector::kmeans::compute_partition;
 pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
 
@@ -452,25 +452,22 @@ impl Quantization for ProductQuantizer {
         QuantizationType::Product
     }
 
-    fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
+    fn metadata(&self, args: Option<QuantizationMetadata>) -> Self::Metadata {
         let codebook_position = match &args {
             Some(args) => args.codebook_position,
             None => Some(0),
         };
-        let codebook_position = codebook_position.ok_or(Error::Index {
-            message: "codebook_position not found".to_owned(),
-            location: location!(),
-        })?;
-        let tensor = pb::Tensor::try_from(&self.codebook)?;
-        Ok(serde_json::to_value(ProductQuantizationMetadata {
+
+        let codebook_position = codebook_position.expect("codebook position should be set");
+        ProductQuantizationMetadata {
             codebook_position,
             nbits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
-            codebook: None,
-            codebook_tensor: tensor.encode_to_vec(),
+            codebook: Some(self.codebook.clone()),
+            codebook_tensor: Vec::new(),
             transposed: args.map(|args| args.transposed).unwrap_or_default(),
-        })?)
+        }
     }
 
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
@@ -492,6 +489,18 @@ impl Quantization for ProductQuantizer {
             codebook,
             distance_type,
         )))
+    }
+
+    fn field(&self) -> Field {
+        let num_bytes_per_sub_vector = self.num_sub_vectors * self.num_bits as usize / 8;
+        Field::new(
+            PQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                num_bytes_per_sub_vector as i32,
+            ),
+            true,
+        )
     }
 }
 

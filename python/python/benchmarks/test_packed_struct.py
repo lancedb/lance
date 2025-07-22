@@ -8,9 +8,6 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
-from lance.tracing import trace_to_chrome
-
-trace_to_chrome(level="debug", file="/tmp/trace.json")
 
 NUM_ROWS = 10_000_000
 RANDOM_ACCESS = "indices"

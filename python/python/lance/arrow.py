@@ -517,8 +517,8 @@ class FixedShapeImageTensorArray(ImageArray):
 
 
 class ImageScalar(pa.ExtensionScalar):
-    def as_py(self):
-        return self.value.as_py()
+    def as_py(self, **kwargs):
+        return self.value.as_py(**kwargs)
 
 
 class ImageURIScalar(ImageScalar):

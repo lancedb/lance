@@ -56,7 +56,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
                     .scan()
                     .nearest("vector", q, 10)
                     .unwrap()
-                    .nprobs(10)
+                    .minimum_nprobes(10)
                     .try_into_stream()
                     .await
                     .unwrap()
@@ -76,7 +76,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
                     .scan()
                     .nearest("vector", q, 10)
                     .unwrap()
-                    .nprobs(10)
+                    .minimum_nprobes(10)
                     .refine(2)
                     .try_into_stream()
                     .await
@@ -92,7 +92,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
     // reopen with no index caching to test IO overhead
     let dataset = rt.block_on(async {
         DatasetBuilder::from_uri("./vec_data.lance")
-            .with_index_cache_size(0)
+            .with_index_cache_size_bytes(0)
             .load()
             .await
             .unwrap()
@@ -110,7 +110,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
                     .scan()
                     .nearest("vector", q, 10)
                     .unwrap()
-                    .nprobs(32)
+                    .minimum_nprobes(32)
                     .try_into_stream()
                     .await
                     .unwrap()

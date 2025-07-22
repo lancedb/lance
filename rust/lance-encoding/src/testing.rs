@@ -12,11 +12,7 @@ use futures::{future::BoxFuture, FutureExt, StreamExt};
 use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use lance_core::{
-    cache::{CapacityMode, FileMetadataCache},
-    utils::bit::pad_bytes,
-    Result,
-};
+use lance_core::{cache::LanceCache, utils::bit::pad_bytes, Result};
 use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
 
 use crate::{
@@ -166,10 +162,7 @@ async fn test_decode(
     ) -> BoxFuture<'static, ()>,
 ) {
     let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
-    let cache = Arc::new(FileMetadataCache::with_capacity(
-        128 * 1024 * 1024,
-        CapacityMode::Bytes,
-    ));
+    let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
     let column_indices = column_indices_from_schema(schema, is_structural_encoding);
     let decode_scheduler = DecodeBatchScheduler::try_new(
         &lance_schema,
@@ -181,6 +174,7 @@ async fn test_decode(
         io,
         cache,
         &FilterExpression::no_filter(),
+        false, // cache_repetition_index - default to false for tests
     )
     .await
     .unwrap();
@@ -271,6 +265,30 @@ pub async fn check_round_trip_encoding_random(field: Field, version: LanceFileVe
         field: field.clone(),
     };
     check_round_trip_encoding_generated(field, Box::new(array_generator_provider), version).await;
+}
+
+pub struct FnArrayGeneratorProvider<F: Fn() -> Box<dyn ArrayGenerator> + Clone + 'static> {
+    provider_fn: F,
+}
+
+impl<F: Fn() -> Box<dyn ArrayGenerator> + Clone + 'static> FnArrayGeneratorProvider<F> {
+    pub fn new(provider_fn: F) -> Self {
+        Self { provider_fn }
+    }
+}
+
+impl<F: Fn() -> Box<dyn ArrayGenerator> + Clone + 'static> ArrayGeneratorProvider
+    for FnArrayGeneratorProvider<F>
+{
+    fn provide(&self) -> Box<dyn ArrayGenerator> {
+        (self.provider_fn)()
+    }
+
+    fn copy(&self) -> Box<dyn ArrayGeneratorProvider> {
+        Box::new(Self {
+            provider_fn: self.provider_fn.clone(),
+        })
+    }
 }
 
 pub async fn check_round_trip_encoding_generated(

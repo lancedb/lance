@@ -20,13 +20,23 @@ use crate::vector::storage::DistCalculator;
 
 pub(crate) const NEIGHBORS_COL: &str = "__neighbors";
 
-lazy_static::lazy_static! {
-    /// NEIGHBORS field.
-    pub static ref NEIGHBORS_FIELD: Field =
-        Field::new(NEIGHBORS_COL, DataType::List(Field::new_list_field(DataType::UInt32, true).into()), true);
-        pub static ref DISTS_FIELD: Field =
-        Field::new(DIST_COL, DataType::List(Field::new_list_field(DataType::Float32, true).into()), true);
-}
+use std::sync::LazyLock;
+
+/// NEIGHBORS field.
+pub static NEIGHBORS_FIELD: LazyLock<Field> = LazyLock::new(|| {
+    Field::new(
+        NEIGHBORS_COL,
+        DataType::List(Field::new_list_field(DataType::UInt32, true).into()),
+        true,
+    )
+});
+pub static DISTS_FIELD: LazyLock<Field> = LazyLock::new(|| {
+    Field::new(
+        DIST_COL,
+        DataType::List(Field::new_list_field(DataType::Float32, true).into()),
+        true,
+    )
+});
 
 pub struct GraphNode<I = u32> {
     pub id: I,
