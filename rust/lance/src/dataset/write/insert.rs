@@ -11,6 +11,9 @@ use humantime::format_duration;
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::datatypes::Schema;
 use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
+use lance_core::ROW_ADDR;
+use lance_core::ROW_ID;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
@@ -26,6 +29,7 @@ use crate::dataset::write::write_fragments_internal;
 use crate::dataset::ReadParams;
 use crate::Dataset;
 use crate::{Error, Result};
+use tracing::info;
 
 use super::commit::CommitBuilder;
 use super::resolve_commit_handler;
@@ -181,6 +185,8 @@ impl<'a> InsertBuilder<'a> {
     ) -> Result<(Transaction, WriteContext<'_>)> {
         let mut context = self.resolve_context().await?;
 
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, path=context.base_path.to_string(), mode=?context.params.mode);
+
         self.validate_write(&mut context, &schema)?;
 
         let written_frags = write_fragments_internal(
@@ -325,6 +331,20 @@ impl<'a> InsertBuilder<'a> {
                 }
 
                 data_schema.check_compatible(&m.schema, &schema_cmp_opts)?;
+            }
+        }
+
+        // Make sure we aren't using any reserved column names
+        for field in data_schema.fields.iter() {
+            if field.name == ROW_ID || field.name == ROW_ADDR {
+                return Err(Error::InvalidInput {
+                    source: format!(
+                        "The column {} is a reserved name and cannot be used in a Lance dataset",
+                        field.name
+                    )
+                    .into(),
+                    location: location!(),
+                });
             }
         }
 

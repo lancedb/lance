@@ -16,6 +16,10 @@
 //! Fullzip compression is a per-value approach where we require that values are transparently
 //! compressed so that we can locate them later.
 
+/// Default threshold for RLE compression selection.
+/// RLE is chosen when the run count is less than this fraction of total values.
+const DEFAULT_RLE_COMPRESSION_THRESHOLD: f64 = 0.5;
+
 use crate::{
     buffer::LanceBuffer,
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
@@ -27,15 +31,18 @@ use crate::{
                 VariableDecoder, VariableEncoder,
             },
             bitpack::InlineBitpacking,
-            block::CompressedBufferEncoder,
+            block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
+            byte_stream_split::ByteStreamSplitDecompressor,
             constant::ConstantDecompressor,
             fsst::{
                 FsstMiniBlockDecompressor, FsstMiniBlockEncoder, FsstPerValueDecompressor,
                 FsstPerValueEncoder,
             },
+            general::{GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor},
             packed::{
                 PackedStructFixedWidthMiniBlockDecompressor, PackedStructFixedWidthMiniBlockEncoder,
             },
+            rle::{RleMiniBlockDecompressor, RleMiniBlockEncoder},
             value::{ValueDecompressor, ValueEncoder},
         },
     },
@@ -46,7 +53,7 @@ use crate::{
 use arrow::{array::AsArray, datatypes::UInt64Type};
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::{
-    datatypes::{Field, COMPRESSION_META_KEY},
+    datatypes::{Field, COMPRESSION_META_KEY, RLE_THRESHOLD_META_KEY},
     Error, Result,
 };
 use snafu::location;
@@ -117,12 +124,10 @@ impl CompressionStrategy for DefaultCompressionStrategy {
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         match data {
             DataBlock::FixedWidth(fixed_width_data) => {
-                if let Some(compression) = field.metadata.get(COMPRESSION_META_KEY) {
-                    if compression == "none" {
-                        return Ok(Box::new(ValueEncoder::default()));
-                    }
-                }
-
+                let is_byte_width_aligned = fixed_width_data.bits_per_value == 8
+                    || fixed_width_data.bits_per_value == 16
+                    || fixed_width_data.bits_per_value == 32
+                    || fixed_width_data.bits_per_value == 64;
                 let bit_widths = data.expect_stat(Stat::BitWidth);
                 let bit_widths = bit_widths.as_primitive::<UInt64Type>();
                 // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
@@ -132,13 +137,40 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 // size might be smaller than the compressed size.
                 let too_small = bit_widths.len() == 1
                     && InlineBitpacking::min_size_bytes(bit_widths.value(0)) >= data.data_size();
-                if !has_all_zeros
-                    && !too_small
-                    && (fixed_width_data.bits_per_value == 8
-                        || fixed_width_data.bits_per_value == 16
-                        || fixed_width_data.bits_per_value == 32
-                        || fixed_width_data.bits_per_value == 64)
+
+                if let Some(compression) = field.metadata.get(COMPRESSION_META_KEY) {
+                    if compression.as_str() == "none" {
+                        return Ok(Box::new(ValueEncoder::default()));
+                    }
+                }
+
+                let rle_threshold: f64 = if let Some(value) =
+                    field.metadata.get(RLE_THRESHOLD_META_KEY)
                 {
+                    value.as_str().parse().map_err(|_| {
+                        Error::invalid_input("rle threshold is not a valid float64", location!())
+                    })?
+                } else {
+                    DEFAULT_RLE_COMPRESSION_THRESHOLD
+                };
+
+                // Check if RLE would be beneficial
+                let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
+                let num_values = fixed_width_data.num_values;
+
+                // Use RLE if the run count is less than the threshold
+                if (run_count as f64) < (num_values as f64) * rle_threshold && is_byte_width_aligned
+                {
+                    if fixed_width_data.bits_per_value >= 32 {
+                        return Ok(Box::new(GeneralMiniBlockCompressor::new(
+                            Box::new(RleMiniBlockEncoder::new()),
+                            CompressionConfig::new(CompressionScheme::Lz4, None),
+                        )));
+                    }
+                    return Ok(Box::new(RleMiniBlockEncoder::new()));
+                }
+
+                if !has_all_zeros && !too_small && is_byte_width_aligned {
                     Ok(Box::new(InlineBitpacking::new(
                         fixed_width_data.bits_per_value,
                     )))
@@ -147,7 +179,9 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 }
             }
             DataBlock::VariableWidth(variable_width_data) => {
-                if variable_width_data.bits_per_offset == 32 {
+                if variable_width_data.bits_per_offset == 32
+                    || variable_width_data.bits_per_offset == 64
+                {
                     let data_size =
                         variable_width_data.expect_single_stat::<UInt64Type>(Stat::DataSize);
                     let max_len =
@@ -160,9 +194,6 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     } else {
                         Ok(Box::new(BinaryMiniBlockEncoder::default()))
                     }
-                } else if variable_width_data.bits_per_offset == 64 {
-                    // TODO: Support FSSTMiniBlockEncoder
-                    Ok(Box::new(BinaryMiniBlockEncoder::default()))
                 } else {
                     todo!(
                         "Implement MiniBlockCompression for VariableWidth DataBlock with {} bit offsets.",
@@ -222,7 +253,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     return Ok(Box::new(CompressedBufferEncoder::default()));
                 }
 
-                if variable_width.bits_per_offset == 32 {
+                if variable_width.bits_per_offset == 32 || variable_width.bits_per_offset == 64 {
                     let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
                     let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
 
@@ -236,7 +267,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                         Ok(variable_compression)
                     }
                 } else {
-                    todo!("Implement MiniBlockCompression for VariableWidth DataBlock with 64 bits offsets.")
+                    panic!("Does not support MiniBlockCompression for VariableWidth DataBlock with {} bits offsets.", variable_width.bits_per_offset);
                 }
             }
             _ => unreachable!(
@@ -296,6 +327,7 @@ pub trait DecompressionStrategy: std::fmt::Debug + Send + Sync {
     fn create_miniblock_decompressor(
         &self,
         description: &pb::ArrayEncoding,
+        decompression_strategy: &dyn DecompressionStrategy,
     ) -> Result<Box<dyn MiniBlockDecompressor>>;
 
     fn create_fixed_per_value_decompressor(
@@ -321,6 +353,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
     fn create_miniblock_decompressor(
         &self,
         description: &pb::ArrayEncoding,
+        decompression_strategy: &dyn DecompressionStrategy,
     ) -> Result<Box<dyn MiniBlockDecompressor>> {
         match description.array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Flat(flat) => {
@@ -333,7 +366,14 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 BinaryMiniBlockDecompressor::new(variable.bits_per_offset as u8),
             )),
             pb::array_encoding::ArrayEncoding::Fsst(description) => {
-                Ok(Box::new(FsstMiniBlockDecompressor::new(description)))
+                let inner_decompressor = decompression_strategy.create_miniblock_decompressor(
+                    description.binary.as_ref().unwrap(),
+                    decompression_strategy,
+                )?;
+                Ok(Box::new(FsstMiniBlockDecompressor::new(
+                    description,
+                    inner_decompressor,
+                )))
             }
             pb::array_encoding::ArrayEncoding::PackedStructFixedWidthMiniBlock(description) => {
                 Ok(Box::new(PackedStructFixedWidthMiniBlockDecompressor::new(
@@ -344,6 +384,38 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 // In the future, we might need to do something more complex here if FSL supports
                 // compression.
                 Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
+            }
+            pb::array_encoding::ArrayEncoding::Rle(rle) => {
+                Ok(Box::new(RleMiniBlockDecompressor::new(rle.bits_per_value)))
+            }
+            pb::array_encoding::ArrayEncoding::ByteStreamSplit(bss) => Ok(Box::new(
+                ByteStreamSplitDecompressor::new(bss.bits_per_value as usize),
+            )),
+            pb::array_encoding::ArrayEncoding::GeneralMiniBlock(general) => {
+                // Create inner decompressor
+                let inner_decompressor = self.create_miniblock_decompressor(
+                    general.inner.as_ref().ok_or_else(|| {
+                        Error::invalid_input("GeneralMiniBlock missing inner encoding", location!())
+                    })?,
+                    decompression_strategy,
+                )?;
+
+                // Parse compression config
+                let compression = general.compression.as_ref().ok_or_else(|| {
+                    Error::invalid_input("GeneralMiniBlock missing compression config", location!())
+                })?;
+
+                let scheme = compression.scheme.parse()?;
+
+                let compression_config = crate::encodings::physical::block::CompressionConfig::new(
+                    scheme,
+                    compression.level,
+                );
+
+                Ok(Box::new(GeneralMiniBlockDecompressor::new(
+                    inner_decompressor,
+                    compression_config,
+                )))
             }
             _ => todo!(),
         }

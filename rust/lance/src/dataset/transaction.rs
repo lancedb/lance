@@ -1549,11 +1549,11 @@ impl Transaction {
                     manifest.update_config(upsert_values.clone());
                 }
                 if let Some(schema_metadata) = schema_metadata {
-                    manifest.update_schema_metadata(schema_metadata.clone());
+                    manifest.replace_schema_metadata(schema_metadata.clone());
                 }
                 if let Some(field_metadata) = field_metadata {
                     for (field_id, metadata) in field_metadata {
-                        manifest.update_field_metadata(*field_id as i32, metadata.clone());
+                        manifest.replace_field_metadata(*field_id as i32, metadata.clone())?;
                     }
                 }
             }
