@@ -19,6 +19,7 @@ public enum IndexType {
   BITMAP(2),
   LABEL_LIST(3),
   INVERTED(4),
+  NGRAM(5),
   VECTOR(100),
   IVF_FLAT(101),
   IVF_SQ(102),
