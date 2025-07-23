@@ -221,10 +221,24 @@ class LanceDataset(pa.dataset.Dataset):
         serialized_manifest: Optional[bytes] = None,
         default_scan_options: Optional[Dict[str, Any]] = None,
         metadata_cache_size_bytes: Optional[int] = None,
+        index_cache_size_bytes: Optional[int] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._storage_options = storage_options
+
+        # Handle deprecation warning for index_cache_size
+        if index_cache_size is not None:
+            import warnings
+
+            warnings.warn(
+                "The 'index_cache_size' parameter is deprecated. "
+                "Use 'index_cache_size_bytes' instead. "
+                "The old parameter will be converted to bytes using 20 MiB per entry.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         self._ds = _Dataset(
             uri,
             version,
@@ -235,6 +249,7 @@ class LanceDataset(pa.dataset.Dataset):
             storage_options,
             serialized_manifest,
             metadata_cache_size_bytes=metadata_cache_size_bytes,
+            index_cache_size_bytes=index_cache_size_bytes,
         )
         self._default_scan_options = default_scan_options
 
@@ -380,6 +395,7 @@ class LanceDataset(pa.dataset.Dataset):
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
+        order_by: Optional[List[Union[ColumnOrdering, str]]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -485,6 +501,11 @@ class LanceDataset(pa.dataset.Dataset):
 
             Note: if this is a search operation, or a take operation (including scalar
             indexed scans) then deleted rows cannot be returned.
+        order_by: list of ColumnOrdering or str, default None
+            If not specified, the rows will be returned as the file order
+            if scan_in_order is true. Otherwise it will fellow as a random order.
+            If specified, the return rows will follow the orderings. If a string is
+            specified, it will assume ascending and nulls last ordering.
 
 
         .. note::
@@ -513,6 +534,11 @@ class LanceDataset(pa.dataset.Dataset):
         builder = ScannerBuilder(self)
         builder = self._apply_default_scan_options(builder)
 
+        if order_by is not None:
+            order_by = [
+                ColumnOrdering(o) if isinstance(o, str) else o for o in order_by
+            ]
+
         # Calls the setter if the user provided a non-None value
         # We need to avoid calling the setter with a None value so
         # we don't override any defaults from _default_scan_options
@@ -539,6 +565,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.include_deleted_rows, include_deleted_rows)
         setopt(builder.scan_stats_callback, scan_stats_callback)
         setopt(builder.strict_batch_size, strict_batch_size)
+        setopt(builder.order_by, order_by)
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
             # No defaults, use user-provided, if any
@@ -619,6 +646,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> pa.Table:
         """Read the data into memory as a :py:class:`pyarrow.Table`
 
@@ -697,6 +725,11 @@ class LanceDataset(pa.dataset.Dataset):
 
             Note: if this is a search operation, or a take operation (including scalar
             indexed scans) then deleted rows cannot be returned.
+        order_by: list of ColumnOrdering, default None
+            If not specified, the rows will be returned as the file order
+            if scan_in_order is true. Otherwise it will fellow as a random order.
+            If specified, the return rows will follow the orderings. If a string is
+            specified, it will assume ascending and nulls last ordering.
 
         Notes
         -----
@@ -725,6 +758,7 @@ class LanceDataset(pa.dataset.Dataset):
             fast_search=fast_search,
             full_text_query=full_text_query,
             include_deleted_rows=include_deleted_rows,
+            order_by=order_by,
         ).to_table()
 
     @property
@@ -810,6 +844,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
         strict_batch_size: Optional[bool] = None,
+        order_by: Optional[List[ColumnOrdering]] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -842,6 +877,7 @@ class LanceDataset(pa.dataset.Dataset):
             use_stats=use_stats,
             full_text_query=full_text_query,
             strict_batch_size=strict_batch_size,
+            order_by=order_by,
         ).to_batches()
 
     def sample(
@@ -3362,6 +3398,19 @@ class LanceOperation:
         schema: LanceSchema
 
 
+@dataclass
+class ColumnOrdering:
+    """
+    This class is used to define the column ordering rules for the `sort` operator.
+    It allows users to specify the sorting order (ascending or descending)
+    and the position of null values (first or last).
+    """
+
+    column_name: str
+    ascending: bool = True
+    nulls_first: bool = False
+
+
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
@@ -3389,6 +3438,7 @@ class ScannerBuilder:
         self._include_deleted_rows = None
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
+        self._orderings = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -3750,6 +3800,21 @@ class ScannerBuilder:
         self._strict_batch_size = strict_batch_size
         return self
 
+    def order_by(self, orderings: Optional[list[ColumnOrdering]]) -> ScannerBuilder:
+        if orderings is not None:
+            inner_orderings = []
+            for order in orderings:
+                if isinstance(order, ColumnOrdering):
+                    inner_orderings.append(order)
+                else:
+                    raise TypeError(
+                        f"orderings must be a list of ColumnOrdering. "
+                        f"Got {type(order)} instead."
+                    )
+            orderings = inner_orderings
+        self._orderings = orderings
+        return self
+
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -3776,6 +3841,7 @@ class ScannerBuilder:
             self._include_deleted_rows,
             self._scan_stats_callback,
             self._strict_batch_size,
+            self._orderings,
         )
         return LanceScanner(scanner, self.ds)
 

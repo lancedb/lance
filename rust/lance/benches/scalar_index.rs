@@ -219,7 +219,11 @@ fn bench_warm_indexed(c: &mut Criterion) {
     let fixture = rt.block_on(BenchmarkFixture::open());
 
     let index = rt
-        .block_on(BTreeIndex::load(fixture.index_store.clone(), None))
+        .block_on(BTreeIndex::load(
+            fixture.index_store.clone(),
+            None,
+            LanceCache::no_cache(),
+        ))
         .unwrap();
 
     c.bench_function("windexed_equality", |b| {

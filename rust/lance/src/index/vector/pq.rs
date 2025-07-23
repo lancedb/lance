@@ -67,7 +67,7 @@ pub struct PQIndex {
     /// Metric type.
     metric_type: MetricType,
 
-    fri: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
 
 impl DeepSizeOf for PQIndex {
@@ -103,14 +103,14 @@ impl PQIndex {
     pub(crate) fn new(
         pq: ProductQuantizer,
         metric_type: MetricType,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Self {
         Self {
             code: None,
             row_ids: None,
             pq,
             metric_type,
-            fri,
+            frag_reuse_index,
         }
     }
 
@@ -349,40 +349,41 @@ impl VectorIndex for PQIndex {
             self.pq.num_sub_vectors,
         );
 
-        let (primitive_row_ids, transposed_pq_codes) = if let Some(fri_ref) = self.fri.as_ref() {
-            let num_vectors = row_ids.len();
-            let row_ids = row_ids.as_primitive::<UInt64Type>().values().iter();
-            let (remapped_row_ids, remapped_pq_codes): (Vec<u64>, Vec<Vec<u8>>) = row_ids
-                .enumerate()
-                .filter_map(|(vec_idx, old_row_id)| {
-                    let new_row_id = fri_ref.remap_row_id(*old_row_id);
-                    new_row_id.map(|new_row_id| {
-                        (
-                            new_row_id,
-                            Self::get_pq_codes(&pq_codes, vec_idx, num_vectors),
-                        )
+        let (primitive_row_ids, transposed_pq_codes) =
+            if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
+                let num_vectors = row_ids.len();
+                let row_ids = row_ids.as_primitive::<UInt64Type>().values().iter();
+                let (remapped_row_ids, remapped_pq_codes): (Vec<u64>, Vec<Vec<u8>>) = row_ids
+                    .enumerate()
+                    .filter_map(|(vec_idx, old_row_id)| {
+                        let new_row_id = frag_reuse_index_ref.remap_row_id(*old_row_id);
+                        new_row_id.map(|new_row_id| {
+                            (
+                                new_row_id,
+                                Self::get_pq_codes(&pq_codes, vec_idx, num_vectors),
+                            )
+                        })
                     })
-                })
-                .unzip();
-            let transposed_codes = transpose(
-                &UInt8Array::from_iter_values(remapped_pq_codes.into_iter().flatten()),
-                remapped_row_ids.len(),
-                self.pq.num_sub_vectors,
-            );
-            (
-                Arc::new(UInt64Array::from_iter_values(remapped_row_ids)),
-                Arc::new(transposed_codes),
-            )
-        } else {
-            (Arc::new(row_ids.as_primitive().clone()), Arc::new(pq_codes))
-        };
+                    .unzip();
+                let transposed_codes = transpose(
+                    &UInt8Array::from_iter_values(remapped_pq_codes.into_iter().flatten()),
+                    remapped_row_ids.len(),
+                    self.pq.num_sub_vectors,
+                );
+                (
+                    Arc::new(UInt64Array::from_iter_values(remapped_row_ids)),
+                    Arc::new(transposed_codes),
+                )
+            } else {
+                (Arc::new(row_ids.as_primitive().clone()), Arc::new(pq_codes))
+            };
 
         Ok(Box::new(Self {
             code: Some(transposed_pq_codes),
             row_ids: Some(primitive_row_ids),
             pq: self.pq.clone(),
             metric_type: self.metric_type,
-            fri: self.fri.clone(),
+            frag_reuse_index: self.frag_reuse_index.clone(),
         }))
     }
 
@@ -610,7 +611,7 @@ pub(crate) fn build_pq_storage(
         pq.dimension,
         distance_type,
         false,
-        // TODO: support auto-remap with FRI for HNSW
+        // TODO: support auto-remap with frag_reuse_index for HNSW
         None,
     )?;
 
