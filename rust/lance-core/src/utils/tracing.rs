@@ -84,3 +84,4 @@ pub const DATASET_DROPPING_COLUMN_EVENT: &str = "dropping_column";
 pub const DATASET_DELETING_EVENT: &str = "deleting";
 pub const DATASET_COMPACTING_EVENT: &str = "compacting";
 pub const DATASET_CLEANING_EVENT: &str = "cleaning";
+pub const DATASET_LOADING_EVENT: &str = "loading";
