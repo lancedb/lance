@@ -311,6 +311,7 @@ impl ReaderProjection {
     }
 }
 
+/// File Reader Options that can control reading behaviors, such as whether to enable caching on repetition indices
 #[derive(Clone, Debug, Default)]
 pub struct FileReaderOptions {
     pub decoder_config: DecoderConfig,
