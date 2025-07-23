@@ -556,23 +556,39 @@ public class Dataset implements Closeable {
   private native void nativeRestore();
 
   /**
-   * Creates a new index on the dataset. Only vector indexes are supported.
+   * Creates a new index on the dataset.
    *
    * @param columns the columns to index from
    * @param indexType the index type
    * @param name the name of the created index
-   * @param params index params
+   * @param params index params, can be null for non-vector index types
    * @param replace whether to replace the existing index
    */
   public void createIndex(
-      List<String> columns,
-      IndexType indexType,
-      Optional<String> name,
-      IndexParams params,
-      boolean replace) {
+          List<String> columns,
+          IndexType indexType,
+          Optional<String> name,
+          IndexParams params,
+          boolean replace) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeCreateIndex(columns, indexType.getValue(), name, params, replace);
+      boolean isVectorIndex =
+              indexType == IndexType.VECTOR
+                      || indexType == IndexType.IVF_FLAT
+                      || indexType == IndexType.IVF_SQ
+                      || indexType == IndexType.IVF_PQ
+                      || indexType == IndexType.IVF_HNSW_SQ
+                      || indexType == IndexType.IVF_HNSW_PQ;
+
+      if (isVectorIndex) {
+        Preconditions.checkArgument(
+                params != null, "IndexParams cannot be null for vector index types");
+      }
+
+      // Most scalar indexes do not require parameters, but some require such as inverted indexes.
+      // TODO: support inverted index params
+      IndexParams finalParams = params != null ? params : IndexParams.empty();
+      nativeCreateIndex(columns, indexType.getValue(), name, finalParams, replace);
     }
   }
 

@@ -45,6 +45,7 @@ use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::Index;
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_index::scalar::{ScalarIndexParams, ScalarIndexType};
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
@@ -614,7 +615,18 @@ fn inner_create_index(
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
     let name = env.get_string_opt(&name_jobj)?;
-    let params = get_index_params(env, params_jobj)?;
+
+    let params: Box<dyn IndexParams> = match index_type {
+        IndexType::BTree => Box::new(ScalarIndexParams::new(ScalarIndexType::BTree)),
+        IndexType::Bitmap => Box::new(ScalarIndexParams::new(ScalarIndexType::Bitmap)),
+        IndexType::LabelList => Box::new(ScalarIndexParams::new(ScalarIndexType::LabelList)),
+        // TODO: using default params for inverted index temporarily, need to extract params from params_jobj
+        IndexType::Inverted => Box::new(ScalarIndexParams::new(ScalarIndexType::Inverted)),
+        IndexType::NGram => Box::new(ScalarIndexParams::new(ScalarIndexType::NGram)),
+        // scalar index alias for btree index
+        IndexType::Scalar => Box::new(ScalarIndexParams::new(ScalarIndexType::BTree)),
+        _ => get_index_params(env, params_jobj)?,
+    };
     let replace = replace_jobj != 0;
     let columns_slice: Vec<&str> = columns.iter().map(AsRef::as_ref).collect();
     let mut dataset_guard =
@@ -644,7 +656,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
             path,
             version_obj,
             block_size_obj,
-            index_cache_size_bytes,
+            index_cache_size,
             metadata_cache_size_bytes,
             storage_options_obj
         )
