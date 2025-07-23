@@ -559,6 +559,15 @@ impl Dataset {
         strict_batch_size: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
+
+        if with_row_id.unwrap_or(false) {
+            scanner.with_row_id();
+        }
+
+        if with_row_address.unwrap_or(false) {
+            scanner.with_row_address();
+        }
+
         match (columns, columns_with_transform) {
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
@@ -675,14 +684,6 @@ impl Dataset {
         }
 
         scanner.scan_in_order(scan_in_order.unwrap_or(true));
-
-        if with_row_id.unwrap_or(false) {
-            scanner.with_row_id();
-        }
-
-        if with_row_address.unwrap_or(false) {
-            scanner.with_row_address();
-        }
 
         if let Some(use_stats) = use_stats {
             scanner.use_stats(use_stats);

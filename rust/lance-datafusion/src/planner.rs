@@ -26,8 +26,8 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility, WindowUDF,
+    AggregateUDF, ColumnarValue, ExprSchemable, GetFieldAccess, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
@@ -238,6 +238,7 @@ impl ContextProvider for LanceContextProvider {
 pub struct Planner {
     schema: SchemaRef,
     context_provider: LanceContextProvider,
+    enable_relations: bool,
 }
 
 impl Planner {
@@ -245,21 +246,47 @@ impl Planner {
         Self {
             schema,
             context_provider: LanceContextProvider::default(),
+            enable_relations: false,
         }
     }
 
-    fn column(idents: &[Ident]) -> Expr {
-        let mut column = col(&idents[0].value);
-        for ident in &idents[1..] {
-            column = Expr::ScalarFunction(ScalarFunction {
-                args: vec![
-                    column,
-                    Expr::Literal(ScalarValue::Utf8(Some(ident.value.clone())), None),
-                ],
-                func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
-            });
+    /// If passed with `true`, then the first identifier in column reference
+    /// is parsed as the relation. For example, `table.field.inner` will be
+    /// read as the nested field `field.inner` (`inner` on struct field `field`)
+    /// on the `table` relation. If `false` (the default), then no relations
+    /// are used and all identifiers are assumed to be a nested column path.
+    pub fn with_enable_relations(mut self, enable_relations: bool) -> Self {
+        self.enable_relations = enable_relations;
+        self
+    }
+
+    fn column(&self, idents: &[Ident]) -> Expr {
+        fn handle_remaining_idents(expr: &mut Expr, idents: &[Ident]) {
+            for ident in idents {
+                *expr = Expr::ScalarFunction(ScalarFunction {
+                    args: vec![
+                        std::mem::take(expr),
+                        Expr::Literal(ScalarValue::Utf8(Some(ident.value.clone())), None),
+                    ],
+                    func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
+                });
+            }
         }
-        column
+
+        if self.enable_relations && idents.len() > 1 {
+            // Create qualified column reference (relation.column)
+            let relation = &idents[0].value;
+            let column_name = &idents[1].value;
+            let column = Expr::Column(Column::new(Some(relation.clone()), column_name.clone()));
+            let mut result = column;
+            handle_remaining_idents(&mut result, &idents[2..]);
+            result
+        } else {
+            // Default behavior - treat as struct field access
+            let mut column = col(&idents[0].value);
+            handle_remaining_idents(&mut column, &idents[1..]);
+            column
+        }
     }
 
     fn binary_op(&self, op: &BinaryOperator) -> Result<Operator> {
@@ -555,10 +582,10 @@ impl Planner {
                 } else if id.quote_style == Some('`') {
                     Ok(Expr::Column(Column::from_name(id.value.clone())))
                 } else {
-                    Ok(Self::column(vec![id.clone()].as_slice()))
+                    Ok(self.column(vec![id.clone()].as_slice()))
                 }
             }
-            SQLExpr::CompoundIdentifier(ids) => Ok(Self::column(ids.as_slice())),
+            SQLExpr::CompoundIdentifier(ids) => Ok(self.column(ids.as_slice())),
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
             SQLExpr::Value(value) => self.value(&value.value),
@@ -787,7 +814,20 @@ impl Planner {
                 location!(),
             )
         })?;
-        Ok(coerce_filter_type_to_boolean(resolved))
+
+        let coerced = coerce_filter_type_to_boolean(resolved);
+
+        // Verify filter returns boolean
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let (ret_type, _) = coerced.data_type_and_nullable(&df_schema)?;
+        if ret_type != ArrowDataType::Boolean {
+            Err(Error::InvalidInput {
+                source: format!("The filter {} does not return a boolean", filter).into(),
+                location: location!(),
+            })
+        } else {
+            Ok(coerced)
+        }
     }
 
     /// Create Logical [Expr] from a SQL expression.
@@ -858,7 +898,6 @@ impl Planner {
     /// Create the [`PhysicalExpr`] from a logical [`Expr`]
     pub fn create_physical_expr(&self, expr: &Expr) -> Result<Arc<dyn PhysicalExpr>> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
-
         Ok(datafusion::physical_expr::create_physical_expr(
             expr,
             df_schema.as_ref(),
@@ -869,6 +908,9 @@ impl Planner {
     /// Collect the columns in the expression.
     ///
     /// The columns are returned in sorted order.
+    ///
+    /// If the expr refers to nested columns these will be returned
+    /// as dotted paths (x.y.z)
     pub fn column_names_in_expr(expr: &Expr) -> Vec<String> {
         let mut visitor = ColumnCapturingVisitor {
             current_path: VecDeque::new(),

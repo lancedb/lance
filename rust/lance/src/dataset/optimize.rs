@@ -2794,13 +2794,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("MaterializeIndex"),
-            "Expected bitmap index scan in plan: {}",
-            plan
-        );
-        assert!(
-            !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
+            plan.contains("ScalarIndexQuery: query=[category = 1]@category_idx"),
+            "Expected index query in plan: {}",
             plan
         );
     }
@@ -2893,13 +2888,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("MaterializeIndex"),
-            "Expected btree index scan in plan: {}",
-            plan
-        );
-        assert!(
-            !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
+            plan.contains("ScalarIndexQuery: query=[id >= 2000 && id < 3000]@id_idx"),
+            "Expected scalar index query in plan: {}",
             plan
         );
     }
@@ -3162,13 +3152,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("MaterializeIndex"),
-            "Expected inverted index scan in plan: {}",
-            plan
-        );
-        assert!(
-            !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
+            plan.contains("ScalarIndexQuery: query=[contains(doc, Utf8"),
+            "Expected scalar index query in plan: {}",
             plan
         );
     }
@@ -3265,13 +3250,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("MaterializeIndex"),
-            "Expected label list index scan in plan: {}",
-            plan
-        );
-        assert!(
-            !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
+            plan.contains("ScalarIndexQuery: query=[array_has_any(labels, List([1]))]@labels_idx"),
+            "Expected scalar index query in plan: {}",
             plan
         );
     }
