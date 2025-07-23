@@ -29,8 +29,6 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class TransactionTest {
-
-  @TempDir static Path tempDir; // Temporary directory for the tests
   private static Dataset dataset;
 
   @BeforeAll
@@ -45,7 +43,7 @@ public class TransactionTest {
   }
 
   @Test
-  void testProjection() {
+  void testProjection(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
