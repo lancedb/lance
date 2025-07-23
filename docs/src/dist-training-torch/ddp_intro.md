@@ -33,9 +33,8 @@ For most projects, the choice is between the high-performance map-style pattern 
 | **Parallelism** | **High**. Data decoding is parallelized across multiple workers. | **Low**. Data is fetched and decoded sequentially in a single stream. |
 | **Shuffling** | Natively supported via PyTorch samplers (e.g., `DistributedSampler`).  | Requires custom implementation (e.g., buffering data). |
 | **Epoch Length** | Deterministic. The dataset has a known length (`__len__`).  | Not deterministic by default. Requires manual loop control. |
-| **Complexity** | **Low**. Integrates directly with standard PyTorch components. | **Low**. Simple to set up for streaming. |
-| **PyTorch `num_workers`** | `> 0` (Recommended for performance). | `0` (Required for this pattern). |
-| **Sampler** | PyTorch `DistributedSampler`. | Lance `ShardedBatchSampler`.  |
+| **PyTorch `num_workers`** | `> 0` (Recommended for performance). | `0` (mutli-worker requireds custom implementation). |
+| **Sampler** | PyTorch `DistributedSampler`. | Custom (E.g. Lance `ShardedBatchSampler`. ) |
 
 It is recommended to use map‑style datasets by default. Map‑style give you their size ahead of time, easier to shuffle, and allow for easy parallel loading. But if you're reading from a massive data source remotely and/or you need to use custom sampling logic, you should use iterable style dataloader. Common techniques and pitfalls of each approach is discussed in their respective sections.
 
