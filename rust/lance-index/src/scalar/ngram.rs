@@ -168,15 +168,18 @@ impl CacheKey for NGramPostingListKey {
 }
 
 impl NGramPostingList {
-    fn try_from_batch(batch: RecordBatch, fri: Option<Arc<FragReuseIndex>>) -> Result<Self> {
+    fn try_from_batch(
+        batch: RecordBatch,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
         let mut bitmap =
             RoaringTreemap::deserialize_from(bitmap_bytes).map_err(|e| Error::Internal {
                 message: format!("Error deserializing ngram list: {}", e),
                 location: location!(),
             })?;
-        if let Some(fri_ref) = fri.as_ref() {
-            bitmap = fri_ref.remap_row_ids_roaring_tree_map(&bitmap);
+        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+            bitmap = frag_reuse_index_ref.remap_row_ids_roaring_tree_map(&bitmap);
         }
         Ok(Self { bitmap })
     }
@@ -197,7 +200,7 @@ impl NGramPostingList {
 /// Reads on-demand ngram posting lists from storage (and stores them in a cache)
 struct NGramPostingListReader {
     reader: Arc<dyn IndexReader>,
-    fri: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
     index_cache: LanceCache,
 }
 
@@ -230,7 +233,7 @@ impl NGramPostingListReader {
                         Some(&[POSTING_LIST_COL]),
                     )
                     .await?;
-                NGramPostingList::try_from_batch(batch, self.fri.clone())
+                NGramPostingList::try_from_batch(batch, self.frag_reuse_index.clone())
         }).await.map_err(|e| Error::io(e.to_string(), location!()))
     }
 }
@@ -282,7 +285,7 @@ impl DeepSizeOf for NGramIndex {
 impl NGramIndex {
     async fn from_store(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: LanceCache,
     ) -> Result<Self> {
         let tokens = store.open_index_file(POSTINGS_FILENAME).await?;
@@ -303,7 +306,7 @@ impl NGramIndex {
 
         let posting_reader = Arc::new(NGramPostingListReader {
             reader: store.open_index_file(POSTINGS_FILENAME).await?,
-            fri,
+            frag_reuse_index,
             index_cache,
         });
 
@@ -468,13 +471,15 @@ impl ScalarIndex for NGramIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: LanceCache,
     ) -> Result<Arc<Self>>
     where
         Self: Sized,
     {
-        Ok(Arc::new(Self::from_store(store, fri, index_cache).await?))
+        Ok(Arc::new(
+            Self::from_store(store, frag_reuse_index, index_cache).await?,
+        ))
     }
 
     async fn remap(

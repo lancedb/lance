@@ -212,7 +212,7 @@ impl ScalarIndex for BitmapIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
         _index_cache: LanceCache,
     ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
@@ -265,8 +265,8 @@ impl ScalarIndex for BitmapIndex {
                 let bitmap_bytes = bitmap_binary_array.value(idx);
                 let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
-                if let Some(fri_ref) = fri.as_ref() {
-                    bitmap = fri_ref.remap_row_ids_tree_map(&bitmap);
+                if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                    bitmap = frag_reuse_index_ref.remap_row_ids_tree_map(&bitmap);
                 }
 
                 index_map_size_bytes += key.deep_size_of();
