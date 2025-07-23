@@ -2823,6 +2823,56 @@ class LanceDataset(pa.dataset.Dataset):
     ) -> None:
         _Dataset.drop(str(base_uri), storage_options, ignore_not_found=ignore_not_found)
 
+    def get_ivf_model(self, index_name: str):
+        """Return the IVF model for a vector index.
+
+        This directly forwards to the underlying Rust Dataset implementation
+        and returns a ``PyIvfModel`` instance (see ``lance.indices``).
+
+        Parameters
+        ----------
+        index_name : str
+            The name of the vector index (e.g. ``"vector_idx"``).
+        """
+        return self._ds.get_ivf_model(index_name)
+
+    def _default_vector_index_for_column(self, column: str) -> str:
+        """Return the first index name that covers *column* and is IVF-based.
+
+        Raises KeyError if no such index exists.
+        """
+        for meta in self.list_indices():
+            if column in meta["fields"] and meta["type"].startswith("IVF"):
+                return meta["name"]
+        raise KeyError(f"No IVF index for column '{column}'")
+
+    def centroids(
+        self,
+        *,
+        index_name: str | None = None,
+        column: str | None = None,
+    ):
+        """Return IVF centroids for a given index/column.
+
+        Parameters
+        ----------
+        index_name : str, optional
+            Explicit index name.  If omitted, *column* must be provided.
+        column : str, optional
+            Column whose default IVF index should be inspected.
+        """
+
+        if index_name is None:
+            if column is None:
+                raise ValueError("Must provide 'index_name' or 'column'.")
+            index_name = self._default_vector_index_for_column(column)
+
+        ivf = self.get_ivf_model(index_name)
+        if ivf is None:
+            return None
+
+        return ivf.centroids
+
 
 class SqlQuery:
     """

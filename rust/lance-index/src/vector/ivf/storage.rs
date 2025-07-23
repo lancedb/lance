@@ -132,6 +132,13 @@ impl IvfModel {
         self.lengths.push(len);
     }
 
+    /// Get a reference to all centroids as a [`FixedSizeListArray`].
+    ///
+    /// Returns `None` if the model does not contain centroids
+    pub fn centroids_array(&self) -> Option<&FixedSizeListArray> {
+        self.centroids.as_ref()
+    }
+
     pub fn row_range(&self, partition: usize) -> Range<usize> {
         let start = self.offsets[partition];
         let end = start + self.lengths[partition] as usize;
@@ -319,5 +326,26 @@ mod tests {
         assert_eq!(ivf.dimension(), 3);
         assert_eq!(ivf.centroids.as_ref().unwrap().len(), 2);
         assert_eq!(ivf.centroids.as_ref().unwrap().value_length(), 3);
+    }
+
+    #[test]
+    fn test_centroids_array_getter() {
+        use arrow_array::Float32Array;
+        // two centroids, dim = 2
+        let values = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
+        let centroids = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let ivf = IvfModel::new(centroids.clone(), None);
+        let out = ivf.centroids_array().unwrap();
+
+        // Validate that the returned array has expected structure
+        assert_eq!(out.len(), centroids.len());
+        assert_eq!(out.value_length(), centroids.value_length());
+
+        // Validate centroid accessor returns correct values for the first partition
+        let first = ivf.centroid(0).unwrap();
+        let first_vals = first.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(first_vals.len(), 2);
+        assert_eq!(first_vals.value(0), 1.0);
+        assert_eq!(first_vals.value(1), 2.0);
     }
 }
