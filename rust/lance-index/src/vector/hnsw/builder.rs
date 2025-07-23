@@ -165,7 +165,7 @@ impl HNSW {
         &self,
         query: ArrayRef,
         k: usize,
-        ef: usize,
+        params: &HnswQueryParams,
         bitset: Option<Visited>,
         visited_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
@@ -189,7 +189,7 @@ impl HNSW {
         Ok(beam_search(
             &bottom_level,
             &ep,
-            ef,
+            params,
             &dist_calc,
             bitset.as_ref(),
             prefetch_distance,
@@ -205,7 +205,7 @@ impl HNSW {
         &self,
         query: ArrayRef,
         k: usize,
-        ef: usize,
+        params: HnswQueryParams,
         bitset: Option<Visited>,
         storage: &impl VectorStore,
     ) -> Result<Vec<OrderedNode>> {
@@ -217,7 +217,7 @@ impl HNSW {
         let result = self.search_inner(
             query,
             k,
-            ef,
+            &params,
             bitset,
             &mut visited_generator,
             storage,
@@ -241,6 +241,7 @@ impl HNSW {
         query: ArrayRef,
         k: usize,
         prefilter_bitset: Visited,
+        params: HnswQueryParams,
     ) -> Vec<OrderedNode> {
         let node_ids = storage
             .row_ids()
@@ -252,6 +253,9 @@ impl HNSW {
             })
             .collect_vec();
 
+        let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
+        let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
+
         let dist_calc = storage.dist_calculator(query);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
         for i in 0..node_ids.len() {
@@ -261,7 +265,10 @@ impl HNSW {
                 }
             }
             let node_id = node_ids[i];
-            let dist = dist_calc.distance(node_id).into();
+            let dist: OrderedFloat = dist_calc.distance(node_id).into();
+            if dist < lower_bound || dist >= upper_bound {
+                continue;
+            }
             if heap.len() < k {
                 heap.push((dist, node_id).into());
             } else if dist < heap.peek().unwrap().dist {
@@ -468,7 +475,11 @@ impl HnswBuilder {
         beam_search(
             &cur_level,
             ep,
-            self.params.ef_construction,
+            &HnswQueryParams {
+                ef: self.params.ef_construction,
+                lower_bound: None,
+                upper_bound: None,
+            },
             dist_calc,
             None,
             self.params.prefetch_distance,
@@ -543,6 +554,8 @@ impl Graph for HnswBottomView<'_> {
 #[derive(Debug)]
 pub struct HnswQueryParams {
     pub ef: usize,
+    pub lower_bound: Option<f32>,
+    pub upper_bound: Option<f32>,
 }
 
 impl From<&Query> for HnswQueryParams {
@@ -550,6 +563,18 @@ impl From<&Query> for HnswQueryParams {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {
             ef: query.ef.unwrap_or(k + k / 2),
+            lower_bound: query.lower_bound,
+            upper_bound: query.upper_bound,
+        }
+    }
+}
+
+impl Clone for HnswQueryParams {
+    fn clone(&self) -> Self {
+        Self {
+            ef: self.ef,
+            lower_bound: self.lower_bound,
+            upper_bound: self.upper_bound,
         }
     }
 }
@@ -701,9 +726,9 @@ impl IvfSubIndex for HNSW {
         let results = if remained < self.len() * 10 / 100 {
             let prefilter_bitset =
                 prefilter_bitset.expect("the prefilter bitset must be set for flat search");
-            self.flat_search(storage, query, k, prefilter_bitset)
+            self.flat_search(storage, query, k, prefilter_bitset, params)
         } else {
-            self.search_basic(query, k, params.ef, prefilter_bitset, storage)?
+            self.search_basic(query, k, params, prefilter_bitset, storage)?
         };
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
@@ -828,7 +853,10 @@ mod tests {
     use crate::vector::{
         flat::storage::FlatFloatStorage,
         graph::{DISTS_FIELD, NEIGHBORS_FIELD},
-        hnsw::{builder::HnswBuildParams, HNSW, VECTOR_ID_FIELD},
+        hnsw::{
+            builder::{HnswBuildParams, HnswQueryParams},
+            HNSW, VECTOR_ID_FIELD,
+        },
     };
 
     #[tokio::test]
@@ -878,12 +906,16 @@ mod tests {
 
         let query = fsl.value(0);
         let k = 10;
-        let ef = 50;
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+        };
         let builder_results = builder
-            .search_basic(query.clone(), k, ef, None, store.as_ref())
+            .search_basic(query.clone(), k, params.clone(), None, store.as_ref())
             .unwrap();
         let loaded_results = loaded_hnsw
-            .search_basic(query, k, ef, None, store.as_ref())
+            .search_basic(query, k, params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
     }
