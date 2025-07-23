@@ -38,3 +38,27 @@ For most projects, the choice is between the high-performance map-style pattern 
 | **Sampler** | PyTorch `DistributedSampler`. | Lance `ShardedBatchSampler`.  |
 
 It is recommended to use map‑style datasets by default. Map‑style give you their size ahead of time, easier to shuffle, and allow for easy parallel loading. But if you're reading from a massive data source remotely and/or you need to use custom sampling logic, you should use iterable style dataloader. Common techniques and pitfalls of each approach is discussed in their respective sections.
+
+### Launching distributed training jobs
+
+It is recommended to launch pytorch distributed training jobs using torchrun. Torchrun is a command-line tool provided by PyTorch for launching distributed training jobs. It offers:
+
+1. Simplified Launch: Eliminates the need for manual environment variable setup or mp.spawn calls within your script.
+2. Scalability: Facilitates scaling training from single-node to multi-node environments with minimal code changes.
+3. Fault Tolerance: Enables robust training by allowing graceful restarts from snapshots.
+
+**Running sinlge-node multi-gpu jobs**
+
+```
+torchrun --nproc_per_node=<N> your_training_script.py
+```
+
+**Multi node multi-gpu jobs**
+
+For multi-node training, you need to specify the number of nodes (--nnodes), the rendezvous endpoint (--rdzv_endpoint), and the number of processes per node.
+
+```
+torchrun --nnodes=2 --nproc_per_node=4 --rdzv_endpoint="master_ip:29500" your_training_script.py
+```
+
+Learn more on [torchrun docs](https://docs.pytorch.org/docs/stable/elastic/run.html)
