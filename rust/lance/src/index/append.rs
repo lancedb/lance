@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use futures::FutureExt;
 use lance_core::{Error, Result};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -168,6 +169,7 @@ pub async fn merge_indices<'a>(
                 &indices,
                 options,
             )
+            .boxed()
             .await
         }
         _ => Err(Error::Index {

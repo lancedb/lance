@@ -201,9 +201,10 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta)
         .await
         .unwrap();
-    let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
-        .await
-        .unwrap();
+    let frag_reuse_index =
+        open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
+            .await
+            .unwrap();
 
     if frag_reuse_index.row_id_maps.is_empty() {
         return Ok(());

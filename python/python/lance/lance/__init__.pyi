@@ -180,6 +180,8 @@ class _Dataset:
         commit_handler: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
         manifest: Optional[bytes] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        index_cache_size_bytes: Optional[int] = None,
         **kwargs,
     ): ...
     @property

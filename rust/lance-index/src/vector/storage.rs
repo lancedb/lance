@@ -112,7 +112,7 @@ pub struct StorageBuilder<Q: Quantization> {
 
     // this is for testing purpose
     assert_num_columns: bool,
-    fri: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
@@ -120,14 +120,14 @@ impl<Q: Quantization> StorageBuilder<Q> {
         vector_column: String,
         distance_type: DistanceType,
         quantizer: Q,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         Ok(Self {
             vector_column,
             distance_type,
             quantizer,
             assert_num_columns: true,
-            fri,
+            frag_reuse_index,
         })
     }
 
@@ -164,7 +164,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
             batch,
             &self.quantizer.metadata(None),
             self.distance_type,
-            self.fri.clone(),
+            self.frag_reuse_index.clone(),
         )
     }
 }
@@ -178,7 +178,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     metadata: Q::Metadata,
 
     ivf: IvfModel,
-    fri: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -191,7 +191,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Open a Loader.
     ///
     ///
-    pub async fn try_new(reader: FileReader, fri: Option<Arc<FragReuseIndex>>) -> Result<Self> {
+    pub async fn try_new(
+        reader: FileReader,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         let schema = reader.schema();
 
         let distance_type = DistanceType::try_from(
@@ -249,7 +252,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             distance_type,
             metadata,
             ivf,
-            fri,
+            frag_reuse_index,
         })
     }
 
@@ -299,6 +302,11 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let schema = Arc::new(self.reader.schema().as_ref().into());
             concat_batches(&schema, batches.iter())?
         };
-        Q::Storage::try_from_batch(batch, self.metadata(), self.distance_type, self.fri.clone())
+        Q::Storage::try_from_batch(
+            batch,
+            self.metadata(),
+            self.distance_type,
+            self.frag_reuse_index.clone(),
+        )
     }
 }
