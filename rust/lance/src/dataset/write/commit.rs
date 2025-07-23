@@ -153,6 +153,11 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
+        self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
+        self
+    }
+
     /// Provide the set of row addresses that were deleted or updated. This is
     /// used to perform fast conflict resolution.
     pub fn with_affected_rows(mut self, affected_rows: RowIdTreeMap) -> Self {
