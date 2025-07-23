@@ -677,6 +677,7 @@ impl std::fmt::Display for ScalarIndexExpr {
 pub enum IndexExprResult {
     // The answer is exactly the rows in the allow list minus the rows in the block list
     Exact(RowIdMask),
+
     // The answer is at most the rows in the allow list minus the rows in the block list
     // Some of the rows in the allow list may not be in the result and will need to be filtered
     // by a recheck.  Every row in the block list is definitely not in the result.
@@ -817,20 +818,18 @@ impl ScalarIndexExpr {
                     .await?;
                 let search_result = index.search(search.query.as_ref(), metrics).await?;
                 match search_result {
-                    SearchResult::Exact(matching_row_ids) => {
-                        Ok(IndexExprResult::Exact(RowIdMask {
-                            block_list: None,
-                            allow_list: Some(matching_row_ids),
-                        }))
+                    SearchResult::Exact(matching_row_ids) => Ok(IndexExprResult::Exact(
+                        RowIdMask::from_allowed(matching_row_ids),
+                    )),
+                    SearchResult::ExactMulti(matching_row_ids) => Ok(IndexExprResult::Exact(
+                        RowIdMask::from_allowed(matching_row_ids),
+                    )),
+                    SearchResult::AtMost(row_ids) => {
+                        Ok(IndexExprResult::AtMost(RowIdMask::from_allowed(row_ids)))
                     }
-                    SearchResult::AtMost(row_ids) => Ok(IndexExprResult::AtMost(RowIdMask {
-                        block_list: None,
-                        allow_list: Some(row_ids),
-                    })),
-                    SearchResult::AtLeast(row_ids) => Ok(IndexExprResult::AtLeast(RowIdMask {
-                        block_list: None,
-                        allow_list: Some(row_ids),
-                    })),
+                    SearchResult::AtLeast(row_ids) => {
+                        Ok(IndexExprResult::AtLeast(RowIdMask::from_allowed(row_ids)))
+                    }
                 }
             }
         }

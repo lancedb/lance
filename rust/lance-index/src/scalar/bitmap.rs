@@ -17,6 +17,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
+use lance_core::utils::mask::MultiRowIdTreeMap;
 use lance_core::{
     cache::LanceCache, error::LanceOptionExt, utils::mask::RowIdTreeMap, Error, Result,
 };
@@ -143,14 +144,14 @@ impl ScalarIndex for BitmapIndex {
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
 
-        let row_ids = match query {
+        let res = match query {
             SargableQuery::Equals(val) => {
                 metrics.record_comparisons(1);
                 if val.is_null() {
-                    self.null_map.clone()
+                    SearchResult::Exact(self.null_map.clone())
                 } else {
                     let key = OrderableScalarValue(val.clone());
-                    self.index_map.get(&key).cloned().unwrap_or_default()
+                    SearchResult::Exact(self.index_map.get(&key).cloned().unwrap_or_default())
                 }
             }
             SargableQuery::Range(start, end) => {
@@ -170,30 +171,31 @@ impl ScalarIndex for BitmapIndex {
                     .index_map
                     .range((range_start, range_end))
                     .map(|(_, v)| v)
+                    .cloned()
                     .collect::<Vec<_>>();
 
                 metrics.record_comparisons(maps.len());
-                RowIdTreeMap::union_all(&maps)
+                SearchResult::ExactMulti(MultiRowIdTreeMap::from_iter(maps))
             }
             SargableQuery::IsIn(values) => {
-                let mut union_bitmap = RowIdTreeMap::default();
+                let mut bitmaps = Vec::with_capacity(values.len());
                 metrics.record_comparisons(values.len());
                 for val in values {
                     if val.is_null() {
-                        union_bitmap |= self.null_map.clone();
+                        bitmaps.push(self.null_map.clone());
                     } else {
                         let key = OrderableScalarValue(val.clone());
                         if let Some(bitmap) = self.index_map.get(&key) {
-                            union_bitmap |= bitmap.clone();
+                            bitmaps.push(bitmap.clone());
                         }
                     }
                 }
 
-                union_bitmap
+                SearchResult::ExactMulti(MultiRowIdTreeMap::from_iter(bitmaps))
             }
             SargableQuery::IsNull() => {
                 metrics.record_comparisons(1);
-                self.null_map.clone()
+                SearchResult::Exact(self.null_map.clone())
             }
             SargableQuery::FullTextSearch(_) => {
                 return Err(Error::NotSupported {
@@ -202,8 +204,7 @@ impl ScalarIndex for BitmapIndex {
                 });
             }
         };
-
-        Ok(SearchResult::Exact(row_ids))
+        Ok(res)
     }
 
     fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
