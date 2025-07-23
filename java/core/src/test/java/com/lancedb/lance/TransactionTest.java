@@ -56,7 +56,7 @@ public class TransactionTest {
       assertEquals(testDataset.getSchema(), dataset.getSchema());
       List<Field> fieldList = new ArrayList<>(testDataset.getSchema().getFields());
       Collections.reverse(fieldList);
-      Transaction txn = dataset.newTransactionBuilder().build().newProject(new Schema(fieldList));
+      Transaction txn = dataset.newTransactionBuilder().project(new Schema(fieldList)).build();
       assertEquals(1, txn.readVersion());
       assertEquals(1, dataset.version());
       assertEquals(1, txn.dataset().version());
@@ -66,7 +66,7 @@ public class TransactionTest {
         assertEquals(2, committedDataset.version());
         assertEquals(new Schema(fieldList), committedDataset.getSchema());
         fieldList.remove(1);
-        txn = committedDataset.newTransactionBuilder().build().newProject(new Schema(fieldList));
+        txn = committedDataset.newTransactionBuilder().project(new Schema(fieldList)).build();
         try (Dataset committedDataset2 = txn.commit()) {
           assertEquals(2, txn.readVersion());
           assertEquals(2, committedDataset.version());

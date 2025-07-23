@@ -25,12 +25,12 @@ import org.apache.arrow.vector.types.pojo.Schema;
 public class Project implements Operation {
 
   private final Schema schema;
-  private final ArrowSchema cSchema;
+  private final BufferAllocator allocator;
+  private ArrowSchema cSchema;
 
   private Project(Schema schema, BufferAllocator allocator) {
     this.schema = schema;
-    this.cSchema = ArrowSchema.allocateNew(allocator);
-    Data.exportSchema(allocator, schema, null, cSchema);
+    this.allocator = allocator;
   }
 
   public Schema getSchema() {
@@ -44,7 +44,9 @@ public class Project implements Operation {
 
   @Override
   public void release() {
-    cSchema.close();
+    if (cSchema != null) {
+      cSchema.close();
+    }
   }
 
   @Override
@@ -53,6 +55,10 @@ public class Project implements Operation {
   }
 
   public long exportSchema() {
+    if (cSchema == null) {
+      this.cSchema = ArrowSchema.allocateNew(allocator);
+      Data.exportSchema(allocator, schema, null, cSchema);
+    }
     return cSchema.memoryAddress();
   }
 

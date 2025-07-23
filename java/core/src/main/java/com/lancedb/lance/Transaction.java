@@ -34,14 +34,21 @@ public class Transaction {
   private final Map<String, String> writeParams;
   // Mainly for JNI usage
   private final Dataset dataset;
-  private Operation operation;
-  private Operation blobOp;
+  private final Operation operation;
+  private final Operation blobOp;
 
   private Transaction(
-      Dataset dataset, long readVersion, String uuid, Map<String, String> writeParams) {
+      Dataset dataset,
+      long readVersion,
+      String uuid,
+      Operation operation,
+      Operation blobOp,
+      Map<String, String> writeParams) {
     this.dataset = dataset;
     this.readVersion = readVersion;
     this.uuid = uuid;
+    this.operation = operation;
+    this.blobOp = blobOp;
     this.writeParams = writeParams != null ? writeParams : new HashMap<>();
   }
 
@@ -69,18 +76,7 @@ public class Transaction {
     return writeParams;
   }
 
-  public Transaction newProject(Schema schema) {
-    validateState();
-    this.operation = new Project.Builder().schema(schema).allocator(dataset.allocator).build();
-    return this;
-  }
-
-  private void validateState() {
-    Preconditions.checkState(operation == null, "Multiple operations are not supported yet");
-  }
-
   public Dataset commit() {
-    Preconditions.checkState(operation != null, "Transaction has no operations");
     try {
       Dataset committed = commitNative();
       committed.allocator = dataset.allocator;
@@ -99,6 +95,8 @@ public class Transaction {
     private final String uuid;
     private final Dataset dataset;
     private long readVersion;
+    private Operation operation;
+    private Operation blobOp;
     private Map<String, String> writeParams;
 
     public Builder(Dataset dataset) {
@@ -116,8 +114,19 @@ public class Transaction {
       return this;
     }
 
+    public Builder project(Schema newSchema) {
+      validateState();
+      this.operation = new Project.Builder().schema(newSchema).allocator(dataset.allocator).build();
+      return this;
+    }
+
+    private void validateState() {
+      Preconditions.checkState(operation == null, "Operation " + operation + " already set");
+    }
+
     public Transaction build() {
-      return new Transaction(dataset, readVersion, uuid, writeParams);
+      Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
+      return new Transaction(dataset, readVersion, uuid, operation, blobOp, writeParams);
     }
   }
 }
