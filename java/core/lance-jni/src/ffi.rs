@@ -398,3 +398,41 @@ pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseIndexParam
 ) {
     ok_or_throw_without_return!(env, get_index_params(&mut env, index_params_obj));
 }
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_benchmarkDataTransfer(
+    mut env: JNIEnv,
+    _obj: JObject,
+    data_size: jint,
+) -> jlong {
+    let start_time = std::time::Instant::now();
+    
+    // Simulate data transfer by creating and processing a large vector
+    let data: Vec<i32> = (0..data_size).collect();
+    let sum: i64 = data.iter().map(|&x| x as i64).sum();
+    
+    let elapsed = start_time.elapsed();
+    elapsed.as_nanos() as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_benchmarkMemoryAllocation(
+    mut env: JNIEnv,
+    _obj: JObject,
+    allocation_count: jint,
+) -> jlong {
+    let start_time = std::time::Instant::now();
+    
+    // Simulate memory allocation/deallocation
+    let mut allocations = Vec::new();
+    for i in 0..allocation_count {
+        let data = vec![i; 1000]; // Allocate 1000 integers
+        allocations.push(data);
+    }
+    
+    // Force deallocation
+    drop(allocations);
+    
+    let elapsed = start_time.elapsed();
+    elapsed.as_nanos() as jlong
+}
