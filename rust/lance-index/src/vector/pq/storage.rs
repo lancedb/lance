@@ -186,7 +186,7 @@ impl ProductQuantizationStorage {
         dimension: usize,
         distance_type: DistanceType,
         transposed: bool,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         if batch.num_columns() != 2 {
             log::warn!(
@@ -241,14 +241,14 @@ impl ProductQuantizationStorage {
             .clone()
             .into();
 
-        if let Some(fri_ref) = fri.as_ref() {
+        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             let transposed_codes = pq_code.values();
             let mut new_row_ids = Vec::with_capacity(row_ids.len());
             let mut new_codes = Vec::with_capacity(row_ids.len() * num_sub_vectors);
 
             let row_ids_values = row_ids.values();
             for (i, row_id) in row_ids_values.iter().enumerate() {
-                if let Some(mapped_value) = fri_ref.remap_row_id(*row_id) {
+                if let Some(mapped_value) = frag_reuse_index_ref.remap_row_id(*row_id) {
                     new_row_ids.push(mapped_value);
                     new_codes.extend(get_pq_code(
                         transposed_codes,
@@ -321,7 +321,7 @@ impl ProductQuantizationStorage {
         quantizer: ProductQuantizer,
         batch: &RecordBatch,
         vector_col: &str,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let codebook = quantizer.codebook.clone();
         let num_bits = quantizer.num_bits;
@@ -338,7 +338,7 @@ impl ProductQuantizationStorage {
             dimension,
             metric_type,
             false,
-            fri,
+            frag_reuse_index,
         )
     }
 
@@ -364,7 +364,7 @@ impl ProductQuantizationStorage {
     pub async fn load(
         object_store: &ObjectStore,
         path: &Path,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let reader = FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
@@ -388,7 +388,14 @@ impl ProductQuantizationStorage {
             DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
         let metadata = ProductQuantizationMetadata::load(&reader).await?;
-        Self::load_partition(&reader, 0..reader.len(), distance_type, &metadata, fri).await
+        Self::load_partition(
+            &reader,
+            0..reader.len(),
+            distance_type,
+            &metadata,
+            frag_reuse_index,
+        )
+        .await
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -448,7 +455,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>
     where
         Self: Sized,
@@ -477,7 +484,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             metadata.dimension,
             distance_type,
             metadata.transposed,
-            fri,
+            frag_reuse_index,
         )
     }
 
@@ -555,7 +562,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         // Hard coded to float32 for now
         let codebook = metadata
@@ -583,7 +590,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             metadata.dimension,
             distance_type,
             metadata.transposed,
-            fri,
+            frag_reuse_index,
         )
     }
 }
