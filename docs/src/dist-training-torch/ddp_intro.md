@@ -1,6 +1,5 @@
-# Overview and Core Recommendations
 
-## Introduction to DDP Training with Lance
+# Introduction to DDP Training with Lance
 
 
 Lance is a modern columnar format designed for high-performance ML workloads. Its architecture enables fast random access and efficient scans. LanceDB's ecosystem provides tools that integrate this storage format with training frameworks, supporting the AI workflow from data storage to optimized training pipelines. 
@@ -38,4 +37,4 @@ For most projects, the choice is between the high-performance map-style pattern 
 | **PyTorch `num_workers`** | `> 0` (Recommended for performance). | `0` (Required for this pattern). |
 | **Sampler** | PyTorch `DistributedSampler`. | Lance `ShardedBatchSampler`.  |
 
-You should use map‑style datasets when possible. Map‑style give you their size ahead of time, easier to shuffle, and allow for easy parallel loading. But if you're reading from a massive data source remotely and/or you need to use custom sampling logic, you should use iterable style dataloader.
+It is recommended to use map‑style datasets by default. Map‑style give you their size ahead of time, easier to shuffle, and allow for easy parallel loading. But if you're reading from a massive data source remotely and/or you need to use custom sampling logic, you should use iterable style dataloader. Common techniques and pitfalls of each approach is discussed in their respective sections.

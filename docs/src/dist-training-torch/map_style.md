@@ -36,18 +36,27 @@ Setting up a DDP-aware data loader with `SafeLanceDataset` involves four main st
 
 3.  **Create the `DataLoader`**: Combine the dataset and sampler in a `DataLoader`. Set `num_workers > 0` to enable parallel data loading.
 
+    !!! Note
+        You need to use spawn launch method when using multiprocessing (DDP) with Lance. You can either set it manually
+        by passing the multiprocessing context to `Dataloader` or you can simply use `get_safe_dataloader` method from lance which automatically
+        does this for you. 
+
+
     ```python
     from torch.utils.data import DataLoader
 
     # Use multiple workers for parallel I/O
     # Set pin_memory=True for faster CPU-to-GPU memory transfers
+    ctx = torch.multiprocessing.get_context("spawn")
     data_loader = DataLoader(
         dataset,
         sampler=sampler,
         batch_size=32,
         num_workers=4,
-        pin_memory=True
+        pin_memory=True,
+        multiprocessing_context=ctx
     )
+
     ```
 
 4.  **Update Sampler Epoch**: In your training loop, you must call `sampler.set_epoch(epoch)` at the beginning of each epoch. This is crucial for proper shuffling across epochs.
@@ -95,7 +104,7 @@ def collate_fn(batch_of_dicts):
         "label": torch.tensor(labels, dtype=torch.long)
     }
 
-loader = get_safe_loader(
+loader = DataLoader(
         dataset,
         sampler=sampler,
         collate_fn=collate_fn,

@@ -5,23 +5,10 @@ The basic iterable-style pattern is for use cases where you need to stream data 
 **Important:** This simple pattern requires setting `num_workers=0` in the `DataLoader`, which means data will be loaded serially. This is significantly slower than the map-style approach and should only be used when the flexibility of iterable datasets is a requirement.
 
 
-!!! Note
-    You can implement an iterable style dataloader with many workers, but it involves sharding at two levels:
-    Global Sharding (DDP Rank) - at the GPU rank level, and local sharding withing Dataloaders the same global rank.
 
 ## Implementation Guide
 
-1.  **Instantiate `LanceDataset`**: This is the iterable-style counterpart to `SafeLanceDataset`.
-
-    ```python
-    import lance
-    from lance.torch.data import LanceDataset
-
-    uri = "path/to/my_dataset.lance"
-    dataset = LanceDataset(uri, batch_size=32)
-    ```
-
-2.  **Create a `ShardedBatchSampler`**: Because `DistributedSampler` only works with map-style datasets, you must use Lance's `ShardedBatchSampler`. This sampler handles distributing batches to each DDP rank.
+1.  **Create a `ShardedBatchSampler`**: Because `DistributedSampler` only works with map-style datasets, you must use Lance's `ShardedBatchSampler`. This sampler handles distributing batches to each DDP rank.
 
     ```python
     from lance.torch.sampler import ShardedBatchSampler
@@ -30,13 +17,32 @@ The basic iterable-style pattern is for use cases where you need to stream data 
     sampler = ShardedBatchSampler(dataset)
     ```
 
+2.  **Instantiate `LanceDataset`**: This is the iterable-style counterpart to `SafeLanceDataset`.
+
+    ```python
+    import lance
+    from lance.torch.data import LanceDataset
+
+    uri = "path/to/my_dataset.lance"
+    dataset = LanceDataset(uri, batch_size=32, sampler=sampler)
+    ```
+
 3.  **Create the `DataLoader`**: Combine the dataset and sampler. **Crucially, `num_workers` must be 0.**
+
+    !!! Note
+        You can implement an iterable style dataloader with many workers, but it involves sharding at two levels:
+        Global Sharding (DDP Rank) - at the GPU rank level, and local sharding withing Dataloaders the same global rank.
+        Its both tricky to sync and also more expensive as you'll have to open many streams.
+
+
+        
 
     ```python
     from torch.utils.data import DataLoader
 
     # NOTE: num_workers MUST be 0 for this simple iterable pattern
-    data_loader = DataLoader(dataset, batch_sampler=sampler, num_workers=0)
+
+    data_loader = DataLoader(dataset, num_workers=0)
     ```
 
 4.  **Training Loop**: Unlike the map-style pattern, you do not need to call `set_epoch`. The sampler handles sharding automatically.
@@ -77,3 +83,8 @@ dataset = LanceDataset(
 ## Complete Example
 
 For a complete, runnable script, see the [iterable-style DDP example](https://github.com/lancedb/lance-distributed-training/blob/main/iterable_ddp.py) in our examples repository.
+
+
+### Further reading
+
+See [this discussion](https://discuss.pytorch.org/t/iterable-pytorch-dataset-with-multiple-workers/135475/2) on pytorch forum to learn more about implementing Iterable style dataloaders with multiple workers
