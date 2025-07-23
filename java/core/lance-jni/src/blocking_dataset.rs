@@ -253,6 +253,7 @@ impl BlockingDataset {
                 .execute(transaction),
         )?;
         Ok(BlockingDataset { inner: new_dataset })
+    }
 
     pub fn replace_field_metadata(
         &mut self,
