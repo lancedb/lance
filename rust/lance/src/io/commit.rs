@@ -862,11 +862,16 @@ pub(crate) async fn commit_transaction(
                         .await;
                 }
 
-                match auto_cleanup_hook(&dataset, &manifest).await {
-                    Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
-                    Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
-                    _ => {}
-                };
+                if !commit_config.skip_auto_cleanup {
+                    // Note: We're using the old dataset here (before the new manifest is committed).
+                    // This means cleanup runs based on the previous version's state, which may affect
+                    // which versions are available for cleanup.
+                    match auto_cleanup_hook(&dataset, &manifest).await {
+                        Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
+                        Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
+                        _ => {}
+                    };
+                }
                 return Ok((manifest, manifest_location));
             }
             Err(CommitError::CommitConflict) => {

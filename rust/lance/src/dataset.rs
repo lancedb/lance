@@ -1968,6 +1968,7 @@ mod tests {
     use lance_table::format::{DataFile, WriterVersion};
 
     use all_asserts::assert_true;
+    use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -2792,7 +2793,7 @@ mod tests {
             ))],
         )
         .unwrap()];
-        write_params.mode = WriteMode::Overwrite;
+        write_params.mode = Overwrite;
         let new_batch_reader =
             RecordBatchIterator::new(new_batches.into_iter().map(Ok), new_schema.clone());
         let dataset = Dataset::write(new_batch_reader, test_uri, Some(write_params.clone()))
@@ -6664,5 +6665,119 @@ mod tests {
         assert_eq!(dataset.get_fragments()[0].id(), 3);
         assert_eq!(dataset.get_fragments()[1].id(), 4);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn test_insert_skip_auto_cleanup() {
+        use lance_core::utils::testing::MockClock;
+        let clock = MockClock::new();
+
+        let tmpdir = tempdir().unwrap();
+        let test_uri = tmpdir.path().join("skip_auto_cleanup_dataset");
+        let test_uri_str = test_uri.to_str().unwrap();
+
+        // Create initial dataset with aggressive auto cleanup (interval=1, older_than=1ms)
+        let data = gen()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 1,
+                older_than: chrono::TimeDelta::try_milliseconds(0).unwrap(), // Cleanup versions older than 0ms
+            }),
+            ..Default::default()
+        };
+
+        // Start at 1 second after epoch
+        clock.set_system_time(chrono::Duration::seconds(1));
+
+        let dataset = Dataset::write(data, test_uri_str, Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.version().version, 1);
+
+        // Advance time by 1 second
+        clock.set_system_time(chrono::Duration::seconds(2));
+
+        // First append WITHOUT skip_auto_cleanup - should trigger cleanup
+        let data1 = gen()
+            .col("id", array::step::<Int32Type>())
+            .into_df_stream(RowCount::from(50), BatchCount::from(1));
+
+        let write_params1 = WriteParams {
+            mode: WriteMode::Append,
+            skip_auto_cleanup: false,
+            ..Default::default()
+        };
+
+        let dataset2 = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_params(&write_params1)
+            .execute_stream(data1)
+            .await
+            .unwrap();
+
+        assert_eq!(dataset2.version().version, 2);
+
+        // Advance time
+        clock.set_system_time(chrono::Duration::seconds(3));
+
+        // Need to do another commit for cleanup to take effect since cleanup runs on the old dataset
+        let data1_extra = gen()
+            .col("id", array::step::<Int32Type>())
+            .into_df_stream(RowCount::from(10), BatchCount::from(1));
+
+        let dataset2_extra = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset2)))
+            .with_params(&write_params1)
+            .execute_stream(data1_extra)
+            .await
+            .unwrap();
+
+        assert_eq!(dataset2_extra.version().version, 3);
+
+        // Version 1 should be cleaned up due to auto cleanup (cleanup runs every version)
+        assert!(
+            dataset2_extra.checkout_version(1).await.is_err(),
+            "Version 1 should have been cleaned up"
+        );
+        // Version 2 should still exist
+        assert!(
+            dataset2_extra.checkout_version(2).await.is_ok(),
+            "Version 2 should still exist"
+        );
+
+        // Advance time
+        clock.set_system_time(chrono::Duration::seconds(4));
+
+        // Second append WITH skip_auto_cleanup - should NOT trigger cleanup
+        let data2 = gen()
+            .col("id", array::step::<Int32Type>())
+            .into_df_stream(RowCount::from(30), BatchCount::from(1));
+
+        let write_params2 = WriteParams {
+            mode: WriteMode::Append,
+            skip_auto_cleanup: true, // Skip auto cleanup
+            ..Default::default()
+        };
+
+        let dataset3 = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset2_extra)))
+            .with_params(&write_params2)
+            .execute_stream(data2)
+            .await
+            .unwrap();
+
+        assert_eq!(dataset3.version().version, 4);
+
+        // Version 2 should still exist because skip_auto_cleanup was enabled
+        assert!(
+            dataset3.checkout_version(2).await.is_ok(),
+            "Version 2 should still exist because skip_auto_cleanup was enabled"
+        );
+        // Version 3 should also still exist
+        assert!(
+            dataset3.checkout_version(3).await.is_ok(),
+            "Version 3 should still exist"
+        );
     }
 }
