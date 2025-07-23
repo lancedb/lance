@@ -27,6 +27,7 @@ use lance_index::scalar::{
 use lance_index::scalar::{
     inverted::METADATA_FILE,
     ngram::{train_ngram_index, NGramIndex},
+    zonemap::{train_zonemap_index, ZoneMapIndex},
 };
 use lance_index::ScalarIndexCriteria;
 use lance_index::{
@@ -176,6 +177,11 @@ fn ngram_index_details() -> prost_types::Any {
     prost_types::Any::from_msg(&details).unwrap()
 }
 
+fn zonemap_index_details() -> prost_types::Any {
+    let details = lance_table::format::pb::ZoneMapIndexDetails {};
+    prost_types::Any::from_msg(&details).unwrap()
+}
+
 pub(super) fn inverted_index_details() -> prost_types::Any {
     let details = lance_table::format::pb::InvertedIndexDetails::default();
     prost_types::Any::from_msg(&details).unwrap()
@@ -211,6 +217,12 @@ impl ScalarIndexDetails for lance_table::format::pb::NGramIndexDetails {
     }
 }
 
+impl ScalarIndexDetails for lance_table::format::pb::ZoneMapIndexDetails {
+    fn get_type(&self) -> ScalarIndexType {
+        ScalarIndexType::ZoneMap
+    }
+}
+
 fn get_scalar_index_details(
     details: &prost_types::Any,
 ) -> Result<Option<Box<dyn ScalarIndexDetails>>> {
@@ -233,6 +245,10 @@ fn get_scalar_index_details(
     } else if details.type_url.ends_with("NGramIndexDetails") {
         Ok(Some(Box::new(
             details.to_msg::<lance_table::format::pb::NGramIndexDetails>()?,
+        )))
+    } else if details.type_url.ends_with("ZoneMapIndexDetails") {
+        Ok(Some(Box::new(
+            details.to_msg::<lance_table::format::pb::ZoneMapIndexDetails>()?,
         )))
     } else {
         Ok(None)
@@ -325,6 +341,11 @@ pub(super) async fn build_scalar_index(
             train_ngram_index(training_request, &index_store).await?;
             Ok(ngram_index_details())
         }
+        Some(ScalarIndexType::ZoneMap) => {
+            // TODO: Add type check for zone map index
+            train_zonemap_index(training_request, &index_store).await?;
+            Ok(zonemap_index_details())
+        }
         _ => {
             let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
             train_btree_index(
@@ -382,10 +403,18 @@ pub async fn open_scalar_index(
             let ngram_index = NGramIndex::load(index_store, fri).await?;
             Ok(ngram_index as Arc<dyn ScalarIndex>)
         }
+        ScalarIndexType::ZoneMap => {
+            let zone_map_index = ZoneMapIndex::load(index_store, fri).await?;
+            Ok(zone_map_index as Arc<dyn ScalarIndex>)
+        }
         ScalarIndexType::BTree => {
             let btree_index = BTreeIndex::load(index_store, fri).await?;
             Ok(btree_index as Arc<dyn ScalarIndex>)
         }
+        _ => Err(Error::InvalidInput {
+            source: format!("Invalid index type: {:?}", index_type).into(),
+            location: location!(),
+        }),
     }
 }
 
@@ -466,6 +495,9 @@ pub async fn detect_scalar_index_type(
 /// This returns IndexType::Vector for all vector index types.
 pub fn infer_index_type(index: &Index) -> Option<IndexType> {
     if let Some(details) = &index.index_details {
+        // "index details" is a serialized protobuf message (prost_types::Any) stored in the Index struct.
+        // It contains type-specific metadata for the index, such as which kind of index it is (scalar, vector, etc).
+        // Here, we try to parse it as a scalar index details proto, and if that fails, as a vector index details proto.
         if let Ok(Some(details)) = get_scalar_index_details(details) {
             return Some(details.get_type().into());
         } else if let Ok(Some(_)) = get_vector_index_details(details) {
