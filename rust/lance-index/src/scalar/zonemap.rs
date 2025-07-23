@@ -10,463 +10,258 @@
 //!
 //! Zone maps are "inexact" filters - they can definitively exclude zones but may include
 //! false positives that require rechecking.
+//!
+//!
+use super::btree::TrainingSource;
+use crate::Any;
+use std::env::temp_dir;
+use std::sync::LazyLock;
+use tempfile::{tempdir, TempDir};
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use super::{AnyQuery, IndexStore, SargableQuery, ScalarIndex, SearchResult};
-use crate::{Index, IndexType};
-use arrow_array::{Array, BinaryArray, RecordBatch, StringArray, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
-use async_trait::async_trait;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use deepsize::DeepSizeOf;
-use futures::TryStreamExt;
-use lance_core::utils::mask::RowIdTreeMap;
-use lance_core::{Error, Result, ROW_ID};
-use roaring::RoaringTreemap;
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion_common::ScalarValue;
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use std::{collections::HashMap, sync::Arc};
 
-use super::btree::{OrderableScalarValue, TrainingSource};
+use super::{AnyQuery, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
+use crate::scalar::FragReuseIndex;
+use crate::vector::VectorIndex;
+use crate::{Index, IndexType};
+use async_trait::async_trait;
+use deepsize::DeepSizeOf;
+use lance_core::Result;
+use lance_core::{utils::mask::RowIdTreeMap, Error};
+use roaring::RoaringBitmap;
+use snafu::location;
+const DEFAULT_ZONE_SIZE: u32 = 4096;
 
-// Zone map constants
-const ZONE_MAP_ZONES_FILENAME: &str = "zones.lance";
-const DEFAULT_ZONE_SIZE: usize = 1024; // Number of rows per zone
-
-fn zones_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("zone_id", DataType::UInt64, false),
-        Field::new("min_value", DataType::Binary, true),
-        Field::new("max_value", DataType::Binary, true),
-        Field::new("null_count", DataType::UInt64, false),
-        Field::new("row_ids", DataType::Binary, false),
-    ]))
+/// Basic stats about zonemap index
+#[derive(Debug)]
+struct ZoneMapStatistics {
+    zone_id: u64,
+    min: ScalarValue,
+    max: ScalarValue,
+    null_count: u64,
+    pub row_ids: RowIdTreeMap,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ZoneStatistics {
-    pub zone_id: u64,
-    pub min_value: Option<Vec<u8>>,
-    pub max_value: Option<Vec<u8>>,
-    pub null_count: u64,
-    pub row_ids: RoaringTreemap,
+impl DeepSizeOf for ZoneMapStatistics {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        // Estimate sizes for ScalarValue
+        let min_size = match &self.min {
+            ScalarValue::Int32(_) => 4,
+            ScalarValue::Int64(_) => 8,
+            ScalarValue::Float32(_) => 4,
+            ScalarValue::Float64(_) => 8,
+            ScalarValue::Utf8(Some(s)) => s.len(),
+            ScalarValue::Utf8(None) => 0,
+            ScalarValue::LargeUtf8(None) => 0,
+            _ => 16, // Default estimate
+        };
+
+        let max_size = match &self.max {
+            ScalarValue::Int32(_) => 4,
+            ScalarValue::Int64(_) => 8,
+            ScalarValue::Float32(_) => 4,
+            ScalarValue::Float64(_) => 8,
+            ScalarValue::Utf8(Some(s)) => s.len(),
+            ScalarValue::Utf8(None) => 0,
+            ScalarValue::LargeUtf8(None) => 0,
+            _ => 16, // Default estimate
+        };
+
+        min_size + max_size + 8 + self.row_ids.serialized_size()
+    }
 }
 
-#[derive(Debug, DeepSizeOf)]
+/// ZoneMap index
+/// At high level it's a columnar database technique for predicate push down and scan pruning.
+/// It breaks data into fixed-size chunks called `zones` and store summary statistics(min, max, null_count) for each zone. It enables efficient filtering by skipping zones that do not contain matching values
+///
+/// This is an inexact filter, similar to a bloom filter. It can return false positives that require rechecking.
+///
+/// Note that it cannot return false negatives.
 pub struct ZoneMapIndex {
-    zones: Vec<ZoneStatistics>,
+    zones: Vec<ZoneMapStatistics>,
     data_type: DataType,
 }
 
+impl std::fmt::Debug for ZoneMapIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZoneMapIndex")
+            .field("data_type", &self.data_type)
+            .finish()
+    }
+}
+
+impl DeepSizeOf for ZoneMapIndex {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.zones.deep_size_of_children(context)
+    }
+}
+
 impl ZoneMapIndex {
-    pub fn new(zones: Vec<ZoneStatistics>, data_type: DataType) -> Self {
-        Self { zones, data_type }
-    }
-
-    pub async fn load(store: Arc<dyn IndexStore>) -> Result<Self> {
-        let reader = store.open_index_file(ZONE_MAP_ZONES_FILENAME).await?;
-        let batches: Vec<_> = reader.read_all().await?;
-
-        if batches.is_empty() {
-            return Ok(Self::new(vec![], DataType::Null));
-        }
-
-        let batch = arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
-
-        let zone_id_col = batch
-            .column(0)
-            .as_primitive::<arrow_array::types::UInt64Type>();
-        let min_value_col = batch.column(1).as_binary::<i32>();
-        let max_value_col = batch.column(2).as_binary::<i32>();
-        let null_count_col = batch
-            .column(3)
-            .as_primitive::<arrow_array::types::UInt64Type>();
-        let row_ids_col = batch.column(4).as_binary::<i32>();
-
-        let mut zones = Vec::with_capacity(batch.num_rows());
-
-        for i in 0..batch.num_rows() {
-            let row_ids_bytes = row_ids_col.value(i);
-            let mut row_ids = RoaringTreemap::new();
-            row_ids.deserialize_from(&row_ids_bytes[..])?;
-
-            zones.push(ZoneStatistics {
-                zone_id: zone_id_col.value(i),
-                min_value: min_value_col
-                    .is_valid(i)
-                    .then(|| min_value_col.value(i).to_vec()),
-                max_value: max_value_col
-                    .is_valid(i)
-                    .then(|| max_value_col.value(i).to_vec()),
-                null_count: null_count_col.value(i),
-                row_ids,
-            });
-        }
-
-        // Infer data type from the first valid min/max value
-        let data_type = if let Some(zone) = zones.iter().find(|z| z.min_value.is_some()) {
-            // For now, assume all zone maps are for numeric types
-            // This can be extended to support other orderable types
-            DataType::Int64 // TODO: Should be determined from the actual column type
-        } else {
-            DataType::Null
-        };
-
-        Ok(Self::new(zones, data_type))
-    }
-
-    fn evaluate_zone_against_query(&self, zone: &ZoneStatistics, query: &SargableQuery) -> bool {
-        // If all values in the zone are null, handle null queries specially
-        if zone.min_value.is_none() && zone.max_value.is_none() {
-            return match query {
-                SargableQuery::IsNull => true,
-                _ => false,
-            };
-        }
-
-        let min_val = match &zone.min_value {
-            Some(bytes) => OrderableScalarValue::try_from_bytes(bytes, &self.data_type),
-            None => return false,
-        };
-        let max_val = match &zone.max_value {
-            Some(bytes) => OrderableScalarValue::try_from_bytes(bytes, &self.data_type),
-            None => return false,
-        };
-
-        let (min_val, max_val) = match (min_val, max_val) {
-            (Ok(min), Ok(max)) => (min, max),
-            _ => return false,
-        };
-
-        match query {
-            SargableQuery::Equals(target) => {
-                if let Ok(target) = OrderableScalarValue::try_from_scalar_value(target) {
-                    target >= min_val && target <= max_val
-                } else {
-                    false
-                }
-            }
-            SargableQuery::Range(start, end) => {
-                use std::ops::Bound;
-
-                let zone_overlaps_range = match (start, end) {
-                    (Bound::Unbounded, Bound::Unbounded) => true,
-                    (Bound::Included(s), Bound::Unbounded)
-                    | (Bound::Excluded(s), Bound::Unbounded) => {
-                        if let Ok(start_val) = OrderableScalarValue::try_from_scalar_value(s) {
-                            let start_check = match start {
-                                Bound::Included(_) => max_val >= start_val,
-                                Bound::Excluded(_) => max_val > start_val,
-                                _ => unreachable!(),
-                            };
-                            start_check
-                        } else {
-                            false
-                        }
-                    }
-                    (Bound::Unbounded, Bound::Included(e))
-                    | (Bound::Unbounded, Bound::Excluded(e)) => {
-                        if let Ok(end_val) = OrderableScalarValue::try_from_scalar_value(e) {
-                            let end_check = match end {
-                                Bound::Included(_) => min_val <= end_val,
-                                Bound::Excluded(_) => min_val < end_val,
-                                _ => unreachable!(),
-                            };
-                            end_check
-                        } else {
-                            false
-                        }
-                    }
-                    (start_bound, end_bound) => {
-                        let start_val = match start_bound {
-                            Bound::Included(s) | Bound::Excluded(s) => {
-                                OrderableScalarValue::try_from_scalar_value(s)
-                            }
-                            _ => unreachable!(),
-                        };
-                        let end_val = match end_bound {
-                            Bound::Included(e) | Bound::Excluded(e) => {
-                                OrderableScalarValue::try_from_scalar_value(e)
-                            }
-                            _ => unreachable!(),
-                        };
-
-                        match (start_val, end_val) {
-                            (Ok(s), Ok(e)) => {
-                                let start_check = match start_bound {
-                                    Bound::Included(_) => max_val >= s,
-                                    Bound::Excluded(_) => max_val > s,
-                                    _ => unreachable!(),
-                                };
-                                let end_check = match end_bound {
-                                    Bound::Included(_) => min_val <= e,
-                                    Bound::Excluded(_) => min_val < e,
-                                    _ => unreachable!(),
-                                };
-                                start_check && end_check
-                            }
-                            _ => false,
-                        }
-                    }
-                };
-                zone_overlaps_range
-            }
-            SargableQuery::IsIn(values) => {
-                // Zone overlaps if any value in the set could be in the zone
-                values.iter().any(|val| {
-                    if let Ok(target) = OrderableScalarValue::try_from_scalar_value(val) {
-                        target >= min_val && target <= max_val
-                    } else {
-                        false
-                    }
-                })
-            }
-            SargableQuery::IsNull => zone.null_count > 0,
-            SargableQuery::IsNotNull => {
-                // Zone may contain non-null values if not all values are null
-                zone.min_value.is_some()
-                    || zone.max_value.is_some()
-                    || zone.row_ids.len() as u64 > zone.null_count
-            }
-        }
+    async fn hello_world() -> u32 {
+        42
     }
 }
 
 #[async_trait]
 impl Index for ZoneMapIndex {
-    fn index_type(&self) -> IndexType {
-        IndexType::ZoneMap
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+        Err(Error::InvalidInput {
+            source: "ZoneMapIndex is not a vector index".into(),
+            location: location!(),
+        })
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
-            "index_type": "ZoneMap",
-            "num_zones": self.zones.len(),
+            "type": "ZoneMap",
+            "num_zones": self.zones.len()
         }))
     }
 
-    async fn calculate_included_frags(&self) -> Result<roaring::RoaringBitmap> {
-        // Zone maps can theoretically be built on any fragment
-        // For now, return all fragments as potentially included
-        Ok(roaring::RoaringBitmap::new())
+    async fn prewarm(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::ZoneMap
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        let frag_ids = RoaringBitmap::new();
+        Ok(frag_ids)
     }
 }
 
 #[async_trait]
 impl ScalarIndex for ZoneMapIndex {
-    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
-        let sargable_query = query.as_any().downcast_ref::<SargableQuery>();
-        if sargable_query.is_none() {
-            return Err(Error::InvalidInput {
-                source: "ZoneMapIndex can only handle SargableQuery".into(),
-                location: location!(),
-            });
-        }
-        let query = sargable_query.unwrap();
-
-        let mut matching_row_ids = RoaringTreemap::new();
-
-        for zone in &self.zones {
-            if self.evaluate_zone_against_query(zone, query) {
-                matching_row_ids |= &zone.row_ids;
-            }
-        }
-
-        // Zone maps are inexact - they may return false positives
-        Ok(SearchResult::AtMost(RowIdTreeMap::from(matching_row_ids)))
+    async fn search(
+        &self,
+        _query: &dyn AnyQuery,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        // TODO: Implement actual search logic
+        Ok(SearchResult::AtMost(RowIdTreeMap::new()))
     }
 
-    fn can_answer_exact(&self, _query: &dyn AnyQuery) -> bool {
-        false // Zone maps are always inexact filters
+    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+        false
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
+    /// Load the scalar index from storage
+    async fn load(
+        _store: Arc<dyn IndexStore>,
+        _fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<Self>>
     where
         Self: Sized,
     {
-        Ok(Arc::new(Self::load(store).await?))
+        // TODO: Implement actual loading logic
+        // For now, return a placeholder implementation
+        Err(Error::InvalidInput {
+            source: "ZoneMapIndex::load not yet implemented".into(),
+            location: location!(),
+        })
+    }
+
+    /// Remap the row ids, creating a new remapped version of this index in `dest_store`
+    async fn remap(
+        &self,
+        _mapping: &HashMap<u64, Option<u64>>,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<()> {
+        // TODO: Implement remap logic
+        Ok(())
+    }
+
+    /// Add the new data into the index, creating an updated version of the index in `dest_store`
+    async fn update(
+        &self,
+        _new_data: SendableRecordBatchStream,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<()> {
+        // TODO: Implement update logic
+        Ok(())
+    }
+}
+#[derive(Debug, Clone)]
+pub struct ZoneMapIndexBuilderOptions {
+    rows_per_zone: usize,
+}
+
+/// TODO: Is 10,000 a good default value?
+static DEFAULT_ROWS_PER_ZONE: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_ZONEMAP_DEFAULT_ROWS_PER_ZONE")
+        .unwrap_or_else(|_| "10000".to_string())
+        .parse()
+        .expect("failed to parse Lance_ZONEMAP_DEFAULT_ROWS_PER_ZONE")
+});
+
+impl Default for ZoneMapIndexBuilderOptions {
+    fn default() -> Self {
+        Self {
+            rows_per_zone: *DEFAULT_ROWS_PER_ZONE,
+        }
     }
 }
 
+// A builder for zonemap index
 pub struct ZoneMapIndexBuilder {
-    zone_size: usize,
-    data_type: DataType,
-    zones: Vec<ZoneStatistics>,
-    current_zone_rows: Vec<(u64, Option<OrderableScalarValue>)>,
-    current_zone_id: u64,
+    options: ZoneMapIndexBuilderOptions,
+    tmpdir: Arc<TempDir>,
+    has_flushed: bool,
 }
 
 impl ZoneMapIndexBuilder {
-    pub fn new(zone_size: usize, data_type: DataType) -> Self {
-        Self {
-            zone_size,
-            data_type,
-            zones: Vec::new(),
-            current_zone_rows: Vec::new(),
-            current_zone_id: 0,
-        }
+    fn try_new(options: ZoneMapIndexBuilderOptions) -> Result<Self> {
+        let tmpdir = Arc::new(tempdir()?);
+        Ok(Self {
+            options,
+            tmpdir,
+            has_flushed: false,
+        })
     }
 
-    fn validate_schema(schema: &Schema) -> Result<()> {
-        if schema.fields().len() != 2 {
-            return Err(Error::InvalidInput {
-                source: "Zone map index schema must have exactly two fields".into(),
-                location: location!(),
-            });
-        }
-        if *schema.field(1).data_type() != DataType::UInt64 {
-            return Err(Error::InvalidInput {
-                source: "Second field in zone map index schema must be of type UInt64".into(),
-                location: location!(),
-            });
-        }
-        Ok(())
+    pub async fn train(&mut self, data: SendableRecordBatchStream) -> Result<Vec<usize>> {
+        let mut to_spill = Vec::with_capacity(10);
+        Ok(to_spill)
     }
 
-    fn finalize_current_zone(&mut self) {
-        if self.current_zone_rows.is_empty() {
-            return;
-        }
-
-        let mut min_val: Option<OrderableScalarValue> = None;
-        let mut max_val: Option<OrderableScalarValue> = None;
-        let mut null_count = 0u64;
-        let mut row_ids = RoaringTreemap::new();
-
-        for (row_id, value) in &self.current_zone_rows {
-            row_ids.insert(*row_id);
-
-            match value {
-                Some(val) => {
-                    if min_val.is_none() || val < min_val.as_ref().unwrap() {
-                        min_val = Some(val.clone());
-                    }
-                    if max_val.is_none() || val > max_val.as_ref().unwrap() {
-                        max_val = Some(val.clone());
-                    }
-                }
-                None => null_count += 1,
-            }
-        }
-
-        let zone_stats = ZoneStatistics {
-            zone_id: self.current_zone_id,
-            min_value: min_val.map(|v| v.to_bytes()),
-            max_value: max_val.map(|v| v.to_bytes()),
-            null_count,
-            row_ids,
-        };
-
-        self.zones.push(zone_stats);
-        self.current_zone_rows.clear();
-        self.current_zone_id += 1;
-    }
-
-    fn process_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        let data_col = batch.column(0);
-        let row_id_col = batch
-            .column(1)
-            .as_primitive::<arrow_array::types::UInt64Type>();
-
-        for (i, row_id) in row_id_col.values().iter().enumerate() {
-            let value = if data_col.is_valid(i) {
-                Some(OrderableScalarValue::try_from_array_value(data_col, i)?)
-            } else {
-                None
-            };
-
-            self.current_zone_rows.push((*row_id, value));
-
-            if self.current_zone_rows.len() >= self.zone_size {
-                self.finalize_current_zone();
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn train(&mut self, mut data: SendableRecordBatchStream) -> Result<()> {
-        let schema = data.schema();
-        Self::validate_schema(schema.as_ref())?;
-
-        while let Some(batch) = data.try_next().await? {
-            self.process_batch(&batch)?;
-        }
-
-        // Finalize any remaining data in the current zone
-        self.finalize_current_zone();
-
-        Ok(())
-    }
-
-    pub async fn write(self, store: &dyn IndexStore) -> Result<()> {
-        if self.zones.is_empty() {
-            // Create an empty file
-            let schema = zones_schema();
-            let empty_batch = RecordBatch::new_empty(schema.clone());
-            let mut writer = store
-                .new_index_file(ZONE_MAP_ZONES_FILENAME, schema)
-                .await?;
-            writer.write_record_batch(empty_batch).await?;
-            writer.finish().await?;
-            return Ok(());
-        }
-
-        let zone_ids = UInt64Array::from_iter_values(self.zones.iter().map(|z| z.zone_id));
-
-        let min_values = BinaryArray::from_opt_vec(
-            self.zones
-                .iter()
-                .map(|z| z.min_value.as_ref().map(|v| v.as_slice()))
-                .collect(),
-        );
-
-        let max_values = BinaryArray::from_opt_vec(
-            self.zones
-                .iter()
-                .map(|z| z.max_value.as_ref().map(|v| v.as_slice()))
-                .collect(),
-        );
-
-        let null_counts = UInt64Array::from_iter_values(self.zones.iter().map(|z| z.null_count));
-
-        let row_ids = BinaryArray::from_iter_values(self.zones.iter().map(|zone| {
-            let mut buf = Vec::new();
-            zone.row_ids.serialize_into(&mut buf).unwrap();
-            buf
-        }));
-
-        let schema = zones_schema();
-        let zones_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(zone_ids),
-                Arc::new(min_values),
-                Arc::new(max_values),
-                Arc::new(null_counts),
-                Arc::new(row_ids),
-            ],
-        )?;
-
-        let mut writer = store
-            .new_index_file(ZONE_MAP_ZONES_FILENAME, schema)
-            .await?;
-        writer.write_record_batch(zones_batch).await?;
-        writer.finish().await?;
-
+    pub async fn write_index(
+        mut self,
+        store: &dyn IndexStore,
+        spill_files: Vec<usize>,
+    ) -> Result<()> {
         Ok(())
     }
 }
 
-pub async fn train_zone_map_index(
+pub async fn train_zonemap_index(
     data_source: Box<dyn TrainingSource + Send>,
     index_store: &dyn IndexStore,
-    data_type: DataType,
 ) -> Result<()> {
-    let batches_source = data_source.scan_unordered_chunks(4096).await?;
-    let mut builder = ZoneMapIndexBuilder::new(DEFAULT_ZONE_SIZE, data_type);
+    // TODO: Implement actual training logic
+    let batches_source = data_source.scan_unordered_chunks(DEFAULT_ZONE_SIZE).await?;
 
-    builder.train(batches_source).await?;
-    builder.write(index_store).await
+    let mut builder = ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderOptions::default())?;
+
+    // Calculate the output
+    let split_files = builder.train(batches_source).await?;
+
+    //  Write it
+    builder.write_index(index_store, split_files).await
 }
