@@ -2,6 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use super::refs::{Ref, Tags};
+use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
+use crate::{
+    error::{Error, Result},
+    session::Session,
+    Dataset,
+};
+use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptions, DEFAULT_CLOUD_IO_PARALLELISM,
@@ -15,14 +23,6 @@ use prost::Message;
 use snafu::location;
 use tracing::{info, instrument};
 use url::Url;
-use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
-use super::refs::{Ref, Tags};
-use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
-use crate::{
-    error::{Error, Result},
-    session::Session,
-    Dataset,
-};
 /// builder for loading a [`Dataset`].
 #[derive(Debug, Clone)]
 pub struct DatasetBuilder {
