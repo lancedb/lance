@@ -388,6 +388,7 @@ impl<'a> CommitBuilder<'a> {
                 tags,
                 index_cache,
                 metadata_cache,
+                file_reader_options: None,
             }),
         }
     }

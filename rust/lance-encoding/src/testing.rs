@@ -3,6 +3,8 @@
 
 use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 
+use crate::decoder::DecoderConfig;
+
 use arrow::array::make_comparator;
 use arrow_array::{Array, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
@@ -174,7 +176,7 @@ async fn test_decode(
         io,
         cache,
         &FilterExpression::no_filter(),
-        false, // cache_repetition_index - default to false for tests
+        &DecoderConfig::default(),
     )
     .await
     .unwrap();
