@@ -14,19 +14,17 @@ PyTorch offers two paradigms for creating datasets: map-style and iterable-style
 A map-style dataset is one that can be indexed and has a known length. It must implement the `__getitem__(self, index)` and `__len__(self)` methods. This design allows the `DataLoader` to fetch any specific item from the dataset by its index, enabling features like random shuffling and straightforward parallel loading across multiple workers. 
 
 *   **Lance Integration:** `lance.torch.data.SafeLanceDataset`
-*   **Best For:** Finite, indexable datasets. This covers the vast majority of standard use cases, such as image classification (ImageNet, FOOD101), text classification, or any scenario where the dataset is a discrete collection of samples.
 
 ### Iterable-Style: `torch.utils.data.IterableDataset`
 An iterable-style dataset works like a Python generator. It implements the `__iter__(self)` method, which yields data items sequentially as a stream. It often has no known length and does not support random access to a specific index. This makes it ideal for handling data that doesn't fit the indexed collection model.
 
 *   **Lance Integration:** `lance.torch.data.LanceDataset`
-*   **Best For:** True streaming data sources (e.g., from a database cursor or real-time log), extremely large datasets where building a full index is impractical, or when implementing complex, custom sampling logic that goes beyond what standard PyTorch samplers offer. 
 
-## Choosing Your Data Loading Strategy
+## Different pytorch Dataloading strategies
 
 For most projects, the choice is between the high-performance map-style pattern and the flexible but slower simple iterable-style pattern. The table below provides a detailed comparison to help beginners select the best approach for their needs.
 
-| Feature | Map-Style (`SafeLanceDataset`) | Simple Iterable-Style (`LanceDataset`) |
+| Feature | Map-Style | Simple Iterable-Style |
 | :--- | :--- | :--- |
 | **Primary Use Case** | Standard, indexable datasets (e.g., image classification) | Streaming data, very large datasets, or custom sampling logic. |
 | **Performance** | **Highest**. The recommended default for throughput. | **Lower**. I/O is serialized in a single process. |
@@ -36,7 +34,9 @@ For most projects, the choice is between the high-performance map-style pattern 
 | **PyTorch `num_workers`** | `> 0` (Recommended for performance). | `0` (mutli-worker requires custom implementation). |
 | **Sampler** | PyTorch `DistributedSampler`. | Custom (E.g. Lance `ShardedBatchSampler`. ) |
 
-It is recommended to use map‑style datasets by default. Map‑style give you their size ahead of time, easier to shuffle, and allow for easy parallel loading. But if you're reading from a massive data source remotely and/or you need to use custom sampling logic, you should use iterable style dataloader. Common techniques and pitfalls of each approach is discussed in their respective sections.
+### Choosing Lance dataloader
+It is recommended to use map‑style datasets by default in DDP setting. Map‑style give you their size ahead of time, easier to shuffle, and allow for easy parallel loading. A common use case for using iterable style dataset is when your dataset index doesn't fit into memory. 
+Lance doesn't materialise the entire map in memory so using map-style dataset in almost all cases should work fin and is recommended. 
 
 ### Launching distributed training jobs
 

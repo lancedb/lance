@@ -1,9 +1,13 @@
 # Training on Stream data with `LanceDataset` (Iterable-Style)
 
-The basic iterable-style pattern is for use cases where you need to stream data sequentially or implement custom sampling logic. This can be due to various reasons like - your data is tool large to fit in a node or in a massively parallel multi-node multi-GPU setting, you need to read data from a central source, etc. It uses the `LanceDataset` and a Lance-native sampler.
+The basic iterable-style pattern is for use cases where you need to stream data sequentially. A general use-case of this approach is used when a dataset index is too large to fit in memory. Because lance doesn't materialise the maps in memory, map-style dataset should work fine in most cases.
 
 **Important:** This simple pattern requires setting `num_workers=0` in the `DataLoader`, which means data will be loaded serially. This is significantly slower than the map-style approach and should only be used when the flexibility of iterable datasets is a requirement.
 
+!!! Note
+    You can implement an iterable style dataloader with many workers in a DDP setting, but it involves sharding at two levels:
+    Global Sharding (DDP Rank) - at the GPU rank level, and local sharding within Dataloaders the same global rank.
+    Its both tricky to sync and also more expensive as you'll have to open many streams.
 
 
 ## Implementation Guide
@@ -27,15 +31,7 @@ The basic iterable-style pattern is for use cases where you need to stream data 
     dataset = LanceDataset(uri, batch_size=32, sampler=sampler)
     ```
 
-3.  **Create the `DataLoader`**: Combine the dataset and sampler. **Crucially, `num_workers` must be 0.**
-
-    !!! Note
-        You can implement an iterable style dataloader with many workers, but it involves sharding at two levels:
-        Global Sharding (DDP Rank) - at the GPU rank level, and local sharding within Dataloaders the same global rank.
-        Its both tricky to sync and also more expensive as you'll have to open many streams.
-
-
-        
+3.  **Create the `DataLoader`**: Combine the dataset and sampler. **Crucially, `num_workers` must be 0.**        
 
     ```python
     from torch.utils.data import DataLoader
