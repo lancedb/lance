@@ -1627,6 +1627,10 @@ pub struct MergeStats {
     ///
     /// See [`MergeInsertBuilder::conflict_retries`] for more information.
     pub num_attempts: u32,
+    /// Total bytes written to storage
+    pub bytes_written: u64,
+    /// Number of data files written
+    pub num_files_written: u64,
 }
 
 pub struct UncommittedMergeInsert {
@@ -1932,8 +1936,8 @@ mod tests {
         dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
         session::Session,
         utils::test::{
-            assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount,
-            ThrottledStoreWrapper,
+            assert_plan_node_equals, assert_string_matches, DatagenExt, FragmentCount,
+            FragmentRowCount, ThrottledStoreWrapper,
         },
     };
 
@@ -3637,5 +3641,149 @@ mod tests {
         assert_plan_node_equals(plan, expected_pattern)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_explain_plan_string_output() {
+        // Set up test dataset
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            "memory://test_explain_string",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+
+        // Test explain_plan string output
+        let source_schema = schema.as_ref().clone();
+        let explain_output = merge_insert_job
+            .explain_plan(&source_schema, false)
+            .await
+            .unwrap();
+
+        // Validate the string output contains expected structure
+        let expected_pattern = "MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep...CoalescePartitionsExec...HashJoinExec...LanceRead...StreamingTableExec: partition_sizes=1, projection=[id, value]";
+
+        assert_string_matches(&explain_output, expected_pattern).unwrap();
+
+        // Test verbose mode produces different output
+        let verbose_output = merge_insert_job
+            .explain_plan(&source_schema, true)
+            .await
+            .unwrap();
+
+        // Verbose should also contain the basic structure but potentially more detail
+        assert_string_matches(&verbose_output, expected_pattern).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_analyze_plan_string_output() {
+        // Set up test dataset
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            "memory://test_analyze_string",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+
+        // Create source data stream
+        let source_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 4])), // 1 matches, 4 is new
+                Arc::new(StringArray::from(vec!["updated_a", "d"])),
+            ],
+        )
+        .unwrap();
+
+        let source_stream = RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async { Ok(source_batch) }).boxed(),
+        );
+
+        // Test analyze_plan string output
+        let analyze_output = merge_insert_job
+            .analyze_plan(Box::pin(source_stream), false)
+            .await
+            .unwrap();
+
+        // Validate the string output contains expected structure and metrics including new write metrics
+        let expected_pattern = "AnalyzeExec verbose=true, metrics=[]...MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_updated_rows=1...StreamingTableExec: partition_sizes=1, projection=[id, value], metrics=[]";
+
+        assert_string_matches(&analyze_output, expected_pattern).unwrap();
+
+        // Test verbose mode
+        let source_batch2 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("value", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 5])), // 2 matches, 5 is new
+                Arc::new(StringArray::from(vec!["updated_b", "e"])),
+            ],
+        )
+        .unwrap();
+
+        let source_stream2 = RecordBatchStreamAdapter::new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("value", DataType::Utf8, true),
+            ])),
+            futures::stream::once(async { Ok(source_batch2) }).boxed(),
+        );
+
+        let verbose_output = merge_insert_job
+            .analyze_plan(Box::pin(source_stream2), true)
+            .await
+            .unwrap();
+
+        // Verbose should also contain metrics (same pattern as non-verbose for this test)
+        assert_string_matches(&verbose_output, expected_pattern).unwrap();
     }
 }

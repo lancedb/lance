@@ -211,7 +211,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         Generate the execution plan for the merge insert operation.
 
         This method creates the execution plan that would be used for the given
-        source schema and returns it as a formatted string for debugging and 
+        source schema and returns it as a formatted string for debugging and
         analysis purposes.
 
         Parameters
@@ -238,19 +238,26 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         ...     pa.field("name", pa.string()),
         ...     pa.field("value", pa.float64())
         ... ])
-        >>> builder = dataset.merge_insert("id").when_matched_update_all().when_not_matched_insert_all()
+        >>> builder = dataset.merge_insert("id").when_matched_update_all()\
+        ...     .when_not_matched_insert_all()
         >>> plan = builder.explain_plan(source_schema, verbose=True)
         >>> print(plan)
         """
         return super(MergeInsertBuilder, self).explain_plan(schema, verbose)
 
-    def analyze_plan(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None, verbose: bool = False) -> str:
+    def analyze_plan(
+        self,
+        data_obj: ReaderLike,
+        *,
+        schema: Optional[pa.Schema] = None,
+        verbose: bool = False,
+    ) -> str:
         """
         Generate the execution plan and analyze its performance with real data.
 
         This method creates the execution plan using the provided source data,
-        executes it to collect performance metrics, and returns the analysis 
-        as a formatted string. This is useful for understanding the actual 
+        executes it to collect performance metrics, and returns the analysis
+        as a formatted string. This is useful for understanding the actual
         performance characteristics of the merge insert operation with your data.
 
         Parameters
@@ -280,7 +287,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         ...     pa.array(["updated_a", "d"]),
         ...     pa.array([10.0, 20.0])
         ... ], names=["id", "name", "value"])
-        >>> builder = dataset.merge_insert("id").when_matched_update_all().when_not_matched_insert_all()
+        >>> builder = dataset.merge_insert("id").when_matched_update_all()\
+        ...     .when_not_matched_insert_all()
         >>> analysis = builder.analyze_plan(new_data, verbose=True)
         >>> print(analysis)
         """

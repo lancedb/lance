@@ -56,6 +56,7 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
+use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{
@@ -77,7 +78,6 @@ use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
-use lance_datafusion::utils::reader_to_stream;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
@@ -264,7 +264,7 @@ impl MergeInsertBuilder {
             .clone()
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        
+
         RT.block_on(None, job.explain_plan(&schema.0, verbose))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
@@ -283,7 +283,7 @@ impl MergeInsertBuilder {
             .clone()
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        
+
         RT.block_on(None, job.analyze_plan(new_data_stream, verbose))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
