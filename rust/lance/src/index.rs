@@ -4,7 +4,6 @@
 //! Secondary Index
 //!
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -14,6 +13,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_core::cache::{CacheKey, UnsizedCacheKey};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tracing::{
@@ -72,7 +72,6 @@ use vector::ivf::v2::IVFIndex;
 use vector::utils::get_vector_type;
 
 pub(crate) mod append;
-pub(crate) mod cache;
 pub mod frag_reuse;
 pub mod mem_wal;
 pub mod prefilter;
@@ -89,7 +88,105 @@ use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 use crate::index::vector::remap_vector_index;
+use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
 use crate::{dataset::Dataset, Error, Result};
+
+// Cache keys for different index types
+#[derive(Debug, Clone)]
+pub struct ScalarIndexCacheKey<'a> {
+    pub uuid: &'a str,
+    pub fri_uuid: Option<&'a Uuid>,
+}
+
+impl<'a> ScalarIndexCacheKey<'a> {
+    pub fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
+        Self { uuid, fri_uuid }
+    }
+}
+
+impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
+    type ValueType = dyn ScalarIndex;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(fri_uuid) = self.fri_uuid {
+            format!("{}-{}", self.uuid, fri_uuid).into()
+        } else {
+            self.uuid.into()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VectorIndexCacheKey<'a> {
+    pub uuid: &'a str,
+    pub fri_uuid: Option<&'a Uuid>,
+}
+
+impl<'a> VectorIndexCacheKey<'a> {
+    pub fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
+        Self { uuid, fri_uuid }
+    }
+}
+
+impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
+    type ValueType = dyn VectorIndex;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(fri_uuid) = self.fri_uuid {
+            format!("{}-{}", self.uuid, fri_uuid).into()
+        } else {
+            self.uuid.into()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FragReuseIndexCacheKey<'a> {
+    pub uuid: &'a str,
+    pub fri_uuid: Option<&'a Uuid>,
+}
+
+impl<'a> FragReuseIndexCacheKey<'a> {
+    pub fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
+        Self { uuid, fri_uuid }
+    }
+}
+
+impl CacheKey for FragReuseIndexCacheKey<'_> {
+    type ValueType = FragReuseIndex;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(fri_uuid) = self.fri_uuid {
+            format!("{}-{}", self.uuid, fri_uuid).into()
+        } else {
+            self.uuid.into()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MemWalCacheKey<'a> {
+    pub uuid: &'a Uuid,
+    pub fri_uuid: Option<&'a Uuid>,
+}
+
+impl<'a> MemWalCacheKey<'a> {
+    pub fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
+        Self { uuid, fri_uuid }
+    }
+}
+
+impl CacheKey for MemWalCacheKey<'_> {
+    type ValueType = MemWalIndex;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(fri_uuid) = self.fri_uuid {
+            format!("{}-{}", self.uuid, fri_uuid).into()
+        } else {
+            self.uuid.to_string().into()
+        }
+    }
+}
 
 // Whether to auto-migrate a dataset when we encounter corruption.
 fn auto_migrate_corruption() -> bool {
@@ -282,7 +379,7 @@ impl DatasetIndexExt for Dataset {
 
         // Load indices from the disk.
         let indices = self.load_indices().await?;
-        let fri = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+        let frag_reuse_index = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
         let index_name = name.unwrap_or(format!("{column}_idx"));
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
             if idx.fields == [field.id] && !replace {
@@ -359,7 +456,7 @@ impl DatasetIndexExt for Dataset {
                     &index_name,
                     &index_id.to_string(),
                     vec_params,
-                    fri,
+                    frag_reuse_index,
                 ))
                 .await?;
                 vector_index_details()
@@ -476,70 +573,50 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        let indices = match self
-            .session
-            .index_cache
-            .get_metadata(self.base.as_ref(), self.version().version)
-        {
+        let metadata_key = IndexMetadataKey {
+            version: self.version().version,
+        };
+        let indices = match self.index_cache.get_with_key(&metadata_key).await {
             Some(indices) => indices,
             None => {
-                let loaded_indices = read_manifest_indexes(
+                let mut loaded_indices = read_manifest_indexes(
                     &self.object_store,
                     &self.manifest_location,
                     &self.manifest,
                 )
                 .await?;
+                retain_supported_indices(&mut loaded_indices);
                 let loaded_indices = Arc::new(loaded_indices);
-                self.session.index_cache.insert_metadata(
-                    self.base.as_ref(),
-                    self.version().version,
-                    loaded_indices.clone(),
-                );
+                self.index_cache
+                    .insert_with_key(&metadata_key, loaded_indices.clone())
+                    .await;
                 loaded_indices
             }
         };
 
-        let mut indices = indices
-            .iter()
-            .filter(|idx| {
-                let max_valid_version = infer_index_type(idx)
-                    .map(|t| t.version())
-                    .unwrap_or_default();
-                let is_valid = idx.index_version <= max_valid_version;
-                if !is_valid {
-                    log::warn!(
-                        "Index {} has version {}, which is not supported (<={}), ignoring it",
-                        idx.name,
-                        idx.index_version,
-                        max_valid_version,
-                    );
-                }
-                is_valid
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if let Some(fri_meta) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-            let uuid = fri_meta.uuid.to_string();
-            let fri = if let Some(index) = self.session.index_cache.get_frag_reuse(&uuid) {
-                log::debug!("Found fragment reuse index in cache uuid: {}", uuid);
-                index
-            } else {
-                let index_details = load_frag_reuse_index_details(self, fri_meta).await?;
-                let index = open_frag_reuse_index(index_details.as_ref()).await?;
-                self.session
-                    .index_cache
-                    .insert_frag_reuse(&uuid, index.clone());
-                index
-            };
+        if let Some(frag_reuse_index_meta) =
+            indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        {
+            let uuid = frag_reuse_index_meta.uuid.to_string();
+            let fri_key = FragReuseIndexKey { uuid: &uuid };
+            let frag_reuse_index = self
+                .index_cache
+                .get_or_insert_with_key(fri_key, || async move {
+                    let index_details =
+                        load_frag_reuse_index_details(self, frag_reuse_index_meta).await?;
+                    open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
+                })
+                .await?;
+            let mut indices = indices.as_ref().clone();
             indices.iter_mut().for_each(|idx| {
                 if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
-                    fri.remap_fragment_bitmap(bitmap).unwrap();
+                    frag_reuse_index.remap_fragment_bitmap(bitmap).unwrap();
                 }
             });
+            Ok(Arc::new(indices))
+        } else {
+            Ok(indices)
         }
-
-        Ok(Arc::new(indices))
     }
 
     async fn commit_existing_index(
@@ -894,6 +971,24 @@ impl DatasetIndexExt for Dataset {
     }
 }
 
+fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
+    indices.retain(|idx| {
+        let max_valid_version = infer_index_type(idx)
+            .map(|t| t.version())
+            .unwrap_or_default();
+        let is_valid = idx.index_version <= max_valid_version;
+        if !is_valid {
+            log::warn!(
+                "Index {} has version {}, which is not supported (<={}), ignoring it",
+                idx.name,
+                idx.index_version,
+                max_valid_version,
+            );
+        }
+        is_valid
+    })
+}
+
 /// A trait for internal dataset utilities
 ///
 /// Internal use only. No API stability guarantees.
@@ -933,6 +1028,9 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<Arc<MemWalIndex>>>;
 
+    /// Gets the fragment reuse index UUID from the current manifest, if it exists
+    fn frag_reuse_index_uuid(&self) -> Option<Uuid>;
+
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
 
@@ -952,13 +1050,23 @@ impl DatasetIndexInternalExt for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>> {
         // Checking for cache existence is cheap so we just check both scalar and vector caches
-        if let Some(index) = self.session.index_cache.get_scalar(uuid) {
+        let frag_reuse_uuid = self.frag_reuse_index_uuid();
+        let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
             return Ok(index.as_index());
         }
-        if let Some(index) = self.session.index_cache.get_vector(uuid) {
+
+        let vector_cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(index) = self
+            .index_cache
+            .get_unsized_with_key(&vector_cache_key)
+            .await
+        {
             return Ok(index.as_index());
         }
-        if let Some(index) = self.session.index_cache.get_frag_reuse(uuid) {
+
+        let frag_reuse_cache_key = FragReuseIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(index) = self.index_cache.get_with_key(&frag_reuse_cache_key).await {
             return Ok(index.as_index());
         }
 
@@ -987,8 +1095,9 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let cache_key = index_cache_key(self, uuid).await.unwrap();
-        if let Some(index) = self.session.index_cache.get_scalar(cache_key.as_ref()) {
+        let frag_reuse_uuid = self.frag_reuse_index_uuid();
+        let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
             return Ok(index);
         }
 
@@ -1002,7 +1111,9 @@ impl DatasetIndexInternalExt for Dataset {
         info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_SCALAR, index_type=index.index_type().to_string());
         metrics.record_index_load();
 
-        self.session.index_cache.insert_scalar(uuid, index.clone());
+        self.index_cache
+            .insert_unsized_with_key(&cache_key, index.clone())
+            .await;
         Ok(index)
     }
 
@@ -1012,19 +1123,24 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let cache_key = index_cache_key(self, uuid).await.unwrap();
-        if let Some(index) = self.session.index_cache.get_vector(cache_key.as_ref()) {
+        let frag_reuse_uuid = self.frag_reuse_index_uuid();
+        let cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+
+        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
             log::debug!("Found vector index in cache uuid: {}", uuid);
             return Ok(index);
         }
 
-        let fri = self.open_frag_reuse_index(metrics).await?;
+        let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
         let index_dir = self.indices_dir().child(uuid);
         let index_file = index_dir.child(INDEX_FILE_NAME);
         let reader: Arc<dyn Reader> = self.object_store.open(&index_file).await?.into();
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
+
+        // Namespace the index cache by the UUID of the index.
+        let index_cache = self.index_cache.with_key_prefix(&cache_key.key());
 
         // the index file is in lance format since version (0,2)
         // TODO: we need to change the legacy IVF_PQ to be in lance format
@@ -1035,7 +1151,14 @@ impl DatasetIndexInternalExt for Dataset {
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
                         let dataset = Arc::new(self.clone());
-                        vector::open_vector_index(dataset, uuid, vector_index, reader, fri).await
+                        vector::open_vector_index(
+                            dataset,
+                            uuid,
+                            vector_index,
+                            reader,
+                            frag_reuse_index,
+                        )
+                        .await
                     }
                     None => Err(Error::Internal {
                         message: "Index proto was missing implementation field".into(),
@@ -1051,8 +1174,14 @@ impl DatasetIndexInternalExt for Dataset {
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )
                 .await?;
-                vector::open_vector_index_v2(Arc::new(self.clone()), column, uuid, reader, fri)
-                    .await
+                vector::open_vector_index_v2(
+                    Arc::new(self.clone()),
+                    column,
+                    uuid,
+                    reader,
+                    frag_reuse_index,
+                )
+                .await
             }
 
             (0, 3) => {
@@ -1097,8 +1226,9 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.object_store.clone(),
                                 self.indices_dir(),
                                 uuid.to_owned(),
-                                Arc::downgrade(&self.session),
-                                fri,
+                                frag_reuse_index,
+                                self.metadata_cache.as_ref(),
+                                index_cache,
                             )
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1108,8 +1238,9 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.object_store.clone(),
                                 self.indices_dir(),
                                 uuid.to_owned(),
-                                Arc::downgrade(&self.session),
-                                fri,
+                                frag_reuse_index,
+                                self.metadata_cache.as_ref(),
+                                index_cache,
                             )
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1128,8 +1259,9 @@ impl DatasetIndexInternalExt for Dataset {
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
-                            Arc::downgrade(&self.session),
-                            fri,
+                            frag_reuse_index,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1140,20 +1272,25 @@ impl DatasetIndexInternalExt for Dataset {
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
-                            Arc::downgrade(&self.session),
-                            fri,
+                            frag_reuse_index,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
                     "IVF_HNSW_FLAT" => {
+                        let uri = self.indices_dir().child(uuid).child("index.pb");
+                        let file_metadata_cache =
+                            self.session.metadata_cache.file_metadata_cache(&uri);
                         let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
-                            Arc::downgrade(&self.session),
-                            fri,
+                            frag_reuse_index,
+                            &file_metadata_cache,
+                            index_cache,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1164,8 +1301,9 @@ impl DatasetIndexInternalExt for Dataset {
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
-                            Arc::downgrade(&self.session),
-                            fri,
+                            frag_reuse_index,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1176,8 +1314,9 @@ impl DatasetIndexInternalExt for Dataset {
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
-                            Arc::downgrade(&self.session),
-                            fri,
+                            frag_reuse_index,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1198,7 +1337,9 @@ impl DatasetIndexInternalExt for Dataset {
         };
         let index = index?;
         metrics.record_index_load();
-        self.session.index_cache.insert_vector(uuid, index.clone());
+        self.index_cache
+            .insert_unsized_with_key(&cache_key, index.clone())
+            .await;
         Ok(index)
     }
 
@@ -1206,26 +1347,29 @@ impl DatasetIndexInternalExt for Dataset {
         &self,
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<Arc<FragReuseIndex>>> {
-        if let Some(fri_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
-            let uuid = fri_meta.uuid.to_string();
-            if let Some(index) = self.session.index_cache.get_frag_reuse(&uuid) {
-                log::debug!("Found fragment reuse index in cache uuid: {}", uuid);
-                return Ok(Some(index));
-            }
+        if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
+            let uuid = frag_reuse_index_meta.uuid.to_string();
+            let frag_reuse_key = FragReuseIndexKey { uuid: &uuid };
+            let uuid_clone = uuid.clone();
 
-            let index_meta = self.load_index(&uuid).await?.ok_or_else(|| Error::Index {
-                message: format!("Index with id {} does not exist", uuid),
-                location: location!(),
-            })?;
-            let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
-            let index = open_frag_reuse_index(index_details.as_ref()).await?;
-
-            info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_FRAG_REUSE);
-            metrics.record_index_load();
-
-            self.session
+            let index = self
                 .index_cache
-                .insert_frag_reuse(&uuid, index.clone());
+                .get_or_insert_with_key(frag_reuse_key, || async move {
+                    let index_meta = self.load_index(&uuid_clone).await?.ok_or_else(|| Error::Index {
+                        message: format!("Index with id {} does not exist", uuid_clone),
+                        location: location!(),
+                    })?;
+                    let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
+                    let index =
+                        open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await?;
+
+                    info!(target: TRACE_IO_EVENTS, index_uuid=uuid_clone, r#type=IO_TYPE_OPEN_FRAG_REUSE);
+                    metrics.record_index_load();
+
+                    Ok(index)
+                })
+                .await?;
+
             Ok(Some(index))
         } else {
             Ok(None)
@@ -1240,11 +1384,14 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(None);
         };
 
-        let uuid = mem_wal_meta.uuid.to_string();
-        if let Some(index) = self.session.index_cache.get_mem_wal(&uuid) {
-            log::debug!("Found MemWAL index in cache uuid: {}", uuid);
+        let frag_reuse_uuid = self.frag_reuse_index_uuid();
+        let cache_key = MemWalCacheKey::new(&mem_wal_meta.uuid, frag_reuse_uuid.as_ref());
+        if let Some(index) = self.index_cache.get_with_key(&cache_key).await {
+            log::debug!("Found MemWAL index in cache uuid: {}", mem_wal_meta.uuid);
             return Ok(Some(index));
         }
+
+        let uuid = mem_wal_meta.uuid.to_string();
 
         let index_meta = self.load_index(&uuid).await?.ok_or_else(|| Error::Index {
             message: format!("Index with id {} does not exist", uuid),
@@ -1255,10 +1402,23 @@ impl DatasetIndexInternalExt for Dataset {
         info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_MEM_WAL);
         metrics.record_index_load();
 
-        self.session
-            .index_cache
-            .insert_mem_wal(&uuid, index.clone());
+        self.index_cache
+            .insert_with_key(&cache_key, index.clone())
+            .await;
         Ok(Some(index))
+    }
+
+    fn frag_reuse_index_uuid(&self) -> Option<Uuid> {
+        // We need to load indices first, but we can't make this async
+        // For now, let's use a synchronous approach by checking if indices are already loaded
+        if let Ok(indices) = futures::executor::block_on(self.load_indices()) {
+            indices
+                .iter()
+                .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                .map(|idx| idx.uuid)
+        } else {
+            None
+        }
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -1287,9 +1447,7 @@ impl DatasetIndexInternalExt for Dataset {
                 DataType::List(_) => Box::new(LabelListQueryParser::new(index.name.clone()))
                     as Box<dyn ScalarQueryParser>,
                 DataType::Utf8 | DataType::LargeUtf8 => {
-                    let index_type =
-                        detect_scalar_index_type(self, index, &field.name, self.session.as_ref())
-                            .await?;
+                    let index_type = detect_scalar_index_type(self, index, &field.name).await?;
                     match index_type {
                         ScalarIndexType::BTree | ScalarIndexType::Bitmap => {
                             Box::new(SargableQueryParser::new(index.name.clone()))
@@ -1384,16 +1542,6 @@ fn is_vector_field(data_type: DataType) -> bool {
             matches!(inner.data_type(), DataType::FixedSizeList(_, _))
         }
         _ => false,
-    }
-}
-
-/// Index cache key should be the ID of the index plus the ID of the FRI.
-/// If FRI has changed, the index would have changed further
-async fn index_cache_key<'a>(dataset: &Dataset, index_id: &'a str) -> Result<Cow<'a, str>> {
-    if let Some(fri) = dataset.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
-        Ok(Cow::Owned(format!("{}-{}", index_id, fri.uuid)))
-    } else {
-        Ok(Cow::Borrowed(index_id))
     }
 }
 
@@ -2160,7 +2308,8 @@ mod tests {
         assert_eq!(index.index_type(), IndexType::Bitmap);
     }
 
-    #[tokio::test]
+    // #[tokio::test]
+    #[lance_test_macros::test(tokio::test)]
     async fn test_load_indices() {
         let session = Arc::new(Session::default());
         let io_stats = Arc::new(StatsHolder::default());
@@ -2202,11 +2351,15 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         let stats = io_stats.incremental_stats();
         // We should already have this cached since we just wrote it.
-        assert_eq!(stats.read_iops, 0);
+        assert_eq!(
+            stats.read_iops, 0,
+            "Read IOPS should be 0. Saw requests: {:?}",
+            stats.requests
+        );
         assert_eq!(stats.read_bytes, 0);
         assert_eq!(indices.len(), 1);
 
-        session.index_cache.clear(); // Clear the cache
+        session.index_cache.clear().await; // Clear the cache
 
         let dataset2 = DatasetBuilder::from_uri(test_uri)
             .with_session(session.clone())

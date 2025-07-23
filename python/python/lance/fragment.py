@@ -36,7 +36,13 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
-    from .dataset import LanceDataset, LanceScanner, ReaderLike, Transaction
+    from .dataset import (
+        ColumnOrdering,
+        LanceDataset,
+        LanceScanner,
+        ReaderLike,
+        Transaction,
+    )
     from .lance import LanceSchema
 
 
@@ -405,6 +411,7 @@ class LanceFragment(pa.dataset.Fragment):
         with_row_id: bool = False,
         with_row_address: bool = False,
         batch_readahead: int = 16,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
         filter_str = str(filter) if filter is not None else None
@@ -424,6 +431,7 @@ class LanceFragment(pa.dataset.Fragment):
             with_row_id=with_row_id,
             with_row_address=with_row_address,
             batch_readahead=batch_readahead,
+            order_by=order_by,
             **columns_arg,
         )
         from .dataset import LanceScanner
@@ -448,6 +456,7 @@ class LanceFragment(pa.dataset.Fragment):
         with_row_id: bool = False,
         with_row_address: bool = False,
         batch_readahead: int = 16,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
             columns=columns,
@@ -458,6 +467,7 @@ class LanceFragment(pa.dataset.Fragment):
             with_row_id=with_row_id,
             with_row_address=with_row_address,
             batch_readahead=batch_readahead,
+            order_by=order_by,
         ).to_batches()
 
     def to_table(
@@ -468,6 +478,7 @@ class LanceFragment(pa.dataset.Fragment):
         offset: Optional[int] = None,
         with_row_id: bool = False,
         with_row_address: bool = False,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> pa.Table:
         return self.scanner(
             columns=columns,
@@ -476,6 +487,7 @@ class LanceFragment(pa.dataset.Fragment):
             offset=offset,
             with_row_id=with_row_id,
             with_row_address=with_row_address,
+            order_by=order_by,
         ).to_table()
 
     def merge(

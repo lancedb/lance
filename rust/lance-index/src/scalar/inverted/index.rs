@@ -36,13 +36,13 @@ use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
+use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::utils::{
     mask::RowIdMask,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
 };
 use lance_core::{container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
-use moka::future::Cache;
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;
@@ -94,13 +94,6 @@ pub static SCORE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
 pub static FTS_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()])));
-
-pub static CACHE_SIZE: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("LANCE_INVERTED_CACHE_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(512 * 1024 * 1024)
-});
 
 #[derive(Clone)]
 pub struct InvertedIndex {
@@ -214,7 +207,8 @@ impl InvertedIndex {
 
     async fn load_legacy_index(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        index_cache: LanceCache,
     ) -> Result<Arc<Self>> {
         log::warn!("loading legacy FTS index");
         let tokens_fut = tokio::spawn({
@@ -236,7 +230,8 @@ impl InvertedIndex {
             let store = store.clone();
             async move {
                 let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
-                let invert_list = PostingListReader::try_new(invert_list_reader).await?;
+                let invert_list =
+                    PostingListReader::try_new(invert_list_reader, index_cache).await?;
                 Result::Ok(Arc::new(invert_list))
             }
         });
@@ -244,7 +239,7 @@ impl InvertedIndex {
             let store = store.clone();
             async move {
                 let docs_reader = store.open_index_file(DOCS_FILE).await?;
-                let docs = DocSet::load(docs_reader, true, fri).await?;
+                let docs = DocSet::load(docs_reader, true, frag_reuse_index).await?;
                 Result::Ok(docs)
             }
         });
@@ -345,7 +340,11 @@ impl ScalarIndex for InvertedIndex {
         true
     }
 
-    async fn load(store: Arc<dyn IndexStore>, fri: Option<Arc<FragReuseIndex>>) -> Result<Arc<Self>>
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        index_cache: LanceCache,
+    ) -> Result<Arc<Self>>
     where
         Self: Sized,
     {
@@ -373,10 +372,12 @@ impl ScalarIndex for InvertedIndex {
 
                 let partitions = partitions.into_iter().map(|id| {
                     let store = store.clone();
-                    let fri_clone = fri.clone();
+                    let frag_reuse_index_clone = frag_reuse_index.clone();
+                    let index_cache = index_cache.clone();
                     async move {
                         Result::Ok(Arc::new(
-                            InvertedPartition::load(store, id, fri_clone).await?,
+                            InvertedPartition::load(store, id, frag_reuse_index_clone, index_cache)
+                                .await?,
                         ))
                     }
                 });
@@ -394,7 +395,7 @@ impl ScalarIndex for InvertedIndex {
             }
             Err(_) => {
                 // old index format
-                Self::load_legacy_index(store, fri).await
+                Self::load_legacy_index(store, frag_reuse_index, index_cache).await
             }
         }
     }
@@ -444,14 +445,15 @@ impl InvertedPartition {
     pub async fn load(
         store: Arc<dyn IndexStore>,
         id: u64,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        index_cache: LanceCache,
     ) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
-        let inverted_list = PostingListReader::try_new(invert_list_file).await?;
+        let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
-        let docs = DocSet::load(docs_file, false, fri).await?;
+        let docs = DocSet::load(docs_file, false, frag_reuse_index).await?;
 
         Ok(Self {
             id,
@@ -813,9 +815,7 @@ pub struct PostingListReader {
 
     has_position: bool,
 
-    // cache
-    posting_cache: Cache<u32, PostingList>,
-    position_cache: Cache<u32, ListArray>,
+    index_cache: LanceCache,
 }
 
 impl std::fmt::Debug for PostingListReader {
@@ -832,13 +832,14 @@ impl DeepSizeOf for PostingListReader {
         self.offsets.deep_size_of_children(context)
             + self.max_scores.deep_size_of_children(context)
             + self.lengths.deep_size_of_children(context)
-            + self.posting_cache.weighted_size() as usize
-            + self.position_cache.weighted_size() as usize
     }
 }
 
 impl PostingListReader {
-    pub(crate) async fn try_new(reader: Arc<dyn IndexReader>) -> Result<Self> {
+    pub(crate) async fn try_new(
+        reader: Arc<dyn IndexReader>,
+        index_cache: LanceCache,
+    ) -> Result<Self> {
         let has_position = reader.schema().field(POSITION_COL).is_some();
         let (offsets, max_scores, lengths) = if reader.schema().field(POSTING_COL).is_none() {
             let (offsets, max_scores) = Self::load_metadata(reader.schema())?;
@@ -858,23 +859,13 @@ impl PostingListReader {
             (None, Some(max_scores), Some(lengths))
         };
 
-        let posting_cache = Cache::builder()
-            .max_capacity(*CACHE_SIZE as u64)
-            .weigher(|_, posting: &PostingList| posting.deep_size_of() as u32)
-            .build();
-        let position_cache = Cache::builder()
-            .max_capacity(*CACHE_SIZE as u64)
-            .weigher(|_, positions: &ListArray| positions.get_array_memory_size() as u32)
-            .build();
-
         Ok(Self {
             reader,
             offsets,
             max_scores,
             lengths,
             has_position,
-            posting_cache,
-            position_cache,
+            index_cache,
         })
     }
 
@@ -984,15 +975,17 @@ impl PostingListReader {
         metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
         let mut posting = self
-            .posting_cache
-            .try_get_with(token_id, async move {
+            .index_cache
+            .get_or_insert_with_key(PostingListKey { token_id }, || async move {
                 metrics.record_part_load();
                 info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
                self.posting_list_from_batch(&batch, token_id)
             })
             .await
-            .map_err(|e| Error::io(e.to_string(), location!()))?;
+            .map_err(|e| Error::io(e.to_string(), location!()))?
+            .as_ref()
+            .clone();
 
         if is_phrase_query {
             // hit the cache and when the cache was populated, the positions column was not loaded
@@ -1026,8 +1019,13 @@ impl PostingListReader {
             let posting_range = self.posting_list_range(token_id as u32);
             let batch = batch.slice(posting_range.start, posting_range.end - posting_range.start);
             let posting_list = self.posting_list_from_batch(&batch, token_id as u32)?;
-            self.posting_cache
-                .insert(token_id as u32, posting_list)
+            self.index_cache
+                .insert_with_key(
+                    &PostingListKey {
+                        token_id: token_id as u32,
+                    },
+                    Arc::new(posting_list),
+                )
                 .await;
         }
 
@@ -1057,7 +1055,7 @@ impl PostingListReader {
     }
 
     async fn read_positions(&self, token_id: u32) -> Result<ListArray> {
-        self.position_cache.try_get_with(token_id, async move {
+        Ok(self.index_cache.get_or_insert_with_key(PositionKey { token_id }, || async move {
             let batch = self
                 .reader
                 .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
@@ -1070,10 +1068,12 @@ impl PostingListReader {
                         e => e
                     }
                 })?;
-            Result::Ok(batch[POSITION_COL]
+            Result::Ok(Positions(batch[POSITION_COL]
                 .as_list::<i32>()
-                .clone())
-        }).await.map_err(|e| Error::io(e.to_string(), location!()))
+                .clone()))
+        }).await.map_err(|e| Error::io(e.to_string(), location!()))?.as_ref()
+            .clone()
+            .0)
     }
 
     fn posting_list_range(&self, token_id: u32) -> Range<usize> {
@@ -1099,6 +1099,48 @@ impl PostingListReader {
             base_columns.push(POSITION_COL);
         }
         base_columns
+    }
+}
+
+/// New type just to allow Positions implement DeepSizeOf so it can be put
+/// in the cache.
+#[derive(Clone)]
+pub struct Positions(ListArray);
+
+impl DeepSizeOf for Positions {
+    fn deep_size_of(&self) -> usize {
+        self.0.get_array_memory_size()
+    }
+
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.0.get_buffer_memory_size()
+    }
+}
+
+// Cache key implementations for type-safe cache access
+#[derive(Debug, Clone)]
+pub struct PostingListKey {
+    pub token_id: u32,
+}
+
+impl CacheKey for PostingListKey {
+    type ValueType = PostingList;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("postings-{}", self.token_id).into()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PositionKey {
+    pub token_id: u32,
+}
+
+impl CacheKey for PositionKey {
+    type ValueType = Positions;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("positions-{}", self.token_id).into()
     }
 }
 
@@ -1773,7 +1815,7 @@ impl DocSet {
     pub async fn load(
         reader: Arc<dyn IndexReader>,
         is_legacy: bool,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
@@ -1787,8 +1829,8 @@ impl DocSet {
                 .values()
                 .iter()
                 .filter_map(|id| {
-                    if let Some(fri_ref) = fri.as_ref() {
-                        fri_ref.remap_row_id(*id)
+                    if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                        frag_reuse_index_ref.remap_row_id(*id)
                     } else {
                         Some(*id)
                     }
@@ -1801,8 +1843,8 @@ impl DocSet {
                     .values()
                     .iter()
                     .filter_map(|id| {
-                        if let Some(fri_ref) = fri.as_ref() {
-                            fri_ref.remap_row_id(*id)
+                        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                            frag_reuse_index_ref.remap_row_id(*id)
                         } else {
                             Some(*id)
                         }
@@ -2097,7 +2139,7 @@ mod tests {
         builder.docs.append(2, 1);
         builder.write(store.as_ref()).await.unwrap();
 
-        let index = InvertedPartition::load(store.clone(), 0, None)
+        let index = InvertedPartition::load(store.clone(), 0, None, LanceCache::no_cache())
             .await
             .unwrap();
         let mut builder = index.into_builder().await.unwrap();
