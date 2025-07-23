@@ -31,7 +31,7 @@ The basic iterable-style pattern is for use cases where you need to stream data 
 
     !!! Note
         You can implement an iterable style dataloader with many workers, but it involves sharding at two levels:
-        Global Sharding (DDP Rank) - at the GPU rank level, and local sharding withing Dataloaders the same global rank.
+        Global Sharding (DDP Rank) - at the GPU rank level, and local sharding within Dataloaders the same global rank.
         Its both tricky to sync and also more expensive as you'll have to open many streams.
 
 

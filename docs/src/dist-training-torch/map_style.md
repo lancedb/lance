@@ -1,6 +1,6 @@
 # Training with `SafeLanceDataset` (Map-Style)
 
-For any training scenarios where the dataset is indexed and can be randomly accesed, the map-style `SafeLanceDataset` is recommended. It integrates with PyTorch's `DataLoader` and `DistributedSampler` to deliver high data loading throughput with minimal configuration.
+For any training scenarios where the dataset is indexed and can be randomly accessed, the map-style `SafeLanceDataset` is recommended. It integrates with PyTorch's `DataLoader` and `DistributedSampler` to deliver high data loading throughput with minimal configuration.
 
 ## The Map-Style Paradigm
 
