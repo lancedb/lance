@@ -1581,7 +1581,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         location,
                         dataset.session(),
                         dataset.commit_handler.clone(),
-                       dataset.file_reader_options.clone(),
+                        dataset.file_reader_options.clone(),
                     )?;
                     let object_store = dataset_version.object_store();
                     let path = dataset_version
