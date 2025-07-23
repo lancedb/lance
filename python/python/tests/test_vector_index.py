@@ -177,6 +177,38 @@ def test_ann(indexed_dataset):
     run(indexed_dataset)
 
 
+def test_rowid_order(indexed_dataset):
+    rs = indexed_dataset.to_table(
+        columns=["meta"],
+        with_row_id=True,
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "use_index": False,
+        },
+        limit=10,
+    )
+
+    print(
+        indexed_dataset.scanner(
+            columns=["meta"],
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "use_index": False,
+            },
+            with_row_id=True,
+            limit=10,
+        ).explain_plan()
+    )
+
+    assert rs.schema[0].name == "meta"
+    assert rs.schema[1].name == "_distance"
+    assert rs.schema[2].name == "_rowid"
+
+
 def test_ann_append(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)

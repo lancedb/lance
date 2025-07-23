@@ -121,6 +121,7 @@ pub static DEFAULT_IO_BUFFER_SIZE: LazyLock<u64> = LazyLock::new(|| {
 ///
 /// Floats are sorted using the IEEE 754 total ordering
 /// Strings are sorted using UTF-8 lexicographic order (i.e. we sort the binary)
+#[derive(Debug, Clone)]
 pub struct ColumnOrdering {
     pub ascending: bool,
     pub nulls_first: bool,
@@ -475,7 +476,7 @@ impl Scanner {
     ///
     /// Only select the specified columns. If not specified, all columns will be scanned.
     pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
-        let mut transformed_columns: Vec<(&str, String)> = columns
+        let transformed_columns: Vec<(&str, String)> = columns
             .iter()
             .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
             .collect();
@@ -501,13 +502,6 @@ impl Scanner {
             }
         }
 
-        if with_row_id && !transformed_columns.iter().any(|(c, _)| *c == ROW_ID) {
-            transformed_columns.push((ROW_ID, ROW_ID.to_string()));
-        }
-        if with_row_addr && !transformed_columns.iter().any(|(c, _)| *c == ROW_ADDR) {
-            transformed_columns.push((ROW_ADDR, ROW_ADDR.to_string()));
-        }
-
         self.project_with_transform(&transformed_columns)
     }
 
@@ -518,14 +512,11 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
-        let with_row_id = self.projection_plan.physical_projection.with_row_id;
-        let with_row_addr = self.projection_plan.physical_projection.with_row_addr;
         let filtered_columns: Vec<_> = columns
             .iter()
             .filter(|(col, _)| {
                 let col_name = col.as_ref();
-                self.nearest.is_some()
-                    || !(with_row_id && col_name == ROW_ID || with_row_addr && col_name == ROW_ADDR)
+                !(col_name == ROW_ID || col_name == ROW_ADDR)
             })
             .map(|(c, t)| (c.as_ref(), t.as_ref()))
             .collect();
@@ -3327,6 +3318,7 @@ mod test {
     use arrow_select::take;
     use datafusion::logical_expr::{col, lit};
     use half::f16;
+    use lance_arrow::SchemaExt;
     use lance_datagen::{array, gen, BatchCount, ByteCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
@@ -4727,6 +4719,38 @@ mod test {
                 .collect();
             assert_eq!(expected_i, actual_i);
         }
+    }
+
+    #[tokio::test]
+    async fn test_projection_order() {
+        let vec_params = VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2);
+        let mut data = gen()
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(4)))
+            .col("text", array::rand_utf8(ByteCount::from(10), false))
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        data.create_index(&["vec"], IndexType::Vector, None, &vec_params, true)
+            .await
+            .unwrap();
+
+        let mut scan = data.scan();
+        scan.nearest("vec", &Float32Array::from(vec![1.0, 1.0, 1.0, 1.0]), 5)
+            .unwrap();
+        scan.with_row_id().project(&["text"]).unwrap();
+
+        let results = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results[0].schema().field_names(),
+            vec!["text", "_distance", "_rowid"]
+        );
     }
 
     #[rstest]
@@ -6634,8 +6658,7 @@ mod test {
                     .fast_search()
                     .project(&["_rowid", "_distance"])
             },
-            "ProjectionExec: expr=[_rowid@1 as _rowid, _distance@0 as _distance]
-  SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]...
+            "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
       ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
@@ -6650,8 +6673,7 @@ mod test {
                     .with_row_id()
                     .project(&["_rowid", "_distance"])
             },
-            "ProjectionExec: expr=[_rowid@1 as _rowid, _distance@0 as _distance]
-  SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]...
+            "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
       ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
@@ -6666,7 +6688,7 @@ mod test {
                     .with_row_id()
                     .project(&["_rowid", "_distance"])
             },
-            "ProjectionExec: expr=[_rowid@0 as _rowid, _distance@2 as _distance]
+            "ProjectionExec: expr=[_distance@2 as _distance, _rowid@0 as _rowid]
   FilterExec: _distance@2 IS NOT NULL
     SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
       KNNVectorDistance: metric=l2

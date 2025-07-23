@@ -744,7 +744,7 @@ pub struct BTreeIndex {
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
     batch_size: u64,
-    fri: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
 
 impl DeepSizeOf for BTreeIndex {
@@ -763,7 +763,7 @@ impl BTreeIndex {
         index_cache: LanceCache,
         sub_index: Arc<dyn BTreeSubIndex>,
         batch_size: u64,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Self {
         let page_lookup = Arc::new(BTreeLookup::new(tree, null_pages));
         Self {
@@ -772,7 +772,7 @@ impl BTreeIndex {
             index_cache,
             sub_index,
             batch_size,
-            fri,
+            frag_reuse_index,
         }
     }
 
@@ -789,8 +789,8 @@ impl BTreeIndex {
             let mut serialized_page = index_reader
                 .read_record_batch(page_number as u64, self.batch_size)
                 .await?;
-            if let Some(fri_ref) = self.fri.as_ref() {
-                serialized_page = fri_ref.remap_row_ids_record_batch(serialized_page, 1)?;
+            if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
+                serialized_page = frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
             }
             let result = self.sub_index.load_subindex(serialized_page).await?;
             Ok(CachedScalarIndex::new(result))
@@ -823,7 +823,7 @@ impl BTreeIndex {
         store: Arc<dyn IndexStore>,
         index_cache: LanceCache,
         batch_size: u64,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
         let mut null_pages = Vec::<u32>::new();
@@ -838,7 +838,7 @@ impl BTreeIndex {
                 index_cache,
                 sub_index,
                 batch_size,
-                fri,
+                frag_reuse_index,
             ));
         }
 
@@ -888,7 +888,7 @@ impl BTreeIndex {
             index_cache,
             sub_index,
             batch_size,
-            fri,
+            frag_reuse_index,
         ))
     }
 
@@ -1071,7 +1071,7 @@ impl ScalarIndex for BTreeIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: LanceCache,
     ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BTREE_LOOKUP_NAME).await?;
@@ -1090,7 +1090,7 @@ impl ScalarIndex for BTreeIndex {
             store,
             index_cache,
             batch_size,
-            fri,
+            frag_reuse_index,
         )?))
     }
 

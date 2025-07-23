@@ -207,7 +207,7 @@ impl InvertedIndex {
 
     async fn load_legacy_index(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: LanceCache,
     ) -> Result<Arc<Self>> {
         log::warn!("loading legacy FTS index");
@@ -239,7 +239,7 @@ impl InvertedIndex {
             let store = store.clone();
             async move {
                 let docs_reader = store.open_index_file(DOCS_FILE).await?;
-                let docs = DocSet::load(docs_reader, true, fri).await?;
+                let docs = DocSet::load(docs_reader, true, frag_reuse_index).await?;
                 Result::Ok(docs)
             }
         });
@@ -342,7 +342,7 @@ impl ScalarIndex for InvertedIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: LanceCache,
     ) -> Result<Arc<Self>>
     where
@@ -372,11 +372,12 @@ impl ScalarIndex for InvertedIndex {
 
                 let partitions = partitions.into_iter().map(|id| {
                     let store = store.clone();
-                    let fri_clone = fri.clone();
+                    let frag_reuse_index_clone = frag_reuse_index.clone();
                     let index_cache = index_cache.clone();
                     async move {
                         Result::Ok(Arc::new(
-                            InvertedPartition::load(store, id, fri_clone, index_cache).await?,
+                            InvertedPartition::load(store, id, frag_reuse_index_clone, index_cache)
+                                .await?,
                         ))
                     }
                 });
@@ -394,7 +395,7 @@ impl ScalarIndex for InvertedIndex {
             }
             Err(_) => {
                 // old index format
-                Self::load_legacy_index(store, fri, index_cache).await
+                Self::load_legacy_index(store, frag_reuse_index, index_cache).await
             }
         }
     }
@@ -444,7 +445,7 @@ impl InvertedPartition {
     pub async fn load(
         store: Arc<dyn IndexStore>,
         id: u64,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: LanceCache,
     ) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
@@ -452,7 +453,7 @@ impl InvertedPartition {
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
         let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
-        let docs = DocSet::load(docs_file, false, fri).await?;
+        let docs = DocSet::load(docs_file, false, frag_reuse_index).await?;
 
         Ok(Self {
             id,
@@ -1814,7 +1815,7 @@ impl DocSet {
     pub async fn load(
         reader: Arc<dyn IndexReader>,
         is_legacy: bool,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
@@ -1828,8 +1829,8 @@ impl DocSet {
                 .values()
                 .iter()
                 .filter_map(|id| {
-                    if let Some(fri_ref) = fri.as_ref() {
-                        fri_ref.remap_row_id(*id)
+                    if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                        frag_reuse_index_ref.remap_row_id(*id)
                     } else {
                         Some(*id)
                     }
@@ -1842,8 +1843,8 @@ impl DocSet {
                     .values()
                     .iter()
                     .filter_map(|id| {
-                        if let Some(fri_ref) = fri.as_ref() {
-                            fri_ref.remap_row_id(*id)
+                        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                            frag_reuse_index_ref.remap_row_id(*id)
                         } else {
                             Some(*id)
                         }
