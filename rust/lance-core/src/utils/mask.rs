@@ -5,7 +5,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::io::Write;
 use std::iter;
-use std::ops::{Range, RangeBounds};
+use std::ops::{BitAnd, Range, RangeBounds};
 use std::{collections::BTreeMap, io::Read};
 
 use arrow_array::{Array, BinaryArray, GenericBinaryArray};
@@ -43,13 +43,13 @@ impl MultiRowIdTreeMap {
         let mut iters = self
             .inner
             .iter()
-            .map(|map| map.row_ids().map(|iter| iter.peekable()))
+            .map(|map| map.row_ids().map(|iter| iter))
             .collect::<Option<Vec<_>>>()?;
 
         let mut heap = BinaryHeap::with_capacity(iters.len());
         for (index, iter) in iters.iter_mut().enumerate() {
-            if let Some(row_id) = iter.peek() {
-                heap.push(Reverse((*row_id, index)));
+            if let Some(row_id) = iter.next() {
+                heap.push(Reverse((row_id, index)));
             }
         }
 
@@ -58,8 +58,8 @@ impl MultiRowIdTreeMap {
         Some(iter::from_fn(move || {
             while let Some(Reverse((row_id, index))) = heap.pop() {
                 let iter = &mut iters[index];
-                if let Some(row_id) = iter.next() {
-                    heap.push(Reverse((row_id, index)));
+                if let Some(next_id) = iter.next() {
+                    heap.push(Reverse((next_id, index)));
                 }
 
                 if Some(row_id) == current_row_id {
@@ -784,7 +784,9 @@ impl RowIdTreeMap {
         Ok(Self { inner })
     }
 
-    pub fn union_all(maps: &[&Self]) -> Self {
+    pub fn union_all<'a>(maps: impl IntoIterator<Item = &'a Self>) -> Self {
+        let maps = maps.into_iter();
+        let len = maps.size_hint().0;
         let mut new_map = BTreeMap::new();
 
         for map in maps {
@@ -792,7 +794,7 @@ impl RowIdTreeMap {
                 new_map
                     .entry(fragment)
                     // I hate this allocation, but I can't think of a better way
-                    .or_insert_with(|| Vec::with_capacity(maps.len()))
+                    .or_insert_with(|| Vec::with_capacity(len))
                     .push(selection);
             }
         }
@@ -811,11 +813,13 @@ impl RowIdTreeMap {
     /// If there is a block list then this will subtract the block list from the set
     pub fn mask(&mut self, mask: &RowIdMask) {
         if let Some(allow_list) = &mask.allow_list {
-            for map in allow_list.iter() {
-                *self &= map;
-            }
+            // A & (B | C) = (A & B) | (A & C)
+            let mut new_map = Self::new();
+            new_map.extend(allow_list.iter().map(|map| map.clone().bitand(self)));
+            *self = new_map;
         }
         if let Some(block_list) = &mask.block_list {
+            // A - (B | C) = (A - B) - C
             for map in block_list.iter() {
                 *self -= map;
             }
@@ -877,11 +881,11 @@ impl std::ops::BitOrAssign<Self> for RowIdTreeMap {
     }
 }
 
-impl std::ops::BitAnd<Self> for RowIdTreeMap {
+impl std::ops::BitAnd<&Self> for RowIdTreeMap {
     type Output = Self;
 
-    fn bitand(mut self, rhs: Self) -> Self::Output {
-        self &= &rhs;
+    fn bitand(mut self, rhs: &Self) -> Self::Output {
+        self &= rhs;
         self
     }
 }
@@ -1202,7 +1206,7 @@ mod tests {
             });
             expected.extend(right_in_left);
 
-            let actual = left & right;
+            let actual = left & &right;
             prop_assert_eq!(expected, actual);
         }
 
@@ -1348,5 +1352,28 @@ mod tests {
         allow_list.insert_fragment(0);
         mask.allow_list = Some(allow_list.into());
         assert!(mask.iter_ids().is_none());
+    }
+
+    #[test]
+    fn test_serialization() {
+        let mask = RowIdMask::from_allowed(MultiRowIdTreeMap::from_iter([
+            RowIdTreeMap::from_iter([1, 3, 5]),
+            RowIdTreeMap::from_iter([2, 4, 6]),
+        ]))
+        .also_block(RowIdTreeMap::from_iter([7, 8, 9]))
+        .also_block(RowIdTreeMap::from_iter([3, 4]));
+
+        let bytes = mask.into_arrow().unwrap();
+        let deserialized = RowIdMask::from_arrow(&bytes).unwrap();
+        let row_ids = deserialized.iter_ids().unwrap().collect::<Vec<_>>();
+        assert_eq!(
+            row_ids,
+            vec![
+                RowAddress::new_from_parts(0, 1),
+                RowAddress::new_from_parts(0, 2),
+                RowAddress::new_from_parts(0, 5),
+                RowAddress::new_from_parts(0, 6),
+            ]
+        );
     }
 }

@@ -178,20 +178,20 @@ impl ScalarIndex for BitmapIndex {
                 SearchResult::ExactMulti(MultiRowIdTreeMap::from_iter(maps))
             }
             SargableQuery::IsIn(values) => {
-                let mut bitmaps = Vec::with_capacity(values.len());
+                let mut maps = Vec::with_capacity(values.len());
                 metrics.record_comparisons(values.len());
                 for val in values {
                     if val.is_null() {
-                        bitmaps.push(self.null_map.clone());
+                        maps.push(self.null_map.clone());
                     } else {
                         let key = OrderableScalarValue(val.clone());
                         if let Some(bitmap) = self.index_map.get(&key) {
-                            bitmaps.push(bitmap.clone());
+                            maps.push(bitmap.clone());
                         }
                     }
                 }
 
-                SearchResult::ExactMulti(MultiRowIdTreeMap::from_iter(bitmaps))
+                SearchResult::ExactMulti(MultiRowIdTreeMap::from_iter(maps))
             }
             SargableQuery::IsNull() => {
                 metrics.record_comparisons(1);

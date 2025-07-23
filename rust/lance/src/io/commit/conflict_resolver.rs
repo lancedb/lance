@@ -1225,7 +1225,7 @@ impl<'a> TransactionRebase<'a> {
                     existing_deletions
                         .insert_bitmap(fragment_id as u32, deletion_vec.as_ref().into());
                 }
-                let conflicting_rows = existing_deletions.clone() & affected_rows.clone();
+                let conflicting_rows = existing_deletions.clone() & affected_rows;
                 if conflicting_rows.len().map(|v| v > 0).unwrap_or(true) {
                     let sample_addressed = conflicting_rows
                         .row_ids()
