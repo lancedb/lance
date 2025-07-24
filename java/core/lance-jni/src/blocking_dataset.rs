@@ -255,6 +255,11 @@ impl BlockingDataset {
         Ok(BlockingDataset { inner: new_dataset })
     }
 
+    pub fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
+        RT.block_on(self.inner.replace_schema_metadata(metadata))?;
+        Ok(())
+    }
+
     pub fn replace_field_metadata(
         &mut self,
         metadata_map: HashMap<u32, HashMap<String, String>>,
