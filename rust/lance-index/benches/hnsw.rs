@@ -45,7 +45,7 @@ fn bench_hnsw(c: &mut Criterion) {
                     .search_basic(
                         query.clone(),
                         K,
-                        HnswQueryParams {
+                        &HnswQueryParams {
                             ef: 300,
                             lower_bound: None,
                             upper_bound: None,
@@ -73,7 +73,7 @@ fn bench_hnsw(c: &mut Criterion) {
                     .search_basic(
                         query.clone(),
                         K,
-                        HnswQueryParams {
+                        &HnswQueryParams {
                             ef: 300,
                             lower_bound: None,
                             upper_bound: None,

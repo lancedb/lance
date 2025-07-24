@@ -94,7 +94,7 @@ impl SimpleIndex {
         let res = self.index.search_basic(
             query,
             1,
-            HnswQueryParams {
+            &HnswQueryParams {
                 ef: 15,
                 lower_bound: None,
                 upper_bound: None,

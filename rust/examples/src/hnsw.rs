@@ -131,7 +131,7 @@ async fn main() {
             upper_bound: None,
         };
         let results: HashSet<u32> = hnsw
-            .search_basic(q.clone(), k, params, None, vector_store.as_ref())
+            .search_basic(q.clone(), k, &params, None, vector_store.as_ref())
             .unwrap()
             .iter()
             .map(|node| node.id)

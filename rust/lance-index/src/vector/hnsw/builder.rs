@@ -205,7 +205,7 @@ impl HNSW {
         &self,
         query: ArrayRef,
         k: usize,
-        params: HnswQueryParams,
+        params: &HnswQueryParams,
         bitset: Option<Visited>,
         storage: &impl VectorStore,
     ) -> Result<Vec<OrderedNode>> {
@@ -241,7 +241,7 @@ impl HNSW {
         query: ArrayRef,
         k: usize,
         prefilter_bitset: Visited,
-        params: HnswQueryParams,
+        params: &HnswQueryParams,
     ) -> Vec<OrderedNode> {
         let node_ids = storage
             .row_ids()
@@ -716,9 +716,9 @@ impl IvfSubIndex for HNSW {
         let results = if remained < self.len() * 10 / 100 {
             let prefilter_bitset =
                 prefilter_bitset.expect("the prefilter bitset must be set for flat search");
-            self.flat_search(storage, query, k, prefilter_bitset, params)
+            self.flat_search(storage, query, k, prefilter_bitset, &params)
         } else {
-            self.search_basic(query, k, params, prefilter_bitset, storage)?
+            self.search_basic(query, k, &params, prefilter_bitset, storage)?
         };
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
@@ -902,10 +902,10 @@ mod tests {
             upper_bound: None,
         };
         let builder_results = builder
-            .search_basic(query.clone(), k, params.clone(), None, store.as_ref())
+            .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
         let loaded_results = loaded_hnsw
-            .search_basic(query, k, params, None, store.as_ref())
+            .search_basic(query, k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
     }
