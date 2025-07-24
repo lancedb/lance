@@ -79,7 +79,10 @@ impl ObjectStoreProvider for OssStoreProvider {
 
         let operator = Operator::from_iter::<Oss>(config_map)
             .map_err(|e| {
-                Error::invalid_input(format!("Failed to create OSS operator: {}", e), location!())
+                Error::invalid_input(
+                    format!("Failed to create OSS operator: {:?}", e),
+                    location!(),
+                )
             })?
             .finish();
 
