@@ -6,6 +6,7 @@
 
 import abc
 import itertools
+from datetime import timedelta
 from typing import Optional
 
 import lance
@@ -221,6 +222,7 @@ def test_all_permutations(with_position):
             write_operation = write_operations[idx]
             print(f"Running {write_operation.__class__.__name__}")
             write_operation.run(ds)
+            ds.cleanup_old_versions(older_than=timedelta(seconds=0))
 
             # write operation changed the status of the table,
             # then we need to run all read only operations after it
