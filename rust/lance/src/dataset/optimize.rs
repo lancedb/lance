@@ -831,12 +831,12 @@ async fn rechunk_stable_row_ids(
         })
         .await?;
 
-    // convert all the range with bitmap to sorted array to exclude deleted row ids
-    for (_, seq) in old_sequences.iter_mut() {
-        let mut new_seq = (**seq).clone();
-        new_seq.convert_rwb_to_sorted_array()?;
-        *seq = Arc::new(new_seq);
-    }
+    // // convert all the range with bitmap to sorted array to exclude deleted row ids
+    // for (_, seq) in old_sequences.iter_mut() {
+    //     let mut new_seq = (**seq).clone();
+    //     new_seq.convert_rwb_to_sorted_array()?;
+    //     *seq = Arc::new(new_seq);
+    // }
 
     debug_assert_eq!(
         { old_sequences.iter().map(|(_, seq)| seq.len()).sum::<u64>() },

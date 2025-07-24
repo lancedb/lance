@@ -280,36 +280,93 @@ impl U64Segment {
                 Self::Range(start..(start + len as u64))
             }
             Self::RangeWithHoles { range, holes } => {
-                let start = range.start + offset as u64;
-                let end = start + len as u64;
-
-                let start = holes.binary_search(start).unwrap_or_else(|x| x) as u64;
-                let end = holes.binary_search(end).unwrap_or_else(|x| x) as u64;
-                let holes_len = end - start;
-
-                if holes_len == 0 {
+                // We need to find the actual value at the given offset position
+                // taking holes into account
+                let mut actual_start = None;
+                let mut actual_end = None;
+                let mut position = 0;
+                let mut holes_iter = holes.iter().peekable();
+                
+                for val in range.clone() {
+                    // Skip if this value is a hole
+                    if let Some(&next_hole) = holes_iter.peek() {
+                        if next_hole == val {
+                            holes_iter.next();
+                            continue;
+                        }
+                    }
+                    
+                    if position == offset {
+                        actual_start = Some(val);
+                    }
+                    if position == offset + len {
+                        actual_end = Some(val);
+                        break;
+                    }
+                    position += 1;
+                }
+                
+                // Handle case where we reach the end
+                if actual_end.is_none() && position == offset + len {
+                    actual_end = Some(range.end);
+                }
+                
+                let start = actual_start.unwrap_or(range.start);
+                let end = actual_end.unwrap_or(range.end);
+                
+                // Collect holes that fall within the new range
+                let new_holes: Vec<u64> = holes.iter()
+                    .filter(|&hole| hole >= start && hole < end)
+                    .collect();
+                
+                if new_holes.is_empty() {
                     Self::Range(start..end)
                 } else {
-                    let holes = holes.slice(start as usize, holes_len as usize);
                     Self::RangeWithHoles {
                         range: start..end,
-                        holes,
+                        holes: EncodedU64Array::from(new_holes),
                     }
                 }
             }
             Self::RangeWithBitmap { range, bitmap } => {
-                let start = range.start + offset as u64;
-                let end = start + len as u64;
-
-                let bitmap = bitmap.slice(offset, len);
-                if bitmap.count_ones() == len {
-                    // Bitmap no longer serves a purpose
-                    Self::Range(start..end)
-                    // TODO: could also have a case where we switch back to RangeWithHoles
+                // We need to find the actual position in the bitmap for the given offset
+                // taking cleared bits (holes) into account
+                let mut actual_start_pos = None;
+                let mut actual_end_pos = None;
+                let mut position = 0;
+                
+                for (i, bit) in bitmap.iter().enumerate() {
+                    if bit {
+                        if position == offset {
+                            actual_start_pos = Some(i);
+                        }
+                        if position == offset + len {
+                            actual_end_pos = Some(i);
+                            break;
+                        }
+                        position += 1;
+                    }
+                }
+                
+                // Handle case where we reach the end
+                if actual_end_pos.is_none() && position == offset + len {
+                    actual_end_pos = Some(bitmap.len());
+                }
+                
+                let start_pos = actual_start_pos.unwrap_or(0);
+                let end_pos = actual_end_pos.unwrap_or(bitmap.len());
+                
+                let bitmap_len = end_pos - start_pos;
+                let new_bitmap = bitmap.slice(start_pos, bitmap_len);
+                let new_range = (range.start + start_pos as u64)..(range.start + end_pos as u64);
+                
+                if new_bitmap.count_ones() == bitmap_len {
+                    // All bits are set, so we can simplify to just a Range
+                    Self::Range(new_range)
                 } else {
                     Self::RangeWithBitmap {
-                        range: start..end,
-                        bitmap: bitmap.into(),
+                        range: new_range,
+                        bitmap: new_bitmap.into(),
                     }
                 }
             }
