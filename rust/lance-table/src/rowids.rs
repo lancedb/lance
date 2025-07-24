@@ -362,7 +362,7 @@ impl RowIdSequence {
                     let mut ids = RowIdTreeMap::from(range.clone());
                     ids.mask(mask);
                     ranges.extend(GroupingIterator::new(
-                        unsafe { ids.into_id_iter() }.map(|id| id - range.start + offset),
+                        unsafe { ids.into_addr_iter() }.map(|id| id - range.start + offset),
                     ));
                     offset += range.end - range.start;
                 }
@@ -382,7 +382,7 @@ impl RowIdSequence {
                     sorted_holes.sort_unstable();
                     let mut next_holes_iter = sorted_holes.into_iter().peekable();
                     let mut holes_passed = 0;
-                    ranges.extend(GroupingIterator::new(unsafe { ids.into_id_iter() }.map(
+                    ranges.extend(GroupingIterator::new(unsafe { ids.into_addr_iter() }.map(
                         |id| {
                             while let Some(next_hole) = next_holes_iter.peek() {
                                 if *next_hole < id {
@@ -409,7 +409,7 @@ impl RowIdSequence {
                     let mut bitmap_iter = bitmap.iter();
                     let mut bitmap_iter_pos = 0;
                     let mut holes_passed = 0;
-                    ranges.extend(GroupingIterator::new(unsafe { ids.into_id_iter() }.map(
+                    ranges.extend(GroupingIterator::new(unsafe { ids.into_addr_iter() }.map(
                         |id| {
                             let offset_no_holes = id - range.start + offset_start;
                             while bitmap_iter_pos < offset_no_holes {
