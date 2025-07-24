@@ -206,7 +206,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).retry_timeout(timeout)
 
-    def explain_plan(self, schema: pa.Schema, verbose: bool = False) -> str:
+    def explain_plan(
+        self, schema: Optional[pa.Schema] = None, verbose: bool = False
+    ) -> str:
         """
         Generate the execution plan for the merge insert operation.
 
@@ -216,10 +218,10 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
         Parameters
         ----------
-        schema : pa.Schema
+        schema : Optional[pa.Schema], default None
             The schema of the source data that would be merged into the dataset.
-            This determines the columns available and their types, which affects
-            the generated execution plan.
+            If None, defaults to the dataset's schema. This determines the columns
+            available and their types, which affects the generated execution plan.
         verbose : bool, default False
             If True, provides more detailed information in the plan output.
 
@@ -233,17 +235,26 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> import lance
         >>> import pyarrow as pa
         >>> dataset = lance.dataset("/tmp/my_dataset")
+        
+        >>> # Using default dataset schema
+        >>> builder = dataset.merge_insert("id").when_matched_update_all()\
+        ...     .when_not_matched_insert_all()
+        >>> plan = builder.explain_plan()  # Uses dataset schema
+        >>> print(plan)
+        
+        >>> # Or with explicit schema
         >>> source_schema = pa.schema([
         ...     pa.field("id", pa.int64()),
         ...     pa.field("name", pa.string()),
         ...     pa.field("value", pa.float64())
         ... ])
-        >>> builder = dataset.merge_insert("id").when_matched_update_all()\
-        ...     .when_not_matched_insert_all()
         >>> plan = builder.explain_plan(source_schema, verbose=True)
         >>> print(plan)
         """
-        return super(MergeInsertBuilder, self).explain_plan(schema, verbose)
+        if schema is None:
+            return super(MergeInsertBuilder, self).explain_plan(verbose=verbose)
+        else:
+            return super(MergeInsertBuilder, self).explain_plan(schema, verbose=verbose)
 
     def analyze_plan(
         self,

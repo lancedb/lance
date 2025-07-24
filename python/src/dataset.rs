@@ -252,10 +252,10 @@ impl MergeInsertBuilder {
         Ok((PyLance(transaction), stats))
     }
 
-    #[pyo3(signature=(schema, verbose = false))]
+    #[pyo3(signature=(schema = None, verbose = false))]
     pub fn explain_plan(
         &mut self,
-        schema: PyArrowType<ArrowSchema>,
+        schema: Option<PyArrowType<ArrowSchema>>,
         verbose: Option<bool>,
     ) -> PyResult<String> {
         let verbose = verbose.unwrap_or(false);
@@ -265,7 +265,8 @@ impl MergeInsertBuilder {
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        RT.block_on(None, job.explain_plan(&schema.0, verbose))?
+        let schema_ref = schema.as_ref().map(|s| &s.0);
+        RT.block_on(None, job.explain_plan(schema_ref, verbose))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 

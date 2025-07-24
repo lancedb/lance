@@ -2168,18 +2168,23 @@ def test_merge_insert_explain_analyze_plan():
         .when_not_matched_insert_all()
     )
 
-    # Define source schema for explain_plan (must match dataset schema exactly)
-    source_schema = pa.schema(
-        [pa.field("id", pa.int64()), pa.field("value", pa.string())]
-    )
-
-    # Test explain_plan
-    plan = builder.explain_plan(source_schema, verbose=False)
+    # Test explain_plan with default schema (None)
+    plan = builder.explain_plan()  # Uses dataset schema by default
     assert isinstance(plan, str)
     assert len(plan) > 0
     assert "MergeInsert" in plan
 
-    plan_verbose = builder.explain_plan(source_schema, verbose=True)
+    # Test with explicit schema (must match dataset schema exactly)
+    source_schema = pa.schema(
+        [pa.field("id", pa.int64()), pa.field("value", pa.string())]
+    )
+    plan_explicit = builder.explain_plan(source_schema, verbose=False)
+    assert isinstance(plan_explicit, str)
+    assert len(plan_explicit) > 0
+    assert "MergeInsert" in plan_explicit
+
+    # Test verbose mode with default schema
+    plan_verbose = builder.explain_plan(verbose=True)
     assert isinstance(plan_verbose, str)
     assert len(plan_verbose) > 0
     assert "MergeInsert" in plan_verbose
@@ -2202,8 +2207,6 @@ def test_merge_insert_explain_analyze_plan():
     # Check for new write metrics
     assert "bytes_written" in analysis
     assert "num_files_written" in analysis
-
-    # No need to test verbose mode anymore since parameter was removed
 
 
 def test_add_null_columns(tmp_path: Path):
