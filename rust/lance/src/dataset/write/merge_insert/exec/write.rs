@@ -305,6 +305,23 @@ impl FullSchemaMergeInsertExec {
         )))
     }
 
+    /// Calculate write metrics from new fragments
+    fn calculate_write_metrics(new_fragments: &[lance_table::format::Fragment]) -> (usize, usize) {
+        let mut total_bytes = 0u64;
+        let mut total_files = 0usize;
+
+        for fragment in new_fragments {
+            for data_file in &fragment.files {
+                if let Some(size) = data_file.file_size_bytes.get() {
+                    total_bytes += u64::from(size);
+                }
+                total_files += 1;
+            }
+        }
+
+        (total_bytes as usize, total_files)
+    }
+
     /// Delete a batch of rows by row address, returns the fragments modified and the fragments removed
     async fn apply_deletions(
         dataset: &Dataset,
@@ -497,6 +514,10 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
             let new_fragments = write_result.default.0;
 
+            // Step 2.5: Calculate write metrics from new fragments
+            let (total_bytes_written, total_files_written) =
+                Self::calculate_write_metrics(&new_fragments);
+
             // Step 3: Apply deletions to existing fragments
             let merge_state =
                 Arc::into_inner(merge_state).expect("MergeState should only have 1 reference now");
@@ -526,6 +547,13 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
             // Step 6: Store transaction, merge stats, and affected rows for later retrieval
             {
+                // Update write metrics before converting to stats
+                merge_state.metrics.bytes_written.add(total_bytes_written);
+                merge_state
+                    .metrics
+                    .num_files_written
+                    .add(total_files_written);
+
                 // Get the final stats from the shared state
                 let stats = MergeStats::from(&merge_state.metrics);
 
