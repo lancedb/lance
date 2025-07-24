@@ -53,7 +53,7 @@ impl CompressionOverrides {
 
         // 3. Check type match
         //
-        // TOOD: maybe we can allow simple types like `string` and `int`.
+        // TODO: maybe we can allow simple types like `string` and `int`.
         let type_name = data_type.to_string();
         self.types.get(&type_name)
     }
