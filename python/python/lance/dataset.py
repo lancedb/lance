@@ -235,13 +235,13 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> import lance
         >>> import pyarrow as pa
         >>> dataset = lance.dataset("/tmp/my_dataset")
-        
+
         >>> # Using default dataset schema
         >>> builder = dataset.merge_insert("id").when_matched_update_all()\
         ...     .when_not_matched_insert_all()
         >>> plan = builder.explain_plan()  # Uses dataset schema
         >>> print(plan)
-        
+
         >>> # Or with explicit schema
         >>> source_schema = pa.schema([
         ...     pa.field("id", pa.int64()),
