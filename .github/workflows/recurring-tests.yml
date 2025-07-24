@@ -84,11 +84,11 @@ jobs:
           pip install pylance==${{ matrix.pylance-version }}
       - name: Run weekly tests
         id: run_weekly_tests
-        run: pytest python/tests/weekly/test_weekly.py
+        run: pytest -vvv -s python/tests/weekly/test_weekly.py
       - name: Upgrade Pylance
         run: pip install -e ".[tests]"
       - name: Run weekly tests again
-        run: pytest python/tests/weekly/test_weekly.py
+        run: pytest -vvv -s python/tests/weekly/test_weekly.py
 
   # This job is used to test the weekly tests on the main branch.
   weekly-linux-fresh-main:
@@ -118,4 +118,4 @@ jobs:
       - name: Install Lance
         run: pip install -e ".[tests]"
       - name: Run weekly tests
-        run: pytest python/tests/weekly/test_weekly.py
+        run: pytest -vvv -s python/tests/weekly/test_weekly.py
