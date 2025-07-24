@@ -1627,9 +1627,9 @@ pub struct MergeStats {
     ///
     /// See [`MergeInsertBuilder::conflict_retries`] for more information.
     pub num_attempts: u32,
-    /// Total bytes written to storage
+    /// Total bytes written to storage. This currently only includes data files.
     pub bytes_written: u64,
-    /// Number of data files written
+    /// Number of data files written. This currently only includes data files.
     pub num_files_written: u64,
 }
 
