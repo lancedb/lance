@@ -288,7 +288,11 @@ pub fn beam_search(
     let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
 
     let mut results = BinaryHeap::with_capacity(k);
-    if bitset.map(|bitset| bitset.contains(ep.id)).unwrap_or(true) {
+
+    if bitset.map(|bitset| bitset.contains(ep.id)).unwrap_or(true)
+        && ep.dist >= lower_bound
+        && ep.dist < upper_bound
+    {
         results.push(ep.clone());
     }
 
@@ -320,11 +324,11 @@ pub fn beam_search(
             visited.insert(neighbor);
             let dist: OrderedFloat = dist_calc.distance(neighbor).into();
             if dist <= furthest || results.len() < k {
-                if dist >= lower_bound
+                if bitset
+                    .map(|bitset| bitset.contains(neighbor))
+                    .unwrap_or(true)
+                    && dist >= lower_bound
                     && dist < upper_bound
-                    && bitset
-                        .map(|bitset| bitset.contains(neighbor))
-                        .unwrap_or(true)
                 {
                     if results.len() < k {
                         results.push((dist, neighbor).into());

@@ -1755,6 +1755,7 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), k)
             .unwrap()
             .minimum_nprobes(nlist)
+            .ef(100)
             .with_row_id()
             .try_into_batch()
             .await
@@ -1771,6 +1772,7 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), part_idx)
             .unwrap()
             .minimum_nprobes(nlist)
+            .ef(100)
             .with_row_id()
             .distance_range(None, Some(part_dist))
             .try_into_batch()
@@ -1781,6 +1783,7 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), k - part_idx)
             .unwrap()
             .minimum_nprobes(nlist)
+            .ef(100)
             .with_row_id()
             .distance_range(Some(part_dist), None)
             .try_into_batch()
@@ -1795,19 +1798,9 @@ mod tests {
             let right_row_ids = right_res[ROW_ID].as_primitive::<UInt64Type>().values();
             row_ids.iter().enumerate().for_each(|(i, id)| {
                 if i < part_idx {
-                    assert_eq!(
-                        left_row_ids[i], *id,
-                        "left_row_ids={:?}, row_ids={:?}",
-                        left_row_ids, *id
-                    );
+                    assert_eq!(left_row_ids[i], *id,);
                 } else {
-                    assert_eq!(
-                        right_row_ids[i - part_idx],
-                        *id,
-                        "right_row_ids[i-part_idx]={:?}, *id={:?}",
-                        right_row_ids[i - part_idx],
-                        *id
-                    );
+                    assert_eq!(right_row_ids[i - part_idx], *id,);
                 }
             });
         }
@@ -1825,6 +1818,7 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), k)
             .unwrap()
             .minimum_nprobes(nlist)
+            .ef(100)
             .with_row_id()
             .distance_range(dists.first().copied(), dists.last().copied())
             .try_into_batch()
