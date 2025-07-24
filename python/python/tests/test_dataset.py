@@ -2194,7 +2194,7 @@ def test_merge_insert_explain_analyze_plan():
     )
 
     # Test analyze_plan
-    analysis = builder.analyze_plan(source_data, verbose=False)
+    analysis = builder.analyze_plan(source_data)
     assert isinstance(analysis, str)
     assert len(analysis) > 0
     assert "MergeInsert" in analysis
@@ -2203,14 +2203,7 @@ def test_merge_insert_explain_analyze_plan():
     assert "bytes_written" in analysis
     assert "num_files_written" in analysis
 
-    analysis_verbose = builder.analyze_plan(source_data, verbose=True)
-    assert isinstance(analysis_verbose, str)
-    assert len(analysis_verbose) > 0
-    assert "MergeInsert" in analysis_verbose
-    assert "metrics" in analysis_verbose
-    # Check for new write metrics in verbose output too
-    assert "bytes_written" in analysis_verbose
-    assert "num_files_written" in analysis_verbose
+    # No need to test verbose mode anymore since parameter was removed
 
 
 def test_add_null_columns(tmp_path: Path):

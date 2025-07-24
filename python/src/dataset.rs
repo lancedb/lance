@@ -269,13 +269,7 @@ impl MergeInsertBuilder {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    #[pyo3(signature=(new_data, verbose = false))]
-    pub fn analyze_plan(
-        &mut self,
-        new_data: &Bound<PyAny>,
-        verbose: Option<bool>,
-    ) -> PyResult<String> {
-        let verbose = verbose.unwrap_or(false);
+    pub fn analyze_plan(&mut self, new_data: &Bound<PyAny>) -> PyResult<String> {
         let new_data_reader = convert_reader(new_data)?;
         let new_data_stream = reader_to_stream(new_data_reader);
         let job = self
@@ -284,7 +278,7 @@ impl MergeInsertBuilder {
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        RT.block_on(None, job.analyze_plan(new_data_stream, verbose))?
+        RT.block_on(None, job.analyze_plan(new_data_stream))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 }
