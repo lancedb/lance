@@ -249,7 +249,6 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         data_obj: ReaderLike,
         *,
         schema: Optional[pa.Schema] = None,
-        verbose: bool = False,
     ) -> str:
         """
         Generate the execution plan and analyze its performance with real data.
@@ -268,8 +267,6 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         schema : Optional[pa.Schema], default None
             The schema of the data. This only needs to be supplied whenever the data
             source is some kind of generator.
-        verbose : bool, default False
-            If True, provides more detailed information in the analysis output.
 
         Returns
         -------
@@ -288,11 +285,11 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         ... ], names=["id", "name", "value"])
         >>> builder = dataset.merge_insert("id").when_matched_update_all()\
         ...     .when_not_matched_insert_all()
-        >>> analysis = builder.analyze_plan(new_data, verbose=True)
+        >>> analysis = builder.analyze_plan(new_data)
         >>> print(analysis)
         """
         reader = _coerce_reader(data_obj, schema)
-        return super(MergeInsertBuilder, self).analyze_plan(reader, verbose)
+        return super(MergeInsertBuilder, self).analyze_plan(reader)
 
 
 class LanceDataset(pa.dataset.Dataset):
