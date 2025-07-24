@@ -26,6 +26,8 @@ use snafu::location;
 
 use crate::buffer::LanceBuffer;
 use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
+use crate::compression_config::CompressionOverrides;
+use crate::configured_compression_strategy::ConfiguredCompressionStrategy;
 use crate::decoder::PageEncoding;
 use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
@@ -277,6 +279,26 @@ pub fn default_encoding_strategy(version: LanceFileVersion) -> Box<dyn FieldEnco
             Box::new(crate::v2::encoder::CoreFieldEncodingStrategy::default())
         }
         _ => Box::new(StructuralEncodingStrategy::default()),
+    }
+}
+
+/// Create an encoding strategy with user-configured compression overrides
+pub fn configured_encoding_strategy(
+    version: LanceFileVersion,
+    overrides: CompressionOverrides,
+) -> Result<Box<dyn FieldEncodingStrategy>> {
+    match version.resolve() {
+        LanceFileVersion::Legacy | LanceFileVersion::V2_0 => Err(Error::invalid_input(
+            "Compression overrides are only supported in Lance file version 2.1 and later",
+            location!(),
+        )),
+        _ => {
+            let compression_strategy = Arc::new(ConfiguredCompressionStrategy::new(overrides));
+            Ok(Box::new(StructuralEncodingStrategy {
+                compression_strategy,
+                version,
+            }))
+        }
     }
 }
 
@@ -610,4 +632,44 @@ pub async fn encode_batch(
         schema,
         num_rows: batch.num_rows() as u64,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compression_config::{CompressionOverrides, CompressionSpec, RleConfig};
+
+    #[test]
+    fn test_configured_encoding_strategy() {
+        // Create test overrides
+        let mut overrides = CompressionOverrides::new();
+        overrides.columns.insert(
+            "*_id".to_string(),
+            vec![CompressionSpec::Rle {
+                rle: RleConfig { threshold: 0.5 },
+            }],
+        );
+
+        // Test with V2.1 - should succeed
+        let strategy = configured_encoding_strategy(LanceFileVersion::V2_1, overrides.clone())
+            .expect("Should succeed for V2.1");
+
+        // Verify it's a StructuralEncodingStrategy
+        assert!(format!("{:?}", strategy).contains("StructuralEncodingStrategy"));
+        assert!(format!("{:?}", strategy).contains("ConfiguredCompressionStrategy"));
+
+        // Test with V2.0 - should fail
+        let err = configured_encoding_strategy(LanceFileVersion::V2_0, overrides.clone())
+            .expect_err("Should fail for V2.0");
+        assert!(err
+            .to_string()
+            .contains("only supported in Lance file version 2.1"));
+
+        // Test with Legacy - should fail
+        let err = configured_encoding_strategy(LanceFileVersion::Legacy, overrides)
+            .expect_err("Should fail for Legacy");
+        assert!(err
+            .to_string()
+            .contains("only supported in Lance file version 2.1"));
+    }
 }
