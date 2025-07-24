@@ -217,7 +217,7 @@ impl HNSW {
         let result = self.search_inner(
             query,
             k,
-            &params,
+            params,
             bitset,
             &mut visited_generator,
             storage,
