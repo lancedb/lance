@@ -21,7 +21,7 @@ use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use lance_core::cache::LanceCache;
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::{MultiRowIdTreeMap, RowIdTreeMap};
 use lance_core::{Error, Result};
 use snafu::location;
 
@@ -562,6 +562,10 @@ impl AnyQuery for TextQuery {
 pub enum SearchResult {
     /// The exact row ids that satisfy the query
     Exact(RowIdTreeMap),
+
+    /// The exact row ids that satisfy the query
+    ExactMulti(MultiRowIdTreeMap),
+
     /// Any row id satisfying the query will be in this set but not every
     /// row id in this set will satisfy the query, a further recheck step
     /// is needed
@@ -577,6 +581,7 @@ impl SearchResult {
     pub fn row_ids(&self) -> &RowIdTreeMap {
         match self {
             Self::Exact(row_ids) => row_ids,
+            Self::ExactMulti(_) => panic!("ExactMulti is not supported"),
             Self::AtMost(row_ids) => row_ids,
             Self::AtLeast(row_ids) => row_ids,
         }

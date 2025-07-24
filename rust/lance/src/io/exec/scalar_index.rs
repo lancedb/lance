@@ -26,6 +26,7 @@ use datafusion::{
 };
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::utils::mask::MultiRowIdTreeMap;
 use lance_core::{
     utils::{
         address::RowAddress,
@@ -356,7 +357,7 @@ impl MapIndexExec {
         if let Some(mut allow_list) = row_id_mask.allow_list {
             // Flatten the allow list
             if let Some(block_list) = row_id_mask.block_list {
-                allow_list -= &block_list;
+                allow_list -= block_list;
             }
 
             let allow_list =
@@ -660,7 +661,7 @@ async fn row_ids_for_mask(
                     .await?;
 
                 let mut capacity = sequences.iter().map(|seq| seq.len() as usize).sum();
-                capacity -= block_list.len().expect("unknown block list len") as usize;
+                capacity -= block_list.max_len().expect("unknown block list len") as usize;
                 let mut row_ids = Vec::with_capacity(capacity);
                 for sequence in sequences {
                     row_ids.extend(
@@ -703,7 +704,7 @@ async fn row_ids_for_mask(
 }
 
 async fn retain_fragments(
-    allow_list: &mut RowIdTreeMap,
+    allow_list: &mut MultiRowIdTreeMap,
     fragments: &[Fragment],
     dataset: &Dataset,
 ) -> Result<()> {
@@ -715,7 +716,7 @@ async fn retain_fragments(
                 Ok(acc)
             })
             .await?;
-        *allow_list &= &fragment_ids;
+        allow_list.iter_mut().for_each(|map| *map &= &fragment_ids);
     } else {
         // Assume row ids are addresses, so we can filter out fragments by their ids.
         allow_list.retain_fragments(fragments.iter().map(|frag| frag.id as u32));

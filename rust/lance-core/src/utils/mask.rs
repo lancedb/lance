@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
 use std::io::Write;
 use std::iter;
-use std::ops::{Range, RangeBounds};
+use std::ops::{BitAnd, Range, RangeBounds};
 use std::{collections::BTreeMap, io::Read};
 
 use arrow_array::{Array, BinaryArray, GenericBinaryArray};
@@ -17,6 +18,171 @@ use crate::Result;
 
 use super::address::RowAddress;
 
+#[derive(Clone, Debug, Default, DeepSizeOf, PartialEq)]
+pub struct MultiRowIdTreeMap {
+    inner: Vec<RowIdTreeMap>,
+}
+
+impl MultiRowIdTreeMap {
+    fn new() -> Self {
+        Self { inner: Vec::new() }
+    }
+    fn push(&mut self, map: RowIdTreeMap) {
+        self.inner.push(map);
+    }
+
+    pub fn contains(&self, row_id: u64) -> bool {
+        self.inner.iter().any(|map| map.contains(row_id))
+    }
+
+    pub fn max_len(&self) -> Option<u64> {
+        self.inner.iter().map(|map| map.len()).sum()
+    }
+
+    pub fn row_ids(&self) -> Option<impl Iterator<Item = RowAddress> + '_> {
+        let mut iters = self
+            .inner
+            .iter()
+            .map(|map| map.row_ids().map(|iter| iter))
+            .collect::<Option<Vec<_>>>()?;
+
+        let mut heap = BinaryHeap::with_capacity(iters.len());
+        for (index, iter) in iters.iter_mut().enumerate() {
+            if let Some(row_id) = iter.next() {
+                heap.push(Reverse((row_id, index)));
+            }
+        }
+
+        let mut current_row_id = None;
+
+        Some(iter::from_fn(move || {
+            while let Some(Reverse((row_id, index))) = heap.pop() {
+                let iter = &mut iters[index];
+                if let Some(next_id) = iter.next() {
+                    heap.push(Reverse((next_id, index)));
+                }
+
+                if Some(row_id) == current_row_id {
+                    continue;
+                }
+                current_row_id = Some(row_id);
+                return Some(row_id);
+            }
+            None
+        }))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &RowIdTreeMap> {
+        self.inner.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut RowIdTreeMap> {
+        self.inner.iter_mut()
+    }
+
+    pub fn retain_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
+        let frag_ids = frag_ids.into_iter().collect::<HashSet<_>>();
+        self.inner
+            .iter_mut()
+            .for_each(|map| map.retain_fragments(&frag_ids));
+    }
+
+    fn serialized_size(&self) -> usize {
+        size_of::<u32>()
+            + self
+                .inner
+                .iter()
+                .map(|map| map.serialized_size())
+                .sum::<usize>()
+    }
+
+    fn serialize_into<W: Write>(&self, mut writer: W) -> Result<()> {
+        writer.write_u32::<byteorder::LittleEndian>(self.inner.len() as u32)?;
+        for map in &self.inner {
+            map.serialize_into(&mut writer)?;
+        }
+        Ok(())
+    }
+
+    fn deserialize_from<R: Read>(mut reader: R) -> Result<Self> {
+        let num_entries = reader.read_u32::<byteorder::LittleEndian>()?;
+        let mut inner = Vec::new();
+        for _ in 0..num_entries {
+            inner.push(RowIdTreeMap::deserialize_from(&mut reader)?);
+        }
+        Ok(Self { inner })
+    }
+
+    pub fn into_single(self) -> RowIdTreeMap {
+        let mut result = RowIdTreeMap::new();
+        result.extend(self.inner.into_iter());
+        result
+    }
+
+    fn may_merge_bitmaps(
+        bitmaps: impl Iterator<Item = RowIdTreeMap>,
+    ) -> impl Iterator<Item = RowIdTreeMap> {
+        // TODO: Implement this
+        bitmaps
+    }
+}
+
+impl From<RowIdTreeMap> for MultiRowIdTreeMap {
+    fn from(map: RowIdTreeMap) -> Self {
+        Self { inner: vec![map] }
+    }
+}
+
+impl std::ops::BitOr<Self> for MultiRowIdTreeMap {
+    type Output = Self;
+
+    fn bitor(mut self, rhs: Self) -> Self::Output {
+        self |= rhs;
+        self
+    }
+}
+
+impl std::ops::BitOrAssign<Self> for MultiRowIdTreeMap {
+    fn bitor_assign(&mut self, rhs: Self) {
+        let mut inner = std::mem::take(&mut self.inner);
+        inner.extend(rhs.inner.into_iter());
+        self.inner = Self::may_merge_bitmaps(inner.into_iter()).collect();
+    }
+}
+
+impl std::ops::BitAnd<Self> for MultiRowIdTreeMap {
+    type Output = Self;
+
+    fn bitand(mut self, rhs: Self) -> Self::Output {
+        self &= rhs;
+        self
+    }
+}
+
+impl std::ops::BitAndAssign<Self> for MultiRowIdTreeMap {
+    fn bitand_assign(&mut self, rhs: Self) {
+        let rhs = rhs.into_single();
+        self.inner.iter_mut().for_each(|map| *map &= &rhs);
+        self.inner.retain(|map| !map.is_empty());
+    }
+}
+
+impl std::ops::SubAssign<Self> for MultiRowIdTreeMap {
+    fn sub_assign(&mut self, rhs: Self) {
+        let rhs = rhs.into_single();
+        self.inner.iter_mut().for_each(|map| *map -= &rhs);
+        self.inner.retain(|map| !map.is_empty());
+    }
+}
+
+impl FromIterator<RowIdTreeMap> for MultiRowIdTreeMap {
+    fn from_iter<T: IntoIterator<Item = RowIdTreeMap>>(iter: T) -> Self {
+        Self {
+            inner: Self::may_merge_bitmaps(iter.into_iter()).collect(),
+        }
+    }
+}
+
 /// A row id mask to select or deselect particular row ids
 ///
 /// If both the allow_list and the block_list are Some then the only selected
@@ -28,9 +194,9 @@ use super::address::RowAddress;
 #[derive(Clone, Debug, Default, DeepSizeOf)]
 pub struct RowIdMask {
     /// If Some then only these row ids are selected
-    pub allow_list: Option<RowIdTreeMap>,
+    pub allow_list: Option<MultiRowIdTreeMap>,
     /// If Some then these row ids are not selected.
-    pub block_list: Option<RowIdTreeMap>,
+    pub block_list: Option<MultiRowIdTreeMap>,
 }
 
 impl RowIdMask {
@@ -42,24 +208,24 @@ impl RowIdMask {
     // Create a mask that doesn't allow anything
     pub fn allow_nothing() -> Self {
         Self {
-            allow_list: Some(RowIdTreeMap::new()),
+            allow_list: Some(MultiRowIdTreeMap::new()),
             block_list: None,
         }
     }
 
     // Create a mask from an allow list
-    pub fn from_allowed(allow_list: RowIdTreeMap) -> Self {
+    pub fn from_allowed(allow_list: impl Into<MultiRowIdTreeMap>) -> Self {
         Self {
-            allow_list: Some(allow_list),
+            allow_list: Some(allow_list.into()),
             block_list: None,
         }
     }
 
     // Create a mask from a block list
-    pub fn from_block(block_list: RowIdTreeMap) -> Self {
+    pub fn from_block(block_list: impl Into<MultiRowIdTreeMap>) -> Self {
         Self {
             allow_list: None,
-            block_list: Some(block_list),
+            block_list: Some(block_list.into()),
         }
     }
 
@@ -115,14 +281,15 @@ impl RowIdMask {
         if block_list.is_empty() {
             return self;
         }
-        if let Some(existing) = self.block_list {
+        if let Some(mut existing) = self.block_list {
+            existing.push(block_list);
             Self {
-                block_list: Some(existing | block_list),
+                block_list: Some(existing.clone()),
                 allow_list: self.allow_list,
             }
         } else {
             Self {
-                block_list: Some(block_list),
+                block_list: Some(MultiRowIdTreeMap::from_iter(std::iter::once(block_list))),
                 allow_list: self.allow_list,
             }
         }
@@ -130,10 +297,11 @@ impl RowIdMask {
 
     /// Also allow the given ids
     pub fn also_allow(self, allow_list: RowIdTreeMap) -> Self {
-        if let Some(existing) = self.allow_list {
+        if let Some(mut existing) = self.allow_list {
+            existing.push(allow_list);
             Self {
                 block_list: self.block_list,
-                allow_list: Some(existing | allow_list),
+                allow_list: Some(existing),
             }
         } else {
             Self {
@@ -190,14 +358,14 @@ impl RowIdMask {
         let block_list = if array.is_null(0) {
             None
         } else {
-            Some(RowIdTreeMap::deserialize_from(array.value(0)))
+            Some(MultiRowIdTreeMap::deserialize_from(array.value(0)))
         }
         .transpose()?;
 
         let allow_list = if array.is_null(1) {
             None
         } else {
-            Some(RowIdTreeMap::deserialize_from(array.value(1)))
+            Some(MultiRowIdTreeMap::deserialize_from(array.value(1)))
         }
         .transpose()?;
         Ok(Self {
@@ -213,7 +381,7 @@ impl RowIdMask {
         if let Some(allow_list) = &self.allow_list {
             // If there is a block list we could theoretically intersect the two
             // but it's not clear if that is worth the effort.  Feel free to add later.
-            allow_list.len()
+            allow_list.max_len()
         } else {
             None
         }
@@ -552,10 +720,8 @@ impl RowIdTreeMap {
         }
     }
 
-    pub fn retain_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
-        let frag_id_set = frag_ids.into_iter().collect::<HashSet<_>>();
-        self.inner
-            .retain(|frag_id, _| frag_id_set.contains(frag_id));
+    pub fn retain_fragments(&mut self, frag_ids: &HashSet<u32>) {
+        self.inner.retain(|frag_id, _| frag_ids.contains(frag_id));
     }
 
     /// Compute the serialized size of the set.
@@ -618,7 +784,9 @@ impl RowIdTreeMap {
         Ok(Self { inner })
     }
 
-    pub fn union_all(maps: &[&Self]) -> Self {
+    pub fn union_all<'a>(maps: impl IntoIterator<Item = &'a Self>) -> Self {
+        let maps = maps.into_iter();
+        let len = maps.size_hint().0;
         let mut new_map = BTreeMap::new();
 
         for map in maps {
@@ -626,7 +794,7 @@ impl RowIdTreeMap {
                 new_map
                     .entry(fragment)
                     // I hate this allocation, but I can't think of a better way
-                    .or_insert_with(|| Vec::with_capacity(maps.len()))
+                    .or_insert_with(|| Vec::with_capacity(len))
                     .push(selection);
             }
         }
@@ -645,10 +813,16 @@ impl RowIdTreeMap {
     /// If there is a block list then this will subtract the block list from the set
     pub fn mask(&mut self, mask: &RowIdMask) {
         if let Some(allow_list) = &mask.allow_list {
-            *self &= allow_list;
+            // A & (B | C) = (A & B) | (A & C)
+            let mut new_map = Self::new();
+            new_map.extend(allow_list.iter().map(|map| map.clone().bitand(self)));
+            *self = new_map;
         }
         if let Some(block_list) = &mask.block_list {
-            *self -= block_list;
+            // A - (B | C) = (A - B) - C
+            for map in block_list.iter() {
+                *self -= map;
+            }
         }
     }
 
@@ -707,11 +881,11 @@ impl std::ops::BitOrAssign<Self> for RowIdTreeMap {
     }
 }
 
-impl std::ops::BitAnd<Self> for RowIdTreeMap {
+impl std::ops::BitAnd<&Self> for RowIdTreeMap {
     type Output = Self;
 
-    fn bitand(mut self, rhs: Self) -> Self::Output {
-        self &= &rhs;
+    fn bitand(mut self, rhs: &Self) -> Self::Output {
+        self &= rhs;
         self
     }
 }
@@ -1032,7 +1206,7 @@ mod tests {
             });
             expected.extend(right_in_left);
 
-            let actual = left & right;
+            let actual = left & &right;
             prop_assert_eq!(expected, actual);
         }
 
@@ -1140,7 +1314,7 @@ mod tests {
         // Test with just an allow list
         let mut allow_list = RowIdTreeMap::default();
         allow_list.extend([1, 5, 10].iter().copied());
-        mask.allow_list = Some(allow_list);
+        mask.allow_list = Some(allow_list.into());
 
         let ids: Vec<_> = mask.iter_ids().unwrap().collect();
         assert_eq!(
@@ -1155,7 +1329,7 @@ mod tests {
         // Test with both allow list and block list
         let mut block_list = RowIdTreeMap::default();
         block_list.extend([5].iter().copied());
-        mask.block_list = Some(block_list);
+        mask.block_list = Some(block_list.into());
 
         let ids: Vec<_> = mask.iter_ids().unwrap().collect();
         assert_eq!(
@@ -1169,14 +1343,37 @@ mod tests {
         // Test with full fragment in block list
         let mut block_list = RowIdTreeMap::default();
         block_list.insert_fragment(0);
-        mask.block_list = Some(block_list);
+        mask.block_list = Some(block_list.into());
         assert!(mask.iter_ids().is_none());
 
         // Test with full fragment in allow list
         mask.block_list = None;
         let mut allow_list = RowIdTreeMap::default();
         allow_list.insert_fragment(0);
-        mask.allow_list = Some(allow_list);
+        mask.allow_list = Some(allow_list.into());
         assert!(mask.iter_ids().is_none());
+    }
+
+    #[test]
+    fn test_serialization() {
+        let mask = RowIdMask::from_allowed(MultiRowIdTreeMap::from_iter([
+            RowIdTreeMap::from_iter([1, 3, 5]),
+            RowIdTreeMap::from_iter([2, 4, 6]),
+        ]))
+        .also_block(RowIdTreeMap::from_iter([7, 8, 9]))
+        .also_block(RowIdTreeMap::from_iter([3, 4]));
+
+        let bytes = mask.into_arrow().unwrap();
+        let deserialized = RowIdMask::from_arrow(&bytes).unwrap();
+        let row_ids = deserialized.iter_ids().unwrap().collect::<Vec<_>>();
+        assert_eq!(
+            row_ids,
+            vec![
+                RowAddress::new_from_parts(0, 1),
+                RowAddress::new_from_parts(0, 2),
+                RowAddress::new_from_parts(0, 5),
+                RowAddress::new_from_parts(0, 6),
+            ]
+        );
     }
 }
