@@ -88,7 +88,9 @@ fn bench_ngram(c: &mut Criterion) {
     group
         .sample_size(10)
         .measurement_time(Duration::from_secs(10));
-    let index = rt.block_on(NGramIndex::load(store, None)).unwrap();
+    let index = rt
+        .block_on(NGramIndex::load(store, None, LanceCache::no_cache()))
+        .unwrap();
     group.bench_function(format!("ngram_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             let sample_idx = rand::random::<usize>() % batch.num_rows();

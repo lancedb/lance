@@ -30,12 +30,11 @@ import java.util.Arrays;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class FilterTest {
-  @TempDir static Path tempDir;
   private static BufferAllocator allocator;
   private static Dataset dataset;
 
   @BeforeAll
-  static void setup() throws IOException {
+  static void setup(@TempDir Path tempDir) throws IOException {
     String datasetPath = tempDir.resolve("filter_test_dataset").toString();
     allocator = new RootAllocator();
     TestUtils.SimpleTestDataset testDataset =

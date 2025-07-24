@@ -15,6 +15,7 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.schema.ColumnAlteration;
+import com.lancedb.lance.schema.LanceField;
 import com.lancedb.lance.schema.SqlExpressions;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -50,7 +51,6 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.*;
 
 public class DatasetTest {
-  @TempDir static Path tempDir; // Temporary directory for the tests
   private static Dataset dataset;
 
   @BeforeAll
@@ -65,7 +65,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testWriteStreamAndOpenPath() throws IOException, URISyntaxException {
+  void testWriteStreamAndOpenPath(@TempDir Path tempDir) throws IOException, URISyntaxException {
     String datasetPath = tempDir.resolve("write_stream").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.RandomAccessDataset testDataset =
@@ -76,7 +76,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testCreateEmptyDataset() {
+  void testCreateEmptyDataset(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("new_empty_dataset").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -86,7 +86,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testCreateDirNotExist() throws IOException, URISyntaxException {
+  void testCreateDirNotExist(@TempDir Path tempDir) throws IOException, URISyntaxException {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (BufferAllocator allocator = new RootAllocator()) {
@@ -97,7 +97,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testOpenInvalidPath() {
+  void testOpenInvalidPath(@TempDir Path tempDir) {
     String validPath = tempDir.resolve("Invalid_dataset").toString();
     assertThrows(
         RuntimeException.class,
@@ -107,7 +107,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testDatasetVersion() {
+  void testDatasetVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("dataset_version").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -189,7 +189,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testDatasetCheckoutVersion() {
+  void testDatasetCheckoutVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("dataset_checkout_version").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -219,7 +219,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testDatasetTags() {
+  void testDatasetTags(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("dataset_tags").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -270,7 +270,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testDatasetRestore() {
+  void testDatasetRestore(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("dataset_restore").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -311,7 +311,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testDatasetUri() {
+  void testDatasetUri(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("dataset_uri").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -323,7 +323,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testOpenNonExist() throws IOException, URISyntaxException {
+  void testOpenNonExist(@TempDir Path tempDir) throws IOException, URISyntaxException {
     String datasetPath = tempDir.resolve("non_exist").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       assertThrows(
@@ -335,7 +335,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testCreateExist() throws IOException, URISyntaxException {
+  void testCreateExist(@TempDir Path tempDir) throws IOException, URISyntaxException {
     String datasetPath = tempDir.resolve("create_exist").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -350,7 +350,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testGetSchemaWithClosedDataset() {
+  void testGetSchemaWithClosedDataset(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -363,7 +363,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testDropColumns() {
+  void testDropColumns(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -387,7 +387,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testAlterColumns() {
+  void testAlterColumns(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -447,7 +447,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testAddColumnBySqlExpressions() {
+  void testAddColumnBySqlExpressions(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -494,7 +494,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testAddColumnsByStream() throws IOException {
+  void testAddColumnsByStream(@TempDir Path tempDir) throws IOException {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -595,7 +595,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testAddColumnByFieldsOrSchema() {
+  void testAddColumnByFieldsOrSchema(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -655,7 +655,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testDropPath() {
+  void testDropPath(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -667,7 +667,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testTake() throws IOException, ClosedChannelException {
+  void testTake(@TempDir Path tempDir) throws IOException, ClosedChannelException {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -695,7 +695,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testCountRows() {
+  void testCountRows(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -715,7 +715,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testCalculateDataSize() {
+  void testCalculateDataSize(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -730,7 +730,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testDeleteRows() {
+  void testDeleteRows(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -765,7 +765,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testUpdateConfig() {
+  void testUpdateConfig(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -800,7 +800,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testDeleteConfigKeys() {
+  void testDeleteConfigKeys(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -838,7 +838,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testGetLanceSchema() {
+  void testGetLanceSchema(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -846,6 +846,76 @@ public class DatasetTest {
           new TestUtils.ComplexTestDataset(allocator, datasetPath);
       dataset = testDataset.createEmptyDataset();
       assertEquals(testDataset.getSchema(), dataset.getLanceSchema().asArrowSchema());
+    }
+  }
+
+  @Test
+  void testReplaceSchemaMetadata(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      assertEquals(1, dataset.version());
+      Map<String, String> replaceMetadata = new HashMap<>();
+      replaceMetadata.put("key1", "value1");
+      replaceMetadata.put("key2", "value2");
+      dataset.replaceSchemaMetadata(replaceMetadata);
+      assertEquals(2, dataset.version());
+      Map<String, String> currentMetadata = dataset.getSchema().getCustomMetadata();
+      for (String configKey : currentMetadata.keySet()) {
+        assertEquals(currentMetadata.get(configKey), replaceMetadata.get(configKey));
+      }
+      assertEquals(replaceMetadata.size(), currentMetadata.size());
+
+      Map<String, String> replaceConfig2 = new HashMap<>();
+      replaceConfig2.put("key1", "value3");
+      dataset.replaceSchemaMetadata(replaceConfig2);
+      currentMetadata = dataset.getSchema().getCustomMetadata();
+      assertEquals(3, dataset.version());
+      assertEquals(1, currentMetadata.size());
+      assertEquals("value3", currentMetadata.get("key1"));
+    }
+  }
+
+  @Test
+  void testReplaceFieldConfig(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      assertEquals(1, dataset.version());
+      LanceField field = dataset.getLanceSchema().fields().get(0);
+      Map<String, String> replaceMetadata = new HashMap<>();
+      replaceMetadata.put("key1", "value1");
+      replaceMetadata.put("key2", "value2");
+      dataset.replaceFieldMetadata(Collections.singletonMap(field.getId(), replaceMetadata));
+      assertEquals(2, dataset.version());
+      Map<String, String> currentMetadata = dataset.getSchema().getFields().get(0).getMetadata();
+      for (String configKey : currentMetadata.keySet()) {
+        assertEquals(currentMetadata.get(configKey), replaceMetadata.get(configKey));
+      }
+      assertEquals(replaceMetadata.size(), currentMetadata.size());
+
+      Map<String, String> replaceConfig2 = new HashMap<>();
+      replaceConfig2.put("key1", "value3");
+      dataset.replaceFieldMetadata(Collections.singletonMap(field.getId(), replaceConfig2));
+      currentMetadata = dataset.getSchema().getFields().get(0).getMetadata();
+      assertEquals(3, dataset.version());
+      assertEquals(1, currentMetadata.size());
+      assertEquals("value3", currentMetadata.get("key1"));
+
+      assertThrows(
+          IllegalArgumentException.class,
+          () ->
+              dataset.replaceFieldMetadata(
+                  Collections.singletonMap(Integer.MAX_VALUE, replaceConfig2)));
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> dataset.replaceFieldMetadata(Collections.singletonMap(-1, replaceConfig2)));
     }
   }
 }

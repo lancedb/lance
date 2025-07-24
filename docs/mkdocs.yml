@@ -76,20 +76,20 @@ nav:
       - Getting Started with Lance: quickstart/index.md
       - Versioning: quickstart/versioning.md
       - Vector Search: quickstart/vector-search.md
-    - Format Specification: format/index.md
-    - User Guide:
-      - Read and Write: guide/read_and_write.md
-      - Data Evolution: guide/data_evolution.md
-      - Blob API: guide/blob.md
-      - Tags: guide/tags.md
-      - Object Store Configuration: guide/object_store.md
-      - Distributed Write: guide/distributed_write.md
-      - Performance Guide: guide/performance.md
-      - Tokenizer: guide/tokenizer.md
-      - Extension Arrays: guide/arrays.md
-    - Contribution Guidelines:
-      - Contribution Guidelines: community/index.md
-      - Lancelot Program: community/lancelot.md
+  - User Guide:
+    - Read and Write: guide/read_and_write.md
+    - Data Evolution: guide/data_evolution.md
+    - Blob API: guide/blob.md
+    - Tags: guide/tags.md
+    - Object Store Configuration: guide/object_store.md
+    - Distributed Write: guide/distributed_write.md
+    - Performance Guide: guide/performance.md
+    - Tokenizer: guide/tokenizer.md
+    - Extension Arrays: guide/arrays.md
+  - Format Specification:
+    - Overview: format/index.md
+    - Table Format: format/table.md
+    - File Format: format/file.md
   - SDK Docs:
     - Overview: sdk_docs.md
     - Python: https://lancedb.github.io/lance-python-doc
@@ -117,3 +117,6 @@ nav:
     - Tensorflow: integrations/tensorflow.md
     - Trino: https://github.com/lancedb/lance-trino
   - Catalog Integrations: https://lancedb.github.io/lance-namespace
+  - Community Guidelines:
+      - Contribution Guidelines: community/index.md
+      - Lancelot Program: community/lancelot.md

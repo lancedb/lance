@@ -12,7 +12,8 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 
-use crate::session::caches::{ManifestKey, TransactionKey};
+use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
+use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
@@ -85,7 +86,6 @@ use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
     detect_overlapping_fragments, read_transaction_file,
 };
-use crate::session::caches::DSMetadataCache;
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
@@ -112,11 +112,13 @@ const INDICES_DIR: &str = "_indices";
 
 pub const DATA_DIR: &str = "data";
 pub const BLOB_DIR: &str = "_blobs";
-pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
+// We default to 6GB for the index cache, since indices are often large but
+// worth caching.
+pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
 // Default to 1 GiB for the metadata cache. Column metadata can be like 40MB,
 // so this should be enough for a few hundred columns. Other metadata is much
 // smaller.
-pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
+pub const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Lance Dataset
 #[derive(Clone)]
@@ -137,6 +139,7 @@ pub struct Dataset {
     pub tags: Tags,
 
     // These are references to session caches, but with the dataset URI as a prefix.
+    pub(crate) index_cache: Arc<DSIndexCache>,
     pub(crate) metadata_cache: Arc<DSMetadataCache>,
 }
 
@@ -178,9 +181,9 @@ impl From<&Manifest> for Version {
 /// Customize read behavior of a dataset.
 #[derive(Clone, Debug)]
 pub struct ReadParams {
-    /// Cache size for index cache. If it is zero, index cache is disabled.
-    ///
-    pub index_cache_size: usize,
+    /// Size of the index cache in bytes. This cache stores index data in memory
+    /// for faster lookups. The default is 6 GiB.
+    pub index_cache_size_bytes: usize,
 
     /// Size of the metadata cache in bytes. This cache stores metadata in memory
     /// for faster open table and scans. The default is 1 GiB.
@@ -214,8 +217,18 @@ pub struct ReadParams {
 
 impl ReadParams {
     /// Set the cache size for indices. Set to zero, to disable the cache.
+    #[deprecated(
+        since = "0.30.0",
+        note = "Use `index_cache_size_bytes` instead, which accepts a size in bytes."
+    )]
     pub fn index_cache_size(&mut self, cache_size: usize) -> &mut Self {
-        self.index_cache_size = cache_size;
+        let assumed_entry_size = 20 * 1024 * 1024; // 20 MiB per entry
+        self.index_cache_size_bytes = cache_size * assumed_entry_size;
+        self
+    }
+
+    pub fn index_cache_size_bytes(&mut self, cache_size: usize) -> &mut Self {
+        self.index_cache_size_bytes = cache_size;
         self
     }
 
@@ -251,7 +264,7 @@ impl ReadParams {
 impl Default for ReadParams {
     fn default() -> Self {
         Self {
-            index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
+            index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             session: None,
             store_options: None,
@@ -299,18 +312,21 @@ impl ProjectionRequest {
         )
     }
 
-    pub fn into_projection_plan(self, dataset_schema: &Schema) -> Result<ProjectionPlan> {
+    pub fn into_projection_plan(self, dataset: Arc<Dataset>) -> Result<ProjectionPlan> {
+        let mut projection_plan = ProjectionPlan::new(dataset.clone());
         match self {
-            Self::Schema(schema) => Ok(ProjectionPlan::new_empty(
-                Arc::new(dataset_schema.project_by_schema(
+            Self::Schema(schema) => {
+                let projection = dataset.schema().project_by_schema(
                     schema.as_ref(),
                     OnMissing::Error,
                     OnTypeMismatch::Error,
-                )?),
-                /*load_blobs=*/ false,
-            )),
+                )?;
+                projection_plan.project_from_schema(&projection);
+                Ok(projection_plan)
+            }
             Self::Sql(columns) => {
-                ProjectionPlan::try_new(dataset_schema, &columns, /*load_blobs=*/ false)
+                projection_plan.project_from_expressions(&columns)?;
+                Ok(projection_plan)
             }
         }
     }
@@ -382,7 +398,7 @@ impl Dataset {
         let manifest = Self::load_manifest(
             self.object_store.as_ref(),
             &manifest_location,
-            &base_path,
+            &self.uri,
             self.session.as_ref(),
         )
         .await?;
@@ -405,7 +421,7 @@ impl Dataset {
     async fn load_manifest(
         object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
-        base_path: &Path,
+        uri: &str,
         session: &Session,
     ) -> Result<Manifest> {
         let object_reader = if let Some(size) = manifest_location.size {
@@ -476,16 +492,19 @@ impl Dataset {
                 let message_data =
                     &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
                 let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-                let indices = section
+                let indices: Vec<Index> = section
                     .indices
                     .into_iter()
                     .map(Index::try_from)
                     .collect::<Result<Vec<_>>>()?;
-                session.index_cache.insert_metadata(
-                    base_path.as_ref(),
-                    manifest_location.version,
-                    Arc::new(indices),
-                );
+
+                let ds_index_cache = session.index_cache.for_dataset(uri);
+                let metadata_key = crate::session::index_caches::IndexMetadataKey {
+                    version: manifest_location.version,
+                };
+                ds_index_cache
+                    .insert_with_key(&metadata_key, Arc::new(indices))
+                    .await;
             }
         }
 
@@ -512,6 +531,7 @@ impl Dataset {
             base_path.clone(),
         );
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
+        let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
         Ok(Self {
             object_store,
             base: base_path,
@@ -522,6 +542,7 @@ impl Dataset {
             session,
             tags,
             metadata_cache,
+            index_cache,
         })
     }
 
@@ -631,7 +652,7 @@ impl Dataset {
             version: location.version,
             e_tag: location.e_tag.as_deref(),
         };
-        let cached_manifest = self.metadata_cache.get_with_key(&manifest_key);
+        let cached_manifest = self.metadata_cache.get_with_key(&manifest_key).await;
         if let Some(cached_manifest) = cached_manifest {
             return Ok((cached_manifest, location));
         }
@@ -1058,13 +1079,14 @@ impl Dataset {
     }
 
     /// Get the number of entries currently in the index cache.
-    pub fn index_cache_entry_count(&self) -> usize {
-        self.session.index_cache.get_size()
+    pub async fn index_cache_entry_count(&self) -> usize {
+        self.session.index_cache.size().await
     }
 
     /// Get cache hit ratio.
-    pub fn index_cache_hit_rate(&self) -> f32 {
-        self.session.index_cache.hit_rate()
+    pub async fn index_cache_hit_rate(&self) -> f32 {
+        let stats = self.session.index_cache_stats().await;
+        stats.hit_ratio()
     }
 
     pub fn cache_size_bytes(&self) -> u64 {
@@ -1148,7 +1170,7 @@ impl Dataset {
         Some(FileFragment::new(dataset, fragment.clone()))
     }
 
-    pub(crate) fn fragments(&self) -> &Arc<Vec<Fragment>> {
+    pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
         &self.manifest.fragments
     }
 
@@ -1295,10 +1317,6 @@ impl Dataset {
             .zip(filtered_sorted_ids)
             .filter_map(|(addr_or_id, maybe_addr)| maybe_addr.map(|_| *addr_or_id))
             .collect())
-    }
-
-    pub(crate) async fn filter_deleted_addresses(&self, addrs: &[u64]) -> Result<Vec<u64>> {
-        self.filter_addr_or_ids(addrs, addrs).await
     }
 
     pub(crate) async fn filter_deleted_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {
@@ -1495,24 +1513,26 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                     version: location.version,
                     e_tag: location.e_tag.as_deref(),
                 };
-                let manifest =
-                    if let Some(cached) = dataset.metadata_cache.get_with_key(&manifest_key) {
-                        cached
-                    } else {
-                        let loaded = Arc::new(
-                            Dataset::load_manifest(
-                                dataset.object_store(),
-                                &location,
-                                &dataset.base,
-                                dataset.session.as_ref(),
-                            )
-                            .await?,
-                        );
-                        dataset
-                            .metadata_cache
-                            .insert_with_key(&manifest_key, loaded.clone());
-                        loaded
-                    };
+                let manifest = if let Some(cached) =
+                    dataset.metadata_cache.get_with_key(&manifest_key).await
+                {
+                    cached
+                } else {
+                    let loaded = Arc::new(
+                        Dataset::load_manifest(
+                            dataset.object_store(),
+                            &location,
+                            &dataset.uri,
+                            dataset.session.as_ref(),
+                        )
+                        .await?,
+                    );
+                    dataset
+                        .metadata_cache
+                        .insert_with_key(&manifest_key, loaded.clone())
+                        .await;
+                    loaded
+                };
 
                 if let Some(latest_tx) = latest_tx {
                     // We ignore the error, since we don't care if the receiver is dropped.
@@ -1529,37 +1549,39 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
             let tx_key = TransactionKey {
                 version: manifest.version,
             };
-            let transaction = if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key) {
-                cached
-            } else {
-                let dataset_version = Dataset::checkout_manifest(
-                    dataset.object_store.clone(),
-                    dataset.base.clone(),
-                    dataset.uri.clone(),
-                    manifest_copy.clone(),
-                    location,
-                    dataset.session(),
-                    dataset.commit_handler.clone(),
-                )?;
-                let object_store = dataset_version.object_store();
-                let path = dataset_version
-                    .manifest
-                    .transaction_file
-                    .as_ref()
-                    .ok_or_else(|| Error::Internal {
-                        message: format!(
-                            "Dataset version {} does not have a transaction file",
-                            manifest_copy.version
-                        ),
-                        location: location!(),
-                    })?;
-                let loaded =
-                    Arc::new(read_transaction_file(object_store, &dataset.base, path).await?);
-                dataset
-                    .metadata_cache
-                    .insert_with_key(&tx_key, loaded.clone());
-                loaded
-            };
+            let transaction =
+                if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
+                    cached
+                } else {
+                    let dataset_version = Dataset::checkout_manifest(
+                        dataset.object_store.clone(),
+                        dataset.base.clone(),
+                        dataset.uri.clone(),
+                        manifest_copy.clone(),
+                        location,
+                        dataset.session(),
+                        dataset.commit_handler.clone(),
+                    )?;
+                    let object_store = dataset_version.object_store();
+                    let path = dataset_version
+                        .manifest
+                        .transaction_file
+                        .as_ref()
+                        .ok_or_else(|| Error::Internal {
+                            message: format!(
+                                "Dataset version {} does not have a transaction file",
+                                manifest_copy.version
+                            ),
+                            location: location!(),
+                        })?;
+                    let loaded =
+                        Arc::new(read_transaction_file(object_store, &dataset.base, path).await?);
+                    dataset
+                        .metadata_cache
+                        .insert_with_key(&tx_key, loaded.clone())
+                        .await;
+                    loaded
+                };
             Ok((manifest.version, transaction))
         })
         .try_buffer_unordered(io_parallelism / 2);
@@ -1946,6 +1968,7 @@ mod tests {
     use lance_table::format::{DataFile, WriterVersion};
 
     use all_asserts::assert_true;
+    use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -2770,7 +2793,7 @@ mod tests {
             ))],
         )
         .unwrap()];
-        write_params.mode = WriteMode::Overwrite;
+        write_params.mode = Overwrite;
         let new_batch_reader =
             RecordBatchIterator::new(new_batches.into_iter().map(Ok), new_schema.clone());
         let dataset = Dataset::write(new_batch_reader, test_uri, Some(write_params.clone()))
@@ -6642,5 +6665,119 @@ mod tests {
         assert_eq!(dataset.get_fragments()[0].id(), 3);
         assert_eq!(dataset.get_fragments()[1].id(), 4);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn test_insert_skip_auto_cleanup() {
+        use lance_core::utils::testing::MockClock;
+        let clock = MockClock::new();
+
+        let tmpdir = tempdir().unwrap();
+        let test_uri = tmpdir.path().join("skip_auto_cleanup_dataset");
+        let test_uri_str = test_uri.to_str().unwrap();
+
+        // Create initial dataset with aggressive auto cleanup (interval=1, older_than=1ms)
+        let data = gen()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 1,
+                older_than: chrono::TimeDelta::try_milliseconds(0).unwrap(), // Cleanup versions older than 0ms
+            }),
+            ..Default::default()
+        };
+
+        // Start at 1 second after epoch
+        clock.set_system_time(chrono::Duration::seconds(1));
+
+        let dataset = Dataset::write(data, test_uri_str, Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.version().version, 1);
+
+        // Advance time by 1 second
+        clock.set_system_time(chrono::Duration::seconds(2));
+
+        // First append WITHOUT skip_auto_cleanup - should trigger cleanup
+        let data1 = gen()
+            .col("id", array::step::<Int32Type>())
+            .into_df_stream(RowCount::from(50), BatchCount::from(1));
+
+        let write_params1 = WriteParams {
+            mode: WriteMode::Append,
+            skip_auto_cleanup: false,
+            ..Default::default()
+        };
+
+        let dataset2 = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_params(&write_params1)
+            .execute_stream(data1)
+            .await
+            .unwrap();
+
+        assert_eq!(dataset2.version().version, 2);
+
+        // Advance time
+        clock.set_system_time(chrono::Duration::seconds(3));
+
+        // Need to do another commit for cleanup to take effect since cleanup runs on the old dataset
+        let data1_extra = gen()
+            .col("id", array::step::<Int32Type>())
+            .into_df_stream(RowCount::from(10), BatchCount::from(1));
+
+        let dataset2_extra = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset2)))
+            .with_params(&write_params1)
+            .execute_stream(data1_extra)
+            .await
+            .unwrap();
+
+        assert_eq!(dataset2_extra.version().version, 3);
+
+        // Version 1 should be cleaned up due to auto cleanup (cleanup runs every version)
+        assert!(
+            dataset2_extra.checkout_version(1).await.is_err(),
+            "Version 1 should have been cleaned up"
+        );
+        // Version 2 should still exist
+        assert!(
+            dataset2_extra.checkout_version(2).await.is_ok(),
+            "Version 2 should still exist"
+        );
+
+        // Advance time
+        clock.set_system_time(chrono::Duration::seconds(4));
+
+        // Second append WITH skip_auto_cleanup - should NOT trigger cleanup
+        let data2 = gen()
+            .col("id", array::step::<Int32Type>())
+            .into_df_stream(RowCount::from(30), BatchCount::from(1));
+
+        let write_params2 = WriteParams {
+            mode: WriteMode::Append,
+            skip_auto_cleanup: true, // Skip auto cleanup
+            ..Default::default()
+        };
+
+        let dataset3 = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset2_extra)))
+            .with_params(&write_params2)
+            .execute_stream(data2)
+            .await
+            .unwrap();
+
+        assert_eq!(dataset3.version().version, 4);
+
+        // Version 2 should still exist because skip_auto_cleanup was enabled
+        assert!(
+            dataset3.checkout_version(2).await.is_ok(),
+            "Version 2 should still exist because skip_auto_cleanup was enabled"
+        );
+        // Version 3 should also still exist
+        assert!(
+            dataset3.checkout_version(3).await.is_ok(),
+            "Version 3 should still exist"
+        );
     }
 }

@@ -220,3 +220,5 @@ pub const ROWS_SCANNED_METRIC: &str = "rows_scanned";
 pub const TASK_WAIT_TIME_METRIC: &str = "task_wait_time";
 pub const DELTAS_SEARCHED_METRIC: &str = "deltas_searched";
 pub const PARTITIONS_SEARCHED_METRIC: &str = "partitions_searched";
+pub const SCALAR_INDEX_SEARCH_TIME_METRIC: &str = "search_time";
+pub const SCALAR_INDEX_SER_TIME_METRIC: &str = "ser_time";

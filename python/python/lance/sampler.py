@@ -143,7 +143,7 @@ def _filtered_efficient_sample(
             limit=(end - start),
             batch_size=shard_size,
         )
-        if len(columns) == 1 and filter.lower() == f"{columns[0]} is not null":
+        if len(columns) == 1 and filter.lower() == f"{columns[0]} is not null".lower():
             table = pc.drop_null(table)
         elif filter is not None:
             raise NotImplementedError(f"Can't yet run filter <{filter}> in-memory")

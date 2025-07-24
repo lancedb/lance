@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::VecDeque;
 use std::pin::Pin;
+use std::task::Poll;
+use std::{collections::VecDeque, task::Context};
 
 use arrow::compute::kernels;
 use arrow_array::RecordBatch;
 use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
 use datafusion_common::DataFusionError;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{ready, Stream, StreamExt, TryStreamExt};
 
+use lance_core::error::DataFusionResult;
 use lance_core::Result;
 
 /// Wraps a [`SendableRecordBatchStream`] into a stream of RecordBatch chunks of
@@ -196,14 +198,114 @@ pub fn chunk_concat_stream(
     Box::pin(RecordBatchStreamAdapter::new(schema_copy, chunk_concat))
 }
 
+/// Given a stream of record batches, this will yield batches of a fixed size.
+///
+/// This stream _will_ combine record batches and so it can be fairly expensive as it will
+/// likely force a copy of all incoming data.  However, it can be useful when users require
+/// precise batch sizing.
+pub struct StrictBatchSizeStream<S> {
+    inner: S,
+    batch_size: usize,
+    residual: Option<RecordBatch>,
+}
+
+impl<S: Stream<Item = DataFusionResult<RecordBatch>> + Unpin> StrictBatchSizeStream<S> {
+    pub fn new(inner: S, batch_size: usize) -> Self {
+        Self {
+            inner,
+            batch_size,
+            residual: None,
+        }
+    }
+}
+
+/// Internal polling method for strict batch size enforcement.
+///
+/// # Use Case
+/// When precise batch sizing is required (e.g., ML batch processing), this method guarantees
+/// output batches exactly match batch_size until final partial batch. Maintains data integrity
+/// across splits using row-aware splitting.
+///
+/// # Example
+/// With batch_size=5 and input sequence:
+/// - Fragment 1: 7 rows → splits into [5,2]
+///   (queues 5, carries 2)
+/// - Fragment 2: 4 rows → combines carried 2 + 4 = 6
+///   splits into [5,1]
+///
+/// - Output batches: [5], [5], [1]
+impl<S> Stream for StrictBatchSizeStream<S>
+where
+    S: Stream<Item = DataFusionResult<RecordBatch>> + Unpin,
+{
+    type Item = DataFusionResult<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            // Process residual first if present
+            if let Some(residual) = self.residual.take() {
+                if residual.num_rows() >= self.batch_size {
+                    let split_at = self.batch_size;
+                    let chunk = residual.slice(0, split_at);
+                    let new_residual = residual.slice(split_at, residual.num_rows() - split_at);
+                    self.residual = Some(new_residual);
+                    return Poll::Ready(Some(Ok(chunk)));
+                } else {
+                    // Keep residual and proceed to get more data
+                    self.residual = Some(residual);
+                }
+            }
+
+            // Poll the inner stream for next batch
+            match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
+                Some(Ok(batch)) => {
+                    // Combine with residual if any
+                    let current_batch = if let Some(residual) = self.residual.take() {
+                        arrow::compute::concat_batches(&residual.schema(), &[residual, batch])
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?
+                    } else {
+                        batch
+                    };
+
+                    if current_batch.num_rows() >= self.batch_size {
+                        let split_at = self.batch_size;
+                        let chunk = current_batch.slice(0, split_at);
+                        let new_residual =
+                            current_batch.slice(split_at, current_batch.num_rows() - split_at);
+                        if new_residual.num_rows() > 0 {
+                            self.residual = Some(new_residual);
+                        }
+                        return Poll::Ready(Some(Ok(chunk)));
+                    } else {
+                        // Not enough rows, store as residual
+                        self.residual = Some(current_batch);
+                        continue;
+                    }
+                }
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                None => {
+                    return Poll::Ready(
+                        self.residual
+                            .take()
+                            .filter(|r| r.num_rows() > 0)
+                            .map(Ok::<_, DataFusionError>),
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::Int32Type;
+    use arrow::datatypes::{Int32Type, Int64Type};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, TryStreamExt};
-    use lance_datagen::RowCount;
+    use lance_datagen::{array, BatchCount, RowCount};
+
+    use crate::datagen::DatafusionDatagenExt;
 
     #[tokio::test]
     async fn test_chunkers() {
@@ -265,5 +367,22 @@ mod tests {
         assert_eq!(chunked[1].num_rows(), 5);
         assert_eq!(chunked[2].num_rows(), 5);
         assert_eq!(chunked[3].num_rows(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_strict_batch_size_stream() {
+        let batches = lance_datagen::gen()
+            .anon_col(array::step::<Int32Type>())
+            .anon_col(array::step::<Int64Type>())
+            .into_df_stream(RowCount::from(7), BatchCount::from(10));
+
+        let stream = super::StrictBatchSizeStream::new(batches, 10);
+
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches.len(), 7);
+
+        for batch in batches {
+            assert_eq!(batch.num_rows(), 10);
+        }
     }
 }

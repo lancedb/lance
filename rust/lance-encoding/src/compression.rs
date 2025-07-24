@@ -32,6 +32,7 @@ use crate::{
             },
             bitpack::InlineBitpacking,
             block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
+            byte_stream_split::ByteStreamSplitDecompressor,
             constant::ConstantDecompressor,
             fsst::{
                 FsstMiniBlockDecompressor, FsstMiniBlockEncoder, FsstPerValueDecompressor,
@@ -178,7 +179,9 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 }
             }
             DataBlock::VariableWidth(variable_width_data) => {
-                if variable_width_data.bits_per_offset == 32 {
+                if variable_width_data.bits_per_offset == 32
+                    || variable_width_data.bits_per_offset == 64
+                {
                     let data_size =
                         variable_width_data.expect_single_stat::<UInt64Type>(Stat::DataSize);
                     let max_len =
@@ -191,9 +194,6 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     } else {
                         Ok(Box::new(BinaryMiniBlockEncoder::default()))
                     }
-                } else if variable_width_data.bits_per_offset == 64 {
-                    // TODO: Support FSSTMiniBlockEncoder
-                    Ok(Box::new(BinaryMiniBlockEncoder::default()))
                 } else {
                     todo!(
                         "Implement MiniBlockCompression for VariableWidth DataBlock with {} bit offsets.",
@@ -253,7 +253,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                     return Ok(Box::new(CompressedBufferEncoder::default()));
                 }
 
-                if variable_width.bits_per_offset == 32 {
+                if variable_width.bits_per_offset == 32 || variable_width.bits_per_offset == 64 {
                     let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
                     let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
 
@@ -267,7 +267,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                         Ok(variable_compression)
                     }
                 } else {
-                    todo!("Implement MiniBlockCompression for VariableWidth DataBlock with 64 bits offsets.")
+                    panic!("Does not support MiniBlockCompression for VariableWidth DataBlock with {} bits offsets.", variable_width.bits_per_offset);
                 }
             }
             _ => unreachable!(
@@ -327,6 +327,7 @@ pub trait DecompressionStrategy: std::fmt::Debug + Send + Sync {
     fn create_miniblock_decompressor(
         &self,
         description: &pb::ArrayEncoding,
+        decompression_strategy: &dyn DecompressionStrategy,
     ) -> Result<Box<dyn MiniBlockDecompressor>>;
 
     fn create_fixed_per_value_decompressor(
@@ -352,6 +353,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
     fn create_miniblock_decompressor(
         &self,
         description: &pb::ArrayEncoding,
+        decompression_strategy: &dyn DecompressionStrategy,
     ) -> Result<Box<dyn MiniBlockDecompressor>> {
         match description.array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Flat(flat) => {
@@ -364,7 +366,14 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 BinaryMiniBlockDecompressor::new(variable.bits_per_offset as u8),
             )),
             pb::array_encoding::ArrayEncoding::Fsst(description) => {
-                Ok(Box::new(FsstMiniBlockDecompressor::new(description)))
+                let inner_decompressor = decompression_strategy.create_miniblock_decompressor(
+                    description.binary.as_ref().unwrap(),
+                    decompression_strategy,
+                )?;
+                Ok(Box::new(FsstMiniBlockDecompressor::new(
+                    description,
+                    inner_decompressor,
+                )))
             }
             pb::array_encoding::ArrayEncoding::PackedStructFixedWidthMiniBlock(description) => {
                 Ok(Box::new(PackedStructFixedWidthMiniBlockDecompressor::new(
@@ -379,12 +388,16 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             pb::array_encoding::ArrayEncoding::Rle(rle) => {
                 Ok(Box::new(RleMiniBlockDecompressor::new(rle.bits_per_value)))
             }
+            pb::array_encoding::ArrayEncoding::ByteStreamSplit(bss) => Ok(Box::new(
+                ByteStreamSplitDecompressor::new(bss.bits_per_value as usize),
+            )),
             pb::array_encoding::ArrayEncoding::GeneralMiniBlock(general) => {
                 // Create inner decompressor
                 let inner_decompressor = self.create_miniblock_decompressor(
                     general.inner.as_ref().ok_or_else(|| {
                         Error::invalid_input("GeneralMiniBlock missing inner encoding", location!())
                     })?,
+                    decompression_strategy,
                 )?;
 
                 // Parse compression config

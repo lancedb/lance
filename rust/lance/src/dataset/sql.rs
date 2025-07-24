@@ -13,7 +13,7 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct SqlQueryBuilder {
     /// The dataset to run the SQL query
-    pub(crate) dataset: Dataset,
+    pub(crate) dataset: Arc<Dataset>,
 
     /// The SQL query to run
     pub(crate) sql: String,
@@ -31,7 +31,7 @@ pub struct SqlQueryBuilder {
 impl SqlQueryBuilder {
     pub fn new(dataset: Dataset, sql: &str) -> Self {
         Self {
-            dataset,
+            dataset: Arc::new(dataset),
             sql: sql.to_string(),
             table_name: "dataset".to_string(),
             with_row_id: false,
@@ -69,7 +69,7 @@ impl SqlQueryBuilder {
         ctx.register_table(
             self.table_name,
             Arc::new(LanceTableProvider::new(
-                Arc::new(self.dataset.clone()),
+                self.dataset.clone(),
                 row_id,
                 row_addr,
             )),
