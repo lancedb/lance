@@ -41,6 +41,10 @@ jobs:
           docker run --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace debian:10 bash -c "
             
             set -ex
+            # Update sources.list to use archive repositories for Debian 10 (EOL)
+            echo 'deb http://archive.debian.org/debian/ buster main' > /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian-security buster/updates main' >> /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian/ buster-updates main' >> /etc/apt/sources.list
             apt-get update
           
             DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes \
@@ -115,6 +119,10 @@ jobs:
           docker run --platform linux/amd64 -v ${{ github.workspace }}:/workspace -w /workspace debian:10 bash -c "
           
             set -ex
+            # Update sources.list to use archive repositories for Debian 10 (EOL)
+            echo 'deb http://archive.debian.org/debian/ buster main' > /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian-security buster/updates main' >> /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian/ buster-updates main' >> /etc/apt/sources.list
             apt-get update
           
             DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes \
