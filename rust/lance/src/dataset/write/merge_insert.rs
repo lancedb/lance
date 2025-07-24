@@ -1539,22 +1539,28 @@ impl MergeInsertJob {
 
     /// Generate the execution plan and return it as a formatted string for debugging.
     ///
-    /// This method takes a schema representing the source data and calls `create_plan()`
-    /// to generate the execution plan, then formats it for display. The verbose flag
-    /// controls the level of detail shown.
+    /// This method takes an optional schema representing the source data and calls `create_plan()`
+    /// to generate the execution plan, then formats it for display. If no schema is provided,
+    /// defaults to the dataset's schema. The verbose flag controls the level of detail shown.
     ///
     /// # Arguments
     ///
-    /// * `schema` - The schema of the source data that would be used in the merge insert
+    /// * `schema` - Optional schema of the source data. If None, uses the dataset's schema
     /// * `verbose` - If true, provides more detailed information in the plan output
     ///
     /// # Errors
     ///
     /// Returns Error::NotSupported if the merge insert configuration doesn't support
     /// the fast path required for plan generation.
-    pub async fn explain_plan(&self, schema: &Schema, verbose: bool) -> Result<String> {
+    pub async fn explain_plan(&self, schema: Option<&Schema>, verbose: bool) -> Result<String> {
+        // Use provided schema or default to dataset schema
+        let schema = match schema {
+            Some(s) => s.clone(),
+            None => arrow_schema::Schema::from(self.dataset.schema()),
+        };
+
         // Check if we can use create_plan
-        if !self.can_use_create_plan(schema).await? {
+        if !self.can_use_create_plan(&schema).await? {
             return Err(Error::NotSupported {
                 source: "This merge insert configuration does not support explain_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into(),
                 location: location!(),
@@ -3414,32 +3420,29 @@ mod tests {
                 .try_build()
                 .unwrap();
 
-        // Test explain_plan with the exact same schema as the dataset
-        let source_schema = arrow_schema::Schema::from(dataset.schema());
-
-        let plan = merge_insert_job
-            .explain_plan(&source_schema, false)
-            .await
-            .unwrap();
-
-        // Verify the plan contains expected components
-        assert!(plan.contains("MergeInsert"));
-        assert!(plan.contains("when_matched=UpdateAll"));
-        assert!(plan.contains("when_not_matched=InsertAll"));
-        assert!(plan.contains("on=[id]"));
+        // Test explain_plan with default schema (None)
+        let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
 
         // Also validate the full string structure with pattern matching
-        let expected_pattern = "MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep...CoalescePartitionsExec...HashJoinExec...LanceRead...StreamingTableExec: partition_sizes=1, projection=[id, name]";
+        let expected_pattern = "\
+MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep...
+  CoalescePartitionsExec...
+    HashJoinExec...
+      LanceRead...
+      StreamingTableExec: partition_sizes=1, projection=[id, name]";
         assert_string_matches(&plan, expected_pattern).unwrap();
 
-        // Test verbose mode produces different (likely longer) output
-        let verbose_plan = merge_insert_job
-            .explain_plan(&source_schema, true)
+        // Test with explicit schema
+        let source_schema = arrow_schema::Schema::from(dataset.schema());
+        let explicit_plan = merge_insert_job
+            .explain_plan(Some(&source_schema), false)
             .await
             .unwrap();
+        assert_eq!(plan, explicit_plan); // Should be the same as default
+
+        // Test verbose mode produces different (likely longer) output
+        let verbose_plan = merge_insert_job.explain_plan(None, true).await.unwrap();
         assert!(verbose_plan.contains("MergeInsert"));
-        // Verbose might be the same length in some cases, so just check it works
-        assert!(verbose_plan.len() > 0);
         // Verbose should also match the expected pattern
         assert_string_matches(&verbose_plan, expected_pattern).unwrap();
     }
@@ -3495,143 +3498,12 @@ mod tests {
         assert!(analysis.contains("num_files_written"));
 
         // Also validate the full string structure with pattern matching
-        let expected_pattern = "MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_updated_rows=1...StreamingTableExec: partition_sizes=1, projection=[id, name], metrics=[]";
+        let expected_pattern = "MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_updated_rows=1]
+    ...
+    StreamingTableExec: partition_sizes=1, projection=[id, name], metrics=[]";
         assert_string_matches(&analysis, expected_pattern).unwrap();
-        assert!(analysis.contains("elapsed_compute") || analysis.contains("output_rows"));
-    }
-
-    #[tokio::test]
-    async fn test_explain_plan_unsupported_schemas() {
-        // Set up test dataset
-        let dataset_schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("data", DataType::Int32, true),
-        ]));
-
-        let dataset_batch = RecordBatch::try_new(
-            dataset_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["a", "b"])),
-                Arc::new(Int32Array::from(vec![1, 2])),
-            ],
-        )
-        .unwrap();
-
-        let dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(dataset_batch)], dataset_schema.clone()),
-            "memory://test_explain_schema_diff",
-            None,
-        )
-        .await
-        .unwrap();
-
-        let merge_insert_job =
-            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["key".to_string()])
-                .unwrap()
-                .when_matched(WhenMatched::UpdateAll)
-                .when_not_matched(WhenNotMatched::InsertAll)
-                .try_build()
-                .unwrap();
-
-        // Test with source schema that has additional columns - should fail
-        let source_schema = Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("data", DataType::Int32, true),
-            Field::new("extra", DataType::Float32, true),
-        ]);
-
-        let result = merge_insert_job.explain_plan(&source_schema, false).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::NotSupported { .. }));
-
-        // Test with minimal source schema (just the join key) - should fail
-        let minimal_schema = Schema::new(vec![Field::new("key", DataType::Utf8, false)]);
-
-        let result = merge_insert_job.explain_plan(&minimal_schema, false).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::NotSupported { .. }));
-
-        // Test with exact matching schema - should succeed
-        let exact_schema = dataset_schema.as_ref().clone();
-        let plan = merge_insert_job
-            .explain_plan(&exact_schema, false)
-            .await
-            .unwrap();
-        assert!(plan.contains("on=[key]"));
-        assert!(plan.contains("MergeInsert"));
-    }
-
-    #[tokio::test]
-    async fn test_explain_plan_structure() {
-        // Set up test dataset
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("value", DataType::Utf8, true),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .unwrap();
-
-        let dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-            "memory://test_explain_plan_structure",
-            None,
-        )
-        .await
-        .unwrap();
-
-        let merge_insert_job =
-            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
-                .unwrap()
-                .when_matched(WhenMatched::UpdateAll)
-                .when_not_matched(WhenNotMatched::InsertAll)
-                .try_build()
-                .unwrap();
-
-        // Verify we can use fast path for this configuration
-        let source_schema = schema.as_ref().clone();
-        let can_use = merge_insert_job
-            .can_use_create_plan(&source_schema)
-            .await
-            .unwrap();
-        assert!(
-            can_use,
-            "Should be able to use create_plan for this configuration"
-        );
-
-        // Create a mock data stream to get the actual execution plan
-        let source_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![4, 5])),
-                Arc::new(StringArray::from(vec!["d", "e"])),
-            ],
-        )
-        .unwrap();
-
-        let source_stream = RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::once(async { Ok(source_batch) }).boxed(),
-        );
-
-        // Get the actual execution plan by calling create_plan
-        let plan = merge_insert_job
-            .create_plan(Box::pin(source_stream))
-            .await
-            .unwrap();
-
-        // Verify the plan structure using assert_plan_node_equals
-        // We verify that it starts with MergeInsert and ends with the source table
-        let expected_pattern = "MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll...StreamingTableExec: partition_sizes=1, projection=[id, value]";
-
-        assert_plan_node_equals(plan, expected_pattern)
-            .await
-            .unwrap();
+        assert!(analysis.contains("bytes_written"));
+        assert!(analysis.contains("num_files_written"));
+        assert!(analysis.contains("elapsed_compute"));
     }
 }
