@@ -1795,9 +1795,19 @@ mod tests {
             let right_row_ids = right_res[ROW_ID].as_primitive::<UInt64Type>().values();
             row_ids.iter().enumerate().for_each(|(i, id)| {
                 if i < part_idx {
-                    assert_eq!(left_row_ids[i], *id);
+                    assert_eq!(
+                        left_row_ids[i], *id,
+                        "left_row_ids={:?}, row_ids={:?}",
+                        left_row_ids, *id
+                    );
                 } else {
-                    assert_eq!(right_row_ids[i - part_idx], *id, "{:?}", right_row_ids);
+                    assert_eq!(
+                        right_row_ids[i - part_idx],
+                        *id,
+                        "right_row_ids[i-part_idx]={:?}, *id={:?}",
+                        right_row_ids[i - part_idx],
+                        *id
+                    );
                 }
             });
         }

@@ -266,7 +266,7 @@ impl HNSW {
             }
             let node_id = node_ids[i];
             let dist: OrderedFloat = dist_calc.distance(node_id).into();
-            if dist < lower_bound || dist >= upper_bound {
+            if dist <= lower_bound || dist > upper_bound {
                 continue;
             }
             if heap.len() < k {
@@ -551,7 +551,7 @@ impl Graph for HnswBottomView<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct HnswQueryParams {
     pub ef: usize,
     pub lower_bound: Option<f32>,
@@ -565,16 +565,6 @@ impl From<&Query> for HnswQueryParams {
             ef: query.ef.unwrap_or(k + k / 2),
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
-        }
-    }
-}
-
-impl Clone for HnswQueryParams {
-    fn clone(&self) -> Self {
-        Self {
-            ef: self.ef,
-            lower_bound: self.lower_bound,
-            upper_bound: self.upper_bound,
         }
     }
 }

@@ -319,13 +319,12 @@ pub fn beam_search(
         let process_neighbor = |neighbor: u32| {
             visited.insert(neighbor);
             let dist: OrderedFloat = dist_calc.distance(neighbor).into();
-            if dist < lower_bound || dist >= upper_bound {
-                return;
-            }
             if dist <= furthest || results.len() < k {
-                if bitset
-                    .map(|bitset| bitset.contains(neighbor))
-                    .unwrap_or(true)
+                if dist >= lower_bound
+                    && dist < upper_bound
+                    && bitset
+                        .map(|bitset| bitset.contains(neighbor))
+                        .unwrap_or(true)
                 {
                     if results.len() < k {
                         results.push((dist, neighbor).into());
