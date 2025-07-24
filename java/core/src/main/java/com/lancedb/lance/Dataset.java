@@ -565,24 +565,24 @@ public class Dataset implements Closeable {
    * @param replace whether to replace the existing index
    */
   public void createIndex(
-          List<String> columns,
-          IndexType indexType,
-          Optional<String> name,
-          IndexParams params,
-          boolean replace) {
+      List<String> columns,
+      IndexType indexType,
+      Optional<String> name,
+      IndexParams params,
+      boolean replace) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       boolean isVectorIndex =
-              indexType == IndexType.VECTOR
-                      || indexType == IndexType.IVF_FLAT
-                      || indexType == IndexType.IVF_SQ
-                      || indexType == IndexType.IVF_PQ
-                      || indexType == IndexType.IVF_HNSW_SQ
-                      || indexType == IndexType.IVF_HNSW_PQ;
+          indexType == IndexType.VECTOR
+              || indexType == IndexType.IVF_FLAT
+              || indexType == IndexType.IVF_SQ
+              || indexType == IndexType.IVF_PQ
+              || indexType == IndexType.IVF_HNSW_SQ
+              || indexType == IndexType.IVF_HNSW_PQ;
 
       if (isVectorIndex) {
         Preconditions.checkArgument(
-                params != null, "IndexParams cannot be null for vector index types");
+            params != null, "IndexParams cannot be null for vector index types");
       }
 
       // Most scalar indexes do not require parameters, but some require such as inverted indexes.

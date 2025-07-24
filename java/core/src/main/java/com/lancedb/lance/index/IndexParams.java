@@ -83,8 +83,8 @@ public class IndexParams {
   @Override
   public String toString() {
     return new ToStringBuilder(this)
-            .append("distanceType", distanceType)
-            .append("vectorIndexParams", vectorIndexParams.orElse(null))
-            .toString();
+        .append("distanceType", distanceType)
+        .append("vectorIndexParams", vectorIndexParams.orElse(null))
+        .toString();
   }
 }
