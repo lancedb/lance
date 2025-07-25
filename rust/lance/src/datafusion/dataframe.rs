@@ -96,7 +96,9 @@ impl TableProvider for LanceTableProvider {
                     columns.push(self.full_schema.field(*field_idx).name());
                 }
             }
-            if !columns.is_empty() {
+            if projection.is_empty() {
+                scan.empty_project()?;
+            } else if !columns.is_empty() {
                 scan.project(&columns)?;
             }
         }
