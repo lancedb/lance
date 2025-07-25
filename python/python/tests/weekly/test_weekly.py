@@ -163,7 +163,7 @@ class VectorSearch(ReadOnlyOperation):
             },
             filter=self.filter,
         )
-        print(query.analyze_plan())
+        query.analyze_plan()
 
 
 class FullTextSearch(ReadOnlyOperation):
@@ -189,7 +189,7 @@ class FullTextSearch(ReadOnlyOperation):
             filter=self.filter,
             limit=10,
         )
-        print(query.analyze_plan())
+        query.analyze_plan()
 
 
 @pytest.mark.weekly
