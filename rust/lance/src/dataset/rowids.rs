@@ -441,24 +441,35 @@ mod test {
     #[tokio::test]
     async fn test_stable_row_id_after_multiple_deletion_and_compaction() {
         fn build_rowid_to_i_map(row_ids: &UInt64Array, i_array: &Int32Array) -> HashMap<u64, i32> {
-            row_ids
-                .values()
-                .iter()
-                .zip(i_array.values().iter())
-                .map(|(&row_id, &i)| (row_id, i))
-                .collect()
+            row_ids.values().iter().zip(i_array.values().iter()).map(|(&row_id, &i)| (row_id, i)).collect()
+        }
+
+        async fn scan_rowid_map(dataset: &Dataset) -> HashMap<u64, i32> {
+            let mut scan = dataset.scan();
+            scan.with_row_id();
+            scan.scan_in_order(true);
+            let result = scan.try_into_batch().await.unwrap();
+            let i = result["i"].as_any().downcast_ref::<Int32Array>().unwrap();
+            let row_ids = result[ROW_ID].as_any().downcast_ref::<UInt64Array>().unwrap();
+            build_rowid_to_i_map(row_ids, i)
+        }
+
+        async fn compact(dataset: &mut Dataset, target_rows: usize) {
+            let options = CompactionOptions {
+                target_rows_per_fragment: target_rows,
+                ..Default::default()
+            };
+            let _ = compact_files(dataset, options, None).await.unwrap();
+        }
+
+        async fn delete(dataset: &mut Dataset, expr: &str) {
+            dataset.delete(expr).await.unwrap();
         }
 
         let mut dataset = lance_datagen::gen()
             .col("i", lance_datagen::array::step::<Int32Type>())
-            .col(
-                "vec",
-                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
-            )
-            .col(
-                "category",
-                lance_datagen::array::cycle::<Int32Type>(vec![1, 2, 3]),
-            )
+            .col("vec", lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)))
+            .col("category", lance_datagen::array::cycle::<Int32Type>(vec![1, 2, 3]))
             .into_ram_dataset_with_params(
                 FragmentCount::from(6),
                 FragmentRowCount::from(10),
@@ -472,157 +483,47 @@ mod test {
             .await
             .unwrap();
 
-        // first delete
-        dataset.delete("i = 2 or i = 3 or i = 5").await.unwrap();
+        // first delete and compact
+        delete(&mut dataset, "i = 2 or i = 3 or i = 5").await;
+        let map_before = scan_rowid_map(&dataset).await;
+        compact(&mut dataset, 20).await;
+        let map_after = scan_rowid_map(&dataset).await;
 
-        // scan and get row ids before compaction
-        let mut scan = dataset.scan();
-        scan.with_row_id();
-        let result_before_compact = scan.try_into_batch().await.unwrap();
-        let i_before = result_before_compact["i"]
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let row_ids_before_compact = result_before_compact[ROW_ID]
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let map_before = build_rowid_to_i_map(row_ids_before_compact, i_before);
-
-        // first compact files
-        let options = CompactionOptions {
-            target_rows_per_fragment: 20,
-            ..Default::default()
-        };
-        let _metrics = compact_files(&mut dataset, options.clone(), None)
-            .await
-            .unwrap();
-
-        // verify the number of rows after compaction
-        assert_eq!(dataset.count_rows(None).await.unwrap(), 57);
-
-        // scan and get row ids after compaction
-        let mut scan = dataset.scan();
-        scan.with_row_id();
-        scan.scan_in_order(true);
-        let result_after_compact = scan.try_into_batch().await.unwrap();
-        let i_after = result_after_compact["i"]
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let row_ids_after_compact = result_after_compact[ROW_ID]
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let map_after = build_rowid_to_i_map(row_ids_after_compact, i_after);
-
-        let row_id_set_before: HashSet<_> =
-            row_ids_before_compact.values().iter().cloned().collect();
-        let row_id_set_after: HashSet<_> = row_ids_after_compact.values().iter().cloned().collect();
-        assert_eq!(row_id_set_before, row_id_set_after);
-
-        for row_id in row_ids_before_compact.values() {
-            let i_val_before = map_before.get(row_id).unwrap();
-            let i_val_after = map_after.get(row_id).unwrap();
-            assert_eq!(
-                i_val_before, i_val_after,
-                "The values of i are not equality for row_id: {}",
-                row_id
-            );
+        // verify row id
+        assert_eq!(map_before.keys().collect::<HashSet<_>>(), map_after.keys().collect::<HashSet<_>>());
+        for row_id in map_before.keys() {
+            assert_eq!(map_before[row_id], map_after[row_id]);
         }
 
         // second delete
-        dataset.delete("i = 9").await.unwrap();
-
+        delete(&mut dataset, "i = 9").await;
         let mut scan = dataset.scan();
-        let result = scan
-            .filter("i >= 0")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let result = scan.filter("i >= 0").unwrap().try_into_batch().await.unwrap();
         let ids = result["i"].as_any().downcast_ref::<Int32Array>().unwrap();
         let id_set = ids.values().iter().cloned().collect::<HashSet<_>>();
-        let expected: Vec<i32> = (0..60)
-            .filter(|&i| i != 2 && i != 3 && i != 5 && i != 9)
-            .collect();
-        assert_eq!(id_set, expected.as_slice().iter().cloned().collect());
+        let expected: Vec<i32> = (0..60).filter(|&i| i != 2 && i != 3 && i != 5 && i != 9).collect();
+        assert_eq!(id_set, expected.iter().cloned().collect());
 
-        // get and save the row id of i equals to 15
-        scan = dataset.scan();
-        scan.with_row_id();
-        scan.scan_in_order(true);
-        let result = scan
-            .filter("i == 15")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_id = result[ROW_ID].as_primitive::<UInt64Type>();
-        let row_id_vec = row_id.values().to_vec();
-
-        // third delete
-        dataset.delete("i = 15 or i = 25").await.unwrap();
-
-        // get and save row ids again before compaction
+        // get the row_id where i == 15
         let mut scan = dataset.scan();
         scan.with_row_id();
         scan.scan_in_order(true);
-        let result_before_compact = scan.try_into_batch().await.unwrap();
-        let i_before = result_before_compact["i"]
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let row_ids_before_compact = result_before_compact[ROW_ID]
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let map_before = build_rowid_to_i_map(row_ids_before_compact, i_before);
+        let result = scan.filter("i == 15").unwrap().try_into_batch().await.unwrap();
+        let row_id_vec = result[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
 
-        // compact files again
-        let options = CompactionOptions {
-            target_rows_per_fragment: 30,
-            ..Default::default()
-        };
-        let _metrics = compact_files(&mut dataset, options.clone(), None)
-            .await
-            .unwrap();
+        // third delete and compact
+        delete(&mut dataset, "i = 15 or i = 25").await;
+        let map_before = scan_rowid_map(&dataset).await;
+        compact(&mut dataset, 30).await;
+        let map_after = scan_rowid_map(&dataset).await;
 
-        // get and save row ids again after compaction
-        let mut scan = dataset.scan();
-        scan.with_row_id();
-        scan.scan_in_order(true);
-        let result_after_compact = scan.try_into_batch().await.unwrap();
-        let i_after = result_after_compact["i"]
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let row_ids_after_compact = result_after_compact[ROW_ID]
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let map_after = build_rowid_to_i_map(row_ids_after_compact, i_after);
-
-        let row_id_set_before: HashSet<_> =
-            row_ids_before_compact.values().iter().cloned().collect();
-        let row_id_set_after: HashSet<_> = row_ids_after_compact.values().iter().cloned().collect();
-        assert_eq!(row_id_set_before, row_id_set_after);
-
-        for row_id in row_ids_before_compact.values() {
-            let i_val_before = map_before.get(row_id).unwrap();
-            let i_val_after = map_after.get(row_id).unwrap();
-            assert_eq!(
-                i_val_before, i_val_after,
-                "The values of i are not equality for row_id: {}",
-                row_id
-            );
+        assert_eq!(map_before.keys().collect::<HashSet<_>>(), map_after.keys().collect::<HashSet<_>>());
+        for row_id in map_before.keys() {
+            assert_eq!(map_before[row_id], map_after[row_id]);
         }
 
-        // take the row id of i equals to 15
-        let result = dataset
-            .take_rows(&row_id_vec, Schema::try_from(dataset.schema()).unwrap())
-            .await
-            .unwrap();
+        // verify the rowid represent i == 15 has been deleted
+        let result = dataset.take_rows(&row_id_vec, Schema::try_from(dataset.schema()).unwrap()).await.unwrap();
         assert_eq!(result.num_rows(), 0);
     }
 }
