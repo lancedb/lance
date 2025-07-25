@@ -769,7 +769,7 @@ mod tests {
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_datagen::{array, gen, BatchCount, RowCount};
-    use lance_encoding::compression_config::{CompressionOverrides, CompressionSpec, RleConfig};
+    use lance_encoding::compression_config::{CompressionParams, CompressionFieldParams};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_encoding::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
@@ -1038,26 +1038,26 @@ mod tests {
         )
         .unwrap();
 
-        // Configure compression overrides
-        let mut overrides = CompressionOverrides::new();
+        // Configure compression parameters
+        let mut params = CompressionParams::new();
 
         // RLE for ID columns (ends with _id)
-        overrides.columns.insert(
+        params.columns.insert(
             "*_id".to_string(),
-            vec![CompressionSpec::Rle {
-                rle: RleConfig { threshold: 0.5 }, // Lower threshold to trigger RLE more easily
-            }],
+            CompressionFieldParams {
+                rle_threshold: Some(0.5), // Lower threshold to trigger RLE more easily
+                compression: None,        // Will use default compression if any
+                compression_level: None,
+            },
         );
 
         // For now, we'll skip Zstd compression since it's not imported
         // In a real implementation, you could add other compression types here
 
-        // Build encoding strategy with compression overrides
-        let encoding_strategy = lance_encoding::encoder::configured_encoding_strategy(
-            LanceFileVersion::V2_1,
-            overrides,
-        )
-        .unwrap();
+        // Build encoding strategy with compression parameters
+        let encoding_strategy =
+            lance_encoding::encoder::configured_encoding_strategy(LanceFileVersion::V2_1, params)
+                .unwrap();
 
         // Configure file writer options
         let options = FileWriterOptions {
