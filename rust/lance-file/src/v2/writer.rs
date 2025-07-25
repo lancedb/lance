@@ -769,7 +769,7 @@ mod tests {
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_datagen::{array, gen, BatchCount, RowCount};
-    use lance_encoding::compression_config::{CompressionParams, CompressionFieldParams};
+    use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_encoding::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;

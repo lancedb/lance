@@ -637,7 +637,7 @@ pub async fn encode_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compression_config::{CompressionParams, CompressionFieldParams};
+    use crate::compression_config::{CompressionFieldParams, CompressionParams};
 
     #[test]
     fn test_configured_encoding_strategy() {
