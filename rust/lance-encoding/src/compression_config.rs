@@ -86,8 +86,8 @@ impl Default for CompressionParams {
 }
 
 impl CompressionFieldParams {
-    /// Merge another FieldParams, non-None values will override
-    fn merge(&mut self, other: &CompressionFieldParams) {
+    /// Merge another CompressionFieldParams, non-None values will override
+    fn merge(&mut self, other: &Self) {
         if other.rle_threshold.is_some() {
             self.rle_threshold = other.rle_threshold;
         }
