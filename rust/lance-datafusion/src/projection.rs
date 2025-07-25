@@ -29,6 +29,11 @@ pub struct ProjectionPlan {
     base: Arc<dyn Projectable>,
     /// The physical schema that must be loaded from the dataset
     pub physical_projection: Projection,
+    /// True if the final schema of datafusion execution plan is empty.
+    /// e.g.
+    ///   select count(*) from dataset.
+    ///   select from dataset.
+    pub final_projection_is_empty: bool,
 
     /// If present, expressions that represent the output columns.  These expressions
     /// run on the output of the physical projection.
@@ -46,6 +51,7 @@ impl ProjectionPlan {
         Self {
             base,
             physical_projection,
+            final_projection_is_empty: false,
             requested_output_expr: None,
         }
     }

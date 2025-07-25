@@ -477,6 +477,15 @@ impl Scanner {
         self.fragments.is_some()
     }
 
+    /// Empty Projection
+    ///
+    /// The row_address will be scanned.
+    pub fn empty_project(&mut self) -> Result<&mut Self> {
+        self.with_row_address();
+        self.projection_plan.final_projection_is_empty = true;
+        Ok(self)
+    }
+
     /// Projection.
     ///
     /// Only select the specified columns. If not specified, all columns will be scanned.
@@ -1565,10 +1574,11 @@ impl Scanner {
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
         // Stage 7: final projection
-        plan = Arc::new(DFProjectionExec::try_new(
-            self.output_expr(plan.schema().as_ref())?,
-            plan,
-        )?);
+        let output_expr = match self.projection_plan.final_projection_is_empty {
+            true => vec![],
+            false => self.output_expr(plan.schema().as_ref())?,
+        };
+        plan = Arc::new(DFProjectionExec::try_new(output_expr, plan)?);
 
         // Stage 8: If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
