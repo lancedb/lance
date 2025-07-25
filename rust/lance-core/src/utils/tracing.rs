@@ -79,7 +79,6 @@ pub const EXECUTION_PLAN_RUN: &str = "plan_run";
 pub const TRACE_DATASET_EVENTS: &str = "lance::dataset_events";
 pub const DATASET_WRITING_EVENT: &str = "writing";
 pub const DATASET_COMMITTED_EVENT: &str = "committed";
-pub const DATASET_OPENING_EVENT: &str = "opening";
 pub const DATASET_DROPPING_COLUMN_EVENT: &str = "dropping_column";
 pub const DATASET_DELETING_EVENT: &str = "deleting";
 pub const DATASET_COMPACTING_EVENT: &str = "compacting";
