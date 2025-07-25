@@ -173,8 +173,8 @@ async fn do_take_rows(
         let mut row_addr_iter = row_addrs.iter().enumerate();
         'outer: loop {
             let (fragment_id, range) = loop {
-                if let Some((i, row_id)) = row_addr_iter.next() {
-                    let fragment_id = row_id >> 32;
+                if let Some((i, row_addr)) = row_addr_iter.next() {
+                    let fragment_id = row_addr >> 32;
                     if fragment_id != current_fragment {
                         let next = (current_fragment, current_start..i);
                         current_fragment = fragment_id;
