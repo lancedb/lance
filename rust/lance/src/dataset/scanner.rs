@@ -1956,7 +1956,13 @@ impl Scanner {
         let columns = query.columns();
         let mut params = query.params();
         if params.limit.is_none() {
-            params = params.with_limit(self.limit.map(|l| l as usize));
+            let search_limit = match (self.limit, self.offset) {
+                (Some(limit), Some(offset)) => Some((limit + offset) as usize),
+                (Some(limit), None) => Some(limit as usize),
+                (None, Some(_)) => None, // No limit but has offset - fetch all and let limit_node handle
+                (None, None) => None,
+            };
+            params = params.with_limit(search_limit);
         }
         let query = if columns.is_empty() {
             // the field is not specified,
@@ -2831,7 +2837,7 @@ impl Scanner {
             }]),
             knn_plan,
         )
-        .with_fetch(Some(q.k));
+        .with_fetch(Some(self.calculate_effective_k(q.k)));
 
         let logical_not_null = col(DIST_COL).is_not_null();
         let not_nulls = Arc::new(LanceFilterExec::try_new(logical_not_null, Arc::new(sort))?);
@@ -2883,8 +2889,9 @@ impl Scanner {
             },
         };
         Ok(Arc::new(
-            SortExec::new(LexOrdering::new(vec![sort_expr]), inner_fanout_search)
-                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+            SortExec::new(LexOrdering::new(vec![sort_expr]), inner_fanout_search).with_fetch(Some(
+                self.calculate_effective_k(q.k) * q.refine_factor.unwrap_or(1) as usize,
+            )),
         ))
     }
 
@@ -2935,8 +2942,9 @@ impl Scanner {
                 },
             };
             let ann_node = Arc::new(
-                SortExec::new(LexOrdering::new(vec![sort_expr]), ann_node)
-                    .with_fetch(Some(q.k * over_fetch_factor as usize)),
+                SortExec::new(LexOrdering::new(vec![sort_expr]), ann_node).with_fetch(Some(
+                    self.calculate_effective_k(q.k) * over_fetch_factor as usize,
+                )),
             );
             ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
@@ -2951,8 +2959,9 @@ impl Scanner {
             },
         };
         let ann_node = Arc::new(
-            SortExec::new(LexOrdering::new(vec![sort_expr]), ann_node)
-                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+            SortExec::new(LexOrdering::new(vec![sort_expr]), ann_node).with_fetch(Some(
+                self.calculate_effective_k(q.k) * q.refine_factor.unwrap_or(1) as usize,
+            )),
         );
 
         Ok(ann_node)
@@ -3042,6 +3051,16 @@ impl Scanner {
         } else {
             // No new columns needed
             Ok(input)
+        }
+    }
+
+    /// Calculate effective k for vector search considering limit and offset
+    fn calculate_effective_k(&self, original_k: usize) -> usize {
+        match (self.limit, self.offset) {
+            (Some(limit), Some(offset)) => std::cmp::max(original_k, (limit + offset) as usize),
+            (Some(limit), None) => std::cmp::max(original_k, limit as usize),
+            (None, Some(offset)) => original_k + offset as usize,
+            (None, None) => original_k,
         }
     }
 
@@ -6960,5 +6979,223 @@ mod test {
             scanner.project(&[ROW_ADDR])
         };
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fts_limit_offset() -> Result<()> {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false).await?;
+        test_ds.make_fts_index().await?;
+        let dataset = &test_ds.dataset;
+
+        // Create FTS query for testing
+        let fts_query = FullTextSearchQuery::new("s".to_string());
+
+        // Get baseline results (all results)
+        let all_results = dataset
+            .scan()
+            .full_text_search(fts_query.clone())?
+            .project(&["i"])?
+            .try_into_batch()
+            .await?;
+
+        let total_rows = all_results.num_rows();
+        assert!(
+            total_rows >= 3,
+            "Need at least 3 rows for testing, got {}",
+            total_rows
+        );
+
+        // Test limit only
+        let limit_results = dataset
+            .scan()
+            .full_text_search(fts_query.clone())?
+            .project(&["i"])?
+            .limit(Some(2), None)?
+            .try_into_batch()
+            .await?;
+        assert_eq!(limit_results.num_rows(), 2, "Limit=2 should return 2 rows");
+
+        // Test offset only
+        let offset_results = dataset
+            .scan()
+            .full_text_search(fts_query.clone())?
+            .project(&["i"])?
+            .limit(None, Some(1))?
+            .try_into_batch()
+            .await?;
+        assert_eq!(
+            offset_results.num_rows(),
+            total_rows - 1,
+            "Offset=1 should return {} rows, got {}",
+            total_rows - 1,
+            offset_results.num_rows()
+        );
+
+        // Test limit + offset - THIS WILL FAIL with current implementation
+        let limit_offset_results = dataset
+            .scan()
+            .full_text_search(fts_query.clone())?
+            .project(&["i"])?
+            .limit(Some(2), Some(1))?
+            .try_into_batch()
+            .await?;
+        assert_eq!(
+            limit_offset_results.num_rows(),
+            2,
+            "Limit=2, Offset=1 should return 2 rows, got {}",
+            limit_offset_results.num_rows()
+        );
+
+        // For FTS, we can't verify exact order since results are sorted by relevance score
+        // Just verify that we got different results than the first 2 (indicating offset worked)
+        let first_two_ids = all_results.column_by_name("i").unwrap().slice(0, 2);
+        let actual_ids = limit_offset_results.column_by_name("i").unwrap();
+
+        // The results should be different from the first 2 results (due to offset)
+        // This is a basic sanity check that offset is working
+        assert_ne!(
+            actual_ids.as_ref(),
+            first_two_ids.as_ref(),
+            "Results with offset should be different from first 2 results"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_limit_offset() -> Result<()> {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false).await?;
+        test_ds.make_vector_index().await?;
+        let dataset = &test_ds.dataset;
+
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+
+        // Get baseline results (k=10)
+        let all_results = dataset
+            .scan()
+            .nearest("vec", &query_vector, 10)?
+            .project(&["i"])?
+            .try_into_batch()
+            .await?;
+
+        let total_rows = all_results.num_rows();
+        assert!(
+            total_rows >= 5,
+            "Need at least 5 rows for testing, got {}",
+            total_rows
+        );
+
+        // Test limit only
+        let limit_results = dataset
+            .scan()
+            .nearest("vec", &query_vector, 10)?
+            .project(&["i"])?
+            .limit(Some(3), None)?
+            .try_into_batch()
+            .await?;
+        assert_eq!(limit_results.num_rows(), 3, "Limit=3 should return 3 rows");
+
+        // Test offset only - we expect total_rows - offset rows
+        let offset_results = dataset
+            .scan()
+            .nearest("vec", &query_vector, 10)?
+            .project(&["i"])?
+            .limit(None, Some(2))?
+            .try_into_batch()
+            .await?;
+
+        // Since we fetch k=10 results and apply offset=2, we should get 8 results
+        assert_eq!(
+            offset_results.num_rows(),
+            total_rows - 2,
+            "Offset=2 should return {} rows, got {}",
+            total_rows - 2,
+            offset_results.num_rows()
+        );
+
+        // Test limit + offset - THIS WILL FAIL with current implementation
+        let limit_offset_results = dataset
+            .scan()
+            .nearest("vec", &query_vector, 10)?
+            .project(&["i"])?
+            .limit(Some(3), Some(2))?
+            .try_into_batch()
+            .await?;
+        assert_eq!(
+            limit_offset_results.num_rows(),
+            3,
+            "Limit=3, Offset=2 should return 3 rows, got {}",
+            limit_offset_results.num_rows()
+        );
+
+        // Verify order is preserved - should be rows 2-4 after skipping first 2
+        let expected_ids = all_results.column_by_name("i").unwrap().slice(2, 3);
+        let actual_ids = limit_offset_results.column_by_name("i").unwrap();
+        assert_eq!(
+            actual_ids.as_ref(),
+            expected_ids.as_ref(),
+            "Results should match expected slice of original results"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_edge_cases_limit_offset() -> Result<()> {
+        let mut test_ds =
+            TestVectorDataset::new_with_dimension(LanceFileVersion::Stable, false, 32).await?;
+        test_ds.make_vector_index().await?;
+        let dataset = &test_ds.dataset;
+
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+
+        // Test offset > k (should return empty results)
+        let results = dataset
+            .scan()
+            .nearest("vec", &query_vector, 2)? // k=2
+            .limit(Some(1), Some(5))? // offset=5 > k=2
+            .try_into_batch()
+            .await?;
+        assert_eq!(
+            results.num_rows(),
+            0,
+            "Offset > k should return 0 results, got {}",
+            results.num_rows()
+        );
+
+        // Test offset = k (boundary case)
+        let results = dataset
+            .scan()
+            .nearest("vec", &query_vector, 3)? // k=3
+            .limit(Some(1), Some(3))? // offset = k
+            .try_into_batch()
+            .await?;
+        assert_eq!(
+            results.num_rows(),
+            0,
+            "Offset = k should return 0 results, got {}",
+            results.num_rows()
+        );
+
+        // Test large offset with FTS
+        let mut test_ds_fts = TestVectorDataset::new(LanceFileVersion::Stable, false).await?;
+        test_ds_fts.make_fts_index().await?;
+        let dataset_fts = &test_ds_fts.dataset;
+
+        let fts_query = FullTextSearchQuery::new("s".to_string());
+        let results = dataset_fts
+            .scan()
+            .full_text_search(fts_query)?
+            .limit(Some(1), Some(1000))? // Very large offset
+            .try_into_batch()
+            .await?;
+        assert_eq!(
+            results.num_rows(),
+            0,
+            "Very large offset should return 0 results, got {}",
+            results.num_rows()
+        );
+
+        Ok(())
     }
 }
