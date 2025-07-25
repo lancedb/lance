@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::Arc;
 
@@ -207,6 +208,11 @@ pub struct WriteParams {
     /// if the writer does not have delete permissions and the clean up would
     /// just try and log a failure anyway. Default is false.
     pub skip_auto_cleanup: bool,
+
+    /// Configuration key-value pairs for this write operation.
+    /// This can include commit messages, engine information, etc.
+    /// this properties map will be persisted as part of Transaction object.
+    pub transaction_properties: Option<HashMap<String, String>>,
 }
 
 impl Default for WriteParams {
@@ -227,6 +233,7 @@ impl Default for WriteParams {
             session: None,
             auto_cleanup: Some(AutoCleanupParams::default()),
             skip_auto_cleanup: false,
+            transaction_properties: None,
         }
     }
 }
@@ -250,6 +257,14 @@ impl WriteParams {
             .as_ref()
             .map(|s| s.store_registry())
             .unwrap_or_default()
+    }
+
+    /// Set the properties for this WriteParams.
+    pub fn with_transaction_properties(self, properties: HashMap<String, String>) -> Self {
+        Self {
+            transaction_properties: Some(properties),
+            ..self
+        }
     }
 }
 

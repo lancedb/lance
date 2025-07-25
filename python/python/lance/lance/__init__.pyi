@@ -329,8 +329,19 @@ class _Dataset:
         transforms: Dict[str, str] | BatchUDF | ReaderLike,
         read_columns: Optional[List[str]] = None,
         batch_size: Optional[int] = None,
+        commit_message: Optional[str] = None,
+        properties: Optional[Dict[str, str]] = None,
+    ): ...
+    def add_columns_with_properties(
+        self,
+        transforms: Dict[str, str] | BatchUDF | ReaderLike,
+        read_columns: Optional[List[str]] = None,
+        batch_size: Optional[int] = None,
+        properties: Optional[Dict[str, str]] = None,
     ): ...
     def add_columns_with_schema(self, schema: pa.Schema): ...
+    def read_transaction(self, version: int) -> Optional[Transaction]: ...
+    def get_transactions(self, max_transactions=10) -> Optional[List[Transaction]]: ...
 
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...
