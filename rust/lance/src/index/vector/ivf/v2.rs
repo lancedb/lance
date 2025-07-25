@@ -1417,6 +1417,7 @@ mod tests {
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
+        test_distance_range(Some(params.clone()), nlist).await;
         test_optimize_strategy(params.clone()).await;
         test_delete_all_rows(params).await;
     }
@@ -1754,6 +1755,7 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), k)
             .unwrap()
             .minimum_nprobes(nlist)
+            .ef(100)
             .with_row_id()
             .try_into_batch()
             .await
@@ -1770,6 +1772,7 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), part_idx)
             .unwrap()
             .minimum_nprobes(nlist)
+            .ef(100)
             .with_row_id()
             .distance_range(None, Some(part_dist))
             .try_into_batch()
@@ -1780,6 +1783,7 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), k - part_idx)
             .unwrap()
             .minimum_nprobes(nlist)
+            .ef(100)
             .with_row_id()
             .distance_range(Some(part_dist), None)
             .try_into_batch()
@@ -1794,9 +1798,9 @@ mod tests {
             let right_row_ids = right_res[ROW_ID].as_primitive::<UInt64Type>().values();
             row_ids.iter().enumerate().for_each(|(i, id)| {
                 if i < part_idx {
-                    assert_eq!(left_row_ids[i], *id);
+                    assert_eq!(left_row_ids[i], *id,);
                 } else {
-                    assert_eq!(right_row_ids[i - part_idx], *id, "{:?}", right_row_ids);
+                    assert_eq!(right_row_ids[i - part_idx], *id,);
                 }
             });
         }
@@ -1814,6 +1818,7 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), k)
             .unwrap()
             .minimum_nprobes(nlist)
+            .ef(100)
             .with_row_id()
             .distance_range(dists.first().copied(), dists.last().copied())
             .try_into_batch()
