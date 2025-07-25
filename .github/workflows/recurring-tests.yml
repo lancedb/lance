@@ -48,7 +48,7 @@ jobs:
   # and the back-compat of the weekly tests.
   weekly-linux:
     needs: get-pylance-versions
-    name: "Weekly: Linux Python 3.12 (Pylance ${{ matrix.pylance-version }})"
+    name: "Recurring: Linux (Pylance ${{ matrix.pylance-version }})"
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     strategy:
@@ -92,7 +92,7 @@ jobs:
 
   # This job is used to test the weekly tests on the main branch.
   weekly-linux-fresh-main:
-    name: "Weekly: Linux Python 3.12 (main)"
+    name: "Recurring: Linux (main)"
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     defaults:
