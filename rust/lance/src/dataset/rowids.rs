@@ -441,7 +441,12 @@ mod test {
     #[tokio::test]
     async fn test_stable_row_id_after_multiple_deletion_and_compaction() {
         fn build_rowid_to_i_map(row_ids: &UInt64Array, i_array: &Int32Array) -> HashMap<u64, i32> {
-            row_ids.values().iter().zip(i_array.values().iter()).map(|(&row_id, &i)| (row_id, i)).collect()
+            row_ids
+                .values()
+                .iter()
+                .zip(i_array.values().iter())
+                .map(|(&row_id, &i)| (row_id, i))
+                .collect()
         }
 
         async fn scan_rowid_map(dataset: &Dataset) -> HashMap<u64, i32> {
@@ -450,7 +455,10 @@ mod test {
             scan.scan_in_order(true);
             let result = scan.try_into_batch().await.unwrap();
             let i = result["i"].as_any().downcast_ref::<Int32Array>().unwrap();
-            let row_ids = result[ROW_ID].as_any().downcast_ref::<UInt64Array>().unwrap();
+            let row_ids = result[ROW_ID]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
             build_rowid_to_i_map(row_ids, i)
         }
 
@@ -468,8 +476,14 @@ mod test {
 
         let mut dataset = lance_datagen::gen()
             .col("i", lance_datagen::array::step::<Int32Type>())
-            .col("vec", lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)))
-            .col("category", lance_datagen::array::cycle::<Int32Type>(vec![1, 2, 3]))
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col(
+                "category",
+                lance_datagen::array::cycle::<Int32Type>(vec![1, 2, 3]),
+            )
             .into_ram_dataset_with_params(
                 FragmentCount::from(6),
                 FragmentRowCount::from(10),
@@ -490,7 +504,10 @@ mod test {
         let map_after = scan_rowid_map(&dataset).await;
 
         // verify row id
-        assert_eq!(map_before.keys().collect::<HashSet<_>>(), map_after.keys().collect::<HashSet<_>>());
+        assert_eq!(
+            map_before.keys().collect::<HashSet<_>>(),
+            map_after.keys().collect::<HashSet<_>>()
+        );
         for row_id in map_before.keys() {
             assert_eq!(map_before[row_id], map_after[row_id]);
         }
@@ -498,18 +515,33 @@ mod test {
         // second delete
         delete(&mut dataset, "i = 9").await;
         let mut scan = dataset.scan();
-        let result = scan.filter("i >= 0").unwrap().try_into_batch().await.unwrap();
+        let result = scan
+            .filter("i >= 0")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
         let ids = result["i"].as_any().downcast_ref::<Int32Array>().unwrap();
         let id_set = ids.values().iter().cloned().collect::<HashSet<_>>();
-        let expected: Vec<i32> = (0..60).filter(|&i| i != 2 && i != 3 && i != 5 && i != 9).collect();
+        let expected: Vec<i32> = (0..60)
+            .filter(|&i| i != 2 && i != 3 && i != 5 && i != 9)
+            .collect();
         assert_eq!(id_set, expected.iter().cloned().collect());
 
         // get the row_id where i == 15
         let mut scan = dataset.scan();
         scan.with_row_id();
         scan.scan_in_order(true);
-        let result = scan.filter("i == 15").unwrap().try_into_batch().await.unwrap();
-        let row_id_vec = result[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
+        let result = scan
+            .filter("i == 15")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_id_vec = result[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
 
         // third delete and compact
         delete(&mut dataset, "i = 15 or i = 25").await;
@@ -517,13 +549,19 @@ mod test {
         compact(&mut dataset, 30).await;
         let map_after = scan_rowid_map(&dataset).await;
 
-        assert_eq!(map_before.keys().collect::<HashSet<_>>(), map_after.keys().collect::<HashSet<_>>());
+        assert_eq!(
+            map_before.keys().collect::<HashSet<_>>(),
+            map_after.keys().collect::<HashSet<_>>()
+        );
         for row_id in map_before.keys() {
             assert_eq!(map_before[row_id], map_after[row_id]);
         }
 
         // verify the rowid represent i == 15 has been deleted
-        let result = dataset.take_rows(&row_id_vec, Schema::try_from(dataset.schema()).unwrap()).await.unwrap();
+        let result = dataset
+            .take_rows(&row_id_vec, Schema::try_from(dataset.schema()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(result.num_rows(), 0);
     }
 }
