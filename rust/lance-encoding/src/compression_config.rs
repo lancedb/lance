@@ -18,9 +18,6 @@ pub struct CompressionParams {
 
     /// Type-level parameters: data type name -> parameters
     pub types: HashMap<String, CompressionFieldParams>,
-
-    /// Global default parameters
-    pub defaults: CompressionFieldParams,
 }
 
 /// Field-level compression parameters
@@ -43,17 +40,16 @@ impl CompressionParams {
         Self {
             columns: HashMap::new(),
             types: HashMap::new(),
-            defaults: CompressionFieldParams::default(),
         }
     }
 
-    /// Get effective parameters for a field (merging defaults, type params, and column params)
+    /// Get effective parameters for a field (merging type params and column params)
     pub fn get_field_params(
         &self,
         field_name: &str,
         data_type: &DataType,
     ) -> CompressionFieldParams {
-        let mut params = self.defaults.clone();
+        let mut params = CompressionFieldParams::default();
 
         // Apply type-level parameters
         let type_name = data_type.to_string();
@@ -184,17 +180,12 @@ mod tests {
     fn test_get_field_params() {
         let mut params = CompressionParams::new();
 
-        // Set defaults
-        params.defaults = CompressionFieldParams {
-            compression: Some("lz4".to_string()),
-            ..Default::default()
-        };
-
         // Set type-level params
         params.types.insert(
             "Int32".to_string(),
             CompressionFieldParams {
                 rle_threshold: Some(0.5),
+                compression: Some("lz4".to_string()),
                 ..Default::default()
             },
         );
@@ -209,14 +200,14 @@ mod tests {
             },
         );
 
-        // Test default only
+        // Test no match (should get default)
         let field_params = params.get_field_params("some_field", &DataType::Float32);
-        assert_eq!(field_params.compression, Some("lz4".to_string()));
+        assert_eq!(field_params.compression, None);
         assert_eq!(field_params.rle_threshold, None);
 
-        // Test type override
+        // Test type match only
         let field_params = params.get_field_params("some_field", &DataType::Int32);
-        assert_eq!(field_params.compression, Some("lz4".to_string())); // From default
+        assert_eq!(field_params.compression, Some("lz4".to_string())); // From type
         assert_eq!(field_params.rle_threshold, Some(0.5)); // From type
 
         // Test column override (pattern match)

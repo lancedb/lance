@@ -363,17 +363,12 @@ mod tests {
     fn test_parameter_merge_priority() {
         let mut params = CompressionParams::new();
 
-        // Set defaults
-        params.defaults = CompressionFieldParams {
-            compression: Some("lz4".to_string()),
-            ..Default::default()
-        };
-
         // Set type-level
         params.types.insert(
             "Int32".to_string(),
             CompressionFieldParams {
                 rle_threshold: Some(0.5),
+                compression: Some("lz4".to_string()),
                 ..Default::default()
             },
         );
@@ -395,10 +390,18 @@ mod tests {
             .params
             .get_field_params("user_id", &DataType::Int32);
 
-        // Column params should override others
+        // Column params should override type params
         assert_eq!(merged.rle_threshold, Some(0.2));
         assert_eq!(merged.compression, Some("zstd".to_string()));
         assert_eq!(merged.compression_level, Some(6));
+
+        // Test field with only type params
+        let merged = strategy
+            .params
+            .get_field_params("other_field", &DataType::Int32);
+        assert_eq!(merged.rle_threshold, Some(0.5));
+        assert_eq!(merged.compression, Some("lz4".to_string()));
+        assert_eq!(merged.compression_level, None);
     }
 
     #[test]
