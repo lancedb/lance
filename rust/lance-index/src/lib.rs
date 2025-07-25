@@ -96,6 +96,8 @@ pub enum IndexType {
 
     MemWal = 7,
 
+    ZoneMap = 8, // ZoneMap, Sargable filter
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -117,6 +119,7 @@ impl std::fmt::Display for IndexType {
             Self::NGram => write!(f, "NGram"),
             Self::FragmentReuse => write!(f, "FragmentReuse"),
             Self::MemWal => write!(f, "MemWal"),
+            Self::ZoneMap => write!(f, "ZoneMap"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -140,6 +143,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::Inverted as i32 => Ok(Self::Inverted),
             v if v == Self::FragmentReuse as i32 => Ok(Self::FragmentReuse),
             v if v == Self::MemWal as i32 => Ok(Self::MemWal),
+            v if v == Self::ZoneMap as i32 => Ok(Self::ZoneMap),
             v if v == Self::Vector as i32 => Ok(Self::Vector),
             v if v == Self::IvfFlat as i32 => Ok(Self::IvfFlat),
             v if v == Self::IvfSq as i32 => Ok(Self::IvfSq),
@@ -165,6 +169,7 @@ impl IndexType {
                 | Self::LabelList
                 | Self::Inverted
                 | Self::NGram
+                | Self::ZoneMap
         )
     }
 
@@ -200,6 +205,7 @@ impl IndexType {
             Self::NGram => 0,
             Self::FragmentReuse => 0,
             Self::MemWal => 0,
+            Self::ZoneMap => 0,
 
             // for now all vector indices are built by the same builder,
             // so they share the same version.

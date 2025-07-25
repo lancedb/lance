@@ -119,6 +119,10 @@ name = "ngram"
 harness = false
 
 [[bench]]
+name = "zonemap"
+harness = false
+
+[[bench]]
 name = "inverted"
 harness = false
 
