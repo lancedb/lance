@@ -755,9 +755,9 @@ async fn rewrite_files(
         reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
 
         if options.defer_index_remap {
-            let mut changed_row_addrs = Vec::with_capacity(row_ids.serialized_size());
-            row_ids.serialize_into(&mut changed_row_addrs)?;
-            (None, Some(changed_row_addrs))
+            let mut changed_row_ids = Vec::with_capacity(row_ids.serialized_size());
+            row_ids.serialize_into(&mut changed_row_ids)?;
+            (None, Some(changed_row_ids))
         } else {
             let row_id_map = remapping::transpose_row_ids(row_ids, &fragments, &new_fragments);
             (Some(row_id_map), None)
