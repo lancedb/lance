@@ -26,6 +26,7 @@ rand = { workspace = true }
 rayon = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+snafu = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
