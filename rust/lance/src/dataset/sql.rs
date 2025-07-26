@@ -188,6 +188,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sql_count() {
+        let mut ds = gen()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step_custom::<Int32Type>(0, 2))
+            .into_dataset(
+                "memory://test_sql_dataset",
+                FragmentCount::from(10),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+
+        let results = ds
+            .sql("SELECT COUNT(*) FROM foo")
+            .table_name("foo")
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(results.len(), 1);
+        let results = results.into_iter().next().unwrap();
+        pretty_assertions::assert_eq!(results.num_columns(), 1);
+        pretty_assertions::assert_eq!(results.num_rows(), 1);
+        pretty_assertions::assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 100);
+
+        let results = ds
+            .sql("SELECT COUNT(*) FROM foo where y >= 100")
+            .table_name("foo")
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(results.len(), 1);
+        let results = results.into_iter().next().unwrap();
+        pretty_assertions::assert_eq!(results.num_columns(), 1);
+        pretty_assertions::assert_eq!(results.num_rows(), 1);
+        pretty_assertions::assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 50);
+    }
+
+    #[tokio::test]
     async fn test_sql_explain_plan() {
         let mut ds = gen()
             .col("x", array::step::<Int32Type>())
