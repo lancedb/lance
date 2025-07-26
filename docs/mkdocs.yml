@@ -34,6 +34,7 @@ theme:
     - search.share
     - content.code.copy
     - content.code.annotate
+    - navigation.expand
   icon:
     repo: fontawesome/brands/github
 
@@ -112,7 +113,12 @@ nav:
     - DuckDB: integrations/duckdb.md
     - Huggingface: integrations/huggingface.md
     - PostgreSQL: https://github.com/lancedb/pglance
-    - PyTorch: integrations/pytorch.md
+    - Distributed Training with PyTorch:
+        - Intro: integrations/pytorch.md
+        - DDP training intro: dist-training-torch/ddp_intro.md
+        - Map style: dist-training-torch/map_style.md
+        - Iterable style: dist-training-torch/iterable_style.md
+        - Choosing a sampler: dist-training-torch/samplers.md
     - Ray: integrations/ray.md
     - Tensorflow: integrations/tensorflow.md
     - Trino: https://github.com/lancedb/lance-trino
