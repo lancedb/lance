@@ -4180,6 +4180,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
+ "criterion",
  "datafusion-common",
  "datafusion-sql",
  "deepsize",

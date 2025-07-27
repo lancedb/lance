@@ -50,9 +50,14 @@ libc = { version = "0.2" }
 tempfile.workspace = true
 lance-testing.workspace = true
 proptest.workspace = true
+criterion.workspace = true
 
 [features]
 datafusion = ["datafusion-common", "datafusion-sql"]
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "row_id_mask"
+harness = false

@@ -541,9 +541,9 @@ impl Graph for HnswBottomView<'_> {
 }
 
 #[derive(Debug)]
-pub struct HnswQueryParams {
-    pub ef: usize,
-}
+    pub struct HnswQueryParams {
+        pub ef: usize,
+    }
 
 impl From<&Query> for HnswQueryParams {
     fn from(query: &Query) -> Self {
