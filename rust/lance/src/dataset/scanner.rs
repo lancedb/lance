@@ -48,6 +48,7 @@ use lance_datafusion::exec::{
     analyze_plan, execute_plan, LanceExecutionOptions, StrictBatchSizeExec,
 };
 use lance_datafusion::projection::ProjectionPlan;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::inverted::query::{
     fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery,
@@ -387,6 +388,9 @@ pub struct Scanner {
     /// Mainly, if the result is returned strictly according to the batch_size,
     /// batching and waiting are required, and the performance will decrease.
     strict_batch_size: bool,
+
+    /// File reader options to use when reading data files.
+    file_reader_options: Option<FileReaderOptions>,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -423,6 +427,7 @@ impl Scanner {
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
+            file_reader_options: None,
         }
     }
 
@@ -1017,6 +1022,12 @@ impl Scanner {
     /// Instruct the scanner to return the `_rowaddr` meta column from the dataset.
     pub fn with_row_address(&mut self) -> &mut Self {
         self.projection_plan.include_row_addr();
+        self
+    }
+
+    /// Set the file reader options to use when reading data files.
+    pub fn with_file_reader_options(&mut self, options: FileReaderOptions) -> &mut Self {
+        self.file_reader_options = Some(options);
         self
     }
 
@@ -2753,6 +2764,10 @@ impl Scanner {
             with_row_address: self.projection_plan.physical_projection.with_row_addr,
             make_deletions_null,
             ordered_output: self.ordered,
+            file_reader_options: self
+                .file_reader_options
+                .clone()
+                .or_else(|| self.dataset.file_reader_options.clone()),
         };
 
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
