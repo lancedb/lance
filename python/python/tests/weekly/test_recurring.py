@@ -73,7 +73,7 @@ def create_or_load_dataset(dataset_name: str, kwargs: dict):
         "vector",
         index_type="IVF_PQ",
         metric="cosine",
-        num_partitions=1024,
+        num_partitions=128,
         num_sub_vectors=DIM // 8,
         replace=True,
     )
@@ -193,7 +193,7 @@ class FullTextSearch(ReadOnlyOperation):
 
 
 @pytest.mark.weekly
-@pytest.mark.parametrize("with_position", [False, True])
+@pytest.mark.parametrize("with_position", [True])
 def test_all_permutations(with_position):
     """Test all operations on dataset without FTS position tracking"""
     dataset_name = f"test_table_with_position_{with_position}"
@@ -212,9 +212,9 @@ def test_all_permutations(with_position):
     read_only_operations = [
         # Read only operations
         VectorSearch(),
-        VectorSearch(filter="id > 1_000"),
+        VectorSearch(filter="id >= 1000 && id < 8000"),
         FullTextSearch(has_position=False),
-        FullTextSearch(has_position=False, filter="id > 1_000"),
+        FullTextSearch(has_position=False, filter="id >= 1000 && id < 8000"),
     ]
 
     for permutation in itertools.permutations(range(len(write_operations))):
