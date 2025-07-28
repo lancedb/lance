@@ -63,8 +63,17 @@ def test_tracing_callback(tmp_path):
     script.write_text(
         """import lance
 import pyarrow as pa
+import time
 
 from lance.tracing import capture_trace_events
+
+def wait_until(condition, timeout=1, interval=0.01):
+    start = time.time()
+    while time.time() - start < timeout:
+        if condition():
+            return
+        time.sleep(interval)
+    raise TimeoutError(f"Condition not met after {timeout} seconds")
 
 events = []
 def callback(evt):
@@ -73,7 +82,7 @@ def callback(evt):
 capture_trace_events(callback)
 
 lance.write_dataset(pa.table({"x": range(100)}), "memory://test")
-assert len(events) == 6
+wait_until(lambda: len(events) == 6)
 
 assert events[0].target == "lance::dataset_events"
 assert events[0].args["event"] == "loading"
