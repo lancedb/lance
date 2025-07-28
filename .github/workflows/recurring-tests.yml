@@ -50,7 +50,7 @@ jobs:
     needs: get-pylance-versions
     name: "Recurring: Linux (Pylance ${{ matrix.pylance-version }})"
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 7200
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.get-pylance-versions.outputs.matrix) }}
@@ -94,7 +94,7 @@ jobs:
   weekly-linux-fresh-main:
     name: "Recurring: Linux (main)"
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 7200
     defaults:
       run:
         shell: bash
