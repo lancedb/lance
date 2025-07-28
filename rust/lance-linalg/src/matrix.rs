@@ -5,8 +5,6 @@ use std::borrow::Cow;
 use std::ops::Mul;
 
 use arrow_array::{ArrowNativeTypeOp, ArrowPrimitiveType, PrimitiveArray};
-use lance_core::{Error, Result};
-use snafu::location;
 
 pub struct Matrix<'a, T: ArrowPrimitiveType> {
     data: Cow<'a, [T::Native]>,
@@ -41,6 +39,10 @@ impl<'a, T: ArrowPrimitiveType> Matrix<'a, T> {
 
     pub fn len(&self) -> usize {
         self.shape.0 * self.shape.1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn row(&self, i: usize) -> impl Iterator<Item = &T::Native> {
@@ -88,21 +90,10 @@ impl<T: ArrowPrimitiveType> ArrayAsMatrix<T> for PrimitiveArray<T> {
 }
 
 impl<'a, T: ArrowPrimitiveType> Mul<&Matrix<'a, T>> for &Matrix<'a, T> {
-    type Output = Result<Matrix<'a, T>>;
+    type Output = Matrix<'a, T>;
 
     fn mul(self, rhs: &Matrix<'a, T>) -> Self::Output {
-        if self.shape().1 != rhs.shape().0 {
-            return Err(Error::invalid_input(
-                format!(
-                    "Matrix dimensions do not match: {}x{} * {}x{}",
-                    self.shape().0,
-                    self.shape().1,
-                    rhs.shape().0,
-                    rhs.shape().1
-                ),
-                location!(),
-            ));
-        }
+        debug_assert_eq!(self.shape().1, rhs.shape().0);
 
         let mut result = Vec::with_capacity(self.len());
         let row = self.shape().0;
@@ -119,7 +110,7 @@ impl<'a, T: ArrowPrimitiveType> Mul<&Matrix<'a, T>> for &Matrix<'a, T> {
             }
         }
 
-        Ok(Matrix::new_owned(result, (row, col)))
+        Matrix::new_owned(result, (row, col))
     }
 }
 
@@ -143,14 +134,14 @@ mod tests {
         // 173 188 203 218
         let lhs = Matrix::<UInt32Type>::new_owned(vec![1, 2, 3, 4, 5, 6], (2, 3));
         let rhs = Matrix::new_owned(vec![7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18], (3, 4));
-        let result = lhs.mul(&rhs).unwrap();
+        let result = lhs.mul(&rhs);
         assert_eq!(result.data.as_ref(), &[74, 80, 86, 92, 173, 188, 203, 218]);
         assert_eq!(result.shape(), (2, 4));
 
         // 4x3 * 3x2 -> 4x2
         let lhs = lhs.transpose();
         let rhs = rhs.transpose();
-        let result = rhs.mul(&lhs).unwrap();
+        let result = rhs.mul(&lhs);
         assert_eq!(result.shape(), (4, 2));
         assert_eq!(result.data.as_ref(), &[74, 173, 80, 188, 86, 203, 92, 218]);
     }

@@ -4511,7 +4511,6 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "rayon",
- "snafu",
  "tokio",
  "tracing",
 ]
