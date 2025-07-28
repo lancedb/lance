@@ -124,7 +124,7 @@ impl<'a, T: ArrowPrimitiveType> Iterator for MatrixVectorIter<'a, T> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = (self.end - self.current) / self.step;
+        let remaining = (self.end - self.current).div_ceil(self.step);
         (remaining, Some(remaining))
     }
 }
