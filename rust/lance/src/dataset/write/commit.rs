@@ -292,7 +292,7 @@ impl<'a> CommitBuilder<'a> {
                         location: location!(),
                     });
                 }
-                let manifest_and_location = commit_detached_transaction(
+                commit_detached_transaction(
                     dataset,
                     object_store.as_ref(),
                     commit_handler.as_ref(),
@@ -300,21 +300,9 @@ impl<'a> CommitBuilder<'a> {
                     &manifest_config,
                     &self.commit_config,
                 )
-                .await?;
-
-                info!(
-                    target: TRACE_DATASET_EVENTS,
-                    event=DATASET_COMMITTED_EVENT,
-                    uri=dataset.uri,
-                    read_version=transaction.read_version,
-                    committed_version=manifest_and_location.0.version,
-                    detached=true,
-                    operation=&transaction.operation.name()
-                );
-
-                manifest_and_location
+                .await?
             } else {
-                let manifest_and_location = commit_transaction(
+                commit_transaction(
                     dataset,
                     object_store.as_ref(),
                     commit_handler.as_ref(),
@@ -324,19 +312,7 @@ impl<'a> CommitBuilder<'a> {
                     manifest_naming_scheme,
                     self.affected_rows.as_ref(),
                 )
-                .await?;
-
-                info!(
-                    target: TRACE_DATASET_EVENTS,
-                    event=DATASET_COMMITTED_EVENT,
-                    uri=dataset.uri,
-                    read_version=transaction.read_version,
-                    committed_version=manifest_and_location.0.version,
-                    detached=false,
-                    operation=&transaction.operation.name()
-                );
-
-                manifest_and_location
+                .await?
             }
         } else if self.detached {
             // I think we may eventually want this, and we can probably handle it, but leaving a TODO for now
@@ -345,7 +321,7 @@ impl<'a> CommitBuilder<'a> {
                 location: location!(),
             });
         } else {
-            let manifest_and_location = commit_new_dataset(
+            commit_new_dataset(
                 object_store.as_ref(),
                 commit_handler.as_ref(),
                 &base_path,
@@ -354,20 +330,18 @@ impl<'a> CommitBuilder<'a> {
                 manifest_naming_scheme,
                 metadata_cache.as_ref(),
             )
-            .await?;
-
-            info!(
-                target: TRACE_DATASET_EVENTS,
-                event=DATASET_COMMITTED_EVENT,
-                path=&base_path.to_string(),
-                read_version=transaction.read_version,
-                committed_version=manifest_and_location.0.version,
-                detached=false,
-                operation=&transaction.operation.name()
-            );
-
-            manifest_and_location
+            .await?
         };
+
+        info!(
+            target: TRACE_DATASET_EVENTS,
+            event=DATASET_COMMITTED_EVENT,
+            uri=dest.uri(),
+            read_version=transaction.read_version,
+            committed_version=manifest.version,
+            detached=self.detached,
+            operation=&transaction.operation.name()
+        );
 
         let tags = Tags::new(
             object_store.clone(),

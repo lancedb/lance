@@ -64,6 +64,13 @@ impl WriteDestination<'_> {
             WriteDestination::Uri(_) => None,
         }
     }
+
+    pub fn uri(&self) -> String {
+        match self {
+            WriteDestination::Dataset(dataset) => dataset.uri.clone(),
+            WriteDestination::Uri(uri) => uri.to_string(),
+        }
+    }
 }
 
 impl From<Arc<Dataset>> for WriteDestination<'_> {

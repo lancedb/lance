@@ -81,7 +81,7 @@ assert events[0].args["uri"] == "memory://test"
 
 assert events[1].target == "lance::dataset_events"
 assert events[1].args["event"] == "writing"
-assert events[1].args["path"] == "test"
+assert events[1].args["uri"] == "memory://test"
 assert events[1].args["mode"] == "Create"
 assert events[1].args["timestamp"] is not None
 
@@ -100,7 +100,7 @@ assert events[4].args["type"] == "manifest"
 
 assert events[5].target == "lance::dataset_events"
 assert events[5].args["event"] == "committed"
-assert events[5].args["path"] == "test"
+assert events[5].args["uri"] == "memory://test"
 assert events[5].args["read_version"] == "0"
 assert events[5].args["committed_version"] == "1"
 assert events[5].args["detached"] == "false"
