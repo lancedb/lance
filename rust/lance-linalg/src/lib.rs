@@ -11,7 +11,6 @@ use arrow_schema::ArrowError;
 mod clustering;
 pub mod distance;
 pub mod kernels;
-pub mod matrix;
 pub mod simd;
 
 #[cfg(test)]
