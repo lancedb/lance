@@ -227,7 +227,7 @@ impl RowIdMask {
     /// TODO: We could probably still iterate efficiently even if the block
     /// list contains "full fragment" blocks but that would require some
     /// extra logic.
-    pub fn iter_ids(&self) -> Option<Box<dyn Iterator<Item = RowAddress> + '_>> {
+    pub fn iter_addresses(&self) -> Option<Box<dyn Iterator<Item = RowAddress> + '_>> {
         if let Some(mut allow_iter) = self
             .allow_list
             .as_ref()
@@ -1139,16 +1139,16 @@ mod tests {
     #[test]
     fn test_iter_ids() {
         let mut mask = RowIdMask::default();
-        assert!(mask.iter_ids().is_none());
+        assert!(mask.iter_addresses().is_none());
 
         // Test with just an allow list
         let mut allow_list = RowIdTreeMap::default();
         allow_list.extend([1, 5, 10].iter().copied());
         mask.allow_list = Some(allow_list);
 
-        let ids: Vec<_> = mask.iter_ids().unwrap().collect();
+        let addrs: Vec<_> = mask.iter_addresses().unwrap().collect();
         assert_eq!(
-            ids,
+            addrs,
             vec![
                 RowAddress::new_from_parts(0, 1),
                 RowAddress::new_from_parts(0, 5),
@@ -1161,9 +1161,9 @@ mod tests {
         block_list.extend([5].iter().copied());
         mask.block_list = Some(block_list);
 
-        let ids: Vec<_> = mask.iter_ids().unwrap().collect();
+        let addrs: Vec<_> = mask.iter_addresses().unwrap().collect();
         assert_eq!(
-            ids,
+            addrs,
             vec![
                 RowAddress::new_from_parts(0, 1),
                 RowAddress::new_from_parts(0, 10)
@@ -1174,13 +1174,13 @@ mod tests {
         let mut block_list = RowIdTreeMap::default();
         block_list.insert_fragment(0);
         mask.block_list = Some(block_list);
-        assert!(mask.iter_ids().is_none());
+        assert!(mask.iter_addresses().is_none());
 
         // Test with full fragment in allow list
         mask.block_list = None;
         let mut allow_list = RowIdTreeMap::default();
         allow_list.insert_fragment(0);
         mask.allow_list = Some(allow_list);
-        assert!(mask.iter_ids().is_none());
+        assert!(mask.iter_addresses().is_none());
     }
 }

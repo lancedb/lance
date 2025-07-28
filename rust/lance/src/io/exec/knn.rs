@@ -716,7 +716,7 @@ impl ANNIvfSubIndexExec {
                     // just return the prefilter ids and don't bother searching any further
 
                     // This next if check should be true, because we wouldn't get max_results otherwise
-                    if let Some(iter_ids) = prefilter_mask.iter_ids() {
+                    if let Some(iter_ids) = prefilter_mask.iter_addresses() {
                         // We only run this on the first delta because the prefilter mask is shared
                         // by all deltas and we don't want to duplicate the rows.
                         if state
