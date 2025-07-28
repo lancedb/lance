@@ -155,11 +155,11 @@ pub fn transpose_row_ids(
 }
 
 pub fn transpose_row_ids_from_digest(
-    row_ids: RoaringTreemap,
+    row_addrs: RoaringTreemap,
     old_fragments: &Vec<FragDigest>,
     new_fragments: &[FragDigest],
 ) -> HashMap<u64, Option<u64>> {
-    let new_ids = new_fragments.iter().flat_map(|frag| {
+    let new_addrs = new_fragments.iter().flat_map(|frag| {
         (0..frag.physical_rows as u32).map(|offset| {
             Some(u64::from(RowAddress::new_from_parts(
                 frag.id as u32,
@@ -167,19 +167,19 @@ pub fn transpose_row_ids_from_digest(
             )))
         })
     });
-    // The hashmap will have an entry for each row id to map plus all rows that
+    // The hashmap will have an entry for each row address to map plus all rows that
     // were deleted.
-    let expected_size = row_ids.len() as usize
+    let expected_size = row_addrs.len() as usize
         + old_fragments
             .iter()
             .map(|frag| frag.num_deleted_rows)
             .sum::<usize>();
-    // We expect row ids to be unique, so we should already not get many collisions.
+    // We expect row addresses to be unique, so we should already not get many collisions.
     // The default hasher is designed to be resistance to DoS attacks, which is
     // more than we need for this use case.
     let mut mapping: HashMap<u64, Option<u64>> = HashMap::with_capacity(expected_size);
-    mapping.extend(row_ids.iter().zip(new_ids));
-    MissingIds::new(row_ids.into_iter(), old_fragments).for_each(|id| {
+    mapping.extend(row_addrs.iter().zip(new_addrs));
+    MissingIds::new(row_addrs.into_iter(), old_fragments).for_each(|id| {
         mapping.insert(id, None);
     });
     mapping
