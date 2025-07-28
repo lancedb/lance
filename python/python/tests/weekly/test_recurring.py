@@ -212,9 +212,9 @@ def test_all_permutations(with_position):
     read_only_operations = [
         # Read only operations
         VectorSearch(),
-        VectorSearch(filter="id >= 1000 && id < 8000"),
+        VectorSearch(filter="id >= 1000 and id < 8000"),
         FullTextSearch(has_position=False),
-        FullTextSearch(has_position=False, filter="id >= 1000 && id < 8000"),
+        FullTextSearch(has_position=False, filter="id >= 1000 and id < 8000"),
     ]
 
     for permutation in itertools.permutations(range(len(write_operations))):
