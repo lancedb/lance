@@ -6,8 +6,12 @@ use std::ops::Mul;
 
 use arrow_array::{ArrowNativeTypeOp, ArrowPrimitiveType, PrimitiveArray};
 
+/// A matrix is a 2D array of elements.
+/// It's a thin wrapper around a vector of elements.
 pub struct Matrix<'a, T: ArrowPrimitiveType> {
     data: Cow<'a, [T::Native]>,
+    // (row, col) without considering transposed
+    // transposing won't change the internal shape, but method `shape()` will return the transposed shape
     shape: (usize, usize),
     transposed: bool,
 }
@@ -47,30 +51,81 @@ impl<'a, T: ArrowPrimitiveType> Matrix<'a, T> {
 
     pub fn row(&self, i: usize) -> impl Iterator<Item = &T::Native> {
         if self.transposed {
-            self.data[i..self.len()].iter().step_by(self.shape.1)
+            self.col_iter(i)
         } else {
-            self.data[i * self.shape.1..(i + 1) * self.shape.1]
-                .iter()
-                .step_by(1) // call step_by(1) to make the type match
+            self.row_iter(i)
         }
     }
 
     pub fn col(&self, j: usize) -> impl Iterator<Item = &T::Native> {
         if self.transposed {
-            self.data[j * self.shape.1..(j + 1) * self.shape.1]
-                .iter()
-                .step_by(1)
+            self.row_iter(j)
         } else {
-            self.data[j..self.len()].iter().step_by(self.shape.1)
+            self.col_iter(j)
         }
     }
 
+    // iterate over the i-th row without considering transposed
+    fn row_iter(&self, i: usize) -> MatrixVectorIter<'_, T> {
+        MatrixVectorIter::new(
+            self.data.as_ref(),
+            i * self.shape.1,
+            (i + 1) * self.shape.1,
+            1,
+        )
+    }
+
+    // iterate over the j-th column without considering transposed
+    fn col_iter(&self, j: usize) -> MatrixVectorIter<'_, T> {
+        MatrixVectorIter::new(self.data.as_ref(), j, self.len(), self.shape.1)
+    }
+
+    /// Transpose the matrix.
+    /// This is a cheap operation, it doesn't copy the data.
+    /// It only changes the shape and the direction of the iteration.
     pub fn transpose(&self) -> Self {
         Self {
             data: self.data.clone(),
             shape: self.shape,
             transposed: !self.transposed,
         }
+    }
+}
+
+pub struct MatrixVectorIter<'a, T: ArrowPrimitiveType> {
+    data: &'a [T::Native],
+    current: usize,
+    end: usize,
+    step: usize,
+}
+
+impl<'a, T: ArrowPrimitiveType> MatrixVectorIter<'a, T> {
+    pub fn new(data: &'a [T::Native], current: usize, end: usize, step: usize) -> Self {
+        Self {
+            data,
+            current,
+            end,
+            step,
+        }
+    }
+}
+
+impl<'a, T: ArrowPrimitiveType> Iterator for MatrixVectorIter<'a, T> {
+    type Item = &'a T::Native;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.end {
+            None
+        } else {
+            let item = &self.data[self.current];
+            self.current += self.step;
+            Some(item)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.end - self.current) / self.step;
+        (remaining, Some(remaining))
     }
 }
 
