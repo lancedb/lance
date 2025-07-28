@@ -17,7 +17,7 @@ import pytest
 # For testing, use smaller numbers to make tests run faster
 # In production, you might want to use: NUM_ROWS = 1_000_000
 NUM_ROWS = 1_000_000
-BATCH_SIZE = 10_000
+BATCH_SIZE = 1_000
 DIM = 32
 
 schema = pa.schema(
@@ -201,7 +201,7 @@ def test_all_permutations(with_position):
 
     write_operations = [
         Append(),
-        Delete(delete_num_rows=100),
+        Delete(delete_num_rows=1000),
         Optimize(num_indices_to_merge=0, column="id"),
         Optimize(num_indices_to_merge=0, column="vector"),  # delta index
         Optimize(num_indices_to_merge=1, column="vector"),  # merge index
