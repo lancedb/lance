@@ -25,7 +25,7 @@ use snafu::location;
 use super::ProjectionRequest;
 use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
 
-/// Convert A list of ROW ids to a list of row addresses.
+/// Convert A list of row indices (positions) to a list of row addresses.
 pub(super) async fn row_indices_to_row_addresses(
     dataset: &Dataset,
     row_indices: &[u64],
@@ -464,7 +464,12 @@ impl TakeBuilder {
                     .collect::<Vec<_>>();
                 addresses
             } else {
-                // If there is no row_id_index, row id and row addr are equality.
+                if self.dataset.manifest().uses_move_stable_row_ids() {
+                    return Err(Error::NotSupported {
+                        source: "Cannot convert row IDs to row addresses without a row ID index when move-stable row IDs are enabled".into(),
+                        location: location!(),
+                    });
+                }
                 row_ids.clone()
             };
             self.row_addrs = Some(addrs);

@@ -1227,7 +1227,7 @@ mod tests {
         assert_eq!(plan.tasks().len(), 0);
     }
 
-    fn row_ids(frag_idx: u32, offsets: Range<u32>) -> Range<u64> {
+    fn row_addresses(frag_idx: u32, offsets: Range<u32>) -> Range<u64> {
         let start = RowAddress::new_from_parts(frag_idx, offsets.start);
         let end = RowAddress::new_from_parts(frag_idx, offsets.end);
         start.into()..end.into()
@@ -1324,22 +1324,25 @@ mod tests {
             &[
                 vec![
                     // 3 small fragments are rewritten to frags 7 & 8
-                    (row_ids(0, 0..400), true),
-                    (row_ids(1, 0..400), true),
-                    (row_ids(2, 0..200), true),
+                    (row_addresses(0, 0..400), true),
+                    (row_addresses(1, 0..400), true),
+                    (row_addresses(2, 0..200), true),
                 ],
-                vec![(row_ids(2, 200..400), true)],
+                vec![(row_addresses(2, 200..400), true)],
                 // frag 3 is skipped since it does not have enough missing data
                 // Frags 4, 5, and 6 are rewritten to frags 9 & 10
                 vec![
                     // Only 800 of the 1000 rows taken from frag 4
-                    (row_ids(4, 0..200), true),
-                    (row_ids(4, 200..400), false),
-                    (row_ids(4, 400..1000), true),
+                    (row_addresses(4, 0..200), true),
+                    (row_addresses(4, 200..400), false),
+                    (row_addresses(4, 400..1000), true),
                     // frags 5 compacted with frag 4
-                    (row_ids(5, 0..200), true),
+                    (row_addresses(5, 0..200), true),
                 ],
-                vec![(row_ids(5, 200..300), true), (row_ids(6, 0..300), true)],
+                vec![
+                    (row_addresses(5, 200..300), true),
+                    (row_addresses(6, 0..300), true),
+                ],
             ],
             first_new_frag_idx,
         );
@@ -1347,19 +1350,22 @@ mod tests {
             &[
                 // Frags 4, 5, and 6 are rewritten to frags 7 & 8
                 vec![
-                    (row_ids(4, 0..200), true),
-                    (row_ids(4, 200..400), false),
-                    (row_ids(4, 400..1000), true),
-                    (row_ids(5, 0..200), true),
+                    (row_addresses(4, 0..200), true),
+                    (row_addresses(4, 200..400), false),
+                    (row_addresses(4, 400..1000), true),
+                    (row_addresses(5, 0..200), true),
                 ],
-                vec![(row_ids(5, 200..300), true), (row_ids(6, 0..300), true)],
+                vec![
+                    (row_addresses(5, 200..300), true),
+                    (row_addresses(6, 0..300), true),
+                ],
                 // 3 small fragments rewritten to frags 9 & 10
                 vec![
-                    (row_ids(0, 0..400), true),
-                    (row_ids(1, 0..400), true),
-                    (row_ids(2, 0..200), true),
+                    (row_addresses(0, 0..400), true),
+                    (row_addresses(1, 0..400), true),
+                    (row_addresses(2, 0..200), true),
                 ],
-                vec![(row_ids(2, 200..400), true)],
+                vec![(row_addresses(2, 200..400), true)],
             ],
             first_new_frag_idx,
         );
@@ -1458,8 +1464,8 @@ mod tests {
         let expected_remap = expect_remap(
             &[vec![
                 // 3 small fragments are rewritten entirely
-                (row_ids(0, 0..5000), true),
-                (row_ids(1, 0..5000), true),
+                (row_addresses(0, 0..5000), true),
+                (row_addresses(1, 0..5000), true),
             ]],
             2,
         );

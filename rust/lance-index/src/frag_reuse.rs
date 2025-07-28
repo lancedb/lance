@@ -246,7 +246,7 @@ impl FragReuseIndex {
     }
 
     pub fn remap_row_ids_tree_map(&self, row_ids: &RowIdTreeMap) -> RowIdTreeMap {
-        RowIdTreeMap::from_iter(row_ids.row_ids().unwrap().filter_map(|addr| {
+        RowIdTreeMap::from_iter(row_ids.row_addresses().unwrap().filter_map(|addr| {
             let addr_as_u64 = u64::from(addr);
             self.remap_row_id(addr_as_u64)
         }))

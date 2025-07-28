@@ -301,7 +301,7 @@ impl ScalarIndex for BitmapIndex {
             .iter()
             .map(|(key, bitmap)| {
                 let bitmap =
-                    RowIdTreeMap::from_iter(bitmap.row_ids().unwrap().filter_map(|addr| {
+                    RowIdTreeMap::from_iter(bitmap.row_addresses().unwrap().filter_map(|addr| {
                         let addr_as_u64 = u64::from(addr);
                         mapping
                             .get(&addr_as_u64)
@@ -313,7 +313,7 @@ impl ScalarIndex for BitmapIndex {
             .collect::<HashMap<_, _>>();
 
         let null_map =
-            RowIdTreeMap::from_iter(self.null_map.row_ids().unwrap().filter_map(|addr| {
+            RowIdTreeMap::from_iter(self.null_map.row_addresses().unwrap().filter_map(|addr| {
                 let addr_as_u64 = u64::from(addr);
                 mapping
                     .get(&addr_as_u64)
@@ -574,7 +574,7 @@ pub mod tests {
                 .unwrap_or_else(|| panic!("Key {} should exist", key_val));
 
             // Convert RowIdTreeMap to a vector for easier assertion
-            let row_ids: Vec<u64> = bitmap.row_ids().unwrap().map(u64::from).collect();
+            let row_ids: Vec<u64> = bitmap.row_addresses().unwrap().map(u64::from).collect();
 
             // Verify length
             assert_eq!(

@@ -361,7 +361,7 @@ impl MapIndexExec {
 
             let allow_list =
                 allow_list
-                    .row_ids()
+                    .row_addresses()
                     .ok_or(datafusion::error::DataFusionError::External(
                         "IndexedLookupExec: row addresses didn't have an iterable allow list"
                             .into(),
@@ -642,7 +642,7 @@ async fn row_ids_for_mask(
         (Some(mut allow_list), None) => {
             retain_fragments(&mut allow_list, fragments, dataset).await?;
 
-            if let Some(allow_list_iter) = allow_list.row_ids() {
+            if let Some(allow_list_iter) = allow_list.row_addresses() {
                 Ok(allow_list_iter.map(u64::from).collect::<Vec<_>>())
             } else {
                 // We shouldn't hit this branch if the row ids are stable.
@@ -680,7 +680,7 @@ async fn row_ids_for_mask(
             // We need to filter out irrelevant fragments as well.
             retain_fragments(&mut allow_list, fragments, dataset).await?;
 
-            if let Some(allow_list_iter) = allow_list.row_ids() {
+            if let Some(allow_list_iter) = allow_list.row_addresses() {
                 Ok(allow_list_iter
                     .filter_map(|addr| {
                         let row_id = u64::from(addr);

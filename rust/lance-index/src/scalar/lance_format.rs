@@ -1389,7 +1389,7 @@ pub mod tests {
                 let row_ids = result.row_ids();
 
                 let row_ids_set = row_ids
-                    .row_ids()
+                    .row_addresses()
                     .unwrap()
                     .map(u64::from)
                     .collect::<std::collections::HashSet<_>>();
