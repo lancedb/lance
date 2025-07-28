@@ -13,13 +13,16 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.operation.Append;
 import com.lancedb.lance.operation.Operation;
+import com.lancedb.lance.operation.Overwrite;
 import com.lancedb.lance.operation.Project;
 
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -95,8 +98,8 @@ public class Transaction {
     private final String uuid;
     private final Dataset dataset;
     private long readVersion;
-    private Operation operation;
-    private Operation blobOp;
+    private Operation.Builder<?> operationBuilder;
+    private Operation.Builder<?> blobOpBuilder;
     private Map<String, String> writeParams;
 
     public Builder(Dataset dataset) {
@@ -114,19 +117,61 @@ public class Transaction {
       return this;
     }
 
+    public Builder operationBuilder(Operation.Builder<?> opBuilder) {
+      validateState();
+      this.operationBuilder = opBuilder;
+      return this;
+    }
+
     public Builder project(Schema newSchema) {
       validateState();
-      this.operation = new Project.Builder().schema(newSchema).allocator(dataset.allocator).build();
+      this.operationBuilder = new Project.Builder(dataset.allocator).schema(newSchema);
+      return this;
+    }
+
+    public Builder overwrite(List<FragmentMetadata> fragments, Schema schema) {
+      validateState();
+      this.operationBuilder =
+          new Overwrite.Builder(dataset.allocator).fragments(fragments).schema(schema);
+      return this;
+    }
+
+    /**
+     * upsertTableConfig would be reused for both Overwrite and UpdateConfig operations.
+     *
+     * @param upsertTableConfig the table config want to be upsert
+     * @return the builder
+     */
+    public Builder upsertTableConfig(Map<String, String> upsertTableConfig) {
+      if (operationBuilder instanceof Overwrite.Builder) {
+        operationBuilder = ((Overwrite.Builder) operationBuilder).configUpsertValues(upsertTableConfig);
+      }
+      // TODO: Reuse this for UpdateConfig operation
+      return this;
+    }
+
+    public Builder append(List<FragmentMetadata> fragments) {
+      validateState();
+      this.operationBuilder = new Append.Builder().fragments(fragments);
       return this;
     }
 
     private void validateState() {
-      Preconditions.checkState(operation == null, "Operation " + operation + " already set");
+      if (operationBuilder != null) {
+        throw new IllegalStateException(
+            String.format("Operation %s has been set", operationBuilder.desc()));
+      }
     }
 
     public Transaction build() {
-      Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
-      return new Transaction(dataset, readVersion, uuid, operation, blobOp, writeParams);
+      Preconditions.checkState(operationBuilder != null, "TransactionBuilder has no operations");
+      return new Transaction(
+          dataset,
+          readVersion,
+          uuid,
+          operationBuilder.build(),
+          blobOpBuilder != null ? blobOpBuilder.build() : null,
+          writeParams);
     }
   }
 }

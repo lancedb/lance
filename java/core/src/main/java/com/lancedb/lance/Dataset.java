@@ -221,7 +221,7 @@ public class Dataset implements Closeable {
       Map<String, String> storageOptions);
 
   /**
-   * Create a new version of dataset.
+   * Create a new version of dataset. Use {@link Transaction} instead
    *
    * @param allocator the buffer allocator
    * @param path The file path of the dataset to open.
@@ -230,6 +230,7 @@ public class Dataset implements Closeable {
    *     is not needed for overwrite or restore operations.
    * @return A new instance of {@link Dataset} linked to the opened dataset.
    */
+  @Deprecated
   public static Dataset commit(
       BufferAllocator allocator,
       String path,
@@ -238,6 +239,7 @@ public class Dataset implements Closeable {
     return commit(allocator, path, operation, readVersion, new HashMap<>());
   }
 
+  @Deprecated
   public static Dataset commit(
       BufferAllocator allocator,
       String path,
@@ -253,12 +255,16 @@ public class Dataset implements Closeable {
     return dataset;
   }
 
+  /** Use {@link Transaction} instead */
+  @Deprecated
   public static native Dataset commitAppend(
       String path,
       Optional<Long> readVersion,
       List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
 
+  /** Use {@link Transaction} instead */
+  @Deprecated
   public static native Dataset commitOverwrite(
       String path,
       long arrowSchemaMemoryAddress,

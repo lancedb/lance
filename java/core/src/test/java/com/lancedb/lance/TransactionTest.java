@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.ipc.LanceScanner;
+
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -27,6 +29,7 @@ import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class TransactionTest {
   private static Dataset dataset;
@@ -70,6 +73,82 @@ public class TransactionTest {
           assertEquals(2, committedDataset.version());
           assertEquals(3, committedDataset2.version());
           assertEquals(new Schema(fieldList), committedDataset2.getSchema());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testAppend(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testAppend").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      // Commit fragment
+      int rowCount = 20;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      Transaction transaction =
+          dataset.newTransactionBuilder().append(Collections.singletonList(fragmentMeta)).build();
+      try (Dataset dataset = transaction.commit()) {
+        assertEquals(2, dataset.version());
+        assertEquals(2, dataset.latestVersion());
+        assertEquals(rowCount, dataset.countRows());
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.newTransactionBuilder().append(new ArrayList<>()).build().commit().close());
+      }
+    }
+  }
+
+  @Test
+  void testOverwrite(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testOverwrite").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Commit fragment
+      int rowCount = 20;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      Transaction transaction =
+          dataset
+              .newTransactionBuilder()
+              .overwrite(Collections.singletonList(fragmentMeta), testDataset.getSchema())
+              .build();
+      try (Dataset dataset = transaction.commit()) {
+        assertEquals(2, dataset.version());
+        assertEquals(2, dataset.latestVersion());
+        assertEquals(rowCount, dataset.countRows());
+        Fragment fragment = dataset.getFragments().get(0);
+
+        try (LanceScanner scanner = fragment.newScan()) {
+          Schema schemaRes = scanner.schema();
+          assertEquals(testDataset.getSchema(), schemaRes);
+        }
+      }
+
+      // Commit fragment again
+      rowCount = 40;
+      fragmentMeta = testDataset.createNewFragment(rowCount);
+      transaction =
+          dataset
+              .newTransactionBuilder()
+              .overwrite(Collections.singletonList(fragmentMeta), testDataset.getSchema())
+              .upsertTableConfig(Collections.singletonMap("config_key", "config_value"))
+              .build();
+      try (Dataset dataset = transaction.commit()) {
+        assertEquals(3, dataset.version());
+        assertEquals(3, dataset.latestVersion());
+        assertEquals(rowCount, dataset.countRows());
+        assertEquals("config_value", dataset.getConfig().get("config_key"));
+        Fragment fragment = dataset.getFragments().get(0);
+
+        try (LanceScanner scanner = fragment.newScan()) {
+          Schema schemaRes = scanner.schema();
+          assertEquals(testDataset.getSchema(), schemaRes);
         }
       }
     }

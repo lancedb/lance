@@ -1,6 +1,6 @@
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
-use crate::traits::IntoJava;
+use crate::traits::{import_vec, FromJObjectWithEnv, IntoJava};
 use crate::utils::to_rust_map;
 use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
@@ -85,21 +85,66 @@ fn convert_to_rust_operation(env: &mut JNIEnv, java_operation: JObject) -> Resul
     let name = JString::from(name);
     let name: String = env.get_string(&name)?.into();
     let op = match name.as_str() {
-        "Project" => {
-            let schema_ptr = env
-                .call_method(&java_operation, "exportSchema", "()J", &[])?
-                .j()?;
-            log::info!("Schema pointer: {:?}", schema_ptr);
-            let c_schema_ptr = schema_ptr as *mut FFI_ArrowSchema;
-            let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
-            let schema = Schema::try_from(&c_schema)?;
-
-            Operation::Project {
-                schema: LanceSchema::try_from(&schema)
-                    .expect("Failed to convert from arrow schema to lance schema"),
+        "Project" => Operation::Project {
+            schema: convert_schema_from_operation(env, &java_operation)?,
+        },
+        "Append" => {
+            let fragment_objs = env
+                .call_method(&java_operation, "fragments", "()Ljava/util/List;", &[])?
+                .l()?;
+            let fragment_objs = import_vec(env, &fragment_objs)?;
+            let mut fragments = Vec::with_capacity(fragment_objs.len());
+            for f in fragment_objs {
+                fragments.push(f.extract_object(env)?);
+            }
+            Operation::Append { fragments }
+        }
+        "Overwrite" => {
+            let fragment_objs = env
+                .call_method(&java_operation, "fragments", "()Ljava/util/List;", &[])?
+                .l()?;
+            let fragment_objs = import_vec(env, &fragment_objs)?;
+            let mut fragments = Vec::with_capacity(fragment_objs.len());
+            for f in fragment_objs {
+                fragments.push(f.extract_object(env)?);
+            }
+            let config_upsert_values = env
+                .call_method(
+                    &java_operation,
+                    "configUpsertValues",
+                    "()Ljava/util/Map;",
+                    &[],
+                )?
+                .l()?;
+            let config_upsert_values = if config_upsert_values.is_null() {
+                None
+            } else {
+                let config_upsert_values = JMap::from_env(env, &config_upsert_values)?;
+                Some(to_rust_map(env, &config_upsert_values)?)
+            };
+            Operation::Overwrite {
+                fragments,
+                schema: convert_schema_from_operation(env, &java_operation)?,
+                config_upsert_values,
             }
         }
         _ => unimplemented!(),
     };
     Ok(op)
+}
+
+fn convert_schema_from_operation(
+    env: &mut JNIEnv,
+    java_operation: &JObject,
+) -> Result<LanceSchema> {
+    let schema_ptr = env
+        .call_method(java_operation, "exportSchema", "()J", &[])?
+        .j()?;
+    let c_schema_ptr = schema_ptr as *mut FFI_ArrowSchema;
+    let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
+    let schema = Schema::try_from(&c_schema)?;
+    Ok(
+        LanceSchema::try_from(&schema)
+            .expect("Failed to convert from arrow schema to lance schema"),
+    )
 }

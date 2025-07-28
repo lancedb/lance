@@ -13,28 +13,18 @@
  */
 package com.lancedb.lance.operation;
 
-import org.apache.arrow.c.ArrowSchema;
-import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
- * Project to a new schema. This only changes the schema, not the data. This operation could be used
- * to: 1. add/remove columns. The data will be removed after compaction. 2. modify column positions
+ * Project to a new schema. This Operation only changes the schema, not the data. Note: 1. For
+ * removing columns. The data will be removed after compaction. 2. Project will modify column
+ * positions, not ids(a.k.a. field id)
  */
-public class Project implements Operation {
-
-  private final Schema schema;
-  private final BufferAllocator allocator;
-  private ArrowSchema cSchema;
+public class Project extends SchemaOperation {
 
   private Project(Schema schema, BufferAllocator allocator) {
-    this.schema = schema;
-    this.allocator = allocator;
-  }
-
-  public Schema getSchema() {
-    return schema;
+    super(schema, allocator);
   }
 
   @Override
@@ -43,42 +33,25 @@ public class Project implements Operation {
   }
 
   @Override
-  public void release() {
-    if (cSchema != null) {
-      cSchema.close();
-    }
-  }
-
-  @Override
   public String toString() {
-    return "Project{" + "schema=" + schema + '}';
-  }
-
-  public long exportSchema() {
-    if (cSchema == null) {
-      this.cSchema = ArrowSchema.allocateNew(allocator);
-      Data.exportSchema(allocator, schema, null, cSchema);
-    }
-    return cSchema.memoryAddress();
+    return "Project{" + "schema=" + +'}';
   }
 
   // Builder class for Project
-  public static class Builder {
+  public static class Builder implements Operation.Builder<Project> {
+    private final BufferAllocator allocator;
     private Schema schema;
-    private BufferAllocator allocator;
 
-    public Builder() {}
+    public Builder(BufferAllocator allocator) {
+      this.allocator = allocator;
+    }
 
     public Builder schema(Schema schema) {
       this.schema = schema;
       return this;
     }
 
-    public Builder allocator(BufferAllocator allocator) {
-      this.allocator = allocator;
-      return this;
-    }
-
+    @Override
     public Project build() {
       return new Project(schema, allocator);
     }
