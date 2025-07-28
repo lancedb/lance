@@ -179,21 +179,6 @@ pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
     l2(from, to)
 }
 
-// f32 kernels for L2
-// mod f32 {
-//     use super::*;
-
-//     #[inline]
-//     pub fn l2_once<S: SIMD<f32, N>, const N: usize>(x: &[f32], y: &[f32]) -> f32 {
-//         debug_assert_eq!(x.len(), N);
-//         debug_assert_eq!(y.len(), N);
-//         let x = unsafe { S::load_unaligned(x.as_ptr()) };
-//         let y = unsafe { S::load_unaligned(y.as_ptr()) };
-//         let s = x - y;
-//         (s * s).reduce_sum()
-//     }
-// }
-
 /// Compute L2 distance between a vector and a batch of vectors.
 ///
 /// Parameters
