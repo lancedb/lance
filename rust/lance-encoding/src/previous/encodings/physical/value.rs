@@ -18,7 +18,7 @@ use crate::encodings::physical::value::ValueEncoder;
 use crate::format::ProtobufUtils;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
-    v2::encoder::{ArrayEncoder, EncodedArray},
+    previous::encoder::{ArrayEncoder, EncodedArray},
     EncodingsIo,
 };
 

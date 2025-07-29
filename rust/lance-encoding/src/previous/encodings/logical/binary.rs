@@ -19,7 +19,7 @@ use crate::{
         DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
     },
-    v2::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
+    previous::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
 };
 
 /// Wraps a varbin scheduler and uses a BinaryPageDecoder to cast
