@@ -1055,9 +1055,11 @@ mod tests {
         // In a real implementation, you could add other compression types here
 
         // Build encoding strategy with compression parameters
-        let encoding_strategy =
-            lance_encoding::encoder::configured_encoding_strategy(LanceFileVersion::V2_1, params)
-                .unwrap();
+        let encoding_strategy = lance_encoding::encoder::default_encoding_strategy_with_params(
+            LanceFileVersion::V2_1,
+            params,
+        )
+        .unwrap();
 
         // Configure file writer options
         let options = FileWriterOptions {

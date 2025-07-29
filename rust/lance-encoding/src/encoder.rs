@@ -27,7 +27,6 @@ use snafu::location;
 use crate::buffer::LanceBuffer;
 use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
 use crate::compression_config::CompressionParams;
-use crate::configured_compression_strategy::ConfiguredCompressionStrategy;
 use crate::decoder::PageEncoding;
 use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
@@ -283,7 +282,7 @@ pub fn default_encoding_strategy(version: LanceFileVersion) -> Box<dyn FieldEnco
 }
 
 /// Create an encoding strategy with user-configured compression parameters
-pub fn configured_encoding_strategy(
+pub fn default_encoding_strategy_with_params(
     version: LanceFileVersion,
     params: CompressionParams,
 ) -> Result<Box<dyn FieldEncodingStrategy>> {
@@ -293,7 +292,7 @@ pub fn configured_encoding_strategy(
             location!(),
         )),
         _ => {
-            let compression_strategy = Arc::new(ConfiguredCompressionStrategy::new(params));
+            let compression_strategy = Arc::new(DefaultCompressionStrategy::with_params(params));
             Ok(Box::new(StructuralEncodingStrategy {
                 compression_strategy,
                 version,
@@ -315,7 +314,7 @@ pub struct StructuralEncodingStrategy {
 impl Default for StructuralEncodingStrategy {
     fn default() -> Self {
         Self {
-            compression_strategy: Arc::<DefaultCompressionStrategy>::default(),
+            compression_strategy: Arc::new(DefaultCompressionStrategy::new()),
             version: LanceFileVersion::default(),
         }
     }
@@ -653,22 +652,23 @@ mod tests {
         );
 
         // Test with V2.1 - should succeed
-        let strategy = configured_encoding_strategy(LanceFileVersion::V2_1, params.clone())
-            .expect("Should succeed for V2.1");
+        let strategy =
+            default_encoding_strategy_with_params(LanceFileVersion::V2_1, params.clone())
+                .expect("Should succeed for V2.1");
 
         // Verify it's a StructuralEncodingStrategy
         assert!(format!("{:?}", strategy).contains("StructuralEncodingStrategy"));
-        assert!(format!("{:?}", strategy).contains("ConfiguredCompressionStrategy"));
+        assert!(format!("{:?}", strategy).contains("DefaultCompressionStrategy"));
 
         // Test with V2.0 - should fail
-        let err = configured_encoding_strategy(LanceFileVersion::V2_0, params.clone())
+        let err = default_encoding_strategy_with_params(LanceFileVersion::V2_0, params.clone())
             .expect_err("Should fail for V2.0");
         assert!(err
             .to_string()
             .contains("only supported in Lance file version 2.1"));
 
         // Test with Legacy - should fail
-        let err = configured_encoding_strategy(LanceFileVersion::Legacy, params)
+        let err = default_encoding_strategy_with_params(LanceFileVersion::Legacy, params)
             .expect_err("Should fail for Legacy");
         assert!(err
             .to_string()

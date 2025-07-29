@@ -12,7 +12,6 @@ pub mod buffer;
 pub mod compression;
 pub mod compression_algo;
 pub mod compression_config;
-pub mod configured_compression_strategy;
 pub mod data;
 pub mod decoder;
 pub mod encoder;
