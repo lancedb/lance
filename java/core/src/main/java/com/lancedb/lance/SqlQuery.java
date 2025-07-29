@@ -11,28 +11,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.lancedb.lance.sql;
-
-import com.lancedb.lance.Dataset;
+package com.lancedb.lance;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
-import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 
 import java.io.IOException;
 import java.util.Optional;
 
 public class SqlQuery {
-  private BufferAllocator allocator;
   private Dataset dataset;
   private String sql;
   private String table;
   private boolean withRowId = false;
   private boolean withRowAddr = false;
 
-  public SqlQuery(BufferAllocator allocator, Dataset dataset, String sql) {
-    this.allocator = allocator;
+  public SqlQuery(Dataset dataset, String sql) {
     this.dataset = dataset;
     this.sql = sql;
   }
@@ -53,10 +48,10 @@ public class SqlQuery {
   }
 
   public ArrowReader intoBatchRecords() throws IOException {
-    try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
+    try (ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator)) {
       intoBatchRecords(
           dataset, sql, Optional.ofNullable(table), withRowId, withRowAddr, s.memoryAddress());
-      return Data.importArrayStream(allocator, s);
+      return Data.importArrayStream(dataset.allocator, s);
     }
   }
 
