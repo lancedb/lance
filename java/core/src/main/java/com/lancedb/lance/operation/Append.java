@@ -39,15 +39,15 @@ public class Append implements Operation {
   }
 
   @Override
-  public void release() {}
-
-  @Override
   public String toString() {
     return "Append{" + "fragments=" + fragments + '}';
   }
 
-  // Builder class for Append
-  public static class Builder implements Operation.Builder<Append> {
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  public static class Builder {
     private List<FragmentMetadata> fragments;
 
     public Builder() {}

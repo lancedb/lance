@@ -13,7 +13,6 @@
  */
 package com.lancedb.lance.operation;
 
-import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
@@ -23,8 +22,8 @@ import org.apache.arrow.vector.types.pojo.Schema;
  */
 public class Project extends SchemaOperation {
 
-  private Project(Schema schema, BufferAllocator allocator) {
-    super(schema, allocator);
+  private Project(Schema schema) {
+    super(schema);
   }
 
   @Override
@@ -37,23 +36,23 @@ public class Project extends SchemaOperation {
     return "Project{" + "schema=" + +'}';
   }
 
+  public static Builder builder() {
+    return new Builder();
+  }
+
   // Builder class for Project
-  public static class Builder implements Operation.Builder<Project> {
-    private final BufferAllocator allocator;
+  public static class Builder {
     private Schema schema;
 
-    public Builder(BufferAllocator allocator) {
-      this.allocator = allocator;
-    }
+    public Builder() {}
 
     public Builder schema(Schema schema) {
       this.schema = schema;
       return this;
     }
 
-    @Override
     public Project build() {
-      return new Project(schema, allocator);
+      return new Project(schema);
     }
   }
 }

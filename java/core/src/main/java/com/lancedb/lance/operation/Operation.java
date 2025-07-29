@@ -23,19 +23,6 @@ public interface Operation {
    */
   String name();
 
-  /** Release the underlying JNI resource including arrow c schema */
-  void release();
-
-  /**
-   * Builder interface for deferred operation construction. Used by {@link
-   * com.lancedb.lance.Transaction.Builder}
-   */
-  interface Builder<T extends Operation> {
-
-    T build();
-
-    default String desc() {
-      return getClass().getSimpleName();
-    }
-  }
+  /** Release the underlying JNI resource like arrow c schema */
+  default void release() {}
 }

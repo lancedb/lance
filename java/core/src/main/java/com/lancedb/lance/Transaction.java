@@ -13,16 +13,11 @@
  */
 package com.lancedb.lance;
 
-import com.lancedb.lance.operation.Append;
 import com.lancedb.lance.operation.Operation;
-import com.lancedb.lance.operation.Overwrite;
-import com.lancedb.lance.operation.Project;
 
 import org.apache.arrow.util.Preconditions;
-import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -35,7 +30,6 @@ public class Transaction {
   private final long readVersion;
   private final String uuid;
   private final Map<String, String> writeParams;
-  // Mainly for JNI usage
   private final Dataset dataset;
   private final Operation operation;
   private final Operation blobOp;
@@ -53,10 +47,6 @@ public class Transaction {
     this.operation = operation;
     this.blobOp = blobOp;
     this.writeParams = writeParams != null ? writeParams : new HashMap<>();
-  }
-
-  public Dataset dataset() {
-    return dataset;
   }
 
   public long readVersion() {
@@ -80,26 +70,25 @@ public class Transaction {
   }
 
   public Dataset commit() {
-    try {
-      Dataset committed = commitNative();
-      committed.allocator = dataset.allocator;
-      return committed;
-    } finally {
-      operation.release();
-      if (blobOp != null) {
-        blobOp.release();
-      }
+    if (dataset == null) {
+      throw new UnsupportedOperationException("Transaction doesn't support create new dataset yet");
     }
+    return dataset.commitTransaction(this);
   }
 
-  private native Dataset commitNative();
+  public void release() {
+    operation.release();
+    if (blobOp != null) {
+      blobOp.release();
+    }
+  }
 
   public static class Builder {
     private final String uuid;
     private final Dataset dataset;
     private long readVersion;
-    private Operation.Builder<?> operationBuilder;
-    private Operation.Builder<?> blobOpBuilder;
+    private Operation operation;
+    private Operation blobOp;
     private Map<String, String> writeParams;
 
     public Builder(Dataset dataset) {
@@ -117,61 +106,22 @@ public class Transaction {
       return this;
     }
 
-    public Builder operationBuilder(Operation.Builder<?> opBuilder) {
+    public Builder operation(Operation operation) {
       validateState();
-      this.operationBuilder = opBuilder;
-      return this;
-    }
-
-    public Builder project(Schema newSchema) {
-      validateState();
-      this.operationBuilder = new Project.Builder(dataset.allocator).schema(newSchema);
-      return this;
-    }
-
-    public Builder overwrite(List<FragmentMetadata> fragments, Schema schema) {
-      validateState();
-      this.operationBuilder =
-          new Overwrite.Builder(dataset.allocator).fragments(fragments).schema(schema);
-      return this;
-    }
-
-    /**
-     * upsertTableConfig would be reused for both Overwrite and UpdateConfig operations.
-     *
-     * @param upsertTableConfig the table config want to be upsert
-     * @return the builder
-     */
-    public Builder upsertTableConfig(Map<String, String> upsertTableConfig) {
-      if (operationBuilder instanceof Overwrite.Builder) {
-        operationBuilder = ((Overwrite.Builder) operationBuilder).configUpsertValues(upsertTableConfig);
-      }
-      // TODO: Reuse this for UpdateConfig operation
-      return this;
-    }
-
-    public Builder append(List<FragmentMetadata> fragments) {
-      validateState();
-      this.operationBuilder = new Append.Builder().fragments(fragments);
+      this.operation = operation;
       return this;
     }
 
     private void validateState() {
-      if (operationBuilder != null) {
+      if (operation != null) {
         throw new IllegalStateException(
-            String.format("Operation %s has been set", operationBuilder.desc()));
+            String.format("Operation %s has been set", operation.name()));
       }
     }
 
     public Transaction build() {
-      Preconditions.checkState(operationBuilder != null, "TransactionBuilder has no operations");
-      return new Transaction(
-          dataset,
-          readVersion,
-          uuid,
-          operationBuilder.build(),
-          blobOpBuilder != null ? blobOpBuilder.build() : null,
-          writeParams);
+      Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
+      return new Transaction(dataset, readVersion, uuid, operation, blobOp, writeParams);
     }
   }
 }

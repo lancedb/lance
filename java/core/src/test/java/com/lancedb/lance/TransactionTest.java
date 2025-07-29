@@ -14,6 +14,9 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
+import com.lancedb.lance.operation.Append;
+import com.lancedb.lance.operation.Overwrite;
+import com.lancedb.lance.operation.Project;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -57,17 +60,25 @@ public class TransactionTest {
       assertEquals(testDataset.getSchema(), dataset.getSchema());
       List<Field> fieldList = new ArrayList<>(testDataset.getSchema().getFields());
       Collections.reverse(fieldList);
-      Transaction txn = dataset.newTransactionBuilder().project(new Schema(fieldList)).build();
+      Transaction txn =
+          dataset
+              .newTransactionBuilder()
+              .operation(Project.builder().schema(new Schema(fieldList)).build())
+              .build();
       assertEquals(1, txn.readVersion());
       assertEquals(1, dataset.version());
-      assertEquals(1, txn.dataset().version());
+      assertEquals(1, dataset.version());
       try (Dataset committedDataset = txn.commit()) {
         assertEquals(1, txn.readVersion());
         assertEquals(1, dataset.version());
         assertEquals(2, committedDataset.version());
         assertEquals(new Schema(fieldList), committedDataset.getSchema());
         fieldList.remove(1);
-        txn = committedDataset.newTransactionBuilder().project(new Schema(fieldList)).build();
+        txn =
+            committedDataset
+                .newTransactionBuilder()
+                .operation(Project.builder().schema(new Schema(fieldList)).build())
+                .build();
         try (Dataset committedDataset2 = txn.commit()) {
           assertEquals(2, txn.readVersion());
           assertEquals(2, committedDataset.version());
@@ -89,7 +100,11 @@ public class TransactionTest {
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
       Transaction transaction =
-          dataset.newTransactionBuilder().append(Collections.singletonList(fragmentMeta)).build();
+          dataset
+              .newTransactionBuilder()
+              .operation(
+                  Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+              .build();
       try (Dataset dataset = transaction.commit()) {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
@@ -97,7 +112,12 @@ public class TransactionTest {
         assertThrows(
             IllegalArgumentException.class,
             () ->
-                dataset.newTransactionBuilder().append(new ArrayList<>()).build().commit().close());
+                dataset
+                    .newTransactionBuilder()
+                    .operation(Append.builder().fragments(new ArrayList<>()).build())
+                    .build()
+                    .commit()
+                    .close());
       }
     }
   }
@@ -116,7 +136,11 @@ public class TransactionTest {
       Transaction transaction =
           dataset
               .newTransactionBuilder()
-              .overwrite(Collections.singletonList(fragmentMeta), testDataset.getSchema())
+              .operation(
+                  Overwrite.builder()
+                      .fragments(Collections.singletonList(fragmentMeta))
+                      .schema(testDataset.getSchema())
+                      .build())
               .build();
       try (Dataset dataset = transaction.commit()) {
         assertEquals(2, dataset.version());
@@ -136,8 +160,12 @@ public class TransactionTest {
       transaction =
           dataset
               .newTransactionBuilder()
-              .overwrite(Collections.singletonList(fragmentMeta), testDataset.getSchema())
-              .upsertTableConfig(Collections.singletonMap("config_key", "config_value"))
+              .operation(
+                  Overwrite.builder()
+                      .fragments(Collections.singletonList(fragmentMeta))
+                      .schema(testDataset.getSchema())
+                      .configUpsertValues(Collections.singletonMap("config_key", "config_value"))
+                      .build())
               .build();
       try (Dataset dataset = transaction.commit()) {
         assertEquals(3, dataset.version());

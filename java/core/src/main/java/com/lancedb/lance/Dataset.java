@@ -59,8 +59,8 @@ public class Dataset implements Closeable {
 
   private long nativeDatasetHandle;
 
-  BufferAllocator allocator;
-  boolean selfManagedAllocator = false;
+  private BufferAllocator allocator;
+  private boolean selfManagedAllocator = false;
 
   private final LockManager lockManager = new LockManager();
 
@@ -272,6 +272,10 @@ public class Dataset implements Closeable {
       List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
 
+  public BufferAllocator allocator() {
+    return allocator;
+  }
+
   /**
    * Create a new transaction builder at current version for the dataset. The dataset itself will
    * not refresh after the transaction committed.
@@ -281,6 +285,26 @@ public class Dataset implements Closeable {
   public Transaction.Builder newTransactionBuilder() {
     return new Transaction.Builder(this).readVersion(version());
   }
+
+  /**
+   * Commit a single transaction and return a new Dataset with the new version. Original dataset
+   * version will not be refreshed.
+   *
+   * @param transaction The transaction to commit
+   * @return A new instance of {@link Dataset} linked to committed version.
+   */
+  public Dataset commitTransaction(Transaction transaction) {
+    Preconditions.checkNotNull(transaction);
+    try {
+      Dataset dataset = nativeCommitTransaction(transaction);
+      dataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      return dataset;
+    } finally {
+      transaction.release();
+    }
+  }
+
+  private native Dataset nativeCommitTransaction(Transaction transaction);
 
   /**
    * Drop a Dataset.

@@ -18,26 +18,27 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+/** Schema related base operation. */
 public abstract class SchemaOperation implements Operation {
 
   private final Schema schema;
-  private final BufferAllocator allocator;
   private ArrowSchema cSchema;
 
-  protected SchemaOperation(Schema schema, BufferAllocator allocator) {
+  protected SchemaOperation(Schema schema) {
     this.schema = schema;
-    this.allocator = allocator;
   }
 
   public Schema schema() {
     return schema;
   }
 
-  public BufferAllocator allocator() {
-    return allocator;
-  }
-
-  public long exportSchema() {
+  /**
+   * Export the schema to rust jni.
+   *
+   * @param allocator the buffer allocator
+   * @return the schema address
+   */
+  public long exportSchema(BufferAllocator allocator) {
     if (cSchema == null) {
       this.cSchema = ArrowSchema.allocateNew(allocator);
       Data.exportSchema(allocator, schema, null, cSchema);

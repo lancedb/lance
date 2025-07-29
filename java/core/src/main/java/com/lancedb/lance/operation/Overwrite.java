@@ -15,7 +15,6 @@ package com.lancedb.lance.operation;
 
 import com.lancedb.lance.FragmentMetadata;
 
-import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.List;
@@ -32,11 +31,8 @@ public class Overwrite extends SchemaOperation {
   private final Map<String, String> configUpsertValues;
 
   protected Overwrite(
-      List<FragmentMetadata> fragments,
-      Schema schema,
-      Map<String, String> configUpsertValues,
-      BufferAllocator allocator) {
-    super(schema, allocator);
+      List<FragmentMetadata> fragments, Schema schema, Map<String, String> configUpsertValues) {
+    super(schema);
     this.fragments = fragments;
     this.configUpsertValues = configUpsertValues;
   }
@@ -47,6 +43,10 @@ public class Overwrite extends SchemaOperation {
 
   public Map<String, String> configUpsertValues() {
     return configUpsertValues;
+  }
+
+  public static Builder builder() {
+    return new Builder();
   }
 
   @Override
@@ -67,15 +67,12 @@ public class Overwrite extends SchemaOperation {
   }
 
   // Builder class for Overwrite
-  public static class Builder implements Operation.Builder<Overwrite> {
-    private final BufferAllocator allocator;
+  public static class Builder {
     private List<FragmentMetadata> fragments;
     private Schema schema;
     private Map<String, String> configUpsertValues;
 
-    public Builder(BufferAllocator allocator) {
-      this.allocator = allocator;
-    }
+    private Builder() {}
 
     public Builder fragments(List<FragmentMetadata> fragments) {
       this.fragments = fragments;
@@ -93,7 +90,7 @@ public class Overwrite extends SchemaOperation {
     }
 
     public Overwrite build() {
-      return new Overwrite(fragments, schema, configUpsertValues, allocator);
+      return new Overwrite(fragments, schema, configUpsertValues);
     }
   }
 }
