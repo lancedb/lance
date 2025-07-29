@@ -58,10 +58,10 @@ mod file_reader;
 mod file_writer;
 mod fragment;
 mod schema;
+mod sql;
 pub mod traits;
 mod transaction;
 pub mod utils;
-mod sql;
 
 pub use error::Error;
 pub use error::Result;
