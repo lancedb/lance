@@ -61,6 +61,7 @@ mod schema;
 pub mod traits;
 mod transaction;
 pub mod utils;
+mod sql;
 
 pub use error::Error;
 pub use error::Result;

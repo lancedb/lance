@@ -21,6 +21,7 @@ import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.schema.ColumnAlteration;
 import com.lancedb.lance.schema.LanceSchema;
 import com.lancedb.lance.schema.SqlExpressions;
+import com.lancedb.lance.sql.SqlQuery;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
@@ -894,6 +895,10 @@ public class Dataset implements Closeable {
         return nativeGetVersionByTag(tag);
       }
     }
+  }
+
+  public SqlQuery sql(String sql, String tableName) {
+    return new SqlQuery(allocator, this, sql, tableName);
   }
 
   private native void nativeCreateTag(String tag, long version);
