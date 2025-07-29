@@ -487,7 +487,6 @@ impl Scanner {
     /// The row_address will be scanned.
     pub fn empty_project(&mut self) -> Result<&mut Self> {
         self.with_row_address();
-        self.projection_plan.final_projection_is_empty = true;
         self.project(&[ROW_ADDR])
     }
 
@@ -535,7 +534,10 @@ impl Scanner {
             .iter()
             .filter(|(col, _)| {
                 let col_name = col.as_ref();
-                !(col_name == ROW_ID || col_name == ROW_ADDR)
+                !(col_name == ROW_ID
+                    || col_name == ROW_ADDR
+                    || col_name == DIST_COL
+                    || col_name == SCORE_COL)
             })
             .map(|(c, t)| (c.as_ref(), t.as_ref()))
             .collect();
@@ -1356,7 +1358,7 @@ impl Scanner {
     fn validate_options(&self) -> Result<()> {
         // Note: it's _ok_ (though maybe dubious) if the projection is empty and there is a vector search
         // or FTS because we might be projecting just the _distance / _score columns
-        if self.projection_plan.physical_projection.is_empty()
+        if !self.projection_plan.has_output_cols()
             && self.nearest.is_none()
             && self.full_text_query.is_none()
         {
@@ -1502,6 +1504,21 @@ impl Scanner {
             (Some(_), None) => self.vector_search_source(&mut filter_plan).await?,
             (None, Some(query)) => self.fts_search_source(&mut filter_plan, query).await?,
             (None, None) => {
+                if self.projection_plan.physical_projection.is_empty() {
+                    // Note: even though we are just going to return an error we still want to calculate the
+                    // output_expr here.  This lets us distinguish between a user doing something like:
+                    //
+                    // SELECT 1 FROM t (not supported error)
+                    // SELECT non_existent_column FROM t (column not found error)
+                    let output_expr = self.output_expr(&ArrowSchema::empty())?;
+                    // This means the user is doing something like `SELECT 1`.  We don't support this and
+                    // I'm not sure we should.  Users should use a full SQL API to do something like this.
+                    return Err(Error::NotSupported {
+                        source: format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into(),
+                        location: location!(),
+                    });
+                }
+
                 let planned_read = self.filtered_read_source(&mut filter_plan).await?;
                 if planned_read.limit_pushed_down {
                     use_limit_node = false;
@@ -1584,10 +1601,8 @@ impl Scanner {
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
         // Stage 7: final projection
-        let output_expr = match self.projection_plan.final_projection_is_empty {
-            true => vec![],
-            false => self.output_expr(plan.schema().as_ref())?,
-        };
+        let output_expr = self.output_expr(plan.schema().as_ref())?;
+
         plan = Arc::new(DFProjectionExec::try_new(output_expr, plan)?);
 
         // Stage 8: If requested, apply a strict batch size to the final output
@@ -3503,6 +3518,53 @@ mod test {
 
         let batch_sizes = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
         assert_eq!(batch_sizes, vec![10, 10, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_column_not_exist() {
+        let dataset = lance_datagen::gen()
+            .col("x", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(7), FragmentRowCount::from(6))
+            .await
+            .unwrap();
+
+        let check_err_msg = |r: Result<DatasetRecordBatchStream>| {
+            let err = match r {
+                Ok(_) => panic!(
+                    "Expected an error to be raised saying column y is not found but got no error"
+                ),
+                Err(e) => e,
+            };
+
+            assert!(
+                err.to_string().contains("No field named y"),
+                "Expected error to contain 'No field named y' but got {}",
+                err
+            );
+        };
+
+        let mut scan = dataset.scan();
+        scan.project(&["x", "y"]).unwrap();
+        check_err_msg(scan.try_into_stream().await);
+
+        let mut scan = dataset.scan();
+        scan.project(&["y"]).unwrap();
+        check_err_msg(scan.try_into_stream().await);
+
+        // This represents a query like `SELECT 1 AS foo` which we could _technically_ satisfy
+        // but it is not supported today
+        let mut scan = dataset.scan();
+        scan.project_with_transform(&[("foo", "1")]).unwrap();
+        match scan.try_into_stream().await {
+            Ok(_) => panic!("Expected an error to be raised saying not supported"),
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("Received only dynamic expressions"),
+                    "Expected error to contain 'Received only dynamic expressions' but got {}",
+                    e
+                );
+            }
+        }
     }
 
     #[cfg(not(windows))]

@@ -29,10 +29,6 @@ pub struct ProjectionPlan {
     base: Arc<dyn Projectable>,
     /// The physical schema that must be loaded from the dataset
     pub physical_projection: Projection,
-    /// True if the final schema of datafusion execution plan is empty.
-    /// e.g.
-    ///   select count(*) from dataset
-    pub final_projection_is_empty: bool,
 
     /// If present, expressions that represent the output columns.  These expressions
     /// run on the output of the physical projection.
@@ -50,7 +46,6 @@ impl ProjectionPlan {
         Self {
             base,
             physical_projection,
-            final_projection_is_empty: false,
             requested_output_expr: None,
         }
     }
@@ -167,6 +162,17 @@ impl ProjectionPlan {
 
     pub fn include_row_addr(&mut self) {
         self.physical_projection.with_row_addr = true;
+    }
+
+    /// Check if the projection has any output columns
+    ///
+    /// This doesn't mean there is a physical projection.  For example, we may someday support
+    /// something like `SELECT 1 AS foo` which would have an output column (foo) but no physical projection
+    pub fn has_output_cols(&self) -> bool {
+        self.requested_output_expr
+            .as_ref()
+            .map(|exprs| !exprs.is_empty())
+            .unwrap_or(!self.physical_projection.is_empty())
     }
 
     pub fn output_schema(&self) -> Result<ArrowSchema> {
