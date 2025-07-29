@@ -153,6 +153,11 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
+        self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
+        self
+    }
+
     /// Provide the set of row addresses that were deleted or updated. This is
     /// used to perform fast conflict resolution.
     pub fn with_affected_rows(mut self, affected_rows: RowIdTreeMap) -> Self {
@@ -232,9 +237,12 @@ impl<'a> CommitBuilder<'a> {
             });
         }
 
-        let metadata_cache = match &dest {
-            WriteDestination::Dataset(ds) => ds.metadata_cache.clone(),
-            WriteDestination::Uri(uri) => Arc::new(session.metadata_cache.for_dataset(uri)),
+        let (metadata_cache, index_cache) = match &dest {
+            WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
+            WriteDestination::Uri(uri) => (
+                Arc::new(session.metadata_cache.for_dataset(uri)),
+                Arc::new(session.index_cache.for_dataset(uri)),
+            ),
         };
 
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
@@ -383,7 +391,9 @@ impl<'a> CommitBuilder<'a> {
                 session,
                 commit_handler,
                 tags,
+                index_cache,
                 metadata_cache,
+                file_reader_options: None,
             }),
         }
     }

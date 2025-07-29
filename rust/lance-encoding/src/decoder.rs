@@ -232,7 +232,7 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
 use lance_core::{ArrowResult, Error, Result};
-use tracing::{instrument, Instrument};
+use tracing::instrument;
 
 use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
@@ -491,6 +491,15 @@ impl CoreFieldDecoderStrategy {
     pub fn with_cache_repetition_index(mut self, cache_repetition_index: bool) -> Self {
         self.cache_repetition_index = cache_repetition_index;
         self
+    }
+
+    /// Create a new strategy from decoder config
+    pub fn from_decoder_config(config: &DecoderConfig) -> Self {
+        Self {
+            validate_data: config.validate_on_decode,
+            decompressor_strategy: Arc::new(DefaultDecompressionStrategy {}),
+            cache_repetition_index: config.cache_repetition_index,
+        }
     }
 
     /// This is just a sanity check to ensure there is no "wrapped encodings"
@@ -932,7 +941,7 @@ impl DecodeBatchScheduler {
         io: Arc<dyn EncodingsIo>,
         cache: Arc<LanceCache>,
         filter: &FilterExpression,
-        cache_repetition_index: bool,
+        decoder_config: &DecoderConfig,
     ) -> Result<Self> {
         assert!(num_rows > 0);
         let buffers = FileBuffers {
@@ -953,8 +962,7 @@ impl DecodeBatchScheduler {
         if column_infos[0].is_structural() {
             let mut column_iter = ColumnInfoIter::new(column_infos.to_vec(), column_indices);
 
-            let strategy = CoreFieldDecoderStrategy::default()
-                .with_cache_repetition_index(cache_repetition_index);
+            let strategy = CoreFieldDecoderStrategy::from_decoder_config(decoder_config);
             let mut root_scheduler =
                 strategy.create_structural_field_scheduler(&root_field, &mut column_iter)?;
 
@@ -978,8 +986,7 @@ impl DecodeBatchScheduler {
                 .chain(column_indices.iter().map(|i| i.saturating_add(1)))
                 .collect::<Vec<_>>();
             let mut column_iter = ColumnInfoIter::new(columns, &adjusted_column_indices);
-            let strategy = CoreFieldDecoderStrategy::default()
-                .with_cache_repetition_index(cache_repetition_index);
+            let strategy = CoreFieldDecoderStrategy::from_decoder_config(decoder_config);
             let root_scheduler =
                 strategy.create_legacy_field_scheduler(&root_field, &mut column_iter, buffers)?;
 
@@ -1388,21 +1395,17 @@ impl BatchDecodeStream {
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
-                let task = tokio::spawn(
-                    (async move {
-                        let next_task = next_task?;
-                        next_task.into_batch(emitted_batch_size_warning)
-                    })
-                    .in_current_span(),
-                );
+                let task = async move {
+                    let next_task = next_task?;
+                    next_task.into_batch(emitted_batch_size_warning)
+                };
                 (task, num_rows)
             });
             next_task.map(|(task, num_rows)| {
-                let task = task.map(|join_wrapper| join_wrapper.unwrap()).boxed();
                 // This should be true since batch size is u32
                 debug_assert!(num_rows <= u32::MAX as u64);
                 let next_task = ReadBatchTask {
-                    task,
+                    task: task.boxed(),
                     num_rows: num_rows as u32,
                 };
                 (next_task, slf)
@@ -1715,18 +1718,17 @@ impl StructuralBatchDecodeStream {
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
-                let task = tokio::spawn(async move {
+                let task = async move {
                     let next_task = next_task?;
                     next_task.into_batch(emitted_batch_size_warning)
-                });
+                };
                 (task, num_rows)
             });
             next_task.map(|(task, num_rows)| {
-                let task = task.map(|join_wrapper| join_wrapper.unwrap()).boxed();
                 // This should be true since batch size is u32
                 debug_assert!(num_rows <= u32::MAX as u64);
                 let next_task = ReadBatchTask {
-                    task,
+                    task: task.boxed(),
                     num_rows: num_rows as u32,
                 };
                 (next_task, slf)
@@ -1751,15 +1753,23 @@ impl RequestedRows {
     }
 }
 
+/// Configuration for decoder behavior
+#[derive(Debug, Clone, Default)]
+pub struct DecoderConfig {
+    /// Whether to cache repetition indices for better performance
+    pub cache_repetition_index: bool,
+    /// Whether to validate decoded data
+    pub validate_on_decode: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct SchedulerDecoderConfig {
     pub decoder_plugins: Arc<DecoderPlugins>,
     pub batch_size: u32,
     pub io: Arc<dyn EncodingsIo>,
     pub cache: Arc<LanceCache>,
-    pub should_validate: bool,
-    /// Whether to cache repetition indices for better performance
-    pub cache_repetition_index: bool,
+    /// Decoder configuration
+    pub decoder_config: DecoderConfig,
 }
 
 fn check_scheduler_on_drop(
@@ -1861,7 +1871,7 @@ fn create_scheduler_decoder(
         num_rows,
         config.batch_size,
         is_structural,
-        config.should_validate,
+        config.decoder_config.validate_on_decode,
         rx,
     );
 
@@ -1876,7 +1886,7 @@ fn create_scheduler_decoder(
             config.io.clone(),
             config.cache,
             &filter,
-            config.cache_repetition_index,
+            &config.decoder_config,
         )
         .await
         {
@@ -1987,7 +1997,7 @@ pub fn schedule_and_decode_blocking(
         config.io.clone(),
         config.cache,
         &filter,
-        config.cache_repetition_index,
+        &config.decoder_config,
     ))?;
 
     // Schedule the requested rows
@@ -2014,7 +2024,7 @@ pub fn schedule_and_decode_blocking(
         &target_schema,
         num_rows,
         config.batch_size,
-        config.should_validate,
+        config.decoder_config.validate_on_decode,
         is_structural,
         messages.into(),
     );
@@ -2538,7 +2548,7 @@ pub async fn decode_batch(
         io_scheduler.clone(),
         cache,
         filter,
-        false, // cache_repetition_index - default to false for decode_batch
+        &DecoderConfig::default(),
     )
     .await?;
     let (tx, rx) = unbounded_channel();

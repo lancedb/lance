@@ -509,9 +509,9 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_index,
                     ..
                 } => {
-                    // if FRI is available, index remapping is deferred and
+                    // if frag_reuse_index is available, index remapping is deferred and
                     // there is no conflict with concurrent CreateIndex of column indices.
-                    // The only case that needs rebasing is when the FRI cleanup
+                    // The only case that needs rebasing is when the frag_reuse_index cleanup
                     // triggers a CreateIndex, and it needs to add the new reuse
                     // version created by the rewrite
                     if let Some(committed_fri) = frag_reuse_index {
@@ -520,7 +520,7 @@ impl<'a> TransactionRebase<'a> {
                             .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
                         {
                             // this should not happen today since we don't support committing
-                            // a mixture of fri and other indices.
+                            // a mixture of frag_reuse_index and other indices.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 return Err(self.incompatible_conflict_err(
                                     other_transaction,
@@ -642,9 +642,9 @@ impl<'a> TransactionRebase<'a> {
                             location!(),
                         ))
                     } else if committed_fri.is_some() && frag_reuse_index.is_some() {
-                        // Do not commit concurrent rewrites that could produce conflicting FRIs.
+                        // Do not commit concurrent rewrites that could produce conflicting frag_reuse_indexes.
                         // The other rewrite must retry.
-                        // TODO: could potentially rebase to combine both FRIs,
+                        // TODO: could potentially rebase to combine both frag_reuse_indexes,
                         //   but today it is already rare to run concurrent rewrites.
                         Err(self.retryable_conflict_err(
                             other_transaction,
@@ -670,12 +670,12 @@ impl<'a> TransactionRebase<'a> {
                             .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
                         &frag_reuse_index,
                     ) {
-                        // If the rewrite produces a FRI, but FRI was cleaned up
-                        // in the other transaction, the FRI produced by the rewrite should
+                        // If the rewrite produces a frag_reuse_index, but frag_reuse_index was cleaned up
+                        // in the other transaction, the frag_reuse_index produced by the rewrite should
                         // be cleaned up in the same way as a part of the rebase.
                         (Some(committed_fri), Some(_)) => {
                             // this should not happen today since we don't support committing
-                            // a mixture of FRI and other indices.
+                            // a mixture of frag_reuse_index and other indices.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 return Err(self.incompatible_conflict_err(
                                     other_transaction,
@@ -691,10 +691,10 @@ impl<'a> TransactionRebase<'a> {
                         // If rewrite defers index remap,
                         // then it does not conflict with index creation
                         (None, Some(_)) => Ok(()),
-                        // Rewrite with remapping and FRI creation can commit without conflict
+                        // Rewrite with remapping and frag_reuse_index creation can commit without conflict
                         (Some(_), None) => {
                             // this should not happen today since we don't support committing
-                            // a mixture of FRI and other indices.
+                            // a mixture of frag_reuse_index and other indices.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 Err(self.incompatible_conflict_err(
                                     other_transaction,
@@ -1286,7 +1286,10 @@ impl<'a> TransactionRebase<'a> {
                         fragment_id: *fragment_id,
                         deletion_file,
                     };
-                    dataset.metadata_cache.insert_with_key(&key, Arc::new(dv));
+                    dataset
+                        .metadata_cache
+                        .insert_with_key(&key, Arc::new(dv))
+                        .await;
 
                     // TODO: also cleanup the old deletion file.
                     new_deletion_files.insert(*fragment_id, new_deletion_file);
@@ -1363,7 +1366,7 @@ impl<'a> TransactionRebase<'a> {
                 max_versions.push(max_version);
             }
 
-            // there should be only 1 FRI in new indices
+            // there should be only 1 frag_reuse_index in new indices
             let new_fri = &new_indices[0];
             let mut new_fri_details = Arc::try_unwrap(
                 load_frag_reuse_index_details(dataset, new_fri)
@@ -1375,7 +1378,7 @@ impl<'a> TransactionRebase<'a> {
 
             let new_frag_bitmap = new_fri_details.new_frag_bitmap();
 
-            let new_fri_meta = build_frag_reuse_index_metadata(
+            let new_frag_reuse_index_meta = build_frag_reuse_index_metadata(
                 dataset,
                 Some(new_fri),
                 new_fri_details,
@@ -1384,7 +1387,7 @@ impl<'a> TransactionRebase<'a> {
             .await?;
 
             new_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
-            new_indices.push(new_fri_meta);
+            new_indices.push(new_frag_reuse_index_meta);
             Ok(self.transaction)
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1430,7 +1433,7 @@ impl<'a> TransactionRebase<'a> {
                     // If committed_fri is empty, that means everything is cleaned up.
                     // then only the last item in committed_fri should be retained, which is [3].
                     // Note that this is under the assumption that the sequence of
-                    // conflicting_frag_reuse_indices all come from FRI cleanup rebase.
+                    // conflicting_frag_reuse_indices all come from frag_reuse_index cleanup rebase.
                     match committed_min_dataset_version {
                         Some(committed_min_dataset_version) => {
                             if committed_min_dataset_version > min_dataset_version {
@@ -1453,7 +1456,7 @@ impl<'a> TransactionRebase<'a> {
                     .retain(|v| v.dataset_version >= min_dataset_version);
                 let new_frag_bitmap = new_fri_details.new_frag_bitmap();
 
-                let new_fri_meta = build_frag_reuse_index_metadata(
+                let new_frag_reuse_index_meta = build_frag_reuse_index_metadata(
                     dataset,
                     Some(new_fri),
                     new_fri_details,
@@ -1461,7 +1464,7 @@ impl<'a> TransactionRebase<'a> {
                 )
                 .await?;
 
-                *frag_reuse_index = Some(new_fri_meta);
+                *frag_reuse_index = Some(new_frag_reuse_index_meta);
                 Ok(self.transaction)
             } else {
                 Ok(self.transaction)
@@ -1660,7 +1663,8 @@ mod tests {
         };
         dataset
             .metadata_cache
-            .insert_with_key(&key, Arc::new(current_deletions));
+            .insert_with_key(&key, Arc::new(current_deletions))
+            .await;
 
         fragment.clone()
     }

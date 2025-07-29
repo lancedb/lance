@@ -17,7 +17,9 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
-use lance_core::{error::LanceOptionExt, utils::mask::RowIdTreeMap, Error, Result};
+use lance_core::{
+    cache::LanceCache, error::LanceOptionExt, utils::mask::RowIdTreeMap, Error, Result,
+};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::location;
@@ -210,7 +212,8 @@ impl ScalarIndex for BitmapIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        _index_cache: LanceCache,
     ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         let total_rows = page_lookup_file.num_rows();
@@ -262,8 +265,8 @@ impl ScalarIndex for BitmapIndex {
                 let bitmap_bytes = bitmap_binary_array.value(idx);
                 let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
-                if let Some(fri_ref) = fri.as_ref() {
-                    bitmap = fri_ref.remap_row_ids_tree_map(&bitmap);
+                if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                    bitmap = frag_reuse_index_ref.remap_row_ids_tree_map(&bitmap);
                 }
 
                 index_map_size_bytes += key.deep_size_of();
@@ -548,7 +551,7 @@ pub mod tests {
 
         // Load the index using BitmapIndex::load
         tracing::info!("Loading index from disk...");
-        let loaded_index = BitmapIndex::load(Arc::new(test_store), None)
+        let loaded_index = BitmapIndex::load(Arc::new(test_store), None, LanceCache::no_cache())
             .await
             .expect("Failed to load bitmap index");
 
@@ -696,7 +699,7 @@ pub mod tests {
             .unwrap();
 
         // Reload and check
-        let reloaded_idx = BitmapIndex::load(test_store, None)
+        let reloaded_idx = BitmapIndex::load(test_store, None, LanceCache::no_cache())
             .await
             .expect("Failed to load bitmap index");
 

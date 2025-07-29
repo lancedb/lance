@@ -280,6 +280,12 @@ message Rle {
   uint64 bits_per_value = 1;
 }
 
+// Byte Stream Split encoding for floating point values
+message ByteStreamSplit {
+  // Number of bits per value (32 for float, 64 for double)
+  uint64 bits_per_value = 1;
+}
+
 // General miniblock encoding - wraps another miniblock encoding with compression
 message GeneralMiniBlock {
   // The inner miniblock encoding (e.g., Rle, Bitpacked, etc.)
@@ -311,6 +317,7 @@ message ArrayEncoding {
         Block block = 18;
         Rle rle = 19;
         GeneralMiniBlock general_mini_block = 20;
+        ByteStreamSplit byte_stream_split = 21;
     }
 }
 

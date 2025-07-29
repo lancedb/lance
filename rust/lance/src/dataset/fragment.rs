@@ -23,8 +23,7 @@ use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::utils::tracing::StreamTracingExt;
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{cache::CacheKey, datatypes::Schema, Error, Result};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
@@ -614,6 +613,8 @@ pub struct FragReadConfig {
     ///
     /// operation_priority: u32 | reader_priority: u32 | file_position: u64
     pub reader_priority: Option<u32>,
+    /// File reader options to use when reading data files.
+    pub file_reader_options: Option<FileReaderOptions>,
 }
 
 impl FragReadConfig {
@@ -634,6 +635,11 @@ impl FragReadConfig {
 
     pub fn with_reader_priority(mut self, value: u32) -> Self {
         self.reader_priority = Some(value);
+        self
+    }
+
+    pub fn with_file_reader_options(mut self, value: FileReaderOptions) -> Self {
+        self.file_reader_options = Some(value);
         self
     }
 }
@@ -725,7 +731,7 @@ impl FileFragment {
                 None,
                 Arc::<DecoderPlugins>::default(),
                 &dataset.metadata_cache.file_metadata_cache(&filepath),
-                FileReaderOptions::default(),
+                dataset.file_reader_options.clone().unwrap_or_default(),
             )
             .await?;
             // If the schemas are not compatible we can't calculate field id offsets
@@ -950,7 +956,11 @@ impl FileFragment {
                     Arc::<DecoderPlugins>::default(),
                     file_metadata,
                     &metadata_cache,
-                    FileReaderOptions::default(),
+                    read_config
+                        .file_reader_options
+                        .clone()
+                        .or_else(|| self.dataset.file_reader_options.clone())
+                        .unwrap_or_default(),
                 )
                 .await?,
             );
@@ -1327,7 +1337,7 @@ impl FileFragment {
         let cache = self.dataset.metadata_cache.file_metadata_cache(path);
 
         let file_metadata = cache
-            .get_or_insert("".into(), |_| async {
+            .get_or_insert_with_key(FileMetadataCacheKey, || async {
                 let file_metadata: CachedFileMetadata =
                     v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
                 Ok(file_metadata)
@@ -1677,6 +1687,18 @@ impl FileFragment {
         .await?;
 
         Ok(Some(self))
+    }
+}
+
+// Cache key for file metadata
+#[derive(Debug, Clone)]
+struct FileMetadataCacheKey;
+
+impl CacheKey for FileMetadataCacheKey {
+    type ValueType = CachedFileMetadata;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "".into()
     }
 }
 
@@ -2116,10 +2138,6 @@ impl FragmentReader {
                         })
                         .boxed()
                 })
-                .stream_in_span(tracing::debug_span!(
-                    "ReadBatchFutStream",
-                    id = self.fragment_id,
-                ))
                 .boxed(),
         )
     }
@@ -2269,10 +2287,6 @@ impl FragmentReader {
                         })
                         .boxed()
                 })
-                .stream_in_span(tracing::debug_span!(
-                    "ReadBatchFutStream",
-                    id = self.fragment_id,
-                ))
                 .boxed(),
         )
     }
@@ -3075,16 +3089,23 @@ mod tests {
             let batches = stream.try_collect::<Vec<_>>().await.unwrap();
 
             assert_eq!(batches[1].schema().as_ref(), &(&new_projection).into());
-            let max_value_in_batch = if with_delete { 15 } else { 20 };
+            let expected_i = match (with_delete, data_storage_version) {
+                // Legacy format uses old scan node which deletes after read and
+                // so the batch is truncated
+                (true, LanceFileVersion::Legacy) => vec![10, 11, 12, 13, 14],
+                // Newer formats delete before read and so we get a full batch of 10
+                (true, _) => vec![10, 11, 12, 13, 14, 20, 21, 22, 23, 24],
+                (false, _) => vec![10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+            };
             let expected_batch = RecordBatch::try_new(
                 Arc::new(ArrowSchema::new(vec![
                     ArrowField::new("i", DataType::Int32, true),
                     ArrowField::new("double_i", DataType::Int32, true),
                 ])),
                 vec![
-                    Arc::new(Int32Array::from_iter_values(10..max_value_in_batch)),
+                    Arc::new(Int32Array::from_iter_values(expected_i.iter().copied())),
                     Arc::new(Int32Array::from_iter_values(
-                        (20..(2 * max_value_in_batch)).step_by(2),
+                        expected_i.iter().map(|i| 2 * i),
                     )),
                 ],
             )

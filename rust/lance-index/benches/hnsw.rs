@@ -16,7 +16,7 @@ use pprof::criterion::{Output, PProfProfiler};
 
 use lance_index::vector::{
     flat::storage::FlatFloatStorage,
-    hnsw::builder::{HnswBuildParams, HNSW},
+    hnsw::builder::{HnswBuildParams, HnswQueryParams, HNSW},
 };
 use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array_with_seed;
@@ -42,7 +42,17 @@ fn bench_hnsw(c: &mut Criterion) {
                     HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default().max_level(6))
                         .unwrap();
                 let uids: HashSet<u32> = hnsw
-                    .search_basic(query.clone(), K, 300, None, vectors.as_ref())
+                    .search_basic(
+                        query.clone(),
+                        K,
+                        &HnswQueryParams {
+                            ef: 300,
+                            lower_bound: None,
+                            upper_bound: None,
+                        },
+                        None,
+                        vectors.as_ref(),
+                    )
                     .unwrap()
                     .iter()
                     .map(|node| node.id)
@@ -60,7 +70,17 @@ fn bench_hnsw(c: &mut Criterion) {
         |b| {
             b.to_async(&rt).iter(|| async {
                 let uids: HashSet<u32> = hnsw
-                    .search_basic(query.clone(), K, 300, None, vectors.as_ref())
+                    .search_basic(
+                        query.clone(),
+                        K,
+                        &HnswQueryParams {
+                            ef: 300,
+                            lower_bound: None,
+                            upper_bound: None,
+                        },
+                        None,
+                        vectors.as_ref(),
+                    )
                     .unwrap()
                     .iter()
                     .map(|node| node.id)

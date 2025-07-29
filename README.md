@@ -207,7 +207,7 @@ We used the SIFT dataset to benchmark our results with 1M vectors of 128D
 
 We create a Lance dataset using the Oxford Pet dataset to do some preliminary performance testing of Lance as compared to Parquet and raw image/XMLs. For analytics queries, Lance is 50-100x better than reading the raw metadata. For batched random access, Lance is 100x better than both parquet and raw files.
 
-![](docs/lance_perf.png)
+![](docs/src/images/lance_perf.png)
 
 ## Why are you building yet another data format?!
 

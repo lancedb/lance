@@ -192,27 +192,13 @@ pub enum WhenMatched {
     DoNothing,
     /// The row is updated (similar to UpdateAll) only for rows where the expression evaluates to
     /// true
-    UpdateIf(Expr),
+    UpdateIf(String),
 }
 
 impl WhenMatched {
-    pub fn update_if(dataset: &Dataset, expr: &str) -> Result<Self> {
-        let dataset_schema: Schema = dataset.schema().into();
-        let combined_schema = combined_schema(&dataset_schema);
-        let planner = Planner::new(Arc::new(combined_schema));
-        let expr = planner
-            .parse_filter(expr)
-            .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
-        let expr = planner
-            .optimize_expr(expr)
-            .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
-        Ok(Self::UpdateIf(expr))
+    pub fn update_if(_dataset: &Dataset, expr: &str) -> Result<Self> {
+        // Store the expression string and defer parsing until we know which path to take
+        Ok(Self::UpdateIf(expr.to_string()))
     }
 }
 
@@ -244,6 +230,11 @@ struct MergeInsertParams {
     // If set, this MemWAL should be marked as flushed, and will be committed to replace the
     // MemWAL that is currently in the index with the same ID.
     mem_wal_to_flush: Option<MemWal>,
+    // If true, skip auto cleanup during commits. This should be set to true
+    // for high frequency writes to improve performance. This is also useful
+    // if the writer does not have delete permissions and the clean up would
+    // just try and log a failure anyway.
+    skip_auto_cleanup: bool,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -323,6 +314,7 @@ impl MergeInsertBuilder {
                 conflict_retries: 10,
                 retry_timeout: Duration::from_secs(30),
                 mem_wal_to_flush: None,
+                skip_auto_cleanup: false,
             },
         })
     }
@@ -375,6 +367,11 @@ impl MergeInsertBuilder {
     /// The default is 30 seconds.
     pub fn retry_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.params.retry_timeout = timeout;
+        self
+    }
+
+    pub fn skip_auto_cleanup(&mut self, skip: bool) -> &mut Self {
+        self.params.skip_auto_cleanup = skip;
         self
     }
 
@@ -1158,7 +1155,8 @@ impl MergeInsertJob {
             } = execute_fut.await??;
             stats.num_attempts = backoff.attempt() + 1;
 
-            let mut commit_builder = CommitBuilder::new(ds.clone());
+            let mut commit_builder = CommitBuilder::new(ds.clone())
+                .with_skip_auto_cleanup(self.params.skip_auto_cleanup);
             if let Some(affected_rows) = affected_rows {
                 commit_builder = commit_builder.with_affected_rows(affected_rows);
             }
@@ -1240,9 +1238,18 @@ impl MergeInsertJob {
         let source_df = session_ctx.read_one_shot(source)?;
         let source_df_aliased = source_df.alias("source")?;
         let scan_aliased = scan.alias("target")?;
+        let join_type = if self.params.insert_not_matched {
+            JoinType::Right
+        } else {
+            JoinType::Inner
+        };
+        let dataset_schema: Schema = self.dataset.schema().into();
         let df = scan_aliased
-            .join(source_df_aliased, JoinType::Right, &on_cols, &on_cols, None)?
-            .with_column("action", merge_insert_action(&self.params)?)?;
+            .join(source_df_aliased, join_type, &on_cols, &on_cols, None)?
+            .with_column(
+                "action",
+                merge_insert_action(&self.params, Some(&dataset_schema))?,
+            )?;
 
         let (session_state, logical_plan) = df.into_parts();
 
@@ -1352,9 +1359,10 @@ impl MergeInsertJob {
         // We are migrating a new plan-based code path. For now, only using this
         // for select supported queries: upsert with full schema, no scalar index, and keeping unmatched rows.
         let has_scalar_index = self.join_key_as_scalar_index().await?.is_some();
-        let can_use_fast_path = self.params.insert_not_matched
-            && matches!(self.params.when_matched, WhenMatched::UpdateAll)
-            && !has_scalar_index
+        let can_use_fast_path = matches!(
+            self.params.when_matched,
+            WhenMatched::UpdateAll | WhenMatched::UpdateIf(_)
+        ) && !has_scalar_index
             && is_full_schema
             && matches!(
                 self.params.delete_not_matched_by_source,
@@ -1575,10 +1583,11 @@ impl Merger {
         } else {
             None
         };
-        let match_filter_expr = if let WhenMatched::UpdateIf(expr) = &params.when_matched {
+        let match_filter_expr = if let WhenMatched::UpdateIf(expr_str) = &params.when_matched {
             let combined_schema = Arc::new(combined_schema(&schema));
             let planner = Planner::new(combined_schema.clone());
-            let expr = planner.optimize_expr(expr.clone())?;
+            let expr = planner.parse_filter(expr_str)?;
+            let expr = planner.optimize_expr(expr)?;
             let match_expr = planner.create_physical_expr(&expr)?;
             let data_type = match_expr.data_type(combined_schema.as_ref())?;
             if data_type != DataType::Boolean {
@@ -1803,7 +1812,6 @@ impl Merger {
 
 #[cfg(test)]
 mod tests {
-
     use arrow_array::{
         types::UInt32Type, Int64Array, RecordBatchIterator, RecordBatchReader, StringArray,
         UInt32Array,
@@ -1817,6 +1825,7 @@ mod tests {
     use lance_io::object_store::ObjectStoreParams;
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
+    use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::sync::{Barrier, Notify};
 
@@ -1851,7 +1860,7 @@ mod tests {
         let new_reader = Box::new(RecordBatchIterator::new([Ok(new_data)], schema.clone()));
         let new_stream = reader_to_stream(new_reader);
 
-        let (merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
+        let (merged_dataset, merge_stats) = job.execute(new_stream).boxed().await.unwrap();
 
         let batches = merged_dataset
             .scan()
@@ -3042,15 +3051,236 @@ mod tests {
     ProjectionExec: expr=[_rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN __common_expr_1@0 AND _rowaddr@1 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as action]
       ProjectionExec: expr=[key@2 IS NOT NULL as __common_expr_1, _rowaddr@0 as _rowaddr, value@1 as value, key@2 as key]
         CoalesceBatchesExec...
-          HashJoinExec: mode=Partitioned, join_type=Right, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
-            CoalesceBatchesExec...
-              RepartitionExec...
-                RepartitionExec...
-                  LanceScan: uri=data, projection=[key], row_id=false, row_addr=true, ordered=false
-            CoalesceBatchesExec...
-              RepartitionExec...
-                RepartitionExec...
-                  StreamingTableExec: partition_sizes=1, projection=[value, key]"
+          HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
+            LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
+            row_id=false, row_addr=true, full_filter=--, refine_filter=--
+            RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
+              StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_update_only() {
+        let data = lance_datagen::gen()
+            .with_seed(Seed::from(1))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(32));
+
+        // Create dataset with initial data
+        let ds = Dataset::write(data, "memory://", None).await.unwrap();
+
+        // Create update-only job (insert_not_matched = false)
+        let merge_insert_job =
+            crate::dataset::MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(crate::dataset::WhenMatched::UpdateAll)
+                .when_not_matched(crate::dataset::WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+
+        // Create new data for update
+        let new_data = lance_datagen::gen()
+            .with_seed(Seed::from(2))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let new_data = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
+        let new_data_stream = reader_to_stream(Box::new(new_data));
+
+        // This should use the fast path (execute_uncommitted_v2)
+        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+
+        // The optimized plan should use Inner join instead of Right join
+        // since we're not inserting unmatched rows
+        assert_plan_node_equals(
+            plan,
+            "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=DoNothing, when_not_matched_by_source=Keep
+  CoalescePartitionsExec
+    ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN key@2 IS NOT NULL AND _rowaddr@0 IS NOT NULL THEN 1 ELSE 0 END as action]
+      CoalesceBatchesExec...
+        HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--
+          RepartitionExec...
+            StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        ).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_conditional_update() {
+        let data = lance_datagen::gen()
+            .with_seed(Seed::from(1))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(32));
+
+        // Create dataset with initial data
+        let ds = Dataset::write(data, "memory://", None).await.unwrap();
+
+        // Create conditional update job (WhenMatched::UpdateIf)
+        let merge_insert_job = crate::dataset::MergeInsertBuilder::try_new(
+            Arc::new(ds.clone()),
+            vec!["key".to_string()],
+        )
+        .unwrap()
+        .when_matched(crate::dataset::WhenMatched::update_if(&ds, "source.value > 20").unwrap())
+        .when_not_matched(crate::dataset::WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+
+        // Create new data for conditional update
+        let new_data = lance_datagen::gen()
+            .with_seed(Seed::from(2))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let new_data_reader = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
+        let new_data_stream = reader_to_stream(Box::new(new_data_reader));
+
+        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+
+        // The optimized plan should use Inner join and include the UpdateIf condition
+        assert_plan_node_equals(
+            plan,
+            "MergeInsert: on=[key], when_matched=UpdateIf(source.value > 20), when_not_matched=DoNothing, when_not_matched_by_source=Keep
+  CoalescePartitionsExec
+    ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN key@2 IS NOT NULL AND _rowaddr@0 IS NOT NULL AND value@1 > 20 THEN 1 ELSE 0 END as action]
+      CoalesceBatchesExec...
+        HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--
+          RepartitionExec...
+            StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        ).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_skip_auto_cleanup() {
+        use lance_core::utils::testing::MockClock;
+        let clock = MockClock::new();
+
+        let tmpdir = tempdir().unwrap();
+        let dataset_uri = tmpdir.path().join("test_dataset");
+        let dataset_path = dataset_uri.to_str().unwrap();
+
+        // Create initial dataset with auto cleanup interval of 1 version
+        let data = lance_datagen::gen()
+            .with_seed(Seed::from(1))
+            .col("id", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let mut auto_cleanup_params = HashMap::new();
+        auto_cleanup_params.insert("lance.auto_cleanup.interval".to_string(), "1".to_string());
+        auto_cleanup_params.insert(
+            "lance.auto_cleanup.older_than".to_string(),
+            "0ms".to_string(),
+        );
+
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            auto_cleanup: Some(crate::dataset::AutoCleanupParams {
+                interval: 1,
+                older_than: chrono::TimeDelta::try_milliseconds(0).unwrap(),
+            }),
+            ..Default::default()
+        };
+
+        // Start at 1 second after epoch
+        clock.set_system_time(chrono::Duration::seconds(1));
+
+        let dataset = Dataset::write(data, dataset_path, Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.version().version, 1);
+
+        // Advance time
+        clock.set_system_time(chrono::Duration::seconds(2));
+
+        // First merge insert WITHOUT skip_auto_cleanup - should trigger cleanup
+        let new_data = lance_datagen::gen()
+            .with_seed(Seed::from(2))
+            .col("id", array::step::<UInt32Type>())
+            .into_df_stream(RowCount::from(50), BatchCount::from(1));
+
+        let (dataset2, _) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute(new_data)
+            .await
+            .unwrap();
+
+        assert_eq!(dataset2.version().version, 2);
+
+        // Advance time
+        clock.set_system_time(chrono::Duration::seconds(3));
+
+        // Need to do another merge insert for cleanup to take effect since cleanup runs on the old dataset
+        let new_data_extra = lance_datagen::gen()
+            .with_seed(Seed::from(4))
+            .col("id", array::step::<UInt32Type>())
+            .into_df_stream(RowCount::from(10), BatchCount::from(1));
+
+        let (dataset2_extra, _) =
+            MergeInsertBuilder::try_new(dataset2.clone(), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute(new_data_extra)
+                .await
+                .unwrap();
+
+        assert_eq!(dataset2_extra.version().version, 3);
+
+        // Load the dataset from disk to check versions
+        let ds_check1 = DatasetBuilder::from_uri(dataset_path).load().await.unwrap();
+
+        // Version 1 should be cleaned up due to auto cleanup (cleanup runs every version)
+        assert!(
+            ds_check1.checkout_version(1).await.is_err(),
+            "Version 1 should have been cleaned up"
+        );
+        // Version 2 should still exist
+        assert!(
+            ds_check1.checkout_version(2).await.is_ok(),
+            "Version 2 should still exist"
+        );
+
+        // Advance time
+        clock.set_system_time(chrono::Duration::seconds(4));
+
+        // Second merge insert WITH skip_auto_cleanup - should NOT trigger cleanup
+        let new_data2 = lance_datagen::gen()
+            .with_seed(Seed::from(3))
+            .col("id", array::step::<UInt32Type>())
+            .into_df_stream(RowCount::from(30), BatchCount::from(1));
+
+        let (dataset3, _) = MergeInsertBuilder::try_new(dataset2_extra, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .skip_auto_cleanup(true) // Skip auto cleanup
+            .try_build()
+            .unwrap()
+            .execute(new_data2)
+            .await
+            .unwrap();
+
+        assert_eq!(dataset3.version().version, 4);
+
+        // Load the dataset from disk to check versions
+        let ds_check2 = DatasetBuilder::from_uri(dataset_path).load().await.unwrap();
+
+        // Version 2 should still exist because skip_auto_cleanup was enabled
+        assert!(
+            ds_check2.checkout_version(2).await.is_ok(),
+            "Version 2 should still exist because skip_auto_cleanup was enabled"
+        );
+        // Version 3 should also still exist
+        assert!(
+            ds_check2.checkout_version(3).await.is_ok(),
+            "Version 3 should still exist"
+        );
     }
 }

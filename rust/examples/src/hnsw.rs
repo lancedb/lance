@@ -20,7 +20,10 @@ use lance::Dataset;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::vector::{
     flat::storage::FlatFloatStorage,
-    hnsw::{builder::HnswBuildParams, HNSW},
+    hnsw::{
+        builder::{HnswBuildParams, HnswQueryParams},
+        HNSW,
+    },
 };
 use lance_linalg::distance::DistanceType;
 
@@ -122,8 +125,13 @@ async fn main() {
         let construct_time = now.elapsed().as_secs_f32();
         let now = std::time::Instant::now();
         // 3. Perform vector search with different parameters and compute the ground truth using L2 distance search
+        let params = HnswQueryParams {
+            ef,
+            lower_bound: None,
+            upper_bound: None,
+        };
         let results: HashSet<u32> = hnsw
-            .search_basic(q.clone(), k, ef, None, vector_store.as_ref())
+            .search_basic(q.clone(), k, &params, None, vector_store.as_ref())
             .unwrap()
             .iter()
             .map(|node| node.id)

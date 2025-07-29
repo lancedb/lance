@@ -109,17 +109,19 @@ def test_sql_predicates(dataset):
 
 
 def test_illegal_predicates(dataset):
-    predicates_nrows = [
+    bad_parse = [
         "str BETWEEN 10 AND 20",
         "str > 10",
-        "x AN",
+        "str AN",
         "🥞",
-        "foo = 7",
-        "int",
     ]
-    for expr in predicates_nrows:
+    for expr in bad_parse:
         with pytest.raises(ValueError, match="Invalid user input: *"):
             dataset.to_table(filter=expr)
+    with pytest.raises(ValueError, match="No field named foo"):
+        dataset.to_table(filter="foo = 7")
+    with pytest.raises(ValueError, match="does not return a boolean"):
+        dataset.to_table(filter="int")
 
 
 def test_compound(dataset):
