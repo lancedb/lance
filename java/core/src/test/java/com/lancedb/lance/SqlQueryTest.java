@@ -60,10 +60,16 @@ public class SqlQueryTest {
         "Schema<id: Int(32, true), name: Utf8>",
         reader.getVectorSchemaRoot().getSchema().toString());
     int rowCount = 0;
+    int totalSum = 0;
     while (reader.loadNextBatch()) {
       rowCount += reader.getVectorSchemaRoot().getRowCount();
+      for (int index = 0; index < reader.getVectorSchemaRoot().getRowCount(); index++) {
+        int id = (Integer) reader.getVectorSchemaRoot().getVector(0).getObject(index);
+        totalSum += id;
+      }
     }
     Assertions.assertEquals(rowCount, 40);
+    Assertions.assertEquals(totalSum, 780);
     reader.close();
 
     // Test agg query
@@ -71,6 +77,9 @@ public class SqlQueryTest {
     Assertions.assertEquals(
         "Schema<sum(sqlquery_test_dataset.id): Int(64, true)>",
         reader.getVectorSchemaRoot().getSchema().toString());
+    Assertions.assertTrue(reader.loadNextBatch());
+    long sum = (Long) reader.getVectorSchemaRoot().getVector(0).getObject(0);
+    Assertions.assertEquals(sum, 780);
     reader.close();
 
     // Test empty result
@@ -84,13 +93,23 @@ public class SqlQueryTest {
     }
     Assertions.assertEquals(rowCount, 0);
     reader.close();
+
+    // Test withRowId and rowAddr
+    reader =
+        dataset
+            .sql("select id, name, _rowid, _rowaddr from " + NAME, NAME)
+            .withRowId(true)
+            .withRowAddr(true)
+            .intoBatchRecords();
+    Assertions.assertEquals(
+        "Schema<id: Int(32, true), name: Utf8, _rowid: Int(64, false), _rowaddr: Int(64, false)>",
+        reader.getVectorSchemaRoot().getSchema().toString());
+    reader.close();
   }
 
   @Test
   public void testToExplainPlan() throws IOException {
-    String plan = dataset
-        .sql("select sum(id) from " + NAME, NAME)
-        .intoExplainPlan(true, false);
+    String plan = dataset.sql("select sum(id) from " + NAME, NAME).intoExplainPlan(true, false);
 
     Assertions.assertTrue(plan.contains("Aggregate") || plan.contains("SUM"));
   }

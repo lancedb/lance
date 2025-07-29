@@ -25,8 +25,8 @@ use lance::dataset::sql::SqlQueryBuilder;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_sql_SqlQuery_intoBatchRecords<'local>(
-    mut env: JNIEnv<'local>,
+pub extern "system" fn Java_com_lancedb_lance_sql_SqlQuery_intoBatchRecords(
+    mut env: JNIEnv,
     _class: JClass,
     java_dataset: JObject,
     sql: JString,
@@ -50,8 +50,8 @@ pub extern "system" fn Java_com_lancedb_lance_sql_SqlQuery_intoBatchRecords<'loc
     )
 }
 
-fn inner_into_batch_records<'local>(
-    env: &mut JNIEnv<'local>,
+fn inner_into_batch_records(
+    env: &mut JNIEnv,
     java_dataset: JObject,
     sql: JString,
     table_name: JString,
@@ -106,6 +106,7 @@ pub extern "system" fn Java_com_lancedb_lance_sql_SqlQuery_intoExplainPlan<'loca
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_into_explain_plan<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
@@ -137,8 +138,8 @@ fn inner_into_explain_plan<'local>(
     Ok(env.new_string(explain)?)
 }
 
-fn sql_builder<'local>(
-    env: &mut JNIEnv<'local>,
+fn sql_builder(
+    env: &mut JNIEnv,
     java_dataset: JObject,
     sql: JString,
     table_name: JString,
@@ -156,5 +157,5 @@ fn sql_builder<'local>(
         .sql(sql_str.as_str())
         .table_name(table_str.as_str())
         .with_row_id(with_row_id == JNI_TRUE)
-        .with_row_id(with_row_addr == JNI_TRUE))
+        .with_row_addr(with_row_addr == JNI_TRUE))
 }
