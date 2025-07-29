@@ -3,16 +3,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Optional, Union
-
-import pyarrow as pa
-from pyarrow import RecordBatch
-
-from . import dataset
-from .dependencies import _check_for_pandas
-from .dependencies import pandas as pd
+from typing import TYPE_CHECKING, Any, Iterable, Optional, Union
 
 if TYPE_CHECKING:
+    import pyarrow as pa  # type: ignore[import-untyped]
+    from pyarrow import RecordBatch
+    from . import dataset
+    from .dependencies import pandas as pd
+    
     ReaderLike = Union[
         pd.Timestamp,
         pa.Table,
@@ -22,6 +20,13 @@ if TYPE_CHECKING:
         Iterable[RecordBatch],
         pa.RecordBatchReader,
     ]
+else:
+    import pyarrow as pa
+    from pyarrow import RecordBatch
+    from . import dataset
+
+from .dependencies import _check_for_pandas
+from .dependencies import pandas as pd
 
 
 def _casting_recordbatch_iter(
@@ -53,15 +58,19 @@ def _casting_recordbatch_iter(
 
 
 def _coerce_reader(
-    data_obj: ReaderLike, schema: Optional[pa.Schema] = None
-) -> pa.RecordBatchReader:
+    data_obj: Any, schema: Optional["pa.Schema"] = None
+) -> "pa.RecordBatchReader":
     if _check_for_pandas(data_obj) and isinstance(data_obj, pd.DataFrame):
         return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
     elif isinstance(data_obj, pa.Table):
         return data_obj.to_reader()
     elif isinstance(data_obj, pa.RecordBatch):
         return pa.Table.from_batches([data_obj]).to_reader()
-    elif isinstance(data_obj, dataset.LanceDataset):
+    elif (
+        hasattr(dataset, 'LanceDataset') 
+        and type(data_obj).__name__ == 'LanceDataset'
+        and hasattr(data_obj, 'scanner')
+    ):
         return data_obj.scanner().to_reader()
     elif isinstance(data_obj, pa.dataset.Dataset):
         return pa.dataset.Scanner.from_dataset(data_obj).to_reader()
@@ -72,6 +81,7 @@ def _coerce_reader(
     elif (
         type(data_obj).__module__.startswith("polars")
         and data_obj.__class__.__name__ == "DataFrame"
+        and hasattr(data_obj, "to_arrow")
     ):
         return data_obj.to_arrow().to_reader()
     elif isinstance(data_obj, dict):
