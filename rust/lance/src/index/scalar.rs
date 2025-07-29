@@ -379,7 +379,7 @@ pub(super) async fn build_scalar_index(
         }
         Some(ScalarIndexType::ZoneMap) => {
             // TODO: Add type check for zone map index
-            train_zonemap_index(training_request, &index_store).await?;
+            train_zonemap_index(training_request, &index_store, None).await?;
             Ok(zonemap_index_details())
         }
         _ => {

@@ -13,6 +13,7 @@
 //!
 //!
 use super::btree::TrainingSource;
+use crate::scalar::SargableQuery;
 use crate::Any;
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
@@ -38,10 +39,10 @@ use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::Result;
 use lance_core::{utils::mask::RowIdTreeMap, Error};
+use log::debug;
 use roaring::RoaringBitmap;
 use snafu::location;
-//const DEFAULT_ZONE_SIZE: u32 = 4096;
-const DEFAULT_ZONE_SIZE: usize = 8192; // for testing
+const ZONEMAP_DEFAULT_SIZE: usize = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "zonemap_size";
@@ -49,7 +50,7 @@ const ZONEMAP_SIZE_META_KEY: &str = "zonemap_size";
 const ZONEMAP_OFFSET_META_KEY: &str = "zonemap_offset";
 
 /// Basic stats about zonemap index
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct ZoneMapStatistics {
     min: ScalarValue,
     max: ScalarValue,
@@ -96,8 +97,11 @@ impl DeepSizeOf for ZoneMapStatistics {
 pub struct ZoneMapIndex {
     zones: Vec<ZoneMapStatistics>,
     data_type: DataType,
-    size: usize,
-    offset: usize,
+    zonemap_size: usize,
+    // 0 means there is no offset.
+    zonemap_offset: usize,
+    store: Arc<dyn IndexStore>,
+    fri: Option<Arc<FragReuseIndex>>,
 }
 
 impl std::fmt::Debug for ZoneMapIndex {
@@ -129,9 +133,32 @@ impl ZoneMapIndex {
         let max_col = data.column_by_name("max").ok_or_else(|| {
             Error::invalid_input("ZoneMapIndex: missing 'max' column", location!())
         })?;
-        let null_count_col = data.column_by_name("null_count").ok_or_else(|| {
-            Error::invalid_input("ZoneMapIndex: missing 'null_count' column", location!())
-        })?;
+        let null_count_col = data
+            .column_by_name("null_count")
+            .ok_or_else(|| {
+                Error::invalid_input("ZoneMapIndex: missing 'null_count' column", location!())
+            })?
+            .as_any()
+            .downcast_ref::<arrow_array::UInt32Array>()
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "ZoneMapIndex: 'null_count' column is not UInt32",
+                    location!(),
+                )
+            })?;
+
+        let data_type = min_col.data_type().clone();
+
+        if data.num_rows() == 0 {
+            return Ok(Self {
+                zones: Vec::new(),
+                data_type: data_type,
+                zonemap_size: zonemap_size,
+                zonemap_offset: 0,
+                store,
+                fri,
+            });
+        }
 
         let num_zones = data.num_rows();
         let mut zones = Vec::with_capacity(num_zones);
@@ -139,17 +166,7 @@ impl ZoneMapIndex {
         for i in 0..num_zones {
             let min = ScalarValue::try_from_array(min_col, i)?;
             let max = ScalarValue::try_from_array(max_col, i)?;
-            let null_count = null_count_col
-                .as_any()
-                .downcast_ref::<arrow_array::UInt32Array>()
-                .ok_or_else(|| {
-                    Error::invalid_input(
-                        "ZoneMapIndex: 'null_count' column is not UInt32",
-                        location!(),
-                    )
-                })?
-                .value(i);
-
+            let null_count = null_count_col.value(i);
             zones.push(ZoneMapStatistics {
                 min,
                 max,
@@ -157,13 +174,13 @@ impl ZoneMapIndex {
             });
         }
 
-        let data_type = min_col.data_type().clone();
-
         Ok(Self {
             zones,
             data_type,
-            size: zonemap_size,
-            offset: zonemap_offset,
+            zonemap_size,
+            zonemap_offset,
+            store,
+            fri,
         })
     }
 }
@@ -185,15 +202,18 @@ impl Index for ZoneMapIndex {
         })
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // Not much to prewarm
+        Ok(())
+    }
+
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
             "type": "ZoneMap",
-            "num_zones": self.zones.len()
+            "num_zones": self.zones.len(),
+            "zonemap_size": self.zonemap_size,
+            "zonemap_offset": self.zonemap_offset,
         }))
-    }
-
-    async fn prewarm(&self) -> Result<()> {
-        Ok(())
     }
 
     fn index_type(&self) -> IndexType {
@@ -210,10 +230,12 @@ impl Index for ZoneMapIndex {
 impl ScalarIndex for ZoneMapIndex {
     async fn search(
         &self,
-        _query: &dyn AnyQuery,
-        _metrics: &dyn MetricsCollector,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         // TODO: Implement actual search logic
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+        // Then what?
         Ok(SearchResult::AtMost(RowIdTreeMap::new()))
     }
 
@@ -236,7 +258,7 @@ impl ScalarIndex for ZoneMapIndex {
             .metadata
             .get(ZONEMAP_SIZE_META_KEY)
             .and_then(|bs| bs.parse().ok())
-            .unwrap_or(DEFAULT_ZONE_SIZE);
+            .unwrap_or(ZONEMAP_DEFAULT_SIZE);
         let zonemap_offset: usize = file_schema
             .metadata
             .get(ZONEMAP_OFFSET_META_KEY)
@@ -277,10 +299,9 @@ pub struct ZoneMapIndexBuilderOptions {
     rows_per_zone: usize,
 }
 
-/// TODO: Is 10,000 a good default value?
 static DEFAULT_ROWS_PER_ZONE: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("LANCE_ZONEMAP_DEFAULT_ROWS_PER_ZONE")
-        .unwrap_or_else(|_| (DEFAULT_ZONE_SIZE).to_string())
+        .unwrap_or_else(|_| (ZONEMAP_DEFAULT_SIZE).to_string())
         .parse()
         .expect("failed to parse Lance_ZONEMAP_DEFAULT_ROWS_PER_ZONE")
 });
@@ -290,6 +311,12 @@ impl Default for ZoneMapIndexBuilderOptions {
         Self {
             rows_per_zone: *DEFAULT_ROWS_PER_ZONE,
         }
+    }
+}
+
+impl ZoneMapIndexBuilderOptions {
+    fn new(rows_per_zone: usize) -> Self {
+        Self { rows_per_zone }
     }
 }
 
@@ -318,8 +345,7 @@ impl ZoneMapIndexBuilder {
             items_type,
             maps: Vec::new(),
             cur_offset: 0,
-            // Default to a full zone
-            final_offset: options.rows_per_zone,
+            final_offset: 0,
             min,
             max,
             null_count: 0,
@@ -328,8 +354,8 @@ impl ZoneMapIndexBuilder {
 
     fn update_stats(&mut self, array: &ArrayRef) -> Result<()> {
         self.null_count += array.null_count() as u32;
-        self.min.update_batch(&[array.clone()]);
-        self.max.update_batch(&[array.clone()]);
+        self.min.update_batch(&[array.clone()])?;
+        self.max.update_batch(&[array.clone()])?;
         Ok(())
     }
 
@@ -441,45 +467,52 @@ impl ZoneMapIndexBuilder {
 pub async fn train_zonemap_index(
     data_source: Box<dyn TrainingSource + Send>,
     index_store: &dyn IndexStore,
+    options: Option<ZoneMapIndexBuilderOptions>,
 ) -> Result<()> {
     // TODO: Implement actual training logic
     let batches_source = data_source.scan_unordered_chunks(4096).await?;
     let value_type = batches_source.schema().field(0).data_type().clone();
 
-    let mut builder =
-        ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderOptions::default(), value_type)?;
+    let mut builder = ZoneMapIndexBuilder::try_new(
+        options.unwrap_or(ZoneMapIndexBuilderOptions::default()),
+        value_type,
+    )?;
 
-    // Calculate the output
     builder.train(batches_source).await?;
 
-    //  Write it
     builder.write_index(index_store).await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::scalar::IndexStore;
+    use crate::scalar::{zonemap::ZONEMAP_DEFAULT_SIZE, IndexStore};
     use std::{
         collections::{HashMap, HashSet},
         sync::Arc,
     };
 
-    use arrow::datatypes::UInt64Type;
+    use crate::scalar::zonemap::{train_zonemap_index, ZoneMapStatistics};
+    use arrow::datatypes::{Float32Type, UInt64Type};
     use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
         execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
     };
     use datafusion_common::DataFusionError;
+    use datafusion_common::ScalarValue;
     use futures::{stream, TryStreamExt};
     use itertools::Itertools;
     use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
-    use lance_datagen::{BatchCount, ByteCount, RowCount};
+    use lance_datafusion::datagen::DatafusionDatagenExt;
+    use lance_datagen::ArrayGeneratorExt;
+    use lance_datagen::{array, gen, BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
     use tantivy::tokenizer::TextAnalyzer;
     use tempfile::{tempdir, TempDir};
+
+    use crate::scalar::lance_format::tests::MockTrainingSource;
 
     use crate::scalar::{
         lance_format::LanceIndexStore,
@@ -491,8 +524,87 @@ mod tests {
     };
 
     #[test_log::test(tokio::test)]
+    async fn test_empty_zonemap_index() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data = arrow_array::Int32Array::from(Vec::<i32>::new());
+        let row_ids = arrow_array::UInt64Array::from(Vec::<u64>::new());
+        //let row_ids = UInt64Array::from(Vec::<u64>::new());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("values", DataType::Int32, false),
+            Field::new("row_ids", DataType::UInt64, false),
+        ]));
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        let mut builder =
+            ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderOptions::default(), DataType::Int32)
+                .unwrap();
+
+        builder.train(data).await.unwrap();
+        builder.write_index(test_store.as_ref()).await.unwrap();
+
+        log::debug!("Successfully wrote the index file");
+
+        // Read the index file back and check its contents
+        let index = ZoneMapIndex::load(test_store.clone(), None)
+            .await
+            .expect("Failed to load ZoneMapIndex");
+        assert_eq!(index.zones.len(), 0);
+        assert_eq!(index.data_type, DataType::Int32);
+        assert_eq!(index.zonemap_size, ZONEMAP_DEFAULT_SIZE);
+        assert_eq!(index.zonemap_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn test_null_zonemap_index() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let stream = gen()
+            .col(
+                "value",
+                array::rand::<Float32Type>().with_nulls(&[true, false, false, false, false]),
+            )
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(5000), BatchCount::from(10));
+        let data_source = Box::new(MockTrainingSource::from(stream));
+        train_zonemap_index(
+            data_source,
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderOptions::new(5000)),
+        )
+        .await
+        .unwrap();
+
+        log::debug!("Successfully wrote the index file");
+
+        // Read the index file back and check its contents
+        let index = ZoneMapIndex::load(test_store.clone(), None)
+            .await
+            .expect("Failed to load ZoneMapIndex");
+        assert_eq!(index.zones.len(), 10);
+        for zone in index.zones.iter() {
+            assert_eq!(zone.null_count, 1000);
+        }
+        assert_eq!(index.zonemap_offset, 0);
+    }
+
+    #[tokio::test]
     async fn test_basic_zonemap_index() {
-        std::env::set_var("LANCE_ZONEMAP_DEFAULT_ROWS_PER_ZONE", "100");
         let tmpdir = Arc::new(tempdir().unwrap());
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -514,19 +626,18 @@ mod tests {
         ));
 
         let mut builder =
-            ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderOptions::default(), DataType::Int32)
+            ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderOptions::new(100), DataType::Int32)
                 .unwrap();
 
-        builder.train(data).await;
-        builder.write_index(test_store.as_ref()).await;
+        builder.train(data).await.unwrap();
+        builder.write_index(test_store.as_ref()).await.unwrap();
 
-        println!("Successfully wrote the index file");
+        log::debug!("Successfully wrote the index file");
 
-        // Read the index file back and check its contents
+        // Read the raw index file back and check its contents
         let index_file = test_store.open_index_file(ZONEMAP_FILENAME).await.unwrap();
         // Print the metadata from the index_file
         let metadata = index_file.schema().metadata.clone();
-        println!("Index file metadata: {:?}", metadata);
         let record_batch = index_file
             .read_record_batch(0, index_file.num_rows() as u64)
             .await
@@ -559,17 +670,94 @@ mod tests {
                 .values(),
             &[0, 0]
         );
+        assert_eq!(metadata.get(ZONEMAP_SIZE_META_KEY).unwrap(), "100");
+        assert_eq!(metadata.get(ZONEMAP_OFFSET_META_KEY).unwrap(), "1");
 
         // Read the index file back and check its contents
         let index = ZoneMapIndex::load(test_store.clone(), None)
             .await
             .expect("Failed to load ZoneMapIndex");
+        assert_eq!(index.zones.len(), 2);
+        assert_eq!(
+            index.zones,
+            vec![
+                ZoneMapStatistics {
+                    min: ScalarValue::Int32(Some(0)),
+                    max: ScalarValue::Int32(Some(99)),
+                    null_count: 0
+                },
+                ZoneMapStatistics {
+                    min: ScalarValue::Int32(Some(100)),
+                    max: ScalarValue::Int32(Some(100)),
+                    null_count: 0
+                }
+            ]
+        );
+        assert_eq!(index.data_type, DataType::Int32);
+        assert_eq!(index.zonemap_size, 100);
+        assert_eq!(index.zonemap_offset, 1);
+    }
 
-        // Check that the index has the expected number of zones
-        let num_zones = index.zones.len();
-        assert!(num_zones > 0, "Expected at least one zone in the index");
+    #[tokio::test]
+    async fn test_complex_zonemap_index() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data =
+            arrow_array::Int32Array::from_iter_values(0..=(ZONEMAP_DEFAULT_SIZE * 2 + 42) as i32);
+        let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("values", DataType::Int32, false),
+            Field::new("row_ids", DataType::UInt64, false),
+        ]));
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        let mut builder =
+            ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderOptions::default(), DataType::Int32)
+                .unwrap();
+
+        builder.train(data).await.unwrap();
+        builder.write_index(test_store.as_ref()).await.unwrap();
+
+        log::debug!("Successfully wrote the index file");
+
+        // Read the index file back and check its contents
+        let index = ZoneMapIndex::load(test_store.clone(), None)
+            .await
+            .expect("Failed to load ZoneMapIndex");
+        assert_eq!(index.zones.len(), 3);
+        assert_eq!(
+            index.zones,
+            vec![
+                ZoneMapStatistics {
+                    min: ScalarValue::Int32(Some(0)),
+                    max: ScalarValue::Int32(Some(8191)),
+                    null_count: 0
+                },
+                ZoneMapStatistics {
+                    min: ScalarValue::Int32(Some(8192)),
+                    max: ScalarValue::Int32(Some(16383)),
+                    null_count: 0
+                },
+                ZoneMapStatistics {
+                    min: ScalarValue::Int32(Some(16384)),
+                    max: ScalarValue::Int32(Some(16426)),
+                    null_count: 0
+                }
+            ]
+        );
+        assert_eq!(index.data_type, DataType::Int32);
+        assert_eq!(index.zonemap_size, ZONEMAP_DEFAULT_SIZE);
+        assert_eq!(index.zonemap_offset, 43);
     }
     // Create another test following test_page_cache in  btree.rs
-
-    // TODO: Test null ids
 }
