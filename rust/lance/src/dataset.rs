@@ -580,8 +580,7 @@ impl Dataset {
         if let Some(params) = &params {
             builder = builder.with_params(params);
         }
-        builder
-            .execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>)
+        Box::pin(builder.execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>))
             .await
     }
 
