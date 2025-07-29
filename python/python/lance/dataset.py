@@ -510,7 +510,7 @@ class LanceDataset(pa.dataset.Dataset):
             specified, it will assume ascending and nulls last ordering.
         cache_repetition_index: bool, default None
             If True, repetition index will be cached in memory to improve performance
-            for large data types. This is especially useful when data is in remote 
+            for large data types. This is especially useful when data is in remote
             storage and there is sufficient RAM available.
         validate_on_decode: bool, default None
             If True, data will be validated when decoded. This can help catch data

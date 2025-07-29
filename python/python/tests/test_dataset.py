@@ -3734,30 +3734,32 @@ def test_file_reader_options(tmp_path: Path):
     """Test cache_repetition_index and validate_on_decode options"""
     table = pa.table({"a": range(100), "b": ["x"] * 100})
     dataset = lance.write_dataset(table, tmp_path / "test")
-    
+
     # Test cache_repetition_index option
     scanner = dataset.scanner(cache_repetition_index=True)
     result = scanner.to_table()
     assert result.num_rows == 100
-    
+
     # Test validate_on_decode option
     scanner = dataset.scanner(validate_on_decode=True)
     result = scanner.to_table()
     assert result.num_rows == 100
-    
+
     # Test both options together
     scanner = dataset.scanner(cache_repetition_index=True, validate_on_decode=False)
     result = scanner.to_table()
     assert result.num_rows == 100
-    
+
     # Test with to_table method directly
     result = dataset.to_table(cache_repetition_index=True, validate_on_decode=True)
     assert result.num_rows == 100
-    
+
     # Test with to_batches method
-    batches = list(dataset.to_batches(cache_repetition_index=False, validate_on_decode=False))
+    batches = list(
+        dataset.to_batches(cache_repetition_index=False, validate_on_decode=False)
+    )
     assert sum(batch.num_rows for batch in batches) == 100
-    
+
     # Test with ScannerBuilder
     builder = dataset.scanner()
     builder.cache_repetition_index(True)
