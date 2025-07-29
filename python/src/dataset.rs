@@ -56,6 +56,8 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
+use lance_encoding::decoder::DecoderConfig;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
@@ -71,8 +73,6 @@ use lance_index::{
     },
     DatasetIndexExt, IndexParams, IndexType,
 };
-use lance_encoding::decoder::DecoderConfig;
-use lance_file::v2::reader::FileReaderOptions;
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
@@ -922,7 +922,7 @@ impl Dataset {
                 .order_by(Some(orderings.into_iter().map(|o| o.0).collect()))
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
-        
+
         // Configure FileReaderOptions if any options are provided
         if cache_repetition_index.is_some() || validate_on_decode.is_some() {
             let decoder_config = DecoderConfig {
@@ -932,7 +932,7 @@ impl Dataset {
             let file_reader_options = FileReaderOptions { decoder_config };
             scanner.with_file_reader_options(file_reader_options);
         }
-        
+
         let scan = Arc::new(scanner);
         Ok(Scanner::new(scan))
     }
