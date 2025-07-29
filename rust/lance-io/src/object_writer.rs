@@ -153,10 +153,6 @@ impl UploadState {
             _ => unreachable!(),
         };
     }
-
-    fn any_to_abort(&mut self) -> Self {
-        std::mem::replace(self, Self::Done(WriteResult::default()))
-    }
 }
 
 impl ObjectWriter {
@@ -324,32 +320,26 @@ impl ObjectWriter {
     }
 
     pub async fn abort(&mut self) {
-        if let Some(abort_task) = self.inner_abort() {
-            abort_task.await;
-        }
-    }
-
-    fn inner_abort(&mut self) -> Option<BoxFuture<'static, ()>> {
-        let state = self.state.any_to_abort();
+        let state = std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
         if let UploadState::InProgress { mut upload, .. } = state {
-            let abort_task = async move {
-                let _ = upload.abort().await;
-            }
-            .boxed();
-            Some(abort_task)
-        } else {
-            None
+            let _ = upload.abort().await;
         }
     }
 }
 
 impl Drop for ObjectWriter {
     fn drop(&mut self) {
-        if let Some(abort_task) = self.inner_abort() {
-            if let Ok(handle) = Handle::try_current() {
-                handle.spawn(async move {
-                    abort_task.await;
-                });
+        // If there is a multipart upload started but not finished, we should abort it.
+        if matches!(self.state, UploadState::InProgress { .. }) {
+            // Take ownership of the state.
+            let state =
+                std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
+            if let UploadState::InProgress { mut upload, .. } = state {
+                if let Ok(handle) = Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = upload.abort().await;
+                    });
+                }
             }
         }
     }
