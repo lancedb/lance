@@ -26,7 +26,14 @@ use rand::Rng;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
+use tokio::runtime::Runtime;
 
+type BenchEnvResult = (
+    Runtime,
+    u64,
+    u64,
+    Arc<dyn Fn(u64, u64, usize) -> Vec<Vec<u32>>>,
+);
 const BATCH_SIZE: u64 = 1024;
 
 fn gen_ranges(num_rows: u64, file_size: u64, n: usize) -> Vec<u64> {
@@ -41,7 +48,7 @@ fn gen_ranges(num_rows: u64, file_size: u64, n: usize) -> Vec<u64> {
 }
 
 fn bench_random_take_with_dataset(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = Runtime::new().unwrap();
     let num_batches = 1024;
 
     for file_size in [1024 * 1024, 1024] {
@@ -66,7 +73,7 @@ fn bench_random_take_with_dataset(c: &mut Criterion) {
 
 fn dataset_take(
     c: &mut Criterion,
-    rt: &tokio::runtime::Runtime,
+    rt: &Runtime,
     file_size: usize,
     num_batches: usize,
     version: LanceFileVersion,
@@ -100,18 +107,7 @@ fn dataset_take(
 }
 
 fn bench_random_single_take_with_file_reader(c: &mut Criterion) {
-    // default tokio runtime
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let num_batches: u64 = 1024;
-    let file_size: u64 = num_batches * BATCH_SIZE + 1;
-    let rows_gen = Box::new(|num_batches, file_size, num_rows| {
-        let rows = gen_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
-        let mut rows_list: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
-        for row in rows {
-            rows_list.push(vec![row as u32]);
-        }
-        rows_list
-    });
+    let (rt, num_batches, file_size, rows_gen) = bench_env();
 
     file_reader_take(
         c,
@@ -134,16 +130,7 @@ fn bench_random_single_take_with_file_reader(c: &mut Criterion) {
 }
 
 fn bench_random_batch_take_with_file_reader(c: &mut Criterion) {
-    // default tokio runtime
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let num_batches: u64 = 1024;
-    let file_size: u64 = num_batches * BATCH_SIZE + 1;
-    let rows_gen = Box::new(|num_batches, file_size, num_rows| {
-        let rows = gen_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
-        let mut rows: Vec<u32> = rows.iter().map(|&x| x as u32).collect();
-        rows.sort();
-        vec![rows]
-    });
+    let (rt, num_batches, file_size, rows_gen) = bench_env();
 
     file_reader_take(
         c,
@@ -167,12 +154,12 @@ fn bench_random_batch_take_with_file_reader(c: &mut Criterion) {
 
 fn file_reader_take(
     c: &mut Criterion,
-    rt: &tokio::runtime::Runtime,
+    rt: &Runtime,
     file_size: u64,
     num_batches: u64,
     version: LanceFileVersion,
     version_name: &str,
-    rows_gen: Box<dyn Fn(u64, u64, usize) -> Vec<Vec<u32>>>,
+    rows_gen: Arc<dyn Fn(u64, u64, usize) -> Vec<Vec<u32>>>,
 ) {
     let (dataset, file_path) = rt.block_on(async {
         // Make sure there is only one fragment.
@@ -250,20 +237,90 @@ async fn create_file_reader(dataset: &Dataset, file_path: &Path) -> FileReader {
     .unwrap()
 }
 
+fn bench_random_single_take_with_file_fragment_session(c: &mut Criterion) {
+    let (rt, num_batches, file_size, rows_gen) = bench_env();
+
+    fragment_session_take(
+        c,
+        &rt,
+        file_size,
+        num_batches,
+        LanceFileVersion::V2_0,
+        "V2_0 Single",
+        rows_gen.clone(),
+    );
+    fragment_session_take(
+        c,
+        &rt,
+        file_size,
+        num_batches,
+        LanceFileVersion::V2_1,
+        "V2_1 Single",
+        rows_gen,
+    );
+}
+
+fn bench_random_batch_take_with_file_fragment_session(c: &mut Criterion) {
+    let (rt, num_batches, file_size, rows_gen) = bench_env();
+
+    fragment_session_take(
+        c,
+        &rt,
+        file_size,
+        num_batches,
+        LanceFileVersion::V2_0,
+        "V2_0 Batch",
+        rows_gen.clone(),
+    );
+    fragment_session_take(
+        c,
+        &rt,
+        file_size,
+        num_batches,
+        LanceFileVersion::V2_1,
+        "V2_1 Batch",
+        rows_gen,
+    );
+}
+
+fn fragment_session_take(
+    c: &mut Criterion,
+    rt: &Runtime,
+    file_size: u64,
+    num_batches: u64,
+    version: LanceFileVersion,
+    version_name: &str,
+    rows_gen: Arc<dyn Fn(u64, u64, usize) -> Vec<Vec<u32>>>,
+) {
+    let dataset = rt.block_on(create_dataset(
+        "memory://test.lance",
+        version,
+        num_batches as i32,
+        file_size as i32,
+    ));
+
+    assert_eq!(dataset.get_fragments().len(), 1);
+    let fragments = dataset.get_fragments();
+    let fragment = fragments.first().unwrap();
+
+    // Bench random take.
+    for num_rows in [1, 10, 100, 1000] {
+        c.bench_function(&format!(
+            "{version_name} Random Take Fragment Session({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
+        ), |b| {
+            b.to_async(rt).iter(|| async {
+                let take_session = fragment.open_session(dataset.schema(), false).await.unwrap();
+                let rows_list = rows_gen(num_batches, file_size, num_rows);
+                for rows in rows_list {
+                    let _ = take_session.take(rows.as_slice()).await;
+                }
+            })
+        });
+    }
+}
+
 fn bench_random_single_take_with_file_fragment(c: &mut Criterion) {
-    // default tokio runtime
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let num_batches: u64 = 1024;
-    // Make sure there is only one fragment.
-    let file_size: u64 = num_batches * BATCH_SIZE + 1;
-    let rows_gen = Box::new(|num_batches, file_size, num_rows| {
-        let rows = gen_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
-        let mut rows_list: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
-        for row in rows {
-            rows_list.push(vec![row as u32]);
-        }
-        rows_list
-    });
+    let (rt, num_batches, file_size, rows_gen) = bench_env();
 
     fragment_take(
         c,
@@ -286,17 +343,7 @@ fn bench_random_single_take_with_file_fragment(c: &mut Criterion) {
 }
 
 fn bench_random_batch_take_with_file_fragment(c: &mut Criterion) {
-    // default tokio runtime
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let num_batches: u64 = 1024;
-    // Make sure there is only one fragment.
-    let file_size: u64 = num_batches * BATCH_SIZE + 1;
-    let rows_gen = Box::new(|num_batches, file_size, num_rows| {
-        let rows = gen_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
-        let mut rows: Vec<u32> = rows.iter().map(|&x| x as u32).collect();
-        rows.sort();
-        vec![rows]
-    });
+    let (rt, num_batches, file_size, rows_gen) = bench_env();
 
     fragment_take(
         c,
@@ -320,12 +367,12 @@ fn bench_random_batch_take_with_file_fragment(c: &mut Criterion) {
 
 fn fragment_take(
     c: &mut Criterion,
-    rt: &tokio::runtime::Runtime,
+    rt: &Runtime,
     file_size: u64,
     num_batches: u64,
     version: LanceFileVersion,
     version_name: &str,
-    rows_gen: Box<dyn Fn(u64, u64, usize) -> Vec<Vec<u32>>>,
+    rows_gen: Arc<dyn Fn(u64, u64, usize) -> Vec<Vec<u32>>>,
 ) {
     let dataset = rt.block_on(create_dataset(
         "memory://test.lance",
@@ -424,6 +471,24 @@ async fn create_dataset(
         .unwrap()
 }
 
+fn bench_env() -> BenchEnvResult {
+    // default tokio runtime
+    let rt = Runtime::new().unwrap();
+    let num_batches: u64 = 1024;
+    // Make sure there is only one fragment.
+    let file_size: u64 = num_batches * BATCH_SIZE + 1;
+    let rows_gen = Arc::new(|num_batches, file_size, num_rows| {
+        let rows = gen_ranges(num_batches * BATCH_SIZE, file_size, num_rows);
+        let mut rows_list: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            rows_list.push(vec![row as u32]);
+        }
+        rows_list
+    });
+
+    (rt, num_batches, file_size, rows_gen)
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
@@ -432,10 +497,10 @@ criterion_group!(
         .sample_size(10000)
         .warm_up_time(Duration::from_secs_f32(3.0))
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader);
+    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_single_take_with_file_fragment_session, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader, bench_random_batch_take_with_file_fragment_session);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader);
+    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_single_take_with_file_fragment_session, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader, bench_random_batch_take_with_file_fragment_session);
 criterion_main!(benches);

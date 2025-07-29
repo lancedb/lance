@@ -3,6 +3,7 @@
 
 //! Wraps a Fragment of the dataset.
 
+pub mod session;
 pub mod write;
 
 use std::borrow::Cow;
@@ -53,6 +54,7 @@ use super::statistics::FieldStatistics;
 use super::updater::Updater;
 use super::{schema_evolution, NewColumnTransform, WriteParams};
 use crate::arrow::*;
+use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
 
@@ -1257,6 +1259,17 @@ impl FileFragment {
         Ok(())
     }
 
+    /// Open a session for take.
+    ///
+    /// A [`FragmentSession`] maintains states for better performance in continuous take requests.
+    pub async fn open_session(
+        &self,
+        projection: &Schema,
+        with_row_address: bool,
+    ) -> Result<FragmentSession> {
+        FragmentSession::open(Arc::new(self.clone()), projection, with_row_address).await
+    }
+
     /// Take rows from this fragment based on the offset in the file.
     ///
     /// This will always return the same number of rows as the input indices.
@@ -1275,39 +1288,7 @@ impl FileFragment {
                 .collect::<Vec<_>>();
             sorted_deleted_ids.sort();
 
-            let mut row_ids = indices.to_vec();
-            for row_id in row_ids.iter_mut() {
-                // We find the number of deleted rows that are less than each row
-                // index, and that becomes the initial offset. We increment the
-                // index by that amount, plus the number of deleted row ids we
-                // encounter along the way. So for example, if deleted rows are
-                // [2, 3, 5] and we want row 4, we need to advanced by 2 (since
-                // 2 and 3 are less than 4). That puts us at row 6, but since
-                // we passed row 5, we need to advance by 1 more, giving a final
-                // row id of 7.
-                let mut new_row_id = *row_id;
-                let offset = sorted_deleted_ids.partition_point(|v| *v <= new_row_id);
-
-                let mut deletion_i = offset;
-                let mut i = 0;
-                while i < offset {
-                    // Advance the row id
-                    new_row_id += 1;
-                    while deletion_i < sorted_deleted_ids.len()
-                        && sorted_deleted_ids[deletion_i] == new_row_id
-                    {
-                        // If we encounter a deleted row, we need to advance
-                        // again.
-                        deletion_i += 1;
-                        new_row_id += 1;
-                    }
-                    i += 1;
-                }
-
-                *row_id = new_row_id;
-            }
-
-            Cow::Owned(row_ids)
+            Cow::Owned(resolve_actual_row_ids(indices, &sorted_deleted_ids))
         } else {
             Cow::Borrowed(indices)
         };
@@ -1688,6 +1669,43 @@ impl FileFragment {
 
         Ok(Some(self))
     }
+}
+
+/// Using deleted ids to remap row ids into actual row ids.
+pub(crate) fn resolve_actual_row_ids(row_ids: &[u32], sorted_deleted_ids: &[u32]) -> Vec<u32> {
+    let mut row_ids = row_ids.to_vec();
+    for row_id in row_ids.iter_mut() {
+        // We find the number of deleted rows that are less than each row
+        // index, and that becomes the initial offset. We increment the
+        // index by that amount, plus the number of deleted row ids we
+        // encounter along the way. So for example, if deleted rows are
+        // [2, 3, 5] and we want row 4, we need to advanced by 2 (since
+        // 2 and 3 are less than 4). That puts us at row 6, but since
+        // we passed row 5, we need to advance by 1 more, giving a final
+        // row id of 7.
+        let mut new_row_id = *row_id;
+        let offset = sorted_deleted_ids.partition_point(|v| *v <= new_row_id);
+
+        let mut deletion_i = offset;
+        let mut i = 0;
+        while i < offset {
+            // Advance the row id
+            new_row_id += 1;
+            while deletion_i < sorted_deleted_ids.len()
+                && sorted_deleted_ids[deletion_i] == new_row_id
+            {
+                // If we encounter a deleted row, we need to advance
+                // again.
+                deletion_i += 1;
+                new_row_id += 1;
+            }
+            i += 1;
+        }
+
+        *row_id = new_row_id;
+    }
+
+    row_ids
 }
 
 // Cache key for file metadata
@@ -2347,7 +2365,7 @@ impl FragmentReader {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
 
     use arrow_arith::numeric::mul;
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
@@ -2368,7 +2386,10 @@ mod tests {
         utils::test::{StatsHolder, TestDatasetGenerator},
     };
 
-    async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
+    pub(crate) async fn create_dataset(
+        test_uri: &str,
+        data_storage_version: LanceFileVersion,
+    ) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, true),
             ArrowField::new("s", DataType::Utf8, true),
