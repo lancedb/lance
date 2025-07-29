@@ -51,8 +51,6 @@ use crate::{
     statistics::{GetStat, Stat},
 };
 
-use std::sync::Arc;
-
 use arrow::{array::AsArray, datatypes::UInt64Type};
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::{
@@ -119,7 +117,7 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default)]
 pub struct DefaultCompressionStrategy {
     /// Optional user-configured compression parameters
-    params: Option<Arc<CompressionParams>>,
+    params: Option<CompressionParams>,
 }
 
 impl DefaultCompressionStrategy {
@@ -131,7 +129,7 @@ impl DefaultCompressionStrategy {
     /// Create a new compression strategy with user-configured parameters
     pub fn with_params(params: CompressionParams) -> Self {
         Self {
-            params: Some(Arc::new(params)),
+            params: Some(params),
         }
     }
 
