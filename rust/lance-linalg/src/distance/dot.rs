@@ -138,17 +138,49 @@ impl Dot for f16 {
     }
 }
 
+fn dot_vectorized<
+    T: AsPrimitive<Output>,
+    Output: Num + Copy + Sum + AddAssign + 'static,
+    const LANES: usize,
+>(
+    from: &[T],
+    to: &[T],
+) -> Output {
+    let x_chunks = from.chunks_exact(LANES);
+    let y_chunks = to.chunks_exact(LANES);
+
+    let s = if !x_chunks.remainder().is_empty() {
+        x_chunks
+            .remainder()
+            .iter()
+            .zip(y_chunks.remainder())
+            .map(|(&x, &y)| x.as_() * y.as_())
+            .sum::<Output>()
+    } else {
+        Output::zero()
+    };
+
+    let mut sums = [Output::zero(); LANES];
+    for (x, y) in x_chunks.zip(y_chunks) {
+        for i in 0..LANES {
+            let diff = x[i].as_() - y[i].as_();
+            sums[i] += diff * diff;
+        }
+    }
+
+    s + sums.iter().copied().sum()
+}
+
 impl Dot for f32 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
         // Manually unrolled 8 times to get enough registers.
-        // TODO: avx512 can unroll more
-        let x_unrolled_chunks = x.chunks_exact(64);
-        let y_unrolled_chunks = y.chunks_exact(64);
+        let x_unrolled_chunks = x.chunks_exact(128);
+        let y_unrolled_chunks = y.chunks_exact(128);
 
-        // 8 float32 SIMD
-        let x_aligned_chunks = x_unrolled_chunks.remainder().chunks_exact(8);
-        let y_aligned_chunks = y_unrolled_chunks.remainder().chunks_exact(8);
+        // 16 float32 SIMD
+        let x_aligned_chunks = x_unrolled_chunks.remainder().chunks_exact(16);
+        let y_aligned_chunks = y_unrolled_chunks.remainder().chunks_exact(16);
 
         let sum = if x_aligned_chunks.remainder().is_empty() {
             0.0
@@ -165,13 +197,13 @@ impl Dot for f32 {
                 .sum()
         };
 
-        let mut sum8 = f32x8::zeros();
+        let mut sum16 = f32x16::zeros();
         x_aligned_chunks
             .zip(y_aligned_chunks)
             .for_each(|(x_chunk, y_chunk)| unsafe {
-                let x1 = f32x8::load_unaligned(x_chunk.as_ptr());
-                let y1 = f32x8::load_unaligned(y_chunk.as_ptr());
-                sum8 += x1 * y1;
+                let x1 = f32x16::load_unaligned(x_chunk.as_ptr());
+                let y1 = f32x16::load_unaligned(y_chunk.as_ptr());
+                sum16 += x1 * y1;
             });
 
         let mut sum16 = f32x16::zeros();
@@ -182,15 +214,24 @@ impl Dot for f32 {
                 let x2 = f32x16::load_unaligned(x.as_ptr().add(16));
                 let x3 = f32x16::load_unaligned(x.as_ptr().add(32));
                 let x4 = f32x16::load_unaligned(x.as_ptr().add(48));
+                let x5 = f32x16::load_unaligned(x.as_ptr().add(64));
+                let x6 = f32x16::load_unaligned(x.as_ptr().add(80));
+                let x7 = f32x16::load_unaligned(x.as_ptr().add(96));
+                let x8 = f32x16::load_unaligned(x.as_ptr().add(112));
 
                 let y1 = f32x16::load_unaligned(y.as_ptr());
                 let y2 = f32x16::load_unaligned(y.as_ptr().add(16));
                 let y3 = f32x16::load_unaligned(y.as_ptr().add(32));
                 let y4 = f32x16::load_unaligned(y.as_ptr().add(48));
+                let y5 = f32x16::load_unaligned(y.as_ptr().add(64));
+                let y6 = f32x16::load_unaligned(y.as_ptr().add(80));
+                let y7 = f32x16::load_unaligned(y.as_ptr().add(96));
+                let y8 = f32x16::load_unaligned(y.as_ptr().add(112));
 
-                sum16 += (x1 * y1 + x2 * y2) + (x3 * y3 + x4 * y4);
+                sum16 +=
+                    x1 * y1 + x2 * y2 + x3 * y3 + x4 * y4 + x5 * y5 + x6 * y6 + x7 * y7 + x8 * y8;
             });
-        sum16.reduce_sum() + sum8.reduce_sum() + sum
+        sum16.reduce_sum() + sum
     }
 }
 
@@ -217,10 +258,10 @@ pub fn dot_distance_batch<'a, T: Dot>(
     from: &'a [T],
     to: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = f32> + 'a> {
+) -> impl Iterator<Item = f32> + 'a {
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
-    Box::new(to.chunks_exact(dimension).map(|v| dot_distance(from, v)))
+    to.chunks_exact(dimension).map(|v| dot_distance(from, v))
 }
 
 fn do_dot_distance_arrow_batch<T: ArrowFloatType>(

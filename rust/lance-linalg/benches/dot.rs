@@ -4,13 +4,11 @@
 use std::iter::{repeat_with, Sum};
 use std::time::Duration;
 
-use arrow_array::{
-    types::{Float16Type, Float32Type, Float64Type},
-    Float32Array,
-};
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use half::bf16;
 use lance_arrow::{ArrowFloatType, FloatArray};
+use lance_linalg::distance::dot_distance_batch;
 use num_traits::Float;
 
 #[cfg(target_os = "linux")]
@@ -37,14 +35,14 @@ where
     let target = generate_random_array_with_seed::<T>(TOTAL * DIMENSION, [42; 32]);
 
     let type_name = std::any::type_name::<T::Native>();
-    c.bench_function(format!("Dot({type_name}, arrow_artiy)").as_str(), |b| {
+    c.bench_function(format!("Dot({type_name}, scalar)").as_str(), |b| {
         b.iter(|| {
-            T::ArrayType::from(
+            black_box(
                 target
                     .as_slice()
                     .chunks(DIMENSION)
                     .map(|arr| dot_scalar(key.as_slice(), arr))
-                    .collect::<Vec<_>>(),
+                    .reduce(|a, b| a + b),
             )
         });
     });
@@ -54,16 +52,25 @@ where
         |b| {
             let x = key.as_slice();
             b.iter(|| {
-                Float32Array::from(
+                black_box(
                     target
                         .as_slice()
                         .chunks(DIMENSION)
-                        .map(|y| black_box(dot(x, y)))
-                        .collect::<Vec<_>>(),
+                        .map(|y| dot(x, y))
+                        .reduce(|a, b| a + b),
                 )
             });
         },
     );
+
+    c.bench_function(format!("Dot({type_name}, batch)").as_str(), |b| {
+        b.iter(|| {
+            black_box(black_box(
+                dot_distance_batch(key.as_slice(), target.as_slice(), DIMENSION)
+                    .reduce(|a, b| a + b),
+            ))
+        });
+    });
 
     // TODO: SIMD needs generic specialization
 }
@@ -77,12 +84,15 @@ fn bench_distance(c: &mut Criterion) {
         let key = generate_random_array_with_seed::<Float16Type>(DIMENSION, [0; 32]);
         // 1M of 1024 D vectors
         let target = generate_random_array_with_seed::<Float16Type>(TOTAL * DIMENSION, [42; 32]);
-        b.iter(|| unsafe {
-            let x = key.values().as_ref();
-            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
-                let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(dot_distance(x, y))
-            }))
+        b.iter(|| {
+            let x = key.values();
+            black_box(
+                target
+                    .as_slice()
+                    .chunks_exact(DIMENSION)
+                    .map(|y| dot_distance(x, y))
+                    .reduce(|a, b| a + b),
+            )
         });
     });
 
@@ -100,9 +110,9 @@ fn bench_distance(c: &mut Criterion) {
             let x = key.as_slice();
             black_box(
                 target
-                    .chunks(DIMENSION)
+                    .chunks_exact(DIMENSION)
                     .map(|y| dot_distance(x, y))
-                    .collect::<Vec<_>>(),
+                    .reduce(|a, b| a + b),
             )
         });
     });
@@ -112,12 +122,15 @@ fn bench_distance(c: &mut Criterion) {
         let key = generate_random_array_with_seed::<Float32Type>(DIMENSION, [0; 32]);
         // 1M of 1024 D vectors
         let target = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, [42; 32]);
-        b.iter(|| unsafe {
+        b.iter(|| {
             let x = key.values().as_ref();
-            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
-                let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(f32::dot(x, y))
-            }))
+            black_box(
+                target
+                    .values()
+                    .chunks_exact(DIMENSION)
+                    .map(|y| dot_distance(x, y))
+                    .reduce(|a, b| a + b),
+            )
         });
     });
 
