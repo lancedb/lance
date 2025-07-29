@@ -15,7 +15,7 @@
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::FromJString;
-use crate::{Error, RT};
+use crate::{Error, JNIEnvExt, RT};
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jlong, JNI_TRUE};
@@ -30,7 +30,7 @@ pub extern "system" fn Java_com_lancedb_lance_sql_SqlQuery_intoBatchRecords(
     _class: JClass,
     java_dataset: JObject,
     sql: JString,
-    table_name: JString,
+    table_name: JObject,
     with_row_id: jboolean,
     with_row_addr: jboolean,
     stream_addr: jlong,
@@ -54,7 +54,7 @@ fn inner_into_batch_records(
     env: &mut JNIEnv,
     java_dataset: JObject,
     sql: JString,
-    table_name: JString,
+    table_name: JObject,
     with_row_id: jboolean,
     with_row_addr: jboolean,
     stream_addr: jlong,
@@ -83,7 +83,7 @@ pub extern "system" fn Java_com_lancedb_lance_sql_SqlQuery_intoExplainPlan<'loca
     _class: JClass,
     java_dataset: JObject,
     sql: JString,
-    table_name: JString,
+    table_name: JObject,
     with_row_id: jboolean,
     with_row_addr: jboolean,
     verbose: jboolean,
@@ -111,7 +111,7 @@ fn inner_into_explain_plan<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
     sql: JString,
-    table_name: JString,
+    table_name: JObject,
     with_row_id: jboolean,
     with_row_addr: jboolean,
     verbose: jboolean,
@@ -142,20 +142,25 @@ fn sql_builder(
     env: &mut JNIEnv,
     java_dataset: JObject,
     sql: JString,
-    table_name: JString,
+    table_name: JObject,
     with_row_id: jboolean,
     with_row_addr: jboolean,
 ) -> Result<SqlQueryBuilder> {
     let sql_str = sql.extract(env)?;
-    let table_str = table_name.extract(env)?;
+    let table_str = env.get_string_opt(&table_name)?;
 
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
-    Ok(dataset_guard
+    let mut builder = dataset_guard
         .inner
         .sql(sql_str.as_str())
-        .table_name(table_str.as_str())
         .with_row_id(with_row_id == JNI_TRUE)
-        .with_row_addr(with_row_addr == JNI_TRUE))
+        .with_row_addr(with_row_addr == JNI_TRUE);
+
+    if let Some(table) = table_str {
+        builder = builder.table_name(table.as_str())
+    }
+
+    Ok(builder)
 }

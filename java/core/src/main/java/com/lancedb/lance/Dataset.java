@@ -897,8 +897,8 @@ public class Dataset implements Closeable {
     }
   }
 
-  public SqlQuery sql(String sql, String tableName) {
-    return new SqlQuery(allocator, this, sql, tableName);
+  public SqlQuery sql(String sql) {
+    return new SqlQuery(allocator, this, sql);
   }
 
   private native void nativeCreateTag(String tag, long version);

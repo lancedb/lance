@@ -21,6 +21,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 
 import java.io.IOException;
+import java.util.Optional;
 
 public class SqlQuery {
   private BufferAllocator allocator;
@@ -30,11 +31,15 @@ public class SqlQuery {
   private boolean withRowId = false;
   private boolean withRowAddr = false;
 
-  public SqlQuery(BufferAllocator allocator, Dataset dataset, String sql, String table) {
+  public SqlQuery(BufferAllocator allocator, Dataset dataset, String sql) {
     this.allocator = allocator;
     this.dataset = dataset;
     this.sql = sql;
-    this.table = table;
+  }
+
+  public SqlQuery tableName(String tableName) {
+    this.table = tableName;
+    return this;
   }
 
   public SqlQuery withRowId(boolean withRowId) {
@@ -49,7 +54,8 @@ public class SqlQuery {
 
   public ArrowReader intoBatchRecords() throws IOException {
     try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
-      intoBatchRecords(dataset, sql, table, withRowId, withRowAddr, s.memoryAddress());
+      intoBatchRecords(
+          dataset, sql, Optional.ofNullable(table), withRowId, withRowAddr, s.memoryAddress());
       return Data.importArrayStream(allocator, s);
     }
   }
@@ -57,20 +63,21 @@ public class SqlQuery {
   private static native void intoBatchRecords(
       Dataset dataset,
       String sql,
-      String tableName,
+      Optional<String> tableName,
       boolean withRowId,
       boolean withRowAddr,
       long streamAddress)
       throws IOException;
 
   public String intoExplainPlan(boolean verbose, boolean analyze) throws IOException {
-    return intoExplainPlan(dataset, sql, table, withRowId, withRowAddr, verbose, analyze);
+    return intoExplainPlan(
+        dataset, sql, Optional.ofNullable(table), withRowId, withRowAddr, verbose, analyze);
   }
 
   private static native String intoExplainPlan(
       Dataset dataset,
       String sql,
-      String tableName,
+      Optional<String> tableName,
       boolean withRowId,
       boolean withRowAddr,
       boolean verbose,

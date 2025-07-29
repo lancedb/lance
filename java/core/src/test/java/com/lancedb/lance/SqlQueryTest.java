@@ -55,7 +55,7 @@ public class SqlQueryTest {
   @Test
   public void testToRecordBatches() throws IOException {
     // Test normal query
-    ArrowReader reader = dataset.sql("select * from " + NAME, NAME).intoBatchRecords();
+    ArrowReader reader = dataset.sql("select * from " + NAME).tableName(NAME).intoBatchRecords();
     Assertions.assertEquals(
         "Schema<id: Int(32, true), name: Utf8>",
         reader.getVectorSchemaRoot().getSchema().toString());
@@ -73,7 +73,7 @@ public class SqlQueryTest {
     reader.close();
 
     // Test agg query
-    reader = dataset.sql("select sum(id) from " + NAME, NAME).intoBatchRecords();
+    reader = dataset.sql("select sum(id) from " + NAME).tableName(NAME).intoBatchRecords();
     Assertions.assertEquals(
         "Schema<sum(sqlquery_test_dataset.id): Int(64, true)>",
         reader.getVectorSchemaRoot().getSchema().toString());
@@ -83,7 +83,8 @@ public class SqlQueryTest {
     reader.close();
 
     // Test empty result
-    reader = dataset.sql("select * from " + NAME + " where id < 0", NAME).intoBatchRecords();
+    reader =
+        dataset.sql("select * from " + NAME + " where id < 0").tableName(NAME).intoBatchRecords();
     Assertions.assertEquals(
         "Schema<id: Int(32, true), name: Utf8>",
         reader.getVectorSchemaRoot().getSchema().toString());
@@ -97,7 +98,8 @@ public class SqlQueryTest {
     // Test withRowId and rowAddr
     reader =
         dataset
-            .sql("select id, name, _rowid, _rowaddr from " + NAME, NAME)
+            .sql("select id, name, _rowid, _rowaddr from " + NAME)
+            .tableName(NAME)
             .withRowId(true)
             .withRowAddr(true)
             .intoBatchRecords();
@@ -109,7 +111,8 @@ public class SqlQueryTest {
 
   @Test
   public void testToExplainPlan() throws IOException {
-    String plan = dataset.sql("select sum(id) from " + NAME, NAME).intoExplainPlan(true, false);
+    String plan =
+        dataset.sql("select sum(id) from " + NAME).tableName(NAME).intoExplainPlan(true, false);
 
     Assertions.assertTrue(plan.contains("Aggregate") || plan.contains("SUM"));
   }
