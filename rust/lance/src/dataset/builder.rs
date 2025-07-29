@@ -2,7 +2,16 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use super::refs::{Ref, Tags};
+use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
+use crate::{
+    error::{Error, Result},
+    session::Session,
+    Dataset,
+};
+use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptions, DEFAULT_CLOUD_IO_PARALLELISM,
 };
@@ -13,16 +22,8 @@ use lance_table::{
 use object_store::{aws::AwsCredentialProvider, path::Path, DynObjectStore};
 use prost::Message;
 use snafu::location;
-use tracing::instrument;
+use tracing::{info, instrument};
 use url::Url;
-
-use super::refs::{Ref, Tags};
-use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
-use crate::{
-    error::{Error, Result},
-    session::Session,
-    Dataset,
-};
 /// builder for loading a [`Dataset`].
 #[derive(Debug, Clone)]
 pub struct DatasetBuilder {
@@ -38,6 +39,7 @@ pub struct DatasetBuilder {
     options: ObjectStoreParams,
     version: Option<Ref>,
     table_uri: String,
+    file_reader_options: Option<FileReaderOptions>,
 }
 
 impl DatasetBuilder {
@@ -51,6 +53,7 @@ impl DatasetBuilder {
             session: None,
             version: None,
             manifest: None,
+            file_reader_options: None,
         }
     }
 }
@@ -198,6 +201,10 @@ impl DatasetBuilder {
             self.commit_handler = Some(commit_handler);
         }
 
+        if let Some(file_reader_options) = read_params.file_reader_options {
+            self.file_reader_options = Some(file_reader_options);
+        }
+
         self
     }
 
@@ -279,6 +286,7 @@ impl DatasetBuilder {
 
     #[instrument(skip_all)]
     pub async fn load(mut self) -> Result<Dataset> {
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=self.table_uri);
         let session = match self.session.as_ref() {
             Some(session) => session.clone(),
             None => Arc::new(Session::new(
@@ -296,6 +304,7 @@ impl DatasetBuilder {
 
         let manifest = self.manifest.take();
 
+        let file_reader_options = self.file_reader_options.clone();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
         if let Some(r) = cloned_ref {
@@ -356,6 +365,7 @@ impl DatasetBuilder {
             location,
             session,
             commit_handler,
+            file_reader_options,
         )
     }
 }

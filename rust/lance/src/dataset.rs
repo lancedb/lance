@@ -20,11 +20,12 @@ use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT,
-    DATASET_DROPPING_COLUMN_EVENT, DATASET_OPENING_EVENT, TRACE_DATASET_EVENTS, TRACE_FILE_AUDIT,
+    DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS, TRACE_FILE_AUDIT,
 };
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
@@ -141,6 +142,9 @@ pub struct Dataset {
     // These are references to session caches, but with the dataset URI as a prefix.
     pub(crate) index_cache: Arc<DSIndexCache>,
     pub(crate) metadata_cache: Arc<DSMetadataCache>,
+
+    /// File reader options to use when reading data files.
+    pub(crate) file_reader_options: Option<FileReaderOptions>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -213,6 +217,11 @@ pub struct ReadParams {
     /// If a custom object store is provided (via store_params.object_store) then this
     /// must also be provided.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
+
+    /// File reader options to use when reading data files.
+    ///
+    /// This allows control over features like caching repetition indices and validation.
+    pub file_reader_options: Option<FileReaderOptions>,
 }
 
 impl ReadParams {
@@ -259,6 +268,12 @@ impl ReadParams {
     pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
         self.commit_handler = Some(Arc::new(lock));
     }
+
+    /// Set the file reader options.
+    pub fn file_reader_options(&mut self, options: FileReaderOptions) -> &mut Self {
+        self.file_reader_options = Some(options);
+        self
+    }
 }
 
 impl Default for ReadParams {
@@ -269,6 +284,7 @@ impl Default for ReadParams {
             session: None,
             store_options: None,
             commit_handler: None,
+            file_reader_options: None,
         }
     }
 }
@@ -350,7 +366,6 @@ impl Dataset {
     /// See also [DatasetBuilder].
     #[instrument]
     pub async fn open(uri: &str) -> Result<Self> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_OPENING_EVENT, uri=uri);
         DatasetBuilder::from_uri(uri).load().await
     }
 
@@ -410,6 +425,7 @@ impl Dataset {
             manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
+            self.file_reader_options.clone(),
         )
     }
 
@@ -524,6 +540,7 @@ impl Dataset {
         manifest_location: ManifestLocation,
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
+        file_reader_options: Option<FileReaderOptions>,
     ) -> Result<Self> {
         let tags = Tags::new(
             object_store.clone(),
@@ -543,6 +560,7 @@ impl Dataset {
             tags,
             metadata_cache,
             index_cache,
+            file_reader_options,
         })
     }
 
@@ -562,8 +580,7 @@ impl Dataset {
         if let Some(params) = &params {
             builder = builder.with_params(params);
         }
-        builder
-            .execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>)
+        Box::pin(builder.execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>))
             .await
     }
 
@@ -626,6 +643,7 @@ impl Dataset {
                 blob_manifest_location,
                 self.session.clone(),
                 self.commit_handler.clone(),
+                self.file_reader_options.clone(),
             )?;
             Ok(Some(Arc::new(blobs_dataset)))
         } else {
@@ -1561,6 +1579,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         location,
                         dataset.session(),
                         dataset.commit_handler.clone(),
+                        dataset.file_reader_options.clone(),
                     )?;
                     let object_store = dataset_version.object_store();
                     let path = dataset_version
@@ -1597,6 +1616,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 location,
                 dataset.session(),
                 dataset.commit_handler.clone(),
+                dataset.file_reader_options.clone(),
             )
         } else {
             // If we didn't get the latest manifest, we can still return the dataset
