@@ -7,7 +7,7 @@ use crate::{
     data::{BlockInfo, DataBlock, OpaqueBlock},
     encodings::physical::block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
     format::ProtobufUtils,
-    v2::encoder::{ArrayEncoder, EncodedArray},
+    previous::encoder::{ArrayEncoder, EncodedArray},
 };
 
 use lance_core::Result;

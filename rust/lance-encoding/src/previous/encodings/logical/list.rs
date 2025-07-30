@@ -26,13 +26,13 @@ use crate::{
     },
     encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
     format::pb,
-    repdef::RepDefBuilder,
-    utils::accumulation::AccumulationQueue,
-    v2::{
+    previous::{
         decoder::{FieldScheduler, LogicalPageDecoder, SchedulingJob},
         encoder::{ArrayEncoder, EncodedArray},
         encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler},
     },
+    repdef::RepDefBuilder,
+    utils::accumulation::AccumulationQueue,
     EncodingsIo,
 };
 

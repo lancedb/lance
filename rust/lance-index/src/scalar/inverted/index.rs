@@ -1061,10 +1061,10 @@ impl PostingListReader {
                 .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
                 .await.map_err(|e| {
                     match e {
-                        Error::Schema { .. } => Error::Index {
-                            message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
-                            location: location!(),
-                        },
+                        Error::Schema { .. } => Error::invalid_input(
+                            "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
+                            location!(),
+                        ),
                         e => e
                     }
                 })?;
