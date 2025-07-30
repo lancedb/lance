@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::dataset::optimize::remapping::transpose_row_ids_from_digest;
+use crate::dataset::optimize::remapping::transpose_row_addrs_from_digest;
 use crate::Dataset;
 use lance_core::Error;
 use lance_index::frag_reuse::{
@@ -84,7 +84,7 @@ pub(crate) async fn open_frag_reuse_index(
         for group in version.groups.iter() {
             let cursor = Cursor::new(&group.changed_row_addrs);
             let changed_row_addrs = RoaringTreemap::deserialize_from(cursor).unwrap();
-            let group_row_id_map = transpose_row_ids_from_digest(
+            let group_row_id_map = transpose_row_addrs_from_digest(
                 changed_row_addrs,
                 &group.old_frags,
                 &group.new_frags,

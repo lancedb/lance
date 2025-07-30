@@ -208,13 +208,13 @@ impl FragReuseIndexDetails {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FragReuseIndex {
     pub uuid: Uuid,
-    pub row_id_maps: Vec<HashMap<u64, Option<u64>>>,
+    pub row_addr_maps: Vec<HashMap<u64, Option<u64>>>,
     pub details: FragReuseIndexDetails,
 }
 
 impl DeepSizeOf for FragReuseIndex {
     fn deep_size_of_children(&self, cx: &mut Context) -> usize {
-        self.row_id_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
+        self.row_addr_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
     }
 }
 
@@ -226,14 +226,14 @@ impl FragReuseIndex {
     ) -> Self {
         Self {
             uuid,
-            row_id_maps,
+            row_addr_maps: row_id_maps,
             details,
         }
     }
 
     pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
         let mut mapped_value = Some(row_id);
-        for row_id_map in self.row_id_maps.iter() {
+        for row_id_map in self.row_addr_maps.iter() {
             if mapped_value.is_some() {
                 mapped_value = row_id_map
                     .get(&mapped_value.unwrap())
