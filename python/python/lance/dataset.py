@@ -297,24 +297,15 @@ class LanceDataset(pa.dataset.Dataset):
 
     def __setstate__(self, state):
         # Handle backwards compatibility - state may not have read_params
-        if len(state) == 5:
-            (
-                self._uri,
-                self._storage_options,
-                version,
-                manifest,
-                default_scan_options,
-            ) = state
-            read_params = None
-        else:
-            (
-                self._uri,
-                self._storage_options,
-                version,
-                manifest,
-                default_scan_options,
-                read_params,
-            ) = state
+        (
+            self._uri,
+            self._storage_options,
+            version,
+            manifest,
+            default_scan_options,
+            *rest,  # Capture optional read_params
+        ) = state
+        read_params = rest[0] if rest else None
         self._ds = _Dataset(
             self._uri,
             version,
