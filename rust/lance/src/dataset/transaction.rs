@@ -1668,10 +1668,10 @@ impl Transaction {
                     apply_update_map(&mut config, config_updates);
                     manifest.config = config;
                 }
-                if let Some(_table_metadata_updates) = table_metadata_updates {
-                    // TODO: Add table_metadata field to internal Manifest structure
-                    // For now, table_metadata updates are ignored in the commit loop
-                    log::warn!("table_metadata updates are not yet implemented in the internal manifest structure");
+                if let Some(table_metadata_updates) = table_metadata_updates {
+                    let mut table_metadata = manifest.table_metadata.clone();
+                    apply_update_map(&mut table_metadata, table_metadata_updates);
+                    manifest.table_metadata = table_metadata;
                 }
                 if let Some(schema_metadata_updates) = schema_metadata_updates {
                     let mut schema_metadata = manifest.schema.metadata.clone();

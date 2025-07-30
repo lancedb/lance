@@ -79,7 +79,8 @@ use self::fragment::FileFragment;
 use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{
-    translate_config_updates, translate_schema_metadata_updates, Operation, Transaction,
+    translate_config_updates, translate_schema_metadata_updates, Operation, Transaction, UpdateMap,
+    UpdateMapEntry,
 };
 use self::write::write_fragments_internal;
 use crate::dataset::sql::SqlQueryBuilder;
@@ -1824,6 +1825,36 @@ impl Dataset {
         self.update_op(Operation::UpdateConfig {
             config_updates: Some(config_update_map),
             table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        })
+        .await
+    }
+
+    /// Get table metadata as a HashMap.
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        &self.manifest.table_metadata
+    }
+
+    /// Update table metadata.
+    ///
+    /// Pass `None` for a value to remove that key.
+    /// Pass `replace=true` to replace the entire metadata map.
+    pub async fn update_metadata(
+        &mut self,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
+    ) -> Result<()> {
+        let table_metadata_update_map = UpdateMap {
+            update_entries: values
+                .into_iter()
+                .map(|(k, v)| UpdateMapEntry { key: k, value: v })
+                .collect(),
+            replace,
+        };
+        self.update_op(Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: Some(table_metadata_update_map),
             schema_metadata_updates: None,
             field_metadata_updates: HashMap::new(),
         })
@@ -3855,6 +3886,88 @@ mod tests {
         assert_eq!(dataset.manifest.config, desired_config);
         assert_eq!(dataset.config().unwrap(), desired_config);
         assert_true!(!dataset.config().unwrap().contains_key("other-key"));
+    }
+
+    #[tokio::test]
+    async fn test_update_table_metadata() {
+        // Create a table
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+        );
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Test that table_metadata starts empty
+        assert!(dataset.metadata().is_empty());
+
+        // Test updating table metadata
+        let mut updates = HashMap::new();
+        updates.insert("description".to_string(), Some("Test dataset".to_string()));
+        updates.insert("author".to_string(), Some("Test author".to_string()));
+
+        dataset.update_metadata(updates, false).await.unwrap();
+        assert_eq!(
+            dataset.metadata().get("description").unwrap(),
+            "Test dataset"
+        );
+        assert_eq!(dataset.metadata().get("author").unwrap(), "Test author");
+
+        // Test adding more table metadata
+        let mut more_updates = HashMap::new();
+        more_updates.insert("version".to_string(), Some("1.0".to_string()));
+        dataset.update_metadata(more_updates, false).await.unwrap();
+        assert_eq!(dataset.metadata().get("version").unwrap(), "1.0");
+        assert_eq!(dataset.metadata().len(), 3);
+
+        // Test deleting table metadata keys by passing None
+        let mut delete_updates = HashMap::new();
+        delete_updates.insert("author".to_string(), None);
+        dataset
+            .update_metadata(delete_updates, false)
+            .await
+            .unwrap();
+        assert!(!dataset.metadata().contains_key("author"));
+        assert_eq!(dataset.metadata().len(), 2);
+
+        // Test replacing table metadata entirely with replace=true
+        let mut replace_updates = HashMap::new();
+        replace_updates.insert("new_key".to_string(), Some("new_value".to_string()));
+        replace_updates.insert("another_key".to_string(), Some("another_value".to_string()));
+        dataset
+            .update_metadata(replace_updates, true)
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.metadata().len(), 2);
+        assert_eq!(dataset.metadata().get("new_key").unwrap(), "new_value");
+        assert_eq!(
+            dataset.metadata().get("another_key").unwrap(),
+            "another_value"
+        );
+        assert!(!dataset.metadata().contains_key("description"));
+        assert!(!dataset.metadata().contains_key("version"));
+
+        // Test that table_metadata persists across dataset reloads
+        let reloaded_dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(reloaded_dataset.metadata().len(), 2);
+        assert_eq!(
+            reloaded_dataset.metadata().get("new_key").unwrap(),
+            "new_value"
+        );
+        assert_eq!(
+            reloaded_dataset.metadata().get("another_key").unwrap(),
+            "another_value"
+        );
     }
 
     #[rstest]
