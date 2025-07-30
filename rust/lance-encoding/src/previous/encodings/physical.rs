@@ -9,7 +9,7 @@ use crate::{
     decoder::{PageBuffers, PageScheduler},
     encodings::physical::block::{CompressionConfig, CompressionScheme},
     format::pb::{self, PackedStruct},
-    v2::encodings::physical::{
+    previous::encodings::physical::{
         basic::BasicPageScheduler, binary::BinaryPageScheduler, bitmap::DenseBitmapScheduler,
         dictionary::DictionaryPageScheduler, fixed_size_list::FixedListScheduler,
         fsst::FsstPageScheduler, packed_struct::PackedStructPageScheduler,
@@ -284,7 +284,7 @@ pub fn decoder_from_array_encoding(
 mod tests {
     use crate::decoder::{ColumnBuffers, FileBuffers, PageBuffers};
     use crate::format::pb;
-    use crate::v2::encodings::physical::get_buffer_decoder;
+    use crate::previous::encodings::physical::get_buffer_decoder;
 
     #[test]
     fn test_get_buffer_decoder_for_compressed_buffer() {

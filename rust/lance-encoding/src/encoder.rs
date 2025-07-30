@@ -274,7 +274,7 @@ pub fn default_encoding_strategy(version: LanceFileVersion) -> Box<dyn FieldEnco
     match version.resolve() {
         LanceFileVersion::Legacy => panic!(),
         LanceFileVersion::V2_0 => {
-            Box::new(crate::v2::encoder::CoreFieldEncodingStrategy::default())
+            Box::new(crate::previous::encoder::CoreFieldEncodingStrategy::default())
         }
         _ => Box::new(StructuralEncodingStrategy::default()),
     }

@@ -23,8 +23,8 @@ use crate::{
     },
     encoder::{EncodeTask, FieldEncoder, OutOfLineBuffers},
     format::pb::{column_encoding, Blob, ColumnEncoding},
+    previous::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
     repdef::RepDefBuilder,
-    v2::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
     EncodingsIo,
 };
 

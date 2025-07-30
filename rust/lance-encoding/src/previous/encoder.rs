@@ -21,7 +21,7 @@ use crate::{
         },
     },
     format::pb,
-    v2::encodings::{
+    previous::encodings::{
         logical::{
             blob::BlobFieldEncoder, list::ListFieldEncoder, primitive::PrimitiveFieldEncoder,
         },
@@ -616,7 +616,7 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
 
 #[cfg(test)]
 pub mod tests {
-    use crate::v2::encoder::{
+    use crate::previous::encoder::{
         check_dict_encoding, check_fixed_size_encoding, ArrayEncodingStrategy,
         CoreArrayEncodingStrategy,
     };

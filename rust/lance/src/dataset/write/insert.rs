@@ -186,7 +186,12 @@ impl<'a> InsertBuilder<'a> {
     ) -> Result<(Transaction, WriteContext<'_>)> {
         let mut context = self.resolve_context().await?;
 
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, path=context.base_path.to_string(), mode=?context.params.mode);
+        info!(
+            target: TRACE_DATASET_EVENTS,
+            event=DATASET_WRITING_EVENT,
+            uri=context.dest.uri(),
+            mode=?context.params.mode
+        );
 
         self.validate_write(&mut context, &schema)?;
 
