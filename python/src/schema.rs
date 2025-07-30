@@ -49,6 +49,11 @@ impl LanceField {
     pub fn id(&self) -> PyResult<i32> {
         Ok(self.0.id)
     }
+
+    #[getter]
+    pub fn metadata(&self) -> PyResult<std::collections::HashMap<String, String>> {
+        Ok(self.0.metadata.clone())
+    }
 }
 
 /// A Lance Schema.

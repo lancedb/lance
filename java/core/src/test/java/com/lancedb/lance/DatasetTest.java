@@ -789,7 +789,7 @@ public class DatasetTest {
       Map<String, String> updateConfig = new HashMap<>();
       updateConfig.put("key1", "value1");
       updateConfig.put("key2", "value2");
-      dataset.updateConfig(updateConfig);
+      dataset.updateConfig(updateConfig, false);
       originalConfig.putAll(updateConfig);
       assertEquals(2, dataset.version());
       Map<String, String> currentConfig = dataset.getConfig();
@@ -800,7 +800,7 @@ public class DatasetTest {
 
       Map<String, String> updateConfig2 = new HashMap<>();
       updateConfig2.put("key1", "value3");
-      dataset.updateConfig(updateConfig2);
+      dataset.updateConfig(updateConfig2, false);
       currentConfig = dataset.getConfig();
       originalConfig.putAll(updateConfig2);
       assertEquals(3, dataset.version());
@@ -824,7 +824,7 @@ public class DatasetTest {
       Map<String, String> config = new HashMap<>();
       config.put("key1", "value1");
       config.put("key2", "value2");
-      dataset.updateConfig(config);
+      dataset.updateConfig(config, false);
       assertEquals(2, dataset.version());
       Map<String, String> currentConfig = dataset.getConfig();
       assertTrue(currentConfig.keySet().containsAll(config.keySet()));
@@ -883,7 +883,7 @@ public class DatasetTest {
 
       Map<String, String> replaceConfig2 = new HashMap<>();
       replaceConfig2.put("key1", "value3");
-      dataset.replaceSchemaMetadata(replaceConfig2);
+      dataset.updateSchemaMetadata(replaceConfig2, true);
       currentMetadata = dataset.getSchema().getCustomMetadata();
       assertEquals(3, dataset.version());
       assertEquals(1, currentMetadata.size());
@@ -904,7 +904,7 @@ public class DatasetTest {
       Map<String, String> replaceMetadata = new HashMap<>();
       replaceMetadata.put("key1", "value1");
       replaceMetadata.put("key2", "value2");
-      dataset.replaceFieldMetadata(Collections.singletonMap(field.getId(), replaceMetadata));
+      dataset.updateFieldMetadata(Collections.singletonMap(field.getId(), replaceMetadata), true);
       assertEquals(2, dataset.version());
       Map<String, String> currentMetadata = dataset.getSchema().getFields().get(0).getMetadata();
       for (String configKey : currentMetadata.keySet()) {
@@ -914,7 +914,7 @@ public class DatasetTest {
 
       Map<String, String> replaceConfig2 = new HashMap<>();
       replaceConfig2.put("key1", "value3");
-      dataset.replaceFieldMetadata(Collections.singletonMap(field.getId(), replaceConfig2));
+      dataset.updateFieldMetadata(Collections.singletonMap(field.getId(), replaceConfig2), true);
       currentMetadata = dataset.getSchema().getFields().get(0).getMetadata();
       assertEquals(3, dataset.version());
       assertEquals(1, currentMetadata.size());
@@ -923,11 +923,11 @@ public class DatasetTest {
       assertThrows(
           IllegalArgumentException.class,
           () ->
-              dataset.replaceFieldMetadata(
-                  Collections.singletonMap(Integer.MAX_VALUE, replaceConfig2)));
+              dataset.updateFieldMetadata(
+                  Collections.singletonMap(Integer.MAX_VALUE, replaceConfig2), true));
       assertThrows(
           IllegalArgumentException.class,
-          () -> dataset.replaceFieldMetadata(Collections.singletonMap(-1, replaceConfig2)));
+          () -> dataset.updateFieldMetadata(Collections.singletonMap(-1, replaceConfig2), true));
     }
   }
 
