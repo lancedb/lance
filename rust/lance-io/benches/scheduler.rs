@@ -44,7 +44,7 @@ async fn create_data(num_bytes: u64) -> (Arc<ObjectStore>, Path) {
     let tmp_file = path.child("foo.file");
 
     let mut some_data = vec![0; num_bytes as usize];
-    rand::thread_rng().fill_bytes(&mut some_data);
+    rand::rng().fill_bytes(&mut some_data);
     obj_store.put(&tmp_file, &some_data).await.unwrap();
 
     (obj_store, tmp_file)
@@ -156,7 +156,7 @@ fn bench_random_read(c: &mut Criterion) {
     for io_parallelism in [1, 16, 32, 64] {
         for item_size in [8, 1024, 4096] {
             let num_indices = DATA_SIZE as u32 / item_size;
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let mut indices = (0..num_indices).collect::<Vec<_>>();
             let (shuffled, _) = indices.partial_shuffle(&mut rng, INDICES_PER_ITER);
             let mut indices = shuffled.to_vec();
