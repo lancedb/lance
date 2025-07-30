@@ -900,9 +900,10 @@ public class Dataset implements Closeable {
    * Execute SQL query on the dataset. The underlying SQL engine is DataFusion. Please refer to the
    * DataFusion documentation for supported SQL syntax.
    *
-   * @param sql SQL SELECT statement to execute. The query must reference the dataset as the FROM
-   *     clause or omit the FROM clause to query the current dataset.
-   * @return a SqlQuery with default table name is "dataset".
+   * @param sql SELECT statement to execute. The default FROM table name is `dataset`, for
+   *     example: SELECT * FROM `dataset` LIMIT 10. If FROM table name is a custom value, the {@link
+   *     SqlQuery#tableName(String)} should be invoked to set the custom table name.
+   * @return a SqlQuery instance.
    */
   public SqlQuery sql(String sql) {
     return new SqlQuery(this, sql);
