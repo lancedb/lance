@@ -119,6 +119,68 @@ impl DeepSizeOf for ZoneMapIndex {
 }
 
 impl ZoneMapIndex {
+    /// Evaluates whether a zone could potentially contain values matching the query
+    fn evaluate_zone_against_query(
+        &self,
+        zone: &ZoneMapStatistics,
+        query: &SargableQuery,
+    ) -> Result<bool> {
+        use std::ops::Bound;
+
+        match query {
+            SargableQuery::IsNull() => {
+                // Zone contains matching values if it has any null values
+                Ok(zone.null_count > 0)
+            }
+            SargableQuery::Equals(target) => {
+                // Zone contains matching values if target falls within [min, max] range
+                // Handle null values - if target is null, check null_count
+                if target.is_null() {
+                    return Ok(zone.null_count > 0);
+                }
+
+                // Check if target is within the zone's range
+                Ok(target >= &zone.min && target <= &zone.max)
+            }
+            SargableQuery::Range(start, end) => {
+                // Zone overlaps with query range if there's any intersection between
+                // the zone's [min, max] and the query's range
+                let zone_min = &zone.min;
+                let zone_max = &zone.max;
+
+                let start_check = match start {
+                    Bound::Unbounded => true,
+                    Bound::Included(s) => zone_max >= s,
+                    Bound::Excluded(s) => zone_max > s,
+                };
+
+                let end_check = match end {
+                    Bound::Unbounded => true,
+                    Bound::Included(e) => zone_min <= e,
+                    Bound::Excluded(e) => zone_min < e,
+                };
+
+                Ok(start_check && end_check)
+            }
+            SargableQuery::IsIn(values) => {
+                // Zone contains matching values if any value in the set falls within [min, max]
+                Ok(values.iter().any(|value| {
+                    if value.is_null() {
+                        zone.null_count > 0
+                    } else {
+                        value >= &zone.min && value <= &zone.max
+                    }
+                }))
+            }
+            SargableQuery::FullTextSearch(_) => {
+                return Err(Error::NotSupported {
+                    source: "full text search is not supported for zonemap indexes".into(),
+                    location: location!(),
+                });
+            }
+        }
+    }
+
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
@@ -231,11 +293,21 @@ impl ScalarIndex for ZoneMapIndex {
     async fn search(
         &self,
         query: &dyn AnyQuery,
-        metrics: &dyn MetricsCollector,
+        _metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        // TODO: Implement actual search logic
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        // Then what?
+
+        let mut matching_zones = Vec::new();
+
+        for (zone_idx, zone) in self.zones.iter().enumerate() {
+            if self.evaluate_zone_against_query(zone, query)? {
+                matching_zones.push(zone_idx);
+            }
+        }
+
+        // TODO: Convert matching zone indices to actual row ID ranges
+        // Each zone covers zonemap_size rows, except possibly the last zone which may have zonemap_offset rows
+        // For now, return empty result - this is the missing piece for a complete implementation
         Ok(SearchResult::AtMost(RowIdTreeMap::new()))
     }
 
@@ -708,25 +780,27 @@ mod tests {
         ));
 
         let data =
-            arrow_array::Int32Array::from_iter_values(0..=(ZONEMAP_DEFAULT_SIZE * 2 + 42) as i32);
+            arrow_array::Int64Array::from_iter_values(0..=(ZONEMAP_DEFAULT_SIZE * 2 + 42) as i64);
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Int32, false),
+            Field::new("values", DataType::Int64, false),
             Field::new("row_ids", DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
-        let data = Box::pin(RecordBatchStreamAdapter::new(
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::once(std::future::ready(Ok(data))),
         ));
 
-        let mut builder =
-            ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderOptions::default(), DataType::Int32)
-                .unwrap();
-
-        builder.train(data).await.unwrap();
-        builder.write_index(test_store.as_ref()).await.unwrap();
+        let data_source = Box::new(MockTrainingSource::from(data_stream));
+        train_zonemap_index(
+            data_source,
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderOptions::default()),
+        )
+        .await
+        .unwrap();
 
         log::debug!("Successfully wrote the index file");
 
@@ -739,25 +813,27 @@ mod tests {
             index.zones,
             vec![
                 ZoneMapStatistics {
-                    min: ScalarValue::Int32(Some(0)),
-                    max: ScalarValue::Int32(Some(8191)),
+                    min: ScalarValue::Int64(Some(0)),
+                    max: ScalarValue::Int64(Some(8191)),
                     null_count: 0
                 },
                 ZoneMapStatistics {
-                    min: ScalarValue::Int32(Some(8192)),
-                    max: ScalarValue::Int32(Some(16383)),
+                    min: ScalarValue::Int64(Some(8192)),
+                    max: ScalarValue::Int64(Some(16383)),
                     null_count: 0
                 },
                 ZoneMapStatistics {
-                    min: ScalarValue::Int32(Some(16384)),
-                    max: ScalarValue::Int32(Some(16426)),
+                    min: ScalarValue::Int64(Some(16384)),
+                    max: ScalarValue::Int64(Some(16426)),
                     null_count: 0
                 }
             ]
         );
-        assert_eq!(index.data_type, DataType::Int32);
+        assert_eq!(index.data_type, DataType::Int64);
         assert_eq!(index.zonemap_size, ZONEMAP_DEFAULT_SIZE);
         assert_eq!(index.zonemap_offset, 43);
+
+        // TODO: Test search functionality
     }
     // Create another test following test_page_cache in  btree.rs
 }
