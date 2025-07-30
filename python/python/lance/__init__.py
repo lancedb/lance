@@ -79,6 +79,7 @@ def dataset(
     default_scan_options: Optional[Dict[str, str]] = None,
     metadata_cache_size_bytes: Optional[int] = None,
     index_cache_size_bytes: Optional[int] = None,
+    read_params: Optional[Dict[str, any]] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -128,6 +129,11 @@ def dataset(
         Size of the metadata cache in bytes. This cache is used to store metadata
         information about the dataset, such as schema and statistics. If not specified,
         a default size will be used.
+    read_params : optional, dict
+        Dictionary of read parameters. Currently supports:
+        - cache_repetition_index (bool): Whether to cache repetition indices for
+          large string/binary columns
+        - validate_on_decode (bool): Whether to validate data during decoding
     """
     ds = LanceDataset(
         uri,
@@ -139,6 +145,7 @@ def dataset(
         default_scan_options=default_scan_options,
         metadata_cache_size_bytes=metadata_cache_size_bytes,
         index_cache_size_bytes=index_cache_size_bytes,
+        read_params=read_params,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -157,8 +164,10 @@ def dataset(
                 block_size,
                 commit_lock=commit_lock,
                 index_cache_size=index_cache_size,
+                storage_options=storage_options,
                 metadata_cache_size_bytes=metadata_cache_size_bytes,
                 index_cache_size_bytes=index_cache_size_bytes,
+                read_params=read_params,
             )
     else:
         return ds

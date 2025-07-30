@@ -3728,3 +3728,38 @@ def test_dataset_sql(tmp_path: Path):
     complex_result = complex_query.to_batch_records()
     expected_complex = pa.table({"user_id": [1, 2, 3], "val": ["A", "B", "C"]})
     assert pa.Table.from_batches(complex_result) == expected_complex
+
+
+def test_file_reader_options(tmp_path: Path):
+    """Test cache_repetition_index and validate_on_decode options"""
+    table = pa.table({"a": range(100), "b": ["x"] * 100})
+    lance.write_dataset(table, tmp_path / "test")
+
+    # Test cache_repetition_index option at dataset level
+    dataset = lance.dataset(
+        tmp_path / "test", read_params={"cache_repetition_index": True}
+    )
+    result = dataset.to_table()
+    assert result.num_rows == 100
+
+    # Test validate_on_decode option at dataset level
+    dataset = lance.dataset(tmp_path / "test", read_params={"validate_on_decode": True})
+    result = dataset.to_table()
+    assert result.num_rows == 100
+
+    # Test both options together
+    dataset = lance.dataset(
+        tmp_path / "test",
+        read_params={"cache_repetition_index": True, "validate_on_decode": False},
+    )
+    result = dataset.to_table()
+    assert result.num_rows == 100
+
+    # Test that scanner inherits options from dataset
+    dataset = lance.dataset(
+        tmp_path / "test",
+        read_params={"cache_repetition_index": True, "validate_on_decode": True},
+    )
+    scanner = dataset.scanner()
+    result = scanner.to_table()
+    assert result.num_rows == 100
