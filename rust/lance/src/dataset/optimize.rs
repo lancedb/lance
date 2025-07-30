@@ -590,9 +590,9 @@ pub struct RewriteResult {
     pub read_version: u64,
     /// The original fragments being replaced
     pub original_fragments: Vec<Fragment>,
-    /// A HashMap of original row IDs to new row IDs or None (deleted)
+    /// A HashMap of original row addrs to new row addrs or None (deleted)
     /// Only set when index remap is done as a part of the compaction
-    pub row_id_map: Option<HashMap<u64, Option<u64>>>,
+    pub row_addr_map: Option<HashMap<u64, Option<u64>>>,
     /// the changed row addresses in the original fragment
     /// in the form of serialized RoaringTreemap
     /// Only set when index remap is deferred after compaction
@@ -651,7 +651,7 @@ async fn rewrite_files(
             new_fragments: Vec::new(),
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
-            row_id_map: None,
+            row_addr_map: None,
             changed_row_addrs: None,
         });
     }
@@ -796,7 +796,7 @@ async fn rewrite_files(
         new_fragments,
         read_version: dataset.manifest.version,
         original_fragments: task.fragments,
-        row_id_map: row_addr_map,
+        row_addr_map: row_addr_map,
         changed_row_addrs,
     })
 }
@@ -885,7 +885,7 @@ pub async fn commit_compaction(
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
     let mut metrics = CompactionMetrics::default();
 
-    let mut row_id_map: HashMap<u64, Option<u64>> = HashMap::default();
+    let mut row_addr_map: HashMap<u64, Option<u64>> = HashMap::default();
     let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
 
@@ -896,7 +896,7 @@ pub async fn commit_compaction(
             new_fragments: task.new_fragments.clone(),
         };
         if needs_remapping {
-            row_id_map.extend(task.row_id_map.unwrap());
+            row_addr_map.extend(task.row_addr_map.unwrap());
         } else if options.defer_index_remap {
             frag_reuse_groups.push(FragReuseGroup {
                 changed_row_addrs: task.changed_row_addrs.unwrap(),
@@ -913,13 +913,13 @@ pub async fn commit_compaction(
 
     let rewritten_indices = if needs_remapping {
         let index_remapper = remap_options.create_remapper(dataset)?;
-        let affected_ids = rewrite_groups
+        let affected_frag_ids = rewrite_groups
             .iter()
             .flat_map(|group| group.old_fragments.iter().map(|frag| frag.id))
             .collect::<Vec<_>>();
 
         let remapped_indices = index_remapper
-            .remap_indices(row_id_map, &affected_ids)
+            .remap_indices(row_addr_map, &affected_frag_ids)
             .await?;
         remapped_indices
             .iter()
@@ -1861,7 +1861,7 @@ mod tests {
         let mut expected_all_old_frag_ids = Vec::new();
         let mut expected_all_new_frag_ids = Vec::new();
         let mut expected_all_new_frag_bitmap = RoaringBitmap::new();
-        let mut expected_all_row_id_map = HashMap::new();
+        let mut expected_all_row_addr_map = HashMap::new();
         let mut deferred_results = Vec::new();
 
         for (task, task2) in plan.tasks().iter().zip(plan2.tasks()) {
@@ -1874,7 +1874,7 @@ mod tests {
                     .unwrap();
 
             // Verify RewriteResult for deferred index remap
-            assert!(deferred_result.row_id_map.is_none());
+            assert!(deferred_result.row_addr_map.is_none());
             assert!(deferred_result.changed_row_addrs.is_some());
             assert!(!deferred_result
                 .changed_row_addrs
@@ -1888,30 +1888,30 @@ mod tests {
             assert!(immediate_result.changed_row_addrs.is_none());
             assert!(!immediate_result.original_fragments.is_empty());
             assert!(!immediate_result.new_fragments.is_empty());
-            assert!(immediate_result.row_id_map.is_some());
+            assert!(immediate_result.row_addr_map.is_some());
 
             // Deserialize the changed_row_addrs from the deferred result
             let changed_row_addrs_bytes = deferred_result.changed_row_addrs.as_ref().unwrap();
             let mut cursor = Cursor::new(changed_row_addrs_bytes);
             let changed_row_addrs = RoaringTreemap::deserialize_from(&mut cursor).unwrap();
 
-            // Use transpose_row_ids to convert changed_row_addrs to row_id_map
+            // Use transpose_row_addrs to convert changed_row_addrs to row_addr_map
             let transposed_map = transpose_row_addrs(
                 changed_row_addrs,
                 &deferred_result.original_fragments,
                 &deferred_result.new_fragments,
             );
 
-            // Compare with the immediate result's row_id_map
-            let immediate_map = immediate_result.row_id_map.as_ref().unwrap();
+            // Compare with the immediate result's row_addr_map
+            let immediate_map = immediate_result.row_addr_map.as_ref().unwrap();
             assert_eq!(transposed_map.len(), immediate_map.len());
-            for (old_row_id, new_row_id) in &transposed_map {
+            for (old_row_addr, new_row_addr) in &transposed_map {
                 assert_eq!(
-                    immediate_map.get(old_row_id),
-                    Some(new_row_id),
-                    "Row ID mapping should be identical: {} -> {:?}",
-                    old_row_id,
-                    new_row_id
+                    immediate_map.get(old_row_addr),
+                    Some(new_row_addr),
+                    "Row Addr mapping should be identical: {} -> {:?}",
+                    old_row_addr,
+                    new_row_addr
                 );
             }
 
@@ -1934,7 +1934,7 @@ mod tests {
                     .map(|s| s.id)
                     .collect::<Vec<_>>(),
             );
-            expected_all_row_id_map.extend(immediate_result.row_id_map.unwrap());
+            expected_all_row_addr_map.extend(immediate_result.row_addr_map.unwrap());
         }
 
         // Now commit the first compaction (using deferred results)
@@ -2006,7 +2006,7 @@ mod tests {
             );
             transposed_map.extend(group_transposed_map);
         }
-        assert_eq!(transposed_map, expected_all_row_id_map);
+        assert_eq!(transposed_map, expected_all_row_addr_map);
         assert_eq!(
             compacted_all_old_frag_digests
                 .iter()
