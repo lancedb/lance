@@ -2819,8 +2819,8 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.read_transaction(version)
 
-    def get_transactions(self) -> Optional[List[Transaction]]:
-        return self._ds.get_transactions()
+    def get_transactions(self, max_transactions=10) -> Optional[List[Transaction]]:
+        return self._ds.get_transactions(max_transactions)
 
     def sql(self, sql: str) -> "SqlQueryBuilder":
         """Execute SQL query on the dataset.
