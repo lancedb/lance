@@ -319,3 +319,40 @@ def test_s3_drop(s3_bucket: str):
     dataset = lance.write_dataset(table, tmp_path, storage_options=storage_options)
     dataset.validate()
     lance.LanceDataset.drop(tmp_path, storage_options=storage_options)
+
+
+def gen_table(num_rows):
+    import pyarrow.compute as pc
+
+    values = pc.random(num_rows * 500).cast(pa.float32())
+    vectors = pa.FixedSizeListArray.from_arrays(values, 500)
+    table = pa.table({"vector": vectors})
+
+    return table
+
+
+@pytest.mark.integration
+def test_s3_create_index(s3_bucket: str):
+    storage_options = copy.deepcopy(CONFIG)
+    table_name = uuid.uuid4().hex
+    tmp_path = f"s3://{s3_bucket}/{table_name}.lance"
+    table = gen_table(1000)
+    dataset = lance.write_dataset(table, tmp_path, storage_options=storage_options)
+    dataset.validate()
+    index_name = "vector_idx"
+    dataset.create_index(
+        "vector",
+        "IVF_PQ",
+        name=index_name,
+        num_partitions=2,
+        num_sub_vectors=2,
+        storage_options=storage_options,
+    )
+
+    indices = dataset.list_indices()
+    assert len(indices) == 1, "must have one index"
+
+    index_info = indices[0]
+    assert index_info["name"] == index_name
+    assert index_info["type"] == "IVF_PQ"
+    assert "vector" in index_info["fields"]
