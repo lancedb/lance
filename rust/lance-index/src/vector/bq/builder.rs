@@ -83,7 +83,7 @@ impl RabbitQuantizer {
             .for_each(|vec| {
                 let col_vec = ndarray::Array2::from_shape_vec(
                     (self.dim(), 1),
-                    vec.into_iter().map(|&x| x.as_()).collect(),
+                    vec.iter().map(|x| x.as_()).collect(),
                 )
                 .unwrap();
                 let col_vec: ndarray::Array2<f32> = self.metadata.inv_p.dot(&col_vec);
@@ -202,7 +202,7 @@ impl TryFrom<Quantizer> for RabbitQuantizer {
 
 impl From<RabbitQuantizer> for Quantizer {
     fn from(quantizer: RabbitQuantizer) -> Self {
-        Quantizer::Rabbit(quantizer)
+        Self::Rabbit(quantizer)
     }
 }
 

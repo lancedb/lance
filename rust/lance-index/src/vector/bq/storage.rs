@@ -58,7 +58,7 @@ impl QuantizerMetadata for RabbitQuantizationMetadata {
         debug_assert!(!bytes.is_empty());
         let codebook_tensor: pb::Tensor = pb::Tensor::decode(bytes)?;
         let inv_p = FixedSizeListArray::try_from(&codebook_tensor)?;
-        let shape = (inv_p.len() as usize, inv_p.len() as usize);
+        let shape = (inv_p.len(), inv_p.len());
         let inv_p = inv_p
             .values()
             .as_primitive::<Float32Type>()
@@ -187,32 +187,31 @@ impl<'a> RabbitDistCalculator<'a> {
         // TODO: optimize this with SIMD
         query_codes
             .chunks_exact(4)
-            .map(|sub_vec| {
+            .flat_map(|sub_vec| {
                 (0..16).map(|j| {
                     let mut dist = 0;
-                    for b in 0..4 {
-                        dist += (sub_vec[b] * ((j >> b) & 0x1)) as u32;
+                    for (b, v) in sub_vec.iter().enumerate() {
+                        dist += (*v * ((j >> b) & 0x1)) as u32;
                     }
                     dist
                 })
             })
-            .flatten()
             .exact_size(query_codes.len() * 4)
             .collect()
     }
 }
 
 // TODO: optimize this with SIMD
-impl<'a> DistCalculator for RabbitDistCalculator<'a> {
+impl DistCalculator for RabbitDistCalculator<'_> {
     fn distance(&self, id: u32) -> f32 {
         let mut dist = 0;
         let id = id as usize;
         let code_len = self.dim * (self.num_bits as usize) / 8;
         let code = &self.codes[id * code_len..(id + 1) * code_len];
-        for i in 0..code_len {
+        for code_byte in code.iter() {
             // code is a bit vector, we need to extract the bits
-            let current_code = (code[i] & 0x0F) as usize;
-            let next_code = (code[i] >> 4) as usize;
+            let current_code = (code_byte & 0x0F) as usize;
+            let next_code = (code_byte >> 4) as usize;
             dist += self.dist_table[current_code];
             dist += self.dist_table[next_code];
         }
@@ -223,8 +222,8 @@ impl<'a> DistCalculator for RabbitDistCalculator<'a> {
         let code_len = self.dim * (self.num_bits as usize) / 8;
         let len = self.codes.len() / code_len;
         let mut dists = vec![0.0; len];
-        for i in 0..len {
-            dists[i] = self.distance(i as u32);
+        for (i, dist) in dists.iter_mut().enumerate() {
+            *dist = self.distance(i as u32);
         }
         dists
     }
