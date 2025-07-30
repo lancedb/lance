@@ -338,10 +338,10 @@ impl RowIdSequence {
         })
     }
 
-    /// Given a mask of row ids, calculate the offset ranges of the row ids that are present
+    /// Given a mask of row addrs, calculate the offset ranges of the row addrs that are present
     /// in the sequence.
     ///
-    /// For example, given a mask that selects all even ids and a sequence that is
+    /// For example, given a mask that selects all even addrs and a sequence that is
     /// [80..85, 86..90, 14]
     ///
     /// this will return [0, 2, 4, 5, 7, 9]
@@ -359,59 +359,59 @@ impl RowIdSequence {
         for segment in &self.0 {
             match segment {
                 U64Segment::Range(range) => {
-                    let mut ids = RowAddrTreeMap::from(range.clone());
-                    ids.mask(mask);
+                    let mut addrs = RowAddrTreeMap::from(range.clone());
+                    addrs.mask(mask);
                     ranges.extend(GroupingIterator::new(
-                        unsafe { ids.into_addr_iter() }.map(|id| id - range.start + offset),
+                        unsafe { addrs.into_addr_iter() }.map(|addr| addr - range.start + offset),
                     ));
                     offset += range.end - range.start;
                 }
                 U64Segment::RangeWithHoles { range, holes } => {
                     let offset_start = offset;
-                    let mut ids = RowAddrTreeMap::from(range.clone());
+                    let mut addrs = RowAddrTreeMap::from(range.clone());
                     offset += range.end - range.start;
                     for hole in holes.iter() {
-                        if ids.remove(hole) {
+                        if addrs.remove(hole) {
                             offset -= 1;
                         }
                     }
-                    ids.mask(mask);
+                    addrs.mask(mask);
 
                     // Sadly we can't just subtract the offset because of the holes
                     let mut sorted_holes = holes.clone().into_iter().collect::<Vec<_>>();
                     sorted_holes.sort_unstable();
                     let mut next_holes_iter = sorted_holes.into_iter().peekable();
                     let mut holes_passed = 0;
-                    ranges.extend(GroupingIterator::new(unsafe { ids.into_addr_iter() }.map(
-                        |id| {
+                    ranges.extend(GroupingIterator::new(unsafe { addrs.into_addr_iter() }.map(
+                        |addr| {
                             while let Some(next_hole) = next_holes_iter.peek() {
-                                if *next_hole < id {
+                                if *next_hole < addr {
                                     next_holes_iter.next();
                                     holes_passed += 1;
                                 } else {
                                     break;
                                 }
                             }
-                            id - range.start + offset_start - holes_passed
+                            addr - range.start + offset_start - holes_passed
                         },
                     )));
                 }
                 U64Segment::RangeWithBitmap { range, bitmap } => {
-                    let mut ids = RowAddrTreeMap::from(range.clone());
+                    let mut addrs = RowAddrTreeMap::from(range.clone());
                     let offset_start = offset;
                     offset += range.end - range.start;
                     for (i, val) in range.clone().enumerate() {
-                        if !bitmap.get(i) && ids.remove(val) {
+                        if !bitmap.get(i) && addrs.remove(val) {
                             offset -= 1;
                         }
                     }
-                    ids.mask(mask);
+                    addrs.mask(mask);
                     let mut bitmap_iter = bitmap.iter();
                     let mut bitmap_iter_pos = 0;
                     let mut holes_passed = 0;
-                    ranges.extend(GroupingIterator::new(unsafe { ids.into_addr_iter() }.map(
-                        |id| {
-                            let offset_no_holes = id - range.start + offset_start;
+                    ranges.extend(GroupingIterator::new(unsafe { addrs.into_addr_iter() }.map(
+                        |addr| {
+                            let offset_no_holes = addr - range.start + offset_start;
                             while bitmap_iter_pos < offset_no_holes {
                                 if !bitmap_iter.next().unwrap() {
                                     holes_passed += 1;
@@ -425,8 +425,8 @@ impl RowIdSequence {
                 U64Segment::SortedArray(array) | U64Segment::Array(array) => {
                     // TODO: Could probably optimize the sorted array case to be O(N) instead of O(N log N)
                     ranges.extend(GroupingIterator::new(array.iter().enumerate().filter_map(
-                        |(off, id)| {
-                            if mask.selected(id) {
+                        |(off, addr)| {
+                            if mask.selected(addr) {
                                 Some(off as u64 + offset)
                             } else {
                                 None
