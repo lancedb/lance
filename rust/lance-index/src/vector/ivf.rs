@@ -13,8 +13,11 @@ use lance_core::Result;
 use lance_linalg::distance::{DistanceType, MetricType};
 use tracing::instrument;
 
+use crate::vector::bq::builder::RabbitQuantizer;
+use crate::vector::bq::transform::RQTransformer;
 use crate::vector::ivf::transform::PartitionTransformer;
 use crate::vector::kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array};
+use crate::vector::transform::NormalizeTransformer;
 use crate::vector::{pq::ProductQuantizer, transform::Transformer};
 
 use super::flat::transform::FlatTransformer;
@@ -75,6 +78,13 @@ pub fn new_ivf_transformer_with_quantizer(
             metric_type,
             vector_column,
             sq,
+            range,
+        )),
+        Quantizer::Rabbit(rq) => Ok(IvfTransformer::with_rq(
+            centroids,
+            metric_type,
+            vector_column,
+            rq,
             range,
         )),
     }
@@ -238,6 +248,53 @@ impl IvfTransformer {
             vector_column.to_owned(),
             SQ_CODE_COLUMN.to_owned(),
         )));
+
+        Self::new(centroids, distance_type, transforms)
+    }
+
+    fn with_rq(
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+        rq: RabbitQuantizer,
+        range: Option<Range<u32>>,
+    ) -> Self {
+        let mut transforms: Vec<Arc<dyn Transformer>> =
+            vec![Arc::new(super::transform::Flatten::new(vector_column))];
+
+        let distance_type = if distance_type == MetricType::Cosine {
+            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                vector_column,
+            )));
+            MetricType::L2
+        } else {
+            distance_type
+        };
+        transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
+
+        let partition_transform = Arc::new(PartitionTransformer::new(
+            centroids.clone(),
+            distance_type,
+            vector_column,
+        ));
+        transforms.push(partition_transform);
+
+        if let Some(range) = range {
+            transforms.push(Arc::new(transform::PartitionFilter::new(
+                PART_ID_COLUMN,
+                range,
+            )));
+        }
+
+        // RQ requires to convert the vector `v` to `(v-c)/||v-c||`
+        transforms.push(Arc::new(ResidualTransform::new(
+            centroids.clone(),
+            PART_ID_COLUMN,
+            vector_column,
+        )));
+        transforms.push(Arc::new(NormalizeTransformer::new(vector_column)));
+
+        transforms.push(Arc::new(RQTransformer::new(rq, vector_column)));
 
         Self::new(centroids, distance_type, transforms)
     }

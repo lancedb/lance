@@ -359,9 +359,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Flat, QuantizationType::Flat) => IndexType::IvfFlat,
             (SubIndexType::Flat, QuantizationType::Product) => IndexType::IvfPq,
             (SubIndexType::Flat, QuantizationType::Scalar) => IndexType::IvfSq,
+            (SubIndexType::Flat, QuantizationType::Rabbit) => IndexType::IvfRq,
             (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
             (SubIndexType::Hnsw, QuantizationType::Flat) => IndexType::IvfHnswFlat,
+            (sub_index_type, quantization_type) => {
+                unimplemented!(
+                    "unsupported index type: {}, {}",
+                    sub_index_type,
+                    quantization_type
+                )
+            }
         }
     }
 
@@ -639,6 +647,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::bq::RQBuildParams;
 
     use crate::index::{vector::is_ivf_hnsw, DatasetIndexInternalExt};
     use crate::utils::test::copy_test_data_to_tmp;
@@ -680,7 +689,7 @@ mod tests {
     use lance_linalg::kernels::normalize_fsl;
     use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
     use object_store::path::Path;
-    use rand::distributions::uniform::SampleUniform;
+    use rand::distr::uniform::SampleUniform;
     use rstest::rstest;
     use tempfile::tempdir;
 
@@ -1366,6 +1375,25 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let sq_params = SQBuildParams::default();
         let params = VectorIndexParams::with_ivf_sq_params(distance_type, ivf_params, sq_params);
+        test_index(params.clone(), nlist, recall_requirement, None).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
+        test_remap(params.clone(), nlist).await;
+        test_optimize_strategy(params).await;
+    }
+
+    #[rstest]
+    #[case(4, DistanceType::L2, 0.85)]
+    #[tokio::test]
+    async fn test_build_ivf_rq(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
+        let ivf_params = IvfBuildParams::new(nlist);
+        let rq_params = RQBuildParams::default();
+        let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;

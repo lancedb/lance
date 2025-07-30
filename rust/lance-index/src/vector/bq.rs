@@ -80,13 +80,20 @@ fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
         }))
 }
 
-pub struct RabbitQuantizationBuildParams {
-    pub num_bits: u16,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RQBuildParams {
+    pub num_bits: u8,
 }
 
-impl QuantizerBuildParams for RabbitQuantizationBuildParams {
+impl QuantizerBuildParams for RQBuildParams {
     fn sample_size(&self) -> usize {
-        2usize.pow(self.num_bits as u32)
+        0
+    }
+}
+
+impl Default for RQBuildParams {
+    fn default() -> Self {
+        Self { num_bits: 1 }
     }
 }
 

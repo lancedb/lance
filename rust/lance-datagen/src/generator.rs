@@ -20,7 +20,7 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SchemaRef};
 use futures::{stream::BoxStream, StreamExt};
-use rand::{distributions::Uniform, Rng, RngCore, SeedableRng};
+use rand::{distr::Uniform, Rng, RngCore, SeedableRng};
 use random_word;
 
 use self::array::rand_with_distribution;
@@ -233,7 +233,7 @@ impl ArrayGenerator for NullGenerator {
             let threshold = (self.null_probability * u8::MAX as f64) as u8;
             let bytes = (0..num_validity_bytes)
                 .map(|byte_idx| {
-                    let mut sample = rng.gen::<u64>();
+                    let mut sample = rng.random::<u64>();
                     let mut byte: u8 = 0;
                     for bit_idx in 0..8 {
                         // We could probably overshoot and fill in extra bits with random data but
@@ -534,7 +534,7 @@ impl CycleListGenerator {
             underlying_gen.data_type().clone(),
             true,
         )));
-        let lengths_dist = Uniform::new(min_list_size.0, max_list_size.0);
+        let lengths_dist = Uniform::new(min_list_size.0, max_list_size.0).unwrap();
         let lengths_gen = rand_with_distribution::<UInt32Type, Uniform<u32>>(lengths_dist);
         Self {
             underlying_gen,
@@ -772,12 +772,14 @@ impl ArrayGenerator for RandomIntervalGenerator {
     ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
         match self.unit {
             IntervalUnit::YearMonth => {
-                let months = (0..length.0).map(|_| rng.gen::<i32>()).collect::<Vec<_>>();
+                let months = (0..length.0)
+                    .map(|_| rng.random::<i32>())
+                    .collect::<Vec<_>>();
                 Ok(Arc::new(arrow_array::IntervalYearMonthArray::from(months)))
             }
             IntervalUnit::MonthDayNano => {
                 let day_time_array = (0..length.0)
-                    .map(|_| IntervalMonthDayNano::new(rng.gen(), rng.gen(), rng.gen()))
+                    .map(|_| IntervalMonthDayNano::new(rng.random(), rng.random(), rng.random()))
                     .collect::<Vec<_>>();
                 Ok(Arc::new(arrow_array::IntervalMonthDayNanoArray::from(
                     day_time_array,
@@ -785,7 +787,7 @@ impl ArrayGenerator for RandomIntervalGenerator {
             }
             IntervalUnit::DayTime => {
                 let day_time_array = (0..length.0)
-                    .map(|_| IntervalDayTime::new(rng.gen(), rng.gen()))
+                    .map(|_| IntervalDayTime::new(rng.random(), rng.random()))
                     .collect::<Vec<_>>();
                 Ok(Arc::new(arrow_array::IntervalDayTimeArray::from(
                     day_time_array,
@@ -995,9 +997,9 @@ impl ArrayGenerator for RandomSentenceGenerator {
         let mut values = Vec::with_capacity(length.0 as usize);
 
         for _ in 0..length.0 {
-            let num_words = rng.gen_range(self.min_words..=self.max_words);
+            let num_words = rng.random_range(self.min_words..=self.max_words);
             let sentence: String = (0..num_words)
-                .map(|_| self.words[rng.gen_range(0..self.words.len())])
+                .map(|_| self.words[rng.random_range(0..self.words.len())])
                 .collect::<Vec<_>>()
                 .join(" ");
             values.push(sentence);
@@ -1049,7 +1051,7 @@ impl ArrayGenerator for RandomWordGenerator {
         let mut values = Vec::with_capacity(length.0 as usize);
 
         for _ in 0..length.0 {
-            let word = self.words[rng.gen_range(0..self.words.len())];
+            let word = self.words[rng.random_range(0..self.words.len())];
             values.push(word.to_string());
         }
 
@@ -1086,7 +1088,7 @@ impl VariableRandomBinaryGenerator {
             min_bytes_per_element.0 as i32,
             max_bytes_per_element.0 as i32,
         );
-        let lengths_gen = rand_with_distribution::<Int32Type, Uniform<i32>>(lengths_dist);
+        let lengths_gen = rand_with_distribution::<Int32Type, Uniform<i32>>(lengths_dist.unwrap());
 
         Self {
             lengths_gen,
@@ -1343,10 +1345,10 @@ impl RandomListGenerator {
         };
         let field = Field::new("", list_type, true);
         let lengths_gen = if is_large {
-            let lengths_dist = Uniform::new_inclusive(0, 10);
+            let lengths_dist = Uniform::new_inclusive(0, 10).unwrap();
             rand_with_distribution::<Int64Type, Uniform<i64>>(lengths_dist)
         } else {
-            let lengths_dist = Uniform::new_inclusive(0, 10);
+            let lengths_dist = Uniform::new_inclusive(0, 10).unwrap();
             rand_with_distribution::<Int32Type, Uniform<i32>>(lengths_dist)
         };
         Self {
@@ -1524,7 +1526,7 @@ impl ArrayGenerator for JitterCentroidsGenerator {
         for _ in 0..length.0 {
             // Generate random N dimensional point
             let mut noise = (0..self.dimension as usize)
-                .map(|_| rng.gen::<f32>())
+                .map(|_| rng.random::<f32>())
                 .collect::<Vec<_>>();
             // Scale point to noise_level length
             let scale = self.noise_level / noise.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -2053,12 +2055,12 @@ pub mod array {
         DataType::Native: Copy + 'static,
         PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
         DataType: ArrowPrimitiveType,
-        rand::distributions::Standard: rand::distributions::Distribution<DataType::Native>,
+        rand::distr::StandardUniform: rand::distr::Distribution<DataType::Native>,
     {
         Box::new(
             FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
                 DataType::DATA_TYPE,
-                move |rng| rng.gen(),
+                move |rng| rng.random(),
                 1,
                 DataType::DATA_TYPE
                     .primitive_width()
@@ -2071,7 +2073,7 @@ pub mod array {
     /// Create a generator of primitive values that are randomly sampled from the entire range available for the value
     pub fn rand_with_distribution<
         DataType,
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
+        Dist: rand::distr::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
     >(
         dist: Dist,
     ) -> Box<dyn ArrayGenerator>
@@ -2099,7 +2101,7 @@ pub mod array {
         DataType::Native: Copy + 'static,
         PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
         DataType: ArrowPrimitiveType,
-        rand::distributions::Standard: rand::distributions::Distribution<DataType::Native>,
+        rand::distr::StandardUniform: rand::distr::Distribution<DataType::Native>,
     {
         let underlying = rand::<DataType>();
         cycle_vec(underlying, dimension)
@@ -2117,7 +2119,7 @@ pub mod array {
 
         let data_type = DataType::Time32(*resolution);
         let size = ByteCount::from(data_type.primitive_width().unwrap() as u64);
-        let dist = Uniform::new(start, end);
+        let dist = Uniform::new(start, end).unwrap();
         let sample_fn = move |rng: &mut _| dist.sample(rng);
 
         match resolution {
@@ -2145,7 +2147,7 @@ pub mod array {
 
         let data_type = DataType::Time64(*resolution);
         let size = ByteCount::from(data_type.primitive_width().unwrap() as u64);
-        let dist = Uniform::new(start, end);
+        let dist = Uniform::new(start, end).unwrap();
         let sample_fn = move |rng: &mut _| dist.sample(rng);
 
         match resolution {
@@ -2216,7 +2218,7 @@ pub mod array {
         let end_days = (end_ms / MS_PER_DAY) as i32;
         let start_ms = start.timestamp_millis();
         let start_days = (start_ms / MS_PER_DAY) as i32;
-        let dist = Uniform::new(start_days, end_days);
+        let dist = Uniform::new(start_days, end_days).unwrap();
 
         Box::new(FnGen::<i32, Date32Array, _>::new_known_size(
             data_type,
@@ -2258,7 +2260,7 @@ pub mod array {
             DataType::Timestamp(TimeUnit::Second, _) => (start.timestamp(), end.timestamp()),
             _ => panic!(),
         };
-        let dist = Uniform::new(start_ticks, end_ticks);
+        let dist = Uniform::new(start_ticks, end_ticks).unwrap();
 
         let data_type = data_type.clone();
         let sample_fn = move |rng: &mut _| (dist.sample(rng));
@@ -2311,7 +2313,7 @@ pub mod array {
         let end_days = end_ms / MS_PER_DAY;
         let start_ms = start.timestamp_millis();
         let start_days = start_ms / MS_PER_DAY;
-        let dist = Uniform::new(start_days, end_days);
+        let dist = Uniform::new(start_days, end_days).unwrap();
 
         Box::new(FnGen::<i64, Date64Array, _>::new_known_size(
             data_type,

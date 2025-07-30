@@ -21,6 +21,8 @@ use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::vector::bq::builder::RabbitQuantizer;
+use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -60,6 +62,7 @@ pub enum StageParams {
     Hnsw(HnswBuildParams),
     PQ(PQBuildParams),
     SQ(SQBuildParams),
+    RQ(RQBuildParams),
 }
 
 // The version of the index file.
@@ -172,6 +175,19 @@ impl VectorIndexParams {
         }
     }
 
+    pub fn with_ivf_rq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        rq: RQBuildParams,
+    ) -> Self {
+        let stages = vec![StageParams::Ivf(ivf), StageParams::RQ(rq)];
+        Self {
+            stages,
+            metric_type,
+            version: IndexFileVersion::V3,
+        }
+    }
+
     pub fn ivf_hnsw(
         distance_type: DistanceType,
         ivf: IvfBuildParams,
@@ -264,6 +280,14 @@ fn is_ivf_sq(stages: &[StageParams]) -> bool {
     }
 
     matches!(&stages[0], StageParams::Ivf(_)) && matches!(&stages[1], StageParams::SQ(_))
+}
+
+fn is_ivf_rq(stages: &[StageParams]) -> bool {
+    if stages.len() < 2 {
+        return false;
+    }
+
+    matches!(&stages[0], StageParams::Ivf(_)) && matches!(&stages[1], StageParams::RQ(_))
 }
 
 fn is_ivf_hnsw(stages: &[StageParams]) -> bool {
@@ -407,6 +431,27 @@ pub(crate) async fn build_vector_index(
             Box::new(shuffler),
             Some(ivf_params.clone()),
             Some(sq_params.clone()),
+            (),
+            frag_reuse_index,
+        )?
+        .build()
+        .await?;
+    } else if is_ivf_rq(stages) {
+        let StageParams::RQ(rq_params) = &stages[1] else {
+            return Err(Error::Index {
+                message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                location: location!(),
+            });
+        };
+
+        IvfIndexBuilder::<FlatIndex, RabbitQuantizer>::new(
+            dataset.clone(),
+            column.to_owned(),
+            dataset.indices_dir().child(uuid),
+            params.metric_type,
+            Box::new(shuffler),
+            Some(ivf_params.clone()),
+            Some(rq_params.clone()),
             (),
             frag_reuse_index,
         )?

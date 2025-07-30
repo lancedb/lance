@@ -539,9 +539,10 @@ fn make_sample<T: OffsetSizeTrait>(in_buf: &[u8], offsets: &[T]) -> (Vec<u8>, Ve
     let mut sample_offsets: Vec<T> = Vec::new();
 
     sample_offsets.push(T::from_usize(0).unwrap());
-    let mut rng = StdRng::from_entropy();
+    let mut rng = rand::rng();
+    let mut rng = StdRng::from_rng(&mut rng);
     while sample_buf.len() < FSST_SAMPLETARGET {
-        let rand_num = rng.gen_range(0..offsets.len()) % (offsets.len() - 1);
+        let rand_num = rng.random_range(0..offsets.len()) % (offsets.len() - 1);
         sample_buf.extend_from_slice(
             &in_buf[offsets[rand_num].as_usize()..offsets[rand_num + 1].as_usize()],
         );

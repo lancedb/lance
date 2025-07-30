@@ -480,6 +480,25 @@ pub(crate) async fn optimize_vector_indices_v2(
             .build()
             .await?;
         }
+        (SubIndexType::Flat, QuantizationType::Rabbit) => {
+            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(indices_to_merge)
+            .retrain(options.retrain)
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?;
+        }
         // IVF_HNSW_FLAT
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
             IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
@@ -548,6 +567,13 @@ pub(crate) async fn optimize_vector_indices_v2(
             .await?
             .build()
             .await?;
+        }
+        (sub_index_type, quantization_type) => {
+            unimplemented!(
+                "unsupported index type: {}, {}",
+                sub_index_type,
+                quantization_type
+            )
         }
     }
 
@@ -728,8 +754,6 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     // Write the metadata of quantizer
     let quantization_metadata = match &quantizer {
-        Quantizer::Flat(_) => None,
-        Quantizer::FlatBin(_) => None,
         Quantizer::Product(pq) => {
             let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
@@ -743,7 +767,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
                 ..Default::default()
             })
         }
-        Quantizer::Scalar(_) => None,
+        _ => None,
     };
 
     aux_writer.add_metadata(
@@ -1687,8 +1711,6 @@ async fn write_ivf_hnsw_file(
 
     // For PQ, we need to store the codebook
     let quantization_metadata = match &quantizer {
-        Quantizer::Flat(_) => None,
-        Quantizer::FlatBin(_) => None,
         Quantizer::Product(pq) => {
             let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
@@ -1702,7 +1724,7 @@ async fn write_ivf_hnsw_file(
                 ..Default::default()
             })
         }
-        Quantizer::Scalar(_) => None,
+        _ => None,
     };
 
     aux_writer.add_metadata(
@@ -1881,7 +1903,7 @@ mod tests {
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
         generate_scaled_random_array, sample_without_replacement,
     };
-    use rand::{seq::SliceRandom, thread_rng};
+    use rand::seq::SliceRandom;
     use rstest::rstest;
     use tempfile::tempdir;
 
@@ -2183,7 +2205,7 @@ mod tests {
         if num_parts > ids.len() as u32 {
             panic!("Not enough ids to break into {num_parts} parts");
         }
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         ids.shuffle(&mut rng);
 
         let values_per_part = ids.len() / num_parts as usize;

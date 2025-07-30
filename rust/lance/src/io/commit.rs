@@ -37,7 +37,7 @@ use lance_table::format::{
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
-use rand::{thread_rng, Rng};
+use rand::Rng;
 use snafu::location;
 
 use futures::future::Either;
@@ -561,7 +561,7 @@ pub(crate) async fn do_commit_detached_transaction(
     let mut backoff = Backoff::default();
     while backoff.attempt() < commit_config.num_retries {
         // Pick a random u64 with the highest bit set to indicate it is detached
-        let random_version = thread_rng().gen::<u64>() | DETACHED_VERSION_MASK;
+        let random_version = rand::rng().random::<u64>() | DETACHED_VERSION_MASK;
 
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
