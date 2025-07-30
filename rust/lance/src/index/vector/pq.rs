@@ -629,7 +629,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::index::vector::ivf::build_ivf_model;
-    use lance_core::utils::mask::RowIdMask;
+    use lance_core::utils::mask::RowAddrMask;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_testing::datagen::generate_random_array_with_range;
 
@@ -775,8 +775,8 @@ mod tests {
             self.row_ids.is_empty()
         }
 
-        fn mask(&self) -> Arc<RowIdMask> {
-            RowIdMask::all_rows().into()
+        fn mask(&self) -> Arc<RowAddrMask> {
+            RowAddrMask::all_rows().into()
         }
 
         fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {

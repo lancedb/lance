@@ -8,7 +8,7 @@ use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt64Array};
 use async_trait::async_trait;
 use deepsize::{Context, DeepSizeOf};
 use itertools::Itertools;
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
 use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
 use lance_table::format::{pb, ExternalFile, Fragment};
@@ -245,8 +245,8 @@ impl FragReuseIndex {
         mapped_value
     }
 
-    pub fn remap_row_ids_tree_map(&self, row_ids: &RowIdTreeMap) -> RowIdTreeMap {
-        RowIdTreeMap::from_iter(row_ids.row_addresses().unwrap().filter_map(|addr| {
+    pub fn remap_row_ids_tree_map(&self, row_ids: &RowAddrTreeMap) -> RowAddrTreeMap {
+        RowAddrTreeMap::from_iter(row_ids.row_addresses().unwrap().filter_map(|addr| {
             let addr_as_u64 = u64::from(addr);
             self.remap_row_addr(addr_as_u64)
         }))

@@ -9,7 +9,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::{Int32Type, UInt32Type};
 use arrow_array::{Array, UInt32Array};
 use arrow_schema::DataType;
-use lance_core::utils::mask::RowIdMask;
+use lance_core::utils::mask::RowAddrMask;
 use lance_core::Result;
 use tracing::instrument;
 
@@ -309,7 +309,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
     pub(crate) fn search(
         &mut self,
         params: &FtsSearchParams,
-        mask: Arc<RowIdMask>,
+        mask: Arc<RowAddrMask>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, u32, u32)>> {
         let limit = params.limit.unwrap_or(usize::MAX);
@@ -719,7 +719,7 @@ mod tests {
         let result = wand
             .search(
                 &FtsSearchParams::default(),
-                Arc::new(RowIdMask::default()),
+                Arc::new(RowAddrMask::default()),
                 &NoOpMetricsCollector,
             )
             .unwrap();

@@ -26,7 +26,7 @@ use deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::RowIdIndex;
 use lance_core::{
-    utils::mask::{RowIdMask, RowIdTreeMap},
+    utils::mask::{RowAddrMask, RowAddrTreeMap},
     Error, Result,
 };
 use lance_io::ReadBatchParams;
@@ -353,13 +353,13 @@ impl RowIdSequence {
     /// This function is useful when determining which row offsets to read from a fragment given
     /// a mask.
     #[instrument(level = "debug", skip_all)]
-    pub fn mask_to_offset_ranges(&self, mask: &RowIdMask) -> Vec<Range<u64>> {
+    pub fn mask_to_offset_ranges(&self, mask: &RowAddrMask) -> Vec<Range<u64>> {
         let mut offset = 0;
         let mut ranges = Vec::new();
         for segment in &self.0 {
             match segment {
                 U64Segment::Range(range) => {
-                    let mut ids = RowIdTreeMap::from(range.clone());
+                    let mut ids = RowAddrTreeMap::from(range.clone());
                     ids.mask(mask);
                     ranges.extend(GroupingIterator::new(
                         unsafe { ids.into_addr_iter() }.map(|id| id - range.start + offset),
@@ -368,7 +368,7 @@ impl RowIdSequence {
                 }
                 U64Segment::RangeWithHoles { range, holes } => {
                     let offset_start = offset;
-                    let mut ids = RowIdTreeMap::from(range.clone());
+                    let mut ids = RowAddrTreeMap::from(range.clone());
                     offset += range.end - range.start;
                     for hole in holes.iter() {
                         if ids.remove(hole) {
@@ -397,7 +397,7 @@ impl RowIdSequence {
                     )));
                 }
                 U64Segment::RangeWithBitmap { range, bitmap } => {
-                    let mut ids = RowIdTreeMap::from(range.clone());
+                    let mut ids = RowAddrTreeMap::from(range.clone());
                     let offset_start = offset;
                     offset += range.end - range.start;
                     for (i, val) in range.clone().enumerate() {
@@ -480,7 +480,7 @@ impl<I: Iterator<Item = u64>> Iterator for GroupingIterator<I> {
     }
 }
 
-impl From<&RowIdSequence> for RowIdTreeMap {
+impl From<&RowIdSequence> for RowAddrTreeMap {
     fn from(row_ids: &RowIdSequence) -> Self {
         let mut tree_map = Self::new();
         for segment in &row_ids.0 {
@@ -956,13 +956,13 @@ mod test {
             U64Segment::Range(40..50),
         ]);
 
-        let tree_map = RowIdTreeMap::from(&sequence);
+        let tree_map = RowAddrTreeMap::from(&sequence);
         let expected = vec![
             0, 1, 2, 3, 4, 7, 9, 10, 12, 14, 35, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
             51, 52, 55, 56, 57, 58, 59,
         ]
         .into_iter()
-        .collect::<RowIdTreeMap>();
+        .collect::<RowAddrTreeMap>();
         assert_eq!(tree_map, expected);
     }
 
@@ -1061,17 +1061,17 @@ mod test {
     fn test_mask_to_offset_ranges() {
         // Tests with a simple range segment
         let sequence = RowIdSequence(vec![U64Segment::Range(0..10)]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 2, 4, 6, 8]));
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 2, 4, 6, 8]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..1, 2..3, 4..5, 6..7, 8..9]);
 
         let sequence = RowIdSequence(vec![U64Segment::Range(40..60)]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[54]));
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[54]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![14..15]);
 
         let sequence = RowIdSequence(vec![U64Segment::Range(40..60)]);
-        let mask = RowIdMask::from_block(RowIdTreeMap::from_iter(&[54]));
+        let mask = RowAddrMask::from_block(RowAddrTreeMap::from_iter(&[54]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..14, 15..20]);
 
@@ -1081,7 +1081,7 @@ mod test {
             range: 0..10,
             holes: vec![2, 6].into(),
         }]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 2, 4, 6, 8]));
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 2, 4, 6, 8]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..1, 3..4, 6..7]);
 
@@ -1089,7 +1089,7 @@ mod test {
             range: 40..60,
             holes: vec![47, 43].into(),
         }]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[44]));
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[44]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![3..4]);
 
@@ -1097,7 +1097,7 @@ mod test {
             range: 40..60,
             holes: vec![47, 43].into(),
         }]);
-        let mask = RowIdMask::from_block(RowIdTreeMap::from_iter(&[44]));
+        let mask = RowAddrMask::from_block(RowAddrTreeMap::from_iter(&[44]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..3, 4..18]);
 
@@ -1111,7 +1111,7 @@ mod test {
             .as_slice()
             .into(),
         }]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 2, 4, 6, 8]));
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 2, 4, 6, 8]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..1, 2..3, 4..5]);
 
@@ -1119,7 +1119,7 @@ mod test {
             range: 40..45,
             bitmap: [true, true, false, false, true].as_slice().into(),
         }]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[44]));
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[44]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![2..3]);
 
@@ -1127,18 +1127,18 @@ mod test {
             range: 40..45,
             bitmap: [true, true, false, false, true].as_slice().into(),
         }]);
-        let mask = RowIdMask::from_block(RowIdTreeMap::from_iter(&[44]));
+        let mask = RowAddrMask::from_block(RowAddrTreeMap::from_iter(&[44]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..2]);
 
         // Test with a sorted array segment
         let sequence = RowIdSequence(vec![U64Segment::SortedArray(vec![0, 2, 4, 6, 8].into())]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 6, 8]));
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 6, 8]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..1, 3..5]);
 
         let sequence = RowIdSequence(vec![U64Segment::Array(vec![8, 2, 6, 0, 4].into())]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 6, 8]));
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 6, 8]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..1, 2..4]);
 
@@ -1154,19 +1154,19 @@ mod test {
             },
             U64Segment::SortedArray(vec![44, 46, 78].into()),
         ]);
-        let mask = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[0, 2, 46, 100, 104]));
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 2, 46, 100, 104]));
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..1, 2..3, 5..6, 8..9, 10..11]);
 
         // Test with empty mask (should select everything)
         let sequence = RowIdSequence(vec![U64Segment::Range(0..10)]);
-        let mask = RowIdMask::default();
+        let mask = RowAddrMask::default();
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..10]);
 
         // Test with allow nothing mask
         let sequence = RowIdSequence(vec![U64Segment::Range(0..10)]);
-        let mask = RowIdMask::allow_nothing();
+        let mask = RowAddrMask::allow_nothing();
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![]);
     }

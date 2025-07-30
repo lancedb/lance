@@ -38,7 +38,7 @@ use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::utils::{
-    mask::RowIdMask,
+    mask::RowAddrMask,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
 };
 use lance_core::{container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus};
@@ -513,7 +513,7 @@ impl InvertedPartition {
         tokens: &[String],
         params: &FtsSearchParams,
         operator: Operator,
-        mask: Arc<RowIdMask>,
+        mask: Arc<RowAddrMask>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, u32, u32)>> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);

@@ -29,7 +29,7 @@ use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{
     utils::{
         address::RowAddress,
-        mask::{RowIdMask, RowIdTreeMap},
+        mask::{RowAddrMask, RowAddrTreeMap},
     },
     Error, Result, ROW_ID_FIELD,
 };
@@ -331,7 +331,7 @@ impl MapIndexExec {
         column_name: String,
         index_name: String,
         dataset: Arc<Dataset>,
-        deletion_mask: Option<Arc<RowIdMask>>,
+        deletion_mask: Option<Arc<RowAddrMask>>,
         batch: RecordBatch,
         metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<RecordBatch> {
@@ -616,7 +616,7 @@ impl MaterializeIndexExec {
 
 #[instrument(name = "make_row_ids", skip(mask, dataset, fragments))]
 async fn row_ids_for_mask(
-    mask: RowIdMask,
+    mask: RowAddrMask,
     dataset: &Dataset,
     fragments: &[Fragment],
 ) -> Result<Vec<u64>> {
@@ -703,14 +703,14 @@ async fn row_ids_for_mask(
 }
 
 async fn retain_fragments(
-    allow_list: &mut RowIdTreeMap,
+    allow_list: &mut RowAddrTreeMap,
     fragments: &[Fragment],
     dataset: &Dataset,
 ) -> Result<()> {
     if dataset.manifest.uses_move_stable_row_ids() {
         let fragment_ids = load_row_id_sequences(dataset, fragments)
-            .map_ok(|(_frag_id, sequence)| RowIdTreeMap::from(sequence.as_ref()))
-            .try_fold(RowIdTreeMap::new(), |mut acc, tree| async {
+            .map_ok(|(_frag_id, sequence)| RowAddrTreeMap::from(sequence.as_ref()))
+            .try_fold(RowAddrTreeMap::new(), |mut acc, tree| async {
                 acc |= tree;
                 Ok(acc)
             })

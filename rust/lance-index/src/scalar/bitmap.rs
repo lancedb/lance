@@ -18,7 +18,7 @@ use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{
-    cache::LanceCache, error::LanceOptionExt, utils::mask::RowIdTreeMap, Error, Result,
+    cache::LanceCache, error::LanceOptionExt, utils::mask::RowAddrTreeMap, Error, Result,
 };
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -43,9 +43,9 @@ const MAX_ROWS_PER_CHUNK: usize = 2 * 1024; // 64kib per int32
 /// The bitmap stores a list of row ids where the value is present.
 #[derive(Clone, Debug)]
 pub struct BitmapIndex {
-    index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap>,
+    index_map: BTreeMap<OrderableScalarValue, RowAddrTreeMap>,
     // We put null in its own map to avoid it matching range queries (arrow-rs considers null to come before minval)
-    null_map: RowIdTreeMap,
+    null_map: RowAddrTreeMap,
     // The data type of the values in the index
     value_type: DataType,
     // Memoized index_map size for DeepSizeOf
@@ -55,8 +55,8 @@ pub struct BitmapIndex {
 
 impl BitmapIndex {
     fn new(
-        index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap>,
-        null_map: RowIdTreeMap,
+        index_map: BTreeMap<OrderableScalarValue, RowAddrTreeMap>,
+        null_map: RowAddrTreeMap,
         value_type: DataType,
         index_map_size_bytes: usize,
         store: Arc<dyn IndexStore>,
@@ -173,10 +173,10 @@ impl ScalarIndex for BitmapIndex {
                     .collect::<Vec<_>>();
 
                 metrics.record_comparisons(maps.len());
-                RowIdTreeMap::union_all(&maps)
+                RowAddrTreeMap::union_all(&maps)
             }
             SargableQuery::IsIn(values) => {
-                let mut union_bitmap = RowIdTreeMap::default();
+                let mut union_bitmap = RowAddrTreeMap::default();
                 metrics.record_comparisons(values.len());
                 for val in values {
                     if val.is_null() {
@@ -225,15 +225,15 @@ impl ScalarIndex for BitmapIndex {
             let data_type = serialized_lookup.schema().field(0).data_type().clone();
             return Ok(Arc::new(Self::new(
                 BTreeMap::new(),
-                RowIdTreeMap::default(),
+                RowAddrTreeMap::default(),
                 data_type,
                 0,
                 store,
             )));
         }
 
-        let mut index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap> = BTreeMap::new();
-        let mut null_map = RowIdTreeMap::default();
+        let mut index_map: BTreeMap<OrderableScalarValue, RowAddrTreeMap> = BTreeMap::new();
+        let mut null_map = RowAddrTreeMap::default();
         let mut value_type: Option<DataType> = None;
         let mut index_map_size_bytes = 0;
 
@@ -263,7 +263,7 @@ impl ScalarIndex for BitmapIndex {
             for idx in 0..chunk.num_rows() {
                 let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
                 let bitmap_bytes = bitmap_binary_array.value(idx);
-                let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
+                let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
                 if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
                     bitmap = frag_reuse_index_ref.remap_row_ids_tree_map(&bitmap);
@@ -301,7 +301,7 @@ impl ScalarIndex for BitmapIndex {
             .iter()
             .map(|(key, bitmap)| {
                 let bitmap =
-                    RowIdTreeMap::from_iter(bitmap.row_addresses().unwrap().filter_map(|addr| {
+                    RowAddrTreeMap::from_iter(bitmap.row_addresses().unwrap().filter_map(|addr| {
                         let addr_as_u64 = u64::from(addr);
                         mapping
                             .get(&addr_as_u64)
@@ -313,7 +313,7 @@ impl ScalarIndex for BitmapIndex {
             .collect::<HashMap<_, _>>();
 
         let null_map =
-            RowIdTreeMap::from_iter(self.null_map.row_addresses().unwrap().filter_map(|addr| {
+            RowAddrTreeMap::from_iter(self.null_map.row_addresses().unwrap().filter_map(|addr| {
                 let addr_as_u64 = u64::from(addr);
                 mapping
                     .get(&addr_as_u64)
@@ -361,7 +361,7 @@ fn get_batch_from_arrays(
 }
 
 async fn write_bitmap_index(
-    state: HashMap<ScalarValue, RowIdTreeMap>,
+    state: HashMap<ScalarValue, RowAddrTreeMap>,
     index_store: &dyn IndexStore,
     value_type: &DataType,
 ) -> Result<()> {
@@ -426,7 +426,7 @@ async fn write_bitmap_index(
 
 async fn do_train_bitmap_index(
     mut data_source: SendableRecordBatchStream,
-    mut state: HashMap<ScalarValue, RowIdTreeMap>,
+    mut state: HashMap<ScalarValue, RowAddrTreeMap>,
     index_store: &dyn IndexStore,
 ) -> Result<()> {
     let value_type = data_source.schema().field(0).data_type().clone();
@@ -458,7 +458,7 @@ pub async fn train_bitmap_index(
     let batches_source = data_source.scan_unordered_chunks(4096).await?;
 
     // mapping from item to list of the row ids where it is present
-    let dictionary: HashMap<ScalarValue, RowIdTreeMap> = HashMap::new();
+    let dictionary: HashMap<ScalarValue, RowAddrTreeMap> = HashMap::new();
 
     do_train_bitmap_index(batches_source, dictionary, index_store).await
 }
@@ -473,7 +473,7 @@ pub mod tests {
     use datafusion_common::ScalarValue;
     use lance_core::cache::LanceCache;
     use lance_core::utils::address::RowAddress;
-    use lance_core::utils::mask::RowIdTreeMap;
+    use lance_core::utils::mask::RowAddrTreeMap;
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
     use std::collections::{BTreeMap, HashMap};
@@ -491,7 +491,7 @@ pub mod tests {
         use arrow_schema::DataType;
         use datafusion_common::ScalarValue;
         use lance_core::cache::LanceCache;
-        use lance_core::utils::mask::RowIdTreeMap;
+        use lance_core::utils::mask::RowAddrTreeMap;
         use lance_io::object_store::ObjectStore;
         use object_store::path::Path;
         use std::collections::HashMap;
@@ -509,7 +509,7 @@ pub mod tests {
         let mut state = HashMap::new();
         for i in 0..m {
             // Create a bitmap that contains, say, 1000 row IDs.
-            let bitmap = RowIdTreeMap::from_iter(0..per_bitmap_size);
+            let bitmap = RowAddrTreeMap::from_iter(0..per_bitmap_size);
 
             let key = ScalarValue::UInt32(Some(i));
             state.insert(key, bitmap);
@@ -634,15 +634,15 @@ pub mod tests {
         // Simulate a bitmap where:
         // frag 1 - { 0: null, 1: null, 2: 1 }
         // frag 2 - { 0: 1, 1: 2, 2: 2 }
-        let mut null_map = RowIdTreeMap::new();
+        let mut null_map = RowAddrTreeMap::new();
         null_map.insert(RowAddress::new_from_parts(1, 0).into());
         null_map.insert(RowAddress::new_from_parts(1, 1).into());
 
-        let mut scalar_value1 = RowIdTreeMap::new();
+        let mut scalar_value1 = RowAddrTreeMap::new();
         scalar_value1.insert(RowAddress::new_from_parts(1, 2).into());
         scalar_value1.insert(RowAddress::new_from_parts(2, 0).into());
 
-        let mut scalar_value2 = RowIdTreeMap::new();
+        let mut scalar_value2 = RowAddrTreeMap::new();
         scalar_value2.insert(RowAddress::new_from_parts(2, 1).into());
         scalar_value2.insert(RowAddress::new_from_parts(2, 2).into());
 
@@ -703,16 +703,16 @@ pub mod tests {
             .await
             .expect("Failed to load bitmap index");
 
-        let mut expected_null_map = RowIdTreeMap::new();
+        let mut expected_null_map = RowAddrTreeMap::new();
         expected_null_map.insert(RowAddress::new_from_parts(3, 0).into());
         expected_null_map.insert(RowAddress::new_from_parts(3, 1).into());
         assert_eq!(reloaded_idx.null_map, expected_null_map);
 
-        let mut expected_scalar_value1 = RowIdTreeMap::new();
+        let mut expected_scalar_value1 = RowAddrTreeMap::new();
         expected_scalar_value1.insert(RowAddress::new_from_parts(3, 2).into());
         expected_scalar_value1.insert(RowAddress::new_from_parts(3, 3).into());
 
-        let mut expected_scalar_value2 = RowIdTreeMap::new();
+        let mut expected_scalar_value2 = RowAddrTreeMap::new();
         expected_scalar_value2.insert(RowAddress::new_from_parts(3, 4).into());
         expected_scalar_value2.insert(RowAddress::new_from_parts(3, 5).into());
 

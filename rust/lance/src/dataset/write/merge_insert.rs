@@ -78,7 +78,7 @@ use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
     utils::{
-        backoff::SlotBackoff, futures::Capacity, mask::RowIdTreeMap,
+        backoff::SlotBackoff, futures::Capacity, mask::RowAddrTreeMap,
         tokio::get_num_compute_intensive_cpus,
     },
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
@@ -1277,7 +1277,7 @@ impl MergeInsertJob {
     async fn execute_uncommitted_v2(
         self,
         source: SendableRecordBatchStream,
-    ) -> Result<(Transaction, MergeStats, Option<RowIdTreeMap>)> {
+    ) -> Result<(Transaction, MergeStats, Option<RowAddrTreeMap>)> {
         let plan = self.create_plan(source).await?;
 
         // Execute the plan
@@ -1336,7 +1336,7 @@ impl MergeInsertJob {
                 location: location!(),
             })?;
 
-        let affected_rows = merge_insert_exec.affected_rows().map(RowIdTreeMap::from);
+        let affected_rows = merge_insert_exec.affected_rows().map(RowAddrTreeMap::from);
 
         Ok((transaction, stats, affected_rows))
     }
@@ -1444,7 +1444,7 @@ impl MergeInsertJob {
                 mem_wal_to_flush: self.params.mem_wal_to_flush,
             };
 
-            let affected_rows = Some(RowIdTreeMap::from(removed_row_ids));
+            let affected_rows = Some(RowAddrTreeMap::from(removed_row_ids));
             (operation, affected_rows)
         };
 
@@ -1534,7 +1534,7 @@ pub struct MergeStats {
 
 pub struct UncommittedMergeInsert {
     pub transaction: Transaction,
-    pub affected_rows: Option<RowIdTreeMap>,
+    pub affected_rows: Option<RowAddrTreeMap>,
     pub stats: MergeStats,
 }
 

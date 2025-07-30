@@ -330,7 +330,7 @@ pub mod tests {
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
-    use lance_core::utils::mask::RowIdTreeMap;
+    use lance_core::utils::mask::RowAddrTreeMap;
     use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
@@ -522,7 +522,7 @@ pub mod tests {
     async fn check(index: &BTreeIndex, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert!(results.is_exact());
-        let expected_arr = RowIdTreeMap::from_iter(expected);
+        let expected_arr = RowAddrTreeMap::from_iter(expected);
         assert_eq!(results.row_ids(), &expected_arr);
     }
 
@@ -1012,7 +1012,7 @@ pub mod tests {
     async fn check_bitmap(index: &BitmapIndex, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert!(results.is_exact());
-        let expected_arr = RowIdTreeMap::from_iter(expected);
+        let expected_arr = RowAddrTreeMap::from_iter(expected);
         assert_eq!(results.row_ids(), &expected_arr);
     }
 

@@ -14,7 +14,7 @@ use std::{borrow::Cow, ops::Deref};
 
 use lance_core::{
     cache::{CacheKey, LanceCache},
-    utils::{deletion::DeletionVector, mask::RowIdMask},
+    utils::{deletion::DeletionVector, mask::RowAddrMask},
 };
 use lance_table::{
     format::{DeletionFile, Manifest},
@@ -117,7 +117,7 @@ pub struct RowIdMaskKey {
 }
 
 impl CacheKey for RowIdMaskKey {
-    type ValueType = RowIdMask;
+    type ValueType = RowAddrMask;
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("row_id_mask/{}", self.version))
