@@ -78,7 +78,9 @@ use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
-use self::transaction::{Operation, Transaction};
+use self::transaction::{
+    translate_config_updates, translate_schema_metadata_updates, Operation, Transaction,
+};
 use self::write::write_fragments_internal;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -1805,22 +1807,25 @@ impl Dataset {
         &mut self,
         upsert_values: impl IntoIterator<Item = (String, String)>,
     ) -> Result<()> {
+        let config_update_map = translate_config_updates(&HashMap::from_iter(upsert_values), &[]);
         self.update_op(Operation::UpdateConfig {
-            upsert_values: Some(HashMap::from_iter(upsert_values)),
-            delete_keys: None,
-            schema_metadata: None,
-            field_metadata: None,
+            config_updates: Some(config_update_map),
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
         })
         .await
     }
 
     /// Delete keys from the config.
     pub async fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
+        let delete_keys_vec = Vec::from_iter(delete_keys.iter().map(ToString::to_string));
+        let config_update_map = translate_config_updates(&HashMap::new(), &delete_keys_vec);
         self.update_op(Operation::UpdateConfig {
-            upsert_values: None,
-            delete_keys: Some(Vec::from_iter(delete_keys.iter().map(ToString::to_string))),
-            schema_metadata: None,
-            field_metadata: None,
+            config_updates: Some(config_update_map),
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
         })
         .await
     }
@@ -1830,11 +1835,13 @@ impl Dataset {
         &mut self,
         new_values: impl IntoIterator<Item = (String, String)>,
     ) -> Result<()> {
+        let schema_metadata_map = HashMap::from_iter(new_values);
+        let schema_metadata_update_map = translate_schema_metadata_updates(&schema_metadata_map);
         self.update_op(Operation::UpdateConfig {
-            upsert_values: None,
-            delete_keys: None,
-            schema_metadata: Some(HashMap::from_iter(new_values)),
-            field_metadata: None,
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: Some(schema_metadata_update_map),
+            field_metadata_updates: HashMap::new(),
         })
         .await
     }
@@ -1845,11 +1852,15 @@ impl Dataset {
         new_values: impl IntoIterator<Item = (u32, HashMap<String, String>)>,
     ) -> Result<()> {
         let new_values = new_values.into_iter().collect::<HashMap<_, _>>();
+        let field_metadata_updates = new_values
+            .into_iter()
+            .map(|(field_id, metadata)| (field_id, translate_schema_metadata_updates(&metadata)))
+            .collect();
         self.update_op(Operation::UpdateConfig {
-            upsert_values: None,
-            delete_keys: None,
-            schema_metadata: None,
-            field_metadata: Some(new_values),
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates,
         })
         .await
     }

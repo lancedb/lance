@@ -510,7 +510,11 @@ impl TryFrom<pb::Manifest> for Manifest {
         let fragment_offsets = compute_fragment_offsets(fragments.as_slice());
         let fields_with_meta = FieldsWithMeta {
             fields: Fields(p.fields),
-            metadata: p.metadata,
+            metadata: p
+                .table_metadata
+                .into_iter()
+                .map(|(k, v)| (k, v.into_bytes()))
+                .collect(),
         };
 
         if FLAG_MOVE_STABLE_ROW_IDS & p.reader_feature_flags != 0
@@ -588,6 +592,12 @@ impl From<&Manifest> for pb::Manifest {
         let fields_with_meta: FieldsWithMeta = (&m.schema).into();
         Self {
             fields: fields_with_meta.fields.0,
+            schema_metadata: m
+                .schema
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
+                .collect(),
             version: m.version,
             writer_version: m
                 .writer_version
@@ -597,7 +607,11 @@ impl From<&Manifest> for pb::Manifest {
                     version: wv.version.clone(),
                 }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
-            metadata: fields_with_meta.metadata,
+            table_metadata: fields_with_meta
+                .metadata
+                .into_iter()
+                .map(|(k, v)| (k, String::from_utf8_lossy(&v).to_string()))
+                .collect(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
             timestamp: timestamp_nanos,
