@@ -382,8 +382,8 @@ impl RowIdSequence {
                     sorted_holes.sort_unstable();
                     let mut next_holes_iter = sorted_holes.into_iter().peekable();
                     let mut holes_passed = 0;
-                    ranges.extend(GroupingIterator::new(unsafe { addrs.into_addr_iter() }.map(
-                        |addr| {
+                    ranges.extend(GroupingIterator::new(
+                        unsafe { addrs.into_addr_iter() }.map(|addr| {
                             while let Some(next_hole) = next_holes_iter.peek() {
                                 if *next_hole < addr {
                                     next_holes_iter.next();
@@ -393,8 +393,8 @@ impl RowIdSequence {
                                 }
                             }
                             addr - range.start + offset_start - holes_passed
-                        },
-                    )));
+                        }),
+                    ));
                 }
                 U64Segment::RangeWithBitmap { range, bitmap } => {
                     let mut addrs = RowAddrTreeMap::from(range.clone());
@@ -409,8 +409,8 @@ impl RowIdSequence {
                     let mut bitmap_iter = bitmap.iter();
                     let mut bitmap_iter_pos = 0;
                     let mut holes_passed = 0;
-                    ranges.extend(GroupingIterator::new(unsafe { addrs.into_addr_iter() }.map(
-                        |addr| {
+                    ranges.extend(GroupingIterator::new(
+                        unsafe { addrs.into_addr_iter() }.map(|addr| {
                             let offset_no_holes = addr - range.start + offset_start;
                             while bitmap_iter_pos < offset_no_holes {
                                 if !bitmap_iter.next().unwrap() {
@@ -419,8 +419,8 @@ impl RowIdSequence {
                                 bitmap_iter_pos += 1;
                             }
                             offset_no_holes - holes_passed
-                        },
-                    )));
+                        }),
+                    ));
                 }
                 U64Segment::SortedArray(array) | U64Segment::Array(array) => {
                     // TODO: Could probably optimize the sorted array case to be O(N) instead of O(N log N)
