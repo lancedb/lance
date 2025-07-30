@@ -2166,7 +2166,7 @@ mod tests {
         );
 
         assert_eq!(
-            FilteredReadStream::trim_ranges(ranges.clone(), 0..25, &(15..25)),
+            FilteredReadStream::trim_ranges(ranges, 0..25, &(15..25)),
             vec![20..25, 30..35]
         );
     }
