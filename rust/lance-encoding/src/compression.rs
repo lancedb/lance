@@ -116,21 +116,19 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
 
 #[derive(Debug, Default)]
 pub struct DefaultCompressionStrategy {
-    /// Optional user-configured compression parameters
-    params: Option<CompressionParams>,
+    /// User-configured compression parameters
+    params: CompressionParams,
 }
 
 impl DefaultCompressionStrategy {
     /// Create a new compression strategy with default behavior
     pub fn new() -> Self {
-        Self { params: None }
+        Self::default()
     }
 
     /// Create a new compression strategy with user-configured parameters
     pub fn with_params(params: CompressionParams) -> Self {
-        Self {
-            params: Some(params),
-        }
+        Self { params }
     }
 
     /// Build compressor based on parameters for fixed-width data
@@ -259,115 +257,16 @@ impl CompressionStrategy for DefaultCompressionStrategy {
         field: &Field,
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
-        // If we have user parameters, use them first
-        if let Some(params) = &self.params {
-            let field_params = params.get_field_params(&field.name, &field.data_type());
+        let field_params = self
+            .params
+            .get_field_params(&field.name, &field.data_type());
 
-            match data {
-                DataBlock::FixedWidth(fixed_width_data) => {
-                    return self.build_fixed_width_compressor(
-                        &field_params,
-                        field,
-                        fixed_width_data,
-                    );
-                }
-                DataBlock::VariableWidth(variable_width_data) => {
-                    return self
-                        .build_variable_width_compressor(&field_params, variable_width_data);
-                }
-                DataBlock::Struct(_) => {
-                    // Struct compression doesn't use parameters currently
-                    return Ok(Box::new(PackedStructFixedWidthMiniBlockEncoder::default()));
-                }
-                DataBlock::FixedSizeList(_) => {
-                    // FSL doesn't support compression currently
-                    return Ok(Box::new(ValueEncoder::default()));
-                }
-                _ => {
-                    // Fall through to default behavior for unsupported types
-                }
-            }
-        }
-
-        // Default behavior (no user parameters)
         match data {
             DataBlock::FixedWidth(fixed_width_data) => {
-                let is_byte_width_aligned = fixed_width_data.bits_per_value == 8
-                    || fixed_width_data.bits_per_value == 16
-                    || fixed_width_data.bits_per_value == 32
-                    || fixed_width_data.bits_per_value == 64;
-                let bit_widths = data.expect_stat(Stat::BitWidth);
-                let bit_widths = bit_widths.as_primitive::<UInt64Type>();
-                // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
-                // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
-                let has_all_zeros = bit_widths.values().iter().any(|v| *v == 0);
-                // The minimum bit packing size is a block of 1024 values.  For very small pages the uncompressed
-                // size might be smaller than the compressed size.
-                let too_small = bit_widths.len() == 1
-                    && InlineBitpacking::min_size_bytes(bit_widths.value(0)) >= data.data_size();
-
-                if let Some(compression) = field.metadata.get(COMPRESSION_META_KEY) {
-                    if compression.as_str() == "none" {
-                        return Ok(Box::new(ValueEncoder::default()));
-                    }
-                }
-
-                let rle_threshold: f64 = if let Some(value) =
-                    field.metadata.get(RLE_THRESHOLD_META_KEY)
-                {
-                    value.as_str().parse().map_err(|_| {
-                        Error::invalid_input("rle threshold is not a valid float64", location!())
-                    })?
-                } else {
-                    DEFAULT_RLE_COMPRESSION_THRESHOLD
-                };
-
-                // Check if RLE would be beneficial
-                let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
-                let num_values = fixed_width_data.num_values;
-
-                // Use RLE if the run count is less than the threshold
-                if (run_count as f64) < (num_values as f64) * rle_threshold && is_byte_width_aligned
-                {
-                    if fixed_width_data.bits_per_value >= 32 {
-                        return Ok(Box::new(GeneralMiniBlockCompressor::new(
-                            Box::new(RleMiniBlockEncoder::new()),
-                            CompressionConfig::new(CompressionScheme::Lz4, None),
-                        )));
-                    }
-                    return Ok(Box::new(RleMiniBlockEncoder::new()));
-                }
-
-                if !has_all_zeros && !too_small && is_byte_width_aligned {
-                    Ok(Box::new(InlineBitpacking::new(
-                        fixed_width_data.bits_per_value,
-                    )))
-                } else {
-                    Ok(Box::new(ValueEncoder::default()))
-                }
+                self.build_fixed_width_compressor(&field_params, field, fixed_width_data)
             }
             DataBlock::VariableWidth(variable_width_data) => {
-                if variable_width_data.bits_per_offset == 32
-                    || variable_width_data.bits_per_offset == 64
-                {
-                    let data_size =
-                        variable_width_data.expect_single_stat::<UInt64Type>(Stat::DataSize);
-                    let max_len =
-                        variable_width_data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
-
-                    if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
-                        && data_size >= FSST_LEAST_INPUT_SIZE as u64
-                    {
-                        Ok(Box::new(FsstMiniBlockEncoder::default()))
-                    } else {
-                        Ok(Box::new(BinaryMiniBlockEncoder::default()))
-                    }
-                } else {
-                    todo!(
-                        "Implement MiniBlockCompression for VariableWidth DataBlock with {} bit offsets.",
-                        variable_width_data.bits_per_offset
-                    )
-                }
+                self.build_variable_width_compressor(&field_params, variable_width_data)
             }
             DataBlock::Struct(struct_data_block) => {
                 // this condition is actually checked at `PrimitiveStructuralEncoder::do_flush`,
@@ -803,8 +702,6 @@ mod tests {
         // Get merged params
         let merged = strategy
             .params
-            .as_ref()
-            .unwrap()
             .get_field_params("user_id", &DataType::Int32);
 
         // Column params should override type params
@@ -815,8 +712,6 @@ mod tests {
         // Test field with only type params
         let merged = strategy
             .params
-            .as_ref()
-            .unwrap()
             .get_field_params("other_field", &DataType::Int32);
         assert_eq!(merged.rle_threshold, Some(0.5));
         assert_eq!(merged.compression, Some("lz4".to_string()));
@@ -842,8 +737,6 @@ mod tests {
         // Should match pattern
         let merged = strategy
             .params
-            .as_ref()
-            .unwrap()
             .get_field_params("log_messages", &DataType::Utf8);
         assert_eq!(merged.compression, Some("zstd".to_string()));
         assert_eq!(merged.compression_level, Some(6));
@@ -851,8 +744,6 @@ mod tests {
         // Should not match
         let merged = strategy
             .params
-            .as_ref()
-            .unwrap()
             .get_field_params("messages_log", &DataType::Utf8);
         assert_eq!(merged.compression, None);
     }
