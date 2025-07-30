@@ -796,7 +796,7 @@ async fn rewrite_files(
         new_fragments,
         read_version: dataset.manifest.version,
         original_fragments: task.fragments,
-        row_addr_map: row_addr_map,
+        row_addr_map,
         changed_row_addrs,
     })
 }
