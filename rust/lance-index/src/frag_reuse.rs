@@ -221,21 +221,21 @@ impl DeepSizeOf for FragReuseIndex {
 impl FragReuseIndex {
     pub fn new(
         uuid: Uuid,
-        row_id_maps: Vec<HashMap<u64, Option<u64>>>,
+        row_addr_maps: Vec<HashMap<u64, Option<u64>>>,
         details: FragReuseIndexDetails,
     ) -> Self {
         Self {
             uuid,
-            row_addr_maps: row_id_maps,
+            row_addr_maps,
             details,
         }
     }
 
     pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
         let mut mapped_value = Some(row_id);
-        for row_id_map in self.row_addr_maps.iter() {
+        for row_addr_map in self.row_addr_maps.iter() {
             if mapped_value.is_some() {
-                mapped_value = row_id_map
+                mapped_value = row_addr_map
                     .get(&mapped_value.unwrap())
                     .copied()
                     .unwrap_or(mapped_value);

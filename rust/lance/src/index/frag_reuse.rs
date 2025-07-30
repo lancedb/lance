@@ -77,24 +77,24 @@ pub(crate) async fn open_frag_reuse_index(
     uuid: Uuid,
     details: &FragReuseIndexDetails,
 ) -> lance_core::Result<FragReuseIndex> {
-    let mut row_id_maps: Vec<HashMap<u64, Option<u64>>> =
+    let mut row_addr_maps: Vec<HashMap<u64, Option<u64>>> =
         Vec::with_capacity(details.versions.len());
     for version in &details.versions {
-        let mut row_id_map = HashMap::<u64, Option<u64>>::new();
+        let mut row_addr_map = HashMap::<u64, Option<u64>>::new();
         for group in version.groups.iter() {
             let cursor = Cursor::new(&group.changed_row_addrs);
             let changed_row_addrs = RoaringTreemap::deserialize_from(cursor).unwrap();
-            let group_row_id_map = transpose_row_addrs_from_digest(
+            let group_row_addr_map = transpose_row_addrs_from_digest(
                 changed_row_addrs,
                 &group.old_frags,
                 &group.new_frags,
             );
-            row_id_map.extend(group_row_id_map);
+            row_addr_map.extend(group_row_addr_map);
         }
-        row_id_maps.push(row_id_map);
+        row_addr_maps.push(row_addr_map);
     }
 
-    Ok(FragReuseIndex::new(uuid, row_id_maps, details.clone()))
+    Ok(FragReuseIndex::new(uuid, row_addr_maps, details.clone()))
 }
 
 pub(crate) async fn build_new_frag_reuse_index(
