@@ -13,18 +13,12 @@ This directory contains the documentation for Lance, built with MkDocs and Mater
 
 2. That's it! No manual dependency installation needed.
 
-**Note**: `uv run` automatically:
-- Creates a virtual environment if it doesn't exist
-- Installs all dependencies from `pyproject.toml`
-- Runs the command in the correct environment
-
 ### Building Documentation
 
 To build and serve the documentation locally:
 
 ```bash
 make serve
-# or directly: uv run mkdocs serve
 ```
 
 The documentation will be available at http://localhost:8000
@@ -33,7 +27,6 @@ The documentation will be available at http://localhost:8000
 
 ```bash
 make build
-# or directly: uv run mkdocs build
 ```
 
 This will create a `site/` directory with the built documentation.
@@ -53,13 +46,7 @@ uv add --dev <package>
 #### Manual Sync (if needed)
 
 ```bash
-# Sync all dependencies
 make sync
-# or directly: uv sync
-
-# Sync including dev dependencies
-make dev-install
-# or directly: uv sync --dev
 ```
 
 #### Upgrading Dependencies
@@ -77,4 +64,3 @@ uv sync --upgrade
 - `src/` - Source markdown files for documentation
 - `mkdocs.yml` - MkDocs configuration
 - `pyproject.toml` - Python project configuration (uv compatible)
-- `requirements.txt` - Legacy requirements file (kept for compatibility)
