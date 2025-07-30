@@ -1830,7 +1830,7 @@ impl DocSet {
                 .iter()
                 .filter_map(|id| {
                     if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                        frag_reuse_index_ref.remap_row_id(*id)
+                        frag_reuse_index_ref.remap_row_addr(*id)
                     } else {
                         Some(*id)
                     }
@@ -1844,7 +1844,7 @@ impl DocSet {
                     .iter()
                     .filter_map(|id| {
                         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                            frag_reuse_index_ref.remap_row_id(*id)
+                            frag_reuse_index_ref.remap_row_addr(*id)
                         } else {
                             Some(*id)
                         }

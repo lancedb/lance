@@ -219,7 +219,7 @@ impl RowIdMask {
         }
     }
 
-    /// Iterate over the row ids that are selected by the mask
+    /// Iterate over the row addrs that are selected by the mask
     ///
     /// This is only possible if there is an allow list and neither the
     /// allow list nor the block list contain any "full fragment" blocks.
@@ -237,19 +237,19 @@ impl RowIdMask {
                 if let Some(block_iter) = block_list.row_addresses() {
                     let mut block_iter = block_iter.peekable();
                     Some(Box::new(iter::from_fn(move || {
-                        for allow_id in allow_iter.by_ref() {
+                        for allow_addr in allow_iter.by_ref() {
                             while let Some(block_id) = block_iter.peek() {
-                                if *block_id >= allow_id {
+                                if *block_id >= allow_addr {
                                     break;
                                 }
                                 block_iter.next();
                             }
                             if let Some(block_id) = block_iter.peek() {
-                                if *block_id == allow_id {
+                                if *block_id == allow_addr {
                                     continue;
                                 }
                             }
-                            return Some(allow_id);
+                            return Some(allow_addr);
                         }
                         None
                     })))
@@ -1137,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_ids() {
+    fn test_iter_addrs() {
         let mut mask = RowIdMask::default();
         assert!(mask.iter_addresses().is_none());
 
