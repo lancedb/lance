@@ -784,16 +784,30 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Replace the schema metadata of the dataset
 
+        .. deprecated:: 0.32.1
+            Use :func:`update_schema_metadata` with ``replace=True`` instead.
+            This method will be removed in a future version.
+
         Parameters
         ----------
         new_metadata: dict
             The new metadata to set
         """
+        warnings.warn(
+            "replace_schema_metadata is deprecated. "
+            "Use update_schema_metadata(metadata, replace=True) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._ds.replace_schema_metadata(new_metadata)
 
     def replace_field_metadata(self, field_name: str, new_metadata: Dict[str, str]):
         """
         Replace the metadata of a field in the schema
+
+        .. deprecated:: 0.32.1
+            Use :func:`update_field_metadata` with ``replace=True`` instead.
+            This method will be removed in a future version.
 
         Parameters
         ----------
@@ -802,7 +816,200 @@ class LanceDataset(pa.dataset.Dataset):
         new_metadata: dict
             The new metadata to set
         """
+        warnings.warn(
+            "replace_field_metadata is deprecated. "
+            "Use update_field_metadata with field paths and replace=True instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._ds.replace_field_metadata(field_name, new_metadata)
+
+    # Unified metadata APIs
+
+    def get_table_metadata(self) -> Dict[str, str]:
+        """
+        Get the table metadata of the dataset.
+
+        Returns
+        -------
+        Dict[str, str]
+            The table metadata as a dictionary of key-value pairs.
+        """
+        return self._ds.get_table_metadata()
+
+    def metadata(self) -> Dict[str, str]:
+        """
+        Get the table metadata of the dataset.
+
+        This is an alias for `get_table_metadata()`.
+
+        Returns
+        -------
+        Dict[str, str]
+            The table metadata as a dictionary of key-value pairs.
+        """
+        return self._ds.metadata()
+
+    def schema_metadata(self) -> Dict[str, str]:
+        """
+        Get the schema metadata of the dataset.
+
+        Returns
+        -------
+        Dict[str, str]
+            The schema metadata as a dictionary of key-value pairs.
+        """
+        return self._ds.schema_metadata()
+
+    def update_metadata(
+        self, values: Dict[str, Optional[str]], *, replace: bool = False
+    ) -> Dict[str, str]:
+        """
+        Update the table metadata of the dataset.
+
+        This method supports both incremental updates (default) and full replacement.
+
+        Parameters
+        ----------
+        values : Dict[str, Optional[str]]
+            Metadata updates where keys are metadata keys and values are:
+            - str: Set the metadata key to this value
+            - None: Remove the metadata key (ignored in replace mode)
+        replace : bool, default False
+            If True, completely replace all table metadata with the provided values.
+            If False, incrementally update only the specified keys.
+
+        Examples
+        --------
+        >>> # Incremental update (add/update specific keys)
+        >>> dataset.update_metadata({"author": "John", "version": "1.2"})
+        >>>
+        >>> # Remove a key (incremental mode only)
+        >>> dataset.update_metadata({"old_key": None})
+        >>>
+        >>> # Full replacement (replaces all metadata)
+        >>> dataset.update_metadata({"author": "John"}, replace=True)
+        """
+        return self._ds.update_metadata(values, replace=replace)
+
+    def update_config(
+        self, values: Dict[str, Optional[str]], *, replace: bool = False
+    ) -> Dict[str, str]:
+        """
+        Update the configuration of the dataset using unified API.
+
+        This method supports both incremental updates (default) and full replacement.
+
+        Parameters
+        ----------
+        values : Dict[str, Optional[str]]
+            Configuration updates where keys are config keys and values are:
+            - str: Set the config key to this value
+            - None: Remove the config key (ignored in replace mode)
+        replace : bool, default False
+            If True, completely replace all configuration with the provided values.
+            If False, incrementally update only the specified keys.
+
+        Examples
+        --------
+        >>> # Incremental update (add/update specific keys)
+        >>> dataset.update_config({"batch_size": "1000", "compression": "zstd"})
+        >>>
+        >>> # Remove a key (incremental mode only)
+        >>> dataset.update_config({"old_setting": None})
+        >>>
+        >>> # Full replacement (replaces all config)
+        >>> dataset.update_config({"batch_size": "1000"}, replace=True)
+        """
+        return self._ds.update_config(values, replace=replace)
+
+    def update_schema_metadata(
+        self, values: Dict[str, Optional[str]], *, replace: bool = False
+    ) -> Dict[str, str]:
+        """
+        Update the schema metadata of the dataset.
+
+        This method supports both incremental updates (default) and full replacement.
+
+        Parameters
+        ----------
+        values : Dict[str, Optional[str]]
+            Schema metadata updates where keys are metadata keys and values are:
+            - str: Set the metadata key to this value
+            - None: Remove the metadata key (ignored in replace mode)
+        replace : bool, default False
+            If True, completely replace all schema metadata with the provided values.
+            If False, incrementally update only the specified keys.
+
+        Examples
+        --------
+        >>> # Incremental update (add/update specific keys)
+        >>> dataset.update_schema_metadata({"encoding": "utf-8", "created_by": "lance"})
+        >>>
+        >>> # Remove a key (incremental mode only)
+        >>> dataset.update_schema_metadata({"temp_key": None})
+        >>>
+        >>> # Full replacement (replaces all schema metadata)
+        >>> dataset.update_schema_metadata({"encoding": "utf-8"}, replace=True)
+        """
+        return self._ds.update_schema_metadata(values, replace=replace)
+
+    def update_field_metadata(
+        self,
+        field_updates: Dict[str, Dict[str, Optional[str]]],
+        *,
+        replace: bool = False,
+    ) -> None:
+        """
+        Update metadata for multiple fields in the dataset.
+
+        This method supports both incremental updates (default) and full replacement.
+
+        Parameters
+        ----------
+        field_updates : Dict[str, Dict[str, Optional[str]]]
+            Field metadata updates where keys are field paths and values are
+            metadata dictionaries.
+            For each field's metadata dictionary:
+            - str values: Set the metadata key to this value
+            - None values: Remove the metadata key (ignored in replace mode)
+        replace : bool, default False
+            If True, completely replace all metadata for the specified fields.
+            If False, incrementally update only the specified keys for each field.
+
+        Examples
+        --------
+        >>> # Incremental update for multiple fields
+        >>> dataset.update_field_metadata({
+        ...     "user_id": {"description": "User ID", "nullable": "false"},
+        ...     "user_name": {"description": "User name", "max_length": "100"}
+        ... })
+        >>>
+        >>> # Remove keys (incremental mode only)
+        >>> dataset.update_field_metadata({"user_id": {"old_key": None}})
+        >>>
+        >>> # Full replacement for specific fields
+        >>> dataset.update_field_metadata({
+        ...     "user_id": {"description": "User ID"}
+        ... }, replace=True)
+        """
+        # Convert field paths to field IDs
+        field_id_updates = {}
+        for field_path, metadata in field_updates.items():
+            field = self.schema.field(field_path)
+            if field is None:
+                raise ValueError(f"Field '{field_path}' not found in schema")
+            # Get field ID from the Lance schema (not PyArrow)
+            lance_field = None
+            for f in self._ds.lance_schema.fields():
+                if f.name() == field_path:
+                    lance_field = f
+                    break
+            if lance_field is None:
+                raise ValueError(f"Field '{field_path}' not found in Lance schema")
+            field_id_updates[lance_field.id()] = metadata
+
+        self._ds.update_field_metadata(field_id_updates, replace=replace)
 
     def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
         """Get all fragments from the dataset.
@@ -2741,9 +2948,13 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.migrate_manifest_paths_v2()
 
-    def update_config(self, upsert_values: Dict[str, str]) -> None:
+    def update_config_legacy(self, upsert_values: Dict[str, str]) -> None:
         """
         Update the dataset configuration.
+
+        .. deprecated:: 0.32.1
+            Use :func:`update_config` instead for more flexible metadata updates.
+            This method will be removed in a future version.
 
         This method inserts or updates configuration key-value pairs for the dataset.
 
@@ -2753,6 +2964,12 @@ class LanceDataset(pa.dataset.Dataset):
             The configuration items to insert or update.
             Both keys and values should be strings.
         """
+        warnings.warn(
+            "update_config(dict) is deprecated. "
+            "Use update_config(dict, replace=False) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._ds.update_config(upsert_values)
 
     def delete_config_keys(self, keys: list[str]) -> None:

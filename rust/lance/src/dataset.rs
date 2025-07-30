@@ -1840,15 +1840,22 @@ impl Dataset {
         &self.manifest.table_metadata
     }
 
+    /// Get schema metadata as a HashMap.
+    pub fn schema_metadata(&self) -> &HashMap<String, String> {
+        &self.manifest.schema.metadata
+    }
+
     /// Update table metadata.
     ///
     /// Pass `None` for a value to remove that key.
     /// Pass `replace=true` to replace the entire metadata map.
+    ///
+    /// Returns the updated metadata map after the operation.
     pub async fn update_metadata(
         &mut self,
         values: HashMap<String, Option<String>>,
         replace: bool,
-    ) -> Result<()> {
+    ) -> Result<HashMap<String, String>> {
         let table_metadata_update_map = UpdateMap {
             update_entries: values
                 .into_iter()
@@ -1862,7 +1869,9 @@ impl Dataset {
             schema_metadata_updates: None,
             field_metadata_updates: HashMap::new(),
         })
-        .await
+        .await?;
+
+        Ok(self.manifest.table_metadata.clone())
     }
 
     /// Update config.
@@ -4081,7 +4090,12 @@ mod tests {
         updates.insert("description".to_string(), Some("Test dataset".to_string()));
         updates.insert("author".to_string(), Some("Test author".to_string()));
 
-        dataset.update_metadata(updates, false).await.unwrap();
+        let updated_metadata = dataset.update_metadata(updates, false).await.unwrap();
+        assert_eq!(updated_metadata.get("description").unwrap(), "Test dataset");
+        assert_eq!(updated_metadata.get("author").unwrap(), "Test author");
+        assert_eq!(updated_metadata.len(), 2);
+
+        // Verify via the getter method too
         assert_eq!(
             dataset.metadata().get("description").unwrap(),
             "Test dataset"
@@ -4091,17 +4105,23 @@ mod tests {
         // Test adding more table metadata
         let mut more_updates = HashMap::new();
         more_updates.insert("version".to_string(), Some("1.0".to_string()));
-        dataset.update_metadata(more_updates, false).await.unwrap();
+        let updated_metadata = dataset.update_metadata(more_updates, false).await.unwrap();
+        assert_eq!(updated_metadata.get("version").unwrap(), "1.0");
+        assert_eq!(updated_metadata.len(), 3);
+
         assert_eq!(dataset.metadata().get("version").unwrap(), "1.0");
         assert_eq!(dataset.metadata().len(), 3);
 
         // Test deleting table metadata keys by passing None
         let mut delete_updates = HashMap::new();
         delete_updates.insert("author".to_string(), None);
-        dataset
+        let updated_metadata = dataset
             .update_metadata(delete_updates, false)
             .await
             .unwrap();
+        assert!(!updated_metadata.contains_key("author"));
+        assert_eq!(updated_metadata.len(), 2);
+
         assert!(!dataset.metadata().contains_key("author"));
         assert_eq!(dataset.metadata().len(), 2);
 
@@ -4109,10 +4129,19 @@ mod tests {
         let mut replace_updates = HashMap::new();
         replace_updates.insert("new_key".to_string(), Some("new_value".to_string()));
         replace_updates.insert("another_key".to_string(), Some("another_value".to_string()));
-        dataset
+        let updated_metadata = dataset
             .update_metadata(replace_updates, true)
             .await
             .unwrap();
+
+        assert_eq!(updated_metadata.len(), 2);
+        assert_eq!(updated_metadata.get("new_key").unwrap(), "new_value");
+        assert_eq!(
+            updated_metadata.get("another_key").unwrap(),
+            "another_value"
+        );
+        assert!(!updated_metadata.contains_key("description"));
+        assert!(!updated_metadata.contains_key("version"));
 
         assert_eq!(dataset.metadata().len(), 2);
         assert_eq!(dataset.metadata().get("new_key").unwrap(), "new_value");

@@ -452,8 +452,13 @@ impl Dataset {
 
     fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.replace_schema_metadata(metadata))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let metadata_options: HashMap<String, Option<String>> =
+            metadata.into_iter().map(|(k, v)| (k, Some(v))).collect();
+        RT.block_on(
+            None,
+            new_self.update_schema_metadata(metadata_options, true),
+        )?
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -468,9 +473,11 @@ impl Dataset {
             .schema()
             .field(field_name)
             .ok_or_else(|| PyKeyError::new_err(format!("Field \"{}\" not found", field_name)))?;
-        let new_field_meta: HashMap<u32, HashMap<String, String>> =
-            HashMap::from_iter(vec![(field.id as u32, metadata)]);
-        RT.block_on(None, new_self.replace_field_metadata(new_field_meta))?
+        let metadata_options: HashMap<String, Option<String>> =
+            metadata.into_iter().map(|(k, v)| (k, Some(v))).collect();
+        let new_field_meta: HashMap<u32, HashMap<String, Option<String>>> =
+            HashMap::from_iter(vec![(field.id as u32, metadata_options)]);
+        RT.block_on(None, new_self.update_field_metadata(new_field_meta, true))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -1849,25 +1856,12 @@ impl Dataset {
         Ok(PyArrowType(reader))
     }
 
-    #[pyo3(signature = (upsert_values))]
-    fn update_config(&mut self, upsert_values: &Bound<'_, PyDict>) -> PyResult<()> {
-        let upsert: HashMap<String, String> = upsert_values
-            .iter()
-            .map(|(k, v)| Ok((k.extract::<String>()?, v.extract::<String>()?)))
-            .collect::<PyResult<_>>()?;
-
-        let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.update_config(upsert))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        self.ds = Arc::new(new_self);
-        Ok(())
-    }
-
     #[pyo3(signature = (keys))]
     fn delete_config_keys(&mut self, keys: Vec<String>) -> PyResult<()> {
-        let key_refs: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.delete_config_keys(&key_refs))?
+        let delete_updates: HashMap<String, Option<String>> =
+            keys.into_iter().map(|k| (k, None)).collect();
+        RT.block_on(None, new_self.update_config(delete_updates, false))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -1890,6 +1884,91 @@ impl Dataset {
             }
             Ok(dict.into())
         })
+    }
+
+    // Unified metadata APIs
+
+    #[pyo3(signature = ())]
+    fn get_table_metadata(&mut self) -> PyResult<PyObject> {
+        let new_self = self.ds.as_ref().clone();
+
+        let table_metadata = new_self.metadata().clone();
+
+        self.ds = Arc::new(new_self);
+
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            for (k, v) in table_metadata {
+                dict.set_item(k, v)?;
+            }
+            Ok(dict.into())
+        })
+    }
+
+    fn metadata(&self) -> PyResult<HashMap<String, String>> {
+        Ok(self.ds.metadata().clone())
+    }
+
+    fn schema_metadata(&self) -> PyResult<HashMap<String, String>> {
+        Ok(self.ds.schema_metadata().clone())
+    }
+
+    #[pyo3(signature = (values, *, replace = false))]
+    fn update_metadata(
+        &mut self,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
+    ) -> PyResult<HashMap<String, String>> {
+        let mut new_self = self.ds.as_ref().clone();
+        let result = RT
+            .block_on(None, new_self.update_metadata(values, replace))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(result)
+    }
+
+    #[pyo3(signature = (values, *, replace = false))]
+    fn update_config(
+        &mut self,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
+    ) -> PyResult<HashMap<String, String>> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.update_config(values, replace))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let result = new_self
+            .config()
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+            .clone();
+        self.ds = Arc::new(new_self);
+        Ok(result)
+    }
+
+    #[pyo3(signature = (values, *, replace = false))]
+    fn update_schema_metadata(
+        &mut self,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
+    ) -> PyResult<HashMap<String, String>> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.update_schema_metadata(values, replace))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let result = new_self.schema_metadata().clone();
+        self.ds = Arc::new(new_self);
+        Ok(result)
+    }
+
+    #[pyo3(signature = (field_updates, *, replace = false))]
+    fn update_field_metadata(
+        &mut self,
+        field_updates: HashMap<u32, HashMap<String, Option<String>>>,
+        replace: bool,
+    ) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.update_field_metadata(field_updates, replace))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     #[pyo3(signature = (index_name))]

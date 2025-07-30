@@ -4,9 +4,7 @@
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
-    dataset::transaction::{
-        translate_config_updates, translate_schema_metadata_updates, Operation, Transaction,
-    },
+    dataset::transaction::{Operation, Transaction},
     Dataset,
 };
 use futures::{StreamExt, TryStreamExt};
@@ -1575,7 +1573,9 @@ mod tests {
         schema_metadata: Option<HashMap<String, String>>,
         field_metadata: Option<HashMap<u32, HashMap<String, String>>>,
     ) -> Operation {
-        use crate::dataset::transaction::translate_schema_metadata_updates;
+        use crate::dataset::transaction::{
+            translate_config_updates, translate_schema_metadata_updates,
+        };
 
         let config_updates = if let Some(upsert) = &upsert_values {
             if let Some(delete) = &delete_keys {
@@ -1584,8 +1584,6 @@ mod tests {
                 Some(translate_config_updates(upsert, &[]))
             }
         } else if let Some(delete) = &delete_keys {
-            use crate::dataset::transaction::translate_config_updates;
-
             Some(translate_config_updates(&HashMap::new(), delete))
         } else {
             None

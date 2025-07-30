@@ -720,8 +720,11 @@ public class Dataset implements Closeable {
    * Update the config of the dataset. This operation will only overwrite and NOT delete the
    * existing config.
    *
+   * @deprecated Use {@link #updateConfig(Map, boolean)} instead for more flexible metadata updates.
+   *             This method will be removed in a future version.
    * @param tableConfig the config to update
    */
+  @Deprecated
   public void updateConfig(Map<String, String> tableConfig) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
@@ -800,8 +803,11 @@ public class Dataset implements Closeable {
   /**
    * Replace the schema metadata of the dataset.
    *
+   * @deprecated Use {@link #updateSchemaMetadata(Map, boolean)} with replace=true instead.
+   *             This method will be removed in a future version.
    * @param metadata the new table metadata
    */
+  @Deprecated
   public void replaceSchemaMetadata(Map<String, String> metadata) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
@@ -814,8 +820,11 @@ public class Dataset implements Closeable {
   /**
    * Replace target field metadata of the dataset. This method won't affect fields not in the map
    *
+   * @deprecated Use {@link #updateFieldMetadata(Map, boolean)} with replace=true instead.
+   *             This method will be removed in a future version.
    * @param fieldMetadataMap field id to metadata map
    */
+  @Deprecated
   public void replaceFieldMetadata(Map<Integer, Map<String, String>> fieldMetadataMap) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
@@ -828,6 +837,106 @@ public class Dataset implements Closeable {
 
   private native void nativeReplaceFieldMetadata(
       Map<Integer, Map<String, String>> fieldMetadataMap);
+
+  // Unified metadata APIs
+
+  /**
+   * Get the table metadata of the dataset.
+   *
+   * @return the table metadata as a map of key-value pairs
+   */
+  public Map<String, String> getTableMetadata() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetTableMetadata();
+    }
+  }
+
+  private native Map<String, String> nativeGetTableMetadata();
+
+  /**
+   * Update the table metadata of the dataset.
+   *
+   * This method supports both incremental updates (default) and full replacement.
+   *
+   * @param values metadata updates where keys are metadata keys and values are:
+   *               - String: Set the metadata key to this value
+   *               - null: Remove the metadata key (ignored in replace mode)
+   * @param replace if true, completely replace all table metadata with the provided values.
+   *                If false, incrementally update only the specified keys.
+   */
+  public void updateMetadata(Map<String, String> values, boolean replace) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeUpdateMetadata(values, replace);
+    }
+  }
+
+  private native void nativeUpdateMetadata(Map<String, String> values, boolean replace);
+
+  /**
+   * Update the configuration of the dataset using unified API.
+   *
+   * This method supports both incremental updates (default) and full replacement.
+   *
+   * @param values configuration updates where keys are config keys and values are:
+   *               - String: Set the config key to this value
+   *               - null: Remove the config key (ignored in replace mode)
+   * @param replace if true, completely replace all configuration with the provided values.
+   *                If false, incrementally update only the specified keys.
+   */
+  public void updateConfig(Map<String, String> values, boolean replace) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeUpdateConfig(values, replace);
+    }
+  }
+
+  private native void nativeUpdateConfig(Map<String, String> values, boolean replace);
+
+  /**
+   * Update the schema metadata of the dataset.
+   *
+   * This method supports both incremental updates (default) and full replacement.
+   *
+   * @param values schema metadata updates where keys are metadata keys and values are:
+   *               - String: Set the metadata key to this value
+   *               - null: Remove the metadata key (ignored in replace mode)
+   * @param replace if true, completely replace all schema metadata with the provided values.
+   *                If false, incrementally update only the specified keys.
+   */
+  public void updateSchemaMetadata(Map<String, String> values, boolean replace) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeUpdateSchemaMetadata(values, replace);
+    }
+  }
+
+  private native void nativeUpdateSchemaMetadata(Map<String, String> values, boolean replace);
+
+  /**
+   * Update metadata for multiple fields in the dataset.
+   *
+   * This method supports both incremental updates (default) and full replacement.
+   *
+   * @param fieldUpdates field metadata updates where keys are field IDs and values are metadata maps.
+   *                     For each field's metadata map:
+   *                     - String values: Set the metadata key to this value
+   *                     - null values: Remove the metadata key (ignored in replace mode)
+   * @param replace if true, completely replace all metadata for the specified fields.
+   *                If false, incrementally update only the specified keys for each field.
+   */
+  public void updateFieldMetadata(Map<Integer, Map<String, String>> fieldUpdates, boolean replace) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      for (Integer fieldId : fieldUpdates.keySet()) {
+        Preconditions.checkArgument(fieldId >= 0, "Field id must be greater than or equal to 0");
+      }
+      nativeUpdateFieldMetadata(fieldUpdates, replace);
+    }
+  }
+
+  private native void nativeUpdateFieldMetadata(Map<Integer, Map<String, String>> fieldUpdates, boolean replace);
 
   /** Tag operations of the dataset. */
   public class Tags {

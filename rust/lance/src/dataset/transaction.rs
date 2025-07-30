@@ -1656,7 +1656,9 @@ impl Transaction {
             Operation::Overwrite {
                 config_upsert_values: Some(tm),
                 ..
-            } => manifest.update_config(tm.clone()),
+            } => {
+                manifest.config_mut().extend(tm.clone());
+            }
             Operation::UpdateConfig {
                 config_updates,
                 table_metadata_updates,
