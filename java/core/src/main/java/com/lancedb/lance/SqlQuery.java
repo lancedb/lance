@@ -21,9 +21,11 @@ import java.io.IOException;
 import java.util.Optional;
 
 public class SqlQuery {
+  private static final String DEFAULT_TABLE_NAME = "dataset";
+
   private Dataset dataset;
   private String sql;
-  private String table;
+  private String table = DEFAULT_TABLE_NAME;
   private boolean withRowId = false;
   private boolean withRowAddr = false;
 
