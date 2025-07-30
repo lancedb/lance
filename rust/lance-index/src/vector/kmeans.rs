@@ -762,6 +762,7 @@ pub fn kmeans_find_partitions_binary(
 }
 
 /// Compute partitions from Arrow FixedSizeListArray.
+#[allow(clippy::type_complexity)]
 pub fn compute_partitions_arrow_array(
     centroids: &FixedSizeListArray,
     vectors: &FixedSizeListArray,
