@@ -297,7 +297,11 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(transaction);
     try {
       Dataset dataset = nativeCommitTransaction(transaction);
-      dataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      if (selfManagedAllocator) {
+        dataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        dataset.allocator = allocator;
+      }
       return dataset;
     } finally {
       transaction.release();
