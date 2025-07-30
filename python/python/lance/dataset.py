@@ -222,6 +222,7 @@ class LanceDataset(pa.dataset.Dataset):
         default_scan_options: Optional[Dict[str, Any]] = None,
         metadata_cache_size_bytes: Optional[int] = None,
         index_cache_size_bytes: Optional[int] = None,
+        read_params: Optional[Dict[str, Any]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -250,8 +251,10 @@ class LanceDataset(pa.dataset.Dataset):
             serialized_manifest,
             metadata_cache_size_bytes=metadata_cache_size_bytes,
             index_cache_size_bytes=index_cache_size_bytes,
+            read_params=read_params,
         )
         self._default_scan_options = default_scan_options
+        self._read_params = read_params
 
     @classmethod
     def __deserialize__(
@@ -261,6 +264,7 @@ class LanceDataset(pa.dataset.Dataset):
         version: int,
         manifest: bytes,
         default_scan_options: Optional[Dict[str, Any]],
+        read_params: Optional[Dict[str, Any]] = None,
     ):
         return cls(
             uri,
@@ -268,6 +272,7 @@ class LanceDataset(pa.dataset.Dataset):
             storage_options=storage_options,
             serialized_manifest=manifest,
             default_scan_options=default_scan_options,
+            read_params=read_params,
         )
 
     def __reduce__(self):
@@ -277,6 +282,7 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.version(),
             self._ds.serialized_manifest(),
             self._default_scan_options,
+            self._read_params,
         )
 
     def __getstate__(self):
@@ -286,23 +292,39 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.version(),
             self._ds.serialized_manifest(),
             self._default_scan_options,
+            self._read_params,
         )
 
     def __setstate__(self, state):
-        (
-            self._uri,
-            self._storage_options,
-            version,
-            manifest,
-            default_scan_options,
-        ) = state
+        # Handle backwards compatibility - state may not have read_params
+        if len(state) == 5:
+            (
+                self._uri,
+                self._storage_options,
+                version,
+                manifest,
+                default_scan_options,
+            ) = state
+            read_params = None
+        else:
+            (
+                self._uri,
+                self._storage_options,
+                version,
+                manifest,
+                default_scan_options,
+                read_params,
+            ) = state
         self._ds = _Dataset(
             self._uri,
             version,
             storage_options=self._storage_options,
             manifest=manifest,
             default_scan_options=default_scan_options,
+            read_params=read_params,
         )
+        self._default_scan_options = default_scan_options
+        self._read_params = read_params
 
     def __copy__(self):
         ds = LanceDataset.__new__(LanceDataset)
@@ -310,6 +332,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._storage_options = self._storage_options
         ds._ds = copy.copy(self._ds)
         ds._default_scan_options = self._default_scan_options
+        ds._read_params = getattr(self, "_read_params", None)
         return ds
 
     def __len__(self):
@@ -396,8 +419,6 @@ class LanceDataset(pa.dataset.Dataset):
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[Union[ColumnOrdering, str]]] = None,
-        cache_repetition_index: Optional[bool] = None,
-        validate_on_decode: Optional[bool] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -508,13 +529,6 @@ class LanceDataset(pa.dataset.Dataset):
             if scan_in_order is true. Otherwise it will fellow as a random order.
             If specified, the return rows will follow the orderings. If a string is
             specified, it will assume ascending and nulls last ordering.
-        cache_repetition_index: bool, default None
-            If True, repetition index will be cached in memory to improve performance
-            for large data types. This is especially useful when data is in remote
-            storage and there is sufficient RAM available.
-        validate_on_decode: bool, default None
-            If True, data will be validated when decoded. This can help catch data
-            corruption issues but may slightly impact performance.
 
 
         .. note::
@@ -575,8 +589,6 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.scan_stats_callback, scan_stats_callback)
         setopt(builder.strict_batch_size, strict_batch_size)
         setopt(builder.order_by, order_by)
-        setopt(builder.cache_repetition_index, cache_repetition_index)
-        setopt(builder.validate_on_decode, validate_on_decode)
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
             # No defaults, use user-provided, if any
@@ -658,8 +670,6 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
-        cache_repetition_index: Optional[bool] = None,
-        validate_on_decode: Optional[bool] = None,
     ) -> pa.Table:
         """Read the data into memory as a :py:class:`pyarrow.Table`
 
@@ -772,8 +782,6 @@ class LanceDataset(pa.dataset.Dataset):
             full_text_query=full_text_query,
             include_deleted_rows=include_deleted_rows,
             order_by=order_by,
-            cache_repetition_index=cache_repetition_index,
-            validate_on_decode=validate_on_decode,
         ).to_table()
 
     @property
@@ -860,8 +868,6 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: Optional[bool] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
-        cache_repetition_index: Optional[bool] = None,
-        validate_on_decode: Optional[bool] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -895,8 +901,6 @@ class LanceDataset(pa.dataset.Dataset):
             full_text_query=full_text_query,
             strict_batch_size=strict_batch_size,
             order_by=order_by,
-            cache_repetition_index=cache_repetition_index,
-            validate_on_decode=validate_on_decode,
         ).to_batches()
 
     def sample(
@@ -3508,8 +3512,6 @@ class ScannerBuilder:
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
         self._orderings = None
-        self._cache_repetition_index = None
-        self._validate_on_decode = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -3886,16 +3888,6 @@ class ScannerBuilder:
         self._orderings = orderings
         return self
 
-    def cache_repetition_index(self, cache_repetition_index: bool) -> ScannerBuilder:
-        """Enable/disable caching repetition indices for better performance"""
-        self._cache_repetition_index = cache_repetition_index
-        return self
-
-    def validate_on_decode(self, validate_on_decode: bool) -> ScannerBuilder:
-        """Enable/disable validation when decoding data"""
-        self._validate_on_decode = validate_on_decode
-        return self
-
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -3923,8 +3915,6 @@ class ScannerBuilder:
             self._scan_stats_callback,
             self._strict_batch_size,
             self._orderings,
-            self._cache_repetition_index,
-            self._validate_on_decode,
         )
         return LanceScanner(scanner, self.ds)
 

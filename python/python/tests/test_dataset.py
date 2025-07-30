@@ -3733,37 +3733,33 @@ def test_dataset_sql(tmp_path: Path):
 def test_file_reader_options(tmp_path: Path):
     """Test cache_repetition_index and validate_on_decode options"""
     table = pa.table({"a": range(100), "b": ["x"] * 100})
-    dataset = lance.write_dataset(table, tmp_path / "test")
+    lance.write_dataset(table, tmp_path / "test")
 
-    # Test cache_repetition_index option
-    scanner = dataset.scanner(cache_repetition_index=True)
-    result = scanner.to_table()
+    # Test cache_repetition_index option at dataset level
+    dataset = lance.dataset(
+        tmp_path / "test", read_params={"cache_repetition_index": True}
+    )
+    result = dataset.to_table()
     assert result.num_rows == 100
 
-    # Test validate_on_decode option
-    scanner = dataset.scanner(validate_on_decode=True)
-    result = scanner.to_table()
+    # Test validate_on_decode option at dataset level
+    dataset = lance.dataset(tmp_path / "test", read_params={"validate_on_decode": True})
+    result = dataset.to_table()
     assert result.num_rows == 100
 
     # Test both options together
-    scanner = dataset.scanner(cache_repetition_index=True, validate_on_decode=False)
-    result = scanner.to_table()
-    assert result.num_rows == 100
-
-    # Test with to_table method directly
-    result = dataset.to_table(cache_repetition_index=True, validate_on_decode=True)
-    assert result.num_rows == 100
-
-    # Test with to_batches method
-    batches = list(
-        dataset.to_batches(cache_repetition_index=False, validate_on_decode=False)
+    dataset = lance.dataset(
+        tmp_path / "test",
+        read_params={"cache_repetition_index": True, "validate_on_decode": False},
     )
-    assert sum(batch.num_rows for batch in batches) == 100
+    result = dataset.to_table()
+    assert result.num_rows == 100
 
-    # Test with ScannerBuilder
-    builder = dataset.scanner()
-    builder.cache_repetition_index(True)
-    builder.validate_on_decode(False)
-    scanner = builder.to_scanner()
+    # Test that scanner inherits options from dataset
+    dataset = lance.dataset(
+        tmp_path / "test",
+        read_params={"cache_repetition_index": True, "validate_on_decode": True},
+    )
+    scanner = dataset.scanner()
     result = scanner.to_table()
     assert result.num_rows == 100
