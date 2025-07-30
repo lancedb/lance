@@ -283,10 +283,7 @@ where
             },
         };
 
-        cluster_and_dists
-            .iter()
-            .map(|cd| (cd.map(|(c, _)| c), cd.map(|(_, d)| d)))
-            .unzip()
+        cluster_and_dists.into_iter().map(Option::unzip).unzip()
     }
 
     fn to_kmeans(
@@ -388,10 +385,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
                 )
             })
             .collect::<Vec<_>>();
-        cluster_and_dists
-            .iter()
-            .map(|cd| (cd.map(|(c, _)| c), cd.map(|(_, d)| d)))
-            .unzip()
+        cluster_and_dists.into_iter().map(Option::unzip).unzip()
     }
 
     fn to_kmeans(
