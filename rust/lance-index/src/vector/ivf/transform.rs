@@ -40,6 +40,7 @@ pub struct PartitionTransformer {
     distance_type: DistanceType,
     input_column: String,
     output_column: String,
+    with_distance: bool,
     index: Option<SimpleIndex>,
 }
 
@@ -61,8 +62,14 @@ impl PartitionTransformer {
             distance_type,
             input_column: input_column.as_ref().to_owned(),
             output_column: PART_ID_COLUMN.to_owned(),
+            with_distance: false,
             index,
         }
+    }
+
+    pub fn with_distance(mut self) -> Self {
+        self.with_distance = true;
+        self
     }
 }
 impl Transformer for PartitionTransformer {
