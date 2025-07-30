@@ -12,10 +12,10 @@ use log::trace;
 use snafu::location;
 
 use crate::decoder::{ColumnBuffers, PageBuffers};
+use crate::previous::decoder::{FieldScheduler, LogicalPageDecoder, SchedulingJob};
+use crate::previous::encoder::ArrayEncodingStrategy;
 use crate::utils::accumulation::AccumulationQueue;
-use crate::v2::decoder::{FieldScheduler, LogicalPageDecoder, SchedulingJob};
-use crate::v2::encoder::ArrayEncodingStrategy;
-use crate::{data::DataBlock, v2::encodings::physical::decoder_from_array_encoding};
+use crate::{data::DataBlock, previous::encodings::physical::decoder_from_array_encoding};
 use lance_core::{datatypes::Field, Error, Result};
 
 use crate::{

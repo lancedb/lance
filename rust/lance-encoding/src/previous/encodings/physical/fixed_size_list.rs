@@ -12,7 +12,7 @@ use crate::{
     data::{DataBlock, FixedSizeListBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     format::ProtobufUtils,
-    v2::encoder::{ArrayEncoder, EncodedArray},
+    previous::encoder::{ArrayEncoder, EncodedArray},
     EncodingsIo,
 };
 

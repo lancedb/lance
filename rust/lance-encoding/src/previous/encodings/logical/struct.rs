@@ -12,7 +12,7 @@ use crate::{
         DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
     },
-    v2::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
+    previous::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
 };
 use arrow_array::{ArrayRef, StructArray};
 use arrow_schema::{DataType, Field, Fields};
