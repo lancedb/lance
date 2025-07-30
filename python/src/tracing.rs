@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::CLIENT_VERSION;
 use chrono::{SecondsFormat, Utc};
 use datafusion_common::HashMap;
 use pyo3::pyclass;
@@ -256,6 +257,8 @@ impl tracing_subscriber::Layer<Registry> for LoggingPassthroughRef {
 
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
             args.args.insert("timestamp".to_string(), now.to_string());
+            args.args
+                .insert("client_version".to_string(), CLIENT_VERSION.to_string());
 
             match callback_sender.try_send(TraceEvent {
                 target: event.metadata().target().to_string(),
