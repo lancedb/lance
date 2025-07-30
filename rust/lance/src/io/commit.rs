@@ -1333,7 +1333,10 @@ mod tests {
                 let mut dataset = dataset.clone();
                 tokio::spawn(async move {
                     dataset
-                        .update_config(vec![(key.to_string(), "value".to_string())])
+                        .update_config(
+                            HashMap::from([(key.to_string(), Some("value".to_string()))]),
+                            false,
+                        )
                         .await
                 })
             })
@@ -1356,7 +1359,11 @@ mod tests {
             .iter()
             .map(|key| {
                 let mut dataset = dataset.clone();
-                tokio::spawn(async move { dataset.delete_config_keys(&[key]).await })
+                tokio::spawn(async move {
+                    dataset
+                        .update_config(HashMap::from([(key.to_string(), None)]), false)
+                        .await
+                })
             })
             .collect();
         let results = join_all(futures).await;
@@ -1386,7 +1393,10 @@ mod tests {
                 let mut dataset = dataset.clone();
                 tokio::spawn(async move {
                     dataset
-                        .update_config(vec![(key.to_string(), "value".to_string())])
+                        .update_config(
+                            HashMap::from([(key.to_string(), Some("value".to_string()))]),
+                            false,
+                        )
                         .await
                 })
             })
