@@ -1804,7 +1804,8 @@ impl Dataset {
     }
 
     /// Update key-value pairs in config.
-    pub async fn update_config(
+    #[deprecated(note = "Use the new update_config(values, replace) method with unified signature")]
+    pub async fn update_config_legacy(
         &mut self,
         upsert_values: impl IntoIterator<Item = (String, String)>,
     ) -> Result<()> {
@@ -1819,6 +1820,9 @@ impl Dataset {
     }
 
     /// Delete keys from the config.
+    #[deprecated(
+        note = "Use the new update_config(values, replace) method - pass None values to delete keys"
+    )]
     pub async fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
         let delete_keys_vec = Vec::from_iter(delete_keys.iter().map(ToString::to_string));
         let config_update_map = translate_config_updates(&HashMap::new(), &delete_keys_vec);
@@ -1861,7 +1865,91 @@ impl Dataset {
         .await
     }
 
+    /// Update config.
+    ///
+    /// Pass `None` for a value to remove that key.
+    /// Pass `replace=true` to replace the entire config map.
+    pub async fn update_config(
+        &mut self,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
+    ) -> Result<()> {
+        let config_update_map = UpdateMap {
+            update_entries: values
+                .into_iter()
+                .map(|(k, v)| UpdateMapEntry { key: k, value: v })
+                .collect(),
+            replace,
+        };
+        self.update_op(Operation::UpdateConfig {
+            config_updates: Some(config_update_map),
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        })
+        .await
+    }
+
+    /// Update schema metadata.
+    ///
+    /// Pass `None` for a value to remove that key.
+    /// Pass `replace=true` to replace the entire schema metadata map.
+    pub async fn update_schema_metadata(
+        &mut self,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
+    ) -> Result<()> {
+        let schema_metadata_update_map = UpdateMap {
+            update_entries: values
+                .into_iter()
+                .map(|(k, v)| UpdateMapEntry { key: k, value: v })
+                .collect(),
+            replace,
+        };
+        self.update_op(Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: Some(schema_metadata_update_map),
+            field_metadata_updates: HashMap::new(),
+        })
+        .await
+    }
+
+    /// Update field metadata.
+    ///
+    /// Pass `None` for a value to remove that key from the field's metadata.
+    /// Pass `replace=true` to replace the entire metadata map for each field.
+    pub async fn update_field_metadata(
+        &mut self,
+        field_updates: HashMap<u32, HashMap<String, Option<String>>>,
+        replace: bool,
+    ) -> Result<()> {
+        let field_metadata_updates = field_updates
+            .into_iter()
+            .map(|(field_id, values)| {
+                let update_map = UpdateMap {
+                    update_entries: values
+                        .into_iter()
+                        .map(|(k, v)| UpdateMapEntry { key: k, value: v })
+                        .collect(),
+                    replace,
+                };
+                (field_id, update_map)
+            })
+            .collect();
+        self.update_op(Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates,
+        })
+        .await
+    }
+
     /// Update schema metadata
+    #[deprecated(
+        note = "Use the new update_schema_metadata(values, replace) method with unified signature"
+    )]
     pub async fn replace_schema_metadata(
         &mut self,
         new_values: impl IntoIterator<Item = (String, String)>,
@@ -1878,6 +1966,9 @@ impl Dataset {
     }
 
     /// Update field metadata
+    #[deprecated(
+        note = "Use the new update_field_metadata(field_updates, replace) method with unified signature"
+    )]
     pub async fn replace_field_metadata(
         &mut self,
         new_values: impl IntoIterator<Item = (u32, HashMap<String, String>)>,
@@ -3871,7 +3962,12 @@ mod tests {
         desired_config.insert("lance.test".to_string(), "value".to_string());
         desired_config.insert("other-key".to_string(), "other-value".to_string());
 
-        dataset.update_config(desired_config.clone()).await.unwrap();
+        // Use new unified API - convert to Option<String> and use replace=true
+        let config_updates = desired_config
+            .iter()
+            .map(|(k, v)| (k.clone(), Some(v.clone())))
+            .collect::<HashMap<String, Option<String>>>();
+        dataset.update_config(config_updates, true).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
         assert_eq!(dataset.config().unwrap(), desired_config);
 
@@ -3882,10 +3978,80 @@ mod tests {
         assert_eq!(other_value, "other-value");
 
         desired_config.remove("other-key");
-        dataset.delete_config_keys(&["other-key"]).await.unwrap();
+        // Use new unified API - pass None to delete the key
+        let mut delete_updates = HashMap::new();
+        delete_updates.insert("other-key".to_string(), None);
+        dataset.update_config(delete_updates, false).await.unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
         assert_eq!(dataset.config().unwrap(), desired_config);
         assert_true!(!dataset.config().unwrap().contains_key("other-key"));
+    }
+
+    #[tokio::test]
+    async fn test_unified_metadata_apis() {
+        // Create a table
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..10))],
+        );
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Test unified config API
+        let mut config_updates = HashMap::new();
+        config_updates.insert("test_key".to_string(), Some("test_value".to_string()));
+        config_updates.insert("another_key".to_string(), Some("another_value".to_string()));
+        dataset.update_config(config_updates, false).await.unwrap();
+
+        assert_eq!(
+            dataset.manifest.config.get("test_key").unwrap(),
+            "test_value"
+        );
+        assert_eq!(
+            dataset.manifest.config.get("another_key").unwrap(),
+            "another_value"
+        );
+
+        // Test deletion with None
+        let mut delete_updates = HashMap::new();
+        delete_updates.insert("test_key".to_string(), None);
+        dataset.update_config(delete_updates, false).await.unwrap();
+        assert!(!dataset.manifest.config.contains_key("test_key"));
+        assert!(dataset.manifest.config.contains_key("another_key"));
+
+        // Test unified schema metadata API
+        let mut schema_updates = HashMap::new();
+        schema_updates.insert("schema_key".to_string(), Some("schema_value".to_string()));
+        dataset
+            .update_schema_metadata(schema_updates, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.schema.metadata.get("schema_key").unwrap(),
+            "schema_value"
+        );
+
+        // Test unified field metadata API
+        let mut field_updates = HashMap::new();
+        let mut field_0_updates = HashMap::new();
+        field_0_updates.insert("field_key".to_string(), Some("field_value".to_string()));
+        field_updates.insert(0, field_0_updates);
+        dataset
+            .update_field_metadata(field_updates, false)
+            .await
+            .unwrap();
+
+        let field = dataset.manifest.schema.field_by_id(0).unwrap();
+        assert_eq!(field.metadata.get("field_key").unwrap(), "field_value");
     }
 
     #[tokio::test]
@@ -3991,8 +4157,13 @@ mod tests {
 
         let mut new_schema_meta = HashMap::new();
         new_schema_meta.insert("new_key".to_string(), "new_value".to_string());
+        // Convert to new API format
+        let schema_updates = new_schema_meta
+            .iter()
+            .map(|(k, v)| (k.clone(), Some(v.clone())))
+            .collect::<HashMap<String, Option<String>>>();
         dataset
-            .replace_schema_metadata(new_schema_meta.clone())
+            .update_schema_metadata(schema_updates, true)
             .await
             .unwrap();
 
@@ -4022,8 +4193,16 @@ mod tests {
 
         let mut new_field_meta = HashMap::new();
         new_field_meta.insert("new_key".to_string(), "new_value".to_string());
+        // Convert to new API format
+        let field_updates = HashMap::from([(
+            0u32,
+            new_field_meta
+                .iter()
+                .map(|(k, v)| (k.clone(), Some(v.clone())))
+                .collect::<HashMap<String, Option<String>>>(),
+        )]);
         dataset
-            .replace_field_metadata(vec![(0, new_field_meta.clone())])
+            .update_field_metadata(field_updates, true)
             .await
             .unwrap();
 

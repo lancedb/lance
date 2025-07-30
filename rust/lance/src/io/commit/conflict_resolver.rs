@@ -25,44 +25,6 @@ use std::{
     sync::Arc,
 };
 
-/// Helper function for tests to create UpdateConfig operations using old-style parameters
-#[cfg(test)]
-fn create_update_config_for_test(
-    upsert_values: Option<HashMap<String, String>>,
-    delete_keys: Option<Vec<String>>,
-    schema_metadata: Option<HashMap<String, String>>,
-    field_metadata: Option<HashMap<u32, HashMap<String, String>>>,
-) -> Operation {
-    let config_updates = if let Some(upsert) = &upsert_values {
-        if let Some(delete) = &delete_keys {
-            Some(translate_config_updates(upsert, delete))
-        } else {
-            Some(translate_config_updates(upsert, &[]))
-        }
-    } else if let Some(delete) = &delete_keys {
-        Some(translate_config_updates(&HashMap::new(), delete))
-    } else {
-        None
-    };
-
-    let schema_metadata_updates = schema_metadata
-        .as_ref()
-        .map(translate_schema_metadata_updates);
-
-    let field_metadata_updates = field_metadata
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(field_id, metadata)| (field_id, translate_schema_metadata_updates(&metadata)))
-        .collect();
-
-    Operation::UpdateConfig {
-        config_updates,
-        table_metadata_updates: None,
-        schema_metadata_updates,
-        field_metadata_updates,
-    }
-}
-
 #[derive(Debug)]
 pub struct TransactionRebase<'a> {
     transaction: Transaction,
@@ -1603,6 +1565,48 @@ mod tests {
             .await
             .unwrap();
         (dataset, io_stats)
+    }
+
+    /// Helper function for tests to create UpdateConfig operations using old-style parameters
+    #[cfg(test)]
+    fn create_update_config_for_test(
+        upsert_values: Option<HashMap<String, String>>,
+        delete_keys: Option<Vec<String>>,
+        schema_metadata: Option<HashMap<String, String>>,
+        field_metadata: Option<HashMap<u32, HashMap<String, String>>>,
+    ) -> Operation {
+        use crate::dataset::transaction::translate_schema_metadata_updates;
+
+        let config_updates = if let Some(upsert) = &upsert_values {
+            if let Some(delete) = &delete_keys {
+                Some(translate_config_updates(upsert, delete))
+            } else {
+                Some(translate_config_updates(upsert, &[]))
+            }
+        } else if let Some(delete) = &delete_keys {
+            use crate::dataset::transaction::translate_config_updates;
+
+            Some(translate_config_updates(&HashMap::new(), delete))
+        } else {
+            None
+        };
+
+        let schema_metadata_updates = schema_metadata
+            .as_ref()
+            .map(translate_schema_metadata_updates);
+
+        let field_metadata_updates = field_metadata
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(field_id, metadata)| (field_id, translate_schema_metadata_updates(&metadata)))
+            .collect();
+
+        Operation::UpdateConfig {
+            config_updates,
+            table_metadata_updates: None,
+            schema_metadata_updates,
+            field_metadata_updates,
+        }
     }
 
     #[tokio::test]
