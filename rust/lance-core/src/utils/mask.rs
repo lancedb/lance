@@ -690,14 +690,14 @@ impl RowIdTreeMap {
         }
     }
 
-    /// Convert the set into an iterator of row ids
+    /// Convert the set into an iterator of row addrs
     ///
     /// # Safety
     ///
     /// This is unsafe because if any of the inner RowIdSelection elements
     /// is not a Partial then the iterator will panic because we don't know
     /// the size of the bitmap.
-    pub unsafe fn into_id_iter(self) -> impl Iterator<Item = u64> {
+    pub unsafe fn into_addr_iter(self) -> impl Iterator<Item = u64> {
         self.inner
             .into_iter()
             .flat_map(|(fragment, selection)| match selection {
