@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -498,21 +499,39 @@ impl Scanner {
         let with_row_id = self.projection_plan.physical_projection.with_row_id;
         let with_row_addr = self.projection_plan.physical_projection.with_row_addr;
 
+        let avail_columns = self
+            .dataset
+            .schema()
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<HashSet<_>>();
+
         for (col, _) in &transformed_columns {
-            if *col == ROW_ID && !with_row_id {
-                return Err(Error::invalid_input(
-                    format!("Cannot project {} without enabling with_row_id", ROW_ID),
-                    location!(),
-                ));
-            }
-            if *col == ROW_ADDR && !with_row_addr {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Cannot project {} without enabling with_row_address",
-                        ROW_ADDR
-                    ),
-                    location!(),
-                ));
+            if *col == ROW_ID {
+                if !with_row_id {
+                    return Err(Error::invalid_input(
+                        format!("Cannot project {} without enabling with_row_id", ROW_ID),
+                        location!(),
+                    ));
+                }
+            } else if *col == ROW_ADDR {
+                if !with_row_addr {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Cannot project {} without enabling with_row_address",
+                            ROW_ADDR
+                        ),
+                        location!(),
+                    ));
+                }
+            } else {
+                if !avail_columns.contains(col) {
+                    return Err(Error::invalid_input(
+                        format!("Column {} not found", col),
+                        location!(),
+                    ));
+                }
             }
         }
 
@@ -3448,6 +3467,24 @@ mod test {
 
         let batch_sizes = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
         assert_eq!(batch_sizes, vec![10, 10, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_column_not_exist() {
+        let dataset = lance_datagen::gen()
+            .col("x", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(7), FragmentRowCount::from(6))
+            .await
+            .unwrap();
+
+        let mut scan = dataset.scan();
+        let err = scan.project(&["x", "y"]);
+
+        let err = err.err().unwrap_or_else(|| {
+            panic!("Expected an error to be raised saying column y is not found")
+        });
+
+        assert!(err.to_string().contains("Column y not found"));
     }
 
     #[cfg(not(windows))]
