@@ -483,7 +483,7 @@ impl Scanner {
     pub fn empty_project(&mut self) -> Result<&mut Self> {
         self.with_row_address();
         self.projection_plan.final_projection_is_empty = true;
-        Ok(self)
+        self.project(&[ROW_ADDR])
     }
 
     /// Projection.

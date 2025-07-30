@@ -31,8 +31,7 @@ pub struct ProjectionPlan {
     pub physical_projection: Projection,
     /// True if the final schema of datafusion execution plan is empty.
     /// e.g.
-    ///   select count(*) from dataset.
-    ///   select from dataset.
+    ///   select count(*) from dataset
     pub final_projection_is_empty: bool,
 
     /// If present, expressions that represent the output columns.  These expressions
