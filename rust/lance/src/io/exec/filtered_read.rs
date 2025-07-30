@@ -691,7 +691,8 @@ impl FilteredReadStream {
                 to_skip -= range_len;
                 continue;
             }
-            let to_take_here = range_len.min(to_take);
+            let avail_here = range_len - to_skip;
+            let to_take_here = avail_here.min(to_take);
             to_take -= to_take_here;
             if to_take_here > 0 {
                 trimmed.push(range.start + to_skip..range.start + to_skip + to_take_here);
@@ -2143,5 +2144,30 @@ mod tests {
             let col = batch.column(0).as_primitive::<UInt32Type>();
             assert_eq!(col.value(0), 7, "Expected a=7 but got a={}", col.value(0));
         }
+    }
+
+    #[test]
+    fn test_trim_ranges() {
+        let ranges = vec![0..10, 15..25, 30..40];
+
+        assert_eq!(
+            FilteredReadStream::trim_ranges(ranges.clone(), 0..25, &(0..10)),
+            vec![0..10]
+        );
+
+        assert_eq!(
+            FilteredReadStream::trim_ranges(ranges.clone(), 0..25, &(10..15)),
+            vec![15..20]
+        );
+
+        assert_eq!(
+            FilteredReadStream::trim_ranges(ranges.clone(), 0..25, &(15..20)),
+            vec![20..25]
+        );
+
+        assert_eq!(
+            FilteredReadStream::trim_ranges(ranges.clone(), 0..25, &(15..25)),
+            vec![20..25, 30..35]
+        );
     }
 }
