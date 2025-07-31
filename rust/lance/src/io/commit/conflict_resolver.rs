@@ -949,8 +949,8 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if let Operation::UpdateConfig {
-            schema_metadata,
-            field_metadata,
+            schema_metadata_updates,
+            field_metadata_updates,
             ..
         } = &self.transaction.operation
         {
@@ -958,8 +958,8 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Overwrite { .. } => {
                     // Updates to schema metadata or field metadata conflict with any kind
                     // of overwrite.
-                    if schema_metadata.is_some()
-                        || field_metadata.is_some()
+                    if schema_metadata_updates.is_some()
+                        || !field_metadata_updates.is_empty()
                         || self
                             .transaction
                             .operation
@@ -1565,6 +1565,48 @@ mod tests {
         (dataset, io_stats)
     }
 
+    /// Helper function for tests to create UpdateConfig operations using old-style parameters
+    #[cfg(test)]
+    fn create_update_config_for_test(
+        upsert_values: Option<HashMap<String, String>>,
+        delete_keys: Option<Vec<String>>,
+        schema_metadata: Option<HashMap<String, String>>,
+        field_metadata: Option<HashMap<u32, HashMap<String, String>>>,
+    ) -> Operation {
+        use crate::dataset::transaction::{
+            translate_config_updates, translate_schema_metadata_updates,
+        };
+
+        let config_updates = if let Some(upsert) = &upsert_values {
+            if let Some(delete) = &delete_keys {
+                Some(translate_config_updates(upsert, delete))
+            } else {
+                Some(translate_config_updates(upsert, &[]))
+            }
+        } else if let Some(delete) = &delete_keys {
+            Some(translate_config_updates(&HashMap::new(), delete))
+        } else {
+            None
+        };
+
+        let schema_metadata_updates = schema_metadata
+            .as_ref()
+            .map(translate_schema_metadata_updates);
+
+        let field_metadata_updates = field_metadata
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(field_id, metadata)| (field_id, translate_schema_metadata_updates(&metadata)))
+            .collect();
+
+        Operation::UpdateConfig {
+            config_updates,
+            table_metadata_updates: None,
+            schema_metadata_updates,
+            field_metadata_updates,
+        }
+    }
+
     #[tokio::test]
     async fn test_non_overlapping_rebase_delete_update() {
         let (dataset, io_tracker) = test_dataset(5, 5).await;
@@ -1989,21 +2031,21 @@ mod tests {
                 fields_modified: vec![0],
                 mem_wal_to_flush: None,
             },
-            Operation::UpdateConfig {
-                upsert_values: Some(HashMap::from_iter(vec![(
+            create_update_config_for_test(
+                Some(HashMap::from_iter(vec![(
                     "lance.test".to_string(),
                     "value".to_string(),
                 )])),
-                delete_keys: Some(vec!["remove-key".to_string()]),
-                schema_metadata: Some(HashMap::from_iter(vec![(
+                Some(vec!["remove-key".to_string()]),
+                Some(HashMap::from_iter(vec![(
                     "schema-key".to_string(),
                     "schema-value".to_string(),
                 )])),
-                field_metadata: Some(HashMap::from_iter(vec![(
+                Some(HashMap::from_iter(vec![(
                     0,
                     HashMap::from_iter(vec![("field-key".to_string(), "field-value".to_string())]),
                 )])),
-            },
+            ),
         ];
         let other_transactions = other_operations
             .iter()
@@ -2195,28 +2237,28 @@ mod tests {
             ),
             (
                 // Update config that should not conflict with anything
-                Operation::UpdateConfig {
-                    upsert_values: Some(HashMap::from_iter(vec![(
+                create_update_config_for_test(
+                    Some(HashMap::from_iter(vec![(
                         "other-key".to_string(),
                         "new-value".to_string(),
                     )])),
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
+                    None,
+                    None,
+                    None,
+                ),
                 [Compatible; 9],
             ),
             (
                 // Update config that conflicts with key being upserted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: Some(HashMap::from_iter(vec![(
+                create_update_config_for_test(
+                    Some(HashMap::from_iter(vec![(
                         "lance.test".to_string(),
                         "new-value".to_string(),
                     )])),
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
+                    None,
+                    None,
+                    None,
+                ),
                 [
                     Compatible,    // append
                     Compatible,    // create index
@@ -2231,15 +2273,15 @@ mod tests {
             ),
             (
                 // Update config that conflicts with key being deleted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: Some(HashMap::from_iter(vec![(
+                create_update_config_for_test(
+                    Some(HashMap::from_iter(vec![(
                         "remove-key".to_string(),
                         "new-value".to_string(),
                     )])),
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
+                    None,
+                    None,
+                    None,
+                ),
                 [
                     Compatible,    // append
                     Compatible,    // create index
@@ -2254,22 +2296,22 @@ mod tests {
             ),
             (
                 // Delete config keys currently being deleted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: Some(vec!["remove-key".to_string()]),
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
+                create_update_config_for_test(
+                    None,
+                    Some(vec!["remove-key".to_string()]),
+                    None,
+                    None,
+                ),
                 [Compatible; 9],
             ),
             (
                 // Delete config keys currently being upserted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: Some(vec!["lance.test".to_string()]),
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
+                create_update_config_for_test(
+                    None,
+                    Some(vec!["lance.test".to_string()]),
+                    None,
+                    None,
+                ),
                 [
                     Compatible,    // append
                     Compatible,    // create index
@@ -2285,15 +2327,15 @@ mod tests {
             (
                 // Changing schema metadata conflicts with another update changing schema
                 // metadata or with an overwrite
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: None,
-                    schema_metadata: Some(HashMap::from_iter(vec![(
+                create_update_config_for_test(
+                    None,
+                    None,
+                    Some(HashMap::from_iter(vec![(
                         "schema-key".to_string(),
                         "new-value".to_string(),
                     )])),
-                    field_metadata: None,
-                },
+                    None,
+                ),
                 [
                     Compatible,    // append
                     Compatible,    // create index
@@ -2309,18 +2351,18 @@ mod tests {
             (
                 // Changing field metadata conflicts with another update changing same field
                 // metadata or overwrite
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: Some(HashMap::from_iter(vec![(
+                create_update_config_for_test(
+                    None,
+                    None,
+                    None,
+                    Some(HashMap::from_iter(vec![(
                         0,
                         HashMap::from_iter(vec![(
                             "field_key".to_string(),
                             "field_value".to_string(),
                         )]),
                     )])),
-                },
+                ),
                 [
                     Compatible,    // append
                     Compatible,    // create index
@@ -2335,18 +2377,18 @@ mod tests {
             ),
             (
                 // Updates to different field metadata are allowed
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: Some(HashMap::from_iter(vec![(
+                create_update_config_for_test(
+                    None,
+                    None,
+                    None,
+                    Some(HashMap::from_iter(vec![(
                         1,
                         HashMap::from_iter(vec![(
                             "field_key".to_string(),
                             "field_value".to_string(),
                         )]),
                     )])),
-                },
+                ),
                 [
                     Compatible,    // append
                     Compatible,    // create index

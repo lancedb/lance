@@ -268,6 +268,49 @@ impl BlockingDataset {
         Ok(())
     }
 
+    // Unified metadata APIs
+
+    pub fn get_table_metadata(&self) -> Result<HashMap<String, String>> {
+        let table_metadata = self.inner.table_metadata()?;
+        Ok(table_metadata)
+    }
+
+    pub fn update_metadata(
+        &mut self,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
+    ) -> Result<()> {
+        RT.block_on(self.inner.update_metadata(values, replace))?;
+        Ok(())
+    }
+
+    pub fn update_config(
+        &mut self,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
+    ) -> Result<()> {
+        RT.block_on(self.inner.update_config(values, replace))?;
+        Ok(())
+    }
+
+    pub fn update_schema_metadata(
+        &mut self,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
+    ) -> Result<()> {
+        RT.block_on(self.inner.update_schema_metadata(values, replace))?;
+        Ok(())
+    }
+
+    pub fn update_field_metadata(
+        &mut self,
+        field_updates: HashMap<u32, HashMap<String, Option<String>>>,
+        replace: bool,
+    ) -> Result<()> {
+        RT.block_on(self.inner.update_field_metadata(field_updates, replace))?;
+        Ok(())
+    }
+
     pub fn close(&self) {}
 }
 
@@ -1114,24 +1157,6 @@ fn inner_get_config<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateConfig(
-    mut env: JNIEnv,
-    java_dataset: JObject,
-    config_map: JObject,
-) {
-    ok_or_throw_without_return!(env, inner_update_config(&mut env, java_dataset, config_map))
-}
-
-fn inner_update_config(env: &mut JNIEnv, java_dataset: JObject, config_map: JObject) -> Result<()> {
-    let jmap = JMap::from_env(env, &config_map)?;
-    let config = to_rust_map(env, &jmap)?;
-    let mut dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.update_config(config.into_iter())?;
-    Ok(())
-}
-
-#[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeDeleteConfigKeys(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -1633,60 +1658,231 @@ fn inner_get_version_by_tag(
     dataset_guard.get_version(tag.as_str())
 }
 
+// Unified metadata API JNI methods
+
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceSchemaMetadata(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetTableMetadata<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_table_metadata(&mut env, java_dataset))
+}
+
+fn inner_get_table_metadata<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let table_metadata = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.get_table_metadata()?
+    };
+
+    let java_hashmap = env
+        .new_object("java/util/HashMap", "()V", &[])
+        .expect("Failed to create Java HashMap");
+
+    for (k, v) in table_metadata {
+        let java_key = env
+            .new_string(&k)
+            .expect("Failed to create Java String (key)");
+        let java_value = env
+            .new_string(&v)
+            .expect("Failed to create Java String (value)");
+
+        env.call_method(
+            &java_hashmap,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&java_key), JValue::Object(&java_value)],
+        )
+        .expect("Failed to call HashMap.put()");
+    }
+
+    Ok(java_hashmap)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateMetadata(
     mut env: JNIEnv,
     java_dataset: JObject,
-    jschema_metadata: JObject,
+    values_map: JObject,
+    replace: jboolean,
 ) {
     ok_or_throw_without_return!(
         env,
-        inner_replace_schema_metadata(&mut env, java_dataset, jschema_metadata)
+        inner_update_metadata(&mut env, java_dataset, values_map, replace)
     )
 }
 
-fn inner_replace_schema_metadata(
+fn inner_update_metadata(
     env: &mut JNIEnv,
     java_dataset: JObject,
-    jschema_metadata: JObject,
+    values_map: JObject,
+    replace: jboolean,
 ) -> Result<()> {
-    let jmap = JMap::from_env(env, &jschema_metadata)?;
-    let schema_metadata = to_rust_map(env, &jmap)?;
+    let jmap = JMap::from_env(env, &values_map)?;
+    let values = to_rust_optional_map(env, &jmap)?;
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.replace_schema_metadata(schema_metadata)
+    dataset_guard.update_metadata(values, replace != 0)
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceFieldMetadata(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateConfig(
     mut env: JNIEnv,
     java_dataset: JObject,
-    jfield_metadata_map: JObject,
+    values_map: JObject,
+    replace: jboolean,
 ) {
     ok_or_throw_without_return!(
         env,
-        inner_replace_field_metadata(&mut env, java_dataset, jfield_metadata_map)
+        inner_update_config(&mut env, java_dataset, values_map, replace)
     )
 }
 
-fn inner_replace_field_metadata(
+fn inner_update_config(
     env: &mut JNIEnv,
     java_dataset: JObject,
-    jfield_metadata_map: JObject,
+    values_map: JObject,
+    replace: jboolean,
 ) -> Result<()> {
-    let jmap = JMap::from_env(env, &jfield_metadata_map)?;
-    let mut field_metadata_map = HashMap::new();
+    let jmap = JMap::from_env(env, &values_map)?;
+    let values = to_rust_optional_map(env, &jmap)?;
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.update_config(values, replace != 0)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateSchemaMetadata(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    values_map: JObject,
+    replace: jboolean,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_update_schema_metadata(&mut env, java_dataset, values_map, replace)
+    )
+}
+
+fn inner_update_schema_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    values_map: JObject,
+    replace: jboolean,
+) -> Result<()> {
+    let jmap = JMap::from_env(env, &values_map)?;
+    let values = to_rust_optional_map(env, &jmap)?;
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.update_schema_metadata(values, replace != 0)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateFieldMetadata(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    field_updates_map: JObject,
+    replace: jboolean,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_update_field_metadata(&mut env, java_dataset, field_updates_map, replace)
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateFieldMetadataByPath(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    field_updates_map: JObject,
+    replace: jboolean,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_update_field_metadata_by_path(&mut env, java_dataset, field_updates_map, replace)
+    )
+}
+
+fn inner_update_field_metadata_by_path(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    field_updates_map: JObject,
+    replace: jboolean,
+) -> Result<()> {
+    use lance_core::datatypes::FieldRef;
+
+    let jmap = JMap::from_env(env, &field_updates_map)?;
+    // First collect field paths as owned strings
+    let mut field_path_updates: Vec<(String, HashMap<String, Option<String>>)> = Vec::new();
+    let mut iter = jmap.iter(env)?;
+    env.with_local_frame(16, |env| {
+        while let Some((key, value)) = iter.next(env)? {
+            let field_path = env.get_string(&key.into())?;
+            let field_path_str = field_path
+                .to_str()
+                .map_err(|e| Error::JNI {
+                    message: format!("Failed to convert field path to string: {}", e),
+                })?
+                .to_string();
+            let inner_map = JMap::from_env(env, &value)?;
+            let field_metadata = to_rust_optional_map(env, &inner_map)?;
+            field_path_updates.push((field_path_str, field_metadata));
+        }
+        Ok::<(), Error>(())
+    })?;
+
+    // Then convert to FieldRef
+    let field_updates: HashMap<FieldRef, HashMap<String, Option<String>>> = field_path_updates
+        .iter()
+        .map(|(path, metadata)| (FieldRef::ByPath(path.as_str()), metadata.clone()))
+        .collect();
+
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.update_field_metadata_by_ref(field_updates, replace != 0)
+}
+
+fn inner_update_field_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    field_updates_map: JObject,
+    replace: jboolean,
+) -> Result<()> {
+    let jmap = JMap::from_env(env, &field_updates_map)?;
+    let mut field_updates = HashMap::new();
     let mut iter = jmap.iter(env)?;
     env.with_local_frame(16, |env| {
         while let Some((key, value)) = iter.next(env)? {
             let field_id = env.call_method(&key, "intValue", "()I", &[])?.i()? as u32;
             let inner_map = JMap::from_env(env, &value)?;
-            let value_map = to_rust_map(env, &inner_map)?;
-            field_metadata_map.insert(field_id, value_map);
+            let field_metadata = to_rust_optional_map(env, &inner_map)?;
+            field_updates.insert(field_id, field_metadata);
         }
         Ok::<(), Error>(())
     })?;
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.replace_field_metadata(field_metadata_map)
+    dataset_guard.update_field_metadata(field_updates, replace != 0)
+}
+
+// Helper function to convert Java Map to Rust HashMap<String, Option<String>>
+fn to_rust_optional_map(env: &mut JNIEnv, jmap: &JMap) -> Result<HashMap<String, Option<String>>> {
+    let mut result = HashMap::new();
+    let mut iter = jmap.iter(env)?;
+    env.with_local_frame(16, |env| {
+        while let Some((key, value)) = iter.next(env)? {
+            let key_str = env.get_string(&JString::from(key))?.into();
+            let value_opt = if value.is_null() {
+                None
+            } else {
+                Some(env.get_string(&JString::from(value))?.into())
+            };
+            result.insert(key_str, value_opt);
+        }
+        Ok::<(), Error>(())
+    })?;
+    Ok(result)
 }
