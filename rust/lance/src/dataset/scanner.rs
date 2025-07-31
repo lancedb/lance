@@ -2830,17 +2830,25 @@ impl Scanner {
 
         // Use DataFusion's [SortExec] for Top-K search
         let sort = SortExec::new(
-            LexOrdering::new(vec![PhysicalSortExpr {
-                expr: expressions::col(DIST_COL, knn_plan.schema().as_ref())?,
-                options: SortOptions {
-                    descending: false,
-                    nulls_first: false,
+            LexOrdering::new(vec![
+                PhysicalSortExpr {
+                    expr: expressions::col(DIST_COL, knn_plan.schema().as_ref())?,
+                    options: SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    },
                 },
-            }]),
+                PhysicalSortExpr {
+                    expr: expressions::col(ROW_ID, knn_plan.schema().as_ref())?,
+                    options: SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    },
+                },
+            ]),
             knn_plan,
         )
-        .with_fetch(Some(self.calculate_effective_k(q.k)))
-        .with_preserve_partitioning(true);
+        .with_fetch(Some(self.calculate_effective_k(q.k)));
 
         let logical_not_null = col(DIST_COL).is_not_null();
         let not_nulls = Arc::new(LanceFilterExec::try_new(logical_not_null, Arc::new(sort))?);
@@ -2891,8 +2899,19 @@ impl Scanner {
                 nulls_first: false,
             },
         };
+        let sort_expr_row_id = PhysicalSortExpr {
+            expr: expressions::col(ROW_ID, inner_fanout_search.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        };
         Ok(Arc::new(
-            SortExec::new(LexOrdering::new(vec![sort_expr]), inner_fanout_search).with_fetch(Some(
+            SortExec::new(
+                LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
+                inner_fanout_search,
+            )
+            .with_fetch(Some(
                 self.calculate_effective_k(q.k) * q.refine_factor.unwrap_or(1) as usize,
             )),
         ))
@@ -2944,8 +2963,19 @@ impl Scanner {
                     nulls_first: false,
                 },
             };
+            let sort_expr_row_id = PhysicalSortExpr {
+                expr: expressions::col(ROW_ID, ann_node.schema().as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            };
             let ann_node = Arc::new(
-                SortExec::new(LexOrdering::new(vec![sort_expr]), ann_node).with_fetch(Some(
+                SortExec::new(
+                    LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
+                    ann_node,
+                )
+                .with_fetch(Some(
                     self.calculate_effective_k(q.k) * over_fetch_factor as usize,
                 )),
             );
@@ -2961,8 +2991,19 @@ impl Scanner {
                 nulls_first: false,
             },
         };
+        let sort_expr_row_id = PhysicalSortExpr {
+            expr: expressions::col(ROW_ID, ann_node.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        };
         let ann_node = Arc::new(
-            SortExec::new(LexOrdering::new(vec![sort_expr]), ann_node).with_fetch(Some(
+            SortExec::new(
+                LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
+                ann_node,
+            )
+            .with_fetch(Some(
                 self.calculate_effective_k(q.k) * q.refine_factor.unwrap_or(1) as usize,
             )),
         );
@@ -6680,7 +6721,7 @@ mod test {
                     .fast_search()
                     .project(&["_rowid", "_distance"])
             },
-            "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]...
+            "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
       ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
@@ -6695,7 +6736,7 @@ mod test {
                     .with_row_id()
                     .project(&["_rowid", "_distance"])
             },
-            "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]...
+            "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
       ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
@@ -6712,18 +6753,18 @@ mod test {
             },
             "ProjectionExec: expr=[_distance@2 as _distance, _rowid@0 as _rowid]
   FilterExec: _distance@2 IS NOT NULL
-    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
+    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@0 ASC NULLS LAST]...
       KNNVectorDistance: metric=l2
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
             ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
               FilterExec: _distance@2 IS NOT NULL
-                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
+                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
                   KNNVectorDistance: metric=l2
                     LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
             Take: columns=\"_distance, _rowid, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
-                SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]...
+                SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
                   ANNSubIndex: name=idx, k=34, deltas=1
                     ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
@@ -6995,13 +7036,10 @@ mod test {
             new_scanner.limit(limit, offset).unwrap();
             let result = new_scanner.try_into_batch().await.unwrap();
 
-            dbg!(&full_result);
-
             let resolved_offset = offset.unwrap_or(0).min(full_result.num_rows() as i64);
             let resolved_length = limit
                 .unwrap_or(i64::MAX)
                 .min(full_result.num_rows() as i64 - resolved_offset);
-            dbg!((resolved_offset, resolved_length));
 
             let expected = full_result.slice(resolved_offset as usize, resolved_length as usize);
 
@@ -7047,7 +7085,7 @@ mod test {
         let query_vector = Float32Array::from(vec![0.0; 32]);
         let mut scanner = test_ds.dataset.scan();
         scanner
-            .nearest("vec", &query_vector, 10)
+            .nearest("vec", &query_vector, 500)
             .unwrap()
             .project(&["i"])
             .unwrap();
@@ -7065,7 +7103,7 @@ mod test {
         test_ds.append_new_data().await.unwrap();
         let query_vector = Float32Array::from(vec![0.0; 32]);
         let mut scanner = test_ds.dataset.scan();
-        scanner.nearest("vec", &query_vector, 10).unwrap();
+        scanner.nearest("vec", &query_vector, 500).unwrap();
         // Nearest has a default limit of 10, so we need the base scanner to have a high limit.
         scanner.limit(Some(500), None).unwrap();
         limit_offset_equivalency_test(&scanner).await;
