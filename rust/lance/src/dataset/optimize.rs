@@ -688,12 +688,12 @@ async fn rewrite_files(
     scanner
         .with_fragments(fragments.clone())
         .scan_in_order(true);
-    let (row_ids, reader) = if needs_remapping {
-        let row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
+    let (row_addrs, reader) = if needs_remapping {
+        let row_addrs = Arc::new(RwLock::new(RoaringTreemap::new()));
         scanner.with_row_address();
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
-        let data_no_row_ids = make_rowaddr_capture_stream(row_ids.clone(), data)?;
-        (Some(row_ids), data_no_row_ids)
+        let data_no_row_ids = make_rowaddr_capture_stream(row_addrs.clone(), data)?;
+        (Some(row_addrs), data_no_row_ids)
     } else {
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         (None, data)
@@ -742,25 +742,26 @@ async fn rewrite_files(
 
     log::info!("Compaction task {}: file written", task_id);
 
-    let (row_id_map, changed_row_addrs) = if let Some(row_ids) = row_ids {
-        let row_ids = Arc::try_unwrap(row_ids)
-            .expect("Row ids lock still owned")
+    let (row_addr_map, changed_row_addrs) = if let Some(row_addrs) = row_addrs {
+        let row_addrs = Arc::try_unwrap(row_addrs)
+            .expect("Row addrs lock still owned")
             .into_inner()
-            .expect("Row ids mutex still locked");
+            .expect("Row addrs mutex still locked");
 
         log::info!(
-            "Compaction task {}: reserving fragment ids and transposing row ids",
+            "Compaction task {}: reserving fragment ids and transposing row addrs",
             task_id
         );
         reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
 
         if options.defer_index_remap {
-            let mut changed_row_addrs = Vec::with_capacity(row_ids.serialized_size());
-            row_ids.serialize_into(&mut changed_row_addrs)?;
+            let mut changed_row_addrs = Vec::with_capacity(row_addrs.serialized_size());
+            row_addrs.serialize_into(&mut changed_row_addrs)?;
             (None, Some(changed_row_addrs))
         } else {
-            let row_id_map = remapping::transpose_row_addrs(row_ids, &fragments, &new_fragments);
-            (Some(row_id_map), None)
+            let row_addr_map =
+                remapping::transpose_row_addrs(row_addrs, &fragments, &new_fragments);
+            (Some(row_addr_map), None)
         }
     } else {
         log::info!("Compaction task {}: rechunking stable row ids", task_id);
@@ -795,7 +796,7 @@ async fn rewrite_files(
         new_fragments,
         read_version: dataset.manifest.version,
         original_fragments: task.fragments,
-        row_id_map,
+        row_id_map: row_addr_map,
         changed_row_addrs,
     })
 }

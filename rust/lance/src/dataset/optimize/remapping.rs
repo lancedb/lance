@@ -121,7 +121,7 @@ impl<I: Iterator<Item = u64>> Iterator for MissingAddrs<'_, I> {
 
             let current_fragment = &self.fragments[self.current_fragment_idx];
             let frag = val / RowAddress::FRAGMENT_SIZE;
-            let expected_row_id = self.expected_row_addr;
+            let expected_row_addr = self.expected_row_addr;
             self.expected_row_addr += 1;
 
             let current_physical_rows = current_fragment.physical_rows;
@@ -135,11 +135,11 @@ impl<I: Iterator<Item = u64>> Iterator for MissingAddrs<'_, I> {
             }
             if frag != current_fragment.id {
                 self.last = Some(val);
-                return Some(expected_row_id);
+                return Some(expected_row_addr);
             }
-            if val != expected_row_id {
+            if val != expected_row_addr {
                 self.last = Some(val);
-                return Some(expected_row_id);
+                return Some(expected_row_addr);
             }
         }
     }
