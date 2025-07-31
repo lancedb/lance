@@ -92,6 +92,8 @@ pub use scanner::Scanner;
 
 use crate::executor::BackgroundExecutor;
 
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[cfg(not(feature = "datagen"))]
 #[pyfunction]
 pub fn is_datagen_supported() -> bool {
